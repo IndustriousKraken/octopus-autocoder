@@ -1,31 +1,40 @@
 ## Context
 
-The project requires an automated way to implement OpenSpec proposals in a serial queue across multiple repositories. To achieve production-grade reliability, the orchestrator cannot rely on external CLI tools (like `gemini-cli`). It must act as a first-class AI client, utilizing the Model Context Protocol (MCP) to expose its local workspace to a hosted LLM.
+The project requires automated processing of OpenSpec proposals across multiple repositories, in serial per repository. To keep the orchestrator small and durable, code-writing is delegated to a swappable executor backend, and the orchestrator owns only the workflow concerns: queue state, git operations, ChatOps escalation, and recovery. This design intentionally avoids reimplementing agentic primitives (LLM loops, tool dispatch, context management) that mature external tools already provide well.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Create a single Rust binary to orchestrate the AI software factory.
-- Implement a serial queue reading from `openspec/changes/` per repository.
-- Manage git operations using `std::process::Command` for local branching, but `reqwest` for external PR creation.
-- Execute implementations using an internal LLM loop (`rig-core`) integrated with `rust-mcp-sdk`.
-- Provide an asynchronous Slack integration to resolve AI ambiguity gracefully.
+- One Rust binary that runs as a daemon and orchestrates the AI software factory.
+- A serial queue per repository, reading from `openspec/changes/`.
+- A backend-agnostic `Executor` trait that the orchestrator calls. Concrete implementations are provided by separate implementation changes.
+- Local git operations via `std::process::Command`; remote operations (PR creation) via the GitHub REST API using `reqwest`.
+- Asynchronous Slack escalation when the executor reports an `AskUser` outcome.
+- Single-instance daemon assumption with explicit stale-lock cleanup on startup.
 
 **Non-Goals:**
-- A web interface or complex dashboard.
-- Automatic Git merge conflict resolution.
-- Re-implementing the OpenSpec schema parsing. The orchestrator will shell out to the `openspec` Node binary purely to generate the prompt instructions, but will handle the actual LLM execution internally.
+- No web dashboard.
+- No automatic git merge-conflict resolution.
+- The architecture-level specs do NOT name any specific executor backend. Concrete backends (claude-cli wrappers, OpenCode, custom MCP, future native loops) are introduced by separate implementation changes.
+- The orchestrator does NOT implement an MCP server itself. If MCP tooling is desired, it is configured into whichever executor backend supports it.
+- No support for multiple daemon instances against a single workspace. The single-instance assumption is load-bearing for the lock-cleanup-on-startup decision.
 
 ## Decisions
 
-- **Language & Runtime:** Rust with `tokio`. Essential for managing concurrent polling loops across multiple repositories while maintaining in-memory LLM conversation state.
-- **AI Execution:** We will salvage core routing logic from the `rabs-coder-agent` project, leveraging `rig-core` to hit provider APIs and `rust-mcp-sdk` to execute file operations locally.
-- **Git Branching Strategy:** Feature branches per queue execution pass. The orchestrator implements changes serially on a single `agent_branch`, and opens one monolithic PR at the end of the pass.
-- **Queue State:** The file system (`openspec/changes/`) acts as the state database. Locks (`.in-progress`) and ChatOps state (`.waiting.json`) are stored alongside the proposals.
+- **Language & Runtime:** Rust with `tokio`. Required for concurrent polling loops across repositories while sharing in-process state safely.
+- **Executor abstraction:** A Rust trait with two async methods — `run(workspace, change) -> Result<ExecutorOutcome>` and `resume(handle, answer) -> Result<ExecutorOutcome>` — where `ExecutorOutcome` is an enum of `Completed`, `AskUser { question, resume_handle }`, or `Failed { reason }`. The orchestrator code is generic over this trait. Concrete backends are introduced by phase-specific changes; if multi-backend support proves over-engineered, the trait is small enough to inline with no architectural rewrite.
+- **Git Branching Strategy:** Per-pass feature branch. Each polling pass branches from the configured `base_branch`, applies all ready changes serially with one commit per change, and opens one monolithic PR at the end of the pass. The agent branch is recreated each pass (`git checkout -B`); prior state is overwritten by design.
+- **Queue State as Filesystem:** The file system (`openspec/changes/`) is the source of truth. `.in-progress` locks and ChatOps state files (`.question.json`, `.answer.json`) live alongside the proposals so they survive restarts.
+- **Single-instance assumption + explicit startup contract:** Only one orchestrator daemon runs per workspace. On startup, the orchestrator (a) deletes any pre-existing `.in-progress` files (conclusively stale, since the daemon is the only writer and it just started), and (b) inspects the workspace for uncommitted git state. If `git status --porcelain` returns non-empty, the orchestrator logs an error and skips that repository's polling loop for the lifetime of the process. This resolves the prior contradiction between "preserve locks across crashes" and "auto-cleanup on startup": locks are cleaned, but a dirty workspace is treated as a hard error rather than silently retried, preserving the user's ability to inspect what was lost.
+- **Verifiable acceptance:** Every requirement in the architecture-level specs names at least one externally-observable side effect — an HTTP call, a file path, an exit code, a branch ref, a `git status` output — so an implementation cannot satisfy a scenario with a placeholder print statement.
 
 ## Risks / Trade-offs
 
-- **Risk:** Implementing an internal LLM loop and MCP server takes significantly more time and lines of code than wrapping an existing CLI.
-  - **Mitigation:** We will salvage proven components from the `rabs-coder-agent` project.
-- **Risk:** Agent processes hanging indefinitely on complex logic.
-  - **Mitigation:** Strict timeouts on LLM API calls and local tool executions.
+- **Risk:** The executor abstraction may be over-engineered if only one backend is ever implemented.
+  - **Mitigation:** The trait is intentionally minimal (two methods, one enum). If multi-backend support never materializes, the trait can be inlined with a small refactor; nothing is lost by starting with it.
+- **Risk:** Executor backends hang indefinitely.
+  - **Mitigation:** The orchestrator wraps every `Executor::run` call in a configurable `tokio::time::timeout`. On timeout, the orchestrator treats the call as `Failed { reason: "timeout" }`, unlocks the change, and does NOT archive it.
+- **Risk:** A dirty workspace at startup blocks the daemon.
+  - **Mitigation:** This is intentional. The recovery path is the `rewind` subcommand, which the user invokes manually after auditing what was lost.
+- **Risk:** Force-recreating the agent branch each pass discards prior commits that may have been worth salvaging.
+  - **Mitigation:** Pushes use `--force-with-lease`, not `--force`, so concurrent human edits to the remote agent branch are detected. Salvaging prior agent work is out of scope; this is a "redo from scratch" workflow by design.

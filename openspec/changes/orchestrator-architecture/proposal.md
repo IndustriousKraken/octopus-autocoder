@@ -1,27 +1,27 @@
 ## Why
 
-This project requires an autonomous CI/CD pipeline to process and implement OpenSpec proposals in sequence across multiple repositories without human supervision. We need a robust, API-first Rust server daemon that acts as an orchestration brain, executing local filesystem tools via the Model Context Protocol (MCP) and integrating natively with Large Language Models (LLMs) to create an autonomous software factory.
+This project requires an autonomous CI/CD pipeline that processes OpenSpec implementation proposals in sequence across multiple repositories without human supervision. The orchestrator must be a robust Rust server daemon that owns the workflow — queue, git, ChatOps, recovery — while delegating actual code-writing to a swappable executor backend. This keeps the orchestrator small, durable, and free of lock-in to any specific agent CLI or LLM provider.
 
 ## What Changes
 
-- An `orchestrator` Rust application will be built to run as a persistent daemon.
-- The queue will operate as a "Serial Queue" per repository to handle dependent features safely without causing git conflicts.
-- The daemon will integrate the official `rust-mcp-sdk` and a native LLM client library (like `rig-core`) to execute implementations directly in-memory, avoiding fragile dependencies on external CLI wrappers.
-- The daemon will generate a single, monolithic Pull Request at the end of each repository's polling pass, combining all processed changes.
-- The architecture requires asynchronous communication (ChatOps) to handle AI ambiguity gracefully without blocking the queue.
+- An `orchestrator` Rust binary will run as a persistent daemon.
+- The queue operates as a "Serial Queue" per repository to handle dependent features safely without git conflicts.
+- Implementation execution is performed by a backend-agnostic `Executor` abstraction. Concrete backends (CLI wrappers, MCP-connected agents, future native loops) are introduced by separate implementation changes; the architecture-level spec does not name any specific backend.
+- The daemon generates one monolithic Pull Request at the end of each repository's polling pass, combining all processed changes.
+- Asynchronous escalation (ChatOps) handles agent ambiguity without blocking the queue.
+- Only one orchestrator daemon runs per workspace at a time. On startup, stale `.in-progress` locks are cleared and dirty workspaces are refused (the user must run `rewind` or clean up manually).
 
 ## Capabilities
 
 ### New Capabilities
-- `orchestrator-cli`: The core Rust asynchronous daemon entry point using `tokio`.
-- `openspec-queue-engine`: Logic for watching the `openspec/changes` folder, determining the next task, and managing states (archiving, unarchiving, locking).
-- `mcp-tool-server`: A Rust-native implementation of the Model Context Protocol providing local tools (read, write, shell) to the internal LLM client.
-- `llm-orchestration-client`: The core loop that communicates directly with external LLM providers (Anthropic, OpenRouter) to execute tasks.
-- `git-workflow-manager`: Automation around git branch creation, commits, and batching monolithic PRs via the GitHub API.
+- `orchestrator-cli`: Asynchronous daemon entry point, configuration loading, subcommand routing, signal handling.
+- `openspec-queue-engine`: Watches `openspec/changes/`, enumerates ready changes, manages archive and lock state.
+- `executor`: Backend-agnostic abstraction that runs an implementation given a workspace and change name; reports outcome (`Completed`, `AskUser`, or `Failed`) and supports resuming after a human answer.
+- `git-workflow-manager`: Branch creation, serial commits, push, monolithic PR creation via the GitHub REST API.
 
 ### Modified Capabilities
 - (none)
 
 ## Impact
 
-This establishes the foundational blueprint for a production-grade, multi-repo AI CI/CD server. It strictly mandates API-first integrations (MCP, GitHub, Slack) over brittle local scripts, ensuring high reliability and maintainability.
+This establishes the foundational blueprint for a production-grade, multi-repo AI CI/CD daemon. By keeping the executor abstract, the orchestrator avoids lock-in to any single agent CLI or LLM provider, stays small enough to actually maintain, and leaves room to evolve the execution backend without rewriting the workflow.

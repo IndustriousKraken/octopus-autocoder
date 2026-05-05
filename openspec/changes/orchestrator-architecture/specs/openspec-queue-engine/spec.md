@@ -1,22 +1,49 @@
 ## ADDED Requirements
 
-### Requirement: Watch the changes directory
-The system SHALL monitor the `openspec/changes/` directory to identify pending proposals that are ready for implementation.
+### Requirement: Enumerate ready changes
+The queue engine SHALL list pending OpenSpec changes in the workspace, excluding archived, locked, dotfile, and non-directory entries.
 
-#### Scenario: Finding the next task
-- **WHEN** the queue engine is queried for the next job
-- **THEN** it returns the oldest unarchived change that is ready for implementation
+#### Scenario: Listing the queue
+- **WHEN** the queue engine is queried for pending changes in a workspace
+- **THEN** it returns the names of every direct subdirectory of `<workspace>/openspec/changes/` that satisfies ALL of the following:
+  - the entry is a directory (not a file or symlink)
+  - the entry name is not the literal string `archive`
+  - the entry name does not begin with `.`
+  - the entry does NOT contain a file named `.in-progress`
+  - the entry contains at least a regular file named `proposal.md`
+- **AND** the returned list is sorted ascending by entry name (so numeric prefixes like `01-`, `02-` order naturally)
 
-### Requirement: Archive state management
-The system SHALL move completed changes to the `archive/` folder to remove them from the active queue.
+### Requirement: Lock state management
+The queue engine SHALL atomically lock and unlock changes via filesystem markers to prevent duplicate execution and to signal in-progress state to humans inspecting the workspace.
 
-#### Scenario: Archiving a completed job
-- **WHEN** a change implementation is successfully committed
-- **THEN** the engine moves the change folder to `openspec/changes/archive/`
+#### Scenario: Locking a change
+- **WHEN** the orchestrator selects a change for execution
+- **THEN** the queue engine creates an empty file at `<workspace>/openspec/changes/<change>/.in-progress` BEFORE invoking the executor
+- **AND** the file is verifiable on disk via standard filesystem inspection (e.g. `ls -a`)
 
-### Requirement: Unarchive state management
-The system SHALL move changes from the `archive/` folder back to the active queue when a rewind is requested.
+#### Scenario: Unlocking after any executor outcome
+- **WHEN** the executor returns ANY outcome (`Completed`, `AskUser`, `Failed`) OR the executor invocation panics
+- **THEN** the queue engine deletes the `.in-progress` file
+- **AND** the deletion is idempotent (no error if the file is already absent)
 
-#### Scenario: Unarchiving a failed job
-- **WHEN** the rewind command is executed for a change
-- **THEN** the engine moves the change folder from `archive/` back to `openspec/changes/`
+#### Scenario: Stale lock cleanup on startup
+- **WHEN** the orchestrator initializes a workspace at process startup
+- **THEN** any pre-existing `.in-progress` files inside `<workspace>/openspec/changes/<change>/` are deleted before the polling loop for that repository begins
+- **AND** a log line is emitted for each lock cleared, naming the change
+
+### Requirement: Archive on completion
+The queue engine SHALL move successfully implemented changes into a dated archive subdirectory only after the corresponding git commit has been recorded.
+
+#### Scenario: Archiving a completed change
+- **WHEN** the executor returns `Completed` for `<change>` AND the git workflow manager has recorded a commit on the agent branch attributable to that change
+- **THEN** the queue engine renames `<workspace>/openspec/changes/<change>/` to `<workspace>/openspec/changes/archive/<YYYY-MM-DD>-<change>/`, where `<YYYY-MM-DD>` is the UTC date of the rename
+- **AND** if the destination path already exists, the engine returns an error naming the conflict and does NOT overwrite the existing archive entry
+
+### Requirement: Unarchive on rewind
+The queue engine SHALL move a previously archived change back into the active queue when requested by the rewind subcommand.
+
+#### Scenario: Unarchiving a single change
+- **WHEN** `unarchive_change(<name>)` is called against a workspace
+- **THEN** the engine searches `<workspace>/openspec/changes/archive/` for directory names matching the regex `^\d{4}-\d{2}-\d{2}-<name>$`, selects the lexicographically highest match (most recently archived), strips the date prefix, and renames it to `<workspace>/openspec/changes/<name>/`
+- **AND** if no match is found, the engine returns an error naming the requested change
+- **AND** if the destination `<workspace>/openspec/changes/<name>/` already exists, the engine returns an error and does NOT overwrite
