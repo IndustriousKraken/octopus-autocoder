@@ -1,22 +1,21 @@
 ## Why
 
-To add a layer of safety before human approval, we need to integrate an automated code review step. Because the orchestrator is an API-first LLM client, this review can happen entirely in-memory using direct API calls, rather than relying on external scripts.
+Once an agent's commits land on the agent branch, they need a quality review BEFORE the PR is human-merged. This change adds an automated AI code-review step focused exclusively on code quality (security, maintainability, smells, language idioms). It is intentionally NOT a spec-compliance check — that is the verifier's job and lives in its own future change.
 
 ## What Changes
 
-- Add a `reviewer` module.
-- Retrieve the git diff between the `base_branch` and the newly committed `agent_branch`.
-- Construct a system prompt for the review task and send the diff to the configured Reviewer LLM API (e.g. Anthropic, Grok, MiMo).
-- Capture the API response as the review report.
+- Add `code-reviewer` capability: extracts the diff between `base_branch` and `agent_branch`, sends it to a configured LLM API, parses the response into a structured `ReviewReport { verdict, markdown }`, returns it.
+- Modify `git-workflow-manager`: when the reviewer is enabled, the PR body includes the report under a `## Code Review` heading; on a `Block` verdict the PR is created as a draft (with a `do-not-merge` label fallback if the host rejects drafts).
+- Implementation: add `src/llm.rs` (provider abstraction), `src/code_reviewer.rs` (the reviewer itself), a `reviewer:` config block, and a default prompt template at `prompts/code-review-default.md` that explicitly scopes the review to code quality.
 
 ## Capabilities
 
 ### New Capabilities
-- `reviewer-agent-integration`: The logic required to invoke an AI reviewer on the newly committed changes and capture its feedback.
+- `code-reviewer`: AI-driven code-quality review of the diff between base and agent branches; produces a structured verdict and markdown report.
 
 ### Modified Capabilities
-- `git-workflow-manager`: Modify the workflow to append the review report to the monolithic Pull Request.
+- `git-workflow-manager`: PR body composition now includes the reviewer report when enabled; Block verdict produces a draft PR.
 
 ## Impact
 
-This provides an automated quality check, catching potential errors or regressions before the PR is presented to the human developer.
+The orchestrator's PRs now ship with a structured code-quality review. Block-verdict PRs cannot be merged accidentally without a human first un-drafting them (or removing the fallback label). The reviewer is opt-in via the config block; setups that omit it run unchanged from phase-1 + multi-repo.

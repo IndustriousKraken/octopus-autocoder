@@ -1,22 +1,22 @@
 ## Why
 
-When an agent fails to implement a change correctly, or a PR is rejected by a reviewer, the dependent tasks in the serial queue are now invalid or conflicted. We need a robust mechanism to "rewind" the queue, discard the corrupted `agent-q` branch, and put the failed and subsequent changes back into the active queue so they can be re-attempted cleanly.
+The architecture spec defines the rewind subcommand's behavior, but phase-1-foundation deliberately implemented it minimally (single-repo, no real branch deletion logic) and `multi-repo-manager` extended the daemon to multiple repos without yet teaching rewind about them. This change finishes the rewind subcommand end-to-end and adds the `--repo` selector required for multi-repo configurations.
 
 ## What Changes
 
-- Implement the full logic for the `rewind` CLI subcommand introduced in the skeleton.
-- Add git utilities to safely delete the local and remote `agent-q` branch.
-- Add queue utilities to identify archived changes and move them back to the active queue.
-- Implement interactive confirmation or dry-run features to prevent accidental data loss when destroying branches.
+- Implement the full `rewind` subcommand: confirmation prompt (unless `--hard`), local + remote agent-branch deletion when `--hard`, unarchive of named changes via `queue::unarchive`, reset of the agent branch back to base.
+- Modify `orchestrator-cli`: when the config contains multiple repositories, `rewind` requires `--repo <selector>`; with exactly one repo, the argument is optional and defaults to that repo.
+- Add git utilities `delete_branch_local` and `delete_branch_remote` if not already implemented in phase-1.
+- Add an interactive confirmation prompt that defaults to "no" so accidental Enter presses don't destroy work.
 
 ## Capabilities
 
 ### New Capabilities
-<!-- No new capabilities, we are implementing the rewind specs defined in the orchestrator-architecture change -->
+<!-- None. This change implements existing architecture-level rewind requirements and modifies the orchestrator-cli rewind subcommand for multi-repo dispatch. -->
 
 ### Modified Capabilities
-<!-- No modified capabilities, we are just implementing the initial draft of the existing specs -->
+- `orchestrator-cli`: the rewind subcommand takes a `--repo <selector>` argument required for multi-repo configs and optional for single-repo configs.
 
 ## Impact
 
-This provides the critical safety net for the autonomous factory. By automating the cleanup and requeuing process, it ensures that a single AI failure doesn't permanently stall the pipeline or require complex manual git surgery.
+After this change, the rewind subcommand works as documented in the architecture spec across both single-repo and multi-repo deployments. Operators can recover individual repositories without affecting others, and the destructive `--hard` mode requires either explicit flag or interactive confirmation.

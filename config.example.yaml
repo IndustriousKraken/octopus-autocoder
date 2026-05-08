@@ -1,18 +1,34 @@
+# OpenSpec CI/CD Orchestrator — example configuration.
+#
+# The orchestrator polls each repository on its configured interval, processes
+# any ready OpenSpec changes via the configured executor, and opens a monolithic
+# Pull Request per pass.
+
 repositories:
-  # Example 1: A backend service on a fast polling loop
+  # Example 1: a backend service on a fast polling loop.
   - url: "git@github.com:my-org/auth-service.git"
-    poll_interval_sec: 300        # Poll every 5 minutes
-    base_branch: "main"           # Base branch for production
-    agent_branch: "agent-queue"   # The branch agents use to build features
+    base_branch: "main"
+    agent_branch: "agent-q"
+    poll_interval_sec: 300
+    # local_path is optional; if omitted, derived as
+    # /tmp/workspaces/<sanitized-url> deterministically.
+    # local_path: "/tmp/workspaces/auth-service"
 
-  # Example 2: A frontend application
+  # Example 2: a frontend application on a slower interval.
   - url: "git@github.com:my-org/web-dashboard.git"
-    poll_interval_sec: 3600       # Poll once an hour
-    base_branch: "dev"            # Active development branch
-    agent_branch: "agent-q"       # Default orchestrator branch
+    base_branch: "dev"
+    agent_branch: "agent-q"
+    poll_interval_sec: 3600
 
-  # Example 3: The orchestrator project itself (self-hosted updates!)
-  - url: "git@github.com:my-org/cicd-impl-agents.git"
-    poll_interval_sec: 7200       # Poll every two hours
-    base_branch: "new-specs"      # Watch a specific branch for new OpenSpec proposals
-    agent_branch: "auto-updates"  # A unique branch for agent modifications
+executor:
+  # Currently supported: claude_cli (wraps the `claude` CLI as a subprocess).
+  kind: claude_cli
+  command: claude
+  # Maximum wall-clock seconds for a single change implementation. The child
+  # process is killed if it exceeds this budget.
+  timeout_secs: 1800
+
+github:
+  # Name of the environment variable holding the GitHub PAT or fine-grained
+  # token. The orchestrator reads the token at PR-creation time only.
+  token_env: GITHUB_TOKEN

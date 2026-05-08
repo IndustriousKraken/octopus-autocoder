@@ -1,0 +1,27 @@
+## MODIFIED Requirements
+
+### Requirement: Enumerate ready changes
+The queue engine SHALL list pending OpenSpec changes in the workspace, excluding archived, locked, **waiting**, dotfile, and non-directory entries.
+
+#### Scenario: Listing the queue
+- **WHEN** the queue engine is queried for pending changes in a workspace
+- **THEN** it returns the names of every direct subdirectory of `<workspace>/openspec/changes/` that satisfies ALL of the following:
+  - the entry is a directory (not a file or symlink)
+  - the entry name is not the literal string `archive`
+  - the entry name does not begin with `.`
+  - the entry does NOT contain a file named `.in-progress`
+  - **the entry does NOT contain a file named `.question.json`**
+  - the entry contains at least a regular file named `proposal.md`
+- **AND** the returned list is sorted ascending by entry name
+
+## ADDED Requirements
+
+### Requirement: Enumerate waiting changes
+The queue engine SHALL provide a separate enumeration of changes currently waiting on a human answer (i.e. those containing a `.question.json` file).
+
+#### Scenario: Listing waiting changes
+- **WHEN** `list_waiting(workspace)` is called
+- **THEN** it returns the names of every direct subdirectory of `<workspace>/openspec/changes/` that contains a `.question.json` file (regardless of whether `.answer.json` is also present)
+- **AND** the returned list is sorted ascending by entry name
+- **AND** archived directories are excluded
+- **AND** entries beginning with `.` are excluded

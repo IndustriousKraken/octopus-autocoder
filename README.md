@@ -17,21 +17,53 @@ The Orchestrator operates on a "Serial Queue" model per repository to manage dep
 
 ## Configuration
 
-The Orchestrator accepts a `config.yaml` file specifying the repositories to watch, their polling intervals, and custom branch names.
+The Orchestrator accepts a `config.yaml` file specifying the repositories to watch, their polling intervals, and custom branch names. Multiple repositories are first-class: the orchestrator spawns one polling task per `repositories[]` entry, each on its own interval.
 
 Copy the example file to get started:
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-**Example `config.yaml`:**
+**Example `config.yaml` (multi-repo):**
 ```yaml
 repositories:
-  - url: "git@github.com:my-org/project-alpha.git"
-    poll_interval_sec: 3600       # Poll every hour
-    base_branch: "dev"            # Branch to branch off of
-    agent_branch: "agent-q"       # Branch the agent will commit to
+  - url: "git@github.com:my-org/auth-service.git"
+    base_branch: "main"
+    agent_branch: "agent-q"
+    poll_interval_sec: 300
+
+  - url: "git@github.com:my-org/web-dashboard.git"
+    base_branch: "dev"
+    agent_branch: "agent-q"
+    poll_interval_sec: 3600
+
+executor:
+  kind: claude_cli           # currently the only supported backend
+  command: claude
+  timeout_secs: 1800
+
+github:
+  token_env: GITHUB_TOKEN    # env var holding the PAT used for PR creation
 ```
+
+### Workspace Path Derivation
+
+If a repository entry omits `local_path`, the workspace path is derived deterministically from the URL:
+
+1. Strip the protocol prefix (`git@`, `ssh://`, `https://`, `http://`).
+2. Strip a trailing `.git`.
+3. Replace any character that is not ASCII alphanumeric, `_`, or `-` with `_`.
+4. Prepend `/tmp/workspaces/`.
+
+This means `git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both map to `/tmp/workspaces/github_com_owner_repo`. At startup, the orchestrator runs a collision check: if two configured repositories resolve to the same workspace path (whether by derivation or by explicit `local_path`), the process exits non-zero before spawning any polling tasks. Set `local_path` explicitly to disambiguate.
+
+### Not Yet Implemented
+
+The orchestrator-foundation milestone provides the polling daemon, queue engine, ClaudeCli executor, GitHub PR creation, and basic single-repo `rewind`. The following capabilities are **scheduled but not yet implemented** and will be added by their respective OpenSpec changes:
+
+- **ChatOps escalation** (change: `chatops-escalation`): when an executor cannot proceed without human input, post the question to a chat channel, persist the resume handle, unblock the queue (with a strict same-repo block on dependent changes), and resume on reply.
+- **Reviewer integration** (change: `reviewer-integration`): an automated post-commit code-quality review step before the human PR review.
+- **`--repo` selector for `rewind`** (change: `rewind-and-recovery`): until this lands, `orchestrator rewind` operates on the FIRST configured repository only and emits a warning if more than one repo is configured. `--hard` is accepted but local + remote agent-branch deletion is also part of `rewind-and-recovery`; until it lands, you must delete the agent branch by hand.
 
 ---
 
