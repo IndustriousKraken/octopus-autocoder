@@ -38,7 +38,7 @@ The architecture spec defines `ExecutorOutcome::AskUser { question, resume_handl
 ## Risks / Trade-offs
 
 - **Risk:** Layer-1 AskUser detection requires the `ask_user` MCP tool to be properly wired into claude-cli's MCP config. If the user's claude-cli setup doesn't have the right config, the layer-1 path silently never fires.
-  - **Mitigation:** The orchestrator emits a startup log line confirming the MCP config it wrote for the executor. The smoke test in `docs/chatops-smoke-test.md` verifies the layer-1 path explicitly.
+  - **Mitigation:** The orchestrator emits a startup log line confirming the MCP config it wrote for the executor. Layer-1 wiring is verified by unit tests against a fixture executor (no live Slack required); live-service exercise happens organically when the orchestrator is run in dev/staging.
 - **Risk:** Layer-2 heuristic regex produces false positives (the agent says "could you clarify the next step yourself" as part of an unrelated thought).
   - **Mitigation:** The heuristic only fires when there is no diff AND no MCP marker. The reviewer agent provides a final-line backstop. If false positives become common, tighten the regex or remove the heuristic entirely.
 - **Risk:** Daemon crash mid-resume loses the partial answer (`.question.json` deleted, `.answer.json` still present, but resume incomplete).

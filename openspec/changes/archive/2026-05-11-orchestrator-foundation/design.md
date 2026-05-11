@@ -10,8 +10,8 @@ This is the first concrete implementation of the architecture specs. To keep the
 - A working `ClaudeCliExecutor` wrapping the `claude` CLI as a child process with timeout, stdout/stderr capture, documented outcome mapping.
 - A working `workspace-manager` with deterministic per-repo path derivation and startup collision detection.
 - A per-repo polling loop with iteration-level error tolerance and graceful SIGINT/SIGTERM shutdown.
-- Unit tests for queue engine, config parser, workspace path derivation, and git wrappers against `tempfile::TempDir` fixtures.
-- A documented manual smoke test against a real GitHub sandbox (or two sandboxes for multi-repo verification) in `docs/foundation-smoke-test.md`.
+- Unit tests for queue engine, config parser, workspace path derivation, git wrappers, polling-loop iterations against `tempfile::TempDir` fixtures, and mockito-tested GitHub PR request shape.
+- An optional operator reference at `docs/foundation-smoke-test.md` (with a scaffolding helper at `scripts/scaffold-smoke-sandboxes.sh`) for hand-running the daemon against real GitHub sandboxes. Not a spec task: per project convention, live-service smoke happens organically when the orchestrator is wired to real repos and is not part of verification.
 
 **Non-Goals:**
 - ChatOps escalation. If the executor returns `AskUser` in this phase, the orchestrator logs an error, unlocks the change, and the iteration ends. The user re-runs after addressing the question manually. ChatOps is the next change.
@@ -89,6 +89,6 @@ This is the first concrete implementation of the architecture specs. To keep the
 - **Risk:** Workspace path derivation produces user-surprising paths.
   - **Mitigation:** The derived path is logged at startup ("watching repo X at workspace path Y"). Users can override with explicit `local_path`.
 - **Risk:** This change is large enough that a single implementer agent produces uneven quality across modules.
-  - **Mitigation:** The tasks.md is sectioned with explicit `Verify:` criteria per section. Each module has unit tests against fixture workspaces. The smoke test exercises the full path. The reviewer-agent change (when it lands) will provide an additional quality backstop.
+  - **Mitigation:** The tasks.md is sectioned with explicit `Verify:` criteria per section. Each module has unit tests against fixture workspaces; section 13 cross-references every baseline Requirement to a concrete attestation. The reviewer-agent change (when it lands) will provide an additional quality backstop.
 - **Risk:** Phase has no `AskUser` detection, so a Claude run that emits a clarification request as final text surfaces as a no-diff `Completed`.
   - **Mitigation:** Documented non-goal. ChatOps change retrofits detection.

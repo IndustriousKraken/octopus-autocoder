@@ -36,7 +36,7 @@
   - If `config.reviewer` is `None` or `enabled: false`: set `review_report = None` and `draft = false`.
   - Otherwise: capture the diff via a new `git::diff_three_dot(workspace, base, head) -> Result<String>` helper. Build the change summary text (a bulleted list of archived change names). Call `reviewer.review(&diff, &summary).await`. On `Ok(report)`: set `review_report = Some(report)` and `draft = matches!(report.verdict, ReviewVerdict::Block)`. On `Err(e)`: log `"reviewer failed: {e:#}"`, build a synthetic report with `verdict: Concerns` and `markdown: format!("(reviewer failed: {e})")`, set `review_report = Some(synthetic)` and `draft = false`.
 - [ ] 5.2 Pass `review_report.as_ref()` and `draft` through to `github::create_pull_request`.
-- [ ] 5.3 **Verify:** Manual smoke test in `docs/reviewer-smoke-test.md`: enable the reviewer in a sandbox config; run the orchestrator against a fixture change. Confirm the PR body contains a `## Code Review` section. Then introduce a deliberately bad commit (an obvious SQL-injection or a hardcoded secret) and confirm the verdict is `Block` and the PR is created as a draft.
+- [ ] 5.3 **Verify:** Unit test `polling_loop::tests::reviewer_block_marks_pr_draft` using a fixture reviewer that returns each `ReviewVerdict` variant in turn. Assert: (a) `Approve` and `Concerns` produce a non-draft PR request with a `## Code Review` section in the body; (b) `Block` produces a draft PR request with the same section; (c) reviewer error path injects the synthetic-`Concerns` report and `draft: false`. PR request shape is observed via the existing `mockito` harness from `github::tests`.
 
 ## 6. Documentation
 

@@ -39,7 +39,6 @@
 - [ ] 5.1a After the waiting-processing loop completes, re-check `queue::list_waiting(workspace)?`. If the result is non-empty, log `"queue blocked for {url}: {N} change(s) still waiting on human reply: {names}"` and SKIP the pending-change loop for this iteration. Proceed directly to the iteration's sleep step. This enforces the same-repo serial-queue invariant: pending changes are not processed while any earlier change is awaiting human input.
 - [ ] 5.2 In the existing pending-change loop, change the `AskUser` handling from "log + exit" to: call `chatops.post_question(channel, change, &question)` to obtain `thread_ts`; write `.question.json` containing the `thread_ts`, channel, `resume_handle`, and `asked_at` timestamp; `queue::unlock(workspace, change)` (architecture already requires unlock-on-any-outcome); proceed to next change.
 - [ ] 5.3 Resolve the per-change channel: `repo.slack_channel_id.as_deref().unwrap_or(&config.slack.default_channel_id)`.
-- [ ] 5.4 **Verify:** Manual smoke test in `docs/chatops-smoke-test.md`: configure a sandbox repo with a change whose tasks include "ask the user what the project name should be" (deliberately ambiguous). Run the orchestrator. Confirm Slack receives a message; reply in the thread with a project name; on the next iteration, confirm the change is committed with the answered name reflected in the diff.
 
 ## 6. Documentation
 

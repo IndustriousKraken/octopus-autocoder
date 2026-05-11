@@ -31,7 +31,7 @@
   - For each change name in `args.changes`: call `queue::unarchive(workspace, name)`. Collect successes and failures.
   - At the end: if any unarchive failed, return `Err(anyhow!("rewind partially failed: {summary}"))` listing the failures; otherwise return Ok with a log line summarizing the rewound changes.
 - [ ] 4.2 Wire `rewind::execute` into `cli.rs`'s `Rewind` subcommand handler.
-- [ ] 4.3 **Verify:** Manual smoke test in `docs/rewind-smoke-test.md`: against a sandbox repo, archive a change manually, run `orchestrator rewind <change> --config config.yaml`, confirm the change directory reappears under `openspec/changes/`. Then push a fake commit to the agent branch and run `orchestrator rewind <change> --config config.yaml --hard`; confirm both local and remote branches are gone.
+- [ ] 4.3 **Verify:** Unit tests in `cli::rewind::tests` exercising the new `--repo` selector and the `--hard` branch-deletion code path against a `tempfile::TempDir` fixture with a bare-repo remote so `git push origin --delete <agent_branch>` is a real operation. Assert: (a) `--repo <selector>` picks the right repo from a multi-repo config; (b) `--hard` removes the local agent branch via `git branch -D` and the remote agent branch via `git push origin --delete` (verify post-state by listing refs); (c) partial unarchive failure surfaces as `Err` with both successful and failed change names in the message.
 
 ## 5. Documentation
 
