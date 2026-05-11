@@ -8,6 +8,10 @@ pub struct Config {
     pub repositories: Vec<RepositoryConfig>,
     pub executor: ExecutorConfig,
     pub github: GithubConfig,
+    #[serde(default)]
+    pub reviewer: Option<ReviewerConfig>,
+    #[serde(default)]
+    pub slack: Option<SlackConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +23,8 @@ pub struct RepositoryConfig {
     pub base_branch: String,
     pub agent_branch: String,
     pub poll_interval_sec: u64,
+    #[serde(default)]
+    pub slack_channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +60,43 @@ pub struct GithubConfig {
 
 fn default_github_token_env() -> String {
     "GITHUB_TOKEN".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub provider: ReviewerProvider,
+    pub model: String,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub prompt_template_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerProvider {
+    Anthropic,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackConfig {
+    pub bot_token_env: String,
+    pub default_channel_id: String,
+}
+
+impl RepositoryConfig {
+    /// Resolve the Slack channel to use for this repo: explicit per-repo
+    /// `slack_channel_id` if set, otherwise the global default.
+    pub fn slack_channel<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.slack_channel_id.as_deref().unwrap_or(fallback)
+    }
 }
 
 impl Config {
@@ -172,6 +215,143 @@ github: {}
             msg.contains("/nonexistent/orchestrator-test-config.yaml"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    #[test]
+    fn loads_with_reviewer() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  api_base_url: https://api.anthropic.com
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with reviewer should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert!(rv.enabled);
+        assert_eq!(rv.provider, ReviewerProvider::Anthropic);
+        assert_eq!(rv.model, "claude-sonnet-4-6");
+        assert_eq!(rv.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert!(rv.prompt_template_path.is_none());
+    }
+
+    #[test]
+    fn reviewer_disabled_by_default() {
+        // Absent block parses to None — opt-in semantics.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.reviewer.is_none());
+    }
+
+    #[test]
+    fn reviewer_openai_compatible_provider() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  provider: openai_compatible
+  model: gpt-4o
+  api_key_env: OPENAI_API_KEY
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let rv = cfg.reviewer.unwrap();
+        assert_eq!(rv.provider, ReviewerProvider::OpenAiCompatible);
+        assert!(!rv.enabled); // default false when omitted
+    }
+
+    #[test]
+    fn loads_with_slack() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    slack_channel_id: C01234OVERRIDE
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0DEFAULT
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let slack = cfg.slack.expect("slack block present");
+        assert_eq!(slack.bot_token_env, "SLACK_BOT_TOKEN");
+        assert_eq!(slack.default_channel_id, "C0DEFAULT");
+        assert_eq!(
+            cfg.repositories[0].slack_channel_id.as_deref(),
+            Some("C01234OVERRIDE")
+        );
+    }
+
+    #[test]
+    fn repo_overrides_channel() {
+        let repo_with_override = RepositoryConfig {
+            url: "x".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: Some("C_REPO_LEVEL".into()),
+        };
+        assert_eq!(repo_with_override.slack_channel("C_DEFAULT"), "C_REPO_LEVEL");
+
+        let repo_default = RepositoryConfig {
+            url: "x".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        };
+        assert_eq!(repo_default.slack_channel("C_DEFAULT"), "C_DEFAULT");
+    }
+
+    #[test]
+    fn slack_block_absent_parses_to_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.slack.is_none());
     }
 
     #[test]

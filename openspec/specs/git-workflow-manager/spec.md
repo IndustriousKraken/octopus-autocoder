@@ -32,21 +32,31 @@ The git workflow manager SHALL produce one commit per successfully implemented c
 - **AND** the change is still archived by the queue engine, since the executor explicitly signaled completion
 
 ### Requirement: Monolithic PR at end of pass
-The git workflow manager SHALL push the agent branch and create a single Pull Request via the GitHub REST API at the end of each polling pass that produced at least one commit.
+The git workflow manager SHALL push the agent branch and create a single Pull Request via the GitHub REST API at the end of each polling iteration that produced at least one commit. **When the code-reviewer is enabled, the PR body SHALL include the reviewer's report under a `## Code Review` heading, and a `Block` verdict SHALL cause the PR to be created as a draft (with a `do-not-merge` label fallback if the host rejects drafts).**
 
-#### Scenario: Opening a PR after a productive pass
-- **WHEN** a polling pass completes AND `<agent_branch>` contains at least one commit ahead of `<base_branch>` (`git rev-list --count <base_branch>..<agent_branch>` returns a value greater than zero)
-- **THEN** the manager runs `git push --force-with-lease origin <agent_branch>`
-- **AND** the manager issues an HTTP `POST` to `https://api.github.com/repos/<owner>/<repo>/pulls` with header `Authorization: Bearer <token>` (token sourced from the configured environment variable name) and a JSON body containing `head: "<agent_branch>"`, `base: "<base_branch>"`, and a title and body summarizing the included changes
-- **AND** on a 2xx response, the manager logs the returned `html_url`
-- **AND** on a non-2xx response, the manager logs the response status code and body verbatim, and the polling pass is recorded as failed; the agent branch and commits remain on the remote for human inspection
+#### Scenario: Opening a PR with a passing review
+- **WHEN** an iteration completes AND the agent branch contains at least one commit ahead of base AND `reviewer.enabled` is true AND `code_reviewer.review` returns `Ok(ReviewReport { verdict: Pass, .. })`
+- **THEN** the manager pushes with `--force-with-lease` and POSTs to the GitHub PR API with `draft: false` and a body whose final section is `## Code Review` followed by the reviewer's `markdown`
 
-#### Scenario: Push rejected by force-with-lease
-- **WHEN** `git push --force-with-lease` exits non-zero because the remote `<agent_branch>` has advanced beyond what the manager last observed
-- **THEN** the manager aborts the PR creation step, leaves the local agent branch intact, and logs an error indicating that the remote was modified by an outside process
-- **AND** no PR is opened
+#### Scenario: Opening a PR with a Block verdict
+- **WHEN** an iteration completes AND the reviewer returns `Ok(ReviewReport { verdict: Block, .. })`
+- **THEN** the manager pushes the agent branch and POSTs to the GitHub PR API with `draft: true`
+- **AND** the PR body's final section is `## Code Review` followed by the reviewer's `markdown`
 
-#### Scenario: No commits in pass
-- **WHEN** a polling pass completes AND `<agent_branch>` contains zero commits ahead of `<base_branch>`
-- **THEN** no push is performed, no PR is created, and the manager logs a single line indicating the pass produced no changes
+#### Scenario: Reviewer disabled or absent
+- **WHEN** the `reviewer` config block is absent OR `reviewer.enabled` is false
+- **THEN** the manager pushes the agent branch and POSTs to the GitHub PR API with `draft: false` and a body that does NOT include a `## Code Review` section
+- **AND** no LLM API call is made
+
+#### Scenario: Reviewer failure
+- **WHEN** `reviewer.enabled` is true AND `code_reviewer.review` returns `Err(_)`
+- **THEN** the manager logs `"reviewer failed: {error}"` naming the reason
+- **AND** the manager pushes the agent branch and POSTs to the GitHub PR API with `draft: false`
+- **AND** the PR body's `## Code Review` section contains only the line `(reviewer failed: <reason>)`
+
+#### Scenario: Draft creation falls back to label
+- **WHEN** `Block` verdict requires `draft: true` AND the GitHub API rejects the draft flag (specific GitHub error indicating drafts are not supported on this repo)
+- **THEN** the manager retries the PR creation request with `draft: false`
+- **AND** on success, the manager POSTs to `https://api.github.com/repos/<owner>/<repo>/issues/<pr_number>/labels` with body `{ "labels": ["do-not-merge"] }`
+- **AND** the manager logs `"draft unsupported; applied do-not-merge label as fallback"`
 

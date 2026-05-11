@@ -2,10 +2,13 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
+use crate::chatops::ChatOps;
+use crate::code_reviewer::CodeReviewer;
 use crate::config::{Config, ExecutorKind, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
+use crate::polling_loop::ChatOpsContext;
 use crate::{git, polling_loop, workspace};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +21,47 @@ pub async fn execute(cfg: Config) -> Result<()> {
             cfg.executor.command.clone(),
             cfg.executor.timeout_secs,
         )),
+    };
+
+    let reviewer: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
+        Some(rcfg) if rcfg.enabled => {
+            let r = CodeReviewer::from_config(rcfg)
+                .context("initializing code reviewer from config")?;
+            tracing::info!(
+                provider = ?rcfg.provider,
+                model = rcfg.model.as_str(),
+                "code reviewer enabled"
+            );
+            Some(Arc::new(r))
+        }
+        _ => {
+            tracing::info!("code reviewer disabled (no reviewer block, or enabled: false)");
+            None
+        }
+    };
+
+    let chatops: Option<Arc<ChatOps>> = match cfg.slack.as_ref() {
+        Some(s) => {
+            let token = std::env::var(&s.bot_token_env).map_err(|_| {
+                anyhow::anyhow!(
+                    "slack.bot_token_env `{}` is not set in the process environment",
+                    s.bot_token_env
+                )
+            })?;
+            let client = ChatOps::new(token)
+                .await
+                .context("initializing Slack ChatOps from config")?;
+            tracing::info!(
+                bot_user_id = client.bot_user_id(),
+                default_channel = s.default_channel_id.as_str(),
+                "ChatOps escalation enabled"
+            );
+            Some(Arc::new(client))
+        }
+        None => {
+            tracing::info!("ChatOps escalation disabled (no `slack:` config block)");
+            None
+        }
     };
 
     for repo in &cfg.repositories {
@@ -42,8 +86,24 @@ pub async fn execute(cfg: Config) -> Result<()> {
         }
         let executor = executor.clone();
         let github = cfg.github.clone();
+        let reviewer = reviewer.clone();
         let cancel = cancel.clone();
-        tasks.spawn(async move { polling_loop::run(repo, executor, github, cancel).await });
+
+        // Build the per-repo ChatOps context: resolve the channel via the
+        // per-repo override or the global default.
+        let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.slack.as_ref()) {
+            (Some(co), Some(slack_cfg)) => {
+                let channel = repo
+                    .slack_channel(&slack_cfg.default_channel_id)
+                    .to_string();
+                Some(Arc::new(ChatOpsContext { chatops: co, channel }))
+            }
+            _ => None,
+        };
+
+        tasks.spawn(async move {
+            polling_loop::run(repo, executor, github, reviewer, chatops_ctx, cancel).await
+        });
     }
 
     spawn_signal_handler(cancel.clone());
@@ -152,6 +212,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
+            slack_channel_id: None,
         }
     }
 

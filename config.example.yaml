@@ -13,6 +13,9 @@ repositories:
     # local_path is optional; if omitted, derived as
     # /tmp/workspaces/<sanitized-url> deterministically.
     # local_path: "/tmp/workspaces/auth-service"
+    # Per-repo Slack channel override (optional). Falls back to
+    # `slack.default_channel_id` if omitted.
+    # slack_channel_id: C0AUTHSVC
 
   # Example 2: a frontend application on a slower interval.
   - url: "git@github.com:my-org/web-dashboard.git"
@@ -32,3 +35,33 @@ github:
   # Name of the environment variable holding the GitHub PAT or fine-grained
   # token. The orchestrator reads the token at PR-creation time only.
   token_env: GITHUB_TOKEN
+
+# Slack escalation block (OPTIONAL). When present, the orchestrator can
+# route `AskUser` outcomes from the executor to a human via Slack thread
+# replies. Without this block, an `AskUser` outcome falls back to the
+# foundation behavior (log + exit the iteration).
+#
+# slack:
+#   bot_token_env: SLACK_BOT_TOKEN           # env var holding the xoxb-... token
+#   default_channel_id: C0123456789          # fallback channel for repos without an override
+#
+# Each repository entry can override the channel via `slack_channel_id:`
+# (see the commented example in the first repository above).
+
+# AI code-reviewer block (OPTIONAL). When present and `enabled: true`, every
+# PR opened by the orchestrator includes a `## Code Review` section in its
+# body containing the reviewer's verdict + markdown report. A `Block` verdict
+# additionally creates the PR as a draft (with a `do-not-merge` label
+# fallback on hosts that reject drafts).
+#
+# Scope is intentionally code-quality only (security, error handling,
+# naming, style, language idioms, obvious bugs). It is NOT a spec-compliance
+# check; that is the verifier's job in a separate change.
+#
+# reviewer:
+#   enabled: true
+#   provider: anthropic           # or `openai_compatible`
+#   model: claude-sonnet-4-6
+#   api_key_env: ANTHROPIC_API_KEY
+#   api_base_url: https://api.anthropic.com   # optional; provider-default if omitted
+#   prompt_template_path: ./prompts/code-review-default.md   # optional; built-in default if omitted

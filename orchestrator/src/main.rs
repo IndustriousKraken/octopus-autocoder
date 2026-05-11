@@ -1,11 +1,15 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod chatops;
 mod cli;
+mod code_reviewer;
 mod config;
 mod executor;
 mod git;
 mod github;
+mod llm;
+mod mcp_askuser_server;
 mod polling_loop;
 mod queue;
 mod workspace;

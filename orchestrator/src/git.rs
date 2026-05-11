@@ -158,6 +158,15 @@ pub fn rev_list_count(workspace: &Path, range: &str) -> Result<usize> {
         .with_context(|| format!("parsing rev-list count output: {s:?}"))
 }
 
+/// Return the three-dot diff between `base` and `head` — i.e. the changes
+/// present on `head` since it diverged from `base`. Equivalent to
+/// `git diff <base>...<head>`.
+pub fn diff_three_dot(workspace: &Path, base: &str, head: &str) -> Result<String> {
+    let range = format!("{base}...{head}");
+    let output = run_git(workspace, "diff", &["diff", &range])?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

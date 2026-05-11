@@ -57,12 +57,115 @@ If a repository entry omits `local_path`, the workspace path is derived determin
 
 This means `git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both map to `/tmp/workspaces/github_com_owner_repo`. At startup, the orchestrator runs a collision check: if two configured repositories resolve to the same workspace path (whether by derivation or by explicit `local_path`), the process exits non-zero before spawning any polling tasks. Set `local_path` explicitly to disambiguate.
 
-### Not Yet Implemented
+## ChatOps Escalation
 
-The orchestrator-foundation milestone provides the polling daemon, queue engine, ClaudeCli executor, GitHub PR creation, and basic single-repo `rewind`. The following capabilities are **scheduled but not yet implemented** and will be added by their respective OpenSpec changes:
+When the optional `slack:` config block is present, the orchestrator routes ambiguous agent outcomes (executor returning `AskUser`) to a human via Slack thread replies, persists the conversation state to disk, and resumes implementation on the next iteration when an answer arrives.
 
-- **ChatOps escalation** (change: `chatops-escalation`): when an executor cannot proceed without human input, post the question to a chat channel, persist the resume handle, unblock the queue (with a strict same-repo block on dependent changes), and resume on reply.
-- **Reviewer integration** (change: `reviewer-integration`): an automated post-commit code-quality review step before the human PR review.
+### Configuring Slack
+
+```yaml
+slack:
+  bot_token_env: SLACK_BOT_TOKEN        # env var containing your xoxb-... bot token
+  default_channel_id: C0123456789       # fallback channel id (use the Slack channel ID, not the name)
+```
+
+Per-repo override:
+
+```yaml
+repositories:
+  - url: "git@github.com:my-org/auth-service.git"
+    # ...
+    slack_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
+```
+
+### Required Slack bot scopes
+
+The Slack app's bot token must have at least these OAuth scopes:
+
+- `chat:write` — post the escalation message into the channel.
+- `channels:history` — read thread replies on public channels.
+- `channels:read` — list channels (for token validation).
+
+The orchestrator does NOT need `users:read` or any user-level scopes; reply attribution is by Slack user id only.
+
+### What gets posted
+
+When an executor returns `AskUser { question, resume_handle }`, the orchestrator posts to the resolved channel:
+
+```
+❓ `<change-name>`: <question text>
+```
+
+The resulting Slack message's thread timestamp + the executor's opaque resume handle are persisted to `<workspace>/openspec/changes/<change-name>/.question.json`. The agent's `.in-progress` lock is removed, so the change moves from "in flight" to "waiting on human."
+
+### How reply detection works
+
+On every polling iteration, BEFORE the orchestrator considers pending changes for that repository, it:
+
+1. Calls `queue::list_waiting(workspace)` to find all `.question.json`-bearing changes.
+2. For each, GETs `conversations.replies` on the tracked thread.
+3. The **first message** that has no `bot_id` field AND whose `user` differs from the orchestrator's own bot user id is treated as the human's answer.
+4. The orchestrator writes `.answer.json`, deletes `.question.json`, calls `executor.resume(handle, answer)`, and handles the new outcome like a fresh run (commit + archive on `Completed`, escalate again on a second `AskUser`, log + revert to pending on `Failed`).
+
+### Same-repo queue blocking
+
+A change waiting on a human answer in repository X blocks ALL pending-change processing for repository X. This preserves the architecture's serial-queue invariant: when change A asks a question, change B (which may depend on A's restructuring) is NOT processed until A is resolved. Cross-repo polling tasks are independent — repository Y continues to be serviced.
+
+### Operator escape hatches for a stuck waiting change
+
+If a Slack reply never arrives (operator on vacation, lost ping, changed mind), the orchestrator does not time out — it waits indefinitely. Three operator-controlled ways to unblock:
+
+1. **Reply in Slack** — the original Slack thread is still tracked. Send any non-bot message in that thread; the next polling iteration resumes the change.
+2. **Manually delete `.question.json`** — this reverts the change to pending state. The next iteration will re-run it from scratch (without the answer). Useful when the question was a false positive or the change should restart.
+3. **`orchestrator rewind <change>`** — full reset: deletes the agent branch, unarchives if needed, clears all `.question.json` / `.answer.json` markers via the rewind path.
+
+### `.question.json` and `.answer.json` as workspace artifacts
+
+These files are written by the orchestrator into the workspace alongside the change's `proposal.md`. They are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the orchestrator's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the marker files with it; they're not deleted separately.
+
+---
+
+## Code Review
+
+When the optional `reviewer:` config block is present and `enabled: true`, every PR opened by the orchestrator includes a structured AI-generated code-quality review under a `## Code Review` heading in the PR body. A `Block` verdict additionally causes the PR to be created as a draft.
+
+### Scope
+
+The reviewer's job is **code quality only**: security (injection, auth, secrets), error handling, naming/style/idioms, dead code, obvious bugs. It explicitly does **not** assess whether the diff implements the spec — that is a separate concern handled by the (future) verifier change. The default prompt template (`prompts/code-review-default.md`) enforces this scope statement at the top.
+
+### Configuring the reviewer
+
+```yaml
+reviewer:
+  enabled: true
+  provider: anthropic               # or `openai_compatible`
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY    # env var containing the API token
+  api_base_url: https://api.anthropic.com   # optional; provider default if omitted
+  prompt_template_path: ./prompts/code-review-default.md  # optional; built-in default if omitted
+```
+
+The `openai_compatible` provider works with any endpoint that speaks the OpenAI `/chat/completions` API — Grok, OpenRouter, local Ollama, etc. Point `api_base_url` at the endpoint and provide a matching token via `api_key_env`.
+
+### Verdict semantics
+
+| Verdict     | PR state  | Meaning                                                                   |
+|-------------|-----------|---------------------------------------------------------------------------|
+| `Pass`      | non-draft | No concerns above style nits.                                              |
+| `Concerns`  | non-draft | Issues warrant discussion but the diff is mergeable.                       |
+| `Block`     | **draft** | At least one issue would cause real harm if merged.                        |
+
+If the LLM's response cannot be parsed for a verdict, the orchestrator defaults to `Concerns` and prepends a parse-failure note to the report. If the API call itself errors (network, auth, rate limit), the orchestrator logs the error and ships the PR anyway with `(reviewer failed: <reason>)` in the `## Code Review` section. **A failed reviewer never blocks PR creation.**
+
+### Block-verdict enforcement (recommended)
+
+The orchestrator does its part by creating the PR as a draft. To make `Block` actually gate merge, configure a branch-protection rule on the PR target branch that **requires PRs not be draft**. Without that rule, anyone with write access can flip the draft state and merge.
+
+On hosts that don't support drafts (some private GHE configurations, certain repo types), the orchestrator falls back automatically: it retries the PR creation with `draft: false` and applies a `do-not-merge` label via the issues-labels endpoint. Configure your branch protection to require the absence of that label as the fallback gate.
+
+### Custom prompt templates
+
+If the default template doesn't match your project's style, override it via `reviewer.prompt_template_path`. Custom templates are **user-owned** — the project does not enforce scope on overrides, so if you want to expand the reviewer to additional dimensions (spec compliance, style guide, etc.), you can. The template must include the two substitution variables `{{diff}}` and `{{change_summary}}` and must instruct the model to begin its response with a line of the form `VERDICT: Pass`, `VERDICT: Concerns`, or `VERDICT: Block`.
 
 ---
 

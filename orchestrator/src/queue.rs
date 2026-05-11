@@ -13,6 +13,7 @@ const CHANGES_SUBDIR: &str = "openspec/changes";
 const ARCHIVE_DIR: &str = "archive";
 const LOCK_FILE: &str = ".in-progress";
 const PROPOSAL_FILE: &str = "proposal.md";
+const QUESTION_FILE: &str = ".question.json";
 
 fn changes_dir(workspace: &Path) -> PathBuf {
     workspace.join(CHANGES_SUBDIR)
@@ -25,7 +26,8 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// List pending change names: direct subdirectories of
 /// `<workspace>/openspec/changes/` that are not the literal `archive`
 /// directory, do not begin with `.`, do not contain a `.in-progress` lock
-/// file, and contain at least a `proposal.md` file. Returns sorted ascending.
+/// file, do not contain a `.question.json` waiting marker, and contain at
+/// least a `proposal.md` file. Returns sorted ascending.
 pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
@@ -54,10 +56,45 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
         if dir.join(LOCK_FILE).exists() {
             continue;
         }
+        if dir.join(QUESTION_FILE).exists() {
+            // Waiting on a human reply — handled by `list_waiting`, not here.
+            continue;
+        }
         if !dir.join(PROPOSAL_FILE).is_file() {
             continue;
         }
         out.push(name);
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// List changes currently waiting on a human reply (i.e. those containing a
+/// `.question.json` file). Returned sorted ascending; archived/dotfile
+/// entries are excluded.
+pub fn list_waiting(workspace: &Path) -> Result<Vec<String>> {
+    let root = changes_dir(workspace);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("reading {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ARCHIVE_DIR || name.starts_with('.') {
+            continue;
+        }
+        if entry.path().join(QUESTION_FILE).exists() {
+            out.push(name);
+        }
     }
     out.sort();
     Ok(out)
@@ -381,6 +418,73 @@ mod tests {
         let err = unarchive(ws, "never-existed").expect_err("should error on no match");
         let msg = format!("{err:#}");
         assert!(msg.contains("never-existed"), "got: {msg}");
+    }
+
+    #[test]
+    fn pending_excludes_waiting() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "waiting");
+        // The `waiting` change has a `.question.json` marker.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("waiting").join(QUESTION_FILE),
+            r#"{"thread_ts":"x","channel":"C","resume_handle":null,"asked_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let pending = list_pending(ws).unwrap();
+        assert_eq!(pending, vec!["ready"], "waiting change must be excluded from pending");
+    }
+
+    #[test]
+    fn list_waiting_returns_questioned() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "wait-a");
+        make_change(ws, "wait-b");
+        for name in &["wait-a", "wait-b"] {
+            std::fs::write(
+                ws.join(CHANGES_SUBDIR).join(name).join(QUESTION_FILE),
+                r#"{"thread_ts":"x","channel":"C","resume_handle":null,"asked_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+        }
+        let waiting = list_waiting(ws).unwrap();
+        assert_eq!(waiting, vec!["wait-a".to_string(), "wait-b".to_string()]);
+        // Sorted ascending.
+    }
+
+    #[test]
+    fn list_waiting_excludes_archive() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Place a fake `.question.json` inside an archived directory entry;
+        // it must NOT be returned by list_waiting.
+        let archive_entry = ws
+            .join(CHANGES_SUBDIR)
+            .join(ARCHIVE_DIR)
+            .join("2026-01-01-historic");
+        std::fs::create_dir_all(&archive_entry).unwrap();
+        std::fs::write(archive_entry.join(QUESTION_FILE), "{}").unwrap();
+        // Also place a dotfile-prefixed directory that would otherwise match.
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(".hidden")).unwrap();
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join(".hidden").join(QUESTION_FILE),
+            "{}",
+        )
+        .unwrap();
+        // A real waiting entry.
+        make_change(ws, "real-wait");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("real-wait").join(QUESTION_FILE),
+            "{}",
+        )
+        .unwrap();
+
+        let waiting = list_waiting(ws).unwrap();
+        assert_eq!(waiting, vec!["real-wait".to_string()]);
     }
 
     #[test]

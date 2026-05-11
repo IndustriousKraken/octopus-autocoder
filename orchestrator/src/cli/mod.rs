@@ -27,6 +27,12 @@ pub enum Command {
         config: PathBuf,
     },
 
+    /// Internal: stdio MCP server exposing the `ask_user` tool. Launched
+    /// by the wrapped CLI agent (via the workspace's `.mcp.json` config),
+    /// NOT invoked directly by humans.
+    #[command(hide = true)]
+    McpAskUserServer,
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -56,6 +62,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = config::Config::load_from(&config)?;
             run::execute(cfg).await
         }
+        Command::McpAskUserServer => crate::mcp_askuser_server::run(),
         Command::Rewind {
             changes,
             config: config_path,

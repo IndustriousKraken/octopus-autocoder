@@ -4,7 +4,7 @@
 TBD - created by archiving change orchestrator-architecture. Update Purpose after archive.
 ## Requirements
 ### Requirement: Enumerate ready changes
-The queue engine SHALL list pending OpenSpec changes in the workspace, excluding archived, locked, dotfile, and non-directory entries.
+The queue engine SHALL list pending OpenSpec changes in the workspace, excluding archived, locked, **waiting**, dotfile, and non-directory entries.
 
 #### Scenario: Listing the queue
 - **WHEN** the queue engine is queried for pending changes in a workspace
@@ -13,8 +13,9 @@ The queue engine SHALL list pending OpenSpec changes in the workspace, excluding
   - the entry name is not the literal string `archive`
   - the entry name does not begin with `.`
   - the entry does NOT contain a file named `.in-progress`
+  - **the entry does NOT contain a file named `.question.json`**
   - the entry contains at least a regular file named `proposal.md`
-- **AND** the returned list is sorted ascending by entry name (so numeric prefixes like `01-`, `02-` order naturally)
+- **AND** the returned list is sorted ascending by entry name
 
 ### Requirement: Lock state management
 The queue engine SHALL atomically lock and unlock changes via filesystem markers to prevent duplicate execution and to signal in-progress state to humans inspecting the workspace.
@@ -50,4 +51,14 @@ The queue engine SHALL move a previously archived change back into the active qu
 - **THEN** the engine searches `<workspace>/openspec/changes/archive/` for directory names matching the regex `^\d{4}-\d{2}-\d{2}-<name>$`, selects the lexicographically highest match (most recently archived), strips the date prefix, and renames it to `<workspace>/openspec/changes/<name>/`
 - **AND** if no match is found, the engine returns an error naming the requested change
 - **AND** if the destination `<workspace>/openspec/changes/<name>/` already exists, the engine returns an error and does NOT overwrite
+
+### Requirement: Enumerate waiting changes
+The queue engine SHALL provide a separate enumeration of changes currently waiting on a human answer (i.e. those containing a `.question.json` file).
+
+#### Scenario: Listing waiting changes
+- **WHEN** `list_waiting(workspace)` is called
+- **THEN** it returns the names of every direct subdirectory of `<workspace>/openspec/changes/` that contains a `.question.json` file (regardless of whether `.answer.json` is also present)
+- **AND** the returned list is sorted ascending by entry name
+- **AND** archived directories are excluded
+- **AND** entries beginning with `.` are excluded
 
