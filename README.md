@@ -1,17 +1,22 @@
 # OpenSpec CI/CD Orchestrator
 
-The OpenSpec CI/CD Orchestrator is an autonomous server daemon designed to read OpenSpec implementation proposals, execute an AI implementation agent (like Gemini or Claude) via a CLI, and create Pull Requests. This effectively creates an "Autonomous AI Software Factory" using OpenSpec as the standardized work order system.
+The OpenSpec CI/CD Orchestrator is an autonomous server daemon that reads OpenSpec implementation proposals out of one or more configured repositories, drives an AI implementation agent (the Claude CLI is the default backend) through each change in serial order, and opens monolithic Pull Requests for human review. It's an "Autonomous AI Software Factory" wired around OpenSpec as the standardized work-order system.
 
 ## Architecture
 
-The Orchestrator operates on a "Serial Queue" model per repository to manage dependent features safely and avoid Git merge conflicts.
+The orchestrator is a single tokio-based daemon with one polling task per configured repository. Each iteration follows a fixed workflow: fetch + branch init → process waiting (escalated) changes → process pending changes → push + PR if any commits were produced. The serial-per-repo invariant guarantees that change B does not run while change A is mid-flight or waiting on human input.
 
-1. **Queue Engine**: Polling mechanism that monitors the `openspec/changes/` directory for ready changes and reads a YAML configuration for multiple repositories.
-2. **Workspace Manager**: Clones or pulls target repositories into `/tmp/workspaces/<repo-name>` to isolate agent execution.
-3. **Agent Subprocess Runner**: Executes the AI agent CLI (e.g. `gemini-cli /opsx:apply <change-name>`) as a blocking subprocess.
-4. **Git Workflow**: Automates `git checkout`, creating a new agent branch (`agent-q` or custom), committing the AI's changes, and opening a monolithic PR at the end of the polling cycle.
-5. **Reviewer Integration**: An automated post-commit review step invoking a second agent (like Grok or MiMo) to assess code quality before human review.
-6. **Recovery System**: A robust `rewind` command that cleans up corrupted branches and unarchives changes back into the active queue when a failure occurs or a PR is rejected.
+Built capabilities (each is a baseline spec under `openspec/specs/`):
+
+1. **orchestrator-cli** — the `run` daemon entry point and the `rewind` recovery subcommand. Multi-repo dispatch with a shared cancellation token; per-repo polling tasks; SIGINT/SIGTERM drain.
+2. **workspace-manager** — deterministic per-repo workspace paths under `/tmp/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, and a startup dirty-workspace check that permanently skips contaminated repos for the process lifetime.
+3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion with `YYYY-MM-DD-<change>` date prefix, unarchive on rewind.
+4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout, two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop), and a real `resume()` implementation.
+5. **git-workflow-manager** — branch init (`fetch → checkout base → pull --ff-only → checkout -B agent`), per-change commits with `<change>: <first line of ## Why>` subject truncated to 72 chars, monolithic PR creation via the GitHub REST API with `--force-with-lease` push.
+6. **chatops-manager** — Slack escalation. On `AskUser`, the orchestrator posts a question to a configured channel and persists `.question.json` to disk. On the next iteration it polls the Slack thread; when the first non-bot reply arrives it writes `.answer.json` and resumes the executor. Same-repo serial-queue invariant is preserved: any waiting change in a repository blocks all pending-change processing for that repo until resolved.
+7. **code-reviewer** — opt-in AI code-quality review of the diff between base and agent branches. Configurable LLM provider (Anthropic or any OpenAI-compatible endpoint, including Grok, OpenRouter, local Ollama). A `Block` verdict creates the PR as a draft (with a `do-not-merge` label fallback on hosts that reject drafts).
+
+The default executor backend is `claude_cli` — the configured CLI (`claude` by default, overridable in config) is spawned as a child process. The orchestrator writes a per-workspace `.mcp.json` pointing at itself as an MCP server exposing the `ask_user` tool; when the agent calls it, a marker file is written and the orchestrator picks it up after the child exits. The MCP server is hosted as a hidden subcommand of the orchestrator binary, so deployment is a single-binary install.
 
 ---
 
@@ -56,6 +61,25 @@ If a repository entry omits `local_path`, the workspace path is derived determin
 4. Prepend `/tmp/workspaces/`.
 
 This means `git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both map to `/tmp/workspaces/github_com_owner_repo`. At startup, the orchestrator runs a collision check: if two configured repositories resolve to the same workspace path (whether by derivation or by explicit `local_path`), the process exits non-zero before spawning any polling tasks. Set `local_path` explicitly to disambiguate.
+
+## Status & Roadmap
+
+The seven capabilities listed under [Architecture](#architecture) are all **implemented and tested** as of the foundation + rewind-and-recovery + reviewer-integration + chatops-escalation milestones. The orchestrator runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the escalation channel.
+
+The following capabilities are **explicitly aspirational** — they are referenced in design documents but not built:
+
+- **Verifier** *(planned; not in any active change)*: a spec-audit step that runs alongside the code reviewer and asks "did the diff actually implement the spec?" The reviewer agent currently focuses on code quality and explicitly does not assess spec compliance. Until the verifier ships, spec correctness is a human-review concern.
+- **Drift audit** *(planned; not in any active change)*: a periodic whole-repo verification that catches gradual divergence between the baseline `openspec/specs/` and the code. Until this ships, the per-change architecture-baseline cross-reference section (e.g. section 13 of an archived change like `orchestrator-foundation`) is the closest equivalent — it runs once at change-archive time, not continuously.
+
+Other items deferred without a current owner:
+
+- **Multi-instance distributed deployment**. The orchestrator assumes single-instance ownership of each configured workspace; running two orchestrators against the same `local_path` would race. Out of scope for the current architecture.
+- **Per-repo executor configuration overrides**. The `executor:` block is global; mixing Claude on one repo and a different backend on another in the same config is not supported.
+- **Streaming or incremental code review**. The reviewer sends the full diff in one LLM call; truncation at 100k chars is documented in `prompts/code-review-default.md`.
+
+If you build something that depends on an aspirational item, file an issue or open an OpenSpec change proposal in this repository — the orchestrator can dogfood its own development once a sandbox is wired up (with appropriate self-modification guardrails; see [AI Security & Guardrails](#ai-security--guardrails)).
+
+---
 
 ## ChatOps Escalation
 

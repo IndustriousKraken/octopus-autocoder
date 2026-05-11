@@ -1,0 +1,8 @@
+## 1. Commit Documentation Spec
+
+- [x] 1.1 Copy the `project-documentation` spec generated in `openspec/changes/project-documentation/specs/project-documentation/spec.md` to the root `openspec/specs/project-documentation/spec.md`. (Handled automatically by `openspec archive`: the ADDED Requirements in the change's delta spec become the new baseline at `openspec/specs/project-documentation/spec.md` when the change is archived.)
+
+## 2. Update Initial Documentation
+
+- [x] 2.1 Update the repository's `README.md` to include a high-level overview of the CI/CD Orchestrator, its architecture, and how to configure it. (Rewrote the intro paragraph to reflect the actual scope — Claude as the default backend, single-daemon multi-repo polling model. Rewrote the `## Architecture` section as a seven-capability enumeration matching the baseline at `openspec/specs/`. Existing Configuration / CLI Usage / Deployment / Security sections were retained from prior changes.)
+- [x] 2.2 Explicitly note in the `README.md` that features like the reviewer agent and multi-repo support are currently aspirational/planned. (The original task text is now stale: reviewer-integration and multi-repo support are both **built and archived**, not aspirational. Per the project-documentation spec's "feature MUST be marked aspirational when partially-implemented or aspirational" requirement, the README accurately reflects current state: a new `## Status & Roadmap` section was added explicitly listing what *is* currently aspirational — **verifier** and **drift audit** per the verification-architecture decision — alongside deferred items without owners. Marking reviewer/multi-repo as "aspirational" today would actively mislead operators.)
