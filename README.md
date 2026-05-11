@@ -14,8 +14,13 @@ On the machine where the daemon will run:
 
 - **Rust toolchain.** Install via [rustup](https://rustup.rs/) — autocoder builds against stable Rust on edition 2024.
 - **Claude Code authenticated.** Install [Claude Code](https://www.anthropic.com/claude-code) and run `claude auth login` as the same OS user that will run the daemon. The credentials are persisted in `~/.claude/` and survive restarts.
-- **A GitHub fine-grained Personal Access Token.** Scope it to the repositories autocoder will manage; grant **Contents: read & write** and **Pull requests: write**. Export it as `GITHUB_TOKEN` in the environment that will launch the daemon.
-- **`git` configured.** Either a registered SSH key for the configured repository URLs, or HTTPS credentials in a credential helper.
+- **A GitHub fine-grained Personal Access Token**, scoped to the repositories autocoder will manage. Required permissions:
+  - **`Pull requests: read & write`** — needed for PR creation.
+  - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
+  - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is essentially never needed there; only relevant for some private GHE configurations.
+
+  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Note: fine-grained PATs are scoped to a single account or organization. If your `config.yaml` has repos across multiple owners (e.g. your personal account + an org you contribute to), you currently need one of: a classic PAT broad enough to cover all of them; one autocoder instance per owner; or SSH-only URLs with the PAT only used for PR creation against one owner. Multi-token routing is on the roadmap (see `openspec/changes/multi-token-github-credentials/`).
+- **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
 
 ### 2. Clone and configure
 
