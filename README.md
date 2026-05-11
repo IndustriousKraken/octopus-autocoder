@@ -271,7 +271,7 @@ sudo cp target/release/orchestrator /usr/local/bin/openspec-orchestrator
 ```
 
 ### 2. Set up Systemd Service
-Create a new file at `/etc/systemd/system/openspec-orchestrator.service`:
+Create a new file at `/etc/systemd/system/autocoder.service`:
 
 ```ini
 [Unit]
@@ -298,8 +298,8 @@ WantedBy=multi-user.target
 ### 3. Start and Enable
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable openspec-orchestrator
-sudo systemctl start openspec-orchestrator
+sudo systemctl enable autocoder
+sudo systemctl start autocoder
 ```
 
 ### Updating the Daemon
