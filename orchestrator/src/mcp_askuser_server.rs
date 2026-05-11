@@ -6,7 +6,7 @@
 //! `ask_user`, this server writes
 //! `<workspace>/openspec/changes/<change>/.askuser-pending.json` containing
 //! the question, then returns a successful tool-call result so the agent
-//! sees its tool succeeded. The orchestrator picks up the marker file
+//! sees its tool succeeded. autocoder picks up the marker file
 //! after the child process exits.
 //!
 //! Protocol: JSON-RPC 2.0 over stdio with newline-delimited messages.
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-/// Env vars the orchestrator sets in the MCP server child's environment so
+/// Env vars autocoder sets in the MCP server child's environment so
 /// the server knows where to write the marker file.
 pub const ENV_WORKSPACE: &str = "ORCH_MCP_WORKSPACE";
 pub const ENV_CHANGE: &str = "ORCH_MCP_CHANGE";
@@ -82,7 +82,7 @@ fn handle_request<W: Write>(
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "orchestrator-ask-user",
+                    "name": "autocoder-ask-user",
                     "version": env!("CARGO_PKG_VERSION"),
                 }
             });
@@ -96,7 +96,7 @@ fn handle_request<W: Write>(
                 "tools": [
                     {
                         "name": "ask_user",
-                        "description": "Ask the human operator a question when you cannot proceed without their input. After calling this tool, stop further changes; the orchestrator will deliver the human's answer in a subsequent invocation.",
+                        "description": "Ask the human operator a question when you cannot proceed without their input. After calling this tool, stop further changes; autocoder will deliver the human's answer in a subsequent invocation.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -138,7 +138,7 @@ fn handle_request<W: Write>(
                 "content": [
                     {
                         "type": "text",
-                        "text": "Your question has been delivered to the human operator. The orchestrator will resume you with their answer in a subsequent invocation. Stop further changes now."
+                        "text": "Your question has been delivered to the human operator. autocoder will resume you with their answer in a subsequent invocation. Stop further changes now."
                     }
                 ],
                 "isError": false
@@ -263,7 +263,7 @@ mod tests {
         );
         assert_eq!(resps.len(), 1);
         assert_eq!(resps[0]["id"], 1);
-        assert_eq!(resps[0]["result"]["serverInfo"]["name"], "orchestrator-ask-user");
+        assert_eq!(resps[0]["result"]["serverInfo"]["name"], "autocoder-ask-user");
         assert!(resps[0]["result"]["capabilities"]["tools"].is_object());
     }
 

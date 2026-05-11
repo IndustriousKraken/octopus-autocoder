@@ -1,4 +1,4 @@
-//! `orchestrator run` — daemon entry point. Spawns one polling task per
+//! `autocoder run` — daemon entry point. Spawns one polling task per
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 

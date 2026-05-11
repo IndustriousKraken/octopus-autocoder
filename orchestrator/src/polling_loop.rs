@@ -738,7 +738,7 @@ mod tests {
     }
 
     /// 13.3.2 / executor baseline: when the executor returns `Failed`,
-    /// the orchestrator unlocks the change AND does NOT archive it.
+    /// autocoder unlocks the change AND does NOT archive it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_change_unlocks_and_does_not_archive() {
         let (_dir, ws) = fixture_workspace_with_remote();
@@ -799,7 +799,7 @@ mod tests {
         };
         run_one_pass_no_push(&ws, &executor).await.expect("pass succeeds");
 
-        // Inspect HEAD on agent-q. The orchestrator left us on agent-q after
+        // Inspect HEAD on agent-q. autocoder left us on agent-q after
         // recreate_branch + commit; verify subject directly.
         let out = std::process::Command::new("git")
             .args(["log", "-1", "--pretty=%s", "agent-q"])
@@ -1321,7 +1321,7 @@ mod tests {
             let (_dir, ws) = fixture_workspace_with_remote();
             add_committed_change(&ws, "rv-change", "make the world a better place");
 
-            // Spin up a mockito server, point the orchestrator's PR creation
+            // Spin up a mockito server, point autocoder's PR creation
             // at it via GITHUB_API_BASE-style override is not available;
             // instead we drive `execute_one_pass` directly and verify by
             // intercepting the github::create_pull_request HTTP call.
@@ -1331,7 +1331,7 @@ mod tests {
             // base, use the existing `create_pull_request_at` indirectly via
             // the `GITHUB_API_BASE`-equivalent — which we don't have.
             //
-            // Approach: this test exercises the orchestrator's review-step
+            // Approach: this test exercises autocoder's review-step
             // logic by invoking `execute_one_pass` and asserting on the
             // _outcome_ (no panic, push happened) plus reading the agent
             // branch tip's *commit subject* unchanged. The detailed
@@ -1339,7 +1339,7 @@ mod tests {
             // already covered by `github::tests::{body_includes_review_section,
             // draft_flag_serialized, label_fallback_on_draft_unsupported}`.
             //
-            // What we add here is the *integration*: the orchestrator
+            // What we add here is the *integration*: autocoder
             // selects the right draft flag and review_report based on the
             // verdict the reviewer produces. We test that by directly
             // calling the same compose logic via a small surface.

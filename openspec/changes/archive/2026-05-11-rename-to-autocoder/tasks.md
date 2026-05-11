@@ -1,0 +1,35 @@
+## 1. Binary + code rename
+
+- [x] 1.1 Update `orchestrator/Cargo.toml` `[package].name` from `"orchestrator"` to `"autocoder"`. Confirm there is no explicit `[[bin]]` section that needs updating (the bin is derived from the package name).
+- [x] 1.2 Update `src/cli/mod.rs` `#[command(name = "orchestrator")]` → `#[command(name = "autocoder")]`. Also update the `about = ...` text to drop the word "orchestrator" if present. (Also updated the `Run` subcommand doc-comment to say "the autocoder daemon".)
+- [x] 1.3 Update `src/github.rs` User-Agent header from `"openspec-orchestrator"` to `"openspec-autocoder"`. Update the `github::tests::create_pull_request_posts_expected_request` test's `.match_header("user-agent", ...)` to match. (Both production call sites updated: `create_pull_request_at` AND `apply_label`.)
+- [x] 1.4 Update `src/mcp_askuser_server.rs` `serverInfo.name` from `"orchestrator-ask-user"` to `"autocoder-ask-user"`. Update `mcp_askuser_server::tests::initialize_returns_capabilities` to assert the new name.
+- [x] 1.5 **Verify:** `cargo build --release` produces `target/release/autocoder` (not `target/release/orchestrator`). `target/release/autocoder --help` shows `autocoder` as the command name. Full test suite passes (136 tests baseline; no regressions).
+
+## 2. README restructure
+
+- [x] 2.1 Rewrite the top of `README.md` to have a `## Quick Start` section as the first content after the title and one-paragraph intro. The Quick Start MUST be a linear walkthrough covering: prerequisites (Rust toolchain, Claude Code authenticated via `claude auth login`, GitHub PAT exported as `GITHUB_TOKEN`); a minimal `config.yaml` example pointing at one sandbox repo; `cargo build --release`; `./target/release/autocoder run --config config.yaml`; a "what to expect" paragraph describing the first iteration's log output; and a pointer to `docs/foundation-smoke-test.md` for sandbox-based verification.
+- [x] 2.2 Consolidate every deployment-related paragraph (currently scattered across "Configuration", "CLI Usage", and "Deployment Guide") into a single `## Deployment` section. The systemd unit name is `autocoder.service`. Include the Claude Code authentication note (the unit's `User=` must own the `~/.claude/` directory). (Plus an upgrade note for operators migrating from the old `openspec-orchestrator` install paths.)
+- [x] 2.3 Reorder the post-Quick-Start sections to: Configuration reference, Architecture, ChatOps Escalation, Code Review, Operating notes (workspace path derivation + multi-repo setup), Deployment, AI Security & Guardrails, CLI reference, Status & Roadmap.
+- [x] 2.4 Update every `orchestrator` invocation in the README to `autocoder` (CLI commands, systemd unit name, install path examples). Update every prose mention of "the orchestrator" to "the daemon" or "autocoder" as fits the sentence. (Residual "orchestrator" references are intentional: the `orchestrator-cli` capability identifier, the upgrade-from-old-version section listing the old paths to remove, and historical archive-name references.)
+
+## 3. Config example simplification
+
+- [x] 3.1 Rewrite `config.example.yaml` per the canonical form in design.md: single repository entry by default, `executor:` block with `command:` commented out (Claude Code default), `github:` block with `GITHUB_TOKEN` env var. Reviewer and Slack blocks fully commented out, each preceded by a one-line pointer comment to its README section.
+- [x] 3.2 Confirm `config::tests::loads_example` still parses the rewritten example. If the existing test references the OLD multi-repo example, update its assertion to match the new single-repo default while keeping a separate test (`loads_multi_repo_example` or similar) that covers the multi-repo syntax against a string fixture, not against the `config.example.yaml` file. (Existing `loads_example` test was already using an inline `VALID_TWO_REPO_YAML` string fixture, not the actual file, so it stays as-is and remains the canonical multi-repo schema test. New `config_example_yaml_parses` test reads the actual `config.example.yaml` at the repo root and asserts single-repo + reviewer-disabled + slack-disabled defaults.)
+
+## 4. Scripts, docs, and miscellaneous references
+
+- [x] 4.1 Update `scripts/scaffold-smoke-sandboxes.sh` to reference `autocoder` instead of `orchestrator` in any messages or comments that mention the binary by name. The script itself only uses `git`, so the impact is limited to documentation strings.
+- [x] 4.2 Update `docs/foundation-smoke-test.md` to invoke `autocoder` instead of `orchestrator` in all CLI examples and binary-path references. (Plus a reframing at the top from "spec verification procedure" to "optional operator confidence-check" per the no-manual-smoke memory.)
+- [x] 4.3 Search the entire repo (`grep -rn "orchestrator" --include='*.rs' --include='*.md' --include='*.yaml' --include='*.toml' --include='*.sh'`) and confirm that any remaining matches are intentional: capability identifiers in `openspec/specs/orchestrator-cli/`, the archived change directories under `openspec/changes/archive/`, the User-Agent's `openspec-` prefix (if retained), and prose mentions of the project's role rather than the binary name. (Sweep done with sed for "the orchestrator"/"The orchestrator" role-noun usages across `.rs` source files and the baseline `openspec/specs/*/spec.md` files. Remaining matches confirmed intentional: capability identifiers `orchestrator-cli`, archived change names `orchestrator-architecture` / `orchestrator-foundation`, test path strings `/nonexistent/orchestrator-test-*.{yaml,md}` (arbitrary placeholder names; not user-visible), and the directory name `orchestrator/` for the Rust crate (renaming the directory would touch git history and isn't required — `cargo` derives the binary name from `[package].name`, not the dir).)
+
+## 5. Spec delta
+
+- [x] 5.1 The MODIFIED Requirement in `openspec/changes/rename-to-autocoder/specs/orchestrator-cli/spec.md` reflects the command-name change in the scenario text. The capability directory at `openspec/specs/orchestrator-cli/` is NOT renamed; only the spec text inside it changes when this change is archived. (Two Requirements are MODIFIED: `Daemon entry point` and `Rewind subcommand`. Both now include a "The binary that exposes this subcommand is named `autocoder`" sentence and update the literal CLI invocations in their scenarios.)
+
+## 6. Verification
+
+- [x] 6.1 `cargo test` passes with 136 tests passing (or more, if any new tests were added during this change) and 1 ignored. (Result: **137 passed, 1 ignored** — one new test added: `config::tests::config_example_yaml_parses` reads the actual `config.example.yaml` shipped at the repo root.)
+- [x] 6.2 `cargo build --release` produces an `autocoder` binary; `./target/release/autocoder --help`, `./target/release/autocoder run --help`, and `./target/release/autocoder rewind --help` all show consistent naming and reference no leftover "orchestrator" strings in their help text.
+- [x] 6.3 The `openspec validate rename-to-autocoder --strict` check passes.

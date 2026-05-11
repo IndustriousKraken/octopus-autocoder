@@ -28,7 +28,7 @@ The code-reviewer SHALL accept a unified diff and a change summary, send them to
 The code-reviewer SHALL ship a default prompt template that explicitly limits the review to code-quality concerns and instructs the LLM not to assess spec compliance.
 
 #### Scenario: Default template is shipped with the binary
-- **WHEN** the orchestrator binary is built
+- **WHEN** autocoder binary is built
 - **THEN** a file named `prompts/code-review-default.md` is included in the project repository at the relative path `prompts/code-review-default.md`
 - **AND** the template's text contains the literal scope statement: `"You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."`
 - **AND** the template specifies the required response format: a verdict line followed by markdown bullets

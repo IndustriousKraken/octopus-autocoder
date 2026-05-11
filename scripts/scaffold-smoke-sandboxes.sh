@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Scaffolds two empty GitHub sandbox repos with the OpenSpec change material
-# required for the orchestrator-foundation smoke test
+# required for the autocoder smoke test
 # (docs/foundation-smoke-test.md).
 #
 # Prerequisites:
@@ -62,9 +62,9 @@ scaffold() {
     cat >"$tmpdir/README.md" <<EOF
 # Orchestrator Smoke Sandbox
 
-This repository is a sandbox for the OpenSpec orchestrator-foundation
-end-to-end smoke test. See \`docs/foundation-smoke-test.md\` in the
-orchestrator repository for the full procedure.
+This repository is a sandbox for autocoder's end-to-end smoke test.
+See \`docs/foundation-smoke-test.md\` in the autocoder repository for
+the full procedure.
 
 The agent's job is described under \`openspec/changes/$change_name/\`.
 EOF
@@ -100,7 +100,7 @@ EOF
 # clone → checkout → executor → commit → push → PR.
 scaffold "$repo_1" \
     "add-greetings-file" \
-    "Smoke-test fixture: confirm the orchestrator applies a trivial change end to end." \
+    "Smoke-test fixture: confirm autocoder applies a trivial change end to end." \
     "Create a file named \`GREETINGS\` containing the text \`hello world\`." \
     "GREETINGS" \
     "hello world"
@@ -109,7 +109,7 @@ scaffold "$repo_1" \
 # truncation rule (72 chars total subject including \"<change>: \" prefix).
 scaffold "$repo_2" \
     "add-farewell-file" \
-    "Smoke-test fixture with an intentionally very long Why line so that the orchestrator's 72-character commit-subject truncation is observable in the resulting commit message on the agent branch." \
+    "Smoke-test fixture with an intentionally very long Why line so that autocoder's 72-character commit-subject truncation is observable in the resulting commit message on the agent branch." \
     "Create a file named \`FAREWELL\` containing the text \`goodbye world\`." \
     "FAREWELL" \
     "goodbye world"
@@ -129,7 +129,7 @@ Next steps:
 
   3. Build and run:
        cargo build --release
-       RUST_LOG=info ./target/release/orchestrator run --config config.yaml
+       RUST_LOG=info ./target/release/autocoder run --config config.yaml
 
   4. After both sandboxes have an open PR on agent-q, send SIGINT (Ctrl-C)
      and verify the pass criteria in docs/foundation-smoke-test.md.

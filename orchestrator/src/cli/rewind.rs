@@ -1,4 +1,4 @@
-//! `orchestrator rewind` — recover from a failed PR or bad implementation by
+//! `autocoder rewind` — recover from a failed PR or bad implementation by
 //! deleting the agent branch and unarchiving named changes back into the
 //! active queue.
 

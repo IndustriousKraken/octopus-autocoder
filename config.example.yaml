@@ -1,67 +1,53 @@
-# OpenSpec CI/CD Orchestrator — example configuration.
+# autocoder — example configuration.
 #
-# The orchestrator polls each repository on its configured interval, processes
-# any ready OpenSpec changes via the configured executor, and opens a monolithic
-# Pull Request per pass.
+# Copy this to `config.yaml` and edit the `url:` to point at YOUR repository.
+# Assuming Claude Code is authenticated on this host (`claude auth login`)
+# and a fine-grained GitHub PAT is exported as $GITHUB_TOKEN, this file
+# is everything autocoder needs to start running.
+#
+# Optional capabilities (AI code review, Slack escalation) are commented
+# out at the bottom — see the README sections of the same name to enable.
 
 repositories:
-  # Example 1: a backend service on a fast polling loop.
-  - url: "git@github.com:my-org/auth-service.git"
-    base_branch: "main"
-    agent_branch: "agent-q"
+  - url: "git@github.com:your-org/your-repo.git"
+    base_branch: main
+    agent_branch: agent-q
     poll_interval_sec: 300
     # local_path is optional; if omitted, derived as
     # /tmp/workspaces/<sanitized-url> deterministically.
-    # local_path: "/tmp/workspaces/auth-service"
-    # Per-repo Slack channel override (optional). Falls back to
-    # `slack.default_channel_id` if omitted.
-    # slack_channel_id: C0AUTHSVC
-
-  # Example 2: a frontend application on a slower interval.
-  - url: "git@github.com:my-org/web-dashboard.git"
-    base_branch: "dev"
-    agent_branch: "agent-q"
-    poll_interval_sec: 3600
 
 executor:
-  # Currently supported: claude_cli (wraps the `claude` CLI as a subprocess).
+  # The default executor wraps the `claude` CLI (Claude Code) installed and
+  # authenticated on this host. No API key in this file — authentication
+  # lives in ~/.claude/ from `claude auth login`.
   kind: claude_cli
-  command: claude
-  # Maximum wall-clock seconds for a single change implementation. The child
-  # process is killed if it exceeds this budget.
+  # Override only if you have a wrapper script or `claude` is not on $PATH:
+  # command: /usr/local/bin/claude
   timeout_secs: 1800
 
 github:
-  # Name of the environment variable holding the GitHub PAT or fine-grained
-  # token. The orchestrator reads the token at PR-creation time only.
+  # Name of the env var holding the GitHub PAT. The token is read once
+  # per PR creation; never logged.
   token_env: GITHUB_TOKEN
 
-# Slack escalation block (OPTIONAL). When present, the orchestrator can
-# route `AskUser` outcomes from the executor to a human via Slack thread
-# replies. Without this block, an `AskUser` outcome falls back to the
-# foundation behavior (log + exit the iteration).
-#
-# slack:
-#   bot_token_env: SLACK_BOT_TOKEN           # env var holding the xoxb-... token
-#   default_channel_id: C0123456789          # fallback channel for repos without an override
-#
-# Each repository entry can override the channel via `slack_channel_id:`
-# (see the commented example in the first repository above).
+# -------------------------------------------------------------------------
+# Optional capabilities — disabled by default. Uncomment to enable.
+# -------------------------------------------------------------------------
 
-# AI code-reviewer block (OPTIONAL). When present and `enabled: true`, every
-# PR opened by the orchestrator includes a `## Code Review` section in its
-# body containing the reviewer's verdict + markdown report. A `Block` verdict
-# additionally creates the PR as a draft (with a `do-not-merge` label
-# fallback on hosts that reject drafts).
-#
-# Scope is intentionally code-quality only (security, error handling,
-# naming, style, language idioms, obvious bugs). It is NOT a spec-compliance
-# check; that is the verifier's job in a separate change.
+# AI code-quality review of each PR. See README's "Code Review" section
+# for scope (code quality, NOT spec compliance), supported providers, and
+# branch-protection recommendations to enforce Block verdicts.
 #
 # reviewer:
 #   enabled: true
-#   provider: anthropic           # or `openai_compatible`
+#   provider: anthropic
 #   model: claude-sonnet-4-6
 #   api_key_env: ANTHROPIC_API_KEY
-#   api_base_url: https://api.anthropic.com   # optional; provider-default if omitted
-#   prompt_template_path: ./prompts/code-review-default.md   # optional; built-in default if omitted
+
+# Slack ChatOps escalation — when the agent can't proceed without human
+# input, post the question to Slack and resume on reply. See README's
+# "ChatOps Escalation" section for bot setup + required scopes.
+#
+# slack:
+#   bot_token_env: SLACK_BOT_TOKEN
+#   default_channel_id: C0123456789

@@ -4,7 +4,7 @@
 TBD - created by archiving change orchestrator-architecture. Update Purpose after archive.
 ## Requirements
 ### Requirement: Daemon entry point
-The orchestrator SHALL provide a `run` subcommand that loads a YAML configuration file and starts an asynchronous polling loop for each configured repository, terminating only on signal (SIGINT/SIGTERM) or fatal initialization error. **In each polling iteration, the orchestrator SHALL process waiting (escalated) changes BEFORE pending (fresh) changes. If after the waiting-processing step ANY change in the same repository is still waiting, the orchestrator SHALL skip the pending-change loop for that iteration. This preserves the architecture's serial-queue invariant — pending changes are not processed while an earlier-or-equal change is unresolved.**
+The orchestrator SHALL provide a `run` subcommand that loads a YAML configuration file and starts an asynchronous polling loop for each configured repository, terminating only on signal (SIGINT/SIGTERM) or fatal initialization error. In each polling iteration, the orchestrator SHALL process waiting (escalated) changes BEFORE pending (fresh) changes. If after the waiting-processing step ANY change in the same repository is still waiting, the orchestrator SHALL skip the pending-change loop for that iteration. This preserves the architecture's serial-queue invariant — pending changes are not processed while an earlier-or-equal change is unresolved. **The binary that exposes this subcommand is named `autocoder`; the full invocation is `autocoder run --config <path>`.**
 
 #### Scenario: Iteration processes waiting changes before pending
 - **WHEN** a polling iteration begins for a repository
@@ -47,10 +47,10 @@ The orchestrator SHALL provide a `run` subcommand that loads a YAML configuratio
 - **AND** any pending changes that were blocked in earlier iterations are eligible for processing now
 
 ### Requirement: Rewind subcommand
-The orchestrator SHALL provide a `rewind` subcommand that recovers from a failed PR or bad implementation by unarchiving specified changes and resetting the relevant agent branch. **The subcommand SHALL accept a `--repo <selector>` argument; the argument is required when the config contains multiple repositories AND optional (defaulting to the only configured repo) when the config contains exactly one.**
+The orchestrator SHALL provide a `rewind` subcommand that recovers from a failed PR or bad implementation by unarchiving specified changes and resetting the relevant agent branch. The subcommand SHALL accept a `--repo <selector>` argument; the argument is required when the config contains multiple repositories AND optional (defaulting to the only configured repo) when the config contains exactly one. **The binary that exposes this subcommand is named `autocoder`; the full invocation is `autocoder rewind <change> --config <path> [--repo <selector>] [--hard]`.**
 
 #### Scenario: Multi-repo rewind requires --repo
-- **WHEN** the loaded config contains 2 or more repositories AND the user invokes `orchestrator rewind <change> --config <path>` without `--repo`
+- **WHEN** the loaded config contains 2 or more repositories AND the user invokes `autocoder rewind <change> --config <path>` without `--repo`
 - **THEN** the process exits non-zero within 5 seconds
 - **AND** stderr names the missing argument AND lists the configured repositories' short names as candidate selectors
 
@@ -86,7 +86,7 @@ The orchestrator SHALL provide a `rewind` subcommand that recovers from a failed
 - **AND** at the end, if any unarchive failed, the process exits non-zero with stderr listing the failed changes and their reasons; otherwise it exits 0 with a summary log line naming all rewound changes
 
 ### Requirement: Per-repository asynchronous polling loop
-The orchestrator SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration.
+autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration.
 
 #### Scenario: Spawn count matches config
 - **WHEN** the daemon starts with a config containing N repositories AND the workspace collision check passes
@@ -114,7 +114,7 @@ The polling loop SHALL continue running after a failed iteration; a single itera
 - **AND** other repositories' polling tasks are unaffected (their iterations continue on schedule)
 
 ### Requirement: Graceful shutdown on signal
-The orchestrator SHALL respond to SIGINT or SIGTERM by cancelling all polling tasks; each task completes its current iteration (if any) and exits cleanly.
+autocoder SHALL respond to SIGINT or SIGTERM by cancelling all polling tasks; each task completes its current iteration (if any) and exits cleanly.
 
 #### Scenario: Signal during inter-iteration sleep
 - **WHEN** SIGINT or SIGTERM arrives while every polling task is sleeping
@@ -127,9 +127,9 @@ The orchestrator SHALL respond to SIGINT or SIGTERM by cancelling all polling ta
 - **AND** any child processes spawned by the iteration receive their normal lifecycle (the executor's child process completes or hits its own `executor.timeout_secs`)
 
 ### Requirement: Startup logging per repository
-The orchestrator SHALL emit a startup log line per configured repository naming its URL, derived (or explicit) workspace path, and configured `poll_interval_sec`.
+autocoder SHALL emit a startup log line per configured repository naming its URL, derived (or explicit) workspace path, and configured `poll_interval_sec`.
 
 #### Scenario: Startup line emitted
 - **WHEN** the daemon starts AND the workspace collision check passes
-- **THEN** before any polling task begins iterating, the orchestrator emits one log line per repository containing the literal URL, the resolved workspace path, and the integer `poll_interval_sec`
+- **THEN** before any polling task begins iterating, autocoder emits one log line per repository containing the literal URL, the resolved workspace path, and the integer `poll_interval_sec`
 

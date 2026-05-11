@@ -17,11 +17,11 @@ The workspace manager SHALL derive a per-repository workspace path deterministic
 - **AND** repeated derivations preserve the inequality
 
 ### Requirement: Cross-repository path collision detection at startup
-The orchestrator SHALL detect any two configured repositories that resolve to the same workspace path and refuse to start, naming both URLs and the shared path in the error message.
+autocoder SHALL detect any two configured repositories that resolve to the same workspace path and refuse to start, naming both URLs and the shared path in the error message.
 
 #### Scenario: Two repos derive to the same path
-- **WHEN** the orchestrator loads a config containing two repositories whose URLs sanitize to the same workspace path (or whose explicit `local_path` overrides collide)
-- **THEN** the orchestrator emits a startup error whose text contains BOTH conflicting URLs verbatim AND the shared path
+- **WHEN** autocoder loads a config containing two repositories whose URLs sanitize to the same workspace path (or whose explicit `local_path` overrides collide)
+- **THEN** autocoder emits a startup error whose text contains BOTH conflicting URLs verbatim AND the shared path
 - **AND** no polling tasks are spawned for either repository
 - **AND** the process exits non-zero within 5 seconds of config load
 

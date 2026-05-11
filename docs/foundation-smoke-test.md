@@ -1,11 +1,13 @@
-# Foundation Smoke Test
+# autocoder end-to-end smoke test
 
-This document describes the manual end-to-end verification procedure for the
-`orchestrator-foundation` change. Section 11 of `tasks.md` references this
-file; tasks 11.2 and 11.3 are completed by running the procedure below
-against real GitHub sandbox repositories.
+This document describes the manual end-to-end verification procedure for
+autocoder. It is **optional operator guidance**, not a spec task — the
+in-tree test suite (`cargo test`) covers behavior comprehensively against
+hermetic fixtures. Run this procedure when you want extra confidence
+against a real GitHub remote before pointing the daemon at a repository
+you care about.
 
-The smoke tests confirm that a built `orchestrator` binary can:
+The smoke tests confirm that a built `autocoder` binary can:
 
 1. Clone or fetch a sandbox repository into its workspace.
 2. Detect a ready OpenSpec change in `openspec/changes/`.
@@ -27,7 +29,7 @@ The procedure assumes the operator has:
 
 ### Setup
 
-1. Create a fresh GitHub sandbox repository, e.g. `your-handle/orchestrator-smoke-1`.
+1. Create a fresh GitHub sandbox repository, e.g. `your-handle/autocoder-smoke-1`.
    Initialize with a single `main` branch and at least one commit so the branch
    exists.
 
@@ -41,7 +43,7 @@ The procedure assumes the operator has:
 
    ```markdown
    ## Why
-   Smoke-test fixture: confirm the orchestrator can apply a trivial change.
+   Smoke-test fixture: confirm the autocoder can apply a trivial change.
 
    ## What Changes
    - Create a file named `GREETINGS` containing the text `hello world`.
@@ -61,7 +63,7 @@ The procedure assumes the operator has:
 
    ```yaml
    repositories:
-     - url: "git@github.com:your-handle/orchestrator-smoke-1.git"
+     - url: "git@github.com:your-handle/autocoder-smoke-1.git"
        base_branch: main
        agent_branch: agent-q
        poll_interval_sec: 60
@@ -79,16 +81,16 @@ The procedure assumes the operator has:
 
 ```bash
 export GITHUB_TOKEN=ghp_yourpathere
-RUST_LOG=info ./target/release/orchestrator run --config config.yaml
+RUST_LOG=info ./target/release/autocoder run --config config.yaml
 ```
 
-Wait until the orchestrator logs `opened PR` for the change, then send
+Wait until the autocoder logs `opened PR` for the change, then send
 `SIGINT` (Ctrl-C). The process should log `received SIGINT; shutting down`
 followed by `shutdown complete` and exit within ~30 seconds.
 
 ### Pass criteria
 
-- `gh pr list --repo your-handle/orchestrator-smoke-1 --head agent-q` shows
+- `gh pr list --repo your-handle/autocoder-smoke-1 --head agent-q` shows
   exactly one open PR.
 - `git log origin/agent-q -1 --pretty=full` (in a fresh clone of the sandbox)
   shows one commit ahead of `main` whose subject matches
@@ -106,12 +108,12 @@ different polling intervals:
 
 ```yaml
 repositories:
-  - url: "git@github.com:your-handle/orchestrator-smoke-1.git"
+  - url: "git@github.com:your-handle/autocoder-smoke-1.git"
     base_branch: main
     agent_branch: agent-q
     poll_interval_sec: 60
 
-  - url: "git@github.com:your-handle/orchestrator-smoke-2.git"
+  - url: "git@github.com:your-handle/autocoder-smoke-2.git"
     base_branch: main
     agent_branch: agent-q
     poll_interval_sec: 180
@@ -119,7 +121,7 @@ repositories:
 
 Run for ~5 minutes. Both sandboxes must produce a PR.
 
-Send `SIGTERM` (`kill <pid>`). The orchestrator must:
+Send `SIGTERM` (`kill <pid>`). The autocoder must:
 
 - Log `received SIGTERM; shutting down`.
 - Drain both polling tasks within 30 seconds.
@@ -142,5 +144,5 @@ After both smoke tests, confirm:
   the original directory gone from `openspec/changes/`.
 - `find /tmp/workspaces -name .in-progress` returns nothing.
 - `git status` inside each workspace is clean (modulo the agent branch's
-  unmerged commits, which is expected — the orchestrator doesn't merge its
+  unmerged commits, which is expected — the autocoder doesn't merge its
   own PRs).

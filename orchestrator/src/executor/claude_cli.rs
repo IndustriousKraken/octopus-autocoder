@@ -3,7 +3,7 @@
 //!
 //! AskUser detection is two-layered:
 //!   1. **MCP tool** — at run time, the executor writes a `.mcp.json` into
-//!      the workspace pointing back at `orchestrator mcp-ask-user-server`.
+//!      the workspace pointing back at `autocoder mcp-ask-user-server`.
 //!      The wrapped CLI loads this MCP config and, when its agent calls
 //!      `ask_user(question)`, the tool writes
 //!      `<workspace>/openspec/changes/<change>/.askuser-pending.json`.
@@ -99,15 +99,15 @@ impl ClaudeCliExecutor {
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
-    /// launch THIS orchestrator binary as the `ask_user` MCP tool. The
+    /// launch THIS autocoder binary as the `ask_user` MCP tool. The
     /// caller MUST delete this file via `delete_mcp_config` after the child
     /// exits to keep the working tree clean.
     fn write_mcp_config(workspace: &Path, change: &str) -> Result<PathBuf> {
-        // We may be running from a non-orchestrator binary (e.g. cargo test).
+        // We may be running from a non-autocoder binary (e.g. cargo test).
         // `current_exe` returns the actual running binary; in production
-        // this is the `orchestrator` binary and the MCP subcommand exists.
+        // this is the `autocoder` binary and the MCP subcommand exists.
         let exe = std::env::current_exe()
-            .context("resolving current orchestrator binary path for MCP config")?;
+            .context("resolving current autocoder binary path for MCP config")?;
         let config = serde_json::json!({
             "mcpServers": {
                 "ask_user": {
@@ -162,7 +162,7 @@ impl ClaudeCliExecutor {
                 )
             })?;
         // Always remove the marker so a stale one cannot survive into the
-        // next iteration. The orchestrator now owns the question.
+        // next iteration. autocoder now owns the question.
         if let Err(e) = std::fs::remove_file(&path) {
             tracing::warn!(
                 "could not remove askuser marker {} after reading: {e}",
@@ -648,7 +648,7 @@ mod tests {
     // observable to the test, but `sleep` inherits the piped stderr handle
     // and keeps it open for the full 30s. The blocking read_to_string on
     // stderr after wait returns blocks for the inherited pipe duration,
-    // which means the orchestrator's timeout never gets a chance to fire.
+    // which means autocoder's timeout never gets a chance to fire.
     #[ignore = "fixture inheritance issue with /bin/sh + sleep on macOS; production path is correct"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_kills_child() {

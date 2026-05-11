@@ -21,7 +21,7 @@ The queue engine SHALL list pending OpenSpec changes in the workspace, excluding
 The queue engine SHALL atomically lock and unlock changes via filesystem markers to prevent duplicate execution and to signal in-progress state to humans inspecting the workspace.
 
 #### Scenario: Locking a change
-- **WHEN** the orchestrator selects a change for execution
+- **WHEN** autocoder selects a change for execution
 - **THEN** the queue engine creates an empty file at `<workspace>/openspec/changes/<change>/.in-progress` BEFORE invoking the executor
 - **AND** the file is verifiable on disk via standard filesystem inspection (e.g. `ls -a`)
 
@@ -31,7 +31,7 @@ The queue engine SHALL atomically lock and unlock changes via filesystem markers
 - **AND** the deletion is idempotent (no error if the file is already absent)
 
 #### Scenario: Stale lock cleanup on startup
-- **WHEN** the orchestrator initializes a workspace at process startup
+- **WHEN** autocoder initializes a workspace at process startup
 - **THEN** any pre-existing `.in-progress` files inside `<workspace>/openspec/changes/<change>/` are deleted before the polling loop for that repository begins
 - **AND** a log line is emitted for each lock cleared, naming the change
 

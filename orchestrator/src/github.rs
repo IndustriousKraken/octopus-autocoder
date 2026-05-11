@@ -79,7 +79,7 @@ async fn create_pull_request_at(
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "openspec-orchestrator")
+            .header("User-Agent", "openspec-autocoder")
             .json(&payload)
             .send()
     };
@@ -173,7 +173,7 @@ async fn apply_label(
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "openspec-orchestrator")
+        .header("User-Agent", "openspec-autocoder")
         .json(&payload)
         .send()
         .await
@@ -292,7 +292,7 @@ mod tests {
             .mock("POST", "/repos/owner/repo/pulls")
             .match_header("authorization", "Bearer testtoken")
             .match_header("accept", "application/vnd.github+json")
-            .match_header("user-agent", "openspec-orchestrator")
+            .match_header("user-agent", "openspec-autocoder")
             .match_body(mockito::Matcher::JsonString(
                 r#"{"title":"t","body":"b","head":"agent-q","base":"main"}"#.to_string(),
             ))
@@ -462,7 +462,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// 4.5: when the host rejects the draft flag, the orchestrator retries
+    /// 4.5: when the host rejects the draft flag, autocoder retries
     /// without `draft` AND applies a `do-not-merge` label.
     #[tokio::test]
     async fn label_fallback_on_draft_unsupported() {

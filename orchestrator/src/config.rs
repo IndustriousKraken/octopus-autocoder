@@ -140,6 +140,32 @@ github:
   token_env: GITHUB_TOKEN
 "#;
 
+    /// Parses the actual `config.example.yaml` file shipped at the repo
+    /// root. This guards against the example drifting out of sync with the
+    /// parser — operators who `cp config.example.yaml config.yaml` should
+    /// always end up with a parseable file.
+    #[test]
+    fn config_example_yaml_parses() {
+        let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("manifest dir has a parent")
+            .join("config.example.yaml");
+        assert!(
+            example_path.exists(),
+            "config.example.yaml must exist at {}",
+            example_path.display()
+        );
+        let cfg = Config::load_from(&example_path)
+            .expect("config.example.yaml must be parseable as Config");
+        // Single-repo by default per the design.
+        assert_eq!(cfg.repositories.len(), 1);
+        assert_eq!(cfg.repositories[0].base_branch, "main");
+        assert_eq!(cfg.repositories[0].agent_branch, "agent-q");
+        // Reviewer and Slack blocks are commented out by default.
+        assert!(cfg.reviewer.is_none(), "reviewer must be off by default");
+        assert!(cfg.slack.is_none(), "slack must be off by default");
+    }
+
     #[test]
     fn loads_example() {
         let (_dir, path) = write_config(VALID_TWO_REPO_YAML);

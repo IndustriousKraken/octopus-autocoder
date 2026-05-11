@@ -7,7 +7,7 @@ TBD - created by archiving change chatops-escalation. Update Purpose after archi
 The chatops-manager SHALL post a human-readable question to a configured Slack channel and return the resulting thread timestamp so future polling iterations can find the human's reply.
 
 #### Scenario: Posting a fresh question
-- **WHEN** the orchestrator passes a question string, a change name, and a target channel id to `post_question(...)`
+- **WHEN** autocoder passes a question string, a change name, and a target channel id to `post_question(...)`
 - **THEN** the manager issues an HTTP POST to `https://slack.com/api/chat.postMessage` with header `Authorization: Bearer <token>` (token sourced from the configured environment variable) and a JSON body containing `channel`, `text` formatted to begin with `❓ \`<change>\`:` followed by the question, and `link_names: 1`
 - **AND** on a 2xx response with `ok: true`, the manager returns the response's `ts` field as a string
 - **AND** on a 2xx response with `ok: false`, the manager returns an error whose text contains the Slack `error` field verbatim
@@ -38,12 +38,12 @@ The chatops-manager SHALL fetch replies in the tracked thread and return the ear
 The chatops-manager SHALL provide read, write, and delete helpers for the `.question.json` and `.answer.json` files inside change directories. Writes MUST be atomic; deletes MUST be idempotent.
 
 #### Scenario: Writing a question file
-- **WHEN** the orchestrator calls `write_question_file(workspace, change, payload)`
+- **WHEN** autocoder calls `write_question_file(workspace, change, payload)`
 - **THEN** the manager writes a JSON document containing at least `thread_ts`, `channel`, `resume_handle`, and `asked_at` to `<workspace>/openspec/changes/<change>/.question.json`
 - **AND** the write is performed via tempfile-then-rename in the same directory so a partially-written file is never observable
 
 #### Scenario: Writing an answer file
-- **WHEN** the orchestrator calls `write_answer_file(workspace, change, payload)`
+- **WHEN** autocoder calls `write_answer_file(workspace, change, payload)`
 - **THEN** the manager writes a JSON document containing at least `answer`, `answered_at`, and `answerer_user_id` to `<workspace>/openspec/changes/<change>/.answer.json`
 - **AND** the write is atomic by the same mechanism
 

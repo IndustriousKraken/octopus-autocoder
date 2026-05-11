@@ -10,8 +10,8 @@ pub mod rewind;
 pub mod run;
 
 #[derive(Parser, Debug)]
-#[command(name = "orchestrator")]
-#[command(about = "Autonomous OpenSpec CI/CD orchestrator", long_about = None)]
+#[command(name = "autocoder")]
+#[command(about = "Autonomous AI code-writer driven by OpenSpec changes", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -19,7 +19,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the orchestrator daemon. Polls every configured repository on its
+    /// Run the autocoder daemon. Polls every configured repository on its
     /// interval, processes ready OpenSpec changes, and opens monolithic PRs.
     Run {
         /// Path to the YAML configuration file.
