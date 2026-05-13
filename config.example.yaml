@@ -79,4 +79,7 @@ github:
 #
 # slack:
 #   bot_token_env: SLACK_BOT_TOKEN
+#   # Inline alternative: when `bot_token` is set, `bot_token_env` is ignored.
+#   # bot_token:
+#   #   value: "xoxb-yourtokenhere"
 #   default_channel_id: C0123456789

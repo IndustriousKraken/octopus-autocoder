@@ -139,6 +139,8 @@ pub enum ReviewerProvider {
 #[serde(deny_unknown_fields)]
 pub struct SlackConfig {
     pub bot_token_env: String,
+    #[serde(default)]
+    pub bot_token: Option<SecretSource>,
     pub default_channel_id: String,
 }
 
@@ -600,6 +602,33 @@ github:
             SecretSource::Inline { value } => assert_eq!(value, "ghp_inlinevalue"),
             _ => panic!("inline entry mis-parsed"),
         }
+    }
+
+    #[test]
+    fn loads_slack_inline_bot_token() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  bot_token:
+    value: "xoxb-inline"
+  default_channel_id: C0DEFAULT
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("inline slack bot_token should parse");
+        let slack = cfg.slack.unwrap();
+        match slack.bot_token.unwrap() {
+            SecretSource::Inline { value } => assert_eq!(value, "xoxb-inline"),
+            _ => panic!("expected inline slack bot token"),
+        }
+        assert_eq!(slack.bot_token_env, "SLACK_BOT_TOKEN");
     }
 
     #[test]

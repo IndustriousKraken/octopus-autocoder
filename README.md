@@ -232,8 +232,13 @@ When the optional `slack:` config block is present, autocoder routes ambiguous a
 ```yaml
 slack:
   bot_token_env: SLACK_BOT_TOKEN        # env var containing your xoxb-... bot token
+  # OR — inline alternative; when `bot_token` is set, `bot_token_env` is ignored.
+  # bot_token:
+  #   value: "xoxb-yourtokenhere"
   default_channel_id: C0123456789       # fallback channel id (use the Slack channel ID, not the name)
 ```
+
+The inline form follows the same dual-source pattern as `github.token` and `reviewer.api_key`; see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for the security tradeoff.
 
 Per-repo override:
 

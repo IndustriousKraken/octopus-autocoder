@@ -45,12 +45,19 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     let chatops: Option<Arc<ChatOps>> = match cfg.slack.as_ref() {
         Some(s) => {
-            let token = std::env::var(&s.bot_token_env).map_err(|_| {
-                anyhow::anyhow!(
-                    "slack.bot_token_env `{}` is not set in the process environment",
-                    s.bot_token_env
-                )
-            })?;
+            let token = if let Some(inline) = s.bot_token.as_ref() {
+                let resolved = inline.resolve("slack.bot_token")?;
+                if inline.is_inline() && std::env::var(&s.bot_token_env).is_ok() {
+                    tracing::warn!(
+                        "slack.bot_token (inline) takes precedence; env var `{}` is being ignored for the Slack bot token",
+                        s.bot_token_env
+                    );
+                }
+                resolved
+            } else {
+                crate::config::SecretSource::EnvVar(s.bot_token_env.clone())
+                    .resolve(&format!("slack.bot_token_env={}", s.bot_token_env))?
+            };
             let client = ChatOps::new(token)
                 .await
                 .context("initializing Slack ChatOps from config")?;
