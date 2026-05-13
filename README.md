@@ -17,7 +17,7 @@ On the machine where the daemon will run:
 - **A GitHub fine-grained Personal Access Token**, scoped to the repositories autocoder will manage. Required permissions:
   - **`Pull requests: read & write`** — needed for PR creation.
   - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
-  - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is essentially never needed there; only relevant for some private GHE configurations.
+  - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is not needed there; only relevant for some private GHE configurations.
 
   Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Fine-grained PATs are scoped to a single account or organization; multi-owner setups use [Multiple GitHub Tokens](#multiple-github-tokens) instead.
 - **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
@@ -166,7 +166,7 @@ Before spawning any polling task, autocoder iterates every configured repository
 On success, autocoder emits one log line per repo naming the env var (never the token value):
 
 ```
-INFO repository git@github.com:rabbeverly/personal-repo.git will use GitHub token from env var PERSONAL_GH_TOKEN
+INFO repository git@github.com:rbeverly/personal-repo.git will use GitHub token from env var PERSONAL_GH_TOKEN
 INFO repository git@github.com:my-org-a/work-repo.git will use GitHub token from env var ORG_A_GH_TOKEN
 INFO repository git@github.com:my-org-b/another-repo.git will use GitHub token from env var ORG_B_GH_TOKEN
 ```
@@ -195,7 +195,7 @@ See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for t
 
 This routing affects only HTTP calls to GitHub's REST API (PR creation, optional label fallback). Git operations (`clone`, `fetch`, `push`) go through whichever authentication `git` itself uses — your SSH key, an HTTPS credential helper, etc.
 
-**Recommendation for multi-owner setups:** use SSH URLs (`git@github.com:owner/repo.git`) in `config.yaml`. A single SSH key registered against each account/org covers the git side without per-owner credential-helper trickery, while autocoder's `owner_tokens` covers the API side. HTTPS URLs work but require a git credential helper that can map URLs to different PATs, which autocoder does not configure for you.
+**Recommendation for multi-owner setups:** use SSH URLs (`git@github.com:owner/repo.git`) in `config.yaml`. A single SSH key registered against each account/org covers the git side without per-owner credential-helper configuration, while autocoder's `owner_tokens` covers the API side. HTTPS URLs work but require a git credential helper that can map URLs to different PATs, which autocoder does not configure for you.
 
 ### Non-goal: per-repository overrides
 
@@ -210,7 +210,7 @@ autocoder is a single tokio-based daemon with one polling task per configured re
 Built capabilities (each is a baseline spec under `openspec/specs/`):
 
 1. **orchestrator-cli** — the `run` daemon entry point and the `rewind` recovery subcommand. Multi-repo dispatch with a shared cancellation token; per-repo polling tasks; SIGINT/SIGTERM drain.
-2. **workspace-manager** — deterministic per-repo workspace paths under `/tmp/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, and a startup dirty-workspace check that permanently skips contaminated repos for the process lifetime.
+2. **workspace-manager** — deterministic per-repo workspace paths under `/tmp/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, and a startup dirty-workspace check that skips a dirty repo for the process lifetime.
 3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion with `YYYY-MM-DD-<change>` date prefix, unarchive on rewind.
 4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout and two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop).
 5. **git-workflow-manager** — branch init (`fetch → checkout base → pull --ff-only → checkout -B agent`), per-change commits with `<change>: <first line of ## Why>` subject truncated to 72 chars, monolithic PR creation via the GitHub REST API with `--force-with-lease` push.
@@ -328,11 +328,11 @@ The `openai_compatible` provider works with any endpoint that speaks the OpenAI 
 | `Concerns`  | non-draft | Issues warrant discussion but the diff is mergeable.                       |
 | `Block`     | **draft** | At least one issue would cause real harm if merged.                        |
 
-If the LLM's response cannot be parsed for a verdict, the daemon defaults to `Concerns` and prepends a parse-failure note to the report. If the API call itself errors (network, auth, rate limit), the daemon logs the error and ships the PR anyway with `(reviewer failed: <reason>)` in the `## Code Review` section. **A failed reviewer never blocks PR creation.**
+If the LLM's response cannot be parsed for a verdict, the daemon defaults to `Concerns` and prepends a parse-failure note to the report. If the API call itself errors (network, auth, rate limit), the daemon logs the error and still opens the PR with `(reviewer failed: <reason>)` in the `## Code Review` section. **A failed reviewer never blocks PR creation.**
 
 ### Block-verdict enforcement (recommended)
 
-autocoder marks Block-verdict PRs as draft. To make this gate merge, configure a branch-protection rule on the PR target branch that **requires PRs not be draft**. Without that rule, anyone with write access can flip the draft state and merge.
+autocoder marks Block-verdict PRs as draft. To make this gate merge, configure a branch-protection rule on the PR target branch that **requires PRs not be draft**. Without that rule, anyone with write access can change the draft state and merge.
 
 On hosts that don't support drafts (some private GHE configurations, certain repo types), autocoder falls back automatically: it retries the PR creation with `draft: false` and applies a `do-not-merge` label via the issues-labels endpoint. Configure your branch protection to require the absence of that label as the fallback gate.
 
@@ -374,7 +374,7 @@ repositories:
 
 ### Recovering from a bad run
 
-The `rewind` subcommand throws away the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](#rewind) below.
+The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](#rewind) below.
 
 ---
 
@@ -506,7 +506,7 @@ GITHUB_TOKEN=ghp_yourtokenhere
 # SLACK_BOT_TOKEN=xoxb-...
 ```
 
-You can also mix the two paths per-secret — e.g. inline `github.token` but `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file only carries the env-var-sourced secrets.
+The two paths can be mixed per-secret — e.g. inline `github.token` alongside `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file carries only the env-var-sourced secrets.
 
 ### 6. Start it
 
@@ -546,7 +546,7 @@ Running an autonomous coding agent with push access to your repositories introdu
 
 ### 1. Credential scoping
 
-Never give autocoder a Personal Access Token (PAT) or SSH key with admin access to your organization. Provide it with **scoped access** strictly limited to the repositories defined in `config.yaml`. A fine-grained PAT scoped to two specific repos is dramatically safer than an org-wide classic token.
+Never give autocoder a Personal Access Token (PAT) or SSH key with admin access to your organization. Provide it with **scoped access** strictly limited to the repositories defined in `config.yaml`. A fine-grained PAT scoped to two specific repos is safer than an org-wide classic token.
 
 ### 2. Branch protection
 
@@ -621,7 +621,7 @@ The daemon polls every configured repository on its interval, processes ready Op
 
 ### `rewind`
 
-Throw away the in-flight agent branch and re-queue one or more archived changes. Use this when an agent produced bad work or a PR was rejected and you want the daemon to try again.
+Discard the in-flight agent branch and re-queue one or more archived changes. Use this when an agent produced unusable work or a PR was rejected and you want the daemon to try again.
 
 ```bash
 # Soft rewind (single-repo config): prompt for confirmation, then delete
@@ -654,15 +654,15 @@ Bare Enter, `n`, or any input other than `y`/`Y` declines and exits without modi
 
 **`--repo` selector:**
 
-With **one** configured repository, `--repo` is optional and defaults to that repo. With **two or more** configured repositories, `--repo` is required. autocoder matches the selector against each repository's full URL (exact equality) AND against the URL's short-name (basename with any trailing `.git` stripped). Zero matches or multiple matches exit non-zero with a clear error listing the available selectors.
+With **one** configured repository, `--repo` is optional and defaults to that repo. With **two or more** configured repositories, `--repo` is required. autocoder matches the selector against each repository's full URL (exact equality) AND against the URL's short-name (basename with any trailing `.git` stripped). Zero matches or multiple matches exit non-zero with an error listing the available selectors.
 
 **Unarchiving multiple changes:**
 
 If you pass multiple change names and one of them fails to unarchive (typo, no matching archive entry, destination collision), the remaining names are still attempted. The process exits non-zero at the end with a summary naming both the succeeded and failed changes.
 
-**"I rewound the wrong change":**
+**Recovering from an accidental rewind:**
 
-Archived directories are **not** deleted by archive — they are renamed under `openspec/changes/archive/<YYYY-MM-DD>-<name>/`. If you accidentally rewind a change and want to put it back, move the directory back into the archive yourself (the canonical date-prefix format is preserved by autocoder's `archive` step, so a manual `mv` restores the queue's view of state).
+Archived directories are **not** deleted by archive — they are renamed under `openspec/changes/archive/<YYYY-MM-DD>-<name>/`. To reverse an accidental rewind, move the directory back into the archive manually. The canonical date-prefix format is preserved by autocoder's `archive` step, so a manual `mv` restores the queue's view of state.
 
 ---
 
