@@ -101,7 +101,8 @@ A list of one or more repositories to manage. Each entry:
 | Field          | Required | Default          | Description |
 |----------------|----------|------------------|-------------|
 | `token_env`    | no       | `GITHUB_TOKEN`   | Name of the env var holding the fallback PAT. |
-| `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name, for multi-owner setups. See [Multiple GitHub Tokens](#multiple-github-tokens). |
+| `token`        | no       | _absent_         | Inline alternative to `token_env`: `{ value: "ghp_..." }`. When set, `token_env` is ignored. See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var). |
+| `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name **or** inline `{ value: "..." }`. See [Multiple GitHub Tokens](#multiple-github-tokens). |
 
 ### `reviewer:` (optional)
 
@@ -172,7 +173,21 @@ INFO repository git@github.com:my-org-b/another-repo.git will use GitHub token f
 
 - Map keys are matched against URL owners **case-insensitively** (`My-Org` matches `my-org` and vice versa). GitHub owner names are case-insensitive at the platform level.
 - The first matching entry wins. If you have duplicate keys differing only in case, fix the YAML — there is no defined priority.
-- An owner with no `owner_tokens` entry falls back to `token_env`. A repository with neither route is a startup error.
+- An owner with no `owner_tokens` entry falls back to `github.token` (inline) if set, otherwise `github.token_env`. A repository with neither route is a startup error.
+
+### Inline owner-token values
+
+Each map value can be either an env var name (bare string) or an inline value (`{ value: "..." }`). Mixed maps are fine:
+
+```yaml
+github:
+  owner_tokens:
+    my-org-a: ORG_A_GH_TOKEN              # env var name
+    my-org-b:                             # inline value
+      value: "github_pat_xxx_for_org_b"
+```
+
+See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for the security tradeoff.
 
 ### Backward compatibility
 
@@ -291,12 +306,15 @@ reviewer:
   enabled: true
   provider: anthropic               # or `openai_compatible`
   model: claude-sonnet-4-6
-  api_key_env: ANTHROPIC_API_KEY    # env var containing the API token
+  api_key_env: ANTHROPIC_API_KEY    # env var holding the API token
+  # OR — inline alternative; when `api_key` is set, `api_key_env` is ignored.
+  # api_key:
+  #   value: "sk-ant-..."
   api_base_url: https://api.anthropic.com   # optional; provider default if omitted
   prompt_template_path: ./prompts/code-review-default.md  # optional; built-in default if omitted
 ```
 
-The `openai_compatible` provider works with any endpoint that speaks the OpenAI `/chat/completions` API — Grok, OpenRouter, local Ollama, etc. Point `api_base_url` at the endpoint and provide a matching token via `api_key_env`.
+The `openai_compatible` provider works with any endpoint that speaks the OpenAI `/chat/completions` API — Grok, OpenRouter, local Ollama, etc. Point `api_base_url` at the endpoint and provide a matching token via `api_key_env` (or `api_key` inline, see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var)).
 
 ### Verdict semantics
 
@@ -490,6 +508,42 @@ autocoder clones repositories into `/tmp/workspaces/`. Ensure this partition has
 - Write access to `/tmp/workspaces/`
 - Write access to its own `~/.claude/` (for Claude Code credentials)
 - Read access to `/opt/autocoder/config.yaml`
+
+### 5. Secrets in `config.yaml` (inline vs env-var)
+
+Every secret-bearing field (`github.token` / `github.owner_tokens[*]` / `reviewer.api_key`) accepts EITHER an env-var name (the original pattern) OR an inline value via the `{ value: "..." }` shape. Examples:
+
+```yaml
+github:
+  token_env: GITHUB_TOKEN                   # env-var path
+  # OR
+  token:
+    value: "github_pat_xxx"                 # inline
+  owner_tokens:
+    my-personal-handle: PERSONAL_GH_TOKEN   # env-var name
+    my-org-a:                               # inline
+      value: "github_pat_for_org_a"
+
+reviewer:
+  api_key_env: ANTHROPIC_API_KEY            # env-var path
+  # OR
+  api_key:
+    value: "sk-ant-..."                     # inline
+```
+
+When both forms are set on the same logical field, the inline value wins and autocoder logs a `warn`-level line at startup naming the env var being ignored. Startup logs name the *source* (`inline (github.token)` or `env var GITHUB_TOKEN`) so an audit can confirm which secrets live in YAML.
+
+**Pick env-var for:** multi-user hosts, systemd-managed deployments (the existing `EnvironmentFile=/etc/autocoder.env` pattern), and any setup where you want secrets out of YAML so the config file can be readable for audit without exposing tokens.
+
+**Pick inline for:** single-host, single-user deployments where collapsing the daemon to one edited file (`~/config.yaml`) is worth the YAML-secrets tradeoff. If you go inline:
+
+- `chmod 600 ~/config.yaml` and own it as the autocoder user.
+- Never commit the file. Ensure your `.gitignore` covers it (the project root's `.gitignore` already excludes `config.yaml` by name).
+- Treat the file like an SSH private key for backup and host-migration purposes.
+
+### 6. Dedicated, non-SSH user (recommended)
+
+For a little extra defense in depth, run autocoder as a dedicated user (`autocoder`) that has no SSH login. Authenticate Claude Code as that user (`sudo -iu autocoder claude auth login`) and keep `config.yaml`, `~/.claude/`, and the daemon's process under that uid. If your interactive login user is compromised, the attacker still has to clear an additional uid boundary (sudo with a password, a suid binary, or a kernel exploit) to reach autocoder's secrets — meaningful protection if your login user is not a passwordless sudoer, cosmetic if it is. The Deployment section's systemd setup uses this pattern by default; on a single-user host it's still worth the small extra setup.
 
 ---
 

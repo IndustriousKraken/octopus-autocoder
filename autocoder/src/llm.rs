@@ -159,12 +159,19 @@ impl LlmClient for OpenAiCompatibleClient {
 /// Construct the right `LlmClient` for the configured provider. Reads the
 /// API key from the environment variable named by `cfg.api_key_env`.
 pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
-    let api_key = std::env::var(&cfg.api_key_env).map_err(|_| {
-        anyhow!(
-            "reviewer api_key_env `{}` is not set in the process environment",
-            cfg.api_key_env
-        )
-    })?;
+    let api_key = if let Some(inline) = cfg.api_key.as_ref() {
+        let key = inline.resolve("reviewer.api_key")?;
+        if std::env::var(&cfg.api_key_env).is_ok() && inline.is_inline() {
+            tracing::warn!(
+                "reviewer.api_key (inline) takes precedence; env var `{}` is being ignored for the reviewer key",
+                cfg.api_key_env
+            );
+        }
+        key
+    } else {
+        crate::config::SecretSource::EnvVar(cfg.api_key_env.clone())
+            .resolve(&format!("reviewer.api_key_env={}", cfg.api_key_env))?
+    };
     let provider = cfg.provider;
     let model = cfg.model.clone();
     let base = cfg.api_base_url.clone();
@@ -186,6 +193,47 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_from_config` MUST use `reviewer.api_key` (inline) verbatim and
+    /// SHOULD NOT touch `reviewer.api_key_env`'s env var even if it happens
+    /// to be set. Asserted by checking the bearer/api-key header on the
+    /// outgoing request matches the inline value.
+    #[tokio::test]
+    async fn inline_api_key_takes_precedence_over_env_var() {
+        use crate::config::{ReviewerConfig, ReviewerProvider, SecretSource};
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("x-api-key", "inline-key-wins")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"content":[{"type":"text","text":"ok"}]}"#)
+            .create_async()
+            .await;
+
+        // Set the env-var pointed to by api_key_env so we can confirm it's
+        // ignored — if precedence were wrong, the request would carry the
+        // env value and mockito would 501 the request shape.
+        unsafe {
+            std::env::set_var("AUTOCODER_TEST_INLINE_PREC_KEY", "env-value-must-not-be-sent")
+        };
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: "AUTOCODER_TEST_INLINE_PREC_KEY".into(),
+            api_key: Some(SecretSource::Inline {
+                value: "inline-key-wins".into(),
+            }),
+            api_base_url: Some(server.url()),
+            prompt_template_path: None,
+        };
+        let client = build_from_config(&cfg).expect("inline build should succeed");
+        let _ = client.complete("hi").await.expect("complete succeeds");
+        mock.assert_async().await;
+        unsafe { std::env::remove_var("AUTOCODER_TEST_INLINE_PREC_KEY") };
+    }
 
     #[tokio::test]
     async fn anthropic_serializes_request_and_parses_response() {

@@ -569,9 +569,13 @@ mod tests {
             .await;
 
         let mut map = std::collections::HashMap::new();
-        map.insert("fixture-owner".into(), var.into());
+        map.insert(
+            "fixture-owner".into(),
+            crate::config::SecretSource::EnvVar(var.into()),
+        );
         let github_cfg = GithubConfig {
             token_env: fallback.into(),
+            token: None,
             owner_tokens: Some(map),
         };
 
@@ -1579,6 +1583,7 @@ mod tests {
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
+            token: None,
             owner_tokens: None,
         };
         let cancel = CancellationToken::new();
@@ -1641,6 +1646,7 @@ mod tests {
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
+            token: None,
             owner_tokens: None,
         };
         let cancel = CancellationToken::new();

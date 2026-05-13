@@ -258,6 +258,7 @@ mod tests {
             provider: ReviewerProvider::Anthropic,
             model: "x".into(),
             api_key_env: "REVIEWER_TEST_KEY_OVERRIDE".into(),
+            api_key: None,
             api_base_url: None,
             prompt_template_path: Some(template_path),
         };
@@ -285,6 +286,7 @@ mod tests {
             provider: ReviewerProvider::Anthropic,
             model: "x".into(),
             api_key_env: "REVIEWER_TEST_KEY_MISSING_TMPL".into(),
+            api_key: None,
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
         };
@@ -310,6 +312,7 @@ mod tests {
             provider: ReviewerProvider::Anthropic,
             model: "x".into(),
             api_key_env: "REVIEWER_TEST_KEY_DEFAULT".into(),
+            api_key: None,
             api_base_url: None,
             prompt_template_path: None,
         };

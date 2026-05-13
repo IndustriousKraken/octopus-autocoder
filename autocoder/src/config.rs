@@ -1,7 +1,51 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// A secret value sourced from EITHER an environment variable name (bare
+/// YAML string) OR an inline value (`{ value: "..." }` object). Used for
+/// any config field that carries a credential.
+///
+/// Parsing relies on `#[serde(untagged)]`: a YAML string deserializes to
+/// `EnvVar(name)`; a YAML mapping with a `value` key deserializes to
+/// `Inline { value }`. Any other shape produces a deserialize error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SecretSource {
+    /// Bare string: names an environment variable holding the secret.
+    EnvVar(String),
+    /// `{ value: "..." }`: the secret value itself, verbatim.
+    Inline { value: String },
+}
+
+impl SecretSource {
+    /// Read the secret. For `EnvVar`, reads the named env var and errors if
+    /// unset, naming both the env var and the originating config field. For
+    /// `Inline`, returns the value verbatim.
+    pub fn resolve(&self, field_label: &str) -> Result<String> {
+        match self {
+            Self::EnvVar(name) => std::env::var(name).map_err(|_| {
+                anyhow!("secret env var `{name}` for `{field_label}` is not set")
+            }),
+            Self::Inline { value } => Ok(value.clone()),
+        }
+    }
+
+    /// Source description for startup logs. NEVER returns the secret value.
+    pub fn describe(&self, field_label: &str) -> String {
+        match self {
+            Self::EnvVar(name) => format!("env var {name}"),
+            Self::Inline { .. } => format!("inline ({field_label})"),
+        }
+    }
+
+    /// True when this source is an inline value (used to detect "both forms
+    /// set" precedence warnings at startup).
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +102,9 @@ pub struct GithubConfig {
     #[serde(default = "default_github_token_env")]
     pub token_env: String,
     #[serde(default)]
-    pub owner_tokens: Option<HashMap<String, String>>,
+    pub token: Option<SecretSource>,
+    #[serde(default)]
+    pub owner_tokens: Option<HashMap<String, SecretSource>>,
 }
 
 fn default_github_token_env() -> String {
@@ -73,6 +119,8 @@ pub struct ReviewerConfig {
     pub provider: ReviewerProvider,
     pub model: String,
     pub api_key_env: String,
+    #[serde(default)]
+    pub api_key: Option<SecretSource>,
     #[serde(default)]
     pub api_base_url: Option<String>,
     #[serde(default)]
@@ -405,8 +453,14 @@ github:
             .github
             .owner_tokens
             .expect("owner_tokens block should be present");
-        assert_eq!(map.get("rabbeverly").map(String::as_str), Some("PERSONAL_GH_TOKEN"));
-        assert_eq!(map.get("my-org-a").map(String::as_str), Some("ORG_A_GH_TOKEN"));
+        match map.get("rabbeverly").unwrap() {
+            SecretSource::EnvVar(name) => assert_eq!(name, "PERSONAL_GH_TOKEN"),
+            _ => panic!("expected env-var source for rabbeverly"),
+        }
+        match map.get("my-org-a").unwrap() {
+            SecretSource::EnvVar(name) => assert_eq!(name, "ORG_A_GH_TOKEN"),
+            _ => panic!("expected env-var source for my-org-a"),
+        }
         assert_eq!(map.len(), 2);
     }
 
@@ -426,6 +480,156 @@ github:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config without owner_tokens should parse");
         assert!(cfg.github.owner_tokens.is_none());
+    }
+
+    #[test]
+    fn secret_source_parses_bare_string_as_env_var() {
+        let s: SecretSource = serde_yaml::from_str("MY_VAR").unwrap();
+        match s {
+            SecretSource::EnvVar(name) => assert_eq!(name, "MY_VAR"),
+            _ => panic!("bare string must parse as EnvVar"),
+        }
+    }
+
+    #[test]
+    fn secret_source_parses_object_as_inline() {
+        let s: SecretSource = serde_yaml::from_str("value: \"abc123\"").unwrap();
+        match s {
+            SecretSource::Inline { value } => assert_eq!(value, "abc123"),
+            _ => panic!("`{{value: ...}}` must parse as Inline"),
+        }
+    }
+
+    #[test]
+    fn secret_source_resolve_env_var_set() {
+        // SAFETY: unique env var name per test, no parallel mutator.
+        unsafe { std::env::set_var("AUTOCODER_TEST_SECRET_RESOLVE_SET", "x") };
+        let s = SecretSource::EnvVar("AUTOCODER_TEST_SECRET_RESOLVE_SET".into());
+        assert_eq!(s.resolve("test.field").unwrap(), "x");
+        unsafe { std::env::remove_var("AUTOCODER_TEST_SECRET_RESOLVE_SET") };
+    }
+
+    #[test]
+    fn secret_source_resolve_env_var_unset_names_field() {
+        unsafe { std::env::remove_var("AUTOCODER_TEST_SECRET_RESOLVE_UNSET") };
+        let s = SecretSource::EnvVar("AUTOCODER_TEST_SECRET_RESOLVE_UNSET".into());
+        let err = s.resolve("my.field.label").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AUTOCODER_TEST_SECRET_RESOLVE_UNSET"),
+            "error must name env var; got: {msg}"
+        );
+        assert!(
+            msg.contains("my.field.label"),
+            "error must name field label; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_source_resolve_inline() {
+        let s = SecretSource::Inline {
+            value: "verbatim".into(),
+        };
+        assert_eq!(s.resolve("any.label").unwrap(), "verbatim");
+    }
+
+    #[test]
+    fn secret_source_describe_redacts_inline_value() {
+        let inline = SecretSource::Inline {
+            value: "super-secret-token-xyz".into(),
+        };
+        let desc = inline.describe("github.token");
+        assert!(
+            !desc.contains("super-secret-token-xyz"),
+            "describe must NEVER expose the inline value; got: {desc}"
+        );
+        assert_eq!(desc, "inline (github.token)");
+
+        let env = SecretSource::EnvVar("MY_VAR".into());
+        assert_eq!(env.describe("anything"), "env var MY_VAR");
+    }
+
+    #[test]
+    fn loads_github_token_inline() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token:
+    value: "ghp_inlinepat"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with inline github.token should parse");
+        match cfg.github.token.unwrap() {
+            SecretSource::Inline { value } => assert_eq!(value, "ghp_inlinepat"),
+            _ => panic!("expected inline source"),
+        }
+        // token_env default still present:
+        assert_eq!(cfg.github.token_env, "GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn loads_owner_tokens_mixed_env_and_inline() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  owner_tokens:
+    org-with-env-var: ORG_ENV_VAR
+    org-with-inline:
+      value: "ghp_inlinevalue"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("mixed owner_tokens should parse");
+        let map = cfg.github.owner_tokens.expect("present");
+        match map.get("org-with-env-var").unwrap() {
+            SecretSource::EnvVar(n) => assert_eq!(n, "ORG_ENV_VAR"),
+            _ => panic!("env-var entry mis-parsed"),
+        }
+        match map.get("org-with-inline").unwrap() {
+            SecretSource::Inline { value } => assert_eq!(value, "ghp_inlinevalue"),
+            _ => panic!("inline entry mis-parsed"),
+        }
+    }
+
+    #[test]
+    fn loads_reviewer_inline_api_key() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  api_key:
+    value: "sk-ant-inline"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("inline reviewer api_key should parse");
+        let rv = cfg.reviewer.unwrap();
+        match rv.api_key.unwrap() {
+            SecretSource::Inline { value } => assert_eq!(value, "sk-ant-inline"),
+            _ => panic!("expected inline reviewer key"),
+        }
+        // api_key_env still present:
+        assert_eq!(rv.api_key_env, "ANTHROPIC_API_KEY");
     }
 
     #[test]

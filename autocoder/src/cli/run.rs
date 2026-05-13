@@ -7,7 +7,7 @@ use crate::code_reviewer::CodeReviewer;
 use crate::config::{Config, ExecutorKind, GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
-use crate::github_credentials::resolve_token;
+use crate::github_credentials::resolve_token_with_source;
 use crate::polling_loop::ChatOpsContext;
 use crate::{git, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
@@ -138,13 +138,12 @@ pub fn validate_github_token_routes(
                 continue;
             }
         };
-        match resolve_token(github, &owner) {
-            Ok(_) => {
-                let env_var = pick_env_var_name(github, &owner);
+        match resolve_token_with_source(github, &owner) {
+            Ok((_value, source_desc)) => {
                 tracing::info!(
-                    "repository {} will use GitHub token from env var {}",
+                    "repository {} will use GitHub token from {}",
                     repo.url,
-                    env_var
+                    source_desc
                 );
             }
             Err(e) => {
@@ -159,21 +158,22 @@ pub fn validate_github_token_routes(
             failures.join("\n  - ")
         ));
     }
-    Ok(())
-}
-
-/// Return the env-var NAME (not value) that `resolve_token` will read for
-/// this owner. Used only for the startup log line.
-fn pick_env_var_name(github: &GithubConfig, owner: &str) -> String {
-    if let Some(map) = github.owner_tokens.as_ref() {
-        if let Some((_k, env_name)) = map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(owner))
-        {
-            return env_name.clone();
-        }
+    // Precedence warning: if `github.token` is inline AND the env var named
+    // by `github.token_env` is also set, the inline value wins; tell the
+    // operator their env var is being ignored on this field.
+    if github
+        .token
+        .as_ref()
+        .map(|s| s.is_inline())
+        .unwrap_or(false)
+        && std::env::var(&github.token_env).is_ok()
+    {
+        tracing::warn!(
+            "github.token (inline) takes precedence; env var `{}` is being ignored for the global GitHub token",
+            github.token_env
+        );
     }
-    github.token_env.clone()
+    Ok(())
 }
 
 /// Initialize the workspace and check for a dirty working tree. Returns
@@ -306,9 +306,13 @@ mod tests {
         }
 
         let mut map = HashMap::new();
-        map.insert("covered-org".into(), covered_var.into());
+        map.insert(
+            "covered-org".into(),
+            crate::config::SecretSource::EnvVar(covered_var.into()),
+        );
         let github = GithubConfig {
             token_env: fallback_var.into(),
+            token: None,
             owner_tokens: Some(map),
         };
 
@@ -337,6 +341,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_passes_with_inline_owner_token_and_no_env() {
+        // No env vars set for either the owner-specific source or the
+        // fallback; both routes resolved entirely via inline values.
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut map = HashMap::new();
+        map.insert(
+            "fixture-org".into(),
+            crate::config::SecretSource::Inline {
+                value: "inline-org-pat".into(),
+            },
+        );
+        let github = GithubConfig {
+            token_env: "AUTOCODER_TEST_INLINE_ROUTE_FALLBACK_NEVER_SET".into(),
+            token: Some(crate::config::SecretSource::Inline {
+                value: "inline-fallback-pat".into(),
+            }),
+            owner_tokens: Some(map),
+        };
+        let repos = vec![
+            repo("git@github.com:fixture-org/repo.git"),    // owner_tokens hit
+            repo("git@github.com:uncovered-org/repo.git"),  // fallback to github.token inline
+        ];
+        validate_github_token_routes(&github, &repos)
+            .expect("both repos should resolve via inline sources");
+    }
+
+    #[test]
     fn startup_passes_when_every_repo_has_a_route() {
         let _g = ENV_LOCK.lock().unwrap();
         let personal_var = "AUTOCODER_TEST_STARTUP_PERSONAL";
@@ -347,9 +378,13 @@ mod tests {
         }
 
         let mut map = HashMap::new();
-        map.insert("rabbeverly".into(), personal_var.into());
+        map.insert(
+            "rabbeverly".into(),
+            crate::config::SecretSource::EnvVar(personal_var.into()),
+        );
         let github = GithubConfig {
             token_env: fallback_var.into(),
+            token: None,
             owner_tokens: Some(map),
         };
 

@@ -29,17 +29,27 @@ github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.
   token_env: GITHUB_TOKEN
+  # Inline alternative: put the PAT directly in this file instead of an
+  # env var. When `token` is set, `token_env` is ignored. Recommended only
+  # when ~/config.yaml is chmod 600 and you accept secrets-in-YAML.
+  # See README's "Secrets in config.yaml" section.
+  #
+  # token:
+  #   value: "github_pat_yourtokenhere"
+  #
   # Optional: route per-owner PATs by GitHub owner name. Fine-grained PATs
   # can only be issued by the owner of a resource (personal account or org
-  # admin), so multi-account operators need one PAT per owner. Each value
-  # names an environment variable; the resolver picks the matching entry
-  # case-insensitively. Any repository whose owner has no entry falls back
-  # to `token_env`. See README's "Multiple GitHub Tokens" section.
+  # admin), so multi-account operators need one PAT per owner. Each map
+  # value can be a bare string (env var name) OR `{ value: "..." }` for
+  # inline. The resolver picks the matching entry case-insensitively. Any
+  # repository whose owner has no entry falls back to `token` / `token_env`.
+  # See README's "Multiple GitHub Tokens" section.
   #
   # owner_tokens:
-  #   your-personal-handle: PERSONAL_GH_TOKEN
-  #   my-org-a: ORG_A_GH_TOKEN
-  #   my-org-b: ORG_B_GH_TOKEN
+  #   your-personal-handle: PERSONAL_GH_TOKEN        # env var name
+  #   my-org-a: ORG_A_GH_TOKEN                       # env var name
+  #   my-org-b:                                      # inline
+  #     value: "github_pat_xxx_for_org_b"
 
 # -------------------------------------------------------------------------
 # Optional capabilities — disabled by default. Uncomment to enable.
@@ -51,9 +61,17 @@ github:
 #
 # reviewer:
 #   enabled: true
-#   provider: anthropic
-#   model: claude-sonnet-4-6
-#   api_key_env: ANTHROPIC_API_KEY
+#   provider: anthropic                 # supported: `anthropic` | `openai_compatible`
+#   model: claude-sonnet-4-6            # provider-specific model name
+#   api_key_env: ANTHROPIC_API_KEY      # env var holding the API token
+#   # Inline alternative: put the API key directly in this file. When
+#   # `api_key` is set, `api_key_env` is ignored. Same chmod-600 caveat.
+#   # api_key:
+#   #   value: "sk-ant-yourkeyhere"
+#   # api_base_url:                     # optional override; defaults:
+#   #                                   #   anthropic         → https://api.anthropic.com
+#   #                                   #   openai_compatible → https://api.openai.com/v1
+#   #                                   # set this for OpenRouter, Grok, local Ollama, etc.
 
 # Slack ChatOps escalation — when the agent can't proceed without human
 # input, post the question to Slack and resume on reply. See README's

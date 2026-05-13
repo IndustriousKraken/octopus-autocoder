@@ -1,8 +1,5 @@
-# code-reviewer Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change reviewer-integration. Update Purpose after archive.
-## Requirements
 ### Requirement: AI-driven code-quality review
 The code-reviewer SHALL accept a unified diff and a change summary, send
 them to a configured LLM API, and return a structured
@@ -58,19 +55,3 @@ change.
 - **THEN** `code_reviewer.review` returns `Err(_)` whose text contains
   the response status (or transport error description) and, when the
   response body is available, a snippet of it (truncated to 500 chars)
-
-### Requirement: Default prompt template enforces code-quality scope
-The code-reviewer SHALL ship a default prompt template that explicitly limits the review to code-quality concerns and instructs the LLM not to assess spec compliance.
-
-#### Scenario: Default template is shipped with the binary
-- **WHEN** autocoder binary is built
-- **THEN** a file named `prompts/code-review-default.md` is included in the project repository at the relative path `prompts/code-review-default.md`
-- **AND** the template's text contains the literal scope statement: `"You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."`
-- **AND** the template specifies the required response format: a verdict line followed by markdown bullets
-
-#### Scenario: User-provided template overrides default
-- **WHEN** `reviewer.prompt_template_path` is set in config
-- **THEN** the code-reviewer reads the template from that path at startup and uses it instead of the default
-- **AND** if the path does not exist or fails to read, startup returns a `Err(_)` naming the path
-- **AND** no scope enforcement is performed on user-supplied templates (custom templates are user-owned)
-
