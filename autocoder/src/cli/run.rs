@@ -45,18 +45,27 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     let chatops: Option<Arc<ChatOps>> = match cfg.slack.as_ref() {
         Some(s) => {
-            let token = if let Some(inline) = s.bot_token.as_ref() {
-                let resolved = inline.resolve("slack.bot_token")?;
-                if inline.is_inline() && std::env::var(&s.bot_token_env).is_ok() {
-                    tracing::warn!(
-                        "slack.bot_token (inline) takes precedence; env var `{}` is being ignored for the Slack bot token",
-                        s.bot_token_env
-                    );
+            let token = match (s.bot_token.as_ref(), s.bot_token_env.as_ref()) {
+                (Some(inline), env_name_opt) => {
+                    let resolved = inline.resolve("slack.bot_token")?;
+                    if inline.is_inline() {
+                        if let Some(env_name) = env_name_opt {
+                            if std::env::var(env_name).is_ok() {
+                                tracing::warn!(
+                                    "slack.bot_token (inline) takes precedence; env var `{env_name}` is being ignored for the Slack bot token"
+                                );
+                            }
+                        }
+                    }
+                    resolved
                 }
-                resolved
-            } else {
-                crate::config::SecretSource::EnvVar(s.bot_token_env.clone())
-                    .resolve(&format!("slack.bot_token_env={}", s.bot_token_env))?
+                (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+                    .resolve(&format!("slack.bot_token_env={env_name}"))?,
+                (None, None) => {
+                    return Err(anyhow::anyhow!(
+                        "slack config has neither `bot_token` (inline) nor `bot_token_env` (env var name) set"
+                    ));
+                }
             };
             let client = ChatOps::new(token)
                 .await

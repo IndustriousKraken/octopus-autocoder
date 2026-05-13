@@ -37,18 +37,20 @@ Edit `config.yaml` and set the `url:` value to your repository. The shipped exam
 ```bash
 cd autocoder
 cargo build --release
-cp target/release/autocoder ~/autocoder        # or somewhere in PATH where you want to install this
+sudo cp target/release/autocoder /usr/local/bin/autocoder
 cd ..
-cp config.yaml ~/config.yaml                   # so the binary and its config sit side-by-side outside the repo
+mkdir -p ~/autocoder
+cp config.yaml ~/autocoder/config.yaml
+chmod 600 ~/autocoder/config.yaml
 ```
 
-The build produces a `~10 MB` self-contained binary. Run time needs only `config.yaml` and (optionally) a `prompts/` directory for a customized code-reviewer prompt. The `--config` flag accepts any absolute path; install the binary anywhere on `$PATH` if `~/autocoder` doesn't suit you.
+The build produces a `~10 MB` self-contained binary. Run time needs only `config.yaml` and (optionally) a `prompts/` directory for a customized code-reviewer prompt. The `--config` flag accepts any absolute path.
 
 ### 4. Run it
 
 ```bash
 export GITHUB_TOKEN=ghp_yourfinegrained_token_here
-RUST_LOG=info ~/autocoder run --config ~/config.yaml
+RUST_LOG=info autocoder run --config ~/autocoder/config.yaml
 ```
 
 > **Multiple GitHub accounts/orgs?** Skip the `GITHUB_TOKEN` export and use the [Multiple GitHub Tokens](#multiple-github-tokens) section to configure `github.owner_tokens:` in `config.yaml` instead.
@@ -401,11 +403,11 @@ The Claude credentials now live at `/home/autocoder/.claude/`. They survive rest
 ### 3. Stage the working directory
 
 ```bash
-sudo mkdir -p /opt/autocoder
-sudo cp config.example.yaml /opt/autocoder/config.yaml
-sudo chown -R autocoder:autocoder /opt/autocoder
-sudo -u autocoder $EDITOR /opt/autocoder/config.yaml   # edit repo URLs, and inline secrets if you chose that path
-sudo chmod 600 /opt/autocoder/config.yaml              # restrictive perms regardless of secret path
+sudo mkdir -p /home/autocoder/autocoder
+sudo cp config.example.yaml /home/autocoder/autocoder/config.yaml
+sudo chown -R autocoder:autocoder /home/autocoder/autocoder
+sudo -u autocoder $EDITOR /home/autocoder/autocoder/config.yaml   # edit repo URLs, and inline secrets if you chose that path
+sudo chmod 600 /home/autocoder/autocoder/config.yaml              # restrictive perms regardless of secret path
 ```
 
 ### 4. Set up the systemd service
@@ -424,8 +426,8 @@ After=network.target
 [Service]
 Type=simple
 User=autocoder
-WorkingDirectory=/home/autocoder
-ExecStart=/home/autocoder/autocoder run --config /home/autocoder/config.yaml
+WorkingDirectory=/home/autocoder/autocoder
+ExecStart=/usr/local/bin/autocoder run --config /home/autocoder/autocoder/config.yaml
 Restart=on-failure
 RestartSec=60
 
@@ -445,12 +447,12 @@ After=network.target
 [Service]
 Type=simple
 User=autocoder
-WorkingDirectory=/home/autocoder
+WorkingDirectory=/home/autocoder/autocoder
 
 # Required only if your config.yaml uses *_env fields (env-var secret path).
 EnvironmentFile=/etc/autocoder.env
 
-ExecStart=/home/autocoder/autocoder run --config /opt/autocoder/config.yaml
+ExecStart=/usr/local/bin/autocoder run --config /home/autocoder/autocoder/config.yaml
 Restart=on-failure
 RestartSec=60
 
@@ -535,7 +537,7 @@ autocoder clones repositories into `/tmp/workspaces/`. Ensure this partition has
 
 - Write access to `/tmp/workspaces/`
 - Write access to its own `~/.claude/` (for Claude Code credentials)
-- Read access to `/opt/autocoder/config.yaml`
+- Read access to `/home/autocoder/autocoder/config.yaml`
 
 ### 5. Secrets in `config.yaml` (inline vs env-var)
 

@@ -159,18 +159,27 @@ impl LlmClient for OpenAiCompatibleClient {
 /// Construct the right `LlmClient` for the configured provider. Reads the
 /// API key from the environment variable named by `cfg.api_key_env`.
 pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
-    let api_key = if let Some(inline) = cfg.api_key.as_ref() {
-        let key = inline.resolve("reviewer.api_key")?;
-        if std::env::var(&cfg.api_key_env).is_ok() && inline.is_inline() {
-            tracing::warn!(
-                "reviewer.api_key (inline) takes precedence; env var `{}` is being ignored for the reviewer key",
-                cfg.api_key_env
-            );
+    let api_key = match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("reviewer.api_key")?;
+            if inline.is_inline() {
+                if let Some(env_name) = env_name_opt {
+                    if std::env::var(env_name).is_ok() {
+                        tracing::warn!(
+                            "reviewer.api_key (inline) takes precedence; env var `{env_name}` is being ignored for the reviewer key"
+                        );
+                    }
+                }
+            }
+            key
         }
-        key
-    } else {
-        crate::config::SecretSource::EnvVar(cfg.api_key_env.clone())
-            .resolve(&format!("reviewer.api_key_env={}", cfg.api_key_env))?
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!("reviewer.api_key_env={env_name}"))?,
+        (None, None) => {
+            return Err(anyhow!(
+                "reviewer config has neither `api_key` (inline) nor `api_key_env` (env var name) set"
+            ));
+        }
     };
     let provider = cfg.provider;
     let model = cfg.model.clone();
@@ -193,6 +202,58 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_from_config_errors_when_no_key_source_set() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: None,
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: None,
+        };
+        let err = match build_from_config(&cfg) {
+            Ok(_) => panic!("no key source must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("api_key") && msg.contains("api_key_env"),
+            "error must name both fields; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_from_config_succeeds_with_inline_only() {
+        use crate::config::{ReviewerConfig, ReviewerProvider, SecretSource};
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("x-api-key", "sk-inline-only")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"content":[{"type":"text","text":"ok"}]}"#)
+            .create_async()
+            .await;
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: None,
+            api_key: Some(SecretSource::Inline {
+                value: "sk-inline-only".into(),
+            }),
+            api_base_url: Some(server.url()),
+            prompt_template_path: None,
+        };
+        let client = build_from_config(&cfg)
+            .expect("inline api_key with no api_key_env should succeed");
+        let _ = client.complete("hi").await.expect("complete succeeds");
+        mock.assert_async().await;
+    }
 
     /// `build_from_config` MUST use `reviewer.api_key` (inline) verbatim and
     /// SHOULD NOT touch `reviewer.api_key_env`'s env var even if it happens
@@ -222,7 +283,7 @@ mod tests {
             enabled: true,
             provider: ReviewerProvider::Anthropic,
             model: "claude-sonnet-4-6".into(),
-            api_key_env: "AUTOCODER_TEST_INLINE_PREC_KEY".into(),
+            api_key_env: Some("AUTOCODER_TEST_INLINE_PREC_KEY".into()),
             api_key: Some(SecretSource::Inline {
                 value: "inline-key-wins".into(),
             }),

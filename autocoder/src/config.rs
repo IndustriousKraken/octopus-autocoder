@@ -118,7 +118,8 @@ pub struct ReviewerConfig {
     pub enabled: bool,
     pub provider: ReviewerProvider,
     pub model: String,
-    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<SecretSource>,
     #[serde(default)]
@@ -138,7 +139,8 @@ pub enum ReviewerProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlackConfig {
-    pub bot_token_env: String,
+    #[serde(default)]
+    pub bot_token_env: Option<String>,
     #[serde(default)]
     pub bot_token: Option<SecretSource>,
     pub default_channel_id: String,
@@ -320,7 +322,7 @@ reviewer:
         assert!(rv.enabled);
         assert_eq!(rv.provider, ReviewerProvider::Anthropic);
         assert_eq!(rv.model, "claude-sonnet-4-6");
-        assert_eq!(rv.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
     }
@@ -385,7 +387,7 @@ slack:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         let slack = cfg.slack.expect("slack block present");
-        assert_eq!(slack.bot_token_env, "SLACK_BOT_TOKEN");
+        assert_eq!(slack.bot_token_env.as_deref(), Some("SLACK_BOT_TOKEN"));
         assert_eq!(slack.default_channel_id, "C0DEFAULT");
         assert_eq!(
             cfg.repositories[0].slack_channel_id.as_deref(),
@@ -628,7 +630,59 @@ slack:
             SecretSource::Inline { value } => assert_eq!(value, "xoxb-inline"),
             _ => panic!("expected inline slack bot token"),
         }
-        assert_eq!(slack.bot_token_env, "SLACK_BOT_TOKEN");
+        assert_eq!(slack.bot_token_env.as_deref(), Some("SLACK_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn loads_reviewer_inline_api_key_without_env_name() {
+        // The point of the fix: with `api_key` inline set, `api_key_env`
+        // is not required in YAML.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key:
+    value: "sk-ant-inline-only"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path)
+            .expect("reviewer with inline api_key and no api_key_env should parse");
+        let rv = cfg.reviewer.unwrap();
+        assert!(rv.api_key_env.is_none());
+        assert!(rv.api_key.is_some());
+    }
+
+    #[test]
+    fn loads_slack_inline_bot_token_without_env_name() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token:
+    value: "xoxb-inline-only"
+  default_channel_id: C0DEFAULT
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path)
+            .expect("slack with inline bot_token and no bot_token_env should parse");
+        let slack = cfg.slack.unwrap();
+        assert!(slack.bot_token_env.is_none());
+        assert!(slack.bot_token.is_some());
     }
 
     #[test]
@@ -658,7 +712,7 @@ reviewer:
             _ => panic!("expected inline reviewer key"),
         }
         // api_key_env still present:
-        assert_eq!(rv.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     }
 
     #[test]
