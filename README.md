@@ -39,15 +39,16 @@ cd autocoder
 cargo build --release
 cp target/release/autocoder ~/autocoder        # or somewhere in PATH where you want to install this
 cd ..
+cp config.yaml ~/config.yaml                   # so the binary and its config sit side-by-side outside the repo
 ```
 
-The build produces a `~10 MB` self-contained binary. Nothing else needs to be present at run time except your `config.yaml` and the optional `prompts/` directory if you customize the code-reviewer prompt later. You can copy the binary anywhere on `$PATH` instead of `~/autocoder` if you prefer.
+The build produces a `~10 MB` self-contained binary. Nothing else needs to be present at run time except your `config.yaml` and the optional `prompts/` directory if you customize the code-reviewer prompt later. You can copy the binary anywhere on `$PATH` instead of `~/autocoder` if you prefer; the `--config` flag takes any absolute path.
 
 ### 4. Run it
 
 ```bash
 export GITHUB_TOKEN=ghp_yourfinegrained_token_here     # single-PAT setup; see below if you have repos across multiple owners
-RUST_LOG=info ~/autocoder run --config config.yaml
+RUST_LOG=info ~/autocoder run --config ~/config.yaml
 ```
 
 > **Multiple GitHub accounts/orgs?** Don't bother with `GITHUB_TOKEN` — skip ahead to [Multiple GitHub Tokens](#multiple-github-tokens) and configure `github.owner_tokens:` in your `config.yaml` instead. Fine-grained PATs are scoped to one owner each, so most multi-account operators end up there anyway.
