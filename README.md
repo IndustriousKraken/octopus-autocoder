@@ -37,16 +37,20 @@ Edit `config.yaml` and set the single `url:` value to your repository. The shipp
 ```bash
 cd autocoder
 cargo build --release
+cp target/release/autocoder ~/autocoder        # or somewhere in PATH where you want to install this
+cd ..
 ```
 
-This produces `target/release/autocoder` (~10 MB). The binary is self-contained — no other files need to be present at run time, except your `config.yaml` and the optional `prompts/` directory if you customize the code-reviewer prompt later.
+The build produces a `~10 MB` self-contained binary. Nothing else needs to be present at run time except your `config.yaml` and the optional `prompts/` directory if you customize the code-reviewer prompt later. You can copy the binary anywhere on `$PATH` instead of `~/autocoder` if you prefer.
 
 ### 4. Run it
 
 ```bash
-export GITHUB_TOKEN=ghp_yourfinegrained_token_here
-RUST_LOG=info ./target/release/autocoder run --config config.yaml
+export GITHUB_TOKEN=ghp_yourfinegrained_token_here     # single-PAT setup; see below if you have repos across multiple owners
+RUST_LOG=info ~/autocoder run --config config.yaml
 ```
+
+> **Multiple GitHub accounts/orgs?** Don't bother with `GITHUB_TOKEN` — skip ahead to [Multiple GitHub Tokens](#multiple-github-tokens) and configure `github.owner_tokens:` in your `config.yaml` instead. Fine-grained PATs are scoped to one owner each, so most multi-account operators end up there anyway.
 
 You should see (within a few seconds):
 
@@ -122,7 +126,7 @@ autocoder resolves this by routing PATs per **repository owner** (the segment be
 github:
   token_env: GITHUB_TOKEN              # fallback for any owner not in the map below
   owner_tokens:
-    rabbeverly:  PERSONAL_GH_TOKEN     # owner → env var name (not the token value)
+    my-personal-gh:  PERSONAL_GH_TOKEN     # owner → env var name (not the token value)
     my-org-a:    ORG_A_GH_TOKEN
     my-org-b:    ORG_B_GH_TOKEN
 
