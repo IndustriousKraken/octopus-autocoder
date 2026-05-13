@@ -425,7 +425,7 @@ After=network.target
 Type=simple
 User=autocoder
 WorkingDirectory=/home/autocoder
-ExecStart=/home/autocoder/autocoder run --config /opt/autocoder/config.yaml
+ExecStart=/home/autocoder/autocoder run --config /home/autocoder/config.yaml
 Restart=on-failure
 RestartSec=60
 
