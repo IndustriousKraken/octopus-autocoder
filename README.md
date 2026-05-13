@@ -26,7 +26,7 @@ On the machine where the daemon will run:
 
 ```bash
 git clone https://github.com/rabbeverly/cicd-impl-agents.git
-cd cicd-impl-agents
+cd openspec-autocoder
 cp config.example.yaml config.yaml
 ```
 
@@ -35,6 +35,7 @@ Edit `config.yaml` and set the single `url:` value to your repository. The shipp
 ### 3. Build the daemon
 
 ```bash
+cd autocoder
 cargo build --release
 ```
 
