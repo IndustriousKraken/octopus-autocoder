@@ -19,7 +19,7 @@ On the machine where the daemon will run:
   - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
   - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is essentially never needed there; only relevant for some private GHE configurations.
 
-  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Note: fine-grained PATs are scoped to a single account or organization. If your `config.yaml` has repos across multiple owners (personal + one or more orgs), see the [Multiple GitHub Tokens](#multiple-github-tokens) section below — one autocoder instance can route a different PAT per owner via the optional `github.owner_tokens:` config map.
+  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Fine-grained PATs are scoped to a single account or organization; multi-owner setups use [Multiple GitHub Tokens](#multiple-github-tokens) instead.
 - **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
 
 ### 2. Clone and configure
@@ -30,7 +30,7 @@ cd openspec-autocoder
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` and set the single `url:` value to your repository. The shipped example uses `git@github.com:your-org/your-repo.git` as a placeholder. Everything else (executor, github token env var, polling interval) works out of the box for a Claude-Code-on-this-host setup; no API keys go in this file.
+Edit `config.yaml` and set the `url:` value to your repository. The shipped example uses `git@github.com:your-org/your-repo.git` as a placeholder.
 
 ### 3. Build the daemon
 
@@ -42,16 +42,16 @@ cd ..
 cp config.yaml ~/config.yaml                   # so the binary and its config sit side-by-side outside the repo
 ```
 
-The build produces a `~10 MB` self-contained binary. Nothing else needs to be present at run time except your `config.yaml` and the optional `prompts/` directory if you customize the code-reviewer prompt later. You can copy the binary anywhere on `$PATH` instead of `~/autocoder` if you prefer; the `--config` flag takes any absolute path.
+The build produces a `~10 MB` self-contained binary. Run time needs only `config.yaml` and (optionally) a `prompts/` directory for a customized code-reviewer prompt. The `--config` flag accepts any absolute path; install the binary anywhere on `$PATH` if `~/autocoder` doesn't suit you.
 
 ### 4. Run it
 
 ```bash
-export GITHUB_TOKEN=ghp_yourfinegrained_token_here     # single-PAT setup; see below if you have repos across multiple owners
+export GITHUB_TOKEN=ghp_yourfinegrained_token_here
 RUST_LOG=info ~/autocoder run --config ~/config.yaml
 ```
 
-> **Multiple GitHub accounts/orgs?** Don't bother with `GITHUB_TOKEN` — skip ahead to [Multiple GitHub Tokens](#multiple-github-tokens) and configure `github.owner_tokens:` in your `config.yaml` instead. Fine-grained PATs are scoped to one owner each, so most multi-account operators end up there anyway.
+> **Multiple GitHub accounts/orgs?** Skip the `GITHUB_TOKEN` export and use the [Multiple GitHub Tokens](#multiple-github-tokens) section to configure `github.owner_tokens:` in `config.yaml` instead.
 
 You should see (within a few seconds):
 
@@ -159,7 +159,7 @@ RUST_LOG=info ./target/release/autocoder run --config config.yaml
 
 ### Startup behavior
 
-Before spawning any polling task, autocoder iterates every configured repository and resolves a token route for each. If any repo's owner has no matching `owner_tokens` entry AND its fallback (`token_env`'s named env var) is unset, the daemon exits non-zero immediately, naming the unmappable repo. This catches typos and missing env vars at boot, not five minutes later on the first PR attempt.
+Before spawning any polling task, autocoder iterates every configured repository and resolves a token route for each. If any repo's owner has no matching `owner_tokens` entry AND its fallback (`token_env`'s named env var) is unset, the daemon exits non-zero immediately, naming the unmappable repo.
 
 On success, autocoder emits one log line per repo naming the env var (never the token value):
 
@@ -177,7 +177,7 @@ INFO repository git@github.com:my-org-b/another-repo.git will use GitHub token f
 
 ### Inline owner-token values
 
-Each map value can be either an env var name (bare string) or an inline value (`{ value: "..." }`). Mixed maps are fine:
+Each map value can be either an env var name (bare string) or an inline value (`{ value: "..." }`); the two forms can be mixed in one map:
 
 ```yaml
 github:
@@ -189,10 +189,6 @@ github:
 
 See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for the security tradeoff.
 
-### Backward compatibility
-
-A config with only `token_env: GITHUB_TOKEN` and no `owner_tokens` works exactly as before. The field is purely additive.
-
 ### git operations are separate
 
 This routing affects only HTTP calls to GitHub's REST API (PR creation, optional label fallback). Git operations (`clone`, `fetch`, `push`) go through whichever authentication `git` itself uses — your SSH key, an HTTPS credential helper, etc.
@@ -201,7 +197,7 @@ This routing affects only HTTP calls to GitHub's REST API (PR creation, optional
 
 ### Non-goal: per-repository overrides
 
-If two repos under the same owner need different tokens (rare), this design does not support it. Open an issue if you hit that case; the natural extension is a `github_token_env` field on each `repositories[]` entry, but it's not in this implementation.
+Two repositories under the same owner cannot use different tokens. Token routing is per-owner only.
 
 ---
 
@@ -214,7 +210,7 @@ Built capabilities (each is a baseline spec under `openspec/specs/`):
 1. **orchestrator-cli** — the `run` daemon entry point and the `rewind` recovery subcommand. Multi-repo dispatch with a shared cancellation token; per-repo polling tasks; SIGINT/SIGTERM drain.
 2. **workspace-manager** — deterministic per-repo workspace paths under `/tmp/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, and a startup dirty-workspace check that permanently skips contaminated repos for the process lifetime.
 3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion with `YYYY-MM-DD-<change>` date prefix, unarchive on rewind.
-4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout, two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop), and a real `resume()` implementation.
+4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout and two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop).
 5. **git-workflow-manager** — branch init (`fetch → checkout base → pull --ff-only → checkout -B agent`), per-change commits with `<change>: <first line of ## Why>` subject truncated to 72 chars, monolithic PR creation via the GitHub REST API with `--force-with-lease` push.
 6. **chatops-manager** — Slack escalation. On `AskUser`, the daemon posts a question to a configured channel and persists `.question.json` to disk. On the next iteration it polls the Slack thread; when the first non-bot reply arrives it writes `.answer.json` and resumes the executor. Same-repo serial-queue invariant is preserved: any waiting change in a repository blocks all pending-change processing for that repo until resolved.
 7. **code-reviewer** — opt-in AI code-quality review of the diff between base and agent branches. Configurable LLM provider (Anthropic or any OpenAI-compatible endpoint, including Grok, OpenRouter, local Ollama). A `Block` verdict creates the PR as a draft (with a `do-not-merge` label fallback on hosts that reject drafts).
@@ -251,13 +247,14 @@ repositories:
 
 ### Required Slack bot scopes
 
-The Slack app's bot token must have at least these OAuth scopes:
+A **private channel** is the recommended deployment — it keeps non-operators from prompting the agent. The Slack app's bot token must have:
 
 - `chat:write` — post the escalation message into the channel.
-- `channels:history` — read thread replies on public channels.
-- `channels:read` — list channels (for token validation).
+- `groups:history` — read thread replies in private channels (use `channels:history` instead if you deploy against a public channel).
 
-autocoder does NOT need `users:read` or any user-level scopes; reply attribution is by Slack user id only.
+`auth.test` is scope-less, so the bot's identity check at startup needs nothing further. `users:read` is not required — reply attribution is by Slack user id only.
+
+After installing the app, invite the bot to the channel (`/invite @YourAppName`); otherwise `chat.postMessage` returns `not_in_channel`.
 
 ### What gets posted
 
@@ -333,7 +330,7 @@ If the LLM's response cannot be parsed for a verdict, the daemon defaults to `Co
 
 ### Block-verdict enforcement (recommended)
 
-autocoder does its part by creating the PR as a draft. To make `Block` actually gate merge, configure a branch-protection rule on the PR target branch that **requires PRs not be draft**. Without that rule, anyone with write access can flip the draft state and merge.
+autocoder marks Block-verdict PRs as draft. To make this gate merge, configure a branch-protection rule on the PR target branch that **requires PRs not be draft**. Without that rule, anyone with write access can flip the draft state and merge.
 
 On hosts that don't support drafts (some private GHE configurations, certain repo types), autocoder falls back automatically: it retries the PR creation with `draft: false` and applies a `do-not-merge` label via the issues-labels endpoint. Configure your branch protection to require the absence of that label as the fallback gate.
 
@@ -381,7 +378,7 @@ The `rewind` subcommand throws away the in-flight agent branch and re-queues one
 
 ## Deployment
 
-For production, run autocoder as a systemd service on a dedicated Linux host. The daemon handles its own polling, so do NOT wrap it in a cron job.
+For production, run autocoder as a systemd service on a dedicated Linux host. The daemon polls on its own — do not wrap it in a cron job.
 
 ### 1. Install the binary
 
@@ -407,12 +404,17 @@ The Claude credentials now live at `/home/autocoder/.claude/`. They survive rest
 sudo mkdir -p /opt/autocoder
 sudo cp config.example.yaml /opt/autocoder/config.yaml
 sudo chown -R autocoder:autocoder /opt/autocoder
-sudo -u autocoder $EDITOR /opt/autocoder/config.yaml   # edit the repo URLs
+sudo -u autocoder $EDITOR /opt/autocoder/config.yaml   # edit repo URLs, and inline secrets if you chose that path
+sudo chmod 600 /opt/autocoder/config.yaml              # restrictive perms regardless of secret path
 ```
 
 ### 4. Set up the systemd service
 
-Create `/etc/systemd/system/autocoder.service`:
+Pick one of the two secret-delivery paths below depending on what you put in your `config.yaml` (see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var)).
+
+#### Path A — inline secrets (recommended for single-host deployments)
+
+With secrets inline in `config.yaml` (`github.token`, `reviewer.api_key`, `slack.bot_token`), the unit needs no env vars. Create `/etc/systemd/system/autocoder.service`:
 
 ```ini
 [Unit]
@@ -422,22 +424,41 @@ After=network.target
 [Service]
 Type=simple
 User=autocoder
-WorkingDirectory=/opt/autocoder
-
-# GitHub PAT (required). Other env vars (e.g. ANTHROPIC_API_KEY for the
-# reviewer, SLACK_BOT_TOKEN for ChatOps) are only needed if the matching
-# config block is enabled.
-EnvironmentFile=/etc/autocoder.env
-
-ExecStart=/usr/local/bin/autocoder run --config /opt/autocoder/config.yaml
+WorkingDirectory=/home/autocoder
+ExecStart=/home/autocoder/autocoder run --config /opt/autocoder/config.yaml
 Restart=on-failure
-RestartSec=10
+RestartSec=60
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Create `/etc/autocoder.env` with the secrets (mode `0600`, owned by root):
+#### Path B — env-var secrets (multi-user hosts, classical production pattern)
+
+With `*_env` fields in `config.yaml` (no inline secrets), add an `EnvironmentFile=` directive pointing at a separate, root-owned env file:
+
+```ini
+[Unit]
+Description=autocoder — autonomous OpenSpec implementation daemon
+After=network.target
+
+[Service]
+Type=simple
+User=autocoder
+WorkingDirectory=/home/autocoder
+
+# Required only if your config.yaml uses *_env fields (env-var secret path).
+EnvironmentFile=/etc/autocoder.env
+
+ExecStart=/home/autocoder/autocoder run --config /opt/autocoder/config.yaml
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create `/etc/autocoder.env` (mode `0600`, owned by root):
 
 ```
 # Single-owner setups: a single PAT named by `github.token_env` in config.yaml.
@@ -451,10 +472,12 @@ GITHUB_TOKEN=ghp_yourtokenhere
 # ORG_A_GH_TOKEN=github_pat_xxx_org_a
 # ORG_B_GH_TOKEN=github_pat_xxx_org_b
 
-# Optional:
+# Optional, only if the matching config block is enabled and uses *_env:
 # ANTHROPIC_API_KEY=...
 # SLACK_BOT_TOKEN=xoxb-...
 ```
+
+You can also mix the two paths per-secret — e.g. inline `github.token` but `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file only carries the env-var-sourced secrets.
 
 ### 5. Start it
 
@@ -536,19 +559,18 @@ reviewer:
     value: "sk-ant-..."                     # inline
 ```
 
-When both forms are set on the same logical field, the inline value wins and autocoder logs a `warn`-level line at startup naming the env var being ignored. Startup logs name the *source* (`inline (github.token)` or `env var GITHUB_TOKEN`) so an audit can confirm which secrets live in YAML.
+When both forms are set on the same logical field, the inline value wins and autocoder logs a `warn`-level line at startup naming the env var being ignored. Startup logs name the source (`inline (github.token)` or `env var GITHUB_TOKEN`) so an audit can confirm which secrets live in YAML.
 
-**Pick env-var for:** multi-user hosts, systemd-managed deployments (the existing `EnvironmentFile=/etc/autocoder.env` pattern), and any setup where you want secrets out of YAML so the config file can be readable for audit without exposing tokens.
+**Env-var form:** secrets stay out of `config.yaml`. Suits multi-user hosts and systemd deployments with `EnvironmentFile=/etc/autocoder.env`.
 
-**Pick inline for:** single-host, single-user deployments where collapsing the daemon to one edited file (`~/config.yaml`) is worth the YAML-secrets tradeoff. If you go inline:
+**Inline form:** secrets live in `config.yaml`. Suits single-host, single-user deployments where one file is easier to manage than two. Requirements:
 
-- `chmod 600 ~/config.yaml` and own it as the autocoder user.
-- Never commit the file. Ensure your `.gitignore` covers it (the project root's `.gitignore` already excludes `config.yaml` by name).
-- Treat the file like an SSH private key for backup and host-migration purposes.
+- `chmod 600` on the config file, owned by the autocoder user.
+- Never commit it. The project root's `.gitignore` already excludes `config.yaml` by name.
 
 ### 6. Dedicated, non-SSH user (recommended)
 
-For a little extra defense in depth, run autocoder as a dedicated user (`autocoder`) that has no SSH login. Authenticate Claude Code as that user (`sudo -iu autocoder claude auth login`) and keep `config.yaml`, `~/.claude/`, and the daemon's process under that uid. If your interactive login user is compromised, the attacker still has to clear an additional uid boundary (sudo with a password, a suid binary, or a kernel exploit) to reach autocoder's secrets — meaningful protection if your login user is not a passwordless sudoer, cosmetic if it is. The Deployment section's systemd setup uses this pattern by default; on a single-user host it's still worth the small extra setup.
+Run autocoder as a dedicated user (`autocoder`) with no SSH login. Authenticate Claude Code as that user (`sudo -iu autocoder claude auth login`) and keep `config.yaml`, `~/.claude/`, and the daemon's process under that uid. A compromised login user must then clear an additional uid boundary to reach autocoder's secrets — meaningful when the login user is not a passwordless sudoer. The Deployment section's systemd setup follows this pattern.
 
 ---
 
@@ -622,7 +644,7 @@ The seven capabilities listed under [Architecture](#architecture) are all **impl
 The following capabilities are **explicitly aspirational** — referenced in design documents but not built:
 
 - **Verifier** *(planned; not in any active change)*: a spec-audit step that runs alongside the code reviewer and asks "did the diff actually implement the spec?" The reviewer agent currently focuses on code quality and explicitly does not assess spec compliance. Until the verifier ships, spec correctness is a human-review concern.
-- **Drift audit** *(planned; not in any active change)*: a periodic whole-repo verification that catches gradual divergence between the baseline `openspec/specs/` and the code. Until this ships, the per-change architecture-baseline cross-reference section (e.g. section 13 of an archived change like `orchestrator-foundation`) is the closest equivalent — it runs once at change-archive time, not continuously.
+- **Drift audit** *(planned; not in any active change)*: a periodic whole-repo verification that catches gradual divergence between the baseline `openspec/specs/` and the code. Until this ships, the per-change architecture cross-reference (run once at change-archive time) is the closest equivalent.
 
 Other items deferred without a current owner:
 
@@ -630,7 +652,7 @@ Other items deferred without a current owner:
 - **Per-repo executor configuration overrides.** The `executor:` block is global; mixing Claude on one repo and a different backend on another in the same config is not supported.
 - **Streaming or incremental code review.** The reviewer sends the full diff in one LLM call; truncation at 100k chars is documented in `prompts/code-review-default.md`.
 
-If you build something that depends on an aspirational item, file an issue or open an OpenSpec change proposal in this repository — autocoder can dogfood its own development once a sandbox is wired up (with appropriate self-modification guardrails; see [AI Security & Guardrails](#ai-security--guardrails)).
+To request an aspirational item, file an issue or open an OpenSpec change proposal in this repository. Self-modification guardrails apply when autocoder works on its own codebase; see [AI Security & Guardrails](#ai-security--guardrails).
 
 ---
 
