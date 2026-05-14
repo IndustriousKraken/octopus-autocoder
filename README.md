@@ -258,6 +258,42 @@ repositories:
     slack_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
 ```
 
+### Progress notifications
+
+In addition to escalation, autocoder posts two **operator-facing** notification streams to the same chatops channel — a low-volume activity feed so a channel-watching operator can tell at a glance whether the daemon is alive and what it is doing.
+
+**Start-of-work** — one line per change pickup:
+
+```
+🚀 `<repo-url>`: starting work on `<change-name>` — <first line of ## Why>
+```
+
+Fires immediately after the change's `.in-progress` lock is created and BEFORE the executor is invoked.
+
+**Throttled failure alerts** — emitted at most once every 24 hours per (repository, failure category) for three categories of *predictable* infrastructure failure: workspace init / clone failure, branch push rejection, and PR creation 4xx from GitHub. Format:
+
+```
+⚠️ `<repo-url>`: <category-label> for the past 24h. Latest: <error excerpt>
+```
+
+The 24h throttle state lives in a per-workspace `.alert-state.json` file. On the next successful iteration the file is removed, so a transient outage followed by recovery does not leave the next failure (whenever it occurs) silenced.
+
+Other failure surfaces — executor returning `Failed`, reviewer LLM call errors, the chatops post itself failing — are deliberately out of scope and never produce a categorized alert.
+
+Configure independently under `slack.notifications`:
+
+```yaml
+slack:
+  # existing fields...
+  notifications:
+    start_work: true       # default true; one message per change pickup
+    failure_alerts: true   # default true; throttled per (repo, category)
+```
+
+Both keys are optional. An absent `notifications:` block parses to "both true" — first-time deployments see useful chatops traffic without further configuration. Set a key to `false` to suppress that stream without affecting the other.
+
+If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
+
 ### Required Slack bot scopes
 
 A **private channel** is the recommended deployment — it keeps non-operators from prompting the agent. The Slack app's bot token must have:
@@ -300,9 +336,13 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 2. **Manually delete `.question.json`** — reverts the change to pending state. The next iteration re-runs it from scratch (without the answer). Useful when the question was a false positive or the change should restart.
 3. **`autocoder rewind <change>`** — full reset: deletes the agent branch, unarchives if needed, clears all `.question.json` / `.answer.json` markers via the rewind path.
 
-### `.question.json` and `.answer.json` as workspace artifacts
+### `.question.json`, `.answer.json`, and `.alert-state.json` as workspace artifacts
 
-These files are written by autocoder into the workspace alongside the change's `proposal.md`. They are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the marker files with it; they're not deleted separately.
+These files are written by autocoder into the workspace as bookkeeping. `.question.json` and `.answer.json` live alongside the change's `proposal.md`; `.alert-state.json` lives at the workspace root and tracks the per-(repo, category) 24h-alert throttle for [progress notifications](#progress-notifications).
+
+All three are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the change-scoped marker files with it; `.alert-state.json` is cleared whenever the polling pass completes without hitting any of the three predictable-failure sites.
+
+Deleting `.alert-state.json` by hand is harmless: it just resets the alert throttle window for that repository, so the next predictable failure will alert immediately rather than wait out the 24h window.
 
 ---
 

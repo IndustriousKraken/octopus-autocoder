@@ -520,6 +520,53 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // post_notification
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_notification_posts_to_chat_postmessage() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_header("authorization", "Bearer xoxb-test")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0FOO","text":"hello world"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1234567890.000000"}"#)
+            .create_async()
+            .await;
+
+        chatops
+            .post_notification("C0FOO", "hello world")
+            .await
+            .expect("notification posts successfully");
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_notification_returns_err_on_ok_false() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        let _ = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .create_async()
+            .await;
+        let err = must_err(
+            chatops.post_notification("CBAD", "hi").await,
+            "ok:false must error",
+        );
+        assert!(
+            format!("{err:#}").contains("channel_not_found"),
+            "error must contain slack error field verbatim; got: {err:#}"
+        );
+    }
+
+    // ----------------------------------------------------------------
     // poll_thread_for_human_reply
     // ----------------------------------------------------------------
 
