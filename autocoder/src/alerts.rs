@@ -108,12 +108,12 @@ pub async fn handle_predictable_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chatops::ChatOps;
+    use crate::chatops::{ChatOpsBackend, SlackBackend};
     use anyhow::anyhow;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn fixture_chatops(server: &mut mockito::Server) -> Arc<ChatOps> {
+    async fn fixture_chatops(server: &mut mockito::Server) -> Arc<dyn ChatOpsBackend> {
         let _auth = server
             .mock("POST", "/auth.test")
             .with_status(200)
@@ -121,13 +121,13 @@ mod tests {
             .create_async()
             .await;
         Arc::new(
-            ChatOps::new_at(server.url(), "xoxb-fixture".into())
+            SlackBackend::new_at(server.url(), "xoxb-fixture".into())
                 .await
                 .unwrap(),
         )
     }
 
-    fn make_ctx(chatops: Arc<ChatOps>) -> ChatOpsContext {
+    fn make_ctx(chatops: Arc<dyn ChatOpsBackend>) -> ChatOpsContext {
         ChatOpsContext {
             chatops,
             channel: "C_FIXTURE".to_string(),
