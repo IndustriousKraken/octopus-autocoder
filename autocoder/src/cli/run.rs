@@ -313,12 +313,47 @@ pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig)
         Ok(s) if s.is_empty() => true,
         Ok(dirty) => {
             let dirty_count = dirty.lines().count();
-            tracing::error!(
+            tracing::warn!(
                 url = repo.url.as_str(),
                 workspace = %workspace_path.display(),
-                "workspace is dirty at startup ({dirty_count} entries from `git status --porcelain`); skipping this repository for the process lifetime"
+                "workspace dirty at startup ({dirty_count} entries); attempting recovery (git reset --hard origin/{} + git clean -fd)",
+                repo.base_branch
             );
-            false
+            // Best-effort: ignore checkout failures (might already be on
+            // base, or HEAD might be detached). The reset + clean are what
+            // actually clear the dirty state.
+            let _ = git::checkout(&workspace_path, &repo.base_branch);
+            if let Err(e) = git::reset_hard_to_remote(&workspace_path, &repo.base_branch) {
+                tracing::error!(
+                    url = repo.url.as_str(),
+                    "recovery `git reset --hard origin/{}` failed: {e:#}; skipping this repository for the process lifetime",
+                    repo.base_branch
+                );
+                return false;
+            }
+            if let Err(e) = git::clean_force(&workspace_path) {
+                tracing::error!(
+                    url = repo.url.as_str(),
+                    "recovery `git clean -fd` failed: {e:#}; skipping this repository for the process lifetime"
+                );
+                return false;
+            }
+            match git::status_porcelain(&workspace_path) {
+                Ok(s) if s.is_empty() => {
+                    tracing::info!(
+                        url = repo.url.as_str(),
+                        "workspace recovered; proceeding to normal polling"
+                    );
+                    true
+                }
+                _ => {
+                    tracing::error!(
+                        url = repo.url.as_str(),
+                        "workspace still dirty after recovery; skipping this repository for the process lifetime"
+                    );
+                    false
+                }
+            }
         }
         Err(e) => {
             tracing::error!(
@@ -561,26 +596,44 @@ mod tests {
         }
     }
 
-    /// 13.1.3 / orchestrator-cli baseline: a workspace dirty at startup
-    /// causes that repository to be skipped for the process lifetime.
-    /// Other configured repositories continue to be serviced.
+    /// A workspace dirty at startup (residue from a prior failed run) is
+    /// auto-recovered via `git reset --hard origin/<base>` + `git clean
+    /// -fd`. After recovery the workspace is clean and the startup check
+    /// returns true.
     #[test]
-    fn dirty_workspace_skipped_at_startup() {
+    fn dirty_workspace_recovers_at_startup() {
         let (_dirty, dirty_path) = dirty_workspace_fixture();
-        let (_clean, clean_path) = clean_workspace_fixture();
+        // Sanity: fixture really is dirty before the check.
+        let before = git::status_porcelain(&dirty_path).unwrap();
+        assert!(!before.is_empty(), "fixture must start dirty");
 
-        let dirty_repo = cfg_with(dirty_path);
-        let clean_repo = cfg_with(clean_path);
-
-        // Dirty repo fails the startup check; clean repo passes.
+        let dirty_repo = cfg_with(dirty_path.clone());
         let direct_push_github = GithubConfig {
             token_env: "X".into(),
             token: None,
             owner_tokens: None,
             fork_owner: None,
         };
-        assert!(!repo_passes_startup_check(&dirty_repo, &direct_push_github),
-            "dirty workspace must fail startup check");
+        assert!(
+            repo_passes_startup_check(&dirty_repo, &direct_push_github),
+            "dirty workspace must auto-recover and pass the startup check"
+        );
+
+        // After recovery the workspace is clean.
+        let after = git::status_porcelain(&dirty_path).unwrap();
+        assert!(after.is_empty(), "workspace must be clean after recovery, got: {after}");
+    }
+
+    #[test]
+    fn clean_workspace_still_passes_startup() {
+        let (_clean, clean_path) = clean_workspace_fixture();
+        let clean_repo = cfg_with(clean_path);
+        let direct_push_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
         assert!(repo_passes_startup_check(&clean_repo, &direct_push_github),
             "clean workspace must pass startup check");
     }

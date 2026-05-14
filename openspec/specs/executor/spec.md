@@ -142,9 +142,11 @@ exits.
   call
 
 ### Requirement: Sandbox config schema
-autocoder SHALL accept an optional `executor.sandbox` block with
-three optional sub-fields, each with a documented safe default
-applied when absent.
+autocoder SHALL accept an optional `executor.sandbox` block with three
+optional sub-fields, each with a documented safe default applied when
+absent. The default `disallowed_bash_patterns` SHALL include patterns
+blocking openspec state-mutation operations so the executor cannot
+short-circuit a change by archiving it.
 
 #### Scenario: `allowed_tools` field
 - **WHEN** `executor.sandbox.allowed_tools` is set
@@ -168,11 +170,19 @@ applied when absent.
 - **THEN** the default is `["Read", "Write", "Edit", "Glob", "Grep", "Bash"]`
 - **AND** notable exclusions are `WebFetch` and `WebSearch`
 
-#### Scenario: Default `disallowed_bash_patterns`
+#### Scenario: Default `disallowed_bash_patterns` includes network egress
 - **WHEN** `executor.sandbox.disallowed_bash_patterns` is absent
 - **THEN** the default includes at minimum: `curl:*`, `wget:*`,
   `nc:*`, `ncat:*`, `netcat:*`, `ssh:*`, `scp:*`, `sftp:*`,
   `rsync:*`, `git push:*`, `git remote *`, `git fetch *://*`
+
+#### Scenario: Default `disallowed_bash_patterns` blocks openspec state mutation
+- **WHEN** `executor.sandbox.disallowed_bash_patterns` is absent
+- **THEN** the default also includes `openspec archive:*` AND
+  `openspec unarchive:*`
+- **AND** read-only `openspec` operations (validate, list, status,
+  show, instructions) are NOT in the denylist; the executor needs
+  them to inspect change state
 
 #### Scenario: Default `disallowed_read_paths`
 - **WHEN** `executor.sandbox.disallowed_read_paths` is absent

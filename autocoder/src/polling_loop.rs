@@ -462,6 +462,17 @@ async fn handle_outcome(
                 tracing::warn!(
                     "executor reported Completed for `{change}` but workspace is clean; archiving anyway per spec"
                 );
+            } else if is_lazy_archive(&dirty) {
+                tracing::warn!(
+                    "agent appears to have archived `{change}` without implementing the change; reverting and marking Failed"
+                );
+                // Revert the staged moves so the next iteration starts clean.
+                if let Err(e) = git::reset_hard_head(workspace) {
+                    tracing::error!(
+                        "failed to revert lazy-archive moves for `{change}`: {e:#}"
+                    );
+                }
+                return Ok(QueueStep::Failed);
             } else {
                 let subject = build_commit_subject(workspace, change)?;
                 git::add_all(workspace)?;
@@ -471,6 +482,41 @@ async fn handle_outcome(
             Ok(QueueStep::Archived)
         }
     }
+}
+
+/// Detect the lazy-archive failure mode: the executor returned Completed
+/// but the only thing it did was rename the change directory into
+/// `openspec/changes/archive/`. Returns true when:
+/// - `status` is non-empty, AND
+/// - every line is a rename (status code contains `R`), AND
+/// - every rename's destination path starts with `openspec/changes/archive/`.
+///
+/// Returns false for any mix that includes a non-rename or a rename outside
+/// the archive path — those are treated as legitimate implementations.
+fn is_lazy_archive(status: &str) -> bool {
+    let mut any = false;
+    for line in status.lines() {
+        if line.len() < 4 {
+            return false; // malformed; bail rather than misclassify
+        }
+        // Porcelain format: two status chars in cols 0-1, space, then paths.
+        let staged = line.as_bytes()[0] as char;
+        let unstaged = line.as_bytes()[1] as char;
+        if staged != 'R' && unstaged != 'R' {
+            return false;
+        }
+        // Rename lines look like `R  old_path -> new_path`.
+        let payload = &line[3..];
+        let dest = match payload.split_once(" -> ") {
+            Some((_old, new)) => new,
+            None => return false,
+        };
+        if !dest.starts_with("openspec/changes/archive/") {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Build a commit subject from the change name and the first non-empty line of
@@ -679,6 +725,38 @@ mod tests {
         .expect("cross-repo PR succeeds");
 
         mock.assert_async().await;
+    }
+
+    #[test]
+    fn detect_lazy_archive_returns_true_for_archive_only_renames() {
+        let status = "R  openspec/changes/foo/proposal.md -> openspec/changes/archive/2026-05-14-foo/proposal.md\nR  openspec/changes/foo/tasks.md -> openspec/changes/archive/2026-05-14-foo/tasks.md\n";
+        assert!(is_lazy_archive(status));
+    }
+
+    #[test]
+    fn detect_lazy_archive_returns_false_when_real_implementation_present() {
+        // Archive rename PLUS a modification to a source file → real work.
+        let status = "R  openspec/changes/foo/proposal.md -> openspec/changes/archive/2026-05-14-foo/proposal.md\n M src/foo.rs\n";
+        assert!(!is_lazy_archive(status));
+    }
+
+    #[test]
+    fn detect_lazy_archive_returns_false_for_added_files() {
+        let status = "A  src/new_module.rs\n";
+        assert!(!is_lazy_archive(status));
+    }
+
+    #[test]
+    fn detect_lazy_archive_returns_false_when_workspace_clean() {
+        assert!(!is_lazy_archive(""));
+    }
+
+    #[test]
+    fn detect_lazy_archive_returns_false_for_rename_outside_archive() {
+        // Renames are fine if they're not into archive/ — agent legitimately
+        // moving files around as part of implementation.
+        let status = "R  old/path.rs -> new/path.rs\n";
+        assert!(!is_lazy_archive(status));
     }
 
     #[test]

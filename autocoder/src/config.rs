@@ -152,6 +152,11 @@ pub fn default_disallowed_bash_patterns() -> Vec<String> {
         "git push:*",
         "git remote *",
         "git fetch *://*",
+        // Defense in depth against the "lazy archive" failure mode. The
+        // structural check in polling_loop::detect_lazy_archive is the
+        // real protection (catches bare `git mv` archive renames too).
+        "openspec archive:*",
+        "openspec unarchive:*",
     ]
     .into_iter()
     .map(String::from)
@@ -551,6 +556,19 @@ github: {}
                 .disallowed_bash_patterns
                 .iter()
                 .any(|p| p.starts_with("curl"))
+        );
+    }
+
+    #[test]
+    fn sandbox_default_blocks_openspec_archive() {
+        let patterns = default_disallowed_bash_patterns();
+        assert!(
+            patterns.contains(&"openspec archive:*".to_string()),
+            "default sandbox must deny `openspec archive`"
+        );
+        assert!(
+            patterns.contains(&"openspec unarchive:*".to_string()),
+            "default sandbox must deny `openspec unarchive`"
         );
     }
 

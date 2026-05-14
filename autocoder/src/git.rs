@@ -79,6 +79,30 @@ pub fn commit(workspace: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git reset --hard origin/<branch>` — discard all local changes and align
+/// HEAD with the remote tip of `branch`. Used by startup auto-recovery to
+/// scrub residue from a prior failed iteration.
+pub fn reset_hard_to_remote(workspace: &Path, branch: &str) -> Result<()> {
+    let target = format!("origin/{branch}");
+    run_git(workspace, "reset --hard origin/<branch>", &["reset", "--hard", &target])?;
+    Ok(())
+}
+
+/// `git reset --hard HEAD` — discard staged AND unstaged changes back to
+/// the current HEAD commit. Used to revert an executor's lazy-archive
+/// rename without changing the active branch.
+pub fn reset_hard_head(workspace: &Path) -> Result<()> {
+    run_git(workspace, "reset --hard HEAD", &["reset", "--hard", "HEAD"])?;
+    Ok(())
+}
+
+/// `git clean -fd` — remove untracked files and directories from the
+/// workspace. Best-effort: errors propagate to the caller.
+pub fn clean_force(workspace: &Path) -> Result<()> {
+    run_git(workspace, "clean -fd", &["clean", "-fd"])?;
+    Ok(())
+}
+
 pub fn push_force_with_lease(workspace: &Path, branch: &str, remote: &str) -> Result<()> {
     run_git(
         workspace,

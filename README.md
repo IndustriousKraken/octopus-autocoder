@@ -14,6 +14,7 @@ On the machine where the daemon will run:
 
 - **Rust toolchain.** Install via [rustup](https://rustup.rs/) — autocoder builds against stable Rust on edition 2024.
 - **Claude Code authenticated.** Install [Claude Code](https://www.anthropic.com/claude-code) and run `claude auth login` as the same OS user that will run the daemon. The credentials are persisted in `~/.claude/` and survive restarts.
+- **OpenSpec CLI installed and on `$PATH`.** Install with `npm install -g @fission-ai/openspec` (Node.js required) and verify with `openspec --version`. autocoder shells out to `openspec instructions apply` to build richer per-change prompts for the agent; without it the executor falls back to raw markdown concatenation, which gives the agent noticeably less guidance and is a known cause of "lazy archive" failures.
 - **A GitHub Personal Access Token**, scoped to the repositories autocoder will manage. Either form works; pick based on your account setup:
 
   - **Fine-grained PAT** (recommended for personal-account-owned repos). Required permissions:
@@ -385,6 +386,18 @@ repositories:
 
 The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](#rewind) below.
 
+### Dirty workspace auto-recovery
+
+If a workspace under `/tmp/workspaces/` is left dirty between polls (uncommitted edits, untracked files, or a checked-out branch other than the base), autocoder recovers automatically at the next startup or poll cycle: it checks out the configured `base_branch`, runs `git reset --hard origin/<base_branch>`, and runs `git clean -fd`. The repo then re-enters its normal polling loop. If recovery itself fails (e.g. the remote is unreachable), the repo is skipped for the daemon's lifetime and an error is logged — restart the daemon once the underlying problem is fixed.
+
+Operators who want to inspect a dirty workspace before any daemon action should stop the systemd unit first:
+
+```bash
+sudo systemctl stop autocoder
+# inspect /tmp/workspaces/<repo>/ at your leisure
+sudo systemctl start autocoder
+```
+
 ---
 
 ## Deployment
@@ -402,12 +415,22 @@ sudo cp target/release/autocoder /usr/local/bin/autocoder
 
 ```bash
 sudo useradd -m -s /bin/bash autocoder
-sudo -u autocoder -i      # become the deploy user
-claude auth login          # interactive Anthropic OAuth
-exit                       # back to your admin shell
+sudo -u autocoder -i                            # become the deploy user
+claude auth login                                # interactive Anthropic OAuth
+git config --global user.email "autocoder@$(hostname)"
+git config --global user.name "autocoder"
+exit                                             # back to your admin shell
+
+# Install openspec so the executor can generate richer prompts via
+# `openspec instructions apply`. Without it the daemon falls back to
+# raw markdown concatenation which gives the agent less guidance.
+sudo -u autocoder npm install -g @fission-ai/openspec
+sudo -u autocoder openspec --version             # verify
 ```
 
-The Claude credentials now live at `/home/autocoder/.claude/`. They survive restarts as long as the systemd unit runs as the same user.
+The Claude credentials now live at `/home/autocoder/.claude/`. The git config writes to `/home/autocoder/.gitconfig` and is required — autocoder's commit step fails without an author identity. Both survive restarts as long as the systemd unit runs as the same user.
+
+(If `npm` isn't on the autocoder user's `$PATH`, install Node.js first via your distro's package manager or `nvm`. The exact openspec install command may vary; check the openspec project for the current recommendation.)
 
 ### 3. Set up SSH for the autocoder user
 
@@ -687,7 +710,7 @@ The agent CLI (Claude Code by default) runs inside the workspace with whatever t
 
 **Default deny rules** (active when `executor.sandbox` is absent from `config.yaml`):
 
-- **Bash commands:** `curl`, `wget`, `nc`/`ncat`/`netcat`, `ssh`/`scp`/`sftp`/`rsync`, `git push`, `git remote *`, `git fetch <url>`. Build/test commands (`cargo`, `npm`, `pytest`, `go test`, etc.) are not on the list.
+- **Bash commands:** `curl`, `wget`, `nc`/`ncat`/`netcat`, `ssh`/`scp`/`sftp`/`rsync`, `git push`, `git remote *`, `git fetch <url>`, `openspec archive`, `openspec unarchive`. Build/test commands (`cargo`, `npm`, `pytest`, `go test`, etc.) are not on the list.
 - **File reads:** `/home/*/.ssh/**`, `/home/*/.claude/**`, `/etc/shadow`, `/etc/ssl/private/**`.
 - **Tools:** `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` allowed. `WebFetch`, `WebSearch`, and any other tools NOT allowed.
 
@@ -710,6 +733,8 @@ executor:
 **What the agent sees on a denial:** the wrapped CLI tells the model the tool call was blocked. The model typically narrates the failure in its output, which surfaces in the iteration's captured stdout. If a legitimate workflow gets blocked, the iteration logs make it obvious which command was denied.
 
 **Threat model caveat:** this is a tool-routing-layer sandbox, not OS-level isolation. A determined model can in principle exec arbitrary code via the allowed `Bash` tool with command patterns that don't match the denylist. For hard isolation, run autocoder under OS-level sandboxing (firejail, bubblewrap, or systemd `ProtectHome=`/`ProtectSystem=`). The autocoder sandbox is a useful first layer.
+
+**Lazy-archive structural detection.** Beyond the sandbox, autocoder inspects the working-tree diff after every executor invocation. If the only changes are renames into `openspec/changes/archive/<date>-<name>/`, the daemon treats the iteration as Failed (not Completed), reverts the staged moves via `git reset --hard`, and leaves the change pending for retry. This catches the "agent renamed the change directory and called itself done" failure mode regardless of which command produced the moves — the openspec-CLI denials above are belt-and-suspenders for the obvious path, but the structural check is what does the real work.
 
 **Reviewer LLM is a separate data flow.** The code reviewer (if enabled) sends the diff to its configured LLM provider as a direct HTTP call. That data flow is governed by your `reviewer:` config (provider, api_key, api_base_url), NOT by `executor.sandbox`. Operators opted in to that flow by enabling the reviewer; sandbox restrictions do not apply.
 
