@@ -24,6 +24,21 @@ executor:
   # Override only if you have a wrapper script or `claude` is not on $PATH:
   # command: /usr/local/bin/claude
   timeout_secs: 1800
+  # Optional tool-use sandbox. Absent → restrictive safe defaults apply
+  # (blocks curl/wget/nc/ssh/scp/git-push, denies reads of ~/.ssh and
+  # ~/.claude, allows only Read/Write/Edit/Glob/Grep/Bash tools).
+  # Each field overrides its default independently; omitted fields keep
+  # the safe default. See README's "Executor tool sandbox" section.
+  #
+  # sandbox:
+  #   allowed_tools: [Read, Write, Edit, Glob, Grep, Bash]
+  #   disallowed_bash_patterns:
+  #     - "nc:*"
+  #     - "ssh:*"
+  #     - "git push:*"
+  #   disallowed_read_paths:
+  #     - "/home/*/.ssh/**"
+  #     - "/home/*/.claude/**"
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
@@ -50,6 +65,13 @@ github:
   #   my-org-a: ORG_A_GH_TOKEN                       # env var name
   #   my-org-b:                                      # inline
   #     value: "github_pat_xxx_for_org_b"
+
+  # Optional: enable fork-and-PR mode. autocoder pushes the agent branch to
+  # a fork owned by this handle and opens cross-repo PRs against upstream.
+  # The machine user only needs READ access on upstream. See README's
+  # "Fork-and-PR workflow" section for one-time fork-setup steps.
+  #
+  # fork_owner: my-machine-user-handle
 
 # -------------------------------------------------------------------------
 # Optional capabilities — disabled by default. Uncomment to enable.

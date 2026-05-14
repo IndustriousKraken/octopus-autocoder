@@ -80,6 +80,94 @@ pub struct ExecutorConfig {
     pub command: String,
     #[serde(default = "default_executor_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub sandbox: Option<ExecutorSandboxConfig>,
+}
+
+/// Per-iteration tool-use restrictions for the wrapped agent CLI. When
+/// absent, restrictive safe defaults apply (see `default_allowed_tools`,
+/// `default_disallowed_bash_patterns`, `default_disallowed_read_paths`).
+/// Each field can be overridden independently; omitted fields keep their
+/// safe defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorSandboxConfig {
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub disallowed_bash_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    pub disallowed_read_paths: Option<Vec<String>>,
+}
+
+/// The fully-resolved sandbox after per-field defaulting. Used by the
+/// executor at spawn time.
+#[derive(Debug, Clone)]
+pub struct ResolvedSandbox {
+    pub allowed_tools: Vec<String>,
+    pub disallowed_bash_patterns: Vec<String>,
+    pub disallowed_read_paths: Vec<String>,
+}
+
+impl ResolvedSandbox {
+    /// Resolve a configured sandbox (or absence) into the values that will
+    /// be passed to the wrapped CLI. Each field falls back to its safe
+    /// default when unset in the operator's config.
+    pub fn resolve(cfg: Option<&ExecutorSandboxConfig>) -> Self {
+        let allowed_tools = cfg
+            .and_then(|c| c.allowed_tools.clone())
+            .unwrap_or_else(default_allowed_tools);
+        let disallowed_bash_patterns = cfg
+            .and_then(|c| c.disallowed_bash_patterns.clone())
+            .unwrap_or_else(default_disallowed_bash_patterns);
+        let disallowed_read_paths = cfg
+            .and_then(|c| c.disallowed_read_paths.clone())
+            .unwrap_or_else(default_disallowed_read_paths);
+        Self {
+            allowed_tools,
+            disallowed_bash_patterns,
+            disallowed_read_paths,
+        }
+    }
+}
+
+pub fn default_allowed_tools() -> Vec<String> {
+    ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+pub fn default_disallowed_bash_patterns() -> Vec<String> {
+    [
+        "curl:*",
+        "wget:*",
+        "nc:*",
+        "ncat:*",
+        "netcat:*",
+        "ssh:*",
+        "scp:*",
+        "sftp:*",
+        "rsync:*",
+        "git push:*",
+        "git remote *",
+        "git fetch *://*",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+pub fn default_disallowed_read_paths() -> Vec<String> {
+    [
+        "/home/*/.ssh/**",
+        "/home/*/.claude/**",
+        "/etc/shadow",
+        "/etc/ssl/private/**",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +193,13 @@ pub struct GithubConfig {
     pub token: Option<SecretSource>,
     #[serde(default)]
     pub owner_tokens: Option<HashMap<String, SecretSource>>,
+    /// When set, autocoder operates in fork-PR mode: the agent branch is
+    /// pushed to `git@github.com:<fork_owner>/<repo>.git` (a fork owned
+    /// by this handle), and PRs are opened as cross-repository PRs with
+    /// `head` formatted as `<fork_owner>:<agent_branch>`. The fork must
+    /// be pre-created; autocoder verifies its existence at startup.
+    #[serde(default)]
+    pub fork_owner: Option<String>,
 }
 
 fn default_github_token_env() -> String {
@@ -433,6 +528,128 @@ github: {}
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.slack.is_none());
+    }
+
+    #[test]
+    fn sandbox_absent_uses_defaults() {
+        let resolved = ResolvedSandbox::resolve(None);
+        assert_eq!(resolved.allowed_tools, default_allowed_tools());
+        assert_eq!(
+            resolved.disallowed_bash_patterns,
+            default_disallowed_bash_patterns()
+        );
+        assert_eq!(
+            resolved.disallowed_read_paths,
+            default_disallowed_read_paths()
+        );
+        // Defense-in-depth: WebFetch and WebSearch are NOT in the defaults.
+        assert!(!resolved.allowed_tools.iter().any(|t| t == "WebFetch"));
+        assert!(!resolved.allowed_tools.iter().any(|t| t == "WebSearch"));
+        // Spot-check that curl is denied.
+        assert!(
+            resolved
+                .disallowed_bash_patterns
+                .iter()
+                .any(|p| p.starts_with("curl"))
+        );
+    }
+
+    #[test]
+    fn sandbox_partial_override_uses_defaults_per_field() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    allowed_tools: [Read, Write]
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("partial sandbox should parse");
+        let resolved = ResolvedSandbox::resolve(cfg.executor.sandbox.as_ref());
+        // Operator's allowed_tools wins.
+        assert_eq!(
+            resolved.allowed_tools,
+            vec!["Read".to_string(), "Write".to_string()]
+        );
+        // Other fields fall back to safe defaults.
+        assert_eq!(
+            resolved.disallowed_bash_patterns,
+            default_disallowed_bash_patterns()
+        );
+        assert_eq!(
+            resolved.disallowed_read_paths,
+            default_disallowed_read_paths()
+        );
+    }
+
+    #[test]
+    fn sandbox_full_override_uses_operator_values_only() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    allowed_tools: [Read]
+    disallowed_bash_patterns: ["custom-pat:*"]
+    disallowed_read_paths: ["/custom/path/**"]
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("full sandbox should parse");
+        let resolved = ResolvedSandbox::resolve(cfg.executor.sandbox.as_ref());
+        assert_eq!(resolved.allowed_tools, vec!["Read".to_string()]);
+        assert_eq!(
+            resolved.disallowed_bash_patterns,
+            vec!["custom-pat:*".to_string()]
+        );
+        assert_eq!(
+            resolved.disallowed_read_paths,
+            vec!["/custom/path/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn loads_fork_owner() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:upstream/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  fork_owner: machine-user-handle
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with fork_owner should parse");
+        assert_eq!(cfg.github.fork_owner.as_deref(), Some("machine-user-handle"));
+    }
+
+    #[test]
+    fn fork_owner_absent_defaults_to_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.github.fork_owner.is_none());
     }
 
     #[test]

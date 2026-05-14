@@ -67,6 +67,7 @@ mod tests {
             token_env: token_env.into(),
             token,
             owner_tokens,
+            fork_owner: None,
         }
     }
 

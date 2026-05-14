@@ -79,12 +79,54 @@ pub fn commit(workspace: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn push_force_with_lease(workspace: &Path, branch: &str) -> Result<()> {
+pub fn push_force_with_lease(workspace: &Path, branch: &str, remote: &str) -> Result<()> {
     run_git(
         workspace,
         "push --force-with-lease",
-        &["push", "--force-with-lease", "origin", branch],
+        &["push", "--force-with-lease", remote, branch],
     )?;
+    Ok(())
+}
+
+/// Idempotently ensure a remote named `name` exists with the given `url`. If
+/// the remote is absent, run `git remote add`. If it exists with a stale
+/// URL, run `git remote set-url`. If it already has the right URL, do
+/// nothing.
+pub fn ensure_remote(workspace: &Path, name: &str, url: &str) -> Result<()> {
+    let probe = Command::new("git")
+        .args(["remote", "get-url", name])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("running `git remote get-url {name}` in {}", workspace.display()))?;
+    if probe.status.success() {
+        let current = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        if current == url {
+            return Ok(());
+        }
+        run_git(
+            workspace,
+            "remote set-url",
+            &["remote", "set-url", name, url],
+        )?;
+        return Ok(());
+    }
+    run_git(workspace, "remote add", &["remote", "add", name, url])?;
+    Ok(())
+}
+
+/// Probe whether a remote URL is reachable for read. Used at startup to
+/// verify fork existence before any polling task spawns. Returns Ok(()) on
+/// reachable; Err with the git stderr on failure (network error, 404,
+/// auth failure).
+pub fn ls_remote_head(url: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["ls-remote", "--quiet", url, "HEAD"])
+        .output()
+        .with_context(|| format!("running `git ls-remote {url}`"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(anyhow!("git ls-remote `{url}` failed: {stderr}"));
+    }
     Ok(())
 }
 
@@ -112,12 +154,13 @@ pub fn delete_branch_local(workspace: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// `git push origin --delete <branch>` — delete a branch on the remote.
-/// Idempotent for the "remote branch does not exist" case (logs at debug
-/// and returns Ok). Other failures (auth, network, etc.) propagate as `Err`.
-pub fn delete_branch_remote(workspace: &Path, branch: &str) -> Result<()> {
+/// `git push <remote> --delete <branch>` — delete a branch on the named
+/// remote. Idempotent for the "remote branch does not exist" case (logs at
+/// debug and returns Ok). Other failures (auth, network, etc.) propagate
+/// as `Err`.
+pub fn delete_branch_remote(workspace: &Path, branch: &str, remote: &str) -> Result<()> {
     let probe = Command::new("git")
-        .args(["ls-remote", "--heads", "origin", branch])
+        .args(["ls-remote", "--heads", remote, branch])
         .current_dir(workspace)
         .output()
         .with_context(|| format!("spawning `git ls-remote` to probe remote branch {branch}"))?;
@@ -126,13 +169,13 @@ pub fn delete_branch_remote(workspace: &Path, branch: &str) -> Result<()> {
         return Err(anyhow!("git ls-remote failed: {stderr}"));
     }
     if probe.stdout.is_empty() {
-        tracing::debug!("remote branch `{branch}` already absent; nothing to delete");
+        tracing::debug!("remote branch `{branch}` on `{remote}` already absent; nothing to delete");
         return Ok(());
     }
     run_git(
         workspace,
         "push --delete",
-        &["push", "origin", "--delete", branch],
+        &["push", remote, "--delete", branch],
     )?;
     Ok(())
 }
@@ -314,6 +357,51 @@ mod tests {
     }
 
     #[test]
+    fn push_uses_specified_remote() {
+        let (dir, ws, _origin) = fixture_clone_with_bare_remote();
+        // Set up a second bare remote.
+        let fork_remote = dir.path().join("fork.git");
+        std::fs::create_dir_all(&fork_remote).unwrap();
+        let st = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(&fork_remote)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        run_init(&ws, &["remote", "add", "fork", fork_remote.to_string_lossy().as_ref()]);
+
+        // Create a branch and push only to fork.
+        recreate_branch(&ws, "agent-q").unwrap();
+        std::fs::write(ws.join("CHANGE.md"), "x").unwrap();
+        run_init(&ws, &["add", "CHANGE.md"]);
+        run_init(&ws, &["commit", "-q", "-m", "agent work"]);
+
+        push_force_with_lease(&ws, "agent-q", "fork").unwrap();
+
+        // Origin must NOT have agent-q.
+        let origin_probe = Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "agent-q"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            origin_probe.stdout.is_empty(),
+            "origin must NOT have agent-q; got: {}",
+            String::from_utf8_lossy(&origin_probe.stdout)
+        );
+        // Fork MUST have agent-q.
+        let fork_probe = Command::new("git")
+            .args(["ls-remote", "--heads", "fork", "agent-q"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            !fork_probe.stdout.is_empty(),
+            "fork MUST have agent-q after push"
+        );
+    }
+
+    #[test]
     fn delete_branch_remote_deletes_and_is_idempotent() {
         let (_dir, ws, _remote) = fixture_clone_with_bare_remote();
 
@@ -332,7 +420,7 @@ mod tests {
             .unwrap();
         assert!(!probe.stdout.is_empty(), "remote should have doomed before delete");
 
-        delete_branch_remote(&ws, "doomed").unwrap();
+        delete_branch_remote(&ws, "doomed", "origin").unwrap();
 
         let probe = Command::new("git")
             .args(["ls-remote", "--heads", "origin", "doomed"])
@@ -342,7 +430,7 @@ mod tests {
         assert!(probe.stdout.is_empty(), "remote should be gone after delete");
 
         // Idempotent: second call against an absent remote branch is Ok.
-        delete_branch_remote(&ws, "doomed").unwrap();
-        delete_branch_remote(&ws, "never-existed-remote").unwrap();
+        delete_branch_remote(&ws, "doomed", "origin").unwrap();
+        delete_branch_remote(&ws, "never-existed-remote", "origin").unwrap();
     }
 }

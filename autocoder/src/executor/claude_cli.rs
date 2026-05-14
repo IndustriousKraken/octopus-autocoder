@@ -32,6 +32,7 @@ pub struct ClaudeCliExecutor {
     command: String,
     args: Vec<String>,
     timeout: Duration,
+    sandbox: crate::config::ResolvedSandbox,
 }
 
 /// Opaque payload stashed inside `ResumeHandle.0` for this backend.
@@ -48,10 +49,23 @@ struct ClaudeResumeData {
 
 impl ClaudeCliExecutor {
     pub fn new(command: String, timeout_secs: u64) -> Self {
+        Self::new_with_sandbox(
+            command,
+            timeout_secs,
+            crate::config::ResolvedSandbox::resolve(None),
+        )
+    }
+
+    pub fn new_with_sandbox(
+        command: String,
+        timeout_secs: u64,
+        sandbox: crate::config::ResolvedSandbox,
+    ) -> Self {
         Self {
             command,
             args: Vec::new(),
             timeout: Duration::from_secs(timeout_secs),
+            sandbox,
         }
     }
 
@@ -63,6 +77,7 @@ impl ClaudeCliExecutor {
             command,
             args,
             timeout: Duration::from_secs(timeout_secs),
+            sandbox: crate::config::ResolvedSandbox::resolve(None),
         }
     }
 
@@ -207,6 +222,38 @@ impl ClaudeCliExecutor {
         }
     }
 
+    /// Write the per-iteration Claude Code settings file to OS temp dir
+    /// (NOT the workspace, to avoid contaminating the diff). Returns the
+    /// path; the caller is responsible for deletion via `TempFileGuard`.
+    fn write_sandbox_settings(&self) -> Result<PathBuf> {
+        let mut deny: Vec<String> = Vec::new();
+        for pat in &self.sandbox.disallowed_bash_patterns {
+            deny.push(format!("Bash({pat})"));
+        }
+        for pat in &self.sandbox.disallowed_read_paths {
+            deny.push(format!("Read({pat})"));
+        }
+        let json = serde_json::json!({
+            "permissions": {
+                "allow": Vec::<String>::new(),
+                "deny": deny,
+            }
+        });
+
+        // Unique-named file in OS temp; UUIDish via process id + nanos.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let path = std::env::temp_dir()
+            .join(format!("autocoder-claude-settings-{pid}-{stamp}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&json)?)
+            .with_context(|| format!("writing sandbox settings to {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
     /// configured timeout, return collected stdout/stderr + exit status.
     async fn run_subprocess(
@@ -214,8 +261,19 @@ impl ClaudeCliExecutor {
         workspace: &Path,
         prompt: &str,
     ) -> Result<SubprocessOutcome> {
+        let settings_path = self
+            .write_sandbox_settings()
+            .context("generating sandbox settings file")?;
+        let _settings_guard = TempFileGuard(settings_path.clone());
+
         let mut child = Command::new(&self.command)
             .args(&self.args)
+            .arg("--settings")
+            .arg(&settings_path)
+            .arg("--allowedTools")
+            .arg(self.sandbox.allowed_tools.join(","))
+            .arg("--permission-mode")
+            .arg("acceptEdits")
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -338,6 +396,22 @@ struct SubprocessOutcome {
     stderr: String,
 }
 
+/// RAII guard that removes a temp file when dropped. Used so the sandbox
+/// settings file is cleaned up regardless of how `run_subprocess` exits
+/// (success, error, panic).
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            tracing::warn!(
+                path = %self.0.display(),
+                "failed to remove sandbox settings temp file: {e}"
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl Executor for ClaudeCliExecutor {
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
@@ -426,6 +500,69 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    #[test]
+    fn sandbox_settings_file_contains_expected_deny_patterns() {
+        // Construct executor with a small custom sandbox so test asserts
+        // are precise.
+        let sandbox = crate::config::ResolvedSandbox {
+            allowed_tools: vec!["Read".into(), "Bash".into()],
+            disallowed_bash_patterns: vec!["curl:*".into(), "git push:*".into()],
+            disallowed_read_paths: vec!["/home/*/.ssh/**".into()],
+        };
+        let executor =
+            ClaudeCliExecutor::new_with_sandbox("dummy-claude".into(), 30, sandbox);
+        let path = executor
+            .write_sandbox_settings()
+            .expect("settings file writes");
+        // Settings file is in OS temp dir.
+        assert_eq!(path.parent().unwrap(), std::env::temp_dir());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deny = parsed["permissions"]["deny"].as_array().unwrap();
+        let deny_strings: Vec<String> = deny
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(deny_strings.contains(&"Bash(curl:*)".to_string()));
+        assert!(deny_strings.contains(&"Bash(git push:*)".to_string()));
+        assert!(deny_strings.contains(&"Read(/home/*/.ssh/**)".to_string()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn sandbox_temp_file_cleaned_up_after_spawn() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let temp_dir_before: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("autocoder-claude-settings-")
+            })
+            .map(|e| e.file_name())
+            .collect();
+        let executor =
+            ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let _ = executor.run(&ws, "x").await.unwrap();
+        let temp_dir_after: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("autocoder-claude-settings-")
+            })
+            .map(|e| e.file_name())
+            .collect();
+        // Temp dir state must be unchanged after run (file cleaned up).
+        assert_eq!(
+            temp_dir_before, temp_dir_after,
+            "settings temp file must be deleted after the child exits"
+        );
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ A list of one or more repositories to manage. Each entry:
 | `kind`          | yes      | —           | Currently only `claude_cli` is supported. |
 | `command`       | no       | `claude`    | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
 | `timeout_secs`  | no       | `1800`      | Wall-clock budget per change. Killed-and-Failed on overrun. |
+| `sandbox`       | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](#8-executor-tool-sandbox). |
 
 ### `github:` (required)
 
@@ -105,6 +106,7 @@ A list of one or more repositories to manage. Each entry:
 | `token_env`    | no       | `GITHUB_TOKEN`   | Name of the env var holding the fallback PAT. |
 | `token`        | no       | _absent_         | Inline alternative to `token_env`: `{ value: "ghp_..." }`. When set, `token_env` is ignored. See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var). |
 | `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name **or** inline `{ value: "..." }`. See [Multiple GitHub Tokens](#multiple-github-tokens). |
+| `fork_owner`   | no       | _absent_         | Enables fork-and-PR mode. Names the GitHub handle that owns the forks. See [Fork-and-PR workflow](#7-fork-and-pr-workflow-recommended-for-org-repos). |
 
 ### `reviewer:` (optional)
 
@@ -135,7 +137,7 @@ github:
     my-org-b:    ORG_B_GH_TOKEN
 
 repositories:
-  - url: "git@github.com:rabbeverly/personal-repo.git"
+  - url: "git@github.com:rbeverly/personal-repo.git"
     base_branch: main
     agent_branch: agent-q
     poll_interval_sec: 300
@@ -402,30 +404,64 @@ The Claude credentials now live at `/home/autocoder/.claude/`. They survive rest
 
 ### 3. Set up SSH for the autocoder user
 
-Required for `config.yaml` repositories using SSH URLs (`git@github.com:...`), which is the recommended form for multi-owner setups. The autocoder user needs its own SSH key registered with GitHub, plus github.com's host key pre-accepted so the daemon never hits an interactive `yes/no` prompt.
+Required for `config.yaml` repositories using SSH URLs (`git@github.com:...`), which is the recommended form for multi-owner setups. The autocoder user needs an SSH key tied to a GitHub identity with access to exactly the configured repositories — no more.
+
+Generate the keypair and pre-accept github.com's host key:
 
 ```bash
-# Generate a passphrase-less key for the autocoder user (-N "" skips the prompt).
-sudo -iu autocoder ssh-keygen -t ed25519 -C "autocoder@$(hostname)" -f ~/.ssh/id_ed25519 -N ""
+# Generate a passphrase-less key for the autocoder user. The outer single
+# quotes are required so `-N ""` survives sudo's argument handling.
+sudo -u autocoder bash -c 'mkdir -p ~/.ssh && ssh-keygen -t ed25519 -C "autocoder@$(hostname)" -f ~/.ssh/id_ed25519 -N ""'
 
 # Pre-accept github.com's host key so the daemon never hits an interactive prompt.
-sudo -iu autocoder bash -c 'ssh-keyscan github.com >> ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts'
+sudo -u autocoder bash -c 'ssh-keyscan github.com >> ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts'
 
 # Print the public key to register with GitHub.
 sudo -u autocoder cat /home/autocoder/.ssh/id_ed25519.pub
 ```
 
-Register the public key with each GitHub account or organization that owns a configured repository:
+Then register the public key against a GitHub identity. **Pick one of the three options below** based on your security posture:
 
-- **Personal account repos:** add the key under *Settings → SSH and GPG keys → New SSH key*.
-- **Organization repos you don't own:** add the key as a *deploy key* on each repo (*Repo settings → Deploy keys → Add deploy key*; check "Allow write access" so autocoder can push the agent branch). Deploy keys are per-repo; if you have many repos in one org, prefer adding the key to a machine user the org has granted collaborator access.
+#### Option A — Machine user (recommended for orgs with real users)
 
-Verify before continuing:
+Create a dedicated GitHub account (e.g. `<your-handle>-autocoder`) that exists only to be autocoder. Add it as a member of a team in each org with access to only the repositories in `config.yaml`, then register the SSH key on the machine user's account (*Settings → SSH and GPG keys → New SSH key*).
+
+Required team-grant permission level:
+
+- **Read** if you use [Fork-and-PR mode](#7-fork-and-pr-workflow-recommended-for-org-repos) (recommended). The machine user only reads upstream and pushes to its own fork.
+- **Write** if you use direct-push mode (no `github.fork_owner` set). The machine user pushes the agent branch directly to upstream.
+
+Mint the PATs you set in `config.yaml`'s `github.owner_tokens` from the machine user too — same scoping principle: the credential's authority matches autocoder's job. A full compromise of the autocoder host then gives the attacker exactly the access you granted that user and nothing more.
+
+GitHub's terms of service permit machine users for automation. The account is free.
+
+#### Option B — Per-repo deploy keys (works without a separate identity)
+
+Add the same public key as a deploy key on each repo: *Repo settings → Deploy keys → Add deploy key*, with **"Allow write access"** checked so autocoder can push the agent branch.
+
+Caveat: GitHub enforces that any given public key can be registered as a deploy key on **exactly one repo** across the platform. If autocoder manages N repos, you need N keypairs in `~autocoder/.ssh/` plus a `~/.ssh/config` with per-host routing — e.g.:
+
+```
+Host github.com-org-a-repo-1
+  HostName github.com
+  IdentityFile ~/.ssh/id_ed25519_org_a_repo_1
+  IdentitiesOnly yes
+```
+
+Then the `config.yaml` URL becomes `git@github.com-org-a-repo-1:org-a/repo-1.git`. Manageable up to a handful of repos; tedious past that.
+
+#### Option C — Personal-account key (small personal-repo setups only)
+
+Register the key under your own `Settings → SSH and GPG keys → New SSH key`. The autocoder daemon will then act as you for all git operations, with whatever permissions you have. **Do not use this for organization repos with real users** — a compromised autocoder host can `git push` anywhere you can. Acceptable only for solo developers managing their own personal repos.
+
+#### Verify
 
 ```bash
 sudo -u autocoder ssh -T git@github.com
 # Expected: "Hi <user>! You've successfully authenticated, but GitHub does not provide shell access."
 ```
+
+`<user>` will be whichever identity you registered the key under (the machine user, your own account, or — for deploy keys — empty since deploy keys don't have a user identity).
 
 ### 4. Stage the working directory
 
@@ -600,6 +636,70 @@ When both forms are set on the same logical field, the inline value wins and aut
 ### 6. Dedicated, non-SSH user (recommended)
 
 Run autocoder as a dedicated user (`autocoder`) with no SSH login. Authenticate Claude Code as that user (`sudo -iu autocoder claude auth login`) and keep `config.yaml`, `~/.claude/`, and the daemon's process under that uid. A compromised login user must then clear an additional uid boundary to reach autocoder's secrets — meaningful when the login user is not a passwordless sudoer. The Deployment section's systemd setup follows this pattern.
+
+### 7. Fork-and-PR workflow (recommended for org repos)
+
+By default, autocoder pushes the agent branch directly to upstream and opens a same-repo PR. This requires the autocoder identity to hold push access on every managed repo. Branch protection on `main`/`dev` limits the damage of a compromise but leaves all other branches reachable.
+
+Fork-and-PR mode collapses the blast radius to "what an external open-source contributor could already do." Set `github.fork_owner` to the handle that owns the forks (typically the machine user from section 6):
+
+```yaml
+github:
+  fork_owner: my-machine-user-handle
+  owner_tokens:
+    UpstreamOrg:
+      value: "github_pat_..."
+```
+
+In this mode autocoder:
+
+- Pushes the agent branch to `git@github.com:my-machine-user-handle/<repo>.git` (the fork)
+- Opens cross-repository PRs with `head: "my-machine-user-handle:agent-q"` against the upstream
+- Never writes to upstream branches; the machine user only needs **read** access on upstream
+
+**One-time setup per repo:**
+
+1. The machine user must have **Read** access to the upstream repo (collaborator invitation, team membership, or — for public repos — no setup required). Read is enough on github.com because the only API calls the bot makes against upstream are `POST /pulls` (Read can do this) and — only if the host rejects drafts — `POST /labels` (this needs **Triage**, but github.com supports drafts everywhere so the label fallback never fires there). Grant Triage only if you deploy against a GitHub Enterprise host that rejects draft PRs.
+2. The machine user must fork the upstream repo on github.com (web UI or `gh repo fork`). Forks of private repos inherit private visibility automatically.
+3. PATs in `github.owner_tokens` should be minted by the machine user and scoped to "Pull requests: read & write" on the upstream repo — no `Contents: write` needed (the API only opens the PR; SSH handles the git side).
+
+**Startup check:** autocoder probes each fork with `git ls-remote` before spawning any polling task. A missing fork produces a startup error naming both the upstream URL and the expected fork URL.
+
+**Rewind in fork mode:** `autocoder rewind --hard` deletes the agent branch from the fork (not upstream), since that's where it lived.
+
+**Limitations:** `fork_owner` is global; one machine user owns the forks for every repo in the config. Per-repo overrides are not supported. Two upstream repos with the same name (across different orgs) would map to the same fork URL — set explicit `local_path` and/or rename one fork to disambiguate.
+
+### 8. Executor tool sandbox
+
+The agent CLI (Claude Code by default) runs inside the workspace with whatever tool access its defaults allow. autocoder constrains this via per-iteration Claude Code settings files that block exfiltration channels by default.
+
+**Default deny rules** (active when `executor.sandbox` is absent from `config.yaml`):
+
+- **Bash commands:** `curl`, `wget`, `nc`/`ncat`/`netcat`, `ssh`/`scp`/`sftp`/`rsync`, `git push`, `git remote *`, `git fetch <url>`. Build/test commands (`cargo`, `npm`, `pytest`, `go test`, etc.) are not on the list.
+- **File reads:** `/home/*/.ssh/**`, `/home/*/.claude/**`, `/etc/shadow`, `/etc/ssl/private/**`.
+- **Tools:** `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` allowed. `WebFetch`, `WebSearch`, and any other tools NOT allowed.
+
+**Customizing:** set `executor.sandbox` in `config.yaml`. Each field overrides its safe default independently; omitted fields keep their defaults.
+
+```yaml
+executor:
+  kind: claude_cli
+  sandbox:
+    # If your project's build needs HTTPS (pip install, brew install, etc.),
+    # restate disallowed_bash_patterns with `curl:*` omitted:
+    disallowed_bash_patterns:
+      - "nc:*"
+      - "ncat:*"
+      - "ssh:*"
+      - "git push:*"
+      - "git remote *"
+```
+
+**What the agent sees on a denial:** the wrapped CLI tells the model the tool call was blocked. The model typically narrates the failure in its output, which surfaces in the iteration's captured stdout. If a legitimate workflow gets blocked, the iteration logs make it obvious which command was denied.
+
+**Threat model caveat:** this is a tool-routing-layer sandbox, not OS-level isolation. A determined model can in principle exec arbitrary code via the allowed `Bash` tool with command patterns that don't match the denylist. For hard isolation, run autocoder under OS-level sandboxing (firejail, bubblewrap, or systemd `ProtectHome=`/`ProtectSystem=`). The autocoder sandbox is a useful first layer.
+
+**Reviewer LLM is a separate data flow.** The code reviewer (if enabled) sends the diff to its configured LLM provider as a direct HTTP call. That data flow is governed by your `reviewer:` config (provider, api_key, api_base_url), NOT by `executor.sandbox`. Operators opted in to that flow by enabling the reviewer; sandbox restrictions do not apply.
 
 ---
 

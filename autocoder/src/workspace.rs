@@ -46,20 +46,33 @@ pub fn resolve_path(repo: &RepositoryConfig) -> PathBuf {
 /// Ensure the repository is locally cloned. If the path does not exist, run
 /// `git clone`. If it exists and is a git repository, run `git fetch`. If it
 /// exists but is not a git repo, return an error without modifying the path.
-pub fn ensure_initialized(workspace: &Path, url: &str) -> Result<()> {
+///
+/// When `fork_url` is `Some`, after the clone or fetch the manager
+/// idempotently registers a second remote named `fork` pointing at that
+/// URL — used by fork-PR mode to push the agent branch to a fork instead
+/// of upstream.
+pub fn ensure_initialized(
+    workspace: &Path,
+    url: &str,
+    fork_url: Option<&str>,
+) -> Result<()> {
     if !workspace.exists() {
         git::clone(workspace, url)
             .with_context(|| format!("cloning {url} into {}", workspace.display()))?;
-        return Ok(());
+    } else {
+        if !workspace.join(".git").is_dir() {
+            return Err(anyhow!(
+                "workspace path exists but is not a git repository (no .git directory): {}",
+                workspace.display()
+            ));
+        }
+        git::fetch(workspace)
+            .with_context(|| format!("fetching origin in {}", workspace.display()))?;
     }
-    if !workspace.join(".git").is_dir() {
-        return Err(anyhow!(
-            "workspace path exists but is not a git repository (no .git directory): {}",
-            workspace.display()
-        ));
+    if let Some(fork_url) = fork_url {
+        git::ensure_remote(workspace, "fork", fork_url)
+            .with_context(|| format!("ensuring fork remote points at {fork_url}"))?;
     }
-    git::fetch(workspace)
-        .with_context(|| format!("fetching origin in {}", workspace.display()))?;
     Ok(())
 }
 
@@ -204,7 +217,7 @@ mod tests {
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url).unwrap();
+        ensure_initialized(&workspace, &url, None).unwrap();
         assert!(workspace.join(".git").is_dir());
         assert!(workspace.join("README.md").is_file());
     }
@@ -216,11 +229,11 @@ mod tests {
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url).unwrap();
+        ensure_initialized(&workspace, &url, None).unwrap();
         // Make a local branch in the workspace; we'll verify it survives a fetch.
         run_git(&workspace, &["branch", "local-only-branch"]);
         // Second call should fetch (not re-clone) and preserve local branches.
-        ensure_initialized(&workspace, &url).unwrap();
+        ensure_initialized(&workspace, &url, None).unwrap();
         let output = Command::new("git")
             .args(["branch", "--list", "local-only-branch"])
             .current_dir(&workspace)
@@ -232,13 +245,71 @@ mod tests {
         );
     }
 
+    fn list_remotes(workspace: &Path) -> String {
+        let out = Command::new("git")
+            .args(["remote", "-v"])
+            .current_dir(workspace)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn adds_fork_remote_on_first_clone() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        let remotes = list_remotes(&workspace);
+        assert!(remotes.contains("origin"), "origin must be present: {remotes}");
+        assert!(remotes.contains("fork"), "fork must be present: {remotes}");
+        assert!(remotes.contains(&fork_url), "fork URL must match: {remotes}");
+    }
+
+    #[test]
+    fn fork_remote_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        // Second invocation must not error or duplicate the remote.
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        let remotes = list_remotes(&workspace);
+        let fork_lines = remotes.lines().filter(|l| l.starts_with("fork")).count();
+        // git remote -v emits two lines per remote (fetch + push).
+        assert_eq!(fork_lines, 2, "fork should be listed exactly once: {remotes}");
+    }
+
+    #[test]
+    fn no_fork_remote_when_disabled() {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        make_fixture_remote(&remote);
+        let workspace = dir.path().join("local");
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &url, None).unwrap();
+        let remotes = list_remotes(&workspace);
+        assert!(remotes.contains("origin"), "origin must be present");
+        assert!(!remotes.contains("fork"), "fork must NOT be present");
+    }
+
     #[test]
     fn ensure_initialized_errors_on_non_git_directory() {
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("not-a-repo");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("hello.txt"), "x").unwrap();
-        let err = ensure_initialized(&workspace, "irrelevant-url")
+        let err = ensure_initialized(&workspace, "irrelevant-url", None)
             .expect_err("should error when path is not a git repo");
         let msg = format!("{err:#}");
         assert!(msg.contains(".git"), "error should mention missing .git: {msg}");

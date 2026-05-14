@@ -72,6 +72,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = config::Config::load_from(&config_path)?;
             rewind::execute(
                 cfg.repositories,
+                cfg.github,
                 rewind::RewindArgs {
                     changes,
                     hard,

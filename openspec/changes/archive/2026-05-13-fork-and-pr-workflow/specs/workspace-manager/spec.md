@@ -1,29 +1,4 @@
-# workspace-manager Specification
-
-## Purpose
-TBD - created by archiving change orchestrator-foundation. Update Purpose after archive.
-## Requirements
-### Requirement: Deterministic workspace path derivation
-The workspace manager SHALL derive a per-repository workspace path deterministically from the configured URL, so that restarting the daemon reuses existing local clones rather than creating new ones.
-
-#### Scenario: Path derivation is stable
-- **WHEN** the manager derives a path for a given URL
-- **THEN** invoking the same derivation a second time with the same URL returns a path equal by `==` to the first
-- **AND** the path is rooted at `/tmp/workspaces/`
-
-#### Scenario: Distinct URLs produce distinct paths
-- **WHEN** the manager derives paths for two URLs that differ in host, owner, or repo name
-- **THEN** the resulting paths are not equal
-- **AND** repeated derivations preserve the inequality
-
-### Requirement: Cross-repository path collision detection at startup
-autocoder SHALL detect any two configured repositories that resolve to the same workspace path and refuse to start, naming both URLs and the shared path in the error message.
-
-#### Scenario: Two repos derive to the same path
-- **WHEN** autocoder loads a config containing two repositories whose URLs sanitize to the same workspace path (or whose explicit `local_path` overrides collide)
-- **THEN** autocoder emits a startup error whose text contains BOTH conflicting URLs verbatim AND the shared path
-- **AND** no polling tasks are spawned for either repository
-- **AND** the process exits non-zero within 5 seconds of config load
+## MODIFIED Requirements
 
 ### Requirement: Idempotent workspace initialization
 The workspace manager SHALL ensure a repository is locally cloned before
@@ -74,6 +49,8 @@ fork URL derived from the upstream URL and `fork_owner`.
   the missing `.git` marker
 - **AND** the manager does NOT delete or modify the existing path
 
+## ADDED Requirements
+
 ### Requirement: Fork URL derivation
 The workspace manager SHALL derive the fork URL deterministically from
 the upstream URL and `github.fork_owner` by substituting the owner
@@ -96,4 +73,3 @@ segment while preserving the URL scheme and the repository name.
   GitHub host)
 - **THEN** fork URL derivation returns an error naming the upstream
   URL and the unsupported scheme
-

@@ -18,11 +18,14 @@ use tokio_util::sync::CancellationToken;
 pub async fn execute(cfg: Config) -> Result<()> {
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
+    validate_fork_existence(&cfg.github, &cfg.repositories)?;
 
+    let sandbox = crate::config::ResolvedSandbox::resolve(cfg.executor.sandbox.as_ref());
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
-        ExecutorKind::ClaudeCli => Arc::new(ClaudeCliExecutor::new(
+        ExecutorKind::ClaudeCli => Arc::new(ClaudeCliExecutor::new_with_sandbox(
             cfg.executor.command.clone(),
             cfg.executor.timeout_secs,
+            sandbox,
         )),
     };
 
@@ -97,7 +100,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     let mut tasks: JoinSet<()> = JoinSet::new();
     for repo in cfg.repositories.iter().cloned() {
-        if !repo_passes_startup_check(&repo) {
+        if !repo_passes_startup_check(&repo, &cfg.github) {
             // Per orchestrator-cli baseline: a repo dirty at startup is
             // skipped for the remainder of the process lifetime. Other
             // configured repositories continue to be serviced.
@@ -192,13 +195,62 @@ pub fn validate_github_token_routes(
     Ok(())
 }
 
+/// When fork-PR mode is active, verify that each configured repository
+/// has a reachable fork at the derived URL. Aggregates failures into a
+/// single error before any polling task is spawned.
+pub fn validate_fork_existence(
+    github: &GithubConfig,
+    repos: &[RepositoryConfig],
+) -> Result<()> {
+    let Some(fork_owner) = github.fork_owner.as_deref() else {
+        return Ok(());
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for repo in repos {
+        let fork_url = match crate::github::derive_fork_url(&repo.url, fork_owner) {
+            Ok(u) => u,
+            Err(e) => {
+                failures.push(format!("repo `{}`: {e:#}", repo.url));
+                continue;
+            }
+        };
+        if let Err(e) = crate::git::ls_remote_head(&fork_url) {
+            failures.push(format!(
+                "repo `{}`: expected fork at `{fork_url}` is unreachable: {e:#}",
+                repo.url
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "fork-PR mode enabled but {} repository(ies) have missing or unreachable forks under `{fork_owner}`:\n  - {}\nVerify each fork exists and the autocoder user has SSH access to it.",
+            failures.len(),
+            failures.join("\n  - ")
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize the workspace and check for a dirty working tree. Returns
 /// `true` if the repository is healthy and a polling task should be spawned;
 /// `false` (with a logged error) if the workspace is dirty or cannot be
 /// initialized.
-pub fn repo_passes_startup_check(repo: &RepositoryConfig) -> bool {
+pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig) -> bool {
     let workspace_path = workspace::resolve_path(repo);
-    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url) {
+    let fork_url = match github.fork_owner.as_deref() {
+        Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::error!(
+                    url = repo.url.as_str(),
+                    "cannot derive fork URL for fork-PR mode: {e:#}; this repository is skipped for the process lifetime"
+                );
+                return false;
+            }
+        },
+        None => None,
+    };
+    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_url.as_deref()) {
         tracing::error!(
             url = repo.url.as_str(),
             workspace = %workspace_path.display(),
@@ -309,6 +361,40 @@ mod tests {
     }
 
     #[test]
+    fn fork_existence_validation_skipped_in_direct_push_mode() {
+        let github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        // No repos to validate; no fork_owner means the function returns Ok
+        // without probing anything.
+        let repos = vec![repo("git@github.com:any/repo.git")];
+        validate_fork_existence(&github, &repos).expect("direct-push mode skips fork probing");
+    }
+
+    #[test]
+    fn fork_existence_validation_errors_on_unsupported_url_scheme() {
+        // Non-github URL combined with fork-PR mode → derive_fork_url
+        // rejects → validation aggregates the failure.
+        let github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: Some("machine-user".into()),
+        };
+        let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
+        let err = validate_fork_existence(&github, &repos)
+            .expect_err("unsupported URL scheme must error in fork mode");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("upstream/repo.git"),
+            "error must name the offending URL; got: {msg}"
+        );
+    }
+
+    #[test]
     fn startup_fails_when_no_token_route() {
         // Two repos: one has a matching owner_tokens entry whose env var
         // is set; the other has no entry AND `token_env`'s named env var
@@ -330,6 +416,7 @@ mod tests {
             token_env: fallback_var.into(),
             token: None,
             owner_tokens: Some(map),
+            fork_owner: None,
         };
 
         let repos = vec![
@@ -374,6 +461,7 @@ mod tests {
                 value: "inline-fallback-pat".into(),
             }),
             owner_tokens: Some(map),
+            fork_owner: None,
         };
         let repos = vec![
             repo("git@github.com:fixture-org/repo.git"),    // owner_tokens hit
@@ -402,6 +490,7 @@ mod tests {
             token_env: fallback_var.into(),
             token: None,
             owner_tokens: Some(map),
+            fork_owner: None,
         };
 
         let repos = vec![
@@ -430,9 +519,15 @@ mod tests {
         let clean_repo = cfg_with(clean_path);
 
         // Dirty repo fails the startup check; clean repo passes.
-        assert!(!repo_passes_startup_check(&dirty_repo),
+        let direct_push_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        assert!(!repo_passes_startup_check(&dirty_repo, &direct_push_github),
             "dirty workspace must fail startup check");
-        assert!(repo_passes_startup_check(&clean_repo),
+        assert!(repo_passes_startup_check(&clean_repo, &direct_push_github),
             "clean workspace must pass startup check");
     }
 }

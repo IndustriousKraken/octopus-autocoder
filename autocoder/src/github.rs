@@ -242,6 +242,27 @@ pub fn parse_repo_url(url: &str) -> Result<(String, String)> {
     ))
 }
 
+/// Derive a fork URL by substituting `fork_owner` for the owner segment of
+/// `upstream_url`, preserving the URL's scheme and the repository name.
+///
+/// Supports both `git@github.com:owner/repo.git` (SSH) and
+/// `https://github.com/owner/repo.git` (HTTPS) inputs. Other schemes
+/// (e.g. enterprise GitHub hosts, `ssh://...`) error explicitly so the
+/// operator knows their config is not supported by fork-PR mode.
+pub fn derive_fork_url(upstream_url: &str, fork_owner: &str) -> Result<String> {
+    let (_upstream_owner, repo) = parse_repo_url(upstream_url)?;
+    let trimmed = upstream_url.trim();
+    if trimmed.starts_with("git@github.com:") {
+        Ok(format!("git@github.com:{fork_owner}/{repo}.git"))
+    } else if trimmed.starts_with("https://github.com/") {
+        Ok(format!("https://github.com/{fork_owner}/{repo}.git"))
+    } else {
+        Err(anyhow!(
+            "fork-PR mode requires a `git@github.com:` or `https://github.com/` upstream URL; got `{upstream_url}`"
+        ))
+    }
+}
+
 fn split_owner_repo(rest: &str, original: &str) -> Result<(String, String)> {
     let mut parts = rest.splitn(2, '/');
     let owner = parts.next().unwrap_or("");
@@ -257,6 +278,41 @@ fn split_owner_repo(rest: &str, original: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_fork_url_ssh() {
+        let got = derive_fork_url("git@github.com:UpstreamOrg/repo.git", "machine-user").unwrap();
+        assert_eq!(got, "git@github.com:machine-user/repo.git");
+    }
+
+    #[test]
+    fn derive_fork_url_https() {
+        let got = derive_fork_url(
+            "https://github.com/UpstreamOrg/repo.git",
+            "machine-user",
+        )
+        .unwrap();
+        assert_eq!(got, "https://github.com/machine-user/repo.git");
+    }
+
+    #[test]
+    fn derive_fork_url_preserves_repo_name_without_git_suffix() {
+        // parse_repo_url accepts URLs without .git; derive_fork_url
+        // always emits .git suffix on the SSH form.
+        let got = derive_fork_url("git@github.com:upstream/repo", "machine-user").unwrap();
+        assert_eq!(got, "git@github.com:machine-user/repo.git");
+    }
+
+    #[test]
+    fn derive_fork_url_unsupported_scheme_errors() {
+        let err = derive_fork_url("ssh://git@github.com/upstream/repo.git", "machine-user")
+            .expect_err("ssh:// scheme should not be supported");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ssh://git@github.com/upstream/repo.git"),
+            "error must name the offending URL; got: {msg}"
+        );
+    }
 
     #[test]
     fn parse_url_ssh_with_git_suffix() {

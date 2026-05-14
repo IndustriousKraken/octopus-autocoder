@@ -84,7 +84,7 @@ pub async fn execute_one_pass(
     reviewer: Option<&CodeReviewer>,
     chatops_ctx: Option<&ChatOpsContext>,
 ) -> Result<()> {
-    let processed = run_pass_through_commits(workspace, repo, executor, chatops_ctx).await?;
+    let processed = run_pass_through_commits(workspace, repo, github_cfg, executor, chatops_ctx).await?;
     if processed.is_empty() {
         return Ok(());
     }
@@ -124,7 +124,12 @@ pub async fn execute_one_pass(
         }
     };
 
-    git::push_force_with_lease(workspace, &repo.agent_branch)?;
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    git::push_force_with_lease(workspace, &repo.agent_branch, push_remote)?;
     open_pull_request(repo, github_cfg, &processed, review_report.as_ref(), draft).await?;
     Ok(())
 }
@@ -145,10 +150,15 @@ fn build_change_summary(processed: &[String]) -> String {
 pub async fn run_pass_through_commits(
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
 ) -> Result<Vec<String>> {
-    workspace::ensure_initialized(workspace, &repo.url)?;
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
+        None => None,
+    };
+    workspace::ensure_initialized(workspace, &repo.url, fork_url.as_deref())?;
     let _cleared = queue::clear_stale_locks(workspace)?;
 
     let dirty = git::status_porcelain(workspace)?;
@@ -508,14 +518,25 @@ async fn open_pull_request(
     draft: bool,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
+    // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
+    // posted to upstream's /pulls endpoint regardless of fork-PR mode, so
+    // the credential authorizing that call must have access to upstream.
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
     let title = format!("agent: {} change(s) in pass", changes.len());
     let body = build_pr_body(changes);
 
+    // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
+    // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
+    // branch name (same-repo PR).
+    let head = match github_cfg.fork_owner.as_deref() {
+        Some(fork_owner) => format!("{fork_owner}:{}", repo.agent_branch),
+        None => repo.agent_branch.clone(),
+    };
+
     let url = github::create_pull_request(
         &owner,
         &repo_name,
-        &repo.agent_branch,
+        &head,
         &repo.base_branch,
         &title,
         &body,
@@ -577,6 +598,7 @@ mod tests {
             token_env: fallback.into(),
             token: None,
             owner_tokens: Some(map),
+            fork_owner: None,
         };
 
         // Mirror open_pull_request's internal sequence.
@@ -607,6 +629,56 @@ mod tests {
             std::env::remove_var(var);
             std::env::remove_var(fallback);
         }
+    }
+
+    /// In fork-PR mode the PR's `head` is `<fork-owner>:<branch>` and the
+    /// API call still goes to the upstream repo's /pulls endpoint.
+    #[tokio::test]
+    async fn pr_uses_cross_repo_head_in_fork_mode() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/upstream-org/repo/pulls")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"head":"machine-user:agent-q","base":"main"}"#.to_string(),
+            ))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"html_url":"https://github.com/upstream-org/repo/pull/1","number":1}"#,
+            )
+            .create_async()
+            .await;
+
+        // Mirror the open_pull_request flow with fork_owner set.
+        let github_cfg = GithubConfig {
+            token_env: "X".into(),
+            token: Some(crate::config::SecretSource::Inline {
+                value: "inline-token".into(),
+            }),
+            owner_tokens: None,
+            fork_owner: Some("machine-user".into()),
+        };
+        let (owner, repo_name) =
+            crate::github::parse_repo_url("git@github.com:upstream-org/repo.git").unwrap();
+        let token = crate::github_credentials::resolve_token(&github_cfg, &owner).unwrap();
+        let head = format!("{}:{}", github_cfg.fork_owner.as_deref().unwrap(), "agent-q");
+
+        crate::github::create_pull_request_at_for_test(
+            &server.url(),
+            &owner,
+            &repo_name,
+            &head,
+            "main",
+            "t",
+            "b",
+            &token,
+            None,
+            false,
+        )
+        .await
+        .expect("cross-repo PR succeeds");
+
+        mock.assert_async().await;
     }
 
     #[test]
@@ -798,7 +870,13 @@ mod tests {
         executor: &dyn Executor,
     ) -> Result<Vec<String>> {
         let repo = fixture_repo(workspace);
-        run_pass_through_commits(workspace, &repo, executor, None).await
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        run_pass_through_commits(workspace, &repo, &github_cfg, executor, None).await
     }
 
     /// 13.3.2 / executor baseline: when the executor returns `Failed`,
@@ -1038,9 +1116,16 @@ mod tests {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
         };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
         let processed = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
+            &test_github,
             &executor,
             Some(&chatops_ctx),
         )
@@ -1124,9 +1209,16 @@ mod tests {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
         };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
         let processed = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
+            &test_github,
             &executor,
             Some(&chatops_ctx),
         )
@@ -1215,9 +1307,16 @@ mod tests {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
         };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
         let processed = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
+            &test_github,
             &executor,
             Some(&chatops_ctx),
         )
@@ -1313,9 +1412,16 @@ mod tests {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
         };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
         let processed = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
+            &test_github,
             &executor,
             Some(&chatops_ctx),
         )
@@ -1411,7 +1517,13 @@ mod tests {
                 artifact_name: format!("REVIEW_FIXTURE_{body_contains}"),
                 artifact_text: "x".into(),
             };
-            let processed = run_pass_through_commits(&ws, &fixture_repo(&ws), &executor, None)
+            let direct_github = GithubConfig {
+                token_env: "X".into(),
+                token: None,
+                owner_tokens: None,
+                fork_owner: None,
+            };
+            let processed = run_pass_through_commits(&ws, &fixture_repo(&ws), &direct_github, &executor, None)
                 .await
                 .expect("commits step succeeds");
             assert_eq!(processed, vec!["rv-change".to_string()]);
@@ -1585,6 +1697,7 @@ mod tests {
             token_env: "DOES_NOT_EXIST".into(),
             token: None,
             owner_tokens: None,
+            fork_owner: None,
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -1648,6 +1761,7 @@ mod tests {
             token_env: "DOES_NOT_EXIST".into(),
             token: None,
             owner_tokens: None,
+            fork_owner: None,
         };
         let cancel = CancellationToken::new();
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);

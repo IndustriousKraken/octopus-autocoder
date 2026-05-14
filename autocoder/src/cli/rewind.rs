@@ -2,7 +2,7 @@
 //! deleting the agent branch and unarchiving named changes back into the
 //! active queue.
 
-use crate::config::RepositoryConfig;
+use crate::config::{GithubConfig, RepositoryConfig};
 use crate::{git, queue, workspace};
 use anyhow::{Result, anyhow};
 use std::io::{BufRead, Write};
@@ -17,15 +17,20 @@ pub struct RewindArgs {
 
 /// Entry point invoked by `cli::dispatch`. Wraps real stdin/stdout for the
 /// confirmation prompt; tests use `execute_with_io` directly.
-pub async fn execute(repos: Vec<RepositoryConfig>, args: RewindArgs) -> Result<()> {
+pub async fn execute(
+    repos: Vec<RepositoryConfig>,
+    github: GithubConfig,
+    args: RewindArgs,
+) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    execute_with_io(repos, args, &mut stdin.lock(), &mut stdout.lock()).await
+    execute_with_io(repos, github, args, &mut stdin.lock(), &mut stdout.lock()).await
 }
 
 /// IO-injected core of `execute`. Tests pass in-memory cursors.
 pub async fn execute_with_io<R: BufRead, W: Write>(
     repos: Vec<RepositoryConfig>,
+    github: GithubConfig,
     args: RewindArgs,
     reader: &mut R,
     writer: &mut W,
@@ -34,7 +39,12 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
     tracing::info!(url = repo.url.as_str(), "rewind targeting repository");
 
     let workspace_path = workspace::resolve_path(repo);
-    workspace::ensure_initialized(&workspace_path, &repo.url)?;
+    let fork_url = match github.fork_owner.as_deref() {
+        Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
+        None => None,
+    };
+    workspace::ensure_initialized(&workspace_path, &repo.url, fork_url.as_deref())?;
+    let remote_name = if github.fork_owner.is_some() { "fork" } else { "origin" };
 
     if !args.hard {
         if !confirm(repo, &args.changes, reader, writer)? {
@@ -53,7 +63,7 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
     if args.hard {
         // Remote delete only on --hard. Errors are logged but do not block
         // the unarchive step per design.md's "Hard rewind" decision.
-        if let Err(e) = git::delete_branch_remote(&workspace_path, &repo.agent_branch) {
+        if let Err(e) = git::delete_branch_remote(&workspace_path, &repo.agent_branch, remote_name) {
             tracing::error!(
                 url = repo.url.as_str(),
                 "remote branch deletion failed for `{}`: {e:#}; unarchive will still proceed",
@@ -214,6 +224,16 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Default test GithubConfig — direct-push mode, no fork.
+    fn direct_push_github() -> GithubConfig {
+        GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        }
+    }
 
     fn cfg(url: &str) -> RepositoryConfig {
         RepositoryConfig {
@@ -419,6 +439,7 @@ mod tests {
         let mut output = Vec::<u8>::new();
         execute_with_io(
             repos,
+            direct_push_github(),
             RewindArgs {
                 changes: vec!["feature-b".to_string()],
                 hard: true,
@@ -455,6 +476,7 @@ mod tests {
         let mut output = Vec::<u8>::new();
         let err = execute_with_io(
             repos,
+            direct_push_github(),
             RewindArgs {
                 changes: vec!["feature-real".to_string(), "never-existed".to_string()],
                 hard: true,
@@ -488,6 +510,7 @@ mod tests {
         let mut output = Vec::<u8>::new();
         execute_with_io(
             repos,
+            direct_push_github(),
             RewindArgs {
                 changes: vec!["feature-x".to_string()],
                 hard: false,
@@ -523,6 +546,7 @@ mod tests {
         let mut output = Vec::<u8>::new();
         execute_with_io(
             repos,
+            direct_push_github(),
             RewindArgs {
                 changes: vec!["feature-y".to_string()],
                 hard: false,
