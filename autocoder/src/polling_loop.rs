@@ -3,7 +3,7 @@
 //! one iteration are logged and the loop continues to the next sleep.
 
 use crate::alert_state::{AlertCategory, AlertEntry, AlertState};
-use crate::chatops::{self, AnswerPayload, ChatOps, QuestionPayload};
+use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
@@ -16,17 +16,17 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-/// Per-pass ChatOps context: the Slack client + the resolved channel id
+/// Per-pass ChatOps context: the active backend + the resolved channel id
 /// for THIS repository. Constructed once at startup from the global
-/// `slack:` config and the per-repo `slack_channel_id` override.
+/// `chatops:` config and the per-repo `chatops_channel_id` override.
 pub struct ChatOpsContext {
-    pub chatops: Arc<ChatOps>,
+    pub chatops: Arc<dyn ChatOpsBackend>,
     pub channel: String,
     /// Whether start-of-work notifications fire for this repo. Resolved
-    /// from `slack.notifications.start_work` (defaults to true).
+    /// from `chatops.notifications.start_work` (defaults to true).
     pub start_work_enabled: bool,
     /// Whether throttled failure alerts fire for this repo. Resolved from
-    /// `slack.notifications.failure_alerts` (defaults to true).
+    /// `chatops.notifications.failure_alerts` (defaults to true).
     pub failure_alerts_enabled: bool,
 }
 
@@ -264,7 +264,7 @@ pub async fn run_pass_through_commits(
 
 /// Iterate over the workspace's `list_waiting` changes. For each:
 ///   1. Read `.question.json` to recover the resume handle + thread coords.
-///   2. Poll Slack for the first human reply.
+///   2. Poll the active ChatOps backend for the first human reply.
 ///   3. If a reply has arrived: write `.answer.json`, delete
 ///      `.question.json`, call `executor.resume(handle, &reply.text)`,
 ///      classify the new outcome the same way `walk_queue` would.
@@ -477,7 +477,7 @@ async fn walk_queue(
             Ok(QueueStep::AskUserExitEarly) => {
                 tracing::error!(
                     url = repo.url.as_str(),
-                    "executor returned AskUser for `{change}` AND chatops is not configured; exiting pass. Set the `slack:` config block to enable escalation."
+                    "executor returned AskUser for `{change}` AND chatops is not configured; exiting pass. Set the `chatops:` config block to enable escalation."
                 );
                 break;
             }
@@ -1153,7 +1153,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
@@ -1425,8 +1425,10 @@ mod tests {
     // chatops-escalation end-to-end tests
     // ============================================================
 
-    /// Build a ChatOps client wired against the given mockito server.
-    async fn fixture_chatops_for(server: &mut mockito::Server) -> Arc<ChatOps> {
+    /// Build a ChatOps backend (Slack-flavored) wired against the given
+    /// mockito server. Returned as a trait object so tests interact with
+    /// the same surface the production polling loop does.
+    async fn fixture_chatops_for(server: &mut mockito::Server) -> Arc<dyn ChatOpsBackend> {
         let _ = server
             .mock("POST", "/auth.test")
             .with_status(200)
@@ -1434,7 +1436,7 @@ mod tests {
             .create_async()
             .await;
         Arc::new(
-            ChatOps::new_at(server.url(), "xoxb-fixture".into())
+            crate::chatops::SlackBackend::new_at(server.url(), "xoxb-fixture".into())
                 .await
                 .unwrap(),
         )
@@ -2203,7 +2205,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 0, // tight loop so we get many iterations fast
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -2267,7 +2269,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -2685,7 +2687,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
 
         struct NoopExecutor;
@@ -2789,7 +2791,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let r1 = run_pass_through_commits(&ws, &bad_repo, &test_github, &executor, Some(&chatops_ctx)).await;
         assert!(r1.is_err(), "iteration 1 must error");
@@ -2818,7 +2820,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let r2 = run_pass_through_commits(&ws, &good_repo, &test_github, &executor, Some(&chatops_ctx)).await;
         assert!(

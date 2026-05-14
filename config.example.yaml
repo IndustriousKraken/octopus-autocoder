@@ -95,21 +95,49 @@ github:
 #   #                                   #   openai_compatible → https://api.openai.com/v1
 #   #                                   # set this for OpenRouter, Grok, local Ollama, etc.
 
-# Slack ChatOps escalation — when the agent can't proceed without human
-# input, post the question to Slack and resume on reply. See README's
-# "ChatOps Escalation" section for bot setup + required scopes.
+# ChatOps escalation — when the agent can't proceed without human input,
+# post the question to a chat platform and resume on reply. Slack is the
+# only officially-supported provider; Discord, Teams, Mattermost, and
+# Matrix are EXPERIMENTAL (best-effort, may break without notice). See
+# README's "ChatOps Escalation" and "Experimental ChatOps Backends"
+# sections for setup details.
 #
-# slack:
-#   bot_token_env: SLACK_BOT_TOKEN
-#   # Inline alternative: when `bot_token` is set, `bot_token_env` is ignored.
-#   # bot_token:
-#   #   value: "xoxb-yourtokenhere"
-#   default_channel_id: C0123456789
+# chatops:
+#   provider: slack                       # one of: slack | discord | teams | mattermost | matrix
+#   default_channel_id: C0123456789       # provider-native channel id format
 #   # Optional: opt-out of either kind of progress notification. Both
 #   # default to `true` when the `notifications:` block is absent OR when
-#   # an individual key is omitted. See README's "Progress notifications"
-#   # subsection for what each flag controls.
-#   #
+#   # an individual key is omitted.
 #   # notifications:
 #   #   start_work: true       # one 🚀 message per pending-change pickup
 #   #   failure_alerts: true   # one ⚠️ alert per (repo, category) per 24h
+#
+#   # Slack — officially supported.
+#   slack:
+#     bot_token_env: SLACK_BOT_TOKEN
+#     # Inline alternative: when `bot_token` is set, `bot_token_env` is ignored.
+#     # bot_token:
+#     #   value: "xoxb-yourtokenhere"
+#
+#   # ---- EXPERIMENTAL backends below — best-effort, no API-stability ----
+#
+#   # Discord (EXPERIMENTAL). Bot tokens via Authorization: Bot <token>.
+#   # discord:
+#   #   bot_token_env: DISCORD_BOT_TOKEN
+#
+#   # Microsoft Teams (EXPERIMENTAL). OAuth client_credentials.
+#   # teams:
+#   #   tenant_id: "11111111-2222-3333-4444-555555555555"
+#   #   client_id: "66666666-7777-8888-9999-aaaaaaaaaaaa"
+#   #   client_secret_env: TEAMS_CLIENT_SECRET
+#   #   team_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+#
+#   # Mattermost (EXPERIMENTAL). PAT auth.
+#   # mattermost:
+#   #   server_url: "https://mattermost.example.com"
+#   #   access_token_env: MATTERMOST_TOKEN
+#
+#   # Matrix (EXPERIMENTAL). Access-token auth.
+#   # matrix:
+#   #   homeserver_url: "https://matrix.example.com"
+#   #   access_token_env: MATRIX_ACCESS_TOKEN

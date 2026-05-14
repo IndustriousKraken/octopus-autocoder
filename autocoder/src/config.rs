@@ -56,7 +56,7 @@ pub struct Config {
     #[serde(default)]
     pub reviewer: Option<ReviewerConfig>,
     #[serde(default)]
-    pub slack: Option<SlackConfig>,
+    pub chatops: Option<ChatOpsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub struct RepositoryConfig {
     pub agent_branch: String,
     pub poll_interval_sec: u64,
     #[serde(default)]
-    pub slack_channel_id: Option<String>,
+    pub chatops_channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,16 +243,71 @@ pub enum ReviewerProvider {
     OpenAiCompatible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatOpsProvider {
+    Slack,
+    Discord,
+    Teams,
+    Mattermost,
+    Matrix,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SlackConfig {
+pub struct ChatOpsConfig {
+    pub provider: ChatOpsProvider,
+    pub default_channel_id: String,
+    #[serde(default)]
+    pub notifications: Option<NotificationsConfig>,
+    #[serde(default)]
+    pub slack: Option<SlackProviderConfig>,
+    #[serde(default)]
+    pub discord: Option<DiscordProviderConfig>,
+    #[serde(default)]
+    pub teams: Option<TeamsProviderConfig>,
+    #[serde(default)]
+    pub mattermost: Option<MattermostProviderConfig>,
+    #[serde(default)]
+    pub matrix: Option<MatrixProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackProviderConfig {
     #[serde(default)]
     pub bot_token_env: Option<String>,
     #[serde(default)]
     pub bot_token: Option<SecretSource>,
-    pub default_channel_id: String,
-    #[serde(default)]
-    pub notifications: Option<NotificationsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordProviderConfig {
+    pub bot_token_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamsProviderConfig {
+    pub tenant_id: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub team_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MattermostProviderConfig {
+    pub server_url: String,
+    pub access_token_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixProviderConfig {
+    pub homeserver_url: String,
+    pub access_token_env: String,
 }
 
 /// Operator-facing notification preferences. Both fields default to `true`
@@ -271,30 +326,30 @@ fn default_true() -> bool {
 }
 
 impl NotificationsConfig {
-    /// Effective value of `start_work` for the given Slack config. Returns
+    /// Effective value of `start_work` for the given ChatOps config. Returns
     /// `true` when either no `notifications:` block was provided OR when
     /// the field defaulted in. Returns `false` only when explicitly set.
-    pub fn start_work_enabled(slack: Option<&SlackConfig>) -> bool {
-        slack
-            .and_then(|s| s.notifications.as_ref())
+    pub fn start_work_enabled(chatops: Option<&ChatOpsConfig>) -> bool {
+        chatops
+            .and_then(|c| c.notifications.as_ref())
             .map(|n| n.start_work)
             .unwrap_or(true)
     }
 
-    /// Effective value of `failure_alerts` for the given Slack config.
-    pub fn failure_alerts_enabled(slack: Option<&SlackConfig>) -> bool {
-        slack
-            .and_then(|s| s.notifications.as_ref())
+    /// Effective value of `failure_alerts` for the given ChatOps config.
+    pub fn failure_alerts_enabled(chatops: Option<&ChatOpsConfig>) -> bool {
+        chatops
+            .and_then(|c| c.notifications.as_ref())
             .map(|n| n.failure_alerts)
             .unwrap_or(true)
     }
 }
 
 impl RepositoryConfig {
-    /// Resolve the Slack channel to use for this repo: explicit per-repo
-    /// `slack_channel_id` if set, otherwise the global default.
-    pub fn slack_channel<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.slack_channel_id.as_deref().unwrap_or(fallback)
+    /// Resolve the ChatOps channel to use for this repo: explicit per-repo
+    /// `chatops_channel_id` if set, otherwise the global default.
+    pub fn chatops_channel<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.chatops_channel_id.as_deref().unwrap_or(fallback)
     }
 }
 
@@ -360,9 +415,9 @@ github:
         assert_eq!(cfg.repositories.len(), 1);
         assert_eq!(cfg.repositories[0].base_branch, "main");
         assert_eq!(cfg.repositories[0].agent_branch, "agent-q");
-        // Reviewer and Slack blocks are commented out by default.
+        // Reviewer and ChatOps blocks are commented out by default.
         assert!(cfg.reviewer.is_none(), "reviewer must be off by default");
-        assert!(cfg.slack.is_none(), "slack must be off by default");
+        assert!(cfg.chatops.is_none(), "chatops must be off by default");
     }
 
     #[test]
@@ -513,29 +568,168 @@ reviewer:
     }
 
     #[test]
-    fn loads_with_slack() {
+    fn loads_with_chatops_slack() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
     base_branch: main
     agent_branch: agent-q
     poll_interval_sec: 60
-    slack_channel_id: C01234OVERRIDE
+    chatops_channel_id: C01234OVERRIDE
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        let slack = cfg.slack.expect("slack block present");
+        let chatops = cfg.chatops.expect("chatops block present");
+        assert_eq!(chatops.provider, ChatOpsProvider::Slack);
+        assert_eq!(chatops.default_channel_id, "C0DEFAULT");
+        let slack = chatops.slack.as_ref().expect("slack sub-block present");
         assert_eq!(slack.bot_token_env.as_deref(), Some("SLACK_BOT_TOKEN"));
-        assert_eq!(slack.default_channel_id, "C0DEFAULT");
         assert_eq!(
-            cfg.repositories[0].slack_channel_id.as_deref(),
+            cfg.repositories[0].chatops_channel_id.as_deref(),
             Some("C01234OVERRIDE")
+        );
+    }
+
+    #[test]
+    fn loads_with_chatops_discord() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: discord
+  default_channel_id: "1111111111"
+  discord:
+    bot_token_env: DISCORD_BOT_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let chatops = cfg.chatops.unwrap();
+        assert_eq!(chatops.provider, ChatOpsProvider::Discord);
+        assert_eq!(
+            chatops.discord.unwrap().bot_token_env,
+            "DISCORD_BOT_TOKEN"
+        );
+    }
+
+    #[test]
+    fn loads_with_chatops_teams() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: teams
+  default_channel_id: "19:abcd@thread.tacv2"
+  teams:
+    tenant_id: "11111111-2222-3333-4444-555555555555"
+    client_id: "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    client_secret_env: TEAMS_CLIENT_SECRET
+    team_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let chatops = cfg.chatops.unwrap();
+        assert_eq!(chatops.provider, ChatOpsProvider::Teams);
+        let t = chatops.teams.unwrap();
+        assert_eq!(t.tenant_id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(t.client_secret_env, "TEAMS_CLIENT_SECRET");
+    }
+
+    #[test]
+    fn loads_with_chatops_mattermost() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: mattermost
+  default_channel_id: "channel-abc"
+  mattermost:
+    server_url: "https://mattermost.example.com"
+    access_token_env: MATTERMOST_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let chatops = cfg.chatops.unwrap();
+        assert_eq!(chatops.provider, ChatOpsProvider::Mattermost);
+        let m = chatops.mattermost.unwrap();
+        assert_eq!(m.server_url, "https://mattermost.example.com");
+        assert_eq!(m.access_token_env, "MATTERMOST_TOKEN");
+    }
+
+    #[test]
+    fn loads_with_chatops_matrix() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: matrix
+  default_channel_id: "!abc:server.tld"
+  matrix:
+    homeserver_url: "https://matrix.example.com"
+    access_token_env: MATRIX_ACCESS_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let chatops = cfg.chatops.unwrap();
+        assert_eq!(chatops.provider, ChatOpsProvider::Matrix);
+        let m = chatops.matrix.unwrap();
+        assert_eq!(m.homeserver_url, "https://matrix.example.com");
+        assert_eq!(m.access_token_env, "MATRIX_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn rejects_unknown_chatops_provider() {
+        let yaml = r##"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: irc
+  default_channel_id: "#chan"
+"##;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("unknown chatops provider must be rejected at parse time");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("irc") || msg.to_lowercase().contains("variant"),
+            "error must reference the offending value; got: {msg}"
         );
     }
 
@@ -547,9 +741,9 @@ slack:
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: Some("C_REPO_LEVEL".into()),
+            chatops_channel_id: Some("C_REPO_LEVEL".into()),
         };
-        assert_eq!(repo_with_override.slack_channel("C_DEFAULT"), "C_REPO_LEVEL");
+        assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
         let repo_default = RepositoryConfig {
             url: "x".into(),
@@ -557,13 +751,13 @@ slack:
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
-        assert_eq!(repo_default.slack_channel("C_DEFAULT"), "C_DEFAULT");
+        assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
 
     #[test]
-    fn slack_block_absent_parses_to_none() {
+    fn chatops_block_absent_parses_to_none() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -576,7 +770,7 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        assert!(cfg.slack.is_none());
+        assert!(cfg.chatops.is_none());
     }
 
     #[test]
@@ -896,15 +1090,18 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
-  bot_token:
-    value: "xoxb-inline"
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    bot_token:
+      value: "xoxb-inline"
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("inline slack bot_token should parse");
-        let slack = cfg.slack.unwrap();
+        let chatops = cfg.chatops.unwrap();
+        let slack = chatops.slack.unwrap();
         match slack.bot_token.unwrap() {
             SecretSource::Inline { value } => assert_eq!(value, "xoxb-inline"),
             _ => panic!("expected inline slack bot token"),
@@ -951,15 +1148,18 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token:
-    value: "xoxb-inline-only"
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token:
+      value: "xoxb-inline-only"
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path)
             .expect("slack with inline bot_token and no bot_token_env should parse");
-        let slack = cfg.slack.unwrap();
+        let chatops = cfg.chatops.unwrap();
+        let slack = chatops.slack.unwrap();
         assert!(slack.bot_token_env.is_none());
         assert!(slack.bot_token.is_some());
     }
@@ -1009,21 +1209,23 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
   notifications:
     start_work: false
     failure_alerts: false
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config with notifications should parse");
-        let slack = cfg.slack.as_ref().expect("slack present");
-        let n = slack.notifications.as_ref().expect("notifications present");
+        let chatops = cfg.chatops.as_ref().expect("chatops present");
+        let n = chatops.notifications.as_ref().expect("notifications present");
         assert!(!n.start_work);
         assert!(!n.failure_alerts);
-        assert!(!NotificationsConfig::start_work_enabled(cfg.slack.as_ref()));
-        assert!(!NotificationsConfig::failure_alerts_enabled(cfg.slack.as_ref()));
+        assert!(!NotificationsConfig::start_work_enabled(cfg.chatops.as_ref()));
+        assert!(!NotificationsConfig::failure_alerts_enabled(cfg.chatops.as_ref()));
     }
 
     #[test]
@@ -1037,20 +1239,22 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
   notifications:
     start_work: false
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("partial notifications should parse");
-        let slack = cfg.slack.as_ref().unwrap();
-        let n = slack.notifications.as_ref().unwrap();
+        let chatops = cfg.chatops.as_ref().unwrap();
+        let n = chatops.notifications.as_ref().unwrap();
         assert!(!n.start_work, "explicitly disabled");
         assert!(n.failure_alerts, "omitted key defaults to true");
-        assert!(!NotificationsConfig::start_work_enabled(cfg.slack.as_ref()));
-        assert!(NotificationsConfig::failure_alerts_enabled(cfg.slack.as_ref()));
+        assert!(!NotificationsConfig::start_work_enabled(cfg.chatops.as_ref()));
+        assert!(NotificationsConfig::failure_alerts_enabled(cfg.chatops.as_ref()));
     }
 
     #[test]
@@ -1064,9 +1268,11 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
   notifications:
     start_work: true
     typo_field: oops
@@ -1092,18 +1298,20 @@ repositories:
 executor:
   kind: claude_cli
 github: {}
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("absent notifications still parses");
-        let slack = cfg.slack.as_ref().unwrap();
-        assert!(slack.notifications.is_none(), "no block was provided");
+        let chatops = cfg.chatops.as_ref().unwrap();
+        assert!(chatops.notifications.is_none(), "no block was provided");
         // The helpers MUST treat absence as "both enabled".
-        assert!(NotificationsConfig::start_work_enabled(cfg.slack.as_ref()));
-        assert!(NotificationsConfig::failure_alerts_enabled(cfg.slack.as_ref()));
-        // No slack at all is the same.
+        assert!(NotificationsConfig::start_work_enabled(cfg.chatops.as_ref()));
+        assert!(NotificationsConfig::failure_alerts_enabled(cfg.chatops.as_ref()));
+        // No chatops at all is the same.
         assert!(NotificationsConfig::start_work_enabled(None));
         assert!(NotificationsConfig::failure_alerts_enabled(None));
     }

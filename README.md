@@ -96,7 +96,7 @@ A list of one or more repositories to manage. Each entry:
 | `agent_branch`       | yes      | —       | The branch the daemon pushes work to (typically `agent-q`). |
 | `poll_interval_sec`  | yes      | —       | Seconds between iterations on this repo. |
 | `local_path`         | no       | derived | See [Workspace path derivation](#workspace-path-derivation). |
-| `slack_channel_id`   | no       | falls back to `slack.default_channel_id` | See [ChatOps Escalation](#chatops-escalation). |
+| `chatops_channel_id` | no       | falls back to `chatops.default_channel_id` | See [ChatOps Escalation](#chatops-escalation). |
 
 ### `executor:` (required)
 
@@ -121,9 +121,9 @@ A list of one or more repositories to manage. Each entry:
 
 See [Code Review](#code-review). Absent block disables the reviewer step.
 
-### `slack:` (optional)
+### `chatops:` (optional)
 
-See [ChatOps Escalation](#chatops-escalation). Absent block disables Slack escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
+See [ChatOps Escalation](#chatops-escalation). Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior. The required `provider:` field selects one of `slack` (officially supported) or `discord` / `teams` / `mattermost` / `matrix` (each EXPERIMENTAL — see [Experimental ChatOps Backends](#experimental-chatops-backends)).
 
 ---
 
@@ -234,17 +234,19 @@ The default executor backend wraps `claude` as a subprocess. The daemon writes a
 
 ## ChatOps Escalation
 
-When the optional `slack:` config block is present, autocoder routes ambiguous agent outcomes (executor returning `AskUser`) to a human via Slack thread replies, persists the conversation state to disk, and resumes implementation on the next iteration when an answer arrives.
+When the optional `chatops:` config block is present, autocoder routes ambiguous agent outcomes (executor returning `AskUser`) to a human via chat thread replies, persists the conversation state to disk, and resumes implementation on the next iteration when an answer arrives. Slack is the only officially-supported backend; the four other providers (Discord, Teams, Mattermost, Matrix) are listed under [Experimental ChatOps Backends](#experimental-chatops-backends) below and emit a loud startup warning when selected.
 
 ### Configuring Slack
 
 ```yaml
-slack:
-  bot_token_env: SLACK_BOT_TOKEN        # env var containing your xoxb-... bot token
-  # OR — inline alternative; when `bot_token` is set, `bot_token_env` is ignored.
-  # bot_token:
-  #   value: "xoxb-yourtokenhere"
+chatops:
+  provider: slack
   default_channel_id: C0123456789       # fallback channel id (use the Slack channel ID, not the name)
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN      # env var containing your xoxb-... bot token
+    # OR — inline alternative; when `bot_token` is set, `bot_token_env` is ignored.
+    # bot_token:
+    #   value: "xoxb-yourtokenhere"
 ```
 
 The inline form follows the same dual-source pattern as `github.token` and `reviewer.api_key`; see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for the security tradeoff.
@@ -255,7 +257,7 @@ Per-repo override:
 repositories:
   - url: "git@github.com:my-org/auth-service.git"
     # ...
-    slack_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
+    chatops_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
 ```
 
 ### Progress notifications
@@ -268,9 +270,11 @@ Two operator-facing chatops signals beyond the AskUser escalation flow:
 Both are on by default. Disable either independently:
 
 ```yaml
-slack:
-  bot_token_env: SLACK_BOT_TOKEN
+chatops:
+  provider: slack
   default_channel_id: C0123456789
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
   notifications:
     start_work: false        # default true; one message per change pickup
     failure_alerts: false    # default true; throttled per (repo, category)
@@ -327,6 +331,80 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 These files are written by autocoder into the workspace alongside the change's `proposal.md`. They are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the marker files with it; they're not deleted separately.
 
 A third per-workspace artifact, `.alert-state.json`, lives at the workspace root (next to `.git`) rather than inside any change directory. It tracks the `last_alerted_at` timestamp for each predictable-failure category so the 24h throttle can decide whether to re-alert. It is safe to inspect (plain JSON) and safe to delete — deleting it just resets the alert window for that repository, so the next failure of any category will re-alert immediately.
+
+---
+
+## Experimental ChatOps Backends
+
+> ⚠️ **EXPERIMENTAL.** Discord, Microsoft Teams, Mattermost, and Matrix support is best-effort: implementations are written against published API docs but not validated against live services on every release. They may break against provider API changes without notice, and they carry **no API-stability guarantees**. Operators selecting one of these providers are expected to file bugs (with reproduction logs) when the provider changes a contract or the implementation drifts. Slack remains the only officially-supported backend.
+
+When `chatops.provider` is anything other than `slack`, autocoder emits exactly one `WARN`-level startup line containing the substrings `EXPERIMENTAL`, `best-effort`, and the selected provider name. The warning fires once per process at startup, never per AskUser iteration.
+
+### Discord (representative walk-through)
+
+1. In the [Discord Developer Portal](https://discord.com/developers/applications), create a new Application, then a Bot under it. Copy the **Bot Token**.
+2. Invite the bot to your server with the `bot` OAuth scope and at minimum the `Send Messages` and `Read Message History` channel permissions.
+3. Right-click the destination channel in Discord (with Developer Mode enabled) and copy its **Channel ID** (a snowflake string).
+4. Export the token and update `config.yaml`:
+
+   ```bash
+   export DISCORD_BOT_TOKEN=MzI...your-token-here...8X
+   ```
+
+   ```yaml
+   chatops:
+     provider: discord
+     default_channel_id: "111122223333444455"   # snowflake of the destination channel
+     discord:
+       bot_token_env: DISCORD_BOT_TOKEN
+   ```
+
+5. Start `autocoder run` and verify the startup log emits a `WARN` line beginning with `EXPERIMENTAL: ChatOps escalation enabled via discord — best-effort support, …`.
+
+When the agent escalates, the bot posts `❓ \`<change>\`: <question>` into the channel; the polling loop watches subsequent messages whose `message_reference.message_id` matches the original post for the human reply.
+
+### Microsoft Teams
+
+OAuth `client_credentials` against Microsoft Graph. Acquire a tenant id, an app registration's client id + client secret (with `ChannelMessage.Send` and `ChannelMessage.Read.All` application permissions granted by an admin), and the destination team id.
+
+```yaml
+chatops:
+  provider: teams
+  default_channel_id: "19:abc...@thread.tacv2"   # channel id (Graph format)
+  teams:
+    tenant_id: "11111111-2222-3333-4444-555555555555"
+    client_id: "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    client_secret_env: TEAMS_CLIENT_SECRET
+    team_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+```
+
+The token is acquired at startup and refreshed on `401` responses or expiry.
+
+### Mattermost
+
+PAT auth (a personal access token from a bot account). Threading uses Mattermost's `root_id`.
+
+```yaml
+chatops:
+  provider: mattermost
+  default_channel_id: "channel-id-from-mattermost"
+  mattermost:
+    server_url: "https://mattermost.example.com"
+    access_token_env: MATTERMOST_TOKEN
+```
+
+### Matrix
+
+Access-token auth (obtain via `POST /_matrix/client/v3/login` once or via a homeserver admin tool). The room id uses the `!abc:server.tld` format.
+
+```yaml
+chatops:
+  provider: matrix
+  default_channel_id: "!abc:matrix.example.com"
+  matrix:
+    homeserver_url: "https://matrix.example.com"
+    access_token_env: MATRIX_ACCESS_TOKEN
+```
 
 ---
 
@@ -613,6 +691,13 @@ GITHUB_TOKEN=ghp_yourtokenhere
 # Optional, only if the matching config block is enabled and uses *_env:
 # ANTHROPIC_API_KEY=...
 # SLACK_BOT_TOKEN=xoxb-...
+#
+# Experimental ChatOps providers (uncomment one set, matching `chatops.provider`).
+# All four are EXPERIMENTAL — see the README's "Experimental ChatOps Backends".
+# DISCORD_BOT_TOKEN=...
+# TEAMS_CLIENT_SECRET=...
+# MATTERMOST_TOKEN=...
+# MATRIX_ACCESS_TOKEN=...
 ```
 
 The two paths can be mixed per-secret — e.g. inline `github.token` alongside `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file carries only the env-var-sourced secrets.
