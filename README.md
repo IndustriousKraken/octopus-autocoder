@@ -14,12 +14,18 @@ On the machine where the daemon will run:
 
 - **Rust toolchain.** Install via [rustup](https://rustup.rs/) — autocoder builds against stable Rust on edition 2024.
 - **Claude Code authenticated.** Install [Claude Code](https://www.anthropic.com/claude-code) and run `claude auth login` as the same OS user that will run the daemon. The credentials are persisted in `~/.claude/` and survive restarts.
-- **A GitHub fine-grained Personal Access Token**, scoped to the repositories autocoder will manage. Required permissions:
-  - **`Pull requests: read & write`** — needed for PR creation.
-  - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
-  - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is not needed there; only relevant for some private GHE configurations.
+- **A GitHub Personal Access Token**, scoped to the repositories autocoder will manage. Either form works; pick based on your account setup:
 
-  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Fine-grained PATs are scoped to a single account or organization; multi-owner setups use [Multiple GitHub Tokens](#multiple-github-tokens) instead.
+  - **Fine-grained PAT** (recommended for personal-account-owned repos). Required permissions:
+    - **`Pull requests: read & write`** — needed for PR creation.
+    - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
+    - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is not needed there; only relevant for some private GHE configurations.
+
+    Fine-grained PATs are scoped to a single account or organization; multi-owner setups use [Multiple GitHub Tokens](#multiple-github-tokens) instead.
+
+  - **Classic PAT** (simpler when the minting account itself has scoped repo access — e.g. a machine user added as Read collaborator on specific repos). Required scope: **`repo`** (covers PR creation, label apply, and HTTPS git ops). The PAT's effective access intersects with the minting user's actual repo permissions, so a classic PAT minted by a scoped-access machine user is effectively scoped to those repos. Tradeoff: future repo additions (new team membership, new collaborator invite) automatically extend the PAT's reach; fine-grained requires re-minting. Also: some orgs require fine-grained PATs at the org-policy level (Settings → Personal access tokens → "Restrict access via fine-grained personal access tokens"); check before committing to classic.
+
+  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon, or use the inline form in `config.yaml` (see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var)).
 - **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
 
 ### 2. Clone and configure
@@ -582,7 +588,12 @@ Running an autonomous coding agent with push access to your repositories introdu
 
 ### 1. Credential scoping
 
-Never give autocoder a Personal Access Token (PAT) or SSH key with admin access to your organization. Provide it with **scoped access** strictly limited to the repositories defined in `config.yaml`. A fine-grained PAT scoped to two specific repos is safer than an org-wide classic token.
+Never give autocoder a Personal Access Token (PAT) or SSH key with admin access to your organization. Provide it with **scoped access** strictly limited to the repositories defined in `config.yaml`. There are two paths:
+
+- **Fine-grained PAT minted by your own account**, with the PAT's repository allowlist restricted to the autocoder-managed repos. The PAT enforces the scope.
+- **Classic PAT minted by a machine user** whose account-level access is itself scoped (Read collaborator on specific repos via team membership). The minting user's permissions enforce the scope, not the PAT.
+
+Either path is acceptable; what matters is that the credential cannot push, merge, or change settings outside the configured repos. An org-wide classic PAT minted by your own admin account is the configuration to avoid.
 
 ### 2. Branch protection
 
@@ -661,7 +672,7 @@ In this mode autocoder:
 
 1. The machine user must have **Read** access to the upstream repo (collaborator invitation, team membership, or — for public repos — no setup required). Read is enough on github.com because the only API calls the bot makes against upstream are `POST /pulls` (Read can do this) and — only if the host rejects drafts — `POST /labels` (this needs **Triage**, but github.com supports drafts everywhere so the label fallback never fires there). Grant Triage only if you deploy against a GitHub Enterprise host that rejects draft PRs.
 2. The machine user must fork the upstream repo on github.com (web UI or `gh repo fork`). Forks of private repos inherit private visibility automatically.
-3. PATs in `github.owner_tokens` should be minted by the machine user and scoped to "Pull requests: read & write" on the upstream repo — no `Contents: write` needed (the API only opens the PR; SSH handles the git side).
+3. PATs in `github.owner_tokens` should be minted by the machine user. Fine-grained: scope to "Pull requests: read & write" on the upstream repo — no `Contents: write` needed (the API only opens the PR; SSH handles the git side). Classic: `repo` scope is fine since the machine user's account-level access is already restricted to the autocoder-managed repos via team membership.
 
 **Startup check:** autocoder probes each fork with `git ls-remote` before spawning any polling task. A missing fork produces a startup error naming both the upstream URL and the expected fork URL.
 
