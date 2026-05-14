@@ -5,7 +5,7 @@
 use crate::alert_state::{AlertCategory, AlertState};
 use crate::alerts::handle_predictable_failure;
 use crate::busy_marker;
-use crate::chatops::{self, AnswerPayload, ChatOps, QuestionPayload};
+use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
@@ -17,21 +17,21 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-/// Per-pass ChatOps context: the Slack client + the resolved channel id
-/// for THIS repository, plus the operator's notification preferences.
-/// Constructed once at startup from the global `slack:` config and the
-/// per-repo `slack_channel_id` override.
+/// Per-pass ChatOps context: the provider-agnostic backend + the resolved
+/// channel id for THIS repository, plus the operator's notification
+/// preferences. Constructed once at startup from the global `chatops:`
+/// config and the per-repo `chatops_channel_id` override.
 pub struct ChatOpsContext {
-    pub chatops: Arc<ChatOps>,
+    pub chatops: Arc<dyn ChatOpsBackend>,
     pub channel: String,
     /// Whether to post a one-line notification each time a pending change
     /// is dequeued for execution. Defaults to `true` when the operator did
-    /// not set `slack.notifications.start_work`.
+    /// not set `chatops.notifications.start_work`.
     pub start_work_enabled: bool,
     /// Whether to emit throttled chatops alerts at the three predictable
     /// failure sites (workspace init, branch push, PR creation). Defaults
     /// to `true` when the operator did not set
-    /// `slack.notifications.failure_alerts`.
+    /// `chatops.notifications.failure_alerts`.
     pub failure_alerts_enabled: bool,
 }
 
@@ -702,7 +702,7 @@ async fn walk_queue(
             Ok(QueueStep::AskUserExitEarly) => {
                 tracing::error!(
                     url = repo.url.as_str(),
-                    "executor returned AskUser for `{change}` AND chatops is not configured; exiting pass. Set the `slack:` config block to enable escalation."
+                    "executor returned AskUser for `{change}` AND chatops is not configured; exiting pass. Set the `chatops:` config block to enable escalation."
                 );
                 break;
             }
@@ -1459,7 +1459,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
@@ -1732,7 +1732,7 @@ mod tests {
     // ============================================================
 
     /// Build a ChatOps client wired against the given mockito server.
-    async fn fixture_chatops_for(server: &mut mockito::Server) -> Arc<ChatOps> {
+    async fn fixture_chatops_for(server: &mut mockito::Server) -> Arc<dyn ChatOpsBackend> {
         let _ = server
             .mock("POST", "/auth.test")
             .with_status(200)
@@ -1740,7 +1740,7 @@ mod tests {
             .create_async()
             .await;
         Arc::new(
-            ChatOps::new_at(server.url(), "xoxb-fixture".into())
+            crate::chatops::SlackBackend::new_at(server.url(), "xoxb-fixture".into())
                 .await
                 .unwrap(),
         )
@@ -2509,7 +2509,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 0, // tight loop so we get many iterations fast
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -2573,7 +2573,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -2610,7 +2610,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
