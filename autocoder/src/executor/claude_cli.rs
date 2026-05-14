@@ -366,14 +366,28 @@ impl ClaudeCliExecutor {
         // clean — if there's a diff, the agent did real work and we trust
         // the Completed outcome regardless of stdout noise.
         let porcelain = crate::git::status_porcelain(workspace).unwrap_or_default();
-        if porcelain.is_empty()
-            && let Some(question) = Self::check_stdout_heuristic(&outcome.stdout)
-        {
-            let handle = build_handle(workspace, change, None);
-            return Ok(ExecutorOutcome::AskUser {
-                question,
-                resume_handle: handle,
-            });
+        if porcelain.is_empty() {
+            if let Some(question) = Self::check_stdout_heuristic(&outcome.stdout) {
+                let handle = build_handle(workspace, change, None);
+                return Ok(ExecutorOutcome::AskUser {
+                    question,
+                    resume_handle: handle,
+                });
+            }
+            // Suspicious: exit-0, no diff, no AskUser marker, no
+            // clarification heuristic. The downstream polling_loop will
+            // classify this as Failed. Surface the agent's actual output
+            // here so journalctl shows *why* on the same line.
+            let stdout_tail = tail(&outcome.stdout, 2048);
+            let stderr_tail = tail(&outcome.stderr, 2048);
+            let log_path = run_log_path(workspace, change);
+            tracing::warn!(
+                change = change,
+                log_file = %log_path.display(),
+                "agent exited 0 without modifying the workspace.\n--- stdout (last 2KB) ---\n{stdout}\n--- stderr (last 2KB) ---\n{stderr}\n--- end ---",
+                stdout = if stdout_tail.is_empty() { "(empty)" } else { stdout_tail },
+                stderr = if stderr_tail.is_empty() { "(empty)" } else { stderr_tail },
+            );
         }
 
         Ok(ExecutorOutcome::Completed)
@@ -427,7 +441,9 @@ impl Executor for ClaudeCliExecutor {
         let _mcp_path = Self::write_mcp_config(workspace, change)?;
         let outcome = self.run_subprocess(workspace, &prompt).await;
         Self::delete_mcp_config(workspace);
-        self.classify_outcome(workspace, change, outcome?).await
+        let outcome = outcome?;
+        persist_run_log(workspace, change, &outcome);
+        self.classify_outcome(workspace, change, outcome).await
     }
 
     async fn resume(&self, handle: ResumeHandle, answer: &str) -> Result<ExecutorOutcome> {
@@ -449,8 +465,64 @@ impl Executor for ClaudeCliExecutor {
         let _mcp_path = Self::write_mcp_config(workspace, change)?;
         let outcome = self.run_subprocess(workspace, &prompt).await;
         Self::delete_mcp_config(workspace);
-        self.classify_outcome(workspace, change, outcome?).await
+        let outcome = outcome?;
+        persist_run_log(workspace, change, &outcome);
+        self.classify_outcome(workspace, change, outcome).await
     }
+}
+
+/// Compute the per-change run-log path:
+/// `<system-temp>/autocoder-logs/<workspace-basename>/<change>.log`.
+pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
+    let basename = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    std::env::temp_dir()
+        .join("autocoder-logs")
+        .join(basename)
+        .join(format!("{change}.log"))
+}
+
+/// Best-effort: write the subprocess's captured stdout and stderr to the
+/// per-change log file. Errors are logged at WARN but never propagated;
+/// the executor outcome must not depend on diagnostic side-effects.
+fn persist_run_log(workspace: &Path, change: &str, outcome: &SubprocessOutcome) {
+    let path = run_log_path(workspace, change);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %parent.display(),
+            "could not create run-log directory: {e}"
+        );
+        return;
+    }
+    let body = format!(
+        "=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+        n = outcome.stdout.len(),
+        m = outcome.stderr.len(),
+        stdout = outcome.stdout,
+        stderr = outcome.stderr,
+    );
+    match std::fs::write(&path, body) {
+        Ok(()) => tracing::info!(path = %path.display(), "run log written"),
+        Err(e) => tracing::warn!(path = %path.display(), "writing run log failed: {e}"),
+    }
+}
+
+/// Return the trailing `max` bytes of `s`, snapped down to the nearest
+/// UTF-8 character boundary so the returned slice never splits a
+/// codepoint. Returns the full string if it is shorter than `max`.
+fn tail(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 #[cfg(test)]
@@ -820,5 +892,68 @@ mod tests {
         let err = ClaudeCliExecutor::build_prompt(dir.path(), "missing")
             .expect_err("missing change dir should error");
         assert!(format!("{err:#}").contains("missing"));
+    }
+
+    /// Run-log persistence: after a subprocess invocation completes,
+    /// both stdout and stderr (verbatim) must be written to the
+    /// per-change log file at the expected path.
+    #[tokio::test]
+    async fn run_log_is_written_with_expected_format() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "echoes.sh",
+            "#!/bin/sh\necho hello-out\necho hello-err >&2\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        assert!(matches!(outcome, ExecutorOutcome::Completed), "got {outcome:?}");
+
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", log.display()));
+        assert!(body.contains("=== STDOUT ("), "missing stdout header in:\n{body}");
+        assert!(body.contains("=== STDERR ("), "missing stderr header in:\n{body}");
+        assert!(body.contains("hello-out"), "stdout text missing in:\n{body}");
+        assert!(body.contains("hello-err"), "stderr text missing in:\n{body}");
+    }
+
+    /// Run-log path layout: `<temp>/autocoder-logs/<workspace-basename>/<change>.log`.
+    /// Both segments must be present so per-workspace and per-change
+    /// inspection is possible.
+    #[tokio::test]
+    async fn run_log_path_is_under_workspace_basename_and_change_name() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let path = run_log_path(&ws, "my-change");
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let s = path.to_string_lossy();
+        assert!(s.contains("autocoder-logs"), "path missing autocoder-logs: {s}");
+        assert!(s.contains(&*basename), "path missing workspace basename `{basename}`: {s}");
+        assert!(s.ends_with("my-change.log"), "path missing change name: {s}");
+    }
+
+    #[test]
+    fn tail_snaps_to_char_boundary() {
+        // Multi-byte string: "héllo" — 'é' is two bytes (0xC3 0xA9).
+        // Asking for 4 bytes from a 6-byte string would naively split
+        // the codepoint at byte index 2.
+        let s = "héllo"; // 6 bytes
+        let t = tail(s, 4);
+        // The slice must be valid UTF-8 (Rust would panic on the slice
+        // op itself if not). Confirm length is <= 4 and content is the
+        // suffix.
+        assert!(t.len() <= 4, "tail length must respect the budget: {:?}", t);
+        assert!(s.ends_with(t), "tail must be a suffix of input: {t:?} vs {s:?}");
+    }
+
+    #[test]
+    fn tail_returns_full_string_when_shorter_than_max() {
+        let s = "abc";
+        assert_eq!(tail(s, 100), "abc");
+    }
+
+    #[test]
+    fn tail_handles_empty_input() {
+        assert_eq!(tail("", 100), "");
     }
 }
