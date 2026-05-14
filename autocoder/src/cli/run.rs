@@ -4,7 +4,7 @@
 
 use crate::chatops::ChatOps;
 use crate::code_reviewer::CodeReviewer;
-use crate::config::{Config, ExecutorKind, GithubConfig, RepositoryConfig};
+use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
@@ -117,7 +117,12 @@ pub async fn execute(cfg: Config) -> Result<()> {
                 let channel = repo
                     .slack_channel(&slack_cfg.default_channel_id)
                     .to_string();
-                Some(Arc::new(ChatOpsContext { chatops: co, channel }))
+                Some(Arc::new(ChatOpsContext {
+                    chatops: co,
+                    channel,
+                    start_work_enabled: NotificationsConfig::start_work_enabled(cfg.slack.as_ref()),
+                    failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(cfg.slack.as_ref()),
+                }))
             }
             _ => None,
         };

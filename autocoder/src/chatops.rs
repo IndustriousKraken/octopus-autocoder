@@ -141,6 +141,45 @@ impl ChatOps {
             .ok_or_else(|| anyhow!("slack post response missing ts"))
     }
 
+    /// Post a one-way notification to Slack. Distinct from
+    /// `post_question`: no `❓` prefix, no `change` formatting, no
+    /// `link_names`, and no thread handle is returned. Used for
+    /// start-of-work and throttled failure alerts.
+    pub async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+        let url = format!(
+            "{}/chat.postMessage",
+            self.api_base.trim_end_matches('/')
+        );
+        let payload = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("slack post_notification request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("slack post_notification http {status}"));
+        }
+        let parsed: PostMessageResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("slack post_notification decode failed: {e}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "slack post_notification failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Ok(())
+    }
+
     /// Poll the tracked thread for the earliest human reply. Returns
     /// `Some(reply)` for the first message that lacks a `bot_id` field AND
     /// whose `user` field differs from the cached bot user id. Otherwise
@@ -477,6 +516,54 @@ mod tests {
             "429 must error",
         );
         assert!(format!("{err:#}").contains("429"));
+    }
+
+    // ----------------------------------------------------------------
+    // post_notification
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_notification_posts_to_chat_postmessage() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_header("authorization", "Bearer xoxb-test")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0FOO","text":"🚀 hello world"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1234567890.123456"}"#)
+            .create_async()
+            .await;
+
+        chatops
+            .post_notification("C0FOO", "🚀 hello world")
+            .await
+            .expect("notification posts ok");
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_notification_returns_err_on_ok_false() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        let _ = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .create_async()
+            .await;
+        let err = must_err(
+            chatops.post_notification("CBAD", "hi").await,
+            "ok:false must error",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("channel_not_found"),
+            "error must contain Slack `error` field; got: {msg}"
+        );
     }
 
     // ----------------------------------------------------------------

@@ -258,6 +258,28 @@ repositories:
     slack_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
 ```
 
+### Progress notifications
+
+Two operator-facing chatops signals beyond the AskUser escalation flow:
+
+- **Start-of-work** — a one-line `🚀` message posted whenever a pending change is dequeued and locked for execution, naming the repository URL, the change name, and the first non-empty line of the change's `## Why` section.
+- **Throttled failure alerts** — a `⚠️` message when one of three predictable infrastructure failures occurs and has NOT been alerted in the last 24 hours: workspace init (clone/fetch), branch push (force-with-lease rejected), and PR creation (GitHub REST 4xx/5xx). The throttle is per-`(repo, category)`; one repo's broken push does not silence another repo's broken init.
+
+Both are on by default. Disable either independently:
+
+```yaml
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0123456789
+  notifications:
+    start_work: false        # default true; one message per change pickup
+    failure_alerts: false    # default true; throttled per (repo, category)
+```
+
+Throttle state lives in `<workspace>/.alert-state.json`. The next *successful* iteration of a repository (workspace init returns Ok) clears the state for that repo, so a transient outage that recovers does not leave the operator without a follow-up signal if the failure recurs. If the chatops POST itself fails, the timestamp is NOT updated — the next iteration retries the alert. Chatops post failures are never re-routed through chatops (they only go to stderr).
+
+Out of scope for this signal: executor `Failed`, reviewer LLM failure, and the chatops post itself. Those either resolve transiently or already surface elsewhere.
+
 ### Required Slack bot scopes
 
 A **private channel** is the recommended deployment — it keeps non-operators from prompting the agent. The Slack app's bot token must have:
@@ -303,6 +325,8 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 ### `.question.json` and `.answer.json` as workspace artifacts
 
 These files are written by autocoder into the workspace alongside the change's `proposal.md`. They are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the marker files with it; they're not deleted separately.
+
+A third per-workspace artifact, `.alert-state.json`, lives at the workspace root (next to `.git`) rather than inside any change directory. It tracks the `last_alerted_at` timestamp for each predictable-failure category so the 24h throttle can decide whether to re-alert. It is safe to inspect (plain JSON) and safe to delete — deleting it just resets the alert window for that repository, so the next failure of any category will re-alert immediately.
 
 ---
 

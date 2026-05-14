@@ -105,3 +105,11 @@ github:
 #   # bot_token:
 #   #   value: "xoxb-yourtokenhere"
 #   default_channel_id: C0123456789
+#   # Optional: opt-out of either kind of progress notification. Both
+#   # default to `true` when the `notifications:` block is absent OR when
+#   # an individual key is omitted. See README's "Progress notifications"
+#   # subsection for what each flag controls.
+#   #
+#   # notifications:
+#   #   start_work: true       # one 🚀 message per pending-change pickup
+#   #   failure_alerts: true   # one ⚠️ alert per (repo, category) per 24h

@@ -2,12 +2,14 @@
 //! init → queue walk → push + PR if commits were produced. Failures inside
 //! one iteration are logged and the loop continues to the next sleep.
 
+use crate::alert_state::{AlertCategory, AlertEntry, AlertState};
 use crate::chatops::{self, AnswerPayload, ChatOps, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
 use crate::{git, github, queue, workspace};
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,12 @@ use tokio_util::sync::CancellationToken;
 pub struct ChatOpsContext {
     pub chatops: Arc<ChatOps>,
     pub channel: String,
+    /// Whether start-of-work notifications fire for this repo. Resolved
+    /// from `slack.notifications.start_work` (defaults to true).
+    pub start_work_enabled: bool,
+    /// Whether throttled failure alerts fire for this repo. Resolved from
+    /// `slack.notifications.failure_alerts` (defaults to true).
+    pub failure_alerts_enabled: bool,
 }
 
 /// Run the polling loop for a single repository. Each iteration is wrapped in
@@ -129,8 +137,34 @@ pub async fn execute_one_pass(
     } else {
         "origin"
     };
-    git::push_force_with_lease(workspace, &repo.agent_branch, push_remote)?;
-    open_pull_request(repo, github_cfg, &processed, review_report.as_ref(), draft).await?;
+    let failure_alerts_enabled = chatops_ctx
+        .map(|c| c.failure_alerts_enabled)
+        .unwrap_or(false);
+    if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
+        handle_predictable_failure(
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            failure_alerts_enabled,
+            AlertCategory::BranchPushFailure,
+            &e,
+        )
+        .await;
+        return Err(e);
+    }
+    if let Err(e) = open_pull_request(
+        repo,
+        github_cfg,
+        &processed,
+        review_report.as_ref(),
+        draft,
+        chatops_ctx,
+        failure_alerts_enabled,
+    )
+    .await
+    {
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -158,7 +192,28 @@ pub async fn run_pass_through_commits(
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
         None => None,
     };
-    workspace::ensure_initialized(workspace, &repo.url, fork_url.as_deref())?;
+    let failure_alerts_enabled = chatops_ctx
+        .map(|c| c.failure_alerts_enabled)
+        .unwrap_or(false);
+    if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_url.as_deref()) {
+        handle_predictable_failure(
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            failure_alerts_enabled,
+            AlertCategory::WorkspaceInitFailure,
+            &e,
+        )
+        .await;
+        return Err(e);
+    }
+    // Clear-on-success for `WorkspaceInitFailure`: workspace init just
+    // succeeded, so any prior alert state is stale. Clearing the entire
+    // map is intentional — see design.md "Wiring sites" — a fresh init
+    // success means the daemon is making progress on this repo again.
+    if let Err(e) = AlertState::clear(workspace) {
+        tracing::warn!("alert-state clear after workspace init failed: {e:#}");
+    }
     let _cleared = queue::clear_stale_locks(workspace)?;
 
     let dirty = git::status_porcelain(workspace)?;
@@ -390,6 +445,25 @@ async fn walk_queue(
         queue::lock(workspace, &change)
             .with_context(|| format!("locking change `{change}`"))?;
 
+        // Start-of-work notification fires AFTER the lock is taken (so a
+        // failed lock doesn't generate a misleading "starting work"
+        // message) and BEFORE the executor runs.
+        if let Some(ctx) = chatops_ctx {
+            if ctx.start_work_enabled {
+                let summary = read_first_line_of_why(workspace, &change).unwrap_or_default();
+                let text = format!(
+                    "🚀 `{}`: starting work on `{}` — {}",
+                    repo.url, change, summary
+                );
+                if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+                    tracing::warn!(
+                        change = change.as_str(),
+                        "start-of-work notification failed; continuing: {e:#}"
+                    );
+                }
+            }
+        }
+
         let outcome = executor.run(workspace, &change).await;
         let result = handle_outcome(workspace, repo, chatops_ctx, &change, outcome).await;
         // Always unlock, even after a Completed → archive (archive moved the
@@ -594,6 +668,19 @@ fn build_commit_subject(workspace: &Path, change: &str) -> Result<String> {
     Ok(subject)
 }
 
+/// Read `<workspace>/openspec/changes/<change>/proposal.md` and return
+/// the first non-empty line under `## Why`. Returns `None` (without
+/// erroring) when the file is missing or the section is empty — the
+/// caller treats it as an empty summary.
+fn read_first_line_of_why(workspace: &Path, change: &str) -> Option<String> {
+    let path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join("proposal.md");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    first_line_of_section(&raw, "## Why")
+}
+
 /// Return the first non-empty line under the named markdown header. Returns
 /// `None` if the header is absent or has no non-empty body line.
 fn first_line_of_section(text: &str, header: &str) -> Option<String> {
@@ -620,6 +707,8 @@ async fn open_pull_request(
     changes: &[String],
     review_report: Option<&ReviewReport>,
     draft: bool,
+    chatops_ctx: Option<&ChatOpsContext>,
+    failure_alerts_enabled: bool,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
@@ -637,7 +726,8 @@ async fn open_pull_request(
         None => repo.agent_branch.clone(),
     };
 
-    let url = github::create_pull_request(
+    let workspace = workspace::resolve_path(repo);
+    let url = match github::create_pull_request(
         &owner,
         &repo_name,
         &head,
@@ -648,7 +738,22 @@ async fn open_pull_request(
         review_report,
         draft,
     )
-    .await?;
+    .await
+    {
+        Ok(u) => u,
+        Err(e) => {
+            handle_predictable_failure(
+                &workspace,
+                &repo.url,
+                chatops_ctx,
+                failure_alerts_enabled,
+                AlertCategory::PrCreationFailure,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
+    };
     tracing::info!(url = repo.url.as_str(), pr = url.as_str(), "opened PR");
     Ok(())
 }
@@ -658,6 +763,78 @@ fn build_pr_body(changes: &[String]) -> String {
     for change in changes {
         s.push_str(&format!("- {change}\n"));
     }
+    s
+}
+
+/// Throttled predictable-failure alert. Posts at most once per 24h per
+/// (repo, category). On post failure the timestamp is NOT updated, so the
+/// next iteration retries the alert. Returns nothing — failures are logged
+/// only and never re-routed through chatops.
+async fn handle_predictable_failure(
+    workspace: &Path,
+    repo_url: &str,
+    chatops_ctx: Option<&ChatOpsContext>,
+    notifications_enabled: bool,
+    category: AlertCategory,
+    err: &anyhow::Error,
+) {
+    if !notifications_enabled {
+        return;
+    }
+    let Some(ctx) = chatops_ctx else { return };
+
+    let now = Utc::now();
+    let mut state = AlertState::load_or_default(workspace);
+    let should_alert = state
+        .alerts
+        .get(&category)
+        .map(|entry| (now - entry.last_alerted_at) >= chrono::Duration::hours(24))
+        .unwrap_or(true);
+    if !should_alert {
+        return;
+    }
+
+    let excerpt = error_excerpt(err, 200);
+    let text = format_alert_text(repo_url, category, &excerpt);
+    if let Err(post_err) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::error!(
+            "chatops alert post failed; not retrying through chatops. \
+             alert_text={text:?} post_err={post_err:#}"
+        );
+        return;
+    }
+
+    state.alerts.insert(
+        category,
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: excerpt,
+        },
+    );
+    if let Err(save_err) = state.save(workspace) {
+        tracing::error!(
+            "alert posted but saving alert-state failed: {save_err:#}; next iteration may re-alert"
+        );
+    }
+}
+
+/// `⚠️ \`<repo-url>\`: <category-label> for the past 24h. Latest: <excerpt>`.
+fn format_alert_text(repo_url: &str, category: AlertCategory, excerpt: &str) -> String {
+    format!(
+        "⚠️ `{repo_url}`: {label} for the past 24h. Latest: {excerpt}",
+        label = category.label(),
+    )
+}
+
+/// Truncate `format!("{err:#}")` to `max_chars` UTF-8 character count,
+/// appending `…` when truncation occurs.
+fn error_excerpt(err: &anyhow::Error, max_chars: usize) -> String {
+    let raw = format!("{err:#}");
+    if raw.chars().count() <= max_chars {
+        return raw;
+    }
+    let mut s: String = raw.chars().take(max_chars).collect();
+    s.push('…');
     s
 }
 
@@ -1305,6 +1482,8 @@ mod tests {
         let chatops_ctx = ChatOpsContext {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -1398,6 +1577,8 @@ mod tests {
         let chatops_ctx = ChatOpsContext {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -1504,6 +1685,8 @@ mod tests {
         let chatops_ctx = ChatOpsContext {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -1631,6 +1814,8 @@ mod tests {
         let chatops_ctx = ChatOpsContext {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -1736,6 +1921,8 @@ mod tests {
         let chatops_ctx = ChatOpsContext {
             chatops: chatops.clone(),
             channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -2104,5 +2291,568 @@ mod tests {
         // otherwise dominate.
         let res = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(res.is_ok(), "polling loop did not exit within 1s of cancel");
+    }
+
+    // ============================================================
+    // handle_predictable_failure helper unit tests
+    // ============================================================
+
+    fn fixture_workspace_only() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    /// Build a ChatOpsContext wired against the given mockito server with
+    /// notifications enabled.
+    async fn fixture_alerts_ctx(server: &mut mockito::Server) -> ChatOpsContext {
+        let chatops = fixture_chatops_for(server).await;
+        ChatOpsContext {
+            chatops,
+            channel: "C_ALERTS".into(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn predictable_failure_first_posts_and_saves_state() {
+        let tmp = fixture_workspace_only();
+        let mut server = mockito::Server::new_async().await;
+        let ctx = fixture_alerts_ctx(&mut server).await;
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let err = anyhow!("clone failed: timeout");
+        handle_predictable_failure(
+            tmp.path(),
+            "git@github.com:owner/repo.git",
+            Some(&ctx),
+            true,
+            AlertCategory::WorkspaceInitFailure,
+            &err,
+        )
+        .await;
+
+        post_mock.assert_async().await;
+        let state = AlertState::load_or_default(tmp.path());
+        assert!(
+            state.alerts.contains_key(&AlertCategory::WorkspaceInitFailure),
+            "alert state must record the category after a successful post"
+        );
+    }
+
+    #[tokio::test]
+    async fn predictable_failure_repeat_within_24h_is_silent() {
+        let tmp = fixture_workspace_only();
+        let mut server = mockito::Server::new_async().await;
+        let ctx = fixture_alerts_ctx(&mut server).await;
+
+        // Pre-populate state with a recent alert.
+        let mut state = AlertState::default();
+        state.alerts.insert(
+            AlertCategory::BranchPushFailure,
+            AlertEntry {
+                last_alerted_at: Utc::now() - chrono::Duration::hours(1),
+                last_error_excerpt: "earlier".into(),
+            },
+        );
+        state.save(tmp.path()).unwrap();
+
+        // No mock expectation: any POST hitting the server panics the test.
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let err = anyhow!("push rejected");
+        handle_predictable_failure(
+            tmp.path(),
+            "x",
+            Some(&ctx),
+            true,
+            AlertCategory::BranchPushFailure,
+            &err,
+        )
+        .await;
+
+        post_mock.assert_async().await;
+
+        // State unchanged — last_error_excerpt still says "earlier".
+        let state = AlertState::load_or_default(tmp.path());
+        assert_eq!(
+            state.alerts[&AlertCategory::BranchPushFailure].last_error_excerpt,
+            "earlier"
+        );
+    }
+
+    #[tokio::test]
+    async fn predictable_failure_beyond_24h_realerts() {
+        let tmp = fixture_workspace_only();
+        let mut server = mockito::Server::new_async().await;
+        let ctx = fixture_alerts_ctx(&mut server).await;
+
+        let mut state = AlertState::default();
+        state.alerts.insert(
+            AlertCategory::PrCreationFailure,
+            AlertEntry {
+                last_alerted_at: Utc::now() - chrono::Duration::hours(25),
+                last_error_excerpt: "earlier".into(),
+            },
+        );
+        state.save(tmp.path()).unwrap();
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let err = anyhow!("github 422 unprocessable");
+        handle_predictable_failure(
+            tmp.path(),
+            "x",
+            Some(&ctx),
+            true,
+            AlertCategory::PrCreationFailure,
+            &err,
+        )
+        .await;
+
+        post_mock.assert_async().await;
+        let state = AlertState::load_or_default(tmp.path());
+        let entry = &state.alerts[&AlertCategory::PrCreationFailure];
+        assert!(
+            entry.last_error_excerpt.contains("github 422"),
+            "excerpt must reflect the latest failure; got: {}",
+            entry.last_error_excerpt
+        );
+    }
+
+    #[tokio::test]
+    async fn predictable_failure_post_failure_does_not_update_state() {
+        let tmp = fixture_workspace_only();
+        let mut server = mockito::Server::new_async().await;
+        let ctx = fixture_alerts_ctx(&mut server).await;
+
+        // Slack returns ok:false → post_notification errors → state must
+        // NOT be persisted.
+        let _ = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .create_async()
+            .await;
+
+        let err = anyhow!("clone failed");
+        handle_predictable_failure(
+            tmp.path(),
+            "x",
+            Some(&ctx),
+            true,
+            AlertCategory::WorkspaceInitFailure,
+            &err,
+        )
+        .await;
+
+        assert!(
+            !tmp.path().join(".alert-state.json").exists(),
+            "state file must not be written when the post itself failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn predictable_failure_disabled_skips_state_read() {
+        let tmp = fixture_workspace_only();
+        let mut server = mockito::Server::new_async().await;
+        let ctx = fixture_alerts_ctx(&mut server).await;
+
+        // Pre-place a state file. After the call we must verify it is
+        // unchanged AND no Slack call was made.
+        let mut state = AlertState::default();
+        state.alerts.insert(
+            AlertCategory::WorkspaceInitFailure,
+            AlertEntry {
+                last_alerted_at: Utc::now(),
+                last_error_excerpt: "preserved".into(),
+            },
+        );
+        state.save(tmp.path()).unwrap();
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let err = anyhow!("anything");
+        handle_predictable_failure(
+            tmp.path(),
+            "x",
+            Some(&ctx),
+            false, // <- disabled
+            AlertCategory::WorkspaceInitFailure,
+            &err,
+        )
+        .await;
+
+        post_mock.assert_async().await;
+        let after = AlertState::load_or_default(tmp.path());
+        assert_eq!(
+            after.alerts[&AlertCategory::WorkspaceInitFailure].last_error_excerpt,
+            "preserved",
+            "disabled path must not modify alert state"
+        );
+    }
+
+    #[test]
+    fn error_excerpt_truncates_with_ellipsis() {
+        let long = "x".repeat(500);
+        let err = anyhow!("{long}");
+        let excerpt = error_excerpt(&err, 200);
+        assert_eq!(
+            excerpt.chars().count(),
+            201,
+            "truncated excerpt must be max_chars + 1 (ellipsis)"
+        );
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn error_excerpt_short_passes_through() {
+        let err = anyhow!("short");
+        assert_eq!(error_excerpt(&err, 200), "short");
+    }
+
+    // ============================================================
+    // Start-of-work notification (Section 5 of the change)
+    // ============================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_of_work_notification_posted_on_dequeue() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "starter", "make widgets sing");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+
+        // Match the exact expected start-of-work text, both `change` and
+        // `repo.url` and the first `## Why` line of the fixture.
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C_TEST","text":"🚀 `git@github.com:owner/fixture.git`: starting work on `starter` — make widgets sing"}"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let executor = CompletingExecutorWithDiff {
+            artifact_name: "starter_artifact.txt".into(),
+            artifact_text: "x".into(),
+        };
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: false,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let processed = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(processed, vec!["starter".to_string()]);
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_of_work_suppressed_when_disabled() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "quiet", "should not produce a notification");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+
+        // expect(0) — fail the test if the post mock is hit.
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let executor = CompletingExecutorWithDiff {
+            artifact_name: "quiet_artifact.txt".into(),
+            artifact_text: "x".into(),
+        };
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false, // <- disabled
+            failure_alerts_enabled: false,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let processed = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(processed, vec!["quiet".to_string()]);
+        post_mock.assert_async().await;
+    }
+
+    // ============================================================
+    // Section 6: failure-alert wiring at the three predictable sites
+    // ============================================================
+
+    /// The simplest predictable-failure to exercise end-to-end is
+    /// `WorkspaceInitFailure`: an existing path without a `.git` directory
+    /// causes `workspace::ensure_initialized` to error. We use that for
+    /// the throttle assertions.
+    fn make_broken_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // No `.git` dir → ensure_initialized will Err.
+        (dir, ws)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failure_alert_posted_then_suppressed_within_24h() {
+        let (_dir, ws) = make_broken_workspace();
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+
+        // Exactly ONE post across two iterations: the first fires, the
+        // second is throttled within 24h.
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: true,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        // Use a repo with a `local_path` that points at the broken workspace
+        // and a URL that will NOT clone successfully even if attempted.
+        let repo = RepositoryConfig {
+            url: "git@github.com:never/exists.git".into(),
+            local_path: Some(ws.clone()),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        };
+
+        struct NoopExecutor;
+        #[async_trait::async_trait]
+        impl Executor for NoopExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                unreachable!("init must fail before reaching the executor")
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = NoopExecutor;
+
+        // Iteration 1: init fails → alert posts.
+        let r1 = run_pass_through_commits(&ws, &repo, &test_github, &executor, Some(&chatops_ctx)).await;
+        assert!(r1.is_err(), "iteration 1 must error on init failure");
+
+        // Verify state was persisted with the WorkspaceInitFailure entry.
+        let state = AlertState::load_or_default(&ws);
+        assert!(
+            state.alerts.contains_key(&AlertCategory::WorkspaceInitFailure),
+            "iteration 1 must have recorded an alert entry"
+        );
+
+        // Iteration 2: init still fails → alert is throttled.
+        let r2 = run_pass_through_commits(&ws, &repo, &test_github, &executor, Some(&chatops_ctx)).await;
+        assert!(r2.is_err(), "iteration 2 must still error");
+
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failure_alert_cleared_on_subsequent_success() {
+        // Iteration 1: init fails (post fires).
+        // Iteration 2: init succeeds (state cleared).
+        // Iteration 3: init fails again (post fires AGAIN — no 24h delay).
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(2) // <- must fire twice across the three iterations
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        // Build a real upstream remote so iteration 2's init succeeds.
+        let remote = dir.path().join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        let run_git = |path: &Path, args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        run_git(&remote, &["init", "-q", "-b", "main"]);
+        run_git(&remote, &["config", "user.email", "t@e"]);
+        run_git(&remote, &["config", "user.name", "t"]);
+        std::fs::write(remote.join("README.md"), "x").unwrap();
+        run_git(&remote, &["add", "-A"]);
+        run_git(&remote, &["commit", "-q", "-m", "initial"]);
+        let remote_url = remote.to_string_lossy().to_string();
+
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: true,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+
+        struct NoopExecutor;
+        #[async_trait::async_trait]
+        impl Executor for NoopExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                Ok(ExecutorOutcome::Failed { reason: "noop".into() })
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = NoopExecutor;
+
+        // Iteration 1: bad ws → init fails → alert.
+        let bad_repo = RepositoryConfig {
+            url: "git@github.com:fake/never.git".into(),
+            local_path: Some(ws.clone()),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        };
+        let r1 = run_pass_through_commits(&ws, &bad_repo, &test_github, &executor, Some(&chatops_ctx)).await;
+        assert!(r1.is_err(), "iteration 1 must error");
+        let state = AlertState::load_or_default(&ws);
+        assert!(
+            state.alerts.contains_key(&AlertCategory::WorkspaceInitFailure),
+            "iter 1 must record alert"
+        );
+
+        // Iteration 2: clone the remote into the workspace so init
+        // succeeds → state must be cleared.
+        std::fs::remove_dir_all(&ws).unwrap();
+        let parent = ws.parent().unwrap();
+        let st = std::process::Command::new("git")
+            .args(["clone", "-q", &remote_url, ws.to_string_lossy().as_ref()])
+            .current_dir(parent)
+            .status()
+            .unwrap();
+        assert!(st.success(), "fixture clone failed");
+        run_git(&ws, &["config", "user.email", "t@e"]);
+        run_git(&ws, &["config", "user.name", "t"]);
+
+        let good_repo = RepositoryConfig {
+            url: remote_url.clone(),
+            local_path: Some(ws.clone()),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        };
+        let r2 = run_pass_through_commits(&ws, &good_repo, &test_github, &executor, Some(&chatops_ctx)).await;
+        assert!(
+            r2.is_ok(),
+            "iteration 2 must succeed (init OK + empty queue): {:?}",
+            r2.err().map(|e| format!("{e:#}"))
+        );
+        let state = AlertState::load_or_default(&ws);
+        assert!(
+            state.alerts.is_empty(),
+            "alert state must be cleared on success; got: {state:?}"
+        );
+
+        // Iteration 3: blow away workspace again → init fails → alert
+        // fires AGAIN (no 24h block, because state was cleared).
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let r3 = run_pass_through_commits(&ws, &bad_repo, &test_github, &executor, Some(&chatops_ctx)).await;
+        assert!(r3.is_err(), "iteration 3 must error");
+
+        post_mock.assert_async().await;
+    }
+
+    #[test]
+    fn format_alert_text_uses_category_label() {
+        let s = format_alert_text(
+            "git@github.com:o/r.git",
+            AlertCategory::WorkspaceInitFailure,
+            "boom",
+        );
+        assert!(s.contains("⚠️"));
+        assert!(s.contains("`git@github.com:o/r.git`"));
+        assert!(s.contains("workspace init keeps failing"));
+        assert!(s.contains("for the past 24h"));
+        assert!(s.ends_with("Latest: boom"));
     }
 }
