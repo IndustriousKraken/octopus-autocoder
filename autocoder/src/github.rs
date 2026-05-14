@@ -4,13 +4,87 @@ use crate::code_reviewer::ReviewReport;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-const DEFAULT_API_BASE: &str = "https://api.github.com";
+pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 const DRAFT_FALLBACK_LABEL: &str = "do-not-merge";
 
 #[derive(Deserialize)]
 struct PullResponse {
     html_url: String,
     number: u64,
+}
+
+/// One element of a `GET /pulls?...` response. Only the fields autocoder
+/// consults are deserialized; everything else in the API payload is
+/// ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenPr {
+    pub number: u64,
+    pub html_url: String,
+}
+
+/// Production wrapper for `list_open_prs_at` against the live GitHub API.
+/// Returns the list of open PRs whose head and base match the given
+/// qualifiers. Used by the polling loop to skip iterations when a PR is
+/// already pending review.
+pub async fn list_open_prs(
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+    token: &str,
+) -> Result<Vec<OpenPr>> {
+    list_open_prs_at(DEFAULT_API_BASE, owner, repo, head, base, token).await
+}
+
+/// Test-only re-export of the internal `list_open_prs_at`. Lets
+/// sibling-module tests exercise the HTTP path against mockito.
+#[cfg(test)]
+pub(crate) async fn list_open_prs_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+    token: &str,
+) -> Result<Vec<OpenPr>> {
+    list_open_prs_at(api_base, owner, repo, head, base, token).await
+}
+
+async fn list_open_prs_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+    token: &str,
+) -> Result<Vec<OpenPr>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .query(&[("state", "open"), ("head", head), ("base", base)])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github pulls GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github pulls GET {owner}/{repo} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<OpenPr> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github pulls response decode failed: {e}"))?;
+    Ok(parsed)
 }
 
 /// Create a fork of the upstream repo via the GitHub REST API. The fork's
@@ -706,5 +780,93 @@ mod tests {
         first.assert_async().await;
         second.assert_async().await;
         label.assert_async().await;
+    }
+
+    /// `list_open_prs` parses a non-empty array response.
+    #[tokio::test]
+    async fn list_open_prs_parses_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/repos/owner/repo/pulls?state=open&head=owner%3Aagent-q&base=main",
+            )
+            .with_status(200)
+            .with_body(
+                r#"[{"number":42,"html_url":"https://github.com/owner/repo/pull/42","title":"ignored","unused":"extra"}]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let prs = list_open_prs_at(
+            &server.url(),
+            "owner",
+            "repo",
+            "owner:agent-q",
+            "main",
+            "testtoken",
+        )
+        .await
+        .expect("list_open_prs should succeed");
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].html_url, "https://github.com/owner/repo/pull/42");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_returns_empty_vec_when_no_prs() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/repos/owner/repo/pulls?state=open&head=owner%3Aagent-q&base=main",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let prs = list_open_prs_at(
+            &server.url(),
+            "owner",
+            "repo",
+            "owner:agent-q",
+            "main",
+            "testtoken",
+        )
+        .await
+        .expect("empty list should succeed");
+
+        assert!(prs.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body(r#"{"message":"internal error"}"#)
+            .create_async()
+            .await;
+
+        let result = list_open_prs_at(
+            &server.url(),
+            "owner",
+            "repo",
+            "owner:agent-q",
+            "main",
+            "testtoken",
+        )
+        .await;
+
+        assert!(result.is_err(), "non-2xx must surface as Err");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("500"), "error must name status code: {msg}");
     }
 }

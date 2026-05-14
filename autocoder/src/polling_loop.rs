@@ -84,6 +84,13 @@ pub async fn execute_one_pass(
     reviewer: Option<&CodeReviewer>,
     chatops_ctx: Option<&ChatOpsContext>,
 ) -> Result<()> {
+    // Before doing any iteration work, check whether an open PR already
+    // exists on the agent branch. If yes, this iteration would burn
+    // tokens re-implementing, force-update the PR's commits under any
+    // reviewer mid-review, and 422 at PR creation. Skip entirely.
+    if open_pr_exists_for_agent_branch(repo, github_cfg).await {
+        return Ok(());
+    }
     let processed = run_pass_through_commits(workspace, repo, github_cfg, executor, chatops_ctx).await?;
     if processed.is_empty() {
         return Ok(());
@@ -816,6 +823,105 @@ fn build_pr_body(changes: &[String]) -> String {
         s.push_str(&format!("- {change}\n"));
     }
     s
+}
+
+/// Return `true` if any open PR exists on GitHub for the configured agent
+/// branch, in which case the caller should skip this iteration. On any
+/// failure to perform the check (parse, token, transport, non-2xx) this
+/// logs a WARN and returns `false` so a transient GitHub problem does not
+/// block normal iterations — the cost of a redundant Claude run is lower
+/// than the cost of an entire repo grinding to a halt on a flaky API.
+///
+/// `api_base` is `github::DEFAULT_API_BASE` in production; tests pass a
+/// mockito server URL instead.
+async fn open_pr_exists_for_agent_branch_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> bool {
+    let (upstream_owner, upstream_repo) = match github::parse_repo_url(&repo.url) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "open-PR check skipped: cannot parse repo URL: {e:#}"
+            );
+            return false;
+        }
+    };
+    // In fork-PR mode, the head qualifier is `<fork_owner>:<branch>`; in
+    // direct mode it's the upstream owner. Either way the QUERY targets
+    // the upstream repo's `/pulls` because that's where PRs are created.
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&upstream_owner);
+    let head = format!("{}:{}", head_owner, repo.agent_branch);
+
+    let token = match crate::github_credentials::resolve_token(github_cfg, &upstream_owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "open-PR check skipped: token resolution failed: {e:#}"
+            );
+            return false;
+        }
+    };
+
+    let result = if api_base == github::DEFAULT_API_BASE {
+        github::list_open_prs(
+            &upstream_owner,
+            &upstream_repo,
+            &head,
+            &repo.base_branch,
+            &token,
+        )
+        .await
+    } else {
+        // Test path: explicit base.
+        #[cfg(test)]
+        {
+            github::list_open_prs_at_for_test(
+                api_base,
+                &upstream_owner,
+                &upstream_repo,
+                &head,
+                &repo.base_branch,
+                &token,
+            )
+            .await
+        }
+        #[cfg(not(test))]
+        {
+            unreachable!("non-default api_base is test-only");
+        }
+    };
+
+    match result {
+        Ok(prs) if !prs.is_empty() => {
+            let numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+            tracing::info!(
+                url = %repo.url,
+                pr_count = numbers.len(),
+                prs = ?numbers,
+                "open PR exists for agent branch; skipping iteration"
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "open-PR check failed: {e:#}; proceeding with iteration"
+            );
+            false
+        }
+    }
+}
+
+async fn open_pr_exists_for_agent_branch(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> bool {
+    open_pr_exists_for_agent_branch_at(github::DEFAULT_API_BASE, repo, github_cfg).await
 }
 
 #[cfg(test)]
@@ -2261,5 +2367,132 @@ mod tests {
         // otherwise dominate.
         let res = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(res.is_ok(), "polling loop did not exit within 1s of cancel");
+    }
+
+    // ============================================================
+    // open-PR pre-flight check (skip-poll-when-pr-open)
+    // ============================================================
+
+    fn open_pr_test_repo() -> RepositoryConfig {
+        RepositoryConfig {
+            url: "git@github.com:upstream-owner/upstream-repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        }
+    }
+
+    fn open_pr_test_github(server_url: &str) -> GithubConfig {
+        // Resolve_token reads from token_env (or inline). Use a fixture
+        // env var unique to this test set so parallel tests don't clobber.
+        unsafe { std::env::set_var("AUTOCODER_OPEN_PR_TEST_TOKEN", "testtoken") };
+        let _ = server_url; // unused but kept for symmetry with future callers
+        GithubConfig {
+            token_env: "AUTOCODER_OPEN_PR_TEST_TOKEN".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_pr_check_returns_true_when_pr_exists() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/repos/upstream-owner/upstream-repo/pulls?state=open&head=upstream-owner%3Aagent-q&base=main",
+            )
+            .with_status(200)
+            .with_body(
+                r#"[{"number":7,"html_url":"https://github.com/upstream-owner/upstream-repo/pull/7"}]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = open_pr_exists_for_agent_branch_at(
+            &server.url(),
+            &open_pr_test_repo(),
+            &open_pr_test_github(&server.url()),
+        )
+        .await;
+        assert!(result, "should report PR exists");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn open_pr_check_returns_false_when_no_pr() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/repos/upstream-owner/upstream-repo/pulls?state=open&head=upstream-owner%3Aagent-q&base=main",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = open_pr_exists_for_agent_branch_at(
+            &server.url(),
+            &open_pr_test_repo(),
+            &open_pr_test_github(&server.url()),
+        )
+        .await;
+        assert!(!result, "should report no PR");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn open_pr_check_returns_false_on_query_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body(r#"{"message":"server error"}"#)
+            .create_async()
+            .await;
+
+        // Best-effort fallback: a 500 from GitHub should not block the
+        // iteration — log WARN and proceed as if no PR exists.
+        let result = open_pr_exists_for_agent_branch_at(
+            &server.url(),
+            &open_pr_test_repo(),
+            &open_pr_test_github(&server.url()),
+        )
+        .await;
+        assert!(!result, "transport/HTTP errors must degrade to 'no PR'");
+    }
+
+    #[tokio::test]
+    async fn open_pr_check_uses_fork_owner_in_head_qualifier() {
+        // With fork_owner = "bot-machine-user", the head query parameter
+        // must be `bot-machine-user:agent-q` (not the upstream owner).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/repos/upstream-owner/upstream-repo/pulls?state=open&head=bot-machine-user%3Aagent-q&base=main",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut gh = open_pr_test_github(&server.url());
+        gh.fork_owner = Some("bot-machine-user".into());
+        let result = open_pr_exists_for_agent_branch_at(
+            &server.url(),
+            &open_pr_test_repo(),
+            &gh,
+        )
+        .await;
+        assert!(!result);
+        mock.assert_async().await;
     }
 }
