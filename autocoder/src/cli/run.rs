@@ -16,17 +16,16 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(cfg: Config) -> Result<()> {
+    openspec_preflight()?;
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
     ensure_forks_exist(&cfg.github, &cfg.repositories).await?;
 
-    let sandbox = crate::config::ResolvedSandbox::resolve(cfg.executor.sandbox.as_ref());
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
-        ExecutorKind::ClaudeCli => Arc::new(ClaudeCliExecutor::new_with_sandbox(
-            cfg.executor.command.clone(),
-            cfg.executor.timeout_secs,
-            sandbox,
-        )),
+        ExecutorKind::ClaudeCli => Arc::new(
+            ClaudeCliExecutor::from_config(&cfg.executor)
+                .context("initializing ClaudeCliExecutor from config")?,
+        ),
     };
 
     let reviewer: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
@@ -138,6 +137,42 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Verify the `openspec` binary is reachable before the polling loop
+/// starts. A failed preflight aborts daemon startup so misconfigured
+/// deployments fail loudly instead of looping forever producing nothing.
+pub fn openspec_preflight() -> Result<()> {
+    openspec_preflight_with("openspec")
+}
+
+/// Internal preflight that takes the binary name as an argument so tests
+/// can target a name guaranteed to be absent.
+fn openspec_preflight_with(bin: &str) -> Result<()> {
+    match std::process::Command::new(bin).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            tracing::info!(
+                version = %String::from_utf8_lossy(&out.stdout).trim(),
+                "openspec preflight passed"
+            );
+            Ok(())
+        }
+        Ok(out) => {
+            let stderr_tail: String =
+                String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
+            Err(anyhow!(
+                "openspec preflight failed: `{bin} --version` exited {code:?}. stderr: {stderr_tail}",
+                code = out.status.code(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "openspec preflight failed: `{bin}` binary not found on PATH. \
+             Install openspec and ensure the systemd unit's PATH covers its install directory."
+        )),
+        Err(e) => Err(anyhow!(
+            "openspec preflight failed: spawning `{bin} --version` errored: {e}"
+        )),
+    }
 }
 
 /// Resolve a GitHub PAT route for every configured repository before any
@@ -376,6 +411,33 @@ mod tests {
     fn run_git(path: &Path, args: &[&str]) {
         let st = Command::new("git").args(args).current_dir(path).status().unwrap();
         assert!(st.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn preflight_errors_when_openspec_binary_missing() {
+        let err = openspec_preflight_with("openspec-definitely-not-installed-on-this-host")
+            .expect_err("missing binary must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("openspec"), "error must name openspec: {msg}");
+        assert!(
+            msg.contains("PATH") || msg.contains("not found"),
+            "error must hint at PATH/install: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_errors_when_binary_exits_nonzero() {
+        // `false` always exits 1. Path differs by platform (/bin/false on
+        // Linux, /usr/bin/false on macOS) — pick whichever exists so the
+        // test runs on both.
+        let false_bin = ["/bin/false", "/usr/bin/false"]
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a `false` binary must exist for this test");
+        let err = openspec_preflight_with(false_bin).expect_err("nonzero exit must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exited"), "error must mention exit code: {msg}");
     }
 
     /// Build a remote + workspace clone pair. The workspace has `origin`

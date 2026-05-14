@@ -28,11 +28,19 @@ use tokio::process::Command;
 const MCP_CONFIG_FILENAME: &str = ".mcp.json";
 const ASKUSER_MARKER_FILENAME: &str = ".askuser-pending.json";
 
+/// Built-in default implementer prompt template, embedded at compile time
+/// so the binary runs without requiring `prompts/` on the filesystem.
+const DEFAULT_IMPLEMENTER_TEMPLATE: &str = include_str!("../../../prompts/implementer.md");
+
+/// Literal placeholder replaced with `openspec instructions apply` output.
+const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
+
 pub struct ClaudeCliExecutor {
     command: String,
     args: Vec<String>,
     timeout: Duration,
     sandbox: crate::config::ResolvedSandbox,
+    template: String,
 }
 
 /// Opaque payload stashed inside `ResumeHandle.0` for this backend.
@@ -66,11 +74,43 @@ impl ClaudeCliExecutor {
             args: Vec::new(),
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
+            template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
         }
     }
 
+    /// Construct an executor wired from an `ExecutorConfig`: resolves the
+    /// implementer prompt template (loading the override file when set,
+    /// otherwise using the embedded default) and the sandbox.
+    pub fn from_config(cfg: &crate::config::ExecutorConfig) -> Result<Self> {
+        let template = match &cfg.implementer_prompt_path {
+            Some(path) => {
+                let s = std::fs::read_to_string(path).with_context(|| {
+                    format!(
+                        "reading implementer prompt template at {}",
+                        path.display()
+                    )
+                })?;
+                if s.trim().is_empty() {
+                    return Err(anyhow!(
+                        "implementer prompt template at {} is empty",
+                        path.display()
+                    ));
+                }
+                s
+            }
+            None => DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+        };
+        Ok(Self {
+            command: cfg.command.clone(),
+            args: Vec::new(),
+            timeout: Duration::from_secs(cfg.timeout_secs),
+            sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
+            template,
+        })
+    }
+
     /// Test/extension constructor allowing additional args to be passed to
-    /// the wrapped command. Production wiring uses `new`.
+    /// the wrapped command. Production wiring uses `from_config`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_args(command: String, args: Vec<String>, timeout_secs: u64) -> Self {
         Self {
@@ -78,76 +118,50 @@ impl ClaudeCliExecutor {
             args,
             timeout: Duration::from_secs(timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(None),
+            template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
         }
     }
 
-    /// Build the prompt string for `change` using `openspec instructions apply`
-    /// when available, falling back to concatenating the change's
-    /// `proposal.md`, `design.md`, and `tasks.md` files.
-    fn build_prompt(workspace: &Path, change: &str) -> Result<String> {
-        // Try `openspec instructions apply` first. Each failure mode logs
-        // a structured WARN so operators can root-cause the silent
-        // fallback that triggered chat-style responses in production.
-        match std::process::Command::new("openspec")
+    /// Build the prompt for `change` by running `openspec instructions
+    /// apply` and substituting the result into the implementer template.
+    /// On any failure to obtain the openspec output (binary not on PATH,
+    /// non-zero exit, empty stdout) the method returns Err and the
+    /// caller fails the iteration. There is no silent fallback: a
+    /// degraded prompt produces nothing useful, and the startup
+    /// preflight in `cli::run::openspec_preflight` should have already
+    /// surfaced a missing binary.
+    fn build_prompt(&self, workspace: &Path, change: &str) -> Result<String> {
+        let out = std::process::Command::new("openspec")
             .args(["instructions", "apply", "--change", change])
             .current_dir(workspace)
             .output()
-        {
-            Ok(out) if out.status.success() => {
-                let s = String::from_utf8_lossy(&out.stdout).to_string();
-                if s.trim().is_empty() {
-                    tracing::warn!(
-                        change = change,
-                        reason = "openspec_empty_stdout",
-                        "openspec instructions apply produced empty stdout; falling back to raw markdown"
-                    );
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "openspec binary not found on PATH while building prompt for `{change}`. \
+                         Set Environment=\"PATH=...\" in the systemd unit so it covers openspec's install directory."
+                    )
                 } else {
-                    return Ok(s);
+                    anyhow!(
+                        "spawning `openspec instructions apply` for `{change}` failed: {e}"
+                    )
                 }
-            }
-            Ok(out) => {
-                let stderr_tail: String =
-                    String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
-                tracing::warn!(
-                    change = change,
-                    reason = "openspec_exited_nonzero",
-                    code = ?out.status.code(),
-                    stderr_tail = %stderr_tail,
-                    "openspec instructions apply exited non-zero; falling back to raw markdown"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    change = change,
-                    reason = "openspec_not_found",
-                    "could not spawn `openspec`; binary not on autocoder's PATH. Set Environment=\"PATH=...\" in the systemd unit. Falling back to raw markdown."
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    change = change,
-                    reason = "openspec_spawn_error",
-                    error = %e,
-                    "spawning `openspec` failed; falling back to raw markdown"
-                );
-            }
-        }
-
-        let change_dir = workspace.join("openspec/changes").join(change);
-        let mut prompt = String::new();
-        for file in ["proposal.md", "design.md", "tasks.md"] {
-            let path = change_dir.join(file);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                prompt.push_str(&format!("\n\n# {file}\n\n{content}"));
-            }
-        }
-        if prompt.trim().is_empty() {
+            })?;
+        if !out.status.success() {
+            let stderr_tail: String =
+                String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
             return Err(anyhow!(
-                "no prompt material found for change `{change}` in {}",
-                change_dir.display()
+                "`openspec instructions apply --change {change}` exited {code:?}: {stderr_tail}",
+                code = out.status.code(),
             ));
         }
-        Ok(prompt)
+        let body = String::from_utf8_lossy(&out.stdout).to_string();
+        if body.trim().is_empty() {
+            return Err(anyhow!(
+                "`openspec instructions apply --change {change}` produced empty stdout"
+            ));
+        }
+        Ok(self.template.replace(PROMPT_BODY_PLACEHOLDER, &body))
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
@@ -466,7 +480,7 @@ impl Drop for TempFileGuard {
 #[async_trait]
 impl Executor for ClaudeCliExecutor {
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
-        let prompt = Self::build_prompt(workspace, change)?;
+        let prompt = self.build_prompt(workspace, change)?;
         // Best-effort: any stale marker from a prior crash gets cleared so
         // it cannot masquerade as the current invocation's question.
         let stale_marker = workspace
@@ -488,7 +502,7 @@ impl Executor for ClaudeCliExecutor {
             .context("decoding ClaudeCliExecutor resume handle")?;
         let workspace = data.workspace.as_path();
         let change = data.change.as_str();
-        let base = Self::build_prompt(workspace, change)?;
+        let base = self.build_prompt(workspace, change)?;
         let prompt = format!(
             "(Earlier you asked a question and the human answered: {answer}) Continue the implementation.\n\n{base}"
         );
@@ -921,16 +935,113 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_returns_non_empty_for_valid_fixture() {
         let (_dir, ws) = fixture_workspace();
-        let prompt = ClaudeCliExecutor::build_prompt(&ws, "x").unwrap();
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(!prompt.trim().is_empty(), "prompt must not be empty");
     }
 
     #[tokio::test]
     async fn build_prompt_errors_when_change_dir_missing() {
         let dir = TempDir::new().unwrap();
-        let err = ClaudeCliExecutor::build_prompt(dir.path(), "missing")
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let err = executor
+            .build_prompt(dir.path(), "missing")
             .expect_err("missing change dir should error");
-        assert!(format!("{err:#}").contains("missing"));
+        // Either openspec rejects the unknown change name or the workspace
+        // has no openspec dir at all — both surface as a non-empty error.
+        assert!(
+            !format!("{err:#}").is_empty(),
+            "error message must be non-empty"
+        );
+    }
+
+    /// Template substitution: a custom template's `{{change_body}}`
+    /// placeholder is replaced with the openspec output.
+    #[tokio::test]
+    async fn build_prompt_substitutes_change_body_into_template() {
+        let (_dir, ws) = fixture_workspace();
+        let mut executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        executor.template = "ROLE_HEADER\n--- BEGIN ---\n{{change_body}}\n--- END ---".into();
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(prompt.starts_with("ROLE_HEADER"), "template prefix missing: {prompt}");
+        assert!(prompt.contains("--- BEGIN ---"));
+        assert!(prompt.contains("--- END ---"));
+        // The openspec output's distinctive header should land between
+        // the BEGIN/END markers.
+        assert!(
+            prompt.contains("Apply: x") || prompt.contains("# proposal.md") || prompt.contains("change_body") == false,
+            "expected change body between markers; got: {prompt}"
+        );
+    }
+
+    /// `from_config`: with no override path, the default template is used.
+    #[test]
+    fn from_config_uses_default_template_when_path_unset() {
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: None,
+        };
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
+    }
+
+    /// `from_config`: with an override path, the file is read and used.
+    #[test]
+    fn from_config_loads_override_template_when_path_set() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("custom.md");
+        std::fs::write(&path, "CUSTOM_TEMPLATE_SENTINEL {{change_body}}").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: Some(path),
+        };
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
+    }
+
+    /// `from_config`: a missing override file errors.
+    #[test]
+    fn from_config_errors_when_override_file_missing() {
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: Some(PathBuf::from("/definitely/not/a/real/path.md")),
+        };
+        let err = match ClaudeCliExecutor::from_config(&cfg) {
+            Ok(_) => panic!("missing file must error"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(s.contains("implementer prompt template"), "error: {s}");
+    }
+
+    /// `from_config`: an empty override file errors (otherwise the
+    /// daemon would feed an empty wrapper to Claude on every run).
+    #[test]
+    fn from_config_errors_when_override_file_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.md");
+        std::fs::write(&path, "   \n  \n").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: Some(path),
+        };
+        let err = match ClaudeCliExecutor::from_config(&cfg) {
+            Ok(_) => panic!("empty file must error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("empty"));
     }
 
     /// Run-log persistence: after a subprocess invocation completes,

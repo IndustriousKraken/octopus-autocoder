@@ -82,6 +82,13 @@ pub struct ExecutorConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
+    /// Optional path to a custom implementer prompt template. When unset,
+    /// the binary uses the template embedded at compile time from
+    /// `prompts/implementer.md`. The file must contain the literal
+    /// `{{change_body}}` placeholder which is replaced with the output of
+    /// `openspec instructions apply` for each change.
+    #[serde(default)]
+    pub implementer_prompt_path: Option<PathBuf>,
 }
 
 /// Per-iteration tool-use restrictions for the wrapped agent CLI. When

@@ -52,7 +52,7 @@ cp config.yaml ~/autocoder/config.yaml
 chmod 600 ~/autocoder/config.yaml
 ```
 
-The build produces a `~10 MB` self-contained binary. Run time needs only `config.yaml` and (optionally) a `prompts/` directory for a customized code-reviewer prompt. The `--config` flag accepts any absolute path.
+The build produces a `~10 MB` self-contained binary. The implementer prompt template (`prompts/implementer.md`) and the code-reviewer template (`prompts/code-review-default.md`) are both embedded at compile time, so the runtime needs only `config.yaml`. To override either template, set `executor.implementer_prompt_path` or `reviewer.prompt_template_path` in `config.yaml` to a path on disk. The `--config` flag accepts any absolute path.
 
 ### 4. Run it
 
@@ -100,12 +100,13 @@ A list of one or more repositories to manage. Each entry:
 
 ### `executor:` (required)
 
-| Field           | Required | Default     | Description |
-|-----------------|----------|-------------|-------------|
-| `kind`          | yes      | —           | Currently only `claude_cli` is supported. |
-| `command`       | no       | `claude`    | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
-| `timeout_secs`  | no       | `1800`      | Wall-clock budget per change. Killed-and-Failed on overrun. |
-| `sandbox`       | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](#8-executor-tool-sandbox). |
+| Field                       | Required | Default       | Description |
+|-----------------------------|----------|---------------|-------------|
+| `kind`                      | yes      | —             | Currently only `claude_cli` is supported. |
+| `command`                   | no       | `claude`      | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
+| `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
+| `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](#8-executor-tool-sandbox). |
+| `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. |
 
 ### `github:` (required)
 
@@ -382,6 +383,12 @@ repositories:
     poll_interval_sec: 3600
 ```
 
+### Startup preflight
+
+At startup, `autocoder run` invokes `openspec --version` once. If the binary is not on the daemon's PATH or exits non-zero, the daemon exits non-zero before any polling task is spawned. The stderr message names the failure (binary not found, non-zero exit code, etc.). This means a misconfigured deployment surfaces at startup rather than producing empty iterations.
+
+If you see `openspec preflight failed: binary not found on PATH`, add the install directory to the systemd unit's `Environment="PATH=..."` line (see [Deployment](#deployment)).
+
 ### Recovering from a bad run
 
 The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](#rewind) below.
@@ -534,7 +541,7 @@ RestartSec=60
 WantedBy=multi-user.target
 ```
 
-> **PATH gotcha.** A common silent failure: `openspec` is installed but not on autocoder's PATH, so `build_prompt` falls back to raw-markdown concatenation and Claude responds with chat-style clarification instead of implementing. The daemon now logs WARN with `reason=openspec_not_found` when this happens — check `journalctl -u autocoder -e | grep reason=openspec` after the first iteration. The per-change run log at `/tmp/autocoder-logs/<workspace>/<change>.log` also persists the actual prompt sent to Claude, with a `=== PROMPT (n bytes) ===` header you can inspect.
+`openspec` must be on autocoder's PATH. The daemon runs `openspec --version` at startup and exits non-zero with a clear stderr message if the binary is missing. Confirm with `sudo -u autocoder which openspec`. The per-change run log at `/tmp/autocoder-logs/<workspace>/<change>.log` records the prompt sent to Claude under a `=== PROMPT (n bytes) ===` header for inspection.
 
 #### Path B — env-var secrets (multi-user hosts, classical production pattern)
 
