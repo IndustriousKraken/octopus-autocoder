@@ -251,6 +251,52 @@ pub struct SlackConfig {
     #[serde(default)]
     pub bot_token: Option<SecretSource>,
     pub default_channel_id: String,
+    #[serde(default)]
+    pub notifications: Option<NotificationsConfig>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_true")]
+    pub start_work: bool,
+    #[serde(default = "default_true")]
+    pub failure_alerts: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            start_work: true,
+            failure_alerts: true,
+        }
+    }
+}
+
+impl NotificationsConfig {
+    /// Resolve the effective `start_work` flag given the (optional) Slack
+    /// config: defaults to `true` when no `notifications:` block was set, and
+    /// honors the explicit value otherwise.
+    pub fn start_work_enabled(slack: Option<&SlackConfig>) -> bool {
+        slack
+            .and_then(|s| s.notifications.as_ref())
+            .map(|n| n.start_work)
+            .unwrap_or(true)
+    }
+
+    /// Resolve the effective `failure_alerts` flag given the (optional) Slack
+    /// config: defaults to `true` when no `notifications:` block was set, and
+    /// honors the explicit value otherwise.
+    pub fn failure_alerts_enabled(slack: Option<&SlackConfig>) -> bool {
+        slack
+            .and_then(|s| s.notifications.as_ref())
+            .map(|n| n.failure_alerts)
+            .unwrap_or(true)
+    }
 }
 
 impl RepositoryConfig {
@@ -955,6 +1001,114 @@ reviewer:
         }
         // api_key_env still present:
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn loads_notifications_block() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0DEFAULT
+  notifications:
+    start_work: false
+    failure_alerts: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config should parse");
+        let slack = cfg.slack.expect("slack present");
+        let n = slack.notifications.clone().expect("notifications present");
+        assert!(!n.start_work);
+        assert!(n.failure_alerts);
+        assert!(!NotificationsConfig::start_work_enabled(Some(&slack)));
+        assert!(NotificationsConfig::failure_alerts_enabled(Some(&slack)));
+    }
+
+    #[test]
+    fn notifications_partial_populated_defaults_other_to_true() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0DEFAULT
+  notifications:
+    start_work: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config should parse");
+        let slack = cfg.slack.expect("slack present");
+        let n = slack.notifications.expect("notifications present");
+        assert!(!n.start_work);
+        assert!(n.failure_alerts, "omitted field must default to true");
+    }
+
+    #[test]
+    fn notifications_rejects_unknown_field() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0DEFAULT
+  notifications:
+    start_work: true
+    typo_field: oops
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("unknown field in notifications must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("typo_field") || msg.to_lowercase().contains("unknown"),
+            "error should mention unknown field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn notifications_absent_block_defaults_both_true() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+slack:
+  bot_token_env: SLACK_BOT_TOKEN
+  default_channel_id: C0DEFAULT
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config should parse");
+        let slack = cfg.slack.expect("slack present");
+        assert!(slack.notifications.is_none(), "block must be absent");
+        // Helpers must default to true when block omitted.
+        assert!(NotificationsConfig::start_work_enabled(Some(&slack)));
+        assert!(NotificationsConfig::failure_alerts_enabled(Some(&slack)));
+        // Helpers must also default to true when slack itself is None.
+        assert!(NotificationsConfig::start_work_enabled(None));
+        assert!(NotificationsConfig::failure_alerts_enabled(None));
     }
 
     #[test]

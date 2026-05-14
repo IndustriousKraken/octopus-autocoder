@@ -4,7 +4,7 @@
 
 use crate::chatops::ChatOps;
 use crate::code_reviewer::CodeReviewer;
-use crate::config::{Config, ExecutorKind, GithubConfig, RepositoryConfig};
+use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
@@ -117,13 +117,20 @@ pub async fn execute(cfg: Config) -> Result<()> {
         let cancel = cancel.clone();
 
         // Build the per-repo ChatOps context: resolve the channel via the
-        // per-repo override or the global default.
+        // per-repo override or the global default. Notification flags
+        // default to `true` when the operator did not configure
+        // `slack.notifications`.
         let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.slack.as_ref()) {
             (Some(co), Some(slack_cfg)) => {
                 let channel = repo
                     .slack_channel(&slack_cfg.default_channel_id)
                     .to_string();
-                Some(Arc::new(ChatOpsContext { chatops: co, channel }))
+                Some(Arc::new(ChatOpsContext {
+                    chatops: co,
+                    channel,
+                    start_work_enabled: NotificationsConfig::start_work_enabled(Some(slack_cfg)),
+                    failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(slack_cfg)),
+                }))
             }
             _ => None,
         };

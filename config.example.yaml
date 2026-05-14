@@ -105,3 +105,12 @@ github:
 #   # bot_token:
 #   #   value: "xoxb-yourtokenhere"
 #   default_channel_id: C0123456789
+#   # Progress notifications. Both keys default to `true` when the block is
+#   # omitted. Set either to `false` to suppress that stream.
+#   #   start_work: a one-line message each time autocoder picks up a change.
+#   #   failure_alerts: throttled (≤1/24h per repo+category) alerts for
+#   #     predictable infrastructure failures (workspace init, branch push,
+#   #     PR creation 4xx). Cleared on the next successful iteration.
+#   # notifications:
+#   #   start_work: true
+#   #   failure_alerts: true
