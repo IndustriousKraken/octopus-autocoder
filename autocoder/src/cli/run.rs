@@ -2,20 +2,26 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
-use crate::chatops::{self, ChatOpsBackend};
+use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
+use crate::control_socket::{
+    self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
+    ReviewerHolder, SpawnOutcome, SpawnRepoFn,
+};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
-use crate::polling_loop::ChatOpsContext;
 use crate::{git, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
-use std::sync::Arc;
-use tokio::task::JoinSet;
+use arc_swap::ArcSwap;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub async fn execute(cfg: Config) -> Result<()> {
+pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     openspec_preflight()?;
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
@@ -28,7 +34,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
         ),
     };
 
-    let reviewer: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
+    let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from config")?;
@@ -45,19 +51,30 @@ pub async fn execute(cfg: Config) -> Result<()> {
         }
     };
 
-    let chatops: Option<Arc<dyn ChatOpsBackend>> = match cfg.chatops.as_ref() {
+    let chatops_initial: Option<ChatOpsSlot> = match cfg.chatops.as_ref() {
         Some(co) => {
             let backend = chatops::from_config(co)
                 .await
                 .context("initializing chatops backend from config")?;
             emit_chatops_startup_log(backend.provider_name(), backend.is_experimental());
-            Some(backend)
+            Some(ChatOpsSlot {
+                backend,
+                default_channel_id: co.default_channel_id.clone(),
+                start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
+                failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
+            })
         }
         None => {
             tracing::info!("ChatOps escalation disabled (no chatops: config block)");
             None
         }
     };
+
+    // Hot-swappable holders. The control socket swaps into these on
+    // `autocoder reload`; the polling loops read snapshots once per pass.
+    let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
+    let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(reviewer_initial));
+    let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
 
     for repo in &cfg.repositories {
         let derived = workspace::resolve_path(repo);
@@ -105,65 +122,172 @@ pub async fn execute(cfg: Config) -> Result<()> {
         }
     }
 
-    let mut tasks: JoinSet<()> = JoinSet::new();
+    let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
+    let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
+    let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
+    let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
+    let spawn_repo = build_spawn_repo_fn(SpawnDeps {
+        executor: executor.clone(),
+        github_holder: github_holder.clone(),
+        reviewer_holder: reviewer_holder.clone(),
+        chatops_holder: chatops_holder.clone(),
+        stuck_threshold_secs,
+        perma_stuck_threshold,
+        executor_max_changes_per_pr,
+        startup_jitter_max_secs,
+        inter_iteration_jitter_pct,
+        global_cancel: cancel.clone(),
+        task_map: task_map.clone(),
+    });
+
     for repo in cfg.repositories.iter().cloned() {
-        if !repo_passes_startup_check(&repo, &cfg.github) {
-            // Per orchestrator-cli baseline: a repo dirty at startup is
-            // skipped for the remainder of the process lifetime. Other
-            // configured repositories continue to be serviced.
-            continue;
-        }
-        let executor = executor.clone();
-        let github = cfg.github.clone();
-        let reviewer = reviewer.clone();
-        let cancel = cancel.clone();
-        let max_changes_per_pr = repo.max_changes_per_pr(&cfg.executor);
-
-        // Build the per-repo ChatOps context: resolve the channel via the
-        // per-repo override or the global default. Notification flags
-        // default to `true` when the operator did not configure
-        // `chatops.notifications`.
-        let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.chatops.as_ref()) {
-            (Some(backend), Some(chatops_cfg)) => {
-                let channel = repo
-                    .chatops_channel(&chatops_cfg.default_channel_id)
-                    .to_string();
-                Some(Arc::new(ChatOpsContext {
-                    chatops: backend,
-                    channel,
-                    start_work_enabled: NotificationsConfig::start_work_enabled(Some(chatops_cfg)),
-                    failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(chatops_cfg)),
-                }))
+        match spawn_repo(repo) {
+            SpawnOutcome::Spawned => {}
+            SpawnOutcome::AlreadyPresent => {
+                // Cannot happen at startup (map is empty) but log defensively.
+                tracing::warn!("startup: spawn helper reported duplicate URL — ignoring");
             }
-            _ => None,
-        };
-
-        tasks.spawn(async move {
-            polling_loop::run(
-                repo,
-                executor,
-                github,
-                reviewer,
-                chatops_ctx,
-                stuck_threshold_secs,
-                perma_stuck_threshold,
-                max_changes_per_pr,
-                cancel,
-            )
-            .await
-        });
+            SpawnOutcome::StartupCheckFailed => {
+                // Per orchestrator-cli baseline: a repo whose workspace
+                // fails the startup check is skipped for the remainder
+                // of the process lifetime. Other repos continue.
+            }
+        }
     }
+
+    // Spawn the control-socket listener as a sibling task. It shares the
+    // same cancellation token as the polling tasks.
+    let control_state = ControlState {
+        github: github_holder.clone(),
+        reviewer: reviewer_holder.clone(),
+        chatops: chatops_holder.clone(),
+        last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
+        config_path,
+        repo_tasks: task_map.clone(),
+        spawn_repo: spawn_repo.clone(),
+    };
+    let listener_cancel = cancel.clone();
+    let control_handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = control_socket::listen(control_state, listener_cancel).await {
+            tracing::error!("control socket listener exited: {e:#}");
+        }
+    });
 
     spawn_signal_handler(cancel.clone());
 
-    while let Some(joined) = tasks.join_next().await {
-        if let Err(e) = joined {
+    // The polling tasks loop until the global cancellation token fires
+    // (or the per-repo token from a reload-induced cancel). Wait for the
+    // global cancel, then drain the task map and await every polling
+    // task. The wrapper inside the spawn closure removes its own entry
+    // on exit, so by draining the map first we take ownership of the
+    // JoinHandles before any wrapper races us for the lock.
+    cancel.cancelled().await;
+    let handles: Vec<JoinHandle<()>> = {
+        let mut guard = task_map.lock().unwrap();
+        guard.drain().map(|(_, h)| h.join).collect()
+    };
+    for h in handles {
+        if let Err(e) = h.await {
             tracing::error!("polling task panicked: {e}");
         }
+    }
+    if let Err(e) = control_handle.await {
+        tracing::error!("control socket task panicked: {e}");
     }
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Dependencies the daemon captures into the spawn closure so the reload
+/// handler can launch new polling tasks without re-deriving them.
+struct SpawnDeps {
+    executor: Arc<dyn Executor>,
+    github_holder: GithubHolder,
+    reviewer_holder: ReviewerHolder,
+    chatops_holder: ChatOpsHolder,
+    stuck_threshold_secs: u64,
+    perma_stuck_threshold: u32,
+    executor_max_changes_per_pr: Option<u32>,
+    startup_jitter_max_secs: u64,
+    inter_iteration_jitter_pct: u8,
+    global_cancel: CancellationToken,
+    task_map: RepoTaskMap,
+}
+
+/// Build a `SpawnRepoFn` that runs the repo's startup check, then spawns
+/// the per-repo polling task with a fresh child cancellation token and a
+/// new `Arc<ArcSwap<RepositoryConfig>>` holder. The spawned task removes
+/// its own map entry on exit so the next reload sees an absent URL.
+fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
+    Arc::new(move |repo: RepositoryConfig| {
+        let url = repo.url.clone();
+        // Fast-path duplicate check before doing the (potentially slow)
+        // startup check. Re-checked under the lock below to close the
+        // race window between this and the insert.
+        {
+            let guard = deps.task_map.lock().unwrap();
+            if guard.contains_key(&url) {
+                return SpawnOutcome::AlreadyPresent;
+            }
+        }
+        // Startup check uses the live github config (post-reload it may
+        // differ from what was on disk at process start).
+        let github_snap = deps.github_holder.load_full();
+        if !repo_passes_startup_check(&repo, &github_snap) {
+            return SpawnOutcome::StartupCheckFailed;
+        }
+        let child_cancel = deps.global_cancel.child_token();
+        let config_holder: Arc<ArcSwap<RepositoryConfig>> =
+            Arc::new(ArcSwap::from_pointee(repo));
+        let cancel_for_task = child_cancel.clone();
+        let config_for_task = config_holder.clone();
+        let map_for_task = deps.task_map.clone();
+        let url_for_task = url.clone();
+        let executor_for_task = deps.executor.clone();
+        let github_for_task = deps.github_holder.clone();
+        let reviewer_for_task = deps.reviewer_holder.clone();
+        let chatops_for_task = deps.chatops_holder.clone();
+        let stuck = deps.stuck_threshold_secs;
+        let perma = deps.perma_stuck_threshold;
+        let exec_max = deps.executor_max_changes_per_pr;
+        let startup_jitter = deps.startup_jitter_max_secs;
+        let iter_jitter = deps.inter_iteration_jitter_pct;
+        let join: JoinHandle<()> = tokio::spawn(async move {
+            polling_loop::run(
+                config_for_task,
+                executor_for_task,
+                github_for_task,
+                reviewer_for_task,
+                chatops_for_task,
+                stuck,
+                perma,
+                exec_max,
+                startup_jitter,
+                iter_jitter,
+                cancel_for_task,
+            )
+            .await;
+            let mut guard = map_for_task.lock().unwrap();
+            guard.remove(&url_for_task);
+        });
+        let mut guard = deps.task_map.lock().unwrap();
+        if guard.contains_key(&url) {
+            // Lost the race against another spawn. Cancel ours and
+            // report the URL as already present.
+            child_cancel.cancel();
+            return SpawnOutcome::AlreadyPresent;
+        }
+        guard.insert(
+            url,
+            RepoTaskHandle {
+                cancel: child_cancel,
+                config: config_holder,
+                join,
+            },
+        );
+        SpawnOutcome::Spawned
+    })
 }
 
 /// Emit the one-shot startup log line for the active ChatOps backend.
