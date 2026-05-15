@@ -110,6 +110,8 @@ A list of one or more repositories to manage. Each entry:
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
 | `max_changes_per_pr`        | no       | `3`           | Default cap on archived changes committed in one iteration's PR; per-repo `max_changes_per_pr` overrides. Operators with long queues see them ship across multiple iterations instead of one large PR. A value of `0` is clamped to `1` with a WARN log at startup. |
+| `startup_jitter_max_secs`   | no       | `30`          | Each polling task waits a uniformly random `[0, startup_jitter_max_secs]` seconds before its first iteration. Staggers a fleet of concurrent `git fetch` operations so an IDS does not see a synchronized burst. Set to `0` to disable. See [Polling cadence and your firewall](#polling-cadence-and-your-firewall). |
+| `inter_iteration_jitter_pct`| no       | `10`          | Each inter-iteration sleep is `poll_interval_sec` adjusted by ±this percent (uniform random offset). Prevents long-term re-synchronization of multiple tasks. Set to `0` for exact intervals. Values above `100` are clamped to `100`. |
 
 ### `github:` (required)
 
@@ -539,6 +541,17 @@ repositories:
     poll_interval_sec: 3600
 ```
 
+### Polling cadence and your firewall
+
+When autocoder spawns ≥5 polling tasks at process start, the simultaneous `git fetch` operations from a single source IP can look like a port scan or scraper to network IDS — one operator reported their IDS killing SSH connections the moment the daemon tried to poll 8–9 repos at once. Even without an IDS, tasks that all share the same `poll_interval_sec` (e.g. the default `300`) drift only marginally across iterations because `git fetch` dominates each iteration's wall-clock, so they tend to re-cluster over time.
+
+Two defaults defuse this:
+
+- `executor.startup_jitter_max_secs` (default `30`) — each task waits a uniformly-random `[0, 30]` seconds before its first iteration, smearing the first round of fetches across a 30 s window.
+- `executor.inter_iteration_jitter_pct` (default `10`) — each inter-iteration sleep is `poll_interval_sec ± 10%`, so tasks that briefly synchronize drift apart again on the next cycle.
+
+Both jitters cost almost nothing in wall-clock and respect SIGTERM/SIGINT (cancellation is observed within 200 ms during either sleep). Operators on isolated networks who prefer deterministic timing can set both to `0`. Operators who want a wider window — say, after seeing IDS alerts even with the defaults — can raise `startup_jitter_max_secs` to something like `120` or `300`.
+
 ### Queue order
 
 Pending changes are processed in `proposal.md` modification-time order, oldest first. The entry name breaks ties when two `proposal.md` files share the same mtime. Operators who want a specific ordering should author proposals in the order they want them applied — no leading `01-`/`02-` prefixes are needed.
@@ -654,6 +667,59 @@ sudo systemctl stop autocoder
 # inspect /tmp/workspaces/<repo>/ at your leisure
 sudo systemctl start autocoder
 ```
+
+### Runtime control: live config reload
+
+A running daemon exposes a Unix-domain control socket at `<system-temp>/autocoder/control/control.sock` (typically `/tmp/autocoder/control/control.sock` on Linux). The file is created on startup with mode `0600` and owned by the user running the daemon — only that user can connect. The socket file is removed at shutdown.
+
+The `autocoder reload` subcommand connects to the socket, sends `{"action":"reload"}`, and prints the daemon's response. The daemon re-reads the YAML config from the same path it was launched with, validates it (parse + workspace-collision + token-route checks), and either rejects the request or hot-applies the safe subset of changes.
+
+What gets hot-applied:
+
+- `github` — per-owner tokens, default `token_env`, `fork_owner`. Applied at the next iteration boundary for each repository.
+- `reviewer` — provider, model, API key, prompt template. In-flight reviews finish with the previous reviewer; subsequent reviews use the new one.
+- `chatops` — backend selection, default channel, notification flags. In-flight notifications finish with the previous backend; subsequent ones use the new one.
+- `repositories` — adding, removing, or modifying repositories in the list. New entries are spawned as fresh polling tasks (workspace setup, dirty-check, busy-marker — same as daemon startup). Removed entries get their per-repo cancellation token fired; the running task finishes its in-flight iteration normally (including push + PR) and exits at the next inter-poll sleep boundary. Modified entries hot-swap an `Arc<ArcSwap<RepositoryConfig>>` holder so the next iteration of that task reads the new `base_branch`, `agent_branch`, `poll_interval_sec`, `chatops_channel_id`, `local_path`, or `max_changes_per_pr`. The reload handler diffs the new list against the current task set by `url` — that field is the identity key. Changing the `url` of an existing entry is treated as `remove old_url + add new_url`. Reordering the list has no effect.
+
+What requires a full restart:
+
+- `executor` — only one executor instance exists, shared across tasks. Changes to `executor:` fields are reported under `requires_restart`.
+
+Response shape on success:
+
+```json
+{
+  "ok": true,
+  "applied": ["github", "reviewer", "repositories"],
+  "requires_restart": ["executor"],
+  "unchanged": ["chatops"],
+  "repositories_delta": {
+    "added": ["git@github.com:owner/repo-c.git"],
+    "removed": ["git@github.com:owner/repo-a.git"],
+    "changed": ["git@github.com:owner/repo-b.git"]
+  }
+}
+```
+
+`repositories_delta` is always present (the three arrays can each be empty) so client tooling has a consistent shape to parse. An entry only appears under one of `added` / `removed` / `changed` per reload.
+
+Validation rejection is non-disruptive: if the new YAML fails to parse or fails semantic validation, the daemon continues running with the previous in-memory config. The response is `{"ok": false, "error": "<message>"}` naming the failure, and the CLI exits non-zero. If the daemon is not running (or is running under a different user), the CLI prints an error naming the expected socket path and hinting at the cause.
+
+#### Adding a repository at runtime
+
+To add a repository without restarting the daemon:
+
+1. Edit `config.yaml` (the path the daemon was launched with) and append the new entry under `repositories:`. Set its `url`, `base_branch`, `agent_branch`, and `poll_interval_sec` as usual.
+2. Run `sudo -u autocoder autocoder reload` from the same host. The CLI prints the daemon's response.
+3. Verify the response includes the new URL under `repositories_delta.added` and `"repositories"` appears in `applied`. The polling task is now running; it does workspace initialization on its first pass.
+
+The reverse (remove a repository) works the same way: delete the entry, reload, and the new URL appears under `repositories_delta.removed`. The cancelled task finishes its current iteration before exiting, so a removal during an active push or PR step completes cleanly.
+
+#### In-flight iteration safety
+
+A repo cancelled mid-iteration finishes its in-flight pass normally. The cancellation check sits in the inter-poll `tokio::select!`, so the next poll never starts after the cancel — but the current one runs to completion. A modify-in-place is observed at the *next* iteration; the current iteration uses the old snapshot. Both rules eliminate mid-iteration tearing of `RepositoryConfig` fields.
+
+If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
 
 ---
 
@@ -856,6 +922,16 @@ sudo systemctl start autocoder
 sudo journalctl -u autocoder -f      # tail logs
 ```
 
+### Applying config changes without a restart
+
+Edit `config.yaml`, then run:
+
+```bash
+sudo -u autocoder autocoder reload
+```
+
+The `autocoder reload` subcommand connects to the daemon's control socket at `/tmp/autocoder/control/control.sock`. That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, `chatops`, and `repositories` sections at the next iteration boundary for each repo. Only changes to `executor:` are not hot-applied; the response names that under `requires_restart` so you know it still needs `systemctl restart autocoder`. See [Runtime control: live config reload](#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
+
 ### Upgrading
 
 Build the new release, copy the binary, restart the unit:
@@ -1028,6 +1104,16 @@ autocoder run --config <path-to-config.yaml>
 ```
 
 The daemon polls every configured repository on its interval, processes ready OpenSpec changes, and opens monolithic PRs. Terminates only on SIGINT, SIGTERM, or a fatal initialization error. Logs go to stderr; control verbosity with `RUST_LOG=info` (default), `RUST_LOG=debug`, etc.
+
+### `reload`
+
+Ask a running daemon to re-read its YAML config and hot-apply the `github`, `reviewer`, and `chatops` sections.
+
+```bash
+sudo -u autocoder autocoder reload
+```
+
+The CLI connects to the daemon's Unix-domain control socket at `/tmp/autocoder/control/control.sock`, sends `{"action":"reload"}`, and prints the daemon's pretty-printed JSON response to stdout (exit 0) or stderr (exit non-zero). The socket file is mode `0600` and owned by the user the daemon runs as, so the CLI must run as the same user — hence `sudo -u autocoder`. If the daemon is not running, the CLI prints an error naming the expected socket path and exits non-zero. See [Runtime control: live config reload](#runtime-control-live-config-reload) for the full behavior.
 
 ### `rewind`
 
