@@ -124,6 +124,8 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
 
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
+    let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
+    let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
         executor: executor.clone(),
         github_holder: github_holder.clone(),
@@ -132,6 +134,8 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
+        startup_jitter_max_secs,
+        inter_iteration_jitter_pct,
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
     });
@@ -205,6 +209,8 @@ struct SpawnDeps {
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
+    startup_jitter_max_secs: u64,
+    inter_iteration_jitter_pct: u8,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
 }
@@ -245,6 +251,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let stuck = deps.stuck_threshold_secs;
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
+        let startup_jitter = deps.startup_jitter_max_secs;
+        let iter_jitter = deps.inter_iteration_jitter_pct;
         let join: JoinHandle<()> = tokio::spawn(async move {
             polling_loop::run(
                 config_for_task,
@@ -255,6 +263,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 stuck,
                 perma,
                 exec_max,
+                startup_jitter,
+                iter_jitter,
                 cancel_for_task,
             )
             .await;
