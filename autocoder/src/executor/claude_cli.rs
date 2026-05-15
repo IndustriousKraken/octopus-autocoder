@@ -41,6 +41,11 @@ pub struct ClaudeCliExecutor {
     timeout: Duration,
     sandbox: crate::config::ResolvedSandbox,
     template: String,
+    /// Override for the directory the per-iteration sandbox settings file
+    /// is written to. `None` (production) means `std::env::temp_dir()`.
+    /// Tests use this to isolate their settings file from concurrent
+    /// tests creating files under the same prefix in the shared OS temp.
+    settings_dir: Option<PathBuf>,
 }
 
 /// Opaque payload stashed inside `ResumeHandle.0` for this backend.
@@ -75,7 +80,16 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            settings_dir: None,
         }
+    }
+
+    /// Test-only override: write the sandbox settings file to `dir` instead
+    /// of `std::env::temp_dir()`. The directory must already exist.
+    #[cfg(test)]
+    pub(crate) fn with_settings_dir(mut self, dir: PathBuf) -> Self {
+        self.settings_dir = Some(dir);
+        self
     }
 
     /// Construct an executor wired from an `ExecutorConfig`: resolves the
@@ -106,6 +120,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(cfg.timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
             template,
+            settings_dir: None,
         })
     }
 
@@ -119,6 +134,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(None),
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            settings_dir: None,
         }
     }
 
@@ -291,15 +307,20 @@ impl ClaudeCliExecutor {
             }
         });
 
-        // Unique-named file in OS temp; UUIDish via process id + nanos.
+        // Unique-named file under the configured settings directory
+        // (production: OS temp; tests: per-test isolated dir). UUIDish via
+        // process id + nanos.
         use std::time::{SystemTime, UNIX_EPOCH};
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        let path = std::env::temp_dir()
-            .join(format!("autocoder-claude-settings-{pid}-{stamp}.json"));
+        let dir = self
+            .settings_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("autocoder-claude-settings-{pid}-{stamp}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(&json)?)
             .with_context(|| format!("writing sandbox settings to {}", path.display()))?;
         Ok(path)
@@ -706,33 +727,20 @@ mod tests {
     async fn sandbox_temp_file_cleaned_up_after_spawn() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
-        let temp_dir_before: Vec<_> = std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("autocoder-claude-settings-")
-            })
-            .map(|e| e.file_name())
-            .collect();
-        let executor =
-            ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        // Per-test isolated settings dir, so the assertion is not racy with
+        // other parallel tests writing to the shared OS temp dir.
+        let settings_dir = TempDir::new().unwrap();
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+            .with_settings_dir(settings_dir.path().to_path_buf());
         let _ = executor.run(&ws, "x").await.unwrap();
-        let temp_dir_after: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        let leftover: Vec<_> = std::fs::read_dir(settings_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("autocoder-claude-settings-")
-            })
             .map(|e| e.file_name())
             .collect();
-        // Temp dir state must be unchanged after run (file cleaned up).
-        assert_eq!(
-            temp_dir_before, temp_dir_after,
-            "settings temp file must be deleted after the child exits"
+        assert!(
+            leftover.is_empty(),
+            "settings file must be deleted after the child exits; leftover: {leftover:?}"
         );
     }
 
@@ -1030,6 +1038,7 @@ mod tests {
             sandbox: None,
             implementer_prompt_path: None,
             perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1048,6 +1057,7 @@ mod tests {
             sandbox: None,
             implementer_prompt_path: Some(path),
             perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1063,6 +1073,7 @@ mod tests {
             sandbox: None,
             implementer_prompt_path: Some(PathBuf::from("/definitely/not/a/real/path.md")),
             perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1086,6 +1097,7 @@ mod tests {
             sandbox: None,
             implementer_prompt_path: Some(path),
             perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),

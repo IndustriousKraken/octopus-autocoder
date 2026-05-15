@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const CHANGES_SUBDIR: &str = "openspec/changes";
 const ARCHIVE_DIR: &str = "archive";
@@ -29,13 +30,14 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// directory, do not begin with `.`, do not contain a `.in-progress` lock
 /// file, do not contain a `.question.json` waiting marker, do not contain
 /// a `.perma-stuck.json` marker, and contain at least a `proposal.md`
-/// file. Returns sorted ascending.
+/// file. Returns sorted ascending by `proposal.md` modification time with
+/// the entry name as a tiebreaker.
 pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
+    let mut out: Vec<(SystemTime, String)> = Vec::new();
     for entry in std::fs::read_dir(&root)
         .with_context(|| format!("reading {}", root.display()))?
     {
@@ -68,13 +70,17 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
             // removes the marker file.
             continue;
         }
-        if !dir.join(PROPOSAL_FILE).is_file() {
+        let proposal_path = dir.join(PROPOSAL_FILE);
+        if !proposal_path.is_file() {
             continue;
         }
-        out.push(name);
+        let mtime = std::fs::metadata(&proposal_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push((mtime, name));
     }
     out.sort();
-    Ok(out)
+    Ok(out.into_iter().map(|(_, name)| name).collect())
 }
 
 /// List changes currently waiting on a human reply (i.e. those containing a
@@ -514,6 +520,77 @@ mod tests {
             pending,
             vec!["alpha".to_string(), "gamma".to_string()],
             "perma-stuck change must be excluded from list_pending"
+        );
+    }
+
+    #[test]
+    fn list_pending_orders_by_proposal_mtime_ascending() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Create `b-change` first, then `a-change`. With name-based sort the
+        // expected order would be ["a-change", "b-change"]; with mtime-based
+        // sort it must be ["b-change", "a-change"].
+        make_change(ws, "b-change");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        make_change(ws, "a-change");
+
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec!["b-change".to_string(), "a-change".to_string()],
+            "older proposal.md mtime should sort first regardless of name"
+        );
+    }
+
+    #[test]
+    fn list_pending_breaks_mtime_ties_alphabetically() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "b-change");
+        make_change(ws, "a-change");
+        // Force both proposal.md files to have an identical mtime.
+        let fixed = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(
+            ws.join(CHANGES_SUBDIR).join("a-change").join(PROPOSAL_FILE),
+            fixed,
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            ws.join(CHANGES_SUBDIR).join("b-change").join(PROPOSAL_FILE),
+            fixed,
+        )
+        .unwrap();
+
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec!["a-change".to_string(), "b-change".to_string()],
+            "tied mtimes should fall back to ascending name order"
+        );
+    }
+
+    #[test]
+    fn list_pending_excludes_perma_stuck_after_ordering_change() {
+        // Sanity: perma-stuck filtering still works alongside the new sort.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Author order is gamma, alpha, beta — different from alphabetical.
+        make_change(ws, "gamma");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        make_change(ws, "alpha");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        make_change(ws, "beta");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("alpha").join(PERMA_STUCK_FILE),
+            r#"{"change":"alpha","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"Delete this file to retry the change."}"#,
+        )
+        .unwrap();
+
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec!["gamma".to_string(), "beta".to_string()],
+            "perma-stuck excluded and remaining returned in mtime order"
         );
     }
 

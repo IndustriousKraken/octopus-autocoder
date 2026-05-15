@@ -97,6 +97,7 @@ A list of one or more repositories to manage. Each entry:
 | `poll_interval_sec`  | yes      | —       | Seconds between iterations on this repo. |
 | `local_path`         | no       | derived | See [Workspace path derivation](#workspace-path-derivation). |
 | `chatops_channel_id` | no       | falls back to `chatops.default_channel_id` | See [ChatOps Escalation](#chatops-escalation). |
+| `max_changes_per_pr` | no       | falls back to `executor.max_changes_per_pr`, then `3` | Upper bound on archived changes committed in one iteration's PR. Remaining pending changes wait for the next iteration. A value of `0` is clamped to `1` with a WARN log at startup. |
 
 ### `executor:` (required)
 
@@ -108,6 +109,7 @@ A list of one or more repositories to manage. Each entry:
 | `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](#8-executor-tool-sandbox). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
+| `max_changes_per_pr`        | no       | `3`           | Default cap on archived changes committed in one iteration's PR; per-repo `max_changes_per_pr` overrides. Operators with long queues see them ship across multiple iterations instead of one large PR. A value of `0` is clamped to `1` with a WARN log at startup. |
 
 ### `github:` (required)
 
@@ -536,6 +538,12 @@ repositories:
     agent_branch: agent-q
     poll_interval_sec: 3600
 ```
+
+### Queue order
+
+Pending changes are processed in `proposal.md` modification-time order, oldest first. The entry name breaks ties when two `proposal.md` files share the same mtime. Operators who want a specific ordering should author proposals in the order they want them applied — no leading `01-`/`02-` prefixes are needed.
+
+Each iteration commits at most `max_changes_per_pr` archived changes (default `3`); any remaining pending changes wait for the next iteration. The cap is configurable per repository, or globally via `executor.max_changes_per_pr`. A long queue therefore ships as several reviewable PRs over time rather than one large PR.
 
 ### Startup preflight
 

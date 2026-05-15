@@ -70,6 +70,14 @@ pub struct RepositoryConfig {
     pub poll_interval_sec: u64,
     #[serde(default)]
     pub chatops_channel_id: Option<String>,
+    /// Per-repo upper bound on the number of archived changes committed
+    /// in one iteration's PR. When unset, falls back to
+    /// `executor.max_changes_per_pr` and finally to a global default of
+    /// `3`. A configured value of `0` is a misconfiguration and is
+    /// clamped to `1` with a WARN log at startup. See
+    /// `Config::resolved_max_changes_per_pr` for the resolved value.
+    #[serde(default)]
+    pub max_changes_per_pr: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +105,12 @@ pub struct ExecutorConfig {
     /// and is clamped to 1 with a WARN log at startup.
     #[serde(default)]
     pub perma_stuck_after_failures: Option<u32>,
+    /// Global default for the per-iteration commit cap. Per-repository
+    /// `RepositoryConfig::max_changes_per_pr` takes precedence. When both
+    /// are unset, the global default of `3` applies. A configured value
+    /// of `0` is clamped to `1` with a WARN log at startup.
+    #[serde(default)]
+    pub max_changes_per_pr: Option<u32>,
 }
 
 impl ExecutorConfig {
@@ -390,6 +404,19 @@ impl RepositoryConfig {
     /// `chatops_channel_id` if set, otherwise the global default.
     pub fn chatops_channel<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.chatops_channel_id.as_deref().unwrap_or(fallback)
+    }
+
+    /// Resolve the effective `max_changes_per_pr` for this repository.
+    /// Lookup order: per-repo override → executor-level default → hardcoded
+    /// `3`. Any configured value is clamped to `>= 1`. Callers that want
+    /// to warn about a configured `0` read the raw fields directly.
+    pub fn max_changes_per_pr(&self, executor: &ExecutorConfig) -> u32 {
+        const DEFAULT: u32 = 3;
+        let chosen = self
+            .max_changes_per_pr
+            .or(executor.max_changes_per_pr)
+            .unwrap_or(DEFAULT);
+        chosen.max(1)
     }
 }
 
@@ -782,6 +809,7 @@ chatops:
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: Some("C_REPO_LEVEL".into()),
+            max_changes_per_pr: None,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
@@ -792,6 +820,7 @@ chatops:
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
@@ -1408,6 +1437,92 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.executor.perma_stuck_after_failures, Some(5));
         assert_eq!(cfg.executor.perma_stuck_threshold(), 5);
+    }
+
+    #[test]
+    fn max_changes_per_pr_global_default_is_3() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.repositories[0].max_changes_per_pr.is_none());
+        assert!(cfg.executor.max_changes_per_pr.is_none());
+        assert_eq!(cfg.repositories[0].max_changes_per_pr(&cfg.executor), 3);
+    }
+
+    #[test]
+    fn max_changes_per_pr_executor_fallback_applies() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_changes_per_pr: 2
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_changes_per_pr, Some(2));
+        assert_eq!(cfg.repositories[0].max_changes_per_pr(&cfg.executor), 2);
+    }
+
+    #[test]
+    fn max_changes_per_pr_per_repo_override_takes_precedence() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    max_changes_per_pr: 5
+executor:
+  kind: claude_cli
+  max_changes_per_pr: 2
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.repositories[0].max_changes_per_pr, Some(5));
+        assert_eq!(cfg.executor.max_changes_per_pr, Some(2));
+        assert_eq!(
+            cfg.repositories[0].max_changes_per_pr(&cfg.executor),
+            5,
+            "per-repo override must win over executor-level"
+        );
+    }
+
+    #[test]
+    fn max_changes_per_pr_zero_clamps_to_1() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    max_changes_per_pr: 0
+executor:
+  kind: claude_cli
+  max_changes_per_pr: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        // Raw configured values preserved so the WARN log can name them.
+        assert_eq!(cfg.repositories[0].max_changes_per_pr, Some(0));
+        assert_eq!(cfg.executor.max_changes_per_pr, Some(0));
+        // Effective cap is clamped.
+        assert_eq!(cfg.repositories[0].max_changes_per_pr(&cfg.executor), 1);
     }
 
     #[test]
