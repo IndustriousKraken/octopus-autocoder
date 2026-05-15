@@ -130,6 +130,7 @@ dependencies = [
  "filetime",
  "libc",
  "mockito",
+ "rand",
  "regex",
  "reqwest",
  "serde",

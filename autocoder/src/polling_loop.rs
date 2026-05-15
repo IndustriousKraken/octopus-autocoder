@@ -14,6 +14,7 @@ use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use chrono::{Duration as ChronoDuration, Utc};
+use rand::Rng;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +63,8 @@ pub async fn run(
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
+    startup_jitter_max_secs: u64,
+    inter_iteration_jitter_pct: u8,
     cancel: CancellationToken,
 ) {
     {
@@ -73,6 +76,33 @@ pub async fn run(
             poll_interval_sec = initial.poll_interval_sec,
             "starting polling loop"
         );
+    }
+
+    // Startup jitter: each task waits a uniformly-random duration in
+    // `[0, startup_jitter_max_secs]` before its first iteration. Without
+    // this, N concurrent polling tasks all fire `git fetch` at process
+    // start within the same millisecond, which an IDS can flag as a
+    // port-scan / scraping signature. Cancellation is honoured during
+    // the wait, matching the inter-iteration sleep's contract.
+    let startup_jitter_secs = pick_startup_jitter_secs(startup_jitter_max_secs);
+    {
+        let initial = repo.load();
+        tracing::info!(
+            url = initial.url.as_str(),
+            startup_jitter_secs,
+            "polling task for {} will wait {startup_jitter_secs}s before first iteration",
+            initial.url
+        );
+    }
+    if startup_jitter_secs > 0 {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                tracing::info!(url = %repo.load().url, "polling loop exiting");
+                return;
+            }
+            () = sleep(Duration::from_secs(startup_jitter_secs)) => {}
+        }
     }
 
     loop {
@@ -121,13 +151,14 @@ pub async fn run(
         // Per design: the inter-poll sleep uses the snapshot's
         // poll_interval, not a re-read. Next iteration's read picks up
         // any hot-swap that landed during the sleep.
-        let sleep_secs = snapshot_ref.poll_interval_sec;
+        let base_secs = snapshot_ref.poll_interval_sec;
         drop(snapshot);
+        let sleep_dur = jittered_sleep_duration(base_secs, inter_iteration_jitter_pct);
 
         tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            () = sleep(Duration::from_secs(sleep_secs)) => {}
+            () = sleep(sleep_dur) => {}
         }
     }
 
@@ -142,6 +173,36 @@ pub async fn run(
 fn resolve_max_changes_per_pr(per_repo: Option<u32>, executor_default: Option<u32>) -> u32 {
     const DEFAULT: u32 = 3;
     per_repo.or(executor_default).unwrap_or(DEFAULT).max(1)
+}
+
+/// Pick a uniformly-random startup-jitter delay in `[0, max_secs]`. A
+/// `max_secs` of `0` short-circuits to `0` without consulting the RNG —
+/// `gen_range(0..=0)` is well-defined but skipping the draw keeps the
+/// degenerate case obvious to readers.
+fn pick_startup_jitter_secs(max_secs: u64) -> u64 {
+    if max_secs == 0 {
+        return 0;
+    }
+    rand::rng().random_range(0..=max_secs)
+}
+
+/// Compute a jittered inter-iteration sleep duration. The offset is
+/// drawn uniformly from `[-max_offset, +max_offset]` where `max_offset
+/// = base_secs * jitter_pct / 100`. Saturates at zero on the negative
+/// side so a degenerate `jitter_pct = 100` cannot underflow. A
+/// `jitter_pct = 0` short-circuits to the exact `base_secs` interval
+/// (matching pre-jitter behaviour).
+fn jittered_sleep_duration(base_secs: u64, jitter_pct: u8) -> Duration {
+    if jitter_pct == 0 {
+        return Duration::from_secs(base_secs);
+    }
+    let max_offset = base_secs.saturating_mul(jitter_pct as u64) / 100;
+    if max_offset == 0 {
+        return Duration::from_secs(base_secs);
+    }
+    let offset = rand::rng().random_range(0..=2 * max_offset) as i64 - max_offset as i64;
+    let secs = (base_secs as i64).saturating_add(offset).max(0) as u64;
+    Duration::from_secs(secs)
 }
 
 /// Build the per-iteration `ChatOpsContext` from the loaded snapshot.
@@ -3323,6 +3384,8 @@ mod tests {
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
+                0, // startup_jitter_max_secs: deterministic for tests
+                0, // inter_iteration_jitter_pct: deterministic for tests
                 cancel_for_task,
             )
             .await;
@@ -3408,6 +3471,8 @@ mod tests {
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
+                0, // startup_jitter_max_secs: deterministic for tests
+                0, // inter_iteration_jitter_pct: deterministic for tests
                 cancel_for_task,
             )
             .await;
@@ -4777,6 +4842,159 @@ mod tests {
         assert!(
             still_pending.contains(&"ch04".to_string()),
             "untouched change still pending: {still_pending:?}"
+        );
+    }
+
+    // ============================================================
+    // Poll jitter and staggering (poll-jitter-and-staggering)
+    // ============================================================
+
+    /// 1000 draws with `startup_jitter_max_secs = 30` MUST all be in
+    /// `[0, 30]`, and the sample MUST contain both endpoints. With a
+    /// uniform 0..=30 draw and 1000 samples the probability of missing
+    /// either endpoint is `(30/31)^1000 ≈ 10^-14`.
+    #[test]
+    fn startup_jitter_in_range() {
+        let mut saw_zero = false;
+        let mut saw_thirty = false;
+        for _ in 0..1000 {
+            let v = pick_startup_jitter_secs(30);
+            assert!(v <= 30, "draw {v} must be in [0, 30]");
+            if v == 0 {
+                saw_zero = true;
+            }
+            if v == 30 {
+                saw_thirty = true;
+            }
+        }
+        assert!(saw_zero, "1000 draws should produce at least one 0");
+        assert!(saw_thirty, "1000 draws should produce at least one 30");
+    }
+
+    /// A `0` ceiling MUST short-circuit to `0` without consulting the
+    /// RNG (and definitely without panicking on a degenerate range).
+    #[test]
+    fn startup_jitter_zero_returns_zero() {
+        for _ in 0..100 {
+            assert_eq!(pick_startup_jitter_secs(0), 0);
+        }
+    }
+
+    /// For `base = 300, pct = 10` the helper draws in `[270, 330]`
+    /// (300 ± 30). 1000 samples MUST stay inside the band AND the mean
+    /// MUST be within ±5 of 300 — a uniform distribution centred on 300
+    /// will, with overwhelming probability, satisfy this.
+    #[test]
+    fn jittered_sleep_duration_within_band() {
+        let mut sum: u64 = 0;
+        for _ in 0..1000 {
+            let d = jittered_sleep_duration(300, 10);
+            let s = d.as_secs();
+            assert!((270..=330).contains(&s), "draw {s} must be in [270, 330]");
+            sum += s;
+        }
+        let mean = sum as f64 / 1000.0;
+        assert!(
+            (mean - 300.0).abs() <= 5.0,
+            "mean {mean} must be within ±5 of 300"
+        );
+    }
+
+    /// `pct = 0` MUST produce exactly `base_secs` every time — the
+    /// arithmetic short-circuit lets operators opt out of jitter for
+    /// deterministic test timing.
+    #[test]
+    fn jittered_sleep_duration_zero_pct_is_exact() {
+        for _ in 0..100 {
+            let d = jittered_sleep_duration(300, 0);
+            assert_eq!(d, Duration::from_secs(300));
+        }
+    }
+
+    /// `base = 10, pct = 100` means the negative offset can be up to
+    /// `-10` (i.e. equal to the entire interval). Result MUST stay in
+    /// `[0, 20]` and MUST NOT panic on the underflow boundary.
+    #[test]
+    fn jittered_sleep_duration_no_underflow_when_pct_is_100() {
+        for _ in 0..1000 {
+            let d = jittered_sleep_duration(10, 100);
+            let s = d.as_secs();
+            assert!(s <= 20, "draw {s} must be in [0, 20]");
+        }
+        // The boundary case: ensure the helper doesn't panic with the
+        // most-aggressive percentage on the smallest interval.
+        let _ = jittered_sleep_duration(1, 100);
+        let _ = jittered_sleep_duration(0, 100);
+    }
+
+    /// Cancellation while the task is in its startup-jitter sleep MUST
+    /// be observed within 200 ms; the task MUST NOT iterate. Uses a
+    /// dummy executor and noisy holders since none should be touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_exits_during_startup_jitter() {
+        struct UnreachableExecutor;
+        #[async_trait::async_trait]
+        impl Executor for UnreachableExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                unreachable!("startup-jitter cancellation must prevent first iteration");
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut repo = fixture_repo(dir.path());
+        // Configure a huge poll_interval so any post-jitter sleep would
+        // also block — if the test passes, we must be exiting from the
+        // jitter sleep, not the iter sleep.
+        repo.poll_interval_sec = 86_400;
+        let repo_holder = Arc::new(ArcSwap::from_pointee(repo));
+        let executor: Arc<dyn Executor> = Arc::new(UnreachableExecutor);
+        let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        }));
+        let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(None));
+        let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(None));
+        let cancel = CancellationToken::new();
+
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                repo_holder,
+                executor,
+                github_holder,
+                reviewer_holder,
+                chatops_holder,
+                1_000_000,
+                u32::MAX,
+                None,
+                60, // startup_jitter_max_secs: large window
+                0,  // inter_iteration_jitter_pct: irrelevant
+                task_cancel,
+            )
+            .await;
+        });
+
+        // Cancel immediately — the task should exit during the
+        // startup-jitter sleep, not after a multi-second wait.
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_millis(2000), handle)
+            .await
+            .expect("run must exit within 2s after cancel during startup jitter")
+            .expect("polling task must not panic");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancellation should be observed within 500 ms; took {elapsed:?}"
         );
     }
 }

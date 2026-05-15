@@ -1039,6 +1039,8 @@ mod tests {
             implementer_prompt_path: None,
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1058,6 +1060,8 @@ mod tests {
             implementer_prompt_path: Some(path),
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1074,6 +1078,8 @@ mod tests {
             implementer_prompt_path: Some(PathBuf::from("/definitely/not/a/real/path.md")),
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1098,6 +1104,8 @@ mod tests {
             implementer_prompt_path: Some(path),
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),

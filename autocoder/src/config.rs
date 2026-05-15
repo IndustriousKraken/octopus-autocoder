@@ -111,6 +111,23 @@ pub struct ExecutorConfig {
     /// of `0` is clamped to `1` with a WARN log at startup.
     #[serde(default)]
     pub max_changes_per_pr: Option<u32>,
+    /// Upper bound (in seconds) on the random sleep each polling task
+    /// performs before its first iteration. Each task independently draws
+    /// a value uniformly from `[0, startup_jitter_max_secs]` at spawn
+    /// time. Staggers a fleet of concurrent `git fetch` operations so an
+    /// IDS does not see a synchronized burst. `0` disables the startup
+    /// jitter entirely. When unset, the effective default is `30`.
+    #[serde(default)]
+    pub startup_jitter_max_secs: Option<u64>,
+    /// Percent (0..=100) of `poll_interval_sec` used as a uniform random
+    /// offset on every inter-iteration sleep. Each task's sleep is drawn
+    /// from `[interval - interval*pct/100, interval + interval*pct/100]`.
+    /// Prevents long-term re-synchronization of multiple tasks. `0`
+    /// produces exact intervals. When unset, the effective default is
+    /// `10`. Values above 100 are clamped to 100 (the negative offset
+    /// could otherwise exceed the interval and would saturate at zero).
+    #[serde(default)]
+    pub inter_iteration_jitter_pct: Option<u8>,
 }
 
 impl ExecutorConfig {
@@ -121,6 +138,18 @@ impl ExecutorConfig {
     /// directly.
     pub fn perma_stuck_threshold(&self) -> u32 {
         self.perma_stuck_after_failures.unwrap_or(2).max(1)
+    }
+
+    /// Effective startup jitter ceiling (seconds). Unset → `30`.
+    pub fn startup_jitter_max_secs(&self) -> u64 {
+        self.startup_jitter_max_secs.unwrap_or(30)
+    }
+
+    /// Effective inter-iteration jitter percentage. Unset → `10`. Clamped
+    /// to `100` so a negative offset cannot exceed the base interval (the
+    /// arithmetic would otherwise saturate at zero and waste resolution).
+    pub fn inter_iteration_jitter_pct(&self) -> u8 {
+        self.inter_iteration_jitter_pct.unwrap_or(10).min(100)
     }
 }
 
@@ -1523,6 +1552,82 @@ github: {}
         assert_eq!(cfg.executor.max_changes_per_pr, Some(0));
         // Effective cap is clamped.
         assert_eq!(cfg.repositories[0].max_changes_per_pr(&cfg.executor), 1);
+    }
+
+    #[test]
+    fn startup_jitter_default_is_30() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.executor.startup_jitter_max_secs.is_none());
+        assert_eq!(cfg.executor.startup_jitter_max_secs(), 30);
+    }
+
+    #[test]
+    fn startup_jitter_explicit_zero_is_zero() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  startup_jitter_max_secs: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.startup_jitter_max_secs, Some(0));
+        assert_eq!(cfg.executor.startup_jitter_max_secs(), 0);
+    }
+
+    #[test]
+    fn inter_iteration_jitter_default_is_10() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.executor.inter_iteration_jitter_pct.is_none());
+        assert_eq!(cfg.executor.inter_iteration_jitter_pct(), 10);
+    }
+
+    #[test]
+    fn inter_iteration_jitter_above_100_is_clamped() {
+        // u8 fits up to 255; values above 100 must clamp to 100 so the
+        // negative offset cannot exceed the base interval.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  inter_iteration_jitter_pct: 250
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.inter_iteration_jitter_pct, Some(250));
+        assert_eq!(cfg.executor.inter_iteration_jitter_pct(), 100);
     }
 
     #[test]
