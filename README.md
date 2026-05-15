@@ -107,6 +107,7 @@ A list of one or more repositories to manage. Each entry:
 | `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
 | `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](#8-executor-tool-sandbox). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. |
+| `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
 
 ### `github:` (required)
 
@@ -572,6 +573,55 @@ sudo systemctl start autocoder
 ```
 
 The per-change run logs (`/tmp/autocoder/logs/<basename>/<change>.log`) and the busy markers share the same `/tmp/autocoder/` root.
+
+### Perma-stuck change detection
+
+When an agent fails the same change two iterations in a row, autocoder marks it perma-stuck: writes a `.perma-stuck.json` marker inside the change directory, posts a chatops alert, and excludes the change from `list_pending` on every subsequent pass until the marker is removed manually. The threshold is `executor.perma_stuck_after_failures` (default `2`, minimum `1`).
+
+What counts as a failure:
+
+- The executor returns `Failed`.
+- The executor returns `Completed` but did not modify the workspace (no-op completion).
+- The executor returns `Completed` but only renamed the change directory into `archive/` (lazy archive).
+
+What does NOT count (transient infrastructure problems):
+
+- Workspace init / clone / fetch failure.
+- `openspec` preflight failure.
+- GitHub API transport errors.
+- A busy-marker stuck-state that skipped the iteration entirely.
+
+Per-repo counter state lives at `<workspace>/.failure-state.json` (registered in `.git/info/exclude` at workspace init so it never trips the pre-pass dirty check). Successfully archiving a change clears its counter entry; the next failure starts fresh from `1`.
+
+The marker file at `<workspace>/openspec/changes/<change>/.perma-stuck.json` has the schema:
+
+```json
+{
+  "change": "<change-name>",
+  "consecutive_failures": 2,
+  "last_reason": "...",
+  "marked_stuck_at": "RFC 3339 UTC timestamp",
+  "operator_action": "Delete this file to retry the change."
+}
+```
+
+The chatops alert names the repo, change, count, and a truncated `last_reason`, plus the marker file path. It is subject to the same 24-hour throttle as the predictable-failure alerts: repeat fix-test-fail cycles do not spam the channel. When no chatops backend is configured, the marker is still written and the change is still excluded — an ERROR log is the operator's only signal.
+
+To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
+
+### Self-heal for already-implemented changes
+
+When a rebase or merge lands the work for a change on the base branch without moving the change directory into `archive/`, the agent sees the implementation already done and returns `Completed` without modifying the workspace. Normally that's classified as Failed (no-op completion) and retried on every poll, burning tokens to re-confirm the same answer. autocoder self-heals this case instead:
+
+When the executor returns `Completed`, `git status --porcelain` is empty, `openspec validate <change> --strict` exits 0, AND every checkbox in `openspec/changes/<change>/tasks.md` is `[x]`, autocoder runs the archive move itself, commits it with subject `archive: <change>: implementation already in base`, and ships a PR through the normal push + PR flow.
+
+If any of the four preconditions fails — including `openspec validate` erroring or any task still `[ ]` — autocoder falls through to the existing Failed path, so non-self-heal cases retain their prior behavior.
+
+The PR body for a pass that self-healed one or more changes is prefixed with:
+
+> _This PR archives one or more changes whose implementation was already present on the base branch. No code diff is included; only the openspec archive move._
+
+The disclaimer identifies these passes for reviewers regardless of whether the pass also includes normally-implemented changes.
 
 ### Skipping iterations while a PR is open
 
