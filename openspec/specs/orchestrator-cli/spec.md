@@ -86,7 +86,7 @@ The orchestrator SHALL provide a `rewind` subcommand that recovers from a failed
 - **AND** at the end, if any unarchive failed, the process exits non-zero with stderr listing the failed changes and their reasons; otherwise it exits 0 with a summary log line naming all rewound changes
 
 ### Requirement: Per-repository asynchronous polling loop
-autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration.
+autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration. Each iteration's queue walk SHALL commit at most `max_changes_per_pr` archived changes before stopping; remaining pending changes wait for the next iteration.
 
 #### Scenario: Spawn count matches config
 - **WHEN** the daemon starts with a config containing N repositories AND the workspace collision check passes
@@ -103,6 +103,37 @@ autocoder SHALL implement the per-repository polling task referenced in `orchest
 - **WHEN** an iteration's wall-clock runtime exceeds `poll_interval_sec`
 - **THEN** the next iteration begins immediately after the current one finishes
 - **AND** no negative sleep is attempted; no two iterations within the same task run in parallel
+
+#### Scenario: Per-iteration commit cap
+- **WHEN** the queue walk has already archived `max_changes_per_pr`
+  changes during the current iteration AND additional pending changes
+  remain in the queue
+- **THEN** the walk stops; the iteration proceeds to the push+PR step
+  with exactly `max_changes_per_pr` commits
+- **AND** the remaining pending changes are NOT removed from the queue
+  and SHALL be picked up by the next iteration
+
+#### Scenario: Failed and escalated changes do not count toward cap
+- **WHEN** the queue walk processes a change whose outcome is `Failed`
+  or `Escalated` (i.e. no commit is produced)
+- **THEN** that change does NOT count toward `max_changes_per_pr`; the
+  walk continues to the next pending change
+- **AND** only `Archived` and `ArchivedSelfHeal` outcomes (which DO
+  produce commits) increment the count
+
+#### Scenario: Resumed waiting change counts toward cap
+- **WHEN** the pass begins by resuming a previously-waiting change AND
+  that resume archives successfully
+- **THEN** the resumed-and-archived change counts as `1` toward the
+  iteration's `max_changes_per_pr` cap before the walk reads new
+  pending changes from the queue
+
+#### Scenario: Cap of 1 ships one change per PR
+- **WHEN** `max_changes_per_pr == 1` AND the queue contains multiple
+  pending changes
+- **THEN** each polling iteration ships exactly one change per PR; the
+  queue drains across N iterations rather than one
+- **AND** the operator sees N small PRs over time rather than one large PR
 
 ### Requirement: Iteration-level error tolerance
 The polling loop SHALL continue running after a failed iteration; a single iteration's error MUST NOT terminate the task or affect other repositories.
@@ -384,7 +415,7 @@ autocoder SHALL attempt automatic recovery before falling back to the existing "
   to prior behavior
 
 ### Requirement: Reject archive-only iterations as Failed
-autocoder SHALL treat an iteration as Failed (not Completed), revert the staged moves via `git reset --hard`, and leave the change pending for retry when the executor returns Completed AND the resulting working-tree changes consist *only* of file moves whose destination paths start with `openspec/changes/archive/`. The detection is structural — pattern-matching on rename destinations — and does not depend on which command produced the moves. autocoder SHALL also treat Completed-with-clean-workspace as Failed and leave the change pending for retry; the prior "archive without commit" handling is removed.
+autocoder SHALL treat an iteration as Failed (not Completed), revert the staged moves via `git reset --hard`, and leave the change pending for retry when the executor returns Completed AND the resulting working-tree changes consist *only* of file moves whose destination paths start with `openspec/changes/archive/`. The detection is structural — pattern-matching on rename destinations — and does not depend on which command produced the moves. autocoder SHALL treat Completed-with-clean-workspace as Failed by default — UNLESS the change's implementation is already on the base branch, in which case autocoder SHALL self-archive the change rather than fail (see "Self-heal: already-implemented change" scenario).
 
 #### Scenario: Agent archives the change instead of implementing it
 - **WHEN** the executor returns `Completed` for a change AND
@@ -412,7 +443,8 @@ autocoder SHALL treat an iteration as Failed (not Completed), revert the staged 
 
 #### Scenario: Workspace is clean (no changes at all)
 - **WHEN** the executor returns `Completed` AND `git status
-  --porcelain` is empty
+  --porcelain` is empty AND the self-heal criteria below are NOT
+  all satisfied
 - **THEN** autocoder treats the outcome as
   `Failed { reason: "agent reported Completed without modifying the workspace" }`
 - **AND** autocoder logs a `warn`-level line naming the change
@@ -423,6 +455,38 @@ autocoder SHALL treat an iteration as Failed (not Completed), revert the staged 
   retries
 - **AND** the lazy-archive detection does NOT fire (no staged
   moves to revert)
+
+#### Scenario: Self-heal — already-implemented change
+- **WHEN** the executor returns `Completed` AND `git status
+  --porcelain` is empty AND `openspec validate <change> --strict`
+  exits 0 AND every line in
+  `openspec/changes/<change>/tasks.md` that matches the regex
+  `^\s*-\s*\[([ x])\]` has `[x]` (and at least one such line
+  exists)
+- **THEN** autocoder treats the outcome as a self-heal Archive:
+  it runs the archive move (renaming
+  `openspec/changes/<change>/` to
+  `openspec/changes/archive/<YYYY-MM-DD>-<change>/`) on the
+  agent branch, commits the move with subject
+  `archive: <change>: implementation already in base`, and
+  proceeds through the normal push + PR flow
+- **AND** the PR body for a self-heal pass includes the
+  paragraph `_This PR archives a change whose implementation was
+  already present on the base branch. No code diff is included;
+  only the openspec archive move._` ahead of any other body
+  content
+- **AND** autocoder logs an INFO line naming the change and the
+  self-heal classification, distinct from the Failed-path log
+
+#### Scenario: Self-heal preconditions unmet
+- **WHEN** the executor returns `Completed` AND `git status
+  --porcelain` is empty AND any of the self-heal preconditions
+  fails: `openspec validate --strict` errors or exits non-zero,
+  OR any task in `tasks.md` is still `[ ]`, OR `tasks.md` cannot
+  be read
+- **THEN** autocoder falls through to the Failed path (as in
+  "Workspace is clean (no changes at all)" above), preserving
+  the prior behavior for non-self-heal cases
 
 ### Requirement: Startup preflight for openspec availability
 autocoder SHALL verify that the `openspec` binary is available before the polling loop starts. A failed preflight aborts daemon startup with a non-zero exit code, ensuring a misconfigured deployment fails loudly instead of looping forever producing nothing.
@@ -692,4 +756,34 @@ repositories is removed from the config schema as part of the broader
 - **WHEN** a repository entry does NOT set `chatops_channel_id`
 - **THEN** AskUser escalations for that repository post to
   `chatops.default_channel_id`
+
+### Requirement: Per-repository config schema for the polling loop
+The `RepositoryConfig` schema SHALL include an optional `max_changes_per_pr: u32` field that bounds the number of archived changes committed in one iteration's PR. When unset on a repository, the value SHALL fall back to the executor-level default `executor.max_changes_per_pr`; when both are unset, the global default of `3` SHALL apply.
+
+#### Scenario: Per-repo override takes precedence
+- **WHEN** a repository sets `max_changes_per_pr: 5` AND
+  `executor.max_changes_per_pr` is unset (or set to a different value)
+- **THEN** the effective cap for that repository is `5`
+
+#### Scenario: Executor-level fallback applies when per-repo is unset
+- **WHEN** a repository does NOT set `max_changes_per_pr` AND
+  `executor.max_changes_per_pr` is `2`
+- **THEN** the effective cap for that repository is `2`
+- **AND** other repositories that also do not set the field also get
+  `2` (the executor-level default is global)
+
+#### Scenario: Global default when neither is configured
+- **WHEN** neither `RepositoryConfig.max_changes_per_pr` nor
+  `executor.max_changes_per_pr` is set
+- **THEN** the effective cap is `3` for every repository
+
+#### Scenario: A configured zero is clamped to one with a warning
+- **WHEN** a configured value (per-repo or executor-level) is `0`
+- **THEN** autocoder treats the effective cap as `1` AND emits exactly
+  one WARN-level log line at startup naming the field path (e.g.
+  `repositories[2].max_changes_per_pr` or
+  `executor.max_changes_per_pr`) and the clamp
+- **AND** the loaded `Config` retains the raw `0` so operator-visible
+  diagnostics show what was configured (matching the
+  `perma_stuck_after_failures` precedent)
 

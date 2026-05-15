@@ -87,6 +87,24 @@ pub async fn execute(cfg: Config) -> Result<()> {
     }
     let perma_stuck_threshold: u32 = cfg.executor.perma_stuck_threshold();
 
+    // Per-PR change cap. Misconfigured `0` is clamped to `1` inside
+    // `RepositoryConfig::max_changes_per_pr`; we WARN once here at startup
+    // so the operator notices.
+    if cfg.executor.max_changes_per_pr == Some(0) {
+        tracing::warn!(
+            "executor.max_changes_per_pr is set to 0; clamping to 1 (each PR would ship zero commits otherwise — fix your config)"
+        );
+    }
+    for (idx, repo) in cfg.repositories.iter().enumerate() {
+        if repo.max_changes_per_pr == Some(0) {
+            tracing::warn!(
+                idx = idx,
+                url = %repo.url,
+                "repositories[{idx}].max_changes_per_pr is set to 0; clamping to 1"
+            );
+        }
+    }
+
     let mut tasks: JoinSet<()> = JoinSet::new();
     for repo in cfg.repositories.iter().cloned() {
         if !repo_passes_startup_check(&repo, &cfg.github) {
@@ -99,6 +117,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
         let github = cfg.github.clone();
         let reviewer = reviewer.clone();
         let cancel = cancel.clone();
+        let max_changes_per_pr = repo.max_changes_per_pr(&cfg.executor);
 
         // Build the per-repo ChatOps context: resolve the channel via the
         // per-repo override or the global default. Notification flags
@@ -128,6 +147,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
                 chatops_ctx,
                 stuck_threshold_secs,
                 perma_stuck_threshold,
+                max_changes_per_pr,
                 cancel,
             )
             .await
@@ -508,6 +528,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 
@@ -526,6 +547,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 

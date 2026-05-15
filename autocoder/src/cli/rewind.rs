@@ -243,6 +243,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 
@@ -254,6 +255,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 

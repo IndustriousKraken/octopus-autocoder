@@ -50,6 +50,7 @@ pub async fn run(
     chatops_ctx: Option<Arc<ChatOpsContext>>,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
+    max_changes_per_pr: u32,
     cancel: CancellationToken,
 ) {
     let workspace = workspace::resolve_path(&repo);
@@ -74,6 +75,7 @@ pub async fn run(
             chatops_ctx.as_deref(),
             stuck_threshold_secs,
             perma_stuck_threshold,
+            max_changes_per_pr,
         )
         .await
         {
@@ -106,6 +108,7 @@ pub async fn execute_one_pass(
     chatops_ctx: Option<&ChatOpsContext>,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
+    max_changes_per_pr: u32,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
@@ -152,6 +155,7 @@ pub async fn execute_one_pass(
         executor,
         chatops_ctx,
         perma_stuck_threshold,
+        max_changes_per_pr,
     )
     .await?;
     if processed.is_empty() {
@@ -380,6 +384,7 @@ pub async fn run_pass_through_commits(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
+    max_changes_per_pr: u32,
 ) -> Result<(Vec<String>, bool)> {
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
@@ -439,6 +444,7 @@ pub async fn run_pass_through_commits(
             executor,
             chatops_ctx,
             perma_stuck_threshold,
+            max_changes_per_pr,
         )
         .await?;
         processed.extend(resumed);
@@ -464,11 +470,28 @@ pub async fn run_pass_through_commits(
         return Ok((processed, includes_self_heal));
     }
 
-    let (pending_processed, pending_self_heal) =
-        walk_queue(workspace, repo, executor, chatops_ctx, perma_stuck_threshold).await?;
-    processed.extend(pending_processed);
-    if pending_self_heal {
-        includes_self_heal = true;
+    let remaining = max_changes_per_pr.saturating_sub(processed.len() as u32);
+    if remaining > 0 {
+        let (pending_processed, pending_self_heal) = walk_queue(
+            workspace,
+            repo,
+            executor,
+            chatops_ctx,
+            perma_stuck_threshold,
+            remaining,
+        )
+        .await?;
+        processed.extend(pending_processed);
+        if pending_self_heal {
+            includes_self_heal = true;
+        }
+    } else {
+        tracing::info!(
+            url = %repo.url,
+            committed = processed.len(),
+            cap = max_changes_per_pr,
+            "resume step already filled the per-PR cap; skipping pending queue this iteration"
+        );
     }
 
     let waiting_after = queue::list_waiting(workspace)?.len();
@@ -498,6 +521,7 @@ async fn process_waiting_changes(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
+    max_changes_per_pr: u32,
 ) -> Result<Vec<String>> {
     let ctx = match chatops_ctx {
         Some(c) => c,
@@ -510,7 +534,12 @@ async fn process_waiting_changes(
         match process_one_waiting(workspace, repo, executor, ctx, &change, perma_stuck_threshold)
             .await
         {
-            Ok(Some(archived)) => resumed_archived.push(archived),
+            Ok(Some(archived)) => {
+                resumed_archived.push(archived);
+                if resumed_archived.len() as u32 >= max_changes_per_pr {
+                    break;
+                }
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::error!(
@@ -736,6 +765,7 @@ async fn walk_queue(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
+    max_changes: u32,
 ) -> Result<(Vec<String>, bool)> {
     let pending = queue::list_pending(workspace)?;
     let mut archived: Vec<String> = Vec::new();
@@ -795,6 +825,14 @@ async fn walk_queue(
                     );
                 }
                 archived.push(change);
+                if archived.len() as u32 >= max_changes {
+                    tracing::info!(
+                        url = %repo.url,
+                        cap = max_changes,
+                        "reached max_changes_per_pr cap; deferring remaining pending changes to next iteration"
+                    );
+                    break;
+                }
             }
             Ok(QueueStep::Failed { reason }) => {
                 // Failed (or transformed-to-Failed) → bump the counter and,
@@ -1983,6 +2021,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 
@@ -2060,8 +2099,10 @@ mod tests {
         // Use a very high threshold so existing tests' single-fail
         // iterations don't accidentally mark perma-stuck.
         let (processed, _self_heal) =
-            run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, u32::MAX)
-                .await?;
+            run_pass_through_commits(
+                workspace, &repo, &github_cfg, executor, None, u32::MAX, u32::MAX,
+            )
+            .await?;
         Ok(processed)
     }
 
@@ -2332,6 +2373,7 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
+            u32::MAX,
         )
         .await
         .expect("pass succeeds");
@@ -2427,6 +2469,7 @@ mod tests {
             &test_github,
             &executor,
             Some(&chatops_ctx),
+            u32::MAX,
             u32::MAX,
         )
         .await
@@ -2536,6 +2579,7 @@ mod tests {
             &test_github,
             &executor,
             Some(&chatops_ctx),
+            u32::MAX,
             u32::MAX,
         )
         .await
@@ -2667,6 +2711,7 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
+            u32::MAX,
         )
         .await
         .expect("pass succeeds without running pending");
@@ -2775,6 +2820,7 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
+            u32::MAX,
         )
         .await
         .expect("pass succeeds");
@@ -2797,6 +2843,142 @@ mod tests {
         assert!(
             resume_idx < pending_idx,
             "resume must run BEFORE pending: invocations={inv:?}"
+        );
+    }
+
+    /// max-changes-per-pr-limit: a resumed waiting change that archives
+    /// counts toward the per-iteration cap. With one waiting + two pending
+    /// and `max_changes_per_pr = 2`, the pass ships exactly two commits
+    /// (the resumed archive + the first pending archive); the second
+    /// pending change is deferred to the next iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_one_pass_resumed_change_counts_toward_cap() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "was-waiting", "fixture for waiting");
+        add_committed_change(&ws, "pending-one", "first fresh pending");
+        add_committed_change(&ws, "pending-two", "second fresh pending");
+
+        // Pre-populate .question.json for `was-waiting` so the resume path
+        // engages.
+        let q = QuestionPayload {
+            thread_ts: "7777.7777".into(),
+            channel: "C_TEST".into(),
+            resume_handle: serde_json::json!({
+                "change": "was-waiting",
+                "workspace": ws,
+            }),
+            asked_at: chrono::Utc::now(),
+        };
+        chatops::write_question_file(&ws, "was-waiting", &q).unwrap();
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "persist marker"]);
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        // Human reply arrives so the resume engages.
+        let _ = server
+            .mock("GET", "/conversations.replies?channel=C_TEST&ts=7777.7777")
+            .with_status(200)
+            .with_body(
+                r#"{"ok":true,"messages":[
+                    {"user":"U_BOT","text":"❓ ...","ts":"7777.7777"},
+                    {"user":"U_HUMAN","text":"go ahead","ts":"7777.0001"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        // Executor: resume writes a file for the waiting change; run
+        // writes a per-change file for fresh pending changes. Both
+        // Completed-with-diff.
+        let ws_for_exec = ws.clone();
+        struct ResumeAndRunPerChange {
+            ws: std::path::PathBuf,
+            invocations: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl Executor for ResumeAndRunPerChange {
+            async fn run(&self, _w: &Path, change: &str) -> Result<ExecutorOutcome> {
+                self.invocations.lock().unwrap().push(format!("run:{change}"));
+                std::fs::write(
+                    self.ws.join(format!("RUN_{change}.txt")),
+                    format!("artifact for {change}"),
+                )?;
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                self.invocations.lock().unwrap().push("resume".to_string());
+                std::fs::write(self.ws.join("RESUMED.txt"), "from resume")?;
+                Ok(ExecutorOutcome::Completed)
+            }
+        }
+        let executor = ResumeAndRunPerChange {
+            ws: ws_for_exec,
+            invocations: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            2, // cap of 2 across resume + pending
+        )
+        .await
+        .expect("pass succeeds");
+
+        assert_eq!(
+            processed.len(),
+            2,
+            "cap of 2 must ship exactly 2 commits: resumed + one pending"
+        );
+        assert_eq!(
+            processed[0], "was-waiting",
+            "resumed change processed first"
+        );
+        assert_eq!(
+            processed[1], "pending-one",
+            "first pending change processed next"
+        );
+
+        let inv = executor.invocations.lock().unwrap().clone();
+        assert!(
+            !inv.contains(&"run:pending-two".to_string()),
+            "second pending must NOT have run (cap stopped the walk); invocations={inv:?}"
+        );
+
+        // The undelivered pending change is still in the queue for the
+        // next iteration.
+        let still_pending = queue::list_pending(&ws).unwrap();
+        assert!(
+            still_pending.contains(&"pending-two".to_string()),
+            "deferred change still pending: {still_pending:?}"
         );
     }
 
@@ -2880,6 +3062,7 @@ mod tests {
                 &direct_github,
                 &executor,
                 None,
+                u32::MAX,
                 u32::MAX,
             )
             .await
@@ -3050,6 +3233,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 0, // tight loop so we get many iterations fast
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -3067,6 +3251,7 @@ mod tests {
                 None,
                 None,
                 2400,
+                u32::MAX,
                 u32::MAX,
                 cancel_for_task,
             )
@@ -3124,6 +3309,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -3143,6 +3329,7 @@ mod tests {
                 None,
                 None,
                 2400,
+                u32::MAX,
                 u32::MAX,
                 cancel_for_task,
             )
@@ -3171,6 +3358,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         }
     }
 
@@ -3338,6 +3526,7 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
+            u32::MAX,
         )
         .await
         .expect("pass succeeds");
@@ -3382,6 +3571,7 @@ mod tests {
             &github,
             &executor,
             Some(&chatops_ctx),
+            u32::MAX,
             u32::MAX,
         )
         .await
@@ -3478,6 +3668,7 @@ mod tests {
             Some(&chatops_ctx),
             stuck_secs,
             u32::MAX,
+            u32::MAX,
         )
         .await;
         assert!(
@@ -3568,6 +3759,7 @@ mod tests {
             None,
             Some(&chatops_ctx),
             stuck_secs,
+            u32::MAX,
             u32::MAX,
         )
         .await;
@@ -3816,9 +4008,16 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let (processed, _) =
-            run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, threshold)
-                .await?;
+        let (processed, _) = run_pass_through_commits(
+            workspace,
+            &repo,
+            &github_cfg,
+            executor,
+            None,
+            threshold,
+            u32::MAX,
+        )
+        .await?;
         Ok(processed)
     }
 
@@ -3970,6 +4169,7 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             chatops_channel_id: None,
+            max_changes_per_pr: None,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -3979,8 +4179,16 @@ mod tests {
         };
         let executor = AlwaysFailingExecutor;
 
-        let result =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, 1).await;
+        let result = run_pass_through_commits(
+            &ws,
+            &repo,
+            &github_cfg,
+            &executor,
+            None,
+            1,
+            u32::MAX,
+        )
+        .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
         // .failure-state.json must NOT have been written.
         assert!(
@@ -4032,6 +4240,7 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             1, // threshold = 1 → first failure marks perma-stuck
+            u32::MAX,
         )
         .await;
 
@@ -4162,7 +4371,7 @@ mod tests {
             fork_owner: None,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
                 .await
                 .expect("self-heal pass succeeds");
         assert_eq!(
@@ -4231,7 +4440,7 @@ mod tests {
             fork_owner: None,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
         assert!(
@@ -4287,7 +4496,7 @@ mod tests {
             fork_owner: None,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
         assert!(processed.is_empty());
@@ -4319,6 +4528,178 @@ mod tests {
         assert!(
             body.contains("- regular-change"),
             "normal change listing must remain"
+        );
+    }
+
+    /// Executor that writes a per-change file so every change produces a
+    /// distinct diff and can archive cleanly across iterations.
+    struct PerChangeArtifactExecutor;
+    #[async_trait::async_trait]
+    impl Executor for PerChangeArtifactExecutor {
+        async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+            std::fs::write(
+                workspace.join(format!("artifact-{change}.txt")),
+                format!("contents for {change}\n"),
+            )?;
+            Ok(ExecutorOutcome::Completed)
+        }
+        async fn resume(
+            &self,
+            _h: crate::executor::ResumeHandle,
+            _a: &str,
+        ) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    /// max-changes-per-pr-limit: with 5 pending changes and a cap of 3, a
+    /// single pass commits exactly 3 archives and leaves the remaining 2
+    /// in the pending queue for the next iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_queue_stops_at_max_changes() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        for n in 1..=5 {
+            add_committed_change(&ws, &format!("ch{n:02}"), &format!("fixture {n}"));
+        }
+
+        let executor = PerChangeArtifactExecutor;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _self_heal) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            3, // cap
+        )
+        .await
+        .expect("pass succeeds");
+
+        assert_eq!(processed.len(), 3, "exactly 3 changes commit in one pass");
+        assert_eq!(
+            processed,
+            vec!["ch01".to_string(), "ch02".to_string(), "ch03".to_string()],
+            "first three by queue order are processed"
+        );
+        // The remaining two are still pending.
+        let still_pending = queue::list_pending(&ws).unwrap();
+        assert_eq!(
+            still_pending,
+            vec!["ch04".to_string(), "ch05".to_string()],
+            "the last two remain in the queue for the next iteration"
+        );
+    }
+
+    /// max-changes-per-pr-limit: a cap of 1 ships exactly one archive per
+    /// pass; the rest of the queue waits for subsequent iterations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_queue_cap_of_1_ships_one_per_pass() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        for n in 1..=3 {
+            add_committed_change(&ws, &format!("ch{n:02}"), &format!("fixture {n}"));
+        }
+        let executor = PerChangeArtifactExecutor;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            1, // cap of 1
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(processed, vec!["ch01".to_string()], "cap=1 → one archive");
+        let still_pending = queue::list_pending(&ws).unwrap();
+        assert_eq!(
+            still_pending,
+            vec!["ch02".to_string(), "ch03".to_string()],
+            "remaining changes wait for the next iteration"
+        );
+    }
+
+    /// max-changes-per-pr-limit: a `Failed` outcome does NOT count toward
+    /// the cap; the walk continues to the next pending change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_queue_failed_change_does_not_count_toward_cap() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // First change: will fail (no artifact written).
+        add_committed_change(&ws, "ch01-fails", "will fail");
+        // Subsequent changes: will succeed.
+        add_committed_change(&ws, "ch02", "succeeds");
+        add_committed_change(&ws, "ch03", "succeeds");
+        add_committed_change(&ws, "ch04", "succeeds");
+
+        struct FailFirstThenArtifact;
+        #[async_trait::async_trait]
+        impl Executor for FailFirstThenArtifact {
+            async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+                if change == "ch01-fails" {
+                    return Ok(ExecutorOutcome::Failed {
+                        reason: "fixture failure".into(),
+                    });
+                }
+                std::fs::write(
+                    workspace.join(format!("artifact-{change}.txt")),
+                    format!("contents for {change}\n"),
+                )?;
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+
+        let executor = FailFirstThenArtifact;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            2, // cap of 2 archived
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(
+            processed,
+            vec!["ch02".to_string(), "ch03".to_string()],
+            "Failed `ch01-fails` doesn't count; cap stops the walk after 2 archives"
+        );
+        // ch01-fails is still pending (failed once, retries next iteration).
+        // ch04 is still pending (cap stopped the walk before it ran).
+        let still_pending = queue::list_pending(&ws).unwrap();
+        assert!(
+            still_pending.contains(&"ch01-fails".to_string()),
+            "failed change still pending for retry: {still_pending:?}"
+        );
+        assert!(
+            still_pending.contains(&"ch04".to_string()),
+            "untouched change still pending: {still_pending:?}"
         );
     }
 }
