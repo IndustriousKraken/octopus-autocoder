@@ -30,18 +30,23 @@ Respond with EXACTLY this structure:
 ```
 VERDICT: <Pass | Concerns | Block>
 
+## Summary
+2-4 sentences naming the files and code surfaces you actually examined, the kinds of issues you specifically looked for given the change's character (e.g. "checked the input-validation path on the new HTTP handler", "audited the lock acquisition order in the new RAII guard", "traced the error propagation through the new module's public API"), and a one-line overall impression. Do NOT recap the diff or restate the change description; demonstrate engagement with the code itself, not the change brief.
+
 ## Security
-- <bullet, or "None observed.">
+- <bullet, or "None observed in the reviewed surface.">
 
 ## Error handling
-- <bullet, or "None observed.">
+- <bullet, or "None observed in the reviewed surface.">
 
 ## Naming, style, idioms
-- <bullet, or "None observed.">
+- <bullet, or "None observed in the reviewed surface.">
 
 ## Possible bugs
-- <bullet, or "None observed.">
+- <bullet, or "None observed in the reviewed surface.">
 ```
+
+The Summary section is mandatory. If a reviewer cannot describe what was examined, the review is not credible — be specific about which files and which patterns were inspected; do not generalize.
 
 The first non-empty line MUST be `VERDICT:` followed by exactly one of `Pass`, `Concerns`, or `Block` (case-insensitive). Pick:
 
