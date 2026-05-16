@@ -724,6 +724,58 @@ A repo cancelled mid-iteration finishes its in-flight pass normally. The cancell
 
 If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
 
+### Periodic audits
+
+autocoder ships a periodic-audit framework (see the `periodic-audits-foundation` change) that runs registered audit tasks on per-audit cadences and posts findings via ChatOps. Every audit is **default-off** — operators opt in per audit by setting a cadence in the `audits:` block of `config.yaml`. Audits run after `recreate_branch` and before `list_pending`, so any spec-writing audit's output enters the same iteration's queue walk.
+
+Registered audits:
+
+| Name | Cadence intent | Write policy | Notes |
+|---|---|---|---|
+| `architecture_brightline` | weekly–monthly | None | Pure-code structural checks (file size, signature collisions, dead public items). |
+| `architecture_consultative` | **monthly–quarterly** | None | LLM-driven architecture *questions* (3–5 anchored observations per run). Daily/weekly is noise; the prompt is tuned for low-cadence consultative use. |
+
+`architecture_consultative` invokes the wrapped agent CLI in a read-only sandbox (`Read`, `Glob`, `Grep`, `Bash` only — `Write`/`Edit` are denied at the tool layer and the post-hoc diff check reverts any leak) with a prompt that explicitly forbids the well-known LLM failure modes for consultative architecture review:
+
+- **No "split into microservices."** This is a single-binary daemon by design.
+- **No "rewrite in language X."** The language is fixed.
+- **No new infrastructure dependencies** (message queues, databases, caches, RPC frameworks) unless the project already uses one of equivalent shape.
+- **No team-of-50 patterns** (event sourcing, CQRS, hexagonal-architecture overlay) imposed on a single-operator daemon.
+- **No stylistic refactorings.** The operator has linters for that.
+- **No suggestion that adds more code than it removes.** Penalize complexity; if the suggestion's implementation grows the codebase net-positive, drop it.
+
+The prompt also directs the agent to: phrase observations as **questions** (not directives), anchor each observation to a specific `file:line-line` range, and produce **0–5 findings, aiming for 3** (silence is acceptable). More than 5 findings is rejected as a malformed run.
+
+If the consultative audit produces noisy output, **tighten the prompt before reaching for `disabled`.** Set `audits.architecture_consultative.prompt_path` to a custom path and edit the anti-pattern list there. The prompt's anti-pattern guardrails exist specifically to mitigate common LLM failure modes — if the output still misfires, the prompt is the right place to fix it; disabling the audit hides the symptom without ever revealing the underlying mis-aim.
+
+Each audit run writes a per-invocation log at `/tmp/autocoder/logs/<workspace-basename>/audits/<audit_type>-<UTC-ISO>.log` containing the prompt sent, the full agent output, and the parsed outcome. When a chatops finding is confusing or terse, that log is the source of truth.
+
+Example `audits:` block for an operator who wants both audits on:
+
+```yaml
+audits:
+  defaults:
+    architecture_brightline: weekly
+    architecture_consultative: monthly
+  settings:
+    architecture_consultative:
+      # Optional: override the embedded default prompt.
+      # prompt_path: /etc/autocoder/prompts/my-consultative.md
+      notify_on_clean: false
+```
+
+Per-repository overrides go on the repo entry itself:
+
+```yaml
+repositories:
+  - url: "git@github.com:my-org/critical-service.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    audits:
+      architecture_consultative: quarterly
+```
+
 ---
 
 ## Deployment

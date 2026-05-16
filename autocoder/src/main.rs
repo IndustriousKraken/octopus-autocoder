@@ -3,6 +3,12 @@ use clap::Parser;
 
 mod alert_state;
 mod alerts;
+// `audits` is not yet wired into the polling loop (the
+// `periodic-audits-foundation` change owns that integration). Until
+// then the trait + types and the architecture-consultative impl are
+// dead code from the binary's POV; the unit tests still cover them.
+#[allow(dead_code)]
+mod audits;
 mod busy_marker;
 mod chatops;
 mod cli;
