@@ -14,6 +14,7 @@
 //! - [`state`]: persistence of `last_run_at` + `last_run_sha` per audit.
 //! - [`scheduler`]: cadence + change-guard + write-policy enforcement.
 
+pub mod architecture_consultative;
 pub mod brightline;
 pub mod dependency_update;
 pub mod drift;
