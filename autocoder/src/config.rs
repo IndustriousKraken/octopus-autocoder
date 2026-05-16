@@ -274,6 +274,16 @@ pub struct GithubConfig {
     /// be pre-created; autocoder verifies its existence at startup.
     #[serde(default)]
     pub fork_owner: Option<String>,
+    /// When true and fork-PR mode is active, on every fresh workspace
+    /// clone (workspace dir was absent) autocoder DELETES the existing
+    /// fork on GitHub and re-forks upstream before initializing. This
+    /// recovers cleanly from snafus where the fork has stale branches no
+    /// one cares about, but is DESTRUCTIVE: any open PRs against
+    /// branches on the deleted fork are closed by GitHub when the head
+    /// ref disappears. Requires the operator's PAT to have the
+    /// `delete_repo` scope. Defaults to `false`.
+    #[serde(default)]
+    pub recreate_fork_on_reinit: bool,
 }
 
 fn default_github_token_env() -> String {
@@ -1017,6 +1027,61 @@ github: {}
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.github.fork_owner.is_none());
+    }
+
+    #[test]
+    fn recreate_fork_on_reinit_defaults_to_false() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(!cfg.github.recreate_fork_on_reinit);
+    }
+
+    #[test]
+    fn recreate_fork_on_reinit_parses_true() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  fork_owner: machine-user
+  recreate_fork_on_reinit: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.github.recreate_fork_on_reinit);
+        assert_eq!(cfg.github.fork_owner.as_deref(), Some("machine-user"));
+    }
+
+    #[test]
+    fn recreate_fork_on_reinit_parses_false() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  recreate_fork_on_reinit: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(!cfg.github.recreate_fork_on_reinit);
     }
 
     #[test]

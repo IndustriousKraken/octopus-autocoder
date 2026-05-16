@@ -519,6 +519,26 @@ pub async fn run_pass_through_commits(
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
         None => None,
     };
+    let did_clone = !workspace.exists();
+    let mut did_refork = false;
+    if did_clone && fork_url.is_some() && github_cfg.recreate_fork_on_reinit {
+        match workspace::recreate_fork(github_cfg, repo).await {
+            Ok(workspace::RecreateOutcome::Recreated) => {
+                did_refork = true;
+            }
+            Ok(workspace::RecreateOutcome::Forbidden) => {
+                // Helper already logged ERROR with scope guidance. Fall
+                // through to the conservative ensure_initialized path so
+                // the iteration still makes progress.
+            }
+            Err(e) => {
+                tracing::error!(
+                    url = %repo.url,
+                    "recreate_fork failed: {e:#}; falling back to conservative ensure_initialized"
+                );
+            }
+        }
+    }
     if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_url.as_deref()) {
         handle_predictable_failure(
             workspace,
@@ -532,6 +552,9 @@ pub async fn run_pass_through_commits(
         )
         .await;
         return Err(e);
+    }
+    if did_refork {
+        maybe_post_refork_notification(repo, chatops_ctx).await;
     }
     let _cleared = queue::clear_stale_locks(workspace)?;
 
@@ -1276,6 +1299,33 @@ async fn maybe_post_pr_opened(
     }
 }
 
+/// Post a one-line ChatOps notification announcing a fork recreation.
+/// Re-forking is destructive: any open PRs from the deleted fork are
+/// closed by GitHub when the head ref disappears, so operators should
+/// see this immediately. Gated by `failure_alerts_enabled` (re-fork is
+/// a recovery action; if the operator opted out of failure alerts, they
+/// have opted out of this too).
+async fn maybe_post_refork_notification(
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let text = format!(
+        ":warning: `{}`: re-forked at workspace reinitialization \
+         (previous fork deleted; any open PRs from this fork are now closed)",
+        repo.url
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "re-fork notification failed; continuing: {e:#}"
+        );
+    }
+}
+
 async fn handle_outcome(
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -1957,6 +2007,7 @@ mod tests {
             token: None,
             owner_tokens: Some(map),
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
 
         // Mirror open_pull_request's internal sequence.
@@ -2015,6 +2066,7 @@ mod tests {
             }),
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
+            recreate_fork_on_reinit: false,
         };
         let (owner, repo_name) =
             crate::github::parse_repo_url("git@github.com:upstream-org/repo.git").unwrap();
@@ -2305,6 +2357,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         // Use a very high threshold so existing tests' single-fail
         // iterations don't accidentally mark perma-stuck.
@@ -2576,6 +2629,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -2674,6 +2728,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -2785,6 +2840,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -2917,6 +2973,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -3027,6 +3084,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -3156,6 +3214,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -3271,6 +3330,7 @@ mod tests {
                 token: None,
                 owner_tokens: None,
                 fork_owner: None,
+                recreate_fork_on_reinit: false,
             };
             let (processed, _) = run_pass_through_commits(
                 &ws,
@@ -3456,6 +3516,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -3541,6 +3602,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let cancel = CancellationToken::new();
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);
@@ -3606,6 +3668,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         }
     }
 
@@ -3753,6 +3816,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -3800,6 +3864,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -3891,6 +3956,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
 
         // Iteration 1: pass through commits succeeds, push fails → alert
@@ -3985,6 +4051,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let stuck_secs = 2400u64;
 
@@ -4245,6 +4312,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             workspace,
@@ -4414,6 +4482,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let executor = AlwaysFailingExecutor;
 
@@ -4470,6 +4539,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -4534,6 +4604,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -4666,6 +4737,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
@@ -4735,6 +4807,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
@@ -4791,6 +4864,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
@@ -4865,6 +4939,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _self_heal) = run_pass_through_commits(
             &ws,
@@ -4907,6 +4982,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -4971,6 +5047,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -5071,6 +5148,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -5115,6 +5193,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -5148,6 +5227,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let _ = run_pass_through_commits(
             &ws,
@@ -5232,6 +5312,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -5286,6 +5367,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -5439,6 +5521,77 @@ mod tests {
         .await;
     }
 
+    /// re-fork-chatops-notification: a successful re-fork triggers
+    /// exactly one chat.postMessage whose body contains the destructive-
+    /// action notice and the repo URL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refork_notification_fires_when_failure_alerts_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("re-forked".to_string()),
+                mockito::Matcher::Regex("owner/repo".to_string()),
+                mockito::Matcher::Regex("closed".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        maybe_post_refork_notification(&repo, Some(&ctx)).await;
+        mock.assert_async().await;
+    }
+
+    /// re-fork-chatops-notification: when failure alerts are disabled
+    /// the helper is a no-op (re-fork is a recovery event, gated by the
+    /// same toggle as the other operator-visible failure alerts).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refork_notification_suppressed_when_failure_alerts_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: true,
+        };
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        maybe_post_refork_notification(&repo, Some(&ctx)).await;
+        mock.assert_async().await;
+    }
+
     /// pr-opened-chatops-notification: when chatops is unconfigured,
     /// the helper is a no-op.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5476,6 +5629,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
             &ws,
@@ -5625,6 +5779,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         }));
         let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(None));

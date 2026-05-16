@@ -117,7 +117,7 @@ pub(crate) async fn create_fork_at_for_test(
     create_fork_at(api_base, upstream_owner, upstream_repo, token).await
 }
 
-async fn create_fork_at(
+pub(crate) async fn create_fork_at(
     api_base: &str,
     upstream_owner: &str,
     upstream_repo: &str,
@@ -145,6 +145,78 @@ async fn create_fork_at(
         ));
     }
     Ok(())
+}
+
+/// Outcome of a `DELETE /repos/{owner}/{repo}` call. Distinguishes the
+/// "fork was already gone" case (404) from the "missing scope" case (403)
+/// from a successful delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// 204 (or 200): the repo existed and was deleted by this call.
+    Deleted,
+    /// 404: the repo was already absent (deleted out-of-band).
+    AlreadyGone,
+    /// 403: the operator's PAT lacks the `delete_repo` scope.
+    Forbidden,
+}
+
+/// Delete a GitHub repository via `DELETE /repos/{owner}/{repo}`. Returns
+/// a `DeleteOutcome` for the common cases; any other non-2xx response
+/// returns `Err`. Used by the `recreate_fork_on_reinit` recovery path
+/// (the workspace helper currently routes through `delete_repo_at` for
+/// uniform API-base injection in tests; this public entry remains for
+/// callers that don't need that override).
+#[allow(dead_code)]
+pub async fn delete_repo(owner: &str, repo: &str, token: &str) -> Result<DeleteOutcome> {
+    delete_repo_at(DEFAULT_API_BASE, owner, repo, token).await
+}
+
+/// Test-only re-export of the internal `delete_repo_at`. Lets sibling-
+/// module tests exercise the HTTP path against a mockito server.
+#[cfg(test)]
+pub(crate) async fn delete_repo_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    token: &str,
+) -> Result<DeleteOutcome> {
+    delete_repo_at(api_base, owner, repo, token).await
+}
+
+pub(crate) async fn delete_repo_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    token: &str,
+) -> Result<DeleteOutcome> {
+    let url = format!("{api_base}/repos/{owner}/{repo}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github DELETE failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(DeleteOutcome::Deleted);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(DeleteOutcome::AlreadyGone);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(DeleteOutcome::Forbidden);
+    }
+    let body_snippet = resp
+        .text()
+        .await
+        .map(|t| t.chars().take(200).collect::<String>())
+        .unwrap_or_default();
+    Err(anyhow!(
+        "github DELETE {owner}/{repo} returned {status}: {body_snippet}"
+    ))
 }
 
 /// Open a pull request via the GitHub REST API. Returns the `html_url` of
@@ -607,6 +679,68 @@ mod tests {
             .expect_err("non-2xx must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("403"), "error must name the HTTP status; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_returns_deleted_on_204() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/repos/owner/repo")
+            .match_header("authorization", "Bearer t")
+            .with_status(204)
+            .create_async()
+            .await;
+        let outcome = delete_repo_at_for_test(&server.url(), "owner", "repo", "t")
+            .await
+            .expect("delete should succeed");
+        assert_eq!(outcome, DeleteOutcome::Deleted);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delete_repo_returns_already_gone_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("DELETE", "/repos/owner/repo")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let outcome = delete_repo_at_for_test(&server.url(), "owner", "repo", "t")
+            .await
+            .expect("404 should map to AlreadyGone, not Err");
+        assert_eq!(outcome, DeleteOutcome::AlreadyGone);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_returns_forbidden_on_403() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("DELETE", "/repos/owner/repo")
+            .with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by personal access token"}"#)
+            .create_async()
+            .await;
+        let outcome = delete_repo_at_for_test(&server.url(), "owner", "repo", "t")
+            .await
+            .expect("403 should map to Forbidden, not Err");
+        assert_eq!(outcome, DeleteOutcome::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_errors_on_other_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("DELETE", "/repos/owner/repo")
+            .with_status(500)
+            .with_body("internal error")
+            .create_async()
+            .await;
+        let err = delete_repo_at_for_test(&server.url(), "owner", "repo", "t")
+            .await
+            .expect_err("500 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"), "error must name the HTTP status; got: {msg}");
     }
 
     #[tokio::test]
