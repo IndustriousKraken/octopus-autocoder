@@ -50,12 +50,33 @@ pub fn fetch(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `git fetch <remote>` — fetch from a named remote (e.g. `fork`).
-/// Used by `workspace::ensure_initialized` to sync the fork's tracking
-/// ref after a fresh clone, so subsequent `--force-with-lease` pushes
-/// compare against accurate data.
+/// `git fetch <remote>` — fetch ALL branches from a named remote
+/// (e.g. `fork`). Currently unused in production; retained for
+/// completeness and as a building block for future callers that need
+/// the wholesale-fetch semantic. Prefer `fetch_remote_branch` for the
+/// post-clone fork sync — fetching only the agent branch avoids
+/// shadow-branch DWIM ambiguity on `git checkout <base_branch>`.
+#[allow(dead_code)]
 pub fn fetch_remote(workspace: &Path, remote: &str) -> Result<()> {
     run_git(workspace, "fetch <remote>", &["fetch", remote])?;
+    Ok(())
+}
+
+/// `git fetch <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>`
+/// — fetch ONLY the named branch from the remote, populating the
+/// corresponding local tracking ref. The leading `+` enables forced
+/// update so a non-fast-forward update on the named branch
+/// (e.g. the fork's agent branch was rewritten) does not fail the
+/// fetch. All other branches on the remote are intentionally not
+/// fetched, so their refs never appear under `refs/remotes/<remote>/*`
+/// and cannot interfere with subsequent `git checkout` DWIM.
+pub fn fetch_remote_branch(workspace: &Path, remote: &str, branch: &str) -> Result<()> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    run_git(
+        workspace,
+        "fetch <remote> <refspec>",
+        &["fetch", remote, &refspec],
+    )?;
     Ok(())
 }
 
@@ -444,6 +465,136 @@ mod tests {
         assert!(
             probe.status.success(),
             "refs/remotes/alt/main must resolve after fetch_remote"
+        );
+    }
+
+    #[test]
+    fn fetch_remote_branch_populates_only_named_branch() {
+        let (dir, ws, _origin) = fixture_clone_with_bare_remote();
+        // Build a fork remote with TWO branches: main and extra-branch.
+        let fork_remote = dir.path().join("fork.git");
+        std::fs::create_dir_all(&fork_remote).unwrap();
+        let st = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(&fork_remote)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let fork_work = dir.path().join("fork-work");
+        std::fs::create_dir_all(&fork_work).unwrap();
+        let fork_url = fork_remote.to_string_lossy().to_string();
+        run_init(&fork_work, &["clone", "-q", &fork_url, "."]);
+        run_init(&fork_work, &["config", "user.email", "test@example.com"]);
+        run_init(&fork_work, &["config", "user.name", "test"]);
+        std::fs::write(fork_work.join("FORK.md"), "fork main").unwrap();
+        run_init(&fork_work, &["add", "FORK.md"]);
+        run_init(&fork_work, &["commit", "-q", "-m", "fork main initial"]);
+        run_init(&fork_work, &["push", "-q", "origin", "main"]);
+        // Push a second branch on the fork.
+        run_init(&fork_work, &["checkout", "-q", "-b", "extra-branch"]);
+        std::fs::write(fork_work.join("EXTRA.md"), "extra").unwrap();
+        run_init(&fork_work, &["add", "EXTRA.md"]);
+        run_init(&fork_work, &["commit", "-q", "-m", "extra"]);
+        run_init(&fork_work, &["push", "-q", "origin", "extra-branch"]);
+
+        run_init(&ws, &["remote", "add", "fork", &fork_url]);
+        fetch_remote_branch(&ws, "fork", "main")
+            .expect("fetch_remote_branch should succeed");
+
+        // refs/remotes/fork/main MUST resolve.
+        let main_probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/main"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            main_probe.status.success(),
+            "refs/remotes/fork/main must resolve after fetch_remote_branch(main)"
+        );
+        // refs/remotes/fork/extra-branch MUST NOT resolve (we asked for
+        // main only).
+        let extra_probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/extra-branch"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            !extra_probe.status.success(),
+            "refs/remotes/fork/extra-branch MUST NOT resolve after a single-branch fetch; \
+             got stdout={:?}",
+            String::from_utf8_lossy(&extra_probe.stdout)
+        );
+    }
+
+    #[test]
+    fn fetch_remote_branch_force_updates_non_ff() {
+        let (dir, ws, _origin) = fixture_clone_with_bare_remote();
+        let fork_remote = dir.path().join("fork.git");
+        std::fs::create_dir_all(&fork_remote).unwrap();
+        let st = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(&fork_remote)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        // Seed fork with an agent-q branch.
+        let fork_work = dir.path().join("fork-work");
+        std::fs::create_dir_all(&fork_work).unwrap();
+        let fork_url = fork_remote.to_string_lossy().to_string();
+        run_init(&fork_work, &["clone", "-q", &fork_url, "."]);
+        run_init(&fork_work, &["config", "user.email", "test@example.com"]);
+        run_init(&fork_work, &["config", "user.name", "test"]);
+        std::fs::write(fork_work.join("FORK.md"), "fork main").unwrap();
+        run_init(&fork_work, &["add", "FORK.md"]);
+        run_init(&fork_work, &["commit", "-q", "-m", "fork main initial"]);
+        run_init(&fork_work, &["push", "-q", "origin", "main"]);
+        run_init(&fork_work, &["checkout", "-q", "-b", "agent-q"]);
+        std::fs::write(fork_work.join("AGENT_V1.md"), "v1").unwrap();
+        run_init(&fork_work, &["add", "AGENT_V1.md"]);
+        run_init(&fork_work, &["commit", "-q", "-m", "agent v1"]);
+        run_init(&fork_work, &["push", "-q", "origin", "agent-q"]);
+
+        run_init(&ws, &["remote", "add", "fork", &fork_url]);
+        fetch_remote_branch(&ws, "fork", "agent-q").expect("v1 fetch");
+        let v1_sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "refs/remotes/fork/agent-q"])
+                .current_dir(&ws)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Rewrite the fork's agent-q history: reset hard to main, then
+        // a different commit. This is a non-fast-forward update.
+        run_init(&fork_work, &["checkout", "-q", "main"]);
+        run_init(&fork_work, &["branch", "-q", "-D", "agent-q"]);
+        run_init(&fork_work, &["checkout", "-q", "-b", "agent-q"]);
+        std::fs::write(fork_work.join("AGENT_V2.md"), "v2").unwrap();
+        run_init(&fork_work, &["add", "AGENT_V2.md"]);
+        run_init(&fork_work, &["commit", "-q", "-m", "agent v2"]);
+        run_init(&fork_work, &["push", "-q", "--force", "origin", "agent-q"]);
+
+        // The `+` refspec must accept the non-FF update.
+        fetch_remote_branch(&ws, "fork", "agent-q")
+            .expect("non-FF fetch must succeed with `+` refspec");
+        let v2_sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "refs/remotes/fork/agent-q"])
+                .current_dir(&ws)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_ne!(
+            v1_sha, v2_sha,
+            "tracking ref must have moved to the rewritten commit"
         );
     }
 

@@ -523,7 +523,10 @@ pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig)
         );
         return true;
     }
-    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_url.as_deref()) {
+    let fork_arg = fork_url
+        .as_deref()
+        .map(|u| (u, repo.agent_branch.as_str()));
+    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg) {
         tracing::error!(
             url = repo.url.as_str(),
             workspace = %workspace_path.display(),
