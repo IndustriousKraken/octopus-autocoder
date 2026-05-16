@@ -5,7 +5,7 @@
 use crate::audits::{
     Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit,
     dependency_update::DependencyUpdateAudit, drift::DriftAudit,
-    missing_tests::MissingTestsAudit,
+    missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
@@ -156,6 +156,10 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     )));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
     registry.register(Arc::new(MissingTestsAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
+    registry.register(Arc::new(SecurityBugAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
