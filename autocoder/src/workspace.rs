@@ -51,14 +51,21 @@ pub fn resolve_path(repo: &RepositoryConfig) -> PathBuf {
 /// `git clone`. If it exists and is a git repository, run `git fetch`. If it
 /// exists but is not a git repo, return an error without modifying the path.
 ///
-/// When `fork_url` is `Some`, after the clone or fetch the manager
-/// idempotently registers a second remote named `fork` pointing at that
-/// URL — used by fork-PR mode to push the agent branch to a fork instead
-/// of upstream.
+/// When `fork` is `Some((fork_url, agent_branch))`, after the clone or fetch
+/// the manager idempotently registers a second remote named `fork` pointing
+/// at that URL — used by fork-PR mode to push the agent branch to a fork
+/// instead of upstream. On a fresh clone the manager also fetches ONLY
+/// `agent_branch` from the fork (via an explicit refspec), populating
+/// `refs/remotes/fork/<agent_branch>` so that subsequent
+/// `git push --force-with-lease fork <agent_branch>` has accurate local
+/// tracking data. Other branches on the fork are intentionally NOT fetched,
+/// so a fork branch whose name shadows an upstream branch (e.g. both have
+/// `dev`) cannot cause `git checkout <base>` DWIM to fail with "matched
+/// multiple remote tracking branches".
 pub fn ensure_initialized(
     workspace: &Path,
     url: &str,
-    fork_url: Option<&str>,
+    fork: Option<(&str, &str)>,
 ) -> Result<()> {
     let did_clone = !workspace.exists();
     if did_clone {
@@ -74,23 +81,29 @@ pub fn ensure_initialized(
         git::fetch(workspace)
             .with_context(|| format!("fetching origin in {}", workspace.display()))?;
     }
-    if let Some(fork_url) = fork_url {
+    if let Some((fork_url, agent_branch)) = fork {
         git::ensure_remote(workspace, "fork", fork_url)
             .with_context(|| format!("ensuring fork remote points at {fork_url}"))?;
-        // After a fresh clone, populate `refs/remotes/fork/*` so the
-        // local tracking ref reflects the fork's actual state. Without
-        // this, the next iteration's `git push --force-with-lease fork
-        // agent-q` compares an empty local tracking value against the
-        // remote's existing commits and fails with "stale info". A
+        // After a fresh clone, populate `refs/remotes/fork/<agent_branch>`
+        // so the local tracking ref reflects the fork's actual state for
+        // that branch. Without this, the next iteration's
+        // `git push --force-with-lease fork <agent_branch>` compares an
+        // empty local tracking value against the remote's existing commits
+        // and fails with "stale info". The single-branch refspec also
+        // prevents the fork's other branches from materializing as
+        // `refs/remotes/fork/*` refs, which would otherwise break
+        // `git checkout <base>` DWIM when the fork has shadow branches
+        // (a fork branch with the same name as an upstream branch). A
         // fetch failure here is non-fatal: the empty tracking ref is no
         // worse than pre-fix behavior, and any real divergence still
         // surfaces via the existing branch-push-failure alert path.
         if did_clone {
-            if let Err(e) = git::fetch_remote(workspace, "fork") {
+            if let Err(e) = git::fetch_remote_branch(workspace, "fork", agent_branch) {
                 tracing::warn!(
                     workspace = %workspace.display(),
                     fork_url = %fork_url,
-                    "post-clone `git fetch fork` failed; local tracking ref will be empty until first successful push: {e:#}"
+                    agent_branch = %agent_branch,
+                    "post-clone `git fetch fork <agent_branch>` failed; local tracking ref will be empty until first successful push: {e:#}"
                 );
             }
         }
@@ -457,7 +470,7 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
         let remotes = list_remotes(&workspace);
         assert!(remotes.contains("origin"), "origin must be present: {remotes}");
         assert!(remotes.contains("fork"), "fork must be present: {remotes}");
@@ -474,9 +487,9 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
         // Second invocation must not error or duplicate the remote.
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
         let remotes = list_remotes(&workspace);
         let fork_lines = remotes.lines().filter(|l| l.starts_with("fork")).count();
         // git remote -v emits two lines per remote (fetch + push).
@@ -501,7 +514,7 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
 
         // refs/remotes/fork/main must resolve (the fetch ran).
         let probe = Command::new("git")
@@ -538,7 +551,7 @@ mod tests {
         let fork_url = fork.to_string_lossy().to_string();
         // First init: fresh clone → fetch fork runs, captures fork's
         // current HEAD.
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
         let initial = Command::new("git")
             .args(["rev-parse", "refs/remotes/fork/main"])
             .current_dir(&workspace)
@@ -553,7 +566,7 @@ mod tests {
 
         // Second init: workspace exists → only `git fetch origin` runs,
         // NOT `git fetch fork`. Local tracking ref must remain stale.
-        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
         let after = Command::new("git")
             .args(["rev-parse", "refs/remotes/fork/main"])
             .current_dir(&workspace)
@@ -568,6 +581,106 @@ mod tests {
     }
 
     #[test]
+    fn ensure_initialized_fetches_only_agent_branch_from_fork() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        // Give the fork a second branch besides `main`. The fetch must
+        // NOT pick this one up — it isn't the named agent branch.
+        run_git(&fork, &["checkout", "-q", "-b", "leftover-fork-branch"]);
+        std::fs::write(fork.join("LEFTOVER.md"), "leftover").unwrap();
+        run_git(&fork, &["add", "LEFTOVER.md"]);
+        run_git(&fork, &["commit", "-q", "-m", "leftover branch commit"]);
+        run_git(&fork, &["checkout", "-q", "main"]);
+
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        // Pretend `main` is the agent branch (fixture's only branch).
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+
+        // refs/remotes/fork/main MUST resolve (the agent branch was fetched).
+        let main_probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/main"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            main_probe.status.success(),
+            "refs/remotes/fork/main must resolve after single-branch fetch"
+        );
+        // refs/remotes/fork/leftover-fork-branch MUST NOT resolve.
+        let leftover_probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/leftover-fork-branch"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            !leftover_probe.status.success(),
+            "refs/remotes/fork/leftover-fork-branch MUST NOT resolve — the \
+             single-branch refspec did not match it"
+        );
+    }
+
+    #[test]
+    fn checkout_base_branch_after_fork_init_does_not_ambiguate() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        // Give BOTH upstream and fork a `dev` branch. This reproduces
+        // the production failure: previously `git fetch fork` (all
+        // branches) caused `refs/remotes/fork/dev` to exist alongside
+        // `refs/remotes/origin/dev`, and `git checkout dev` failed
+        // with "matched multiple (2) remote tracking branches". After
+        // the fix only `refs/remotes/fork/agent-q` is populated, so
+        // `dev` resolves unambiguously to origin's copy.
+        run_git(&upstream, &["checkout", "-q", "-b", "dev"]);
+        std::fs::write(upstream.join("UPSTREAM_DEV.md"), "upstream dev").unwrap();
+        run_git(&upstream, &["add", "UPSTREAM_DEV.md"]);
+        run_git(&upstream, &["commit", "-q", "-m", "upstream dev work"]);
+        run_git(&upstream, &["checkout", "-q", "main"]);
+
+        run_git(&fork, &["checkout", "-q", "-b", "dev"]);
+        std::fs::write(fork.join("FORK_DEV.md"), "fork dev shadow").unwrap();
+        run_git(&fork, &["add", "FORK_DEV.md"]);
+        run_git(&fork, &["commit", "-q", "-m", "fork dev shadow"]);
+        run_git(&fork, &["checkout", "-q", "main"]);
+        // Fork's agent branch.
+        run_git(&fork, &["checkout", "-q", "-b", "agent-q"]);
+        std::fs::write(fork.join("AGENT.md"), "agent").unwrap();
+        run_git(&fork, &["add", "AGENT.md"]);
+        run_git(&fork, &["commit", "-q", "-m", "agent work"]);
+        run_git(&fork, &["checkout", "-q", "main"]);
+
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "agent-q"))).unwrap();
+
+        // The regression: `git checkout dev` must succeed without DWIM
+        // ambiguity. (origin/dev is the only candidate; fork's dev
+        // was filtered out by the single-branch refspec.)
+        let checkout = Command::new("git")
+            .args(["checkout", "dev"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&checkout.stderr);
+        assert!(
+            checkout.status.success(),
+            "`git checkout dev` must succeed; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("matched multiple"),
+            "DWIM ambiguity error must not appear; stderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn ensure_initialized_tolerates_fork_fetch_failure() {
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
@@ -577,7 +690,7 @@ mod tests {
         // Point fork to a non-existent path — the fetch will fail.
         let bogus_fork_url = dir.path().join("does-not-exist").to_string_lossy().to_string();
         // ensure_initialized must still return Ok (the fetch is best-effort).
-        ensure_initialized(&workspace, &upstream_url, Some(&bogus_fork_url))
+        ensure_initialized(&workspace, &upstream_url, Some((&bogus_fork_url, "main")))
             .expect("ensure_initialized must tolerate fork fetch failure");
         // The fork remote was still registered.
         let remotes = list_remotes(&workspace);

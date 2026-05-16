@@ -43,7 +43,10 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
         None => None,
     };
-    workspace::ensure_initialized(&workspace_path, &repo.url, fork_url.as_deref())?;
+    let fork_arg = fork_url
+        .as_deref()
+        .map(|u| (u, repo.agent_branch.as_str()));
+    workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg)?;
     let remote_name = if github.fork_owner.is_some() { "fork" } else { "origin" };
 
     if !args.hard {

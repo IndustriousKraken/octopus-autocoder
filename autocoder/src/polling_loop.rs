@@ -539,7 +539,10 @@ pub async fn run_pass_through_commits(
             }
         }
     }
-    if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_url.as_deref()) {
+    let fork_arg = fork_url
+        .as_deref()
+        .map(|u| (u, repo.agent_branch.as_str()));
+    if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_arg) {
         handle_predictable_failure(
             workspace,
             &repo.url,
