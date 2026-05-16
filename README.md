@@ -121,6 +121,7 @@ A list of one or more repositories to manage. Each entry:
 | `token`        | no       | _absent_         | Inline alternative to `token_env`: `{ value: "ghp_..." }`. When set, `token_env` is ignored. See [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var). |
 | `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name **or** inline `{ value: "..." }`. See [Multiple GitHub Tokens](#multiple-github-tokens). |
 | `fork_owner`   | no       | _absent_         | Enables fork-and-PR mode. Names the GitHub handle that owns the forks. See [Fork-and-PR workflow](#7-fork-and-pr-workflow-recommended-for-org-repos). |
+| `recreate_fork_on_reinit` | no | `false` | When `true` AND fork-PR mode is active AND the workspace directory was absent at iteration start (fresh clone), autocoder deletes the existing fork on GitHub and re-forks upstream before initializing the workspace. Recovers cleanly when the fork has accumulated stale branches no one cares about. **Destructive**: any open PRs whose head branch lives on the deleted fork are closed by GitHub when the head ref disappears. Requires the operator's PAT to include the `delete_repo` scope (without it, the DELETE returns 403, autocoder logs ERROR, and falls back to the conservative non-recreating init path). See [Operating notes — fork recreation on workspace reinitialization](#fork-recreation-on-workspace-reinitialization). |
 
 ### `reviewer:` (optional)
 
@@ -599,6 +600,35 @@ sudo systemctl start autocoder
 ```
 
 The per-change run logs (`/tmp/autocoder/logs/<basename>/<change>.log`) and the busy markers share the same `/tmp/autocoder/` root.
+
+### Workspace directory deleted
+
+If a workspace directory under `/tmp/workspaces/` is removed while autocoder is running (or while stopped), the daemon's next iteration treats this as a fresh-clone case: it clones upstream into the path again. In fork-PR mode it also fetches the `fork` remote at that time so the local `refs/remotes/fork/agent-q` tracking ref reflects the fork's actual state. Without that fetch the next `git push --force-with-lease fork agent-q` would compare an empty local tracking value against the fork's existing commits and reject with `! [rejected] agent-q -> agent-q (stale info)`, leaving the daemon stuck. The post-clone fork fetch is best-effort: if it fails (network blip, fork doesn't yet exist), the daemon proceeds and the next push will surface the divergence via the existing branch-push-failure alert.
+
+### Fork recreation on workspace reinitialization
+
+The default workspace-deleted recovery above preserves whatever state lives on the fork. That is the right behavior when you have open PRs from that fork — losing their head refs would close the PRs. But the same preservation is a liability when the fork has accumulated stale branches no one cares about, or when the fork's state is genuinely worthless and you'd rather start from a pristine mirror of upstream.
+
+Set `github.recreate_fork_on_reinit: true` to opt in to the destructive recovery path. When that flag is enabled AND fork-PR mode is active AND the workspace directory is absent at iteration start, autocoder:
+
+1. Calls `DELETE /repos/<fork_owner>/<repo>` against the GitHub API to delete the fork.
+2. Waits 2 seconds for the deletion to propagate.
+3. Calls `POST /repos/<upstream_owner>/<repo>/forks` to re-fork from upstream.
+4. Polls the new fork's URL via `git ls-remote` for up to 30 seconds until reachable.
+5. Proceeds with the normal clone + fork-remote registration.
+
+After a successful re-fork, autocoder posts a one-line chatops notification:
+
+> :warning: \`<repo>\`: re-forked at workspace reinitialization (previous fork deleted; any open PRs from this fork are now closed)
+
+The notification is gated by the same `chatops.notifications.failure_alerts` toggle as the other operator-visible failure alerts.
+
+Requirements:
+
+- The operator's PAT must include the `delete_repo` scope. Without it, the DELETE returns 403, autocoder logs an ERROR naming the missing scope, and falls back to the conservative non-recreating init path (clone + fetch fork). The iteration still makes progress; the fork is unchanged.
+- The flag is global on the `github:` block, not per-repository — all configured repos in a single autocoder process share the same fork owner, and the fork-recreation policy is uniform across them.
+
+Defaults to `false`. With the default, the workspace-deleted recovery preserves fork state (see [Workspace directory deleted](#workspace-directory-deleted) above).
 
 ### Perma-stuck change detection
 

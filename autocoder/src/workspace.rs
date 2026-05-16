@@ -1,10 +1,14 @@
 //! Per-repository workspace management: deterministic path derivation,
 //! idempotent clone-or-fetch, and startup-time collision detection.
 
+use crate::config::GithubConfig;
+use crate::github::{self, DeleteOutcome};
+use crate::github_credentials::resolve_token;
 use crate::{config::RepositoryConfig, git};
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const WORKSPACE_ROOT: &str = "/tmp/workspaces";
 
@@ -56,7 +60,8 @@ pub fn ensure_initialized(
     url: &str,
     fork_url: Option<&str>,
 ) -> Result<()> {
-    if !workspace.exists() {
+    let did_clone = !workspace.exists();
+    if did_clone {
         git::clone(workspace, url)
             .with_context(|| format!("cloning {url} into {}", workspace.display()))?;
     } else {
@@ -72,6 +77,23 @@ pub fn ensure_initialized(
     if let Some(fork_url) = fork_url {
         git::ensure_remote(workspace, "fork", fork_url)
             .with_context(|| format!("ensuring fork remote points at {fork_url}"))?;
+        // After a fresh clone, populate `refs/remotes/fork/*` so the
+        // local tracking ref reflects the fork's actual state. Without
+        // this, the next iteration's `git push --force-with-lease fork
+        // agent-q` compares an empty local tracking value against the
+        // remote's existing commits and fails with "stale info". A
+        // fetch failure here is non-fatal: the empty tracking ref is no
+        // worse than pre-fix behavior, and any real divergence still
+        // surfaces via the existing branch-push-failure alert path.
+        if did_clone {
+            if let Err(e) = git::fetch_remote(workspace, "fork") {
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    fork_url = %fork_url,
+                    "post-clone `git fetch fork` failed; local tracking ref will be empty until first successful push: {e:#}"
+                );
+            }
+        }
     }
     // Per-workspace bookkeeping files live at the workspace root and must
     // not appear in `git status` output (the dirty-check before each pass
@@ -120,6 +142,129 @@ pub fn ensure_git_info_excluded(workspace: &Path, entry: &str) -> Result<()> {
     std::fs::write(&exclude_path, updated)
         .with_context(|| format!("writing {}", exclude_path.display()))?;
     Ok(())
+}
+
+/// Outcome of a `recreate_fork` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecreateOutcome {
+    /// DELETE returned 2xx/404 and the subsequent CREATE succeeded and
+    /// the fork is reachable. The local workspace state is unchanged
+    /// (caller still needs to run `ensure_initialized` to clone).
+    Recreated,
+    /// DELETE returned 403 (typically: the PAT lacks the `delete_repo`
+    /// scope). No CREATE was attempted. The caller must fall back to
+    /// the conservative `ensure_initialized` path.
+    Forbidden,
+}
+
+/// Destructively recreate the fork for `repo` on GitHub: DELETE the
+/// existing fork under `github_cfg.fork_owner`, wait briefly for the
+/// deletion to propagate, then POST a fresh fork from upstream and
+/// poll until reachable (up to 30s).
+///
+/// Caller must verify `github_cfg.fork_owner.is_some()` and the
+/// `recreate_fork_on_reinit` flag before invoking; this function does
+/// not re-check those conditions.
+///
+/// Does NOT touch the local workspace directory — only GitHub state.
+/// The caller is responsible for invoking `ensure_initialized` after
+/// a successful return to clone from upstream and register the (now
+/// pristine) fork remote.
+pub async fn recreate_fork(
+    github_cfg: &GithubConfig,
+    repo: &RepositoryConfig,
+) -> Result<RecreateOutcome> {
+    recreate_fork_inner(github::DEFAULT_API_BASE, github_cfg, repo, true).await
+}
+
+/// Same as `recreate_fork` but with an injectable API base URL and a
+/// flag to skip the (slow) post-create reachability poll. Used by
+/// tests to drive both 2xx and error paths through a mockito server
+/// without waiting on a real GitHub round-trip.
+#[cfg(test)]
+pub(crate) async fn recreate_fork_at_for_test(
+    api_base: &str,
+    github_cfg: &GithubConfig,
+    repo: &RepositoryConfig,
+) -> Result<RecreateOutcome> {
+    recreate_fork_inner(api_base, github_cfg, repo, false).await
+}
+
+async fn recreate_fork_inner(
+    api_base: &str,
+    github_cfg: &GithubConfig,
+    repo: &RepositoryConfig,
+    poll_reachable: bool,
+) -> Result<RecreateOutcome> {
+    let fork_owner = github_cfg
+        .fork_owner
+        .as_deref()
+        .ok_or_else(|| anyhow!("recreate_fork called with fork_owner unset"))?;
+    let (upstream_owner, repo_name) = github::parse_repo_url(&repo.url)
+        .with_context(|| format!("parsing upstream URL `{}`", repo.url))?;
+    let token = resolve_token(github_cfg, &upstream_owner)
+        .with_context(|| format!("resolving GitHub token for owner `{upstream_owner}`"))?;
+
+    match github::delete_repo_at(api_base, fork_owner, &repo_name, &token).await? {
+        DeleteOutcome::Deleted => {
+            tracing::info!(
+                upstream = %repo.url,
+                fork_owner = %fork_owner,
+                "recreate_fork: deleted existing fork on GitHub"
+            );
+        }
+        DeleteOutcome::AlreadyGone => {
+            tracing::info!(
+                upstream = %repo.url,
+                fork_owner = %fork_owner,
+                "recreate_fork: fork already absent; proceeding to recreate"
+            );
+        }
+        DeleteOutcome::Forbidden => {
+            tracing::error!(
+                upstream = %repo.url,
+                fork_owner = %fork_owner,
+                "recreate_fork: DELETE returned 403 — the operator's PAT \
+                 likely lacks the `delete_repo` scope. Falling back to \
+                 the conservative (non-recreating) workspace init path."
+            );
+            return Ok(RecreateOutcome::Forbidden);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    github::create_fork_at(api_base, &upstream_owner, &repo_name, &token)
+        .await
+        .with_context(|| {
+            format!("re-forking `{upstream_owner}/{repo_name}` under `{fork_owner}`")
+        })?;
+
+    if poll_reachable {
+        let fork_url = github::derive_fork_url(&repo.url, fork_owner)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reachable = false;
+        while Instant::now() < deadline {
+            if git::ls_remote_head(&fork_url).is_ok() {
+                reachable = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if !reachable {
+            return Err(anyhow!(
+                "recreate_fork: re-forked `{upstream_owner}/{repo_name}` under \
+                 `{fork_owner}` but `{fork_url}` was not reachable within 30s"
+            ));
+        }
+    }
+
+    tracing::info!(
+        upstream = %repo.url,
+        fork_owner = %fork_owner,
+        "recreate_fork: re-forked successfully (fork is now a pristine mirror of upstream)"
+    );
+    Ok(RecreateOutcome::Recreated)
 }
 
 /// Detect any two configured repositories that resolve to the same workspace
@@ -339,6 +484,107 @@ mod tests {
     }
 
     #[test]
+    fn ensure_initialized_fetches_fork_on_fresh_clone() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        // Distinguish fork's HEAD from upstream's: add an extra commit
+        // only to fork. After ensure_initialized's fresh-clone path,
+        // the post-clone `git fetch fork` should populate
+        // refs/remotes/fork/main with fork's commit.
+        std::fs::write(fork.join("FORK_ONLY.md"), "fork-only").unwrap();
+        run_git(&fork, &["add", "FORK_ONLY.md"]);
+        run_git(&fork, &["commit", "-q", "-m", "fork-only commit"]);
+
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+
+        // refs/remotes/fork/main must resolve (the fetch ran).
+        let probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/main"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "refs/remotes/fork/main must resolve after ensure_initialized's fresh-clone path"
+        );
+        // And its SHA must match fork's HEAD, not upstream's.
+        let fork_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fork)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&probe.stdout).trim(),
+            String::from_utf8_lossy(&fork_head.stdout).trim(),
+            "local tracking ref must match fork's actual HEAD"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_does_not_re_fetch_fork_on_existing_workspace() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        let fork = dir.path().join("fork");
+        make_fixture_remote(&upstream);
+        make_fixture_remote(&fork);
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        let fork_url = fork.to_string_lossy().to_string();
+        // First init: fresh clone → fetch fork runs, captures fork's
+        // current HEAD.
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        let initial = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/main"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let initial_sha = String::from_utf8_lossy(&initial.stdout).trim().to_string();
+
+        // Now advance fork by one commit.
+        std::fs::write(fork.join("NEW.md"), "new").unwrap();
+        run_git(&fork, &["add", "NEW.md"]);
+        run_git(&fork, &["commit", "-q", "-m", "advance fork"]);
+
+        // Second init: workspace exists → only `git fetch origin` runs,
+        // NOT `git fetch fork`. Local tracking ref must remain stale.
+        ensure_initialized(&workspace, &upstream_url, Some(&fork_url)).unwrap();
+        let after = Command::new("git")
+            .args(["rev-parse", "refs/remotes/fork/main"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let after_sha = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_eq!(
+            initial_sha, after_sha,
+            "fork tracking ref must NOT be updated on re-init of existing workspace; \
+             only fresh-clone path fetches fork"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_tolerates_fork_fetch_failure() {
+        let dir = TempDir::new().unwrap();
+        let upstream = dir.path().join("upstream");
+        make_fixture_remote(&upstream);
+        let workspace = dir.path().join("local");
+        let upstream_url = upstream.to_string_lossy().to_string();
+        // Point fork to a non-existent path — the fetch will fail.
+        let bogus_fork_url = dir.path().join("does-not-exist").to_string_lossy().to_string();
+        // ensure_initialized must still return Ok (the fetch is best-effort).
+        ensure_initialized(&workspace, &upstream_url, Some(&bogus_fork_url))
+            .expect("ensure_initialized must tolerate fork fetch failure");
+        // The fork remote was still registered.
+        let remotes = list_remotes(&workspace);
+        assert!(remotes.contains("fork"));
+    }
+
+    #[test]
     fn no_fork_remote_when_disabled() {
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
@@ -388,5 +634,125 @@ mod tests {
             .expect_err("should error when path is not a git repo");
         let msg = format!("{err:#}");
         assert!(msg.contains(".git"), "error should mention missing .git: {msg}");
+    }
+
+    /// Build a `GithubConfig` whose token resolves inline (no env vars
+    /// needed) so the recreate_fork tests stay hermetic.
+    fn github_cfg_with_inline_token(fork_owner: &str) -> GithubConfig {
+        GithubConfig {
+            token_env: "AUTOCODER_RECREATE_TEST_UNSET".into(),
+            token: Some(crate::config::SecretSource::Inline {
+                value: "fake-pat-for-test".into(),
+            }),
+            owner_tokens: None,
+            fork_owner: Some(fork_owner.into()),
+            recreate_fork_on_reinit: true,
+        }
+    }
+
+    fn repo_cfg(url: &str) -> RepositoryConfig {
+        RepositoryConfig {
+            url: url.into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_fork_returns_recreated_on_normal_path() {
+        let mut server = mockito::Server::new_async().await;
+        let delete_mock = server
+            .mock("DELETE", "/repos/fork-owner/repo")
+            .match_header("authorization", "Bearer fake-pat-for-test")
+            .with_status(204)
+            .create_async()
+            .await;
+        let create_mock = server
+            .mock("POST", "/repos/upstream-org/repo/forks")
+            .match_header("authorization", "Bearer fake-pat-for-test")
+            .with_status(202)
+            .with_body(r#"{"name":"repo"}"#)
+            .create_async()
+            .await;
+
+        let github_cfg = github_cfg_with_inline_token("fork-owner");
+        let repo = repo_cfg("https://github.com/upstream-org/repo.git");
+        let outcome = recreate_fork_at_for_test(&server.url(), &github_cfg, &repo)
+            .await
+            .expect("recreate should succeed on 204+202");
+        assert_eq!(outcome, RecreateOutcome::Recreated);
+        delete_mock.assert_async().await;
+        create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn recreate_fork_already_gone_proceeds_to_create() {
+        let mut server = mockito::Server::new_async().await;
+        let delete_mock = server
+            .mock("DELETE", "/repos/fork-owner/repo")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let create_mock = server
+            .mock("POST", "/repos/upstream-org/repo/forks")
+            .with_status(202)
+            .with_body(r#"{"name":"repo"}"#)
+            .create_async()
+            .await;
+
+        let github_cfg = github_cfg_with_inline_token("fork-owner");
+        let repo = repo_cfg("https://github.com/upstream-org/repo.git");
+        let outcome = recreate_fork_at_for_test(&server.url(), &github_cfg, &repo)
+            .await
+            .expect("404-then-create path must succeed");
+        assert_eq!(outcome, RecreateOutcome::Recreated);
+        delete_mock.assert_async().await;
+        create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn recreate_fork_forbidden_returns_forbidden_without_creating() {
+        let mut server = mockito::Server::new_async().await;
+        let delete_mock = server
+            .mock("DELETE", "/repos/fork-owner/repo")
+            .with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by personal access token"}"#)
+            .create_async()
+            .await;
+        // CREATE must NOT be invoked when DELETE returns 403.
+        let create_mock = server
+            .mock("POST", "/repos/upstream-org/repo/forks")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let github_cfg = github_cfg_with_inline_token("fork-owner");
+        let repo = repo_cfg("https://github.com/upstream-org/repo.git");
+        let outcome = recreate_fork_at_for_test(&server.url(), &github_cfg, &repo)
+            .await
+            .expect("403 must surface as Forbidden, not Err");
+        assert_eq!(outcome, RecreateOutcome::Forbidden);
+        delete_mock.assert_async().await;
+        create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn recreate_fork_errors_when_fork_owner_unset() {
+        let mut github_cfg = github_cfg_with_inline_token("placeholder");
+        github_cfg.fork_owner = None;
+        let repo = repo_cfg("https://github.com/upstream-org/repo.git");
+        let err = recreate_fork_at_for_test("http://example.invalid", &github_cfg, &repo)
+            .await
+            .expect_err("missing fork_owner must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fork_owner"),
+            "error must mention fork_owner: {msg}"
+        );
     }
 }

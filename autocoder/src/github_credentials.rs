@@ -68,6 +68,7 @@ mod tests {
             token,
             owner_tokens,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         }
     }
 

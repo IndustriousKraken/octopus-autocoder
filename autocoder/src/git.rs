@@ -50,6 +50,15 @@ pub fn fetch(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `git fetch <remote>` — fetch from a named remote (e.g. `fork`).
+/// Used by `workspace::ensure_initialized` to sync the fork's tracking
+/// ref after a fresh clone, so subsequent `--force-with-lease` pushes
+/// compare against accurate data.
+pub fn fetch_remote(workspace: &Path, remote: &str) -> Result<()> {
+    run_git(workspace, "fetch <remote>", &["fetch", remote])?;
+    Ok(())
+}
+
 pub fn checkout(workspace: &Path, branch: &str) -> Result<()> {
     run_git(workspace, "checkout", &["checkout", branch])?;
     Ok(())
@@ -397,6 +406,45 @@ mod tests {
         run_init(&workspace, &["push", "-q", "-u", "origin", "main"]);
 
         (dir, workspace, remote)
+    }
+
+    #[test]
+    fn fetch_remote_invokes_git_fetch_for_named_remote() {
+        let (dir, ws, _origin) = fixture_clone_with_bare_remote();
+        // Set up a second bare remote with a distinct commit.
+        let alt_remote = dir.path().join("alt.git");
+        std::fs::create_dir_all(&alt_remote).unwrap();
+        let st = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(&alt_remote)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        // Seed alt with its own commit by pushing from a side worktree.
+        let alt_work = dir.path().join("alt-work");
+        std::fs::create_dir_all(&alt_work).unwrap();
+        let alt_url = alt_remote.to_string_lossy().to_string();
+        run_init(&alt_work, &["clone", "-q", &alt_url, "."]);
+        run_init(&alt_work, &["config", "user.email", "test@example.com"]);
+        run_init(&alt_work, &["config", "user.name", "test"]);
+        std::fs::write(alt_work.join("ALT.md"), "alt content").unwrap();
+        run_init(&alt_work, &["add", "ALT.md"]);
+        run_init(&alt_work, &["commit", "-q", "-m", "alt initial"]);
+        run_init(&alt_work, &["push", "-q", "origin", "main"]);
+
+        run_init(&ws, &["remote", "add", "alt", &alt_url]);
+        fetch_remote(&ws, "alt").expect("fetch_remote should succeed");
+
+        // After fetch, refs/remotes/alt/main should resolve to alt's commit.
+        let probe = Command::new("git")
+            .args(["rev-parse", "refs/remotes/alt/main"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "refs/remotes/alt/main must resolve after fetch_remote"
+        );
     }
 
     #[test]

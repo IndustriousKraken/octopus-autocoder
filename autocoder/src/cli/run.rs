@@ -25,6 +25,11 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     openspec_preflight()?;
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
+    if cfg.github.recreate_fork_on_reinit && cfg.github.fork_owner.is_none() {
+        tracing::info!(
+            "github.recreate_fork_on_reinit is true but fork_owner is unset; flag will have no effect"
+        );
+    }
     ensure_forks_exist(&cfg.github, &cfg.repositories).await?;
 
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
@@ -502,6 +507,22 @@ pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig)
         },
         None => None,
     };
+    // Recreate-fork mode + absent workspace: defer all init to the first
+    // polling iteration. The recreate path runs async (`DELETE /repos/...`
+    // + `POST /repos/.../forks`) and we can't call async work from the
+    // sync spawn closure that wraps this function. The polling iteration
+    // has its own async context and its own failure-alert plumbing.
+    let defer_init =
+        github.recreate_fork_on_reinit && fork_url.is_some() && !workspace_path.exists();
+    if defer_init {
+        tracing::info!(
+            url = repo.url.as_str(),
+            workspace = %workspace_path.display(),
+            "deferring workspace init to first polling iteration \
+             (recreate_fork_on_reinit + absent workspace)"
+        );
+        return true;
+    }
     if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_url.as_deref()) {
         tracing::error!(
             url = repo.url.as_str(),
@@ -683,6 +704,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         // No repos to validate; no fork_owner means the function returns Ok
         // without probing anything.
@@ -701,6 +723,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
+            recreate_fork_on_reinit: false,
         };
         let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
         let err = ensure_forks_exist(&github, &repos)
@@ -736,6 +759,7 @@ mod tests {
             token: None,
             owner_tokens: Some(map),
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
 
         let repos = vec![
@@ -781,6 +805,7 @@ mod tests {
             }),
             owner_tokens: Some(map),
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         let repos = vec![
             repo("git@github.com:fixture-org/repo.git"),    // owner_tokens hit
@@ -810,6 +835,7 @@ mod tests {
             token: None,
             owner_tokens: Some(map),
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
 
         let repos = vec![
@@ -843,6 +869,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         assert!(
             repo_passes_startup_check(&dirty_repo, &direct_push_github),
@@ -882,6 +909,7 @@ mod tests {
             token: None,
             owner_tokens: None,
             fork_owner: None,
+            recreate_fork_on_reinit: false,
         };
         assert!(repo_passes_startup_check(&clean_repo, &direct_push_github),
             "clean workspace must pass startup check");
