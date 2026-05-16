@@ -1138,10 +1138,15 @@ async fn post_perma_stuck_alert(
         .join("openspec/changes")
         .join(change)
         .join(".perma-stuck.json");
+    // Tied to the Claude CLI executor's log convention; refactor to an
+    // Executor trait method if a second executor backend with a
+    // different log layout is added.
+    let log_path = crate::executor::claude_cli::run_log_path(&workspace, change);
     let text = format!(
-        ":no_entry: autocoder: change perma-stuck\nrepo: {}\nchange: {}\nconsecutive_failures: {count}\nlast_reason: {excerpt}\n\nThis change has failed {count} iterations in a row. autocoder will not retry until an operator removes {}.",
+        ":no_entry: autocoder: change perma-stuck\nrepo: {}\nchange: {}\nconsecutive_failures: {count}\nlast_reason: {excerpt}\nrun_log: {}\n\nThis change has failed {count} iterations in a row. autocoder will not retry until an operator removes {}.",
         repo.url,
         change,
+        log_path.display(),
         marker_path.display(),
     );
     if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
@@ -4483,6 +4488,64 @@ mod tests {
                 .exists(),
             "marker should be written when threshold = 1 and the executor failed once"
         );
+        alert_mock.assert_async().await;
+    }
+
+    /// perma-stuck-alert-includes-log-path: the alert body MUST include a
+    /// `run_log:` line pointing at the per-change run log so the
+    /// operator can diagnose the failure without knowing the path convention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perma_stuck_alert_body_contains_log_path() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "log-path-fixture", "diagnostic test");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        // Match BOTH the perma-stuck subject AND the run_log: line with
+        // the expected change name segment.
+        let alert_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("change perma-stuck".to_string()),
+                mockito::Matcher::Regex("run_log:".to_string()),
+                mockito::Matcher::Regex("log-path-fixture\\.log".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _other = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let executor = AlwaysFailingExecutor;
+        let _ = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+            1, // threshold = 1
+            u32::MAX,
+        )
+        .await;
         alert_mock.assert_async().await;
     }
 
