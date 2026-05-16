@@ -555,7 +555,7 @@ Both jitters cost almost nothing in wall-clock and respect SIGTERM/SIGINT (cance
 
 ### Queue order
 
-Pending changes are processed in `proposal.md` modification-time order, oldest first. The entry name breaks ties when two `proposal.md` files share the same mtime. Operators who want a specific ordering should author proposals in the order they want them applied — no leading `01-`/`02-` prefixes are needed.
+Pending changes are processed in ascending entry-name order (UTF-8 byte order, which is alphabetical for ASCII names). Operators with stacked dependencies — i.e. change N+1 depends on change N — encode order explicitly by prefixing change names with a number: `01-rename-foo`, `02-extract-bar`, `03-wire-baz`. The prefix is the operator's contract for "this change depends on the previous in sequence." For unrelated changes, no prefix is needed; alphabetical order is arbitrary but deterministic.
 
 Each iteration commits at most `max_changes_per_pr` archived changes (default `3`); any remaining pending changes wait for the next iteration. The cap is configurable per repository, or globally via `executor.max_changes_per_pr`. A long queue therefore ships as several reviewable PRs over time rather than one large PR.
 

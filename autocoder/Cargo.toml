@@ -25,6 +25,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-filetime = "0.2"
 mockito = "1"
 tracing-test = "0.2"
