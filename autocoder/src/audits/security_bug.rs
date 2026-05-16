@@ -1,19 +1,22 @@
-//! Missing-tests audit. Invokes the wrapped agent CLI with an
-//! `OpenSpecOnly` sandbox and a missing-tests prompt. The agent
-//! surveys the source tree, identifies uncovered behavior, and writes
-//! up to `max_proposals_per_run` new OpenSpec change directories under
-//! `openspec/changes/` proposing tests to fill those gaps.
+//! Security & bug audit. Invokes the wrapped agent CLI with an
+//! `OpenSpecOnly` sandbox and a security-and-bug-detection prompt.
+//! The agent surveys the source tree for high-confidence security
+//! issues and likely bugs, then writes up to `max_proposals_per_run`
+//! new OpenSpec change directories under `openspec/changes/` proposing
+//! a fix per finding. The shared
+//! [`super::specs_writing::run_specs_writing_audit`] helper handles
+//! the sandbox, snapshot diff, validation, over-cap pruning, and
+//! commit; this module's only responsibilities are reading settings,
+//! resolving the prompt, and delegating.
 //!
-//! The audit itself does NOT decide which gaps matter — that's the
-//! agent's job. The shared [`super::specs_writing::run_specs_writing_audit`]
-//! helper handles the sandbox, snapshot diff, validation, over-cap
-//! pruning, and commit. This module's only responsibilities are
-//! reading settings, resolving the prompt, and delegating.
+//! `requires_head_change = true` — re-surveying the same SHA finds
+//! the same issues. `WritePolicy::OpenSpecOnly` — the agent may write
+//! under `openspec/changes/` but nowhere else; the framework reverts
+//! anything else.
 //!
-//! `requires_head_change = true` — there is no point re-surveying the
-//! same code state for new coverage gaps. `WritePolicy::OpenSpecOnly`
-//! — the agent may write under `openspec/changes/` but nowhere else;
-//! a write outside that prefix triggers the framework's revert.
+//! Naming convention: proposed change directories are prefixed with
+//! `fix-` for bug fixes and `secure-` for security hardening so
+//! operators can recognize audit-produced changes at a glance.
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -25,19 +28,19 @@ use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 
 /// Built-in default prompt, embedded at compile time so the binary
 /// runs without requiring `prompts/` on disk.
-const DEFAULT_PROMPT: &str = include_str!("../../../prompts/missing-tests-audit.md");
+const DEFAULT_PROMPT: &str = include_str!("../../../prompts/security-bug-audit.md");
 
 /// Placeholder substituted into the prompt with the per-run cap.
 const MAX_PROPOSALS_PLACEHOLDER: &str = "{{MAX_PROPOSALS}}";
 
 /// Default cap on the number of change directories the audit will
 /// commit per run. Operators override via
-/// `audits.settings.missing_tests_audit.extra.max_proposals_per_run`.
+/// `audits.settings.security_bug_audit.extra.max_proposals_per_run`.
 pub const DEFAULT_MAX_PROPOSALS_PER_RUN: u32 = 2;
 
 const SETTINGS_KEY_MAX_PROPOSALS: &str = "max_proposals_per_run";
 
-pub struct MissingTestsAudit {
+pub struct SecurityBugAudit {
     pub settings: AuditSettings,
     pub max_proposals_per_run: u32,
     pub executor_command: String,
@@ -53,8 +56,8 @@ pub struct MissingTestsAudit {
     openspec_command: String,
 }
 
-impl MissingTestsAudit {
-    pub const TYPE: &'static str = "missing_tests_audit";
+impl SecurityBugAudit {
+    pub const TYPE: &'static str = "security_bug_audit";
 
     pub fn new(
         audit_settings: &std::collections::HashMap<String, AuditSettings>,
@@ -108,13 +111,13 @@ impl MissingTestsAudit {
             Some(path) => {
                 let body = std::fs::read_to_string(path).with_context(|| {
                     format!(
-                        "reading missing-tests-audit prompt override at {}",
+                        "reading security-bug-audit prompt override at {}",
                         path.display()
                     )
                 })?;
                 if body.trim().is_empty() {
                     return Err(anyhow!(
-                        "missing-tests-audit prompt override at {} is empty",
+                        "security-bug-audit prompt override at {} is empty",
                         path.display()
                     ));
                 }
@@ -130,7 +133,7 @@ impl MissingTestsAudit {
 }
 
 #[async_trait]
-impl Audit for MissingTestsAudit {
+impl Audit for SecurityBugAudit {
     fn audit_type(&self) -> &'static str {
         Self::TYPE
     }
@@ -162,7 +165,7 @@ impl Audit for MissingTestsAudit {
                 settings_dir: self.settings_dir.as_deref(),
                 openspec_command: &self.openspec_command,
                 prompt_source: &prompt_source,
-                commit_subject: "missing-tests proposals",
+                commit_subject: "security-bug proposals",
             },
             ctx,
         )
@@ -172,7 +175,6 @@ impl Audit for MissingTestsAudit {
 
 #[cfg(test)]
 mod tests {
-    use super::super::specs_writing::snapshot_change_dirs;
     use super::*;
     use crate::audits::AuditLogWriter;
     use crate::config::{ExecutorKind, RepositoryConfig};
@@ -218,9 +220,6 @@ mod tests {
         path
     }
 
-    /// Initialize a workspace with `openspec/changes/` populated by a
-    /// caller-provided list of existing change directory names. Returns
-    /// the TempDir handle (drop = cleanup) and the workspace path.
     fn init_workspace_with(existing_changes: &[&str]) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
         let ws = dir.path().to_path_buf();
@@ -263,41 +262,26 @@ mod tests {
     }
 
     fn make_log_writer(workspace: &Path) -> AuditLogWriter {
-        AuditLogWriter::open(workspace, MissingTestsAudit::TYPE)
+        AuditLogWriter::open(workspace, SecurityBugAudit::TYPE)
             .expect("audit log open succeeds")
     }
 
     // ------------- Settings / prompt resolution -------------
 
     #[test]
-    fn new_reads_max_proposals_from_extra_and_defaults_otherwise() {
-        let mut extra = HashMap::new();
-        extra.insert(
-            SETTINGS_KEY_MAX_PROPOSALS.into(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(5_u64)),
-        );
-        let mut settings_map = HashMap::new();
-        settings_map.insert(
-            MissingTestsAudit::TYPE.to_string(),
-            AuditSettings {
-                prompt_path: None,
-                notify_on_clean: false,
-                extra,
-            },
-        );
+    fn audit_type_and_policy_are_fixed() {
         let cfg = executor_cfg("/bin/true");
-        let audit = MissingTestsAudit::new(&settings_map, &cfg);
-        assert_eq!(audit.max_proposals_per_run, 5);
-
-        let bare = MissingTestsAudit::new(&HashMap::new(), &cfg);
-        assert_eq!(bare.max_proposals_per_run, DEFAULT_MAX_PROPOSALS_PER_RUN);
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg);
+        assert_eq!(audit.audit_type(), "security_bug_audit");
+        assert!(audit.requires_head_change());
+        assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
     }
 
     #[test]
-    fn parses_max_proposals_substitution_into_prompt() {
+    fn prompt_substitution_includes_max_proposals() {
         let cfg = executor_cfg("/bin/true");
         let audit =
-            MissingTestsAudit::new(&HashMap::new(), &cfg).with_max_proposals(7);
+            SecurityBugAudit::new(&HashMap::new(), &cfg).with_max_proposals(4);
         let prompt = audit.resolve_prompt().expect("default prompt resolves");
         assert!(
             !prompt.contains(MAX_PROPOSALS_PLACEHOLDER),
@@ -305,199 +289,69 @@ mod tests {
             MAX_PROPOSALS_PLACEHOLDER
         );
         assert!(
-            prompt.contains("MAX_PROPOSALS: 7"),
-            "substituted value must appear: {prompt}"
+            prompt.contains("MAX_PROPOSALS: 4"),
+            "substituted value must appear in the prompt: {prompt}"
         );
     }
 
     #[test]
-    fn resolve_prompt_reads_override_file_and_substitutes() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("override.md");
-        std::fs::write(&p, "CUSTOM PROMPT cap={{MAX_PROPOSALS}}").unwrap();
-        let mut map = HashMap::new();
-        map.insert(
-            MissingTestsAudit::TYPE.into(),
+    fn new_reads_max_proposals_from_extra_and_defaults_otherwise() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            SETTINGS_KEY_MAX_PROPOSALS.into(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(6_u64)),
+        );
+        let mut settings_map = HashMap::new();
+        settings_map.insert(
+            SecurityBugAudit::TYPE.to_string(),
             AuditSettings {
-                prompt_path: Some(p),
+                prompt_path: None,
                 notify_on_clean: false,
-                extra: HashMap::new(),
+                extra,
             },
         );
         let cfg = executor_cfg("/bin/true");
-        let audit = MissingTestsAudit::new(&map, &cfg).with_max_proposals(3);
-        let prompt = audit.resolve_prompt().expect("override resolves");
-        assert!(prompt.contains("CUSTOM PROMPT"));
-        assert!(prompt.contains("cap=3"));
+        let audit = SecurityBugAudit::new(&settings_map, &cfg);
+        assert_eq!(audit.max_proposals_per_run, 6);
+
+        let bare = SecurityBugAudit::new(&HashMap::new(), &cfg);
+        assert_eq!(bare.max_proposals_per_run, DEFAULT_MAX_PROPOSALS_PER_RUN);
     }
 
+    /// The prompt must contain the confidence-filter and out-of-scope
+    /// instructions: without them, the audit's noise floor would be
+    /// unacceptable. Asserts on the embedded default so accidental
+    /// prompt drift breaks CI rather than the operator's mailbox.
     #[test]
-    fn resolve_prompt_errors_on_empty_override() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("empty.md");
-        std::fs::write(&p, "  \n").unwrap();
-        let mut map = HashMap::new();
-        map.insert(
-            MissingTestsAudit::TYPE.into(),
-            AuditSettings {
-                prompt_path: Some(p),
-                notify_on_clean: false,
-                extra: HashMap::new(),
-            },
-        );
+    fn low_confidence_finding_filtering_explicit_in_prompt() {
         let cfg = executor_cfg("/bin/true");
-        let audit = MissingTestsAudit::new(&map, &cfg);
-        let err = audit.resolve_prompt().expect_err("empty override errors");
-        assert!(format!("{err:#}").contains("empty"));
-    }
-
-    #[test]
-    fn audit_type_and_policy_are_fixed() {
-        let cfg = executor_cfg("/bin/true");
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg);
-        assert_eq!(audit.audit_type(), "missing_tests_audit");
-        assert!(audit.requires_head_change());
-        assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
-    }
-
-    // ------------- Pre-run snapshot -------------
-
-    #[test]
-    fn pre_run_snapshot_captures_existing_change_dirs() {
-        let (_t, ws) =
-            init_workspace_with(&["existing-one", "existing-two"]);
-        // Add an archive dir; it should NOT count toward the snapshot.
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/old-thing")).unwrap();
-        let snap = snapshot_change_dirs(&ws);
-        assert!(snap.contains("existing-one"));
-        assert!(snap.contains("existing-two"));
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg);
+        let prompt = audit.resolve_prompt().expect("default prompt resolves");
         assert!(
-            !snap.contains("archive"),
-            "archive/ must be excluded from the snapshot"
+            prompt.contains("Only emit a change for findings you are highly confident about"),
+            "prompt must instruct high-confidence filter: {prompt}"
         );
-        assert_eq!(snap.len(), 2);
+        assert!(
+            prompt.contains("false positive wastes downstream implementer work"),
+            "prompt must explain WHY low-confidence findings are harmful: {prompt}"
+        );
+        assert!(
+            prompt.contains("When in doubt, DON'T emit"),
+            "prompt must explicitly tell the agent to drop uncertain findings: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do NOT propose stylistic"),
+            "prompt must forbid stylistic 'best-practice' suggestions: {prompt}"
+        );
     }
 
-    #[test]
-    fn snapshot_handles_missing_openspec_changes_dir() {
-        let tmp = TempDir::new().unwrap();
-        let snap = snapshot_change_dirs(tmp.path());
-        assert!(snap.is_empty(), "missing dir → empty snapshot, not panic");
-    }
-
-    // ------------- Post-run new-dir detection -------------
+    // ------------- Full-run scenarios -------------
 
     #[tokio::test]
-    async fn post_run_detects_only_new_change_dirs() {
-        let (_t, ws) = init_workspace_with(&["already-here"]);
-        // Fake CLI: drop a fresh change directory under openspec/changes/.
-        let new_change_dir = ws
-            .join("openspec/changes/tests-new-thing")
-            .display()
-            .to_string();
-        let script = write_script(
-            &ws,
-            "fake-claude.sh",
-            &format!(
-                "#!/bin/sh\nmkdir -p '{new_change_dir}'\necho '# proposal' > '{new_change_dir}/proposal.md'\nexit 0\n"
-            ),
-        );
-        // Fake openspec validator: always passes (exit 0).
-        let ok_validator = write_script(&ws, "fake-openspec-ok.sh", "#!/bin/sh\nexit 0\n");
-
-        let cfg = executor_cfg(&script.to_string_lossy());
-        let settings_dir = TempDir::new().unwrap();
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf())
-            .with_openspec_command(ok_validator.to_string_lossy().to_string());
-        let repo = fixture_repo();
-        let mut ctx = AuditContext {
-            workspace: &ws,
-            repo: &repo,
-            chatops_ctx: None,
-            log_writer: make_log_writer(&ws),
-        };
-        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
-        match outcome {
-            AuditOutcome::SpecsWritten(names) => {
-                assert_eq!(names, vec!["tests-new-thing".to_string()]);
-            }
-            other => panic!("expected SpecsWritten, got {other:?}"),
-        }
-        let log_path = ctx.log_writer.path().to_path_buf();
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
-        }
-    }
-
-    #[tokio::test]
-    async fn validation_failure_rejects_change_and_logs_warning() {
-        let (_t, ws) = init_workspace_with(&[]);
-        // CLI creates one change dir.
-        let new = ws
-            .join("openspec/changes/tests-bad-shape")
-            .display()
-            .to_string();
-        let script = write_script(
-            &ws,
-            "fake-claude.sh",
-            &format!(
-                "#!/bin/sh\nmkdir -p '{new}'\necho '# nope' > '{new}/proposal.md'\nexit 0\n"
-            ),
-        );
-        // Validator always fails (nonzero exit).
-        let bad_validator = write_script(
-            &ws,
-            "fake-openspec-fail.sh",
-            "#!/bin/sh\necho 'spec missing scenarios' >&2\nexit 2\n",
-        );
-
-        let cfg = executor_cfg(&script.to_string_lossy());
-        let settings_dir = TempDir::new().unwrap();
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf())
-            .with_openspec_command(bad_validator.to_string_lossy().to_string());
-        let repo = fixture_repo();
-        let mut ctx = AuditContext {
-            workspace: &ws,
-            repo: &repo,
-            chatops_ctx: None,
-            log_writer: make_log_writer(&ws),
-        };
-        let log_path = ctx.log_writer.path().to_path_buf();
-
-        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
-        match outcome {
-            AuditOutcome::SpecsWritten(names) => {
-                assert!(
-                    names.is_empty(),
-                    "validation failure must reject the change: got {names:?}"
-                );
-            }
-            other => panic!("expected SpecsWritten(empty), got {other:?}"),
-        }
-        // The invalid change directory must have been removed.
-        assert!(
-            !ws.join("openspec/changes/tests-bad-shape").exists(),
-            "invalid change directory must be removed so the framework's \
-             post-hoc OpenSpecOnly check sees a clean tree"
-        );
-        // Audit log captured the validation failure.
-        let log = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            log.contains("missing_tests_audit_validation_failure_tests-bad-shape"),
-            "validation failure must be logged: {log}"
-        );
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
-        }
-    }
-
-    #[tokio::test]
-    async fn validation_success_commits_change_to_agent_branch() {
+    async fn change_with_fix_prefix_validates_and_commits() {
         let (_t, ws) = init_workspace_with(&[]);
         let new = ws
-            .join("openspec/changes/tests-good-thing")
+            .join("openspec/changes/fix-off-by-one-in-queue-walker")
             .display()
             .to_string();
         let script = write_script(
@@ -511,7 +365,7 @@ mod tests {
 
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_openspec_command(ok_validator.to_string_lossy().to_string());
         let repo = fixture_repo();
@@ -522,29 +376,18 @@ mod tests {
             log_writer: make_log_writer(&ws),
         };
         let log_path = ctx.log_writer.path().to_path_buf();
-        let _ = audit.run(&mut ctx).await.expect("run succeeds");
 
-        // The validated change must have been committed: the workspace
-        // should now be clean (no porcelain).
-        let porcelain = StdCommand::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&ws)
-            .output()
-            .unwrap();
-        let porcelain_str = String::from_utf8_lossy(&porcelain.stdout);
-        // Strip the fake-claude.sh and fake-openspec-ok.sh untracked
-        // entries before asserting cleanliness (those are test fixture
-        // files, not the audit's writes).
-        let interesting: Vec<&str> = porcelain_str
-            .lines()
-            .filter(|l| !l.contains("fake-"))
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        assert!(
-            interesting.is_empty(),
-            "validated change must be committed; leftover porcelain: {interesting:?}"
-        );
-        // Git log must mention the commit.
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten(names) => {
+                assert_eq!(
+                    names,
+                    vec!["fix-off-by-one-in-queue-walker".to_string()]
+                );
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        // Commit message names the audit and the count.
         let log = StdCommand::new("git")
             .args(["log", "--oneline", "-n", "5"])
             .current_dir(&ws)
@@ -552,7 +395,8 @@ mod tests {
             .unwrap();
         let log_str = String::from_utf8_lossy(&log.stdout);
         assert!(
-            log_str.contains("missing-tests proposals") && log_str.contains("1 change(s)"),
+            log_str.contains("security-bug proposals")
+                && log_str.contains("1 change(s)"),
             "commit message must reflect the validated count: {log_str}"
         );
         if let Some(parent) = log_path.parent() {
@@ -561,15 +405,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_findings_no_commit_no_chatops_post() {
+    async fn change_with_secure_prefix_validates_and_commits() {
         let (_t, ws) = init_workspace_with(&[]);
-        // CLI exits cleanly without creating any change directory.
-        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let new = ws
+            .join("openspec/changes/secure-sanitize-user-paths")
+            .display()
+            .to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\necho '# proposal' > '{new}/proposal.md'\nexit 0\n"
+            ),
+        );
         let ok_validator = write_script(&ws, "fake-openspec-ok.sh", "#!/bin/sh\nexit 0\n");
 
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_openspec_command(ok_validator.to_string_lossy().to_string());
         let repo = fixture_repo();
@@ -581,38 +434,49 @@ mod tests {
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
-        // Capture HEAD before run.
-        let head_before = crate::git::rev_parse(&ws, "HEAD").unwrap();
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => assert!(names.is_empty()),
-            other => panic!("expected SpecsWritten(empty), got {other:?}"),
+            AuditOutcome::SpecsWritten(names) => {
+                assert_eq!(
+                    names,
+                    vec!["secure-sanitize-user-paths".to_string()]
+                );
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
         }
-        // HEAD must not have moved (no commit made).
-        let head_after = crate::git::rev_parse(&ws, "HEAD").unwrap();
-        assert_eq!(head_before, head_after, "empty findings must NOT commit");
-
+        let log = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "5"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log_str.contains("security-bug proposals")
+                && log_str.contains("1 change(s)"),
+            "commit message must reflect the validated count: {log_str}"
+        );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
     }
 
     #[tokio::test]
-    async fn over_cap_excess_change_dirs_are_dropped_before_commit() {
-        // Defense-in-depth: even if the agent creates more change dirs
-        // than the cap, the audit must NOT commit or return more than
-        // `max_proposals_per_run` of them.
+    async fn oversized_run_truncated_to_cap_with_warn_log() {
+        // Defense-in-depth: if the agent ignores its cap and produces
+        // more change dirs than `max_proposals_per_run`, the helper
+        // must truncate (deterministic by sorted name) and log the
+        // dropped names.
         let (_t, ws) = init_workspace_with(&[]);
         let c1 = ws
-            .join("openspec/changes/tests-a")
+            .join("openspec/changes/fix-a")
             .display()
             .to_string();
         let c2 = ws
-            .join("openspec/changes/tests-b")
+            .join("openspec/changes/secure-b")
             .display()
             .to_string();
         let c3 = ws
-            .join("openspec/changes/tests-c")
+            .join("openspec/changes/secure-c")
             .display()
             .to_string();
         let script_body = format!(
@@ -623,7 +487,7 @@ mod tests {
 
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_openspec_command(ok_validator.to_string_lossy().to_string())
             .with_max_proposals(2);
@@ -635,17 +499,33 @@ mod tests {
             log_writer: make_log_writer(&ws),
         };
         let log_path = ctx.log_writer.path().to_path_buf();
+
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
             AuditOutcome::SpecsWritten(names) => {
                 assert_eq!(names.len(), 2, "cap must hold: got {names:?}");
-                // Deterministic: sorted names → tests-a, tests-b kept.
-                assert_eq!(names, vec!["tests-a".to_string(), "tests-b".to_string()]);
+                // Deterministic: sorted names → fix-a, secure-b kept;
+                // secure-c dropped.
+                assert_eq!(
+                    names,
+                    vec!["fix-a".to_string(), "secure-b".to_string()]
+                );
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
         }
         // The dropped change dir must not survive.
-        assert!(!ws.join("openspec/changes/tests-c").exists());
+        assert!(!ws.join("openspec/changes/secure-c").exists());
+        // The audit log captured the WARN-equivalent: a section naming
+        // the dropped changes.
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("security_bug_audit_dropped_over_cap"),
+            "log must contain the dropped-over-cap section: {log}"
+        );
+        assert!(
+            log.contains("secure-c"),
+            "log must name the dropped change: {log}"
+        );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
