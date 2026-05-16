@@ -3,7 +3,9 @@
 //! all tasks to finish.
 
 use crate::audits::{
-    Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit,
+    Audit, AuditRegistry,
+    architecture_consultative::ArchitectureConsultativeAudit,
+    brightline::ArchitectureBrightlineAudit,
     dependency_update::DependencyUpdateAudit, drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
@@ -160,6 +162,10 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         &cfg.executor,
     )));
     registry.register(Arc::new(SecurityBugAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
+    registry.register(Arc::new(ArchitectureConsultativeAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
