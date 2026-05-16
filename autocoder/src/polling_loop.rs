@@ -949,6 +949,12 @@ async fn walk_queue(
             "change finished"
         );
 
+        // Any non-Archive outcome halts the walk. Later changes in the
+        // queue may depend on this one having succeeded; attempting them
+        // now would either produce wrong-shape commits or contaminate
+        // this change's retry. Perma-stuck (default threshold 2) bounds
+        // repeat failures: a persistently-failing change is excluded
+        // from `list_pending` after the threshold, freeing the queue.
         match result {
             Ok(QueueStep::Archived) | Ok(QueueStep::ArchivedSelfHeal) => {
                 let was_self_heal = matches!(&result, Ok(QueueStep::ArchivedSelfHeal));
@@ -977,7 +983,9 @@ async fn walk_queue(
             }
             Ok(QueueStep::Failed { reason }) => {
                 // Failed (or transformed-to-Failed) → bump the counter and,
-                // if the threshold is hit, mark perma-stuck + alert.
+                // if the threshold is hit, mark perma-stuck + alert. Then
+                // halt the walk: later pending changes may depend on this
+                // one and should not be attempted until the next iteration.
                 handle_failure_counter(
                     workspace,
                     repo,
@@ -987,8 +995,25 @@ async fn walk_queue(
                     perma_stuck_threshold,
                 )
                 .await;
+                tracing::info!(
+                    url = %repo.url,
+                    change = %change,
+                    "change failed; halting queue walk this iteration (later changes may depend on this one)"
+                );
+                break;
             }
-            Ok(QueueStep::Escalated) => {} // posted to Slack; continue to next
+            Ok(QueueStep::Escalated) => {
+                // Escalation posts a question to chatops and leaves the
+                // change in the waiting set. Later pending changes may
+                // depend on it; halt the walk so they wait for the human
+                // reply on the next iteration.
+                tracing::info!(
+                    url = %repo.url,
+                    change = %change,
+                    "change escalated to chatops; halting queue walk this iteration"
+                );
+                break;
+            }
             Ok(QueueStep::AskUserExitEarly) => {
                 tracing::error!(
                     url = repo.url.as_str(),
@@ -4840,23 +4865,24 @@ mod tests {
         );
     }
 
-    /// max-changes-per-pr-limit: a `Failed` outcome does NOT count toward
-    /// the cap; the walk continues to the next pending change.
+    /// halt-queue-walk-on-non-archive: a `Failed` outcome halts the walk
+    /// regardless of cap. Changes later in the queue may depend on the
+    /// failed one and SHALL NOT be attempted until the next iteration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn walk_queue_failed_change_does_not_count_toward_cap() {
+    async fn walk_queue_halts_on_failed_change() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        // First change: will fail (no artifact written).
-        add_committed_change(&ws, "ch01-fails", "will fail");
-        // Subsequent changes: will succeed.
-        add_committed_change(&ws, "ch02", "succeeds");
-        add_committed_change(&ws, "ch03", "succeeds");
-        add_committed_change(&ws, "ch04", "succeeds");
+        // ch01 succeeds, ch02 fails, ch03 and ch04 would succeed but the
+        // walk must halt at the failure.
+        add_committed_change(&ws, "ch01", "succeeds first");
+        add_committed_change(&ws, "ch02-fails", "fails second");
+        add_committed_change(&ws, "ch03", "should not be attempted");
+        add_committed_change(&ws, "ch04", "should not be attempted");
 
-        struct FailFirstThenArtifact;
+        struct ArchiveThenFailThenWouldArchive;
         #[async_trait::async_trait]
-        impl Executor for FailFirstThenArtifact {
+        impl Executor for ArchiveThenFailThenWouldArchive {
             async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
-                if change == "ch01-fails" {
+                if change == "ch02-fails" {
                     return Ok(ExecutorOutcome::Failed {
                         reason: "fixture failure".into(),
                     });
@@ -4876,7 +4902,7 @@ mod tests {
             }
         }
 
-        let executor = FailFirstThenArtifact;
+        let executor = ArchiveThenFailThenWouldArchive;
         let github_cfg = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
             token: None,
@@ -4890,25 +4916,125 @@ mod tests {
             &executor,
             None,
             u32::MAX,
-            2, // cap of 2 archived
+            10, // cap intentionally generous; halt must come from the failure
         )
         .await
         .expect("pass succeeds");
         assert_eq!(
             processed,
-            vec!["ch02".to_string(), "ch03".to_string()],
-            "Failed `ch01-fails` doesn't count; cap stops the walk after 2 archives"
+            vec!["ch01".to_string()],
+            "only ch01 archived; ch02-fails halts the walk before ch03/ch04"
         );
-        // ch01-fails is still pending (failed once, retries next iteration).
-        // ch04 is still pending (cap stopped the walk before it ran).
+        // ch02-fails still pending (failed once, retries next iteration).
+        // ch03 and ch04 still pending (walker never reached them).
         let still_pending = queue::list_pending(&ws).unwrap();
         assert!(
-            still_pending.contains(&"ch01-fails".to_string()),
+            still_pending.contains(&"ch02-fails".to_string()),
             "failed change still pending for retry: {still_pending:?}"
         );
         assert!(
+            still_pending.contains(&"ch03".to_string()),
+            "untouched ch03 still pending: {still_pending:?}"
+        );
+        assert!(
             still_pending.contains(&"ch04".to_string()),
-            "untouched change still pending: {still_pending:?}"
+            "untouched ch04 still pending: {still_pending:?}"
+        );
+        // ch03 must not have a failure-state entry — it was never attempted.
+        assert!(
+            !ws.join("openspec/changes/ch03/.failure-state.json").exists(),
+            "ch03 must not have a failure-state entry — walker never reached it"
+        );
+    }
+
+    /// halt-queue-walk-on-non-archive: an `Escalated` outcome (AskUser
+    /// posted to chatops) halts the walk regardless of cap. Later
+    /// pending changes wait for the next iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_queue_halts_on_escalated_change() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "ch01", "succeeds first");
+        add_committed_change(&ws, "ch02-asks", "asks a question");
+        add_committed_change(&ws, "ch03", "should not be attempted");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let _post = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"2222222222.111111"}"#)
+            .create_async()
+            .await;
+
+        struct ArchiveThenAskThenWouldArchive {
+            ws: std::path::PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl Executor for ArchiveThenAskThenWouldArchive {
+            async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+                if change == "ch02-asks" {
+                    return Ok(ExecutorOutcome::AskUser {
+                        question: "Halt me?".to_string(),
+                        resume_handle: ResumeHandle(
+                            serde_json::json!({"change": change, "workspace": self.ws}),
+                        ),
+                    });
+                }
+                std::fs::write(
+                    workspace.join(format!("artifact-{change}.txt")),
+                    format!("contents for {change}\n"),
+                )?;
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!("resume not exercised in this test")
+            }
+        }
+
+        let executor = ArchiveThenAskThenWouldArchive { ws: ws.clone() };
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            10, // cap intentionally generous; halt must come from escalation
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(
+            processed,
+            vec!["ch01".to_string()],
+            "only ch01 archived; ch02-asks halts the walk before ch03"
+        );
+        // ch02-asks is now waiting (has .question.json).
+        assert!(
+            ws.join("openspec/changes/ch02-asks/.question.json").is_file(),
+            "ch02-asks must have .question.json after escalation"
+        );
+        // ch03 is still pending — walker never reached it.
+        let still_pending = queue::list_pending(&ws).unwrap();
+        assert!(
+            still_pending.contains(&"ch03".to_string()),
+            "untouched ch03 still pending: {still_pending:?}"
         );
     }
 
