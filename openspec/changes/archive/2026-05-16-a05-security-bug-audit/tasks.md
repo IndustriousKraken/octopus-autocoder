@@ -1,6 +1,6 @@
 ## 1. Default prompt template
 
-- [ ] 1.1 New file `prompts/security-bug-audit.md`. Contents:
+- [x] 1.1 New file `prompts/security-bug-audit.md`. Contents:
   - Framing: "You are auditing this repository for security issues and likely bugs. Output: zero or more new OpenSpec change directories under `openspec/changes/`, each describing one confirmed issue and proposing a fix."
   - **In-scope categories** (each with one-line examples):
     - Injection (SQL, command, path, template)
@@ -25,18 +25,18 @@
     - "Do NOT modify any file outside `openspec/changes/`."
     - "Do NOT fix bugs directly — propose them as changes for the implementer to drive."
     - "Pick at most MAX_PROPOSALS gaps; order by severity (high first)."
-- [ ] 1.2 Embed at compile time via `include_str!`.
+- [x] 1.2 Embed at compile time via `include_str!`.
 
 ## 2. Audit implementation
 
-- [ ] 2.1 New module `autocoder/src/audits/security_bug.rs`. Define `pub struct SecurityBugAudit { settings: AuditSettings, max_proposals_per_run: u32, executor_command: String, executor_timeout_secs: u64 }`.
-- [ ] 2.2 `impl Audit` with `audit_type() = "security_bug_audit"`, `requires_head_change() = true`, `write_policy() = WritePolicy::OpenSpecOnly`.
-- [ ] 2.3 `run(&self, ctx)`: identical algorithm to missing-tests-audit (see that change's tasks.md §2.3) with these differences:
+- [x] 2.1 New module `autocoder/src/audits/security_bug.rs`. Define `pub struct SecurityBugAudit { settings: AuditSettings, max_proposals_per_run: u32, executor_command: String, executor_timeout_secs: u64 }`.
+- [x] 2.2 `impl Audit` with `audit_type() = "security_bug_audit"`, `requires_head_change() = true`, `write_policy() = WritePolicy::OpenSpecOnly`.
+- [x] 2.3 `run(&self, ctx)`: identical algorithm to missing-tests-audit (see that change's tasks.md §2.3) with these differences:
   - Different prompt (`prompts/security-bug-audit.md`).
   - Different `MAX_PROPOSALS` value source.
   - Different audit_type label.
-- [ ] 2.4 Both audits share so much logic that the algorithm SHOULD be extracted into a shared helper in `audits/mod.rs`: `run_specs_writing_audit(audit_type, prompt, max_proposals, ctx) -> Result<AuditOutcome>`. Both `MissingTestsAudit` and `SecurityBugAudit` delegate. (Refactor the missing-tests audit when this change lands; it's a small move.)
-- [ ] 2.5 Tests `audits::security_bug::tests`:
+- [x] 2.4 Both audits share so much logic that the algorithm SHOULD be extracted into a shared helper in `audits/mod.rs`: `run_specs_writing_audit(audit_type, prompt, max_proposals, ctx) -> Result<AuditOutcome>`. Both `MissingTestsAudit` and `SecurityBugAudit` delegate. (Refactor the missing-tests audit when this change lands; it's a small move.)
+- [x] 2.5 Tests `audits::security_bug::tests`:
   - `prompt_substitution_includes_max_proposals`
   - `change_with_fix_prefix_validates_and_commits`
   - `change_with_secure_prefix_validates_and_commits`
@@ -45,15 +45,15 @@
 
 ## 3. Registration
 
-- [ ] 3.1 In `cli/run.rs::build_audit_registry`, append `Arc::new(SecurityBugAudit::new(&audit_settings, &cfg.executor))`.
+- [x] 3.1 In `cli/run.rs::build_audit_registry`, append `Arc::new(SecurityBugAudit::new(&audit_settings, &cfg.executor))`.
 
 ## 4. Documentation
 
-- [ ] 4.1 README "Periodic audits" — add `security_bug_audit` to the registered-audits list. Document spec-driven flow + `fix-`/`secure-` naming.
-- [ ] 4.2 README "Config reference" — under `audits.security_bug_audit`, document `prompt_path`, `max_proposals_per_run` (default `2`), `notify_on_clean`.
-- [ ] 4.3 README operator-warning paragraph: "This audit can be noisy in early iterations on an unfamiliar codebase. Operators are advised to monitor the first few invocations and tighten the prompt (or disable the audit) if false-positive rate is high."
+- [x] 4.1 README "Periodic audits" — add `security_bug_audit` to the registered-audits list. Document spec-driven flow + `fix-`/`secure-` naming.
+- [x] 4.2 README "Config reference" — under `audits.security_bug_audit`, document `prompt_path`, `max_proposals_per_run` (default `2`), `notify_on_clean`.
+- [x] 4.3 README operator-warning paragraph: "This audit can be noisy in early iterations on an unfamiliar codebase. Operators are advised to monitor the first few invocations and tighten the prompt (or disable the audit) if false-positive rate is high."
 
 ## 5. Verification
 
-- [ ] 5.1 `cargo test` passes.
-- [ ] 5.2 `openspec validate security-bug-audit --strict` passes.
+- [x] 5.1 `cargo test` passes.
+- [x] 5.2 `openspec validate security-bug-audit --strict` passes.

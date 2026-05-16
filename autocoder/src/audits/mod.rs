@@ -19,6 +19,8 @@ pub mod dependency_update;
 pub mod drift;
 pub mod missing_tests;
 pub mod scheduler;
+pub mod security_bug;
+pub mod specs_writing;
 pub mod state;
 
 use anyhow::{Context, Result};
