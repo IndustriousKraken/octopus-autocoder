@@ -245,6 +245,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
