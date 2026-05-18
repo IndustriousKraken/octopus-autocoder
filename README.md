@@ -85,6 +85,8 @@ To stop the daemon: `Ctrl-C` (SIGINT). It drains the current iteration and exits
 
 Full schema of `config.yaml`. The minimal viable file is in [config.example.yaml](config.example.yaml); everything below is for tuning or enabling optional capabilities.
 
+`config.example.yaml` ships annotated comments for every field documented below; copy it as a starting point for your own `config.yaml`.
+
 ### `repositories:` (required)
 
 A list of one or more repositories to manage. Each entry:
