@@ -721,21 +721,122 @@ github:
   token_env: GITHUB_TOKEN
 "#;
 
+    /// Resolves the path to the shipped `config.example.yaml` (one level
+    /// above this crate's manifest directory). Panics with a clear message
+    /// if the file is missing — the example is part of the operator-facing
+    /// contract and must always be present at this path.
+    fn example_yaml_path() -> std::path::PathBuf {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("manifest dir has a parent")
+            .join("config.example.yaml");
+        assert!(
+            path.exists(),
+            "config.example.yaml not found at {}",
+            path.display()
+        );
+        path
+    }
+
+    /// Coverage check: every YAML-deserializable field documented in the
+    /// Configuration Reference SHALL appear as a substring in
+    /// `config.example.yaml` (active key OR comment annotation). Catches
+    /// new configurable fields that ship without corresponding example
+    /// coverage at CI time, rather than at operator-onboarding time.
+    ///
+    /// When extending the schema with a new field, you MUST update BOTH
+    /// `config.example.yaml` (add an active key or commented annotation)
+    /// AND the `EXPECTED_FIELDS` list below. A failure here means one of
+    /// the two artifacts was forgotten.
+    #[test]
+    fn example_yaml_mentions_every_top_level_field() {
+        // Top-level keys on `Config` and nested-struct keys. Field names
+        // only — values and comments are not asserted, only that each
+        // identifier appears somewhere in the example file.
+        const EXPECTED_FIELDS: &[&str] = &[
+            // Top-level `Config` fields.
+            "repositories",
+            "executor",
+            "github",
+            "reviewer",
+            "chatops",
+            "audits",
+            // `RepositoryConfig`.
+            "local_path",
+            "base_branch",
+            "agent_branch",
+            "poll_interval_sec",
+            "chatops_channel_id",
+            "max_changes_per_pr",
+            // `ExecutorConfig` + `ExecutorSandboxConfig`.
+            "command",
+            "timeout_secs",
+            "sandbox",
+            "implementer_prompt_path",
+            "perma_stuck_after_failures",
+            "startup_jitter_max_secs",
+            "inter_iteration_jitter_pct",
+            "allowed_tools",
+            "disallowed_bash_patterns",
+            "disallowed_read_paths",
+            // `GithubConfig`.
+            "token_env",
+            "token",
+            "owner_tokens",
+            "fork_owner",
+            "recreate_fork_on_reinit",
+            // `ReviewerConfig`.
+            "enabled",
+            "provider",
+            "model",
+            "api_key_env",
+            "api_key",
+            "api_base_url",
+            // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
+            "bot_token_env",
+            "bot_token",
+            "default_channel_id",
+            "notifications",
+            "start_work",
+            "failure_alerts",
+            "pr_opened",
+            // `AuditsConfig` + `AuditSettings`.
+            "defaults",
+            "settings",
+            "prompt_path",
+            "notify_on_clean",
+            "extra",
+        ];
+
+        let path = example_yaml_path();
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("config.example.yaml not found at {}: {e}", path.display()));
+
+        let mut missing: Vec<&str> = Vec::new();
+        for field in EXPECTED_FIELDS {
+            if !body.contains(field) {
+                missing.push(field);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "config.example.yaml is missing documented field(s): {:?}\n\
+             Update BOTH `config.example.yaml` (add an active key or commented \
+             annotation) AND the EXPECTED_FIELDS list in \
+             autocoder/src/config.rs::tests::example_yaml_mentions_every_top_level_field \
+             so reviewers can confirm the example, the schema, and this \
+             test stay in sync.",
+            missing
+        );
+    }
+
     /// Parses the actual `config.example.yaml` file shipped at the repo
     /// root. This guards against the example drifting out of sync with the
     /// parser — operators who `cp config.example.yaml config.yaml` should
     /// always end up with a parseable file.
     #[test]
     fn config_example_yaml_parses() {
-        let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("manifest dir has a parent")
-            .join("config.example.yaml");
-        assert!(
-            example_path.exists(),
-            "config.example.yaml must exist at {}",
-            example_path.display()
-        );
+        let example_path = example_yaml_path();
         let cfg = Config::load_from(&example_path)
             .expect("config.example.yaml must be parseable as Config");
         // Single-repo by default per the design.

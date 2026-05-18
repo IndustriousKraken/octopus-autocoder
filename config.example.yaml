@@ -5,8 +5,11 @@
 # and a fine-grained GitHub PAT is exported as $GITHUB_TOKEN, this file
 # is everything autocoder needs to start running.
 #
-# Optional capabilities (AI code review, ChatOps escalation) are commented
-# out at the bottom — see the README sections of the same name to enable.
+# Optional capabilities (AI code review, ChatOps escalation, periodic
+# audits) are commented out at the bottom — see the README sections of
+# the same name to enable. Every field documented in the README's
+# Configuration Reference appears below either active or as a comment;
+# uncomment what you need.
 
 repositories:
   - url: "git@github.com:your-org/your-repo.git"
@@ -15,6 +18,25 @@ repositories:
     poll_interval_sec: 300
     # local_path is optional; if omitted, derived as
     # /tmp/workspaces/<sanitized-url> deterministically.
+    # local_path: /tmp/workspaces/your-repo
+
+    # Per-repository overrides. Each falls back to a global default when unset.
+    #
+    # Override the ChatOps escalation channel for this repo (falls back to
+    # `chatops.default_channel_id`):
+    # chatops_channel_id: C01234REPO
+    #
+    # Cap on archived changes committed in one iteration's PR (falls back
+    # to `executor.max_changes_per_pr`, then 3):
+    # max_changes_per_pr: 3
+    #
+    # Per-repo audit cadence overrides. Keys are audit type slugs (see the
+    # `audits:` block below for the full list). Each entry overrides the
+    # global `audits.defaults` cadence for this repo only. Cadence values:
+    # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
+    # audits:
+    #   architecture_brightline: weekly
+    #   dependency_update_triage: daily
 
 executor:
   # The default executor wraps the `claude` CLI (Claude Code) installed and
@@ -39,6 +61,35 @@ executor:
   #   disallowed_read_paths:
   #     - "/home/*/.ssh/**"
   #     - "/home/*/.claude/**"
+
+  # Path to a file overriding the built-in implementer prompt template.
+  # The template must contain the literal `{{change_body}}` placeholder
+  # (replaced with `openspec instructions apply` output each invocation).
+  # Unset → use the prompt compiled into the binary.
+  # implementer_prompt_path: /etc/autocoder/implementer.md
+
+  # Consecutive Failed iterations after which a change is marked
+  # perma-stuck (writes `.perma-stuck.json`, posts a chatops alert, and
+  # is excluded from `list_pending` until the marker is removed). A
+  # configured `0` is clamped to `1` with a WARN log at startup.
+  # perma_stuck_after_failures: 2
+
+  # Global default cap on archived changes committed in one iteration's
+  # PR. Per-repo `max_changes_per_pr` (under `repositories[]`) overrides
+  # this. A configured `0` is clamped to `1` with a WARN log at startup.
+  # max_changes_per_pr: 3
+
+  # Upper bound (in seconds) on the random sleep each polling task
+  # performs before its first iteration. Staggers a fleet of concurrent
+  # `git fetch` operations so an IDS does not see a synchronized burst.
+  # `0` disables the startup jitter entirely.
+  # startup_jitter_max_secs: 30
+
+  # Percent (0..=100) of `poll_interval_sec` used as a uniform random
+  # offset on every inter-iteration sleep. Prevents long-term
+  # re-synchronization of multiple tasks. `0` produces exact intervals.
+  # Values above 100 are clamped to 100.
+  # inter_iteration_jitter_pct: 10
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
@@ -72,6 +123,16 @@ github:
   # "Fork-and-PR workflow" section for one-time fork-setup steps.
   #
   # fork_owner: my-machine-user-handle
+
+  # DESTRUCTIVE — when `true` AND fork-PR mode is active AND the workspace
+  # directory was absent at iteration start, autocoder DELETES the existing
+  # fork on GitHub and re-forks upstream before initializing. Any open PRs
+  # whose head branch lives on the deleted fork are closed by GitHub when
+  # the head ref disappears. Requires the PAT to include the `delete_repo`
+  # scope. See README's "Fork recreation on workspace reinitialization"
+  # section before enabling.
+  #
+  # recreate_fork_on_reinit: false
 
 # -------------------------------------------------------------------------
 # Optional capabilities — disabled by default. Uncomment to enable.
@@ -111,15 +172,17 @@ github:
 #     # bot_token:
 #     #   value: "xoxb-yourtokenhere"
 #
-#   # Progress notifications. Both keys default to `true` when the block is
-#   # omitted. Set either to `false` to suppress that stream.
+#   # Progress notifications. Each key defaults to `true` when the block is
+#   # omitted. Set any to `false` to suppress that stream.
 #   #   start_work: a one-line message each time autocoder picks up a change.
 #   #   failure_alerts: throttled (≤1/24h per repo+category) alerts for
 #   #     predictable infrastructure failures (workspace init, branch push,
 #   #     PR creation 4xx). Cleared on the next successful iteration.
+#   #   pr_opened: a message each time autocoder opens a new pull request.
 #   # notifications:
 #   #   start_work: true
 #   #   failure_alerts: true
+#   #   pr_opened: true
 #
 #   # ---------------------------------------------------------------
 #   # EXPERIMENTAL alternatives — pick ONE provider and uncomment the
@@ -146,3 +209,66 @@ github:
 #   # matrix:
 #   #   homeserver_url: "https://matrix.example.com"
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
+
+# Periodic audits — long-cycle background checks orchestrated by the
+# daemon between regular polling iterations. Six audits ship today:
+#   - architecture_brightline    — flags files exceeding a line-count threshold
+#   - dependency_update_triage   — opens a change per ready dependabot PR
+#   - drift_audit                — detects spec/code drift via LLM scan
+#   - missing_tests_audit        — proposes test coverage for untested code
+#   - security_bug_audit         — LLM scan for security smells
+#   - architecture_consultative  — LLM architectural-health review
+#
+# Cadence vocabulary (per audit; default `disabled`):
+#   disabled | daily | every-N-days | weekly | monthly | quarterly
+#
+# When the entire `audits:` block is absent, every audit resolves to
+# `Disabled` and the scheduler does no work. Operators opt in explicitly
+# by listing audit type names with a non-`disabled` cadence under
+# `audits.defaults`. Per-repo overrides live under `repositories[].audits`.
+#
+# audits:
+#   # Global default cadence per audit type. Omitted entries → `Disabled`.
+#   defaults:
+#     architecture_brightline: weekly
+#     dependency_update_triage: daily
+#     drift_audit: weekly
+#     missing_tests_audit: monthly
+#     security_bug_audit: weekly
+#     architecture_consultative: quarterly
+#
+#   # Per-audit knobs. `prompt_path` overrides the audit's embedded LLM
+#   # prompt template. `notify_on_clean` toggles a brief "no findings"
+#   # chatops post for empty-result outcomes (silence is success by
+#   # default). `extra` is a free-form mapping each audit reads its own
+#   # thresholds out of — keys documented per audit below.
+#   settings:
+#     architecture_brightline:
+#       # prompt_path: /etc/autocoder/prompts/brightline.md
+#       notify_on_clean: false
+#       extra:
+#         file_lines_threshold: 500   # WARN any file with > N lines
+#     dependency_update_triage:
+#       # prompt_path: /etc/autocoder/prompts/dep-update.md
+#       notify_on_clean: false
+#       extra:
+#         max_approvals_per_run: 3    # cap auto-approved dependabot PRs per run
+#         fork_remote_name: origin    # which remote to push update branches to
+#     drift_audit:
+#       # prompt_path: /etc/autocoder/prompts/drift.md
+#       notify_on_clean: false
+#       extra: {}
+#     missing_tests_audit:
+#       # prompt_path: /etc/autocoder/prompts/missing-tests.md
+#       notify_on_clean: false
+#       extra:
+#         max_proposals_per_run: 3    # cap change proposals opened per run
+#     security_bug_audit:
+#       # prompt_path: /etc/autocoder/prompts/security-bug.md
+#       notify_on_clean: false
+#       extra:
+#         max_proposals_per_run: 3
+#     architecture_consultative:
+#       # prompt_path: /etc/autocoder/prompts/arch-consult.md
+#       notify_on_clean: false
+#       extra: {}
