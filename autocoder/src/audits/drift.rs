@@ -735,6 +735,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_returns_err_on_subprocess_timeout() {
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let script = write_script(
+            ws_dir.path(),
+            "slow.sh",
+            "#!/bin/sh\nsleep 10\n",
+        );
+        let mut cfg = executor_cfg(&script.to_string_lossy());
+        cfg.timeout_secs = 1;
+        let settings_dir = TempDir::new().unwrap();
+        let audit = DriftAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(workspace),
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let err = audit
+            .run(&mut ctx)
+            .await
+            .expect_err("subprocess timeout must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("drift_audit"),
+            "error must name the audit type: {msg}"
+        );
+        assert!(
+            msg.contains("timeout"),
+            "error must mention timeout: {msg}"
+        );
+        let log = std::fs::read_to_string(&log_path).expect("log readable");
+        assert!(
+            log.contains("kind: Err"),
+            "log must record Err outcome: {log}"
+        );
+        assert!(
+            log.contains("reason: timeout"),
+            "log must record timeout reason: {log}"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
     async fn run_returns_err_on_malformed_stdout() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
