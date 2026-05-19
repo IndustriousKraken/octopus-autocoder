@@ -391,4 +391,118 @@ mod tests {
         assert!(msg.contains("401"), "{msg}");
         assert!(msg.contains("invalid api key"), "{msg}");
     }
+
+    #[tokio::test]
+    async fn anthropic_errors_when_response_contains_no_text_block() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":[{"type":"image","source":{"type":"base64","data":"x"}}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "testkey".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("no text block must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no text block"),
+            "must name missing-text-block condition: {msg}"
+        );
+        assert!(
+            !msg.contains("request failed") && !msg.contains("API error"),
+            "must not claim the HTTP call failed: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_errors_when_response_body_is_unparseable_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not-json")
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "testkey".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("unparseable JSON must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("decode failed"),
+            "must name decode failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_errors_when_choices_array_is_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"choices":[]}"#)
+            .create_async()
+            .await;
+
+        let client = OpenAiCompatibleClient::new(
+            server.url(),
+            "testkey".to_string(),
+            "gpt-4o".to_string(),
+        );
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("empty choices must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no choices"),
+            "must name empty-choices condition: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_errors_when_response_body_is_unparseable_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not-json")
+            .create_async()
+            .await;
+
+        let client = OpenAiCompatibleClient::new(
+            server.url(),
+            "testkey".to_string(),
+            "gpt-4o".to_string(),
+        );
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("unparseable JSON must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("decode failed"),
+            "must name decode failure: {msg}"
+        );
+    }
 }
