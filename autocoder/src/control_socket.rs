@@ -799,6 +799,46 @@ github:
         cancel.cancel();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_returns_error_on_unparseable_json() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(&socket, "not-json").await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("malformed JSON"),
+            "error must contain `malformed JSON`: {err}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_returns_error_when_action_field_missing() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        for body in ["{}", r#"{"unrelated":"x"}"#] {
+            let resp = send_request(&socket, body).await;
+            assert_eq!(
+                resp["ok"],
+                serde_json::Value::Bool(false),
+                "resp for {body}: {resp}"
+            );
+            let err = resp["error"].as_str().unwrap();
+            assert!(
+                err.contains("missing"),
+                "error must contain `missing` for body {body}: {err}"
+            );
+            assert!(
+                err.contains("action"),
+                "error must contain `action` for body {body}: {err}"
+            );
+            assert!(
+                !err.contains("malformed JSON"),
+                "missing-action error must be distinguishable from `malformed JSON` for body {body}: {err}"
+            );
+        }
+        cancel.cancel();
+    }
+
     /// Helper: copy the task map's current URLs into a sorted Vec for
     /// stable assertions.
     fn task_map_urls(state: &ControlState) -> Vec<String> {
