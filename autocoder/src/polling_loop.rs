@@ -6440,4 +6440,109 @@ mod tests {
             "body must not include non-Why sections; got: {body}"
         );
     }
+
+    // ============================================================
+    // extract_stdout_section — log-parser branches
+    // ============================================================
+
+    #[test]
+    fn extract_stdout_section_returns_body_between_markers() {
+        let raw = "=== STDOUT (10) ===\nhello world\n=== STDERR (0) ===\nignored\n";
+        assert_eq!(extract_stdout_section(raw), "hello world\n");
+    }
+
+    #[test]
+    fn extract_stdout_section_returns_empty_when_no_stdout_marker() {
+        let raw = "no markers anywhere\n=== STDERR (0) ===\n";
+        assert_eq!(extract_stdout_section(raw), "");
+    }
+
+    #[test]
+    fn extract_stdout_section_returns_empty_when_header_has_no_newline() {
+        let raw = "=== STDOUT (10) ===";
+        assert_eq!(extract_stdout_section(raw), "");
+    }
+
+    #[test]
+    fn extract_stdout_section_returns_to_eof_when_no_stderr_marker() {
+        let raw = "=== STDOUT (5) ===\nbody only\n";
+        assert_eq!(extract_stdout_section(raw), "body only\n");
+    }
+
+    // ============================================================
+    // filter_alert_state_lines — porcelain filter
+    // ============================================================
+
+    #[test]
+    fn filter_alert_state_lines_passes_through_when_no_alert_state() {
+        let porcelain = " M src/foo.rs\n?? new.txt\n";
+        let out = filter_alert_state_lines(porcelain);
+        // `.lines()` strips the trailing newline; `join("\n")` re-joins
+        // without one, so we compare against the same shape.
+        assert_eq!(out, " M src/foo.rs\n?? new.txt");
+    }
+
+    #[test]
+    fn filter_alert_state_lines_strips_only_alert_state_entry() {
+        let porcelain = "?? .alert-state.json\n";
+        let out = filter_alert_state_lines(porcelain);
+        assert!(
+            out.trim().is_empty(),
+            "expected empty/whitespace-only output, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_alert_state_lines_keeps_real_files_and_strips_alert_state() {
+        let porcelain = " M src/foo.rs\n?? .alert-state.json\n M src/bar.rs\n";
+        let out = filter_alert_state_lines(porcelain);
+        assert!(out.contains(" M src/foo.rs"), "missing foo.rs: {out:?}");
+        assert!(out.contains(" M src/bar.rs"), "missing bar.rs: {out:?}");
+        assert!(
+            !out.contains(".alert-state.json"),
+            "alert-state line leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_alert_state_lines_does_not_match_subpath_or_similar_name() {
+        let porcelain = " M subdir/.alert-state.json\n?? prefix.alert-state.json\n";
+        let out = filter_alert_state_lines(porcelain);
+        assert!(
+            out.contains("subdir/.alert-state.json"),
+            "subdir variant must survive: {out:?}"
+        );
+        assert!(
+            out.contains("prefix.alert-state.json"),
+            "prefix variant must survive: {out:?}"
+        );
+    }
+
+    // ============================================================
+    // truncate_reason — boundary behavior
+    // ============================================================
+
+    #[test]
+    fn truncate_reason_passthrough_when_under_or_equal_to_cap() {
+        let input: String = "a".repeat(PERMA_STUCK_REASON_EXCERPT_MAX);
+        let out = truncate_reason(&input);
+        assert_eq!(out, input);
+        assert!(!out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_reason_truncates_and_appends_ellipsis_when_over_cap() {
+        let input: String = "a".repeat(PERMA_STUCK_REASON_EXCERPT_MAX + 50);
+        let out = truncate_reason(&input);
+        assert_eq!(out.chars().count(), PERMA_STUCK_REASON_EXCERPT_MAX + 1);
+        assert!(out.ends_with('…'), "expected trailing ellipsis: {out:?}");
+    }
+
+    #[test]
+    fn truncate_reason_respects_char_boundary_on_multibyte_input() {
+        let input: String = "é".repeat(PERMA_STUCK_REASON_EXCERPT_MAX + 50);
+        let out = truncate_reason(&input);
+        assert_eq!(out.chars().count(), PERMA_STUCK_REASON_EXCERPT_MAX + 1);
+        assert!(out.ends_with('…'));
+    }
 }
