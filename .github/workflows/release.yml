@@ -1,0 +1,141 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            autocoder/target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('autocoder/Cargo.lock') }}
+
+      - name: cargo test
+        working-directory: autocoder
+        run: cargo test --release --all-features
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            strip_cmd: strip
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            strip_cmd: aarch64-linux-gnu-strip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            strip_cmd: strip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Install aarch64 strip tool
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        working-directory: autocoder
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        working-directory: autocoder
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Stage release artifact
+        id: stage
+        working-directory: autocoder
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_STRIP_CMD: ${{ matrix.strip_cmd }}
+          REF_NAME: ${{ github.ref_name }}
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          BIN_SRC="target/${MATRIX_TARGET}/release/autocoder"
+          ASSET_NAME="autocoder-${REF_NAME}-${MATRIX_TARGET}"
+          STAGING="${RUNNER_TEMP_DIR}/release-staging"
+          mkdir -p "$STAGING"
+          cp "$BIN_SRC" "$STAGING/$ASSET_NAME"
+          "$MATRIX_STRIP_CMD" "$STAGING/$ASSET_NAME"
+          cd "$STAGING"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256"
+          else
+            shasum -a 256 "$ASSET_NAME" > "${ASSET_NAME}.sha256"
+          fi
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "staging=$STAGING" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.asset_name }}
+          path: |
+            ${{ steps.stage.outputs.staging }}/${{ steps.stage.outputs.asset_name }}
+            ${{ steps.stage.outputs.staging }}/${{ steps.stage.outputs.asset_name }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: ls -la release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/autocoder-${{ github.ref_name }}-*

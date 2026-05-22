@@ -910,6 +910,12 @@ If you remove a repo and re-add it (or change a setting) before the previous tas
 
 For production, run autocoder as a systemd service on a dedicated Linux host. The daemon polls on its own — do not wrap it in a cron job.
 
+### Recommended: install from a binary release
+
+See the install-script-and-wizard companion path for the `curl … | bash` flow that downloads a pre-built binary from the latest GitHub Release, verifies its SHA-256 checksum, and installs it. The remainder of this section covers source builds and manual installs for operators who need them.
+
+Releases are versioned `vX.Y.Z` (SemVer). Each tag in the [GitHub Releases page](https://github.com/IndustriousKraken/openspec-autocoder/releases) carries three pre-built binaries — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — plus a matching `.sha256` for each. Pre-release tags (e.g. `vX.Y.Z-rc1`, `vX.Y.Z-beta.2`) are auto-flagged as pre-releases. See [RELEASING.md](RELEASING.md) for the maintainer-side cut procedure.
+
 ### 1. Install the binary
 
 ```bash
