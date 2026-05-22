@@ -1,0 +1,155 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: build matrix but skip publish'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Lint workflows with actionlint
+        uses: rhysd/actionlint@v1
+
+  test:
+    name: cargo test
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        working-directory: autocoder
+        run: cargo test --release --all-features
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain (for aarch64-unknown-linux-gnu)
+        if: matrix.use_cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: autocoder
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux)
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: strip autocoder/target/${{ matrix.target }}/release/autocoder
+
+      - name: Strip binary (Linux aarch64 via cross-strip)
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-strip autocoder/target/${{ matrix.target }}/release/autocoder
+
+      - name: Strip binary (macOS)
+        if: runner.os == 'macOS'
+        run: strip autocoder/target/${{ matrix.target }}/release/autocoder
+
+      - name: Stage release asset and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET_DIR="${RUNNER_TEMP}/release"
+          mkdir -p "$ASSET_DIR"
+          ASSET_NAME="autocoder-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          cp "autocoder/target/${{ matrix.target }}/release/autocoder" "${ASSET_DIR}/${ASSET_NAME}"
+          cd "$ASSET_DIR"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256"
+          else
+            # macOS fallback: format `shasum -a 256` output to match `sha256sum`'s `<hex>  <name>`.
+            shasum -a 256 "$ASSET_NAME" > "${ASSET_NAME}.sha256"
+          fi
+          # Self-verify the checksum file so a malformed one fails the job here, not in user-land.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "${ASSET_NAME}.sha256"
+          else
+            shasum -a 256 -c "${ASSET_NAME}.sha256"
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: autocoder-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/release/autocoder-${{ github.ref_name }}-${{ matrix.target }}
+            ${{ runner.temp }}/release/autocoder-${{ github.ref_name }}-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish github release
+    needs: [test, build]
+    if: github.event_name == 'push' || inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded assets
+        run: ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/autocoder-${{ github.ref_name }}-*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
