@@ -11,7 +11,8 @@ use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
-use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
+use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
+use crate::spec_revision::{self, SpecNeedsRevisionDetail};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow};
@@ -898,6 +899,43 @@ async fn process_one_waiting(
             // to pending state for the next iteration.
             (ResumeDisposition::Failed, Some(reason))
         }
+        Ok(ExecutorOutcome::SpecNeedsRevision {
+            unimplementable_tasks,
+            revision_suggestion,
+        }) => {
+            // Even on the resume path, the agent may decide a task is
+            // unimplementable (e.g. the operator's answer revealed a
+            // requirement outside the sandbox). Same treatment as the
+            // pending path: write the marker, alert the operator, halt.
+            // Question/answer files were already cleared above; the
+            // marker is the new operator-action gate.
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                flagged = unimplementable_tasks.len(),
+                "resume returned SpecNeedsRevision; writing marker and alerting operator"
+            );
+            let detail = SpecNeedsRevisionDetail {
+                unimplementable_tasks: unimplementable_tasks.clone(),
+                revision_suggestion: revision_suggestion.clone(),
+            };
+            if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "failed to write spec-needs-revision marker (resume): {e:#}"
+                );
+            }
+            maybe_post_spec_revision_alert(
+                Some(ctx),
+                repo,
+                change,
+                &unimplementable_tasks,
+                &revision_suggestion,
+            )
+            .await;
+            (ResumeDisposition::SpecRevisionMarked, None)
+        }
     };
 
     // Counter book-keeping mirrors the pending path:
@@ -948,6 +986,10 @@ enum ResumeDisposition {
     EscalatedAgain,
     Failed,
     Errored,
+    /// Resume returned `SpecNeedsRevision`. Marker has been written and
+    /// the operator alerted; treat as a non-counter-bumping failure-
+    /// equivalent (the marker handles exclusion).
+    SpecRevisionMarked,
 }
 
 impl ResumeDisposition {
@@ -958,6 +1000,7 @@ impl ResumeDisposition {
             ResumeDisposition::EscalatedAgain => "escalated",
             ResumeDisposition::Failed => "failed",
             ResumeDisposition::Errored => "errored",
+            ResumeDisposition::SpecRevisionMarked => "spec_needs_revision",
         }
     }
 }
@@ -1042,6 +1085,7 @@ async fn walk_queue(
             Ok(QueueStep::Failed { .. }) => "failed",
             Ok(QueueStep::Escalated) => "escalated",
             Ok(QueueStep::AskUserExitEarly) => "ask_user_exit_early",
+            Ok(QueueStep::SpecRevisionMarked) => "spec_needs_revision",
             Err(_) => "error",
         };
         tracing::info!(
@@ -1123,6 +1167,21 @@ async fn walk_queue(
                 );
                 break;
             }
+            Ok(QueueStep::SpecRevisionMarked) => {
+                // Operator-action territory. The marker file, the chatops
+                // alert, and the unlock have already been written by
+                // `handle_outcome`. We must NOT bump the perma-stuck
+                // counter (this isn't repeat-execution-failure territory)
+                // but we DO halt the walk so later changes don't run
+                // against an environment we just decided we can't
+                // implement against.
+                tracing::info!(
+                    url = %repo.url,
+                    change = %change,
+                    "change flagged as needing spec revision; halting queue walk this iteration"
+                );
+                break;
+            }
             Err(e) => {
                 tracing::error!(
                     url = repo.url.as_str(),
@@ -1152,6 +1211,12 @@ enum QueueStep {
     },
     Escalated,
     AskUserExitEarly,
+    /// The executor returned `SpecNeedsRevision`. The change's marker has
+    /// been written and the chatops alert posted. The walker halts the
+    /// queue this iteration (operator-action territory). Unlike `Failed`,
+    /// this MUST NOT increment the perma-stuck counter — the marker
+    /// handles exclusion directly, the counter is irrelevant here.
+    SpecRevisionMarked,
 }
 
 /// Increment the per-change failure counter, and on threshold transition
@@ -1271,6 +1336,78 @@ async fn post_perma_stuck_alert(
             url = %repo.url,
             change = %change,
             "failed to persist perma-stuck alert state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops spec-needs-revision alert (best-effort, 24h-throttled
+/// per change). State for this throttle lives in `.alert-state.json`'s
+/// `spec_revision_alerts` map. Mirrors `post_perma_stuck_alert` — both
+/// announce operator-action states with the same throttle window.
+async fn maybe_post_spec_revision_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    flagged_tasks: &[UnimplementableTask],
+    revision_suggestion: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    let now = Utc::now();
+    let should_alert = state
+        .spec_revision_alerts
+        .get(change)
+        .map(|entry| {
+            now - entry.last_alerted_at
+                >= ChronoDuration::hours(PERMA_STUCK_ALERT_THROTTLE_HOURS)
+        })
+        .unwrap_or(true);
+    if !should_alert {
+        return;
+    }
+    let marker_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join(".needs-spec-revision.json");
+    let log_path = crate::executor::claude_cli::run_log_path(&workspace, change);
+    let mut tasks_block = String::new();
+    for task in flagged_tasks {
+        tasks_block.push_str(&format!("  - {}: {} ({})\n", task.task_id, task.task_text, task.reason));
+    }
+    let text = format!(
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` has unimplementable tasks\n\nTasks the agent flagged as outside its sandbox:\n{tasks_block}\nSuggested revision:\n  {suggestion}\n\nOperator action:\n  1. Edit openspec/changes/{change}/tasks.md to remove or revise the flagged tasks.\n  2. Commit + push to {base}.\n  3. Delete openspec/changes/{change}/.needs-spec-revision.json — the next iteration will retry the change.\n\nmarker: {marker}\nlog:    {log}",
+        repo_url = repo.url,
+        change = change,
+        tasks_block = tasks_block,
+        suggestion = revision_suggestion,
+        base = repo.base_branch,
+        marker = marker_path.display(),
+        log = log_path.display(),
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "spec-needs-revision chatops alert post failed: {e:#}"
+        );
+        return;
+    }
+    state.spec_revision_alerts.insert(
+        change.to_string(),
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: truncate_reason(revision_suggestion),
+        },
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to persist spec-needs-revision alert state: {e:#}"
         );
     }
 }
@@ -1443,6 +1580,51 @@ async fn handle_outcome(
         Ok(ExecutorOutcome::Failed { reason }) => {
             tracing::error!("executor reported Failed for `{change}`: {reason}");
             Ok(QueueStep::Failed { reason })
+        }
+        Ok(ExecutorOutcome::SpecNeedsRevision {
+            unimplementable_tasks,
+            revision_suggestion,
+        }) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                flagged = unimplementable_tasks.len(),
+                "executor returned SpecNeedsRevision; writing marker and alerting operator"
+            );
+            // (a) Unlock the change so it's not left in an in-progress
+            // state. Mirrors how every other Failed-equivalent outcome
+            // hands the change back to operator-managed territory.
+            queue::unlock(workspace, change)?;
+            // (b) Write the marker. A failure here is logged but does NOT
+            // propagate: the alert still goes out, and the next iteration
+            // would simply re-trigger the outcome (the agent's pre-flight
+            // is deterministic for a given tasks.md).
+            let detail = SpecNeedsRevisionDetail {
+                unimplementable_tasks: unimplementable_tasks.clone(),
+                revision_suggestion: revision_suggestion.clone(),
+            };
+            if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "failed to write spec-needs-revision marker: {e:#}"
+                );
+            }
+            // (c) Post the chatops alert. Best-effort: any failure is
+            // logged at WARN and does not propagate.
+            maybe_post_spec_revision_alert(
+                chatops_ctx,
+                repo,
+                change,
+                &unimplementable_tasks,
+                &revision_suggestion,
+            )
+            .await;
+            // (d) Halt the queue walk this iteration. Do NOT increment
+            // the perma-stuck counter — the marker handles exclusion
+            // directly; the counter is for repeat-execution-failure
+            // territory, which this is not.
+            Ok(QueueStep::SpecRevisionMarked)
         }
         Ok(ExecutorOutcome::AskUser {
             question,
@@ -4891,6 +5073,266 @@ mod tests {
         )
         .await;
         alert_mock.assert_async().await;
+    }
+
+    // ============================================================
+    // SpecNeedsRevision outcome
+    // ============================================================
+
+    /// Executor that returns `SpecNeedsRevision` with a fixed payload on
+    /// every `run`. Useful for asserting marker write + alert + queue halt.
+    struct SpecRevisionExecutor {
+        tasks: Vec<UnimplementableTask>,
+        suggestion: String,
+        invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Executor for SpecRevisionExecutor {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks: self.tasks.clone(),
+                revision_suggestion: self.suggestion.clone(),
+            })
+        }
+        async fn resume(
+            &self,
+            _h: crate::executor::ResumeHandle,
+            _a: &str,
+        ) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    fn fixture_unimpl_tasks() -> Vec<UnimplementableTask> {
+        vec![UnimplementableTask {
+            task_id: "5.2".into(),
+            task_text: "install actionlint locally".into(),
+            reason: "no apt access".into(),
+        }]
+    }
+
+    /// SpecNeedsRevision outcome → marker written, chatops alert posted,
+    /// queue walk halts. Later pending changes are not processed in the
+    /// same iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spec_needs_revision_writes_marker_and_alerts_and_halts_queue() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "01-needs-revision", "fixture");
+        add_committed_change(&ws, "02-would-run-if-not-halted", "fixture");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let alert_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::Regex("spec needs revision".into()))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // Allow other unrelated POSTs (start-of-work etc.) without
+        // failing assert. We suppress start-of-work in the ctx below to
+        // keep things tidy, but accept any extras.
+        let _other = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor = SpecRevisionExecutor {
+            tasks: fixture_unimpl_tasks(),
+            suggestion: "drop 5.2 from tasks.md".into(),
+            invocations: invocations.clone(),
+        };
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: false,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let _ = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+
+        // Marker is at the expected path with the expected schema fields.
+        let marker_path = ws.join("openspec/changes/01-needs-revision/.needs-spec-revision.json");
+        assert!(
+            marker_path.exists(),
+            "marker file must be written at {}",
+            marker_path.display()
+        );
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(raw.contains("\"change\""));
+        assert!(raw.contains("\"01-needs-revision\""));
+        assert!(raw.contains("\"unimplementable_tasks\""));
+        assert!(raw.contains("\"5.2\""));
+        assert!(raw.contains("\"revision_suggestion\""));
+        assert!(raw.contains("drop 5.2 from tasks.md"));
+        assert!(raw.contains("\"operator_action\""));
+        assert!(raw.contains("\"marked_at\""));
+
+        // Alert was posted exactly once.
+        alert_mock.assert_async().await;
+
+        // Queue walk halted: the executor ran for the first change only.
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "queue walk must halt after SpecNeedsRevision; later changes must not run"
+        );
+        // The second change is still in pending (not archived, not marked).
+        assert!(
+            ws.join("openspec/changes/02-would-run-if-not-halted").exists(),
+            "second change must remain in the queue"
+        );
+
+        // The lock for the flagged change was cleaned up.
+        assert!(
+            !ws.join("openspec/changes/01-needs-revision/.in-progress").exists(),
+            ".in-progress lock must be removed after SpecNeedsRevision"
+        );
+    }
+
+    /// SpecNeedsRevision must NOT increment the perma-stuck counter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spec_needs_revision_does_not_increment_perma_stuck_counter() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "no-counter-bump", "fixture");
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor = SpecRevisionExecutor {
+            tasks: fixture_unimpl_tasks(),
+            suggestion: "x".into(),
+            invocations: invocations.clone(),
+        };
+        let _ = run_one_pass_with_threshold(&ws, &executor, 1).await;
+        // Marker is present.
+        assert!(
+            ws.join("openspec/changes/no-counter-bump/.needs-spec-revision.json").exists()
+        );
+        // failure-state.json must NOT have an entry for this change (or
+        // the file must not exist at all). The marker handles exclusion;
+        // the counter is operator-action territory, not repeat-failure
+        // territory.
+        let counter_file = ws.join(".failure-state.json");
+        if counter_file.exists() {
+            let state = failure_state::load(&ws).unwrap();
+            assert!(
+                !state.entries.contains_key("no-counter-bump"),
+                "SpecNeedsRevision must not write a failure-state entry"
+            );
+        }
+    }
+
+    /// Pre-place a marker → change is excluded from list_pending → the
+    /// executor is never invoked for that change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_with_revision_marker_excluded_from_list_pending() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "pre-marked", "fixture");
+        // Pre-place the marker; the marker file must NOT trip the dirty
+        // check because workspace::ensure_initialized adds it to
+        // .git/info/exclude.
+        std::fs::write(
+            ws.join("openspec/changes/pre-marked/.needs-spec-revision.json"),
+            r#"{"change":"pre-marked","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"Edit tasks.md, commit, then delete this marker."}"#,
+        )
+        .unwrap();
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "executor must NOT be invoked for a change with a needs-spec-revision marker"
+        );
+    }
+
+    /// Pre-place the marker, run once (executor not called), then delete the
+    /// marker and run again — the executor IS called the second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marker_removed_re_enables_change() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "operator-cleared", "fixture");
+        let marker = ws.join("openspec/changes/operator-cleared/.needs-spec-revision.json");
+        std::fs::write(
+            &marker,
+            r#"{"change":"operator-cleared","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"Edit tasks.md, commit, then delete this marker."}"#,
+        )
+        .unwrap();
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "noop fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        // First pass: marker present → executor must not run.
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "executor must not be invoked while marker is present"
+        );
+
+        // Operator removes the marker.
+        std::fs::remove_file(&marker).unwrap();
+
+        // Second pass: change is back in pending, executor runs.
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "executor must run after the operator clears the marker"
+        );
     }
 
     // ============================================================

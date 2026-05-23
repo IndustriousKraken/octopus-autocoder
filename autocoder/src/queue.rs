@@ -15,6 +15,7 @@ const LOCK_FILE: &str = ".in-progress";
 const PROPOSAL_FILE: &str = "proposal.md";
 const QUESTION_FILE: &str = ".question.json";
 const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
+const NEEDS_REVISION_FILE: &str = ".needs-spec-revision.json";
 
 fn changes_dir(workspace: &Path) -> PathBuf {
     workspace.join(CHANGES_SUBDIR)
@@ -64,10 +65,12 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
             // Waiting on a human reply — handled by `list_waiting`, not here.
             continue;
         }
-        if dir.join(PERMA_STUCK_FILE).exists() {
-            // Perma-stuck: the change has hit the consecutive-failure
-            // threshold and autocoder will not retry until the operator
-            // removes the marker file.
+        if dir.join(PERMA_STUCK_FILE).exists() || dir.join(NEEDS_REVISION_FILE).exists() {
+            // Operator-action markers: perma-stuck (the change has hit the
+            // consecutive-failure threshold) and spec-needs-revision (the
+            // agent identified one or more unimplementable tasks). In both
+            // cases autocoder will not retry until the operator removes the
+            // marker file.
             continue;
         }
         if !dir.join(PROPOSAL_FILE).is_file() {
@@ -108,6 +111,14 @@ pub fn list_waiting(workspace: &Path) -> Result<Vec<String>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// True when `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`
+/// exists. Mirrors the `.perma-stuck.json` presence check: the marker is
+/// operator-action territory, and its presence is the exclusive trigger
+/// for keeping the change out of `list_pending`.
+pub fn is_needs_spec_revision_marked(workspace: &Path, change: &str) -> bool {
+    change_dir(workspace, change).join(NEEDS_REVISION_FILE).exists()
 }
 
 pub fn lock(workspace: &Path, change: &str) -> Result<()> {
@@ -517,6 +528,30 @@ mod tests {
             vec!["alpha".to_string(), "gamma".to_string()],
             "perma-stuck change must be excluded from list_pending"
         );
+    }
+
+    #[test]
+    fn list_pending_excludes_needs_spec_revision() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "alpha");
+        make_change(ws, "beta");
+        make_change(ws, "gamma");
+        // Mark `beta` as needing spec revision.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("beta").join(NEEDS_REVISION_FILE),
+            r#"{"change":"beta","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"Edit tasks.md, commit, then delete this marker."}"#,
+        )
+        .unwrap();
+
+        let pending = list_pending(ws).unwrap();
+        assert_eq!(
+            pending,
+            vec!["alpha".to_string(), "gamma".to_string()],
+            "needs-spec-revision change must be excluded from list_pending"
+        );
+        assert!(is_needs_spec_revision_marked(ws, "beta"));
+        assert!(!is_needs_spec_revision_marked(ws, "alpha"));
     }
 
     #[test]
