@@ -5,17 +5,24 @@
 //! changes to the `github`, `reviewer`, `chatops`, and `repositories`
 //! sections. Only the `executor` section requires a process restart.
 
+use crate::alert_state::AlertState;
 use crate::chatops::ChatOpsBackend;
+use crate::chatops::operator_commands::{
+    LastIteration, MarkerEntry, RepoStatusResponse, ThrottledAlertEntry,
+};
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{
     ChatOpsConfig, Config, GithubConfig, NotificationsConfig, RepositoryConfig, ReviewerConfig,
 };
+use crate::failure_state;
+use crate::{queue, workspace};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -219,7 +226,263 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
     };
     match action.as_str() {
         "reload" => handle_reload(state).await,
+        "repo_status" => handle_repo_status(&parsed, state),
+        "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
+        "clear_revision_marker" => handle_clear_revision(&parsed, state),
+        "wipe_workspace" => handle_wipe_workspace(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
+    }
+}
+
+// =====================================================================
+// Operator-command action handlers
+// =====================================================================
+
+/// Look up the configured repository whose `url` matches `url_arg`. Errors
+/// when the URL is unknown to the daemon.
+fn find_repo(state: &ControlState, url_arg: &str) -> std::result::Result<RepositoryConfig, String> {
+    let cfg = state.last_config.load_full();
+    cfg.repositories
+        .iter()
+        .find(|r| r.url == url_arg)
+        .cloned()
+        .ok_or_else(|| format!("no repository configured with url `{url_arg}`"))
+}
+
+fn require_str(parsed: &Value, field: &str) -> std::result::Result<String, String> {
+    parsed
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing `{field}` field"))
+}
+
+fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+    match build_repo_status(&workspace_path, &repo) {
+        Ok(resp) => match serde_json::to_value(&resp) {
+            Ok(body) => json!({"ok": true, "status": body}),
+            Err(e) => json!({"ok": false, "error": format!("serializing status: {e}")}),
+        },
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    }
+}
+
+/// Build the `RepoStatusResponse` for one repo by reading the workspace's
+/// failure-state, alert-state, marker files, and queue state. Pure
+/// filesystem reads + config snapshot — does not interrogate the live
+/// polling-task map for `last_iteration` (no central record exists yet);
+/// the field is populated from the most recent failure-state timestamp
+/// when available.
+fn build_repo_status(workspace_path: &Path, repo: &RepositoryConfig) -> Result<RepoStatusResponse> {
+    let mut resp = RepoStatusResponse {
+        url: repo.url.clone(),
+        ..RepoStatusResponse::default()
+    };
+
+    // Workspace may not exist yet (e.g. a freshly added repo whose initial
+    // clone hasn't run). Treat that as "everything empty" — the URL header
+    // is still useful and operators won't see a false error.
+    if !workspace_path.is_dir() {
+        return Ok(resp);
+    }
+
+    // Marker-excluded changes — pull marked_at + detail from the marker
+    // JSON files where possible.
+    let (perma_changes, revision_changes) = queue::list_marker_excluded(workspace_path)?;
+    for change in perma_changes {
+        let marker_path = workspace_path
+            .join("openspec/changes")
+            .join(&change)
+            .join(".perma-stuck.json");
+        let (marked_at, detail) = read_perma_marker(&marker_path);
+        resp.perma_stuck_changes.push(MarkerEntry {
+            change,
+            marked_at,
+            detail,
+        });
+    }
+    for change in revision_changes {
+        let marker_path = workspace_path
+            .join("openspec/changes")
+            .join(&change)
+            .join(".needs-spec-revision.json");
+        let marked_at = read_revision_marker(&marker_path);
+        resp.revision_marked_changes.push(MarkerEntry {
+            change,
+            marked_at,
+            detail: String::new(),
+        });
+    }
+
+    // Throttled alerts (category-level + per-change perma-stuck +
+    // per-change spec-revision).
+    let alert_state = AlertState::load_or_default(workspace_path);
+    for (category, entry) in &alert_state.alerts {
+        resp.throttled_alerts.push(ThrottledAlertEntry {
+            label: category.label().to_string(),
+            last_fired_at: entry.last_alerted_at,
+            throttle_window_hours: 24,
+        });
+    }
+    for (change, entry) in &alert_state.perma_stuck_alerts {
+        resp.throttled_alerts.push(ThrottledAlertEntry {
+            label: format!("perma_stuck:{change}"),
+            last_fired_at: entry.last_alerted_at,
+            throttle_window_hours: 24,
+        });
+    }
+    for (change, entry) in &alert_state.spec_revision_alerts {
+        resp.throttled_alerts.push(ThrottledAlertEntry {
+            label: format!("spec_revision:{change}"),
+            last_fired_at: entry.last_alerted_at,
+            throttle_window_hours: 24,
+        });
+    }
+
+    // Queue snapshot.
+    resp.pending_changes = queue::list_pending(workspace_path).unwrap_or_default();
+    resp.waiting_changes = queue::list_waiting(workspace_path).unwrap_or_default();
+
+    // Best-effort last-iteration: failure-state's most recent entry
+    // gives us a timestamp for "something happened recently"; without a
+    // central iteration log there's no archive-vs-failure outcome to
+    // report. Skip when there are no failure-state entries (a healthy
+    // workspace).
+    if let Ok(state) = failure_state::load(workspace_path) {
+        if let Some(latest_entry) = state
+            .entries
+            .values()
+            .max_by_key(|e| e.last_failed_at)
+        {
+            resp.last_iteration = Some(LastIteration {
+                finished_at: latest_entry.last_failed_at,
+                outcome_summary: format!(
+                    "last failure: {}",
+                    truncate(&latest_entry.last_reason, 80)
+                ),
+                next_iteration_estimate: Some(
+                    latest_entry.last_failed_at
+                        + chrono::Duration::seconds(repo.poll_interval_sec as i64),
+                ),
+                poll_interval_sec: repo.poll_interval_sec,
+            });
+        }
+    }
+
+    Ok(resp)
+}
+
+fn read_perma_marker(path: &Path) -> (DateTime<Utc>, String) {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let marked_at = parsed
+        .get("marked_stuck_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or_else(Utc::now);
+    let count = parsed
+        .get("consecutive_failures")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let detail = if count > 0 {
+        format!("consecutive_failures: {count}")
+    } else {
+        String::new()
+    };
+    (marked_at, detail)
+}
+
+fn read_revision_marker(path: &Path) -> DateTime<Utc> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    parsed
+        .get("marked_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or_else(Utc::now)
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+    match queue::remove_perma_stuck_marker(&workspace_path, &change) {
+        Ok(()) => json!({"ok": true, "change": change, "url": url}),
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    }
+}
+
+fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+    match queue::remove_revision_marker(&workspace_path, &change) {
+        Ok(()) => json!({"ok": true, "change": change, "url": url}),
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    }
+}
+
+/// Idempotent — a missing workspace directory is success (the user wanted
+/// it gone, it's gone). Returns the path that was (or would have been)
+/// removed in the success response so the chatops reply names a concrete
+/// thing.
+fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+    let display = workspace_path.display().to_string();
+    if !workspace_path.exists() {
+        return json!({"ok": true, "path": display, "url": url, "already_absent": true});
+    }
+    match std::fs::remove_dir_all(&workspace_path) {
+        Ok(()) => json!({"ok": true, "path": display, "url": url, "already_absent": false}),
+        Err(e) => json!({
+            "ok": false,
+            "error": format!("removing {display}: {e}"),
+        }),
     }
 }
 
@@ -1121,6 +1384,312 @@ github:
         );
         let snap = state.last_config.load_full();
         assert_eq!(snap.executor.timeout_secs, 600);
+        cancel.cancel();
+    }
+
+    /// Build YAML for a workspace at an explicit `local_path` so the
+    /// operator-command tests don't try to look under /tmp/workspaces.
+    fn local_path_yaml(local_path: &Path) -> String {
+        format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/myrepo.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+  token:
+    value: "ghp_fixture"
+"#,
+            local_path.display()
+        )
+    }
+
+    /// Create a workspace fixture with an openspec/changes/<name>/proposal.md
+    /// file so `queue::list_pending` includes it.
+    fn make_change(workspace: &Path, change: &str) {
+        let dir = workspace.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), "## Why\nfixture\n").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_removes_marker_and_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        std::fs::write(
+            workspace.join("openspec/changes/a06-foo/.perma-stuck.json"),
+            r#"{"change":"a06-foo","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a06-foo",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert!(
+            !workspace
+                .join("openspec/changes/a06-foo/.perma-stuck.json")
+                .exists(),
+            "marker file should be gone"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_errors_when_marker_absent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a06-foo",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("no perma-stuck marker"),
+            "error must name marker: {err}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_removes_marker_and_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a07-bar");
+        std::fs::write(
+            workspace.join("openspec/changes/a07-bar/.needs-spec-revision.json"),
+            r#"{"change":"a07-bar","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a07-bar",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert!(
+            !workspace
+                .join("openspec/changes/a07-bar/.needs-spec-revision.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_errors_when_marker_absent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a07-bar");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a07-bar",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_url_returns_error_for_marker_clear() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/UNKNOWN.git",
+            "change": "x",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("no repository configured"), "got: {err}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_removes_directory_and_returns_path() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join("openspec/changes")).unwrap();
+        std::fs::write(workspace.join("dummy.txt"), "x").unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        assert!(workspace.exists());
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert!(!workspace.exists(), "workspace should have been removed");
+        assert_eq!(
+            resp["path"].as_str().unwrap(),
+            workspace.display().to_string(),
+            "response must echo the removed path"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_is_idempotent_when_directory_absent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        // Intentionally do NOT create the workspace directory.
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(
+            resp["ok"],
+            serde_json::Value::Bool(true),
+            "missing dir must be Ok: {resp}"
+        );
+        assert_eq!(resp["already_absent"], serde_json::Value::Bool(true));
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_status_assembles_marker_alert_and_queue_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        make_change(&workspace, "a07-bar");
+        make_change(&workspace, "a08-ready");
+        // Marker on a06 + a07.
+        std::fs::write(
+            workspace.join("openspec/changes/a06-foo/.perma-stuck.json"),
+            r#"{"change":"a06-foo","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("openspec/changes/a07-bar/.needs-spec-revision.json"),
+            r#"{"change":"a07-bar","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "repo_status",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let status = &resp["status"];
+        assert_eq!(status["url"], "git@github.com:owner/myrepo.git");
+        let perma: Vec<String> = status["perma_stuck_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["change"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(perma, vec!["a06-foo".to_string()]);
+        let revision: Vec<String> = status["revision_marked_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["change"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(revision, vec!["a07-bar".to_string()]);
+        // Pending = a08-ready (the others are marker-excluded).
+        let pending: Vec<String> = status["pending_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(pending, vec!["a08-ready".to_string()]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_status_handles_missing_workspace_gracefully() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("never-created");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "repo_status",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let status = &resp["status"];
+        assert!(status["perma_stuck_changes"].as_array().unwrap().is_empty());
+        assert!(status["pending_changes"].as_array().unwrap().is_empty());
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_to_end_dispatcher_drives_full_flow_through_real_socket() {
+        use crate::chatops::operator_commands::{
+            ControlSocketSubmitter, OperatorCommandDispatcher,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        std::fs::write(
+            workspace.join("openspec/changes/a06-foo/.perma-stuck.json"),
+            r#"{"change":"a06-foo","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let submitter = ControlSocketSubmitter::new(socket.clone());
+        let dispatcher = OperatorCommandDispatcher::new();
+        let repos = state.last_config.load_full().repositories.clone();
+        let bot = "<@UBOT>";
+        let reply = dispatcher
+            .handle_message(
+                &format!("{bot} clear-perma-stuck myrepo a06-foo"),
+                "C1",
+                bot,
+                &repos,
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        assert!(reply.starts_with("✓"), "expected success reply: {reply}");
+        assert!(
+            !workspace
+                .join("openspec/changes/a06-foo/.perma-stuck.json")
+                .exists(),
+            "marker must have been removed"
+        );
         cancel.cancel();
     }
 

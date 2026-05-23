@@ -121,6 +121,80 @@ pub fn is_needs_spec_revision_marked(workspace: &Path, change: &str) -> bool {
     change_dir(workspace, change).join(NEEDS_REVISION_FILE).exists()
 }
 
+/// True when `<workspace>/openspec/changes/<change>/.perma-stuck.json` exists.
+/// Pure filesystem check.
+pub fn is_perma_stuck(workspace: &Path, change: &str) -> bool {
+    change_dir(workspace, change).join(PERMA_STUCK_FILE).exists()
+}
+
+/// Remove `<workspace>/openspec/changes/<change>/.perma-stuck.json`. Errors
+/// when the marker is absent so the operator can be told precisely "no
+/// perma-stuck marker for change `<change>`" — chatops surfaces that
+/// distinct from accidental success on a typo. Non-NotFound IO errors
+/// propagate.
+pub fn remove_perma_stuck_marker(workspace: &Path, change: &str) -> Result<()> {
+    let path = change_dir(workspace, change).join(PERMA_STUCK_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "no perma-stuck marker for change `{change}`"
+        )),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Remove `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`.
+/// Errors when the marker is absent with a clear "no needs-spec-revision
+/// marker for change `<change>`" message; non-NotFound IO errors propagate.
+pub fn remove_revision_marker(workspace: &Path, change: &str) -> Result<()> {
+    let path = change_dir(workspace, change).join(NEEDS_REVISION_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "no needs-spec-revision marker for change `{change}`"
+        )),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// List changes excluded from `list_pending` by an operator-action marker.
+/// Returns `(perma_stuck_changes, revision_marked_changes)` — each sorted
+/// ascending. Subdirectories that begin with `.` or are the literal
+/// `archive` directory are skipped.
+pub fn list_marker_excluded(workspace: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let root = changes_dir(workspace);
+    if !root.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut perma: Vec<String> = Vec::new();
+    let mut revision: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("reading {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ARCHIVE_DIR || name.starts_with('.') {
+            continue;
+        }
+        let dir = entry.path();
+        if dir.join(PERMA_STUCK_FILE).exists() {
+            perma.push(name.clone());
+        }
+        if dir.join(NEEDS_REVISION_FILE).exists() {
+            revision.push(name);
+        }
+    }
+    perma.sort();
+    revision.sort();
+    Ok((perma, revision))
+}
+
 pub fn lock(workspace: &Path, change: &str) -> Result<()> {
     let path = change_dir(workspace, change).join(LOCK_FILE);
     std::fs::File::create(&path)
@@ -627,6 +701,87 @@ mod tests {
         let ws3 = dir3.path();
         make_change(ws3, "baz");
         assert!(!would_collide_on_archive(ws3, "baz"));
+    }
+
+    #[test]
+    fn remove_perma_stuck_marker_returns_ok_and_clears_file() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "alpha");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("alpha").join(PERMA_STUCK_FILE),
+            r#"{"change":"alpha","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        assert!(is_perma_stuck(ws, "alpha"));
+        remove_perma_stuck_marker(ws, "alpha").unwrap();
+        assert!(!is_perma_stuck(ws, "alpha"));
+    }
+
+    #[test]
+    fn remove_perma_stuck_marker_errors_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "alpha");
+        let err =
+            remove_perma_stuck_marker(ws, "alpha").expect_err("missing marker must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no perma-stuck marker for change `alpha`"),
+            "error must name change: {msg}"
+        );
+    }
+
+    #[test]
+    fn remove_revision_marker_returns_ok_and_clears_file() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "beta");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("beta").join(NEEDS_REVISION_FILE),
+            r#"{"change":"beta","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        assert!(is_needs_spec_revision_marked(ws, "beta"));
+        remove_revision_marker(ws, "beta").unwrap();
+        assert!(!is_needs_spec_revision_marked(ws, "beta"));
+    }
+
+    #[test]
+    fn remove_revision_marker_errors_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "beta");
+        let err =
+            remove_revision_marker(ws, "beta").expect_err("missing marker must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no needs-spec-revision marker for change `beta`"),
+            "error must name change: {msg}"
+        );
+    }
+
+    #[test]
+    fn list_marker_excluded_groups_by_marker_type() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "alpha");
+        make_change(ws, "beta");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("alpha").join(PERMA_STUCK_FILE),
+            r#"{"change":"alpha","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("beta").join(NEEDS_REVISION_FILE),
+            r#"{"change":"beta","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let (perma, revision) = list_marker_excluded(ws).unwrap();
+        assert_eq!(perma, vec!["alpha".to_string()]);
+        assert_eq!(revision, vec!["beta".to_string()]);
     }
 
     #[test]

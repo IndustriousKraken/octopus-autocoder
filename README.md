@@ -404,6 +404,55 @@ All three are safe to inspect (plain JSON) but unsafe to modify by hand — atom
 
 Deleting `.alert-state.json` by hand is harmless: it just resets the alert throttle window for that repository, so the next predictable failure will alert immediately rather than wait out the 24h window.
 
+### ChatOps operator commands
+
+A small set of operator-issued commands lets you handle the common SSH-and-edit recovery actions from chat instead of switching to a terminal. The bot recognises:
+
+| Verb | Syntax | What it does |
+| --- | --- | --- |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line summary: active markers, currently-engaged 24h alert throttles, last-iteration timestamp + next-iteration estimate, queue snapshot. |
+| `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
+| `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
+| `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
+
+The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](#what-gets-posted) recovery uses, deleted via a chat reply instead.
+
+#### Repo substring matching
+
+You type the short name; the bot resolves it. The match is case-insensitive substring search against the full configured `repositories[].url`. `myrepo` matches `git@github.com:acme/myrepo.git`; `MYREPO` does too. If two repos with the same trailing name exist under different owners, the bot replies with the candidate list and asks for a more specific substring. If nothing matches, the bot replies with the full list of configured URLs so you can copy one back.
+
+#### Two-step confirmation for `wipe-workspace`
+
+`wipe-workspace` is destructive, so the first reply is a warning rather than the action:
+
+```
+⚠️ This will delete /tmp/workspaces/github_com_acme_myrepo (forces a re-clone on the next iteration). Reply 'confirm' within 60 seconds.
+```
+
+To proceed, reply `confirm` (case-insensitive, no mention needed) within 60 seconds in the same channel. The confirmation is channel-scoped: a `confirm` in a different channel does NOT trigger a pending wipe somewhere else. If you wait longer than 60 seconds, the pending entry expires and you must re-issue the original `wipe-workspace` command.
+
+#### Reply shape
+
+Success replies are one line beginning with `✓`. Error replies are one line beginning with `✗`. The `status` command is the only multi-line reply. Examples:
+
+```
+✓ cleared .perma-stuck.json for a06-foo on myrepo
+✗ no perma-stuck marker for change a99-nonexistent on myrepo
+✗ no repo matched 'gibberish'; configured: myrepo, widgets
+```
+
+#### Unrecognised verbs are silently ignored
+
+Random chat that happens to mention the bot but doesn't match a known verb (typos, drive-by mentions, AskUser-thread replies, etc.) is ignored — no error reply. This keeps the channel quiet during normal use and reserves the `✗` shape for actionable, operator-initiated failures.
+
+The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
+
+#### Trust boundary
+
+Whoever has write access to the configured chatops channel is treated as an operator — the same trust boundary as the existing `AskUser` reply detection. Sites that need finer-grained control configure separate channels per concern via the existing per-repo `chatops_channel_id` override.
+
+Under the hood, the chatops listener parses the command, resolves the repository, and submits a JSON action over the daemon's existing Unix-domain control socket (the same socket used by `autocoder reload`). The same actions are reachable from any future CLI subcommand without duplicating logic; the control socket's existing Unix-perms / daemon-user-only authentication applies identically.
+
 ---
 
 ## Experimental ChatOps Backends
