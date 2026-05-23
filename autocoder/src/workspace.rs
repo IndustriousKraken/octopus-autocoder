@@ -139,6 +139,18 @@ pub fn ensure_initialized(
             "could not register .perma-stuck.json in .git/info/exclude: {e:#}"
         );
     }
+    // Per-change spec-revision markers live at
+    // `openspec/changes/<change>/.needs-spec-revision.json`. They are
+    // operator-managed (deletion is the "retry this change" signal) and
+    // follow the same gitignore contract as `.perma-stuck.json`: they
+    // must not trip the pre-pass dirty check and must survive
+    // `git clean -fd` during per-iteration recovery.
+    if let Err(e) = ensure_git_info_excluded(workspace, ".needs-spec-revision.json") {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register .needs-spec-revision.json in .git/info/exclude: {e:#}"
+        );
+    }
     Ok(())
 }
 
@@ -742,21 +754,33 @@ mod tests {
         ensure_initialized(&workspace, &url, None).unwrap();
 
         let exclude_path = workspace.join(".git/info/exclude");
-        // After ensure_initialized, .failure-state.json should be registered.
+        // After ensure_initialized, every per-workspace bookkeeping file
+        // should be registered.
         let contents = std::fs::read_to_string(&exclude_path).unwrap();
-        assert!(
-            contents.lines().any(|l| l.trim() == ".failure-state.json"),
-            "exclude file must contain .failure-state.json: {contents}"
-        );
+        for entry in [
+            ".failure-state.json",
+            ".audit-state.json",
+            ".perma-stuck.json",
+            ".needs-spec-revision.json",
+        ] {
+            assert!(
+                contents.lines().any(|l| l.trim() == entry),
+                "exclude file must contain {entry}: {contents}"
+            );
+        }
 
-        // Calling ensure_initialized again must NOT duplicate the entry.
+        // Calling ensure_initialized again must NOT duplicate any entry.
         ensure_initialized(&workspace, &url, None).unwrap();
         let contents = std::fs::read_to_string(&exclude_path).unwrap();
-        let occurrences = contents
-            .lines()
-            .filter(|l| l.trim() == ".failure-state.json")
-            .count();
-        assert_eq!(occurrences, 1, "duplicate entry added: {contents}");
+        for entry in [
+            ".failure-state.json",
+            ".audit-state.json",
+            ".perma-stuck.json",
+            ".needs-spec-revision.json",
+        ] {
+            let occurrences = contents.lines().filter(|l| l.trim() == entry).count();
+            assert_eq!(occurrences, 1, "duplicate `{entry}` entry added: {contents}");
+        }
     }
 
     #[test]

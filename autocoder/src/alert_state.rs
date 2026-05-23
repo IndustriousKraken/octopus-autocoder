@@ -28,6 +28,12 @@ pub enum AlertCategory {
     /// the next iteration, and emits a throttled alert under this
     /// category so the operator can investigate.
     AuditWritePolicyViolation,
+    /// The executor returned `SpecNeedsRevision` for a change: one or
+    /// more tasks in tasks.md require capabilities outside the agent's
+    /// sandbox. autocoder writes a `.needs-spec-revision.json` marker
+    /// and emits a throttled alert under this category so the operator
+    /// can revise tasks.md.
+    SpecNeedsRevision,
 }
 
 impl AlertCategory {
@@ -40,6 +46,7 @@ impl AlertCategory {
             Self::BranchPushFailure => "branch push keeps failing",
             Self::PrCreationFailure => "PR creation keeps failing",
             Self::AuditWritePolicyViolation => "audit attempted disallowed write",
+            Self::SpecNeedsRevision => "spec needs revision",
         }
     }
 }
@@ -59,6 +66,13 @@ pub struct AlertState {
     /// change doesn't spam the alert channel.
     #[serde(default)]
     pub perma_stuck_alerts: HashMap<String, AlertEntry>,
+    /// Per-change spec-needs-revision alert throttle. Keyed by change
+    /// name. Same 24h throttle as `perma_stuck_alerts`. The marker file
+    /// itself excludes the change from `list_pending`, so under normal
+    /// operation this alert fires at most once per (change, marker
+    /// lifecycle).
+    #[serde(default)]
+    pub spec_revision_alerts: HashMap<String, AlertEntry>,
 }
 
 fn alert_state_path(workspace: &Path) -> PathBuf {

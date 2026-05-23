@@ -716,6 +716,44 @@ The chatops alert names the repo, change, count, and a truncated `last_reason`, 
 
 To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
 
+See also [Spec marked as needing revision](#spec-marked-as-needing-revision) — its sibling pattern for the case where the operator (not the agent) is the one with work to do.
+
+### Spec marked as needing revision
+
+Sibling pattern to [Perma-stuck change detection](#perma-stuck-change-detection). Where perma-stuck signals "the agent kept failing on this change," needs-spec-revision signals "the spec is asking the agent to do something it cannot do." Both are operator-action states; both are cleared by deleting the marker file.
+
+**What triggers it.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`, posts a chatops alert under `AlertCategory::SpecNeedsRevision` (same 24-hour throttle as perma-stuck), and halts the queue walk for the iteration.
+
+The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves the project invariant that no AI process edits its own marching orders without human review.
+
+**The marker file** at `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` has the schema:
+
+```json
+{
+  "change": "<change-name>",
+  "marked_at": "RFC 3339 UTC timestamp",
+  "unimplementable_tasks": [
+    {"task_id": "5.2", "task_text": "...", "reason": "..."}
+  ],
+  "revision_suggestion": "free-form text the agent wrote describing what to change",
+  "operator_action": "Edit openspec/changes/<change>/tasks.md to remove or revise the flagged tasks, commit + push, then delete this marker file."
+}
+```
+
+The marker is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check and survives `git clean -fd` during per-iteration recovery (same treatment as `.perma-stuck.json`).
+
+**The chatops alert** lists each flagged task's id + text, the agent's revision suggestion, an operator-action checklist, and the marker file path + the per-change run log path. It is gated on `failure_alerts_enabled` and subject to the standard 24-hour per-category throttle.
+
+**Operator workflow.**
+
+1. Read the chatops alert. The flagged tasks and the agent's revision suggestion are in the body; the run log is named for deeper diagnosis if needed.
+2. Edit `openspec/changes/<change>/tasks.md` to remove or revise the flagged tasks. Commit + push to the base branch.
+3. Delete the marker file: `rm openspec/changes/<change>/.needs-spec-revision.json`. The next iteration picks the change back up.
+
+**False-positive escape hatch.** If you review the flagged tasks and decide the agent was overly conservative, delete the marker WITHOUT editing `tasks.md`. The change re-enters `list_pending` on the next iteration. If the agent flags the same task again, you can add a comment in `tasks.md` near it explaining why it's implementable (e.g. naming a tool path or workflow that resolves the concern), or update the implementer prompt template via a follow-up change to relax the relevant pattern.
+
+The marker is operator-cleared, not auto-cleared. autocoder does not remove it on the next iteration even when the spec has been revised — same rationale as the perma-stuck marker: the operator's audit trail is clearer when "did the issue actually get fixed?" requires an explicit human action.
+
 ### Self-heal for already-implemented changes
 
 When a rebase or merge lands the work for a change on the base branch without moving the change directory into `archive/`, the agent sees the implementation already done and returns `Completed` without modifying the workspace. Normally that's classified as Failed (no-op completion) and retried on every poll, burning tokens to re-confirm the same answer. autocoder self-heals this case instead:
