@@ -79,6 +79,16 @@ pub fn write_marker(
     Ok(())
 }
 
+/// Idempotent removal of the marker. A missing file is success.
+pub fn remove_marker(workspace: &Path, change: &str) -> Result<()> {
+    let path = marker_path(workspace, change);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
