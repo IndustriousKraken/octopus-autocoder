@@ -1029,6 +1029,22 @@ The Claude credentials now live at `/home/autocoder/.claude/`. The git config wr
 
 (If `npm` isn't on the autocoder user's `$PATH`, install Node.js first via your distro's package manager or `nvm`. The exact openspec install command may vary; check the openspec project for the current recommendation.)
 
+After installing the openspec CLI, configure its workflow profile to include `sync` (and any other workflows you find useful):
+
+```bash
+sudo -u autocoder openspec config profile
+```
+
+This launches an interactive picker. Choose **Delivery: Both (skills + commands)** and at minimum tick **Sync specs** in the workflow list. Then in each project the daemon operates on, the openspec installation in that workspace needs to be refreshed for the new workflows to take effect:
+
+```bash
+sudo -u autocoder bash -c 'cd /tmp/workspaces/<sanitized-url> && openspec update'
+```
+
+This step exists because openspec 0.18 split the canonical-spec merge step out of `openspec archive` into a separate `sync` workflow that the default profile doesn't install (see [Fission-AI/OpenSpec#913](https://github.com/Fission-AI/OpenSpec/issues/913)). Without `sync` installed in the profile, `openspec archive` archives the change directory but does NOT propagate the change's `## ADDED`/`## MODIFIED`/`## REMOVED` requirements into `openspec/specs/<capability>/spec.md`. The upstream is expected to re-bundle `sync` by default in a future release; this configuration step is the right-now workaround.
+
+The autocoder also ships a defense-in-depth `spec_sync_audit` (when enabled via the `audits:` config block) that walks every archived change and reconciles drift independently of the openspec CLI's configuration. The audit is the right choice if (a) you don't want to depend on per-host openspec config, (b) you want existing pre-configuration drift backfilled automatically, or (c) you onboard repos that may have accumulated drift before autocoder ever touched them. The two layers are complementary: profile config prevents new drift from autocoder-driven archives going forward; the audit closes whatever's already there and catches drift from any other source (manual `openspec archive` runs by operators, repos imported with pre-existing gaps, etc.).
+
 ### 3. Set up SSH for the autocoder user
 
 Required for `config.yaml` repositories using SSH URLs (`git@github.com:...`), which is the recommended form for multi-owner setups. The autocoder user needs an SSH key tied to a GitHub identity with access to exactly the configured repositories — no more.
