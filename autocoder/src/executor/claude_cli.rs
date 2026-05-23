@@ -13,7 +13,7 @@
 //!      clarification regex, the executor synthesizes an AskUser from the
 //!      first matching sentence.
 
-use super::{Executor, ExecutorOutcome, ResumeHandle};
+use super::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
@@ -27,6 +27,8 @@ use tokio::process::Command;
 
 const MCP_CONFIG_FILENAME: &str = ".mcp.json";
 const ASKUSER_MARKER_FILENAME: &str = ".askuser-pending.json";
+const OUTCOME_SENTINEL_TAG: &str = "=== AUTOCODER-OUTCOME ===";
+const SENTINEL_EXCERPT_MAX: usize = 200;
 
 /// Built-in default implementer prompt template, embedded at compile time
 /// so the binary runs without requiring `prompts/` on the filesystem.
@@ -254,6 +256,136 @@ impl ClaudeCliExecutor {
         Ok(Some(question))
     }
 
+    /// Scan `stdout` for an `=== AUTOCODER-OUTCOME ===` block followed by a
+    /// JSON object. Returns the JSON payload string (everything between the
+    /// tag line and the first blank line or EOF) and the original byte
+    /// excerpt around the payload for diagnostics on parse failure. Returns
+    /// `None` if no sentinel is present.
+    fn extract_outcome_sentinel(stdout: &str) -> Option<String> {
+        let idx = stdout.find(OUTCOME_SENTINEL_TAG)?;
+        let after = &stdout[idx + OUTCOME_SENTINEL_TAG.len()..];
+        // Skip leading whitespace/newlines to reach the JSON body.
+        let body_start = after
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .unwrap_or(after.len());
+        let body = &after[body_start..];
+        if body.is_empty() {
+            return None;
+        }
+        // The agent emits a single JSON object (object/array depth-tracked).
+        // Find the first `{` and consume until the matching `}` at depth 0,
+        // honoring string literals so braces inside strings don't confuse
+        // the depth counter.
+        let bytes = body.as_bytes();
+        let start = bytes.iter().position(|&b| b == b'{')?;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escape = false;
+        let mut end: Option<usize> = None;
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
+            if in_str {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        Some(body[start..end].to_string())
+    }
+
+    /// Try to interpret an outcome-sentinel JSON payload as a
+    /// `SpecNeedsRevision` outcome. Returns:
+    ///   - `Ok(Some(outcome))` if the payload is a well-formed
+    ///     `spec_needs_revision` block with a non-empty task list.
+    ///   - `Ok(None)` if the payload is some other outcome type (caller
+    ///     leaves the sentinel alone — other parsers may handle it).
+    ///   - `Err(reason)` if the payload looks like `spec_needs_revision`
+    ///     (matches the `type` field) but is malformed — missing required
+    ///     fields, wrong field types, or an empty `unimplementable_tasks`
+    ///     list. The caller falls back to `Failed` with a diagnostic.
+    fn try_parse_spec_needs_revision(
+        payload: &str,
+    ) -> std::result::Result<Option<ExecutorOutcome>, String> {
+        let value: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("invalid JSON: {e}")),
+        };
+        let type_field = value.get("type").and_then(|v| v.as_str());
+        if type_field != Some("spec_needs_revision") {
+            return Ok(None);
+        }
+        let tasks_val = value.get("unimplementable_tasks");
+        let tasks_array = match tasks_val.and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return Err("missing or non-array `unimplementable_tasks`".to_string()),
+        };
+        if tasks_array.is_empty() {
+            return Err("`unimplementable_tasks` is empty".to_string());
+        }
+        let mut tasks: Vec<UnimplementableTask> = Vec::with_capacity(tasks_array.len());
+        for (i, entry) in tasks_array.iter().enumerate() {
+            let task_id = entry
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("task[{i}] missing string `task_id`"))?;
+            let task_text = entry
+                .get("task_text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("task[{i}] missing string `task_text`"))?;
+            let reason = entry
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("task[{i}] missing string `reason`"))?;
+            tasks.push(UnimplementableTask {
+                task_id: task_id.to_string(),
+                task_text: task_text.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        let revision_suggestion = value
+            .get("revision_suggestion")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing string `revision_suggestion`".to_string())?
+            .to_string();
+        Ok(Some(ExecutorOutcome::SpecNeedsRevision {
+            unimplementable_tasks: tasks,
+            revision_suggestion,
+        }))
+    }
+
+    /// Truncate `s` to at most `SENTINEL_EXCERPT_MAX` characters (codepoints)
+    /// for inclusion in a parse-failure reason. Adds an ellipsis when
+    /// truncated.
+    fn excerpt_for_reason(s: &str) -> String {
+        let count = s.chars().count();
+        if count <= SENTINEL_EXCERPT_MAX {
+            s.to_string()
+        } else {
+            let mut out: String = s.chars().take(SENTINEL_EXCERPT_MAX).collect();
+            out.push('…');
+            out
+        }
+    }
+
     /// Layer-2 backstop: scan stdout for a clarification phrase. Returns
     /// the first sentence containing a match, or `None`.
     ///
@@ -442,6 +574,35 @@ impl ClaudeCliExecutor {
                 question,
                 resume_handle: handle,
             });
+        }
+
+        // Outcome sentinel: the agent's pre-flight check writes an
+        // `=== AUTOCODER-OUTCOME ===` block when it identifies an
+        // unimplementable task. We check this BEFORE looking at the exit
+        // status so an agent that exits non-zero after flagging is still
+        // honored, and so the dispatcher's no-diff-Failed fallback never
+        // sees the workspace ahead of the signal.
+        if let Some(payload) = Self::extract_outcome_sentinel(&outcome.stdout) {
+            match Self::try_parse_spec_needs_revision(&payload) {
+                Ok(Some(spec_revision)) => return Ok(spec_revision),
+                Ok(None) => {
+                    // Sentinel present but not a spec_needs_revision payload.
+                    // Other parsers (none today) could match here; fall
+                    // through to normal exit-status handling.
+                }
+                Err(parse_err) => {
+                    let excerpt = Self::excerpt_for_reason(&payload);
+                    tracing::warn!(
+                        change = %change,
+                        "agent emitted unparseable SpecNeedsRevision sentinel: {parse_err}; payload: {excerpt}"
+                    );
+                    return Ok(ExecutorOutcome::Failed {
+                        reason: format!(
+                            "agent emitted unparseable SpecNeedsRevision sentinel: {excerpt}"
+                        ),
+                    });
+                }
+            }
         }
 
         if outcome.timed_out {
@@ -1207,6 +1368,139 @@ mod tests {
         assert!(body.contains("PROMPT_SENTINEL"));
         assert!(body.contains("STDOUT_SENTINEL"));
         assert!(body.contains("STDERR_SENTINEL"));
+    }
+
+    #[test]
+    fn parse_spec_needs_revision_sentinel_round_trips() {
+        let stdout = "\
+some narrative output before the sentinel\n\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"5.2\",\"task_text\":\"install actionlint on host\",\"reason\":\"no apt access\"}],\
+\"revision_suggestion\":\"Replace 5.2 with a CI gate.\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let outcome =
+            ClaudeCliExecutor::try_parse_spec_needs_revision(&payload).expect("parse ok");
+        match outcome {
+            Some(ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                revision_suggestion,
+            }) => {
+                assert_eq!(unimplementable_tasks.len(), 1);
+                assert_eq!(unimplementable_tasks[0].task_id, "5.2");
+                assert_eq!(
+                    unimplementable_tasks[0].task_text,
+                    "install actionlint on host"
+                );
+                assert_eq!(unimplementable_tasks[0].reason, "no apt access");
+                assert_eq!(revision_suggestion, "Replace 5.2 with a CI gate.");
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_needs_revision_missing_required_field_falls_back_to_failed() {
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"revision_suggestion\":\"x\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect_err("missing tasks field must surface as parse error");
+        assert!(
+            err.contains("unimplementable_tasks"),
+            "error should name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_spec_needs_revision_with_empty_task_list_treated_as_invalid() {
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[],\"revision_suggestion\":\"x\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect_err("empty task list must surface as parse error");
+        assert!(err.contains("empty"), "error should mention emptiness: {err}");
+    }
+
+    #[test]
+    fn extract_outcome_sentinel_handles_braces_in_strings() {
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"1.1\",\"task_text\":\"sudo apt-get install x { y }\",\"reason\":\"no apt\"}],\
+\"revision_suggestion\":\"drop {curlies} in description\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel extracted");
+        // The full JSON object must be captured: depth tracker should not
+        // close early on `{` or `}` inside string literals.
+        assert!(payload.ends_with('}'));
+        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect("parse ok")
+            .expect("Some outcome");
+        match outcome {
+            ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                ..
+            } => {
+                assert!(unimplementable_tasks[0].task_text.contains("{ y }"));
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    /// End-to-end: a script that emits a well-formed spec-needs-revision
+    /// sentinel on stdout and exits 0 causes the executor to return
+    /// `SpecNeedsRevision`, not `Completed`.
+    #[tokio::test]
+    async fn spec_needs_revision_sentinel_routes_through_run() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "needs_revision.sh",
+            "#!/bin/sh\ncat <<'EOF'\nbla bla\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"7.3\",\"task_text\":\"smoke test on macOS\",\"reason\":\"no macOS host in sandbox\"}],\"revision_suggestion\":\"drop the macOS smoke step\"}\nEOF\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                revision_suggestion,
+            } => {
+                assert_eq!(unimplementable_tasks.len(), 1);
+                assert_eq!(unimplementable_tasks[0].task_id, "7.3");
+                assert!(revision_suggestion.contains("macOS"));
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    /// Unparseable sentinel → Failed with parse-error reason. Production
+    /// invariant from the spec: the daemon must not crash on a malformed
+    /// payload, and it must not silently treat the run as success.
+    #[tokio::test]
+    async fn malformed_spec_needs_revision_sentinel_yields_failed() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "bad_sentinel.sh",
+            "#!/bin/sh\ncat <<'EOF'\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[]}\nEOF\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("unparseable SpecNeedsRevision sentinel"),
+                    "reason should mention the parse failure: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     /// End-to-end: after a `run`, the persisted log contains a PROMPT
