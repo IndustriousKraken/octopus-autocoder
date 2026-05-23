@@ -18,6 +18,7 @@ use crate::config::{ChatOpsConfig, ChatOpsProvider, SecretSource};
 pub mod discord;
 pub mod matrix;
 pub mod mattermost;
+pub mod operator_commands;
 pub mod slack;
 pub mod teams;
 
