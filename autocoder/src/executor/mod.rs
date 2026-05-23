@@ -12,11 +12,16 @@ pub mod claude_cli;
 
 #[async_trait]
 pub trait Executor: Send + Sync {
+    /// Run the agent against `change` in `workspace`.
+    ///
+    /// Returns `SpecNeedsRevision` when one or more tasks in tasks.md
+    /// require capabilities outside the executor's sandbox. The agent
+    /// flags upfront, before starting implementation.
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome>;
     async fn resume(&self, handle: ResumeHandle, answer: &str) -> Result<ExecutorOutcome>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExecutorOutcome {
     /// The underlying agent reported successful completion of the change.
     /// autocoder decides what to do with a no-diff `Completed`.
@@ -31,6 +36,32 @@ pub enum ExecutorOutcome {
     /// Unrecoverable failure. autocoder unlocks the change and does
     /// NOT archive it.
     Failed { reason: String },
+    /// The agent inspected `tasks.md` and identified one or more tasks
+    /// that require capabilities outside its sandbox. autocoder writes
+    /// a `.needs-spec-revision.json` marker, posts a chatops alert under
+    /// `AlertCategory::SpecNeedsRevision`, and halts the queue walk. The
+    /// change is excluded from future `list_pending` calls until the
+    /// operator deletes the marker.
+    SpecNeedsRevision {
+        unimplementable_tasks: Vec<UnimplementableTask>,
+        revision_suggestion: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnimplementableTask {
+    /// Task identifier from tasks.md, e.g. "5.2" or "13.1".
+    pub task_id: String,
+    /// The literal task text, quoted from tasks.md for the alert body.
+    pub task_text: String,
+    /// One-line reason the task is outside the agent's sandbox.
+    pub reason: String,
+}
+
+impl PartialEq for ResumeHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
 
 /// Opaque payload passed between `run` and `resume`. JSON-serializable so
