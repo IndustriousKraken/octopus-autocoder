@@ -57,6 +57,11 @@ pub struct RepoTaskHandle {
     pub cancel: CancellationToken,
     pub config: Arc<ArcSwap<RepositoryConfig>>,
     pub join: JoinHandle<()>,
+    /// "Run a canonical-spec rebuild at the next iteration" flag. The
+    /// control socket's `rebuild_specs` action sets this to `true`; the
+    /// polling loop checks + clears it at iteration start (see
+    /// `polling_loop::run`).
+    pub pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Daemon-level task registry keyed by repository URL. Mutated only by
@@ -230,6 +235,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
         "wipe_workspace" => handle_wipe_workspace(&parsed, state),
+        "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -483,6 +489,80 @@ fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
             "ok": false,
             "error": format!("removing {display}: {e}"),
         }),
+    }
+}
+
+/// Rebuild canonical specs from archive history. Two modes:
+///   - `immediate: true`: SIGTERM the running executor (via the busy
+///     marker's subprocess sidecar), wait up to 30s, then run the
+///     rebuild synchronously and return the report in the response.
+///   - `immediate: false`: set `pending_rebuild = true` on the named
+///     repo's polling task state and return immediately. The next
+///     polling iteration picks up the flag and runs the rebuild
+///     instead of the normal queue walk.
+async fn handle_rebuild_specs(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let immediate = parsed
+        .get("immediate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = workspace::resolve_path(&repo);
+
+    if immediate {
+        if let Err(e) =
+            crate::cli::sync_specs::coordinate_with_daemon(&workspace, true).await
+        {
+            return json!({
+                "ok": false,
+                "error": format!("--immediate coordination failed: {e:#}"),
+            });
+        }
+        match crate::cli::sync_specs::rebuild_canonical(&workspace).await {
+            Ok(report) => {
+                let report_val = serde_json::to_value(&report).unwrap_or(Value::Null);
+                json!({
+                    "ok": true,
+                    "url": url,
+                    "immediate": true,
+                    "report": report_val,
+                })
+            }
+            Err(e) => json!({
+                "ok": false,
+                "error": format!("rebuild failed: {e:#}"),
+            }),
+        }
+    } else {
+        // Set the per-repo task's pending_rebuild flag.
+        let flag = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard.get(&url).map(|h| h.pending_rebuild.clone())
+        };
+        match flag {
+            Some(f) => {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+                json!({
+                    "ok": true,
+                    "url": url,
+                    "immediate": false,
+                    "scheduled": true,
+                    "poll_interval_sec": repo.poll_interval_sec,
+                })
+            }
+            None => json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            }),
+        }
     }
 }
 
@@ -820,6 +900,7 @@ mod tests {
                     cancel: child_cancel,
                     config,
                     join,
+                    pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
             SpawnOutcome::Spawned
@@ -1735,6 +1816,7 @@ github:
                     cancel: pre_cancelled,
                     config: Arc::new(ArcSwap::from_pointee(parked_repo)),
                     join: parked,
+                    pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
         }
