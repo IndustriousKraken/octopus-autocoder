@@ -313,6 +313,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let registry_for_task = deps.audit_registry.clone();
         let audits_cfg_for_task = deps.audits_cfg.clone();
         let audit_settings_for_task = deps.audit_settings.clone();
+        let pending_rebuild: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_rebuild_for_task = pending_rebuild.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             polling_loop::run(
                 config_for_task,
@@ -328,6 +331,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 registry_for_task,
                 audits_cfg_for_task,
                 audit_settings_for_task,
+                pending_rebuild_for_task,
                 cancel_for_task,
             )
             .await;
@@ -347,6 +351,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 cancel: child_cancel,
                 config: config_holder,
                 join,
+                pending_rebuild,
             },
         );
         SpawnOutcome::Spawned

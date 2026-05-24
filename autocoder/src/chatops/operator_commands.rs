@@ -15,6 +15,10 @@
 //!   - `confirm`                              (second step; only within 60s
 //!                                            of a wipe-workspace in the
 //!                                            same channel)
+//!   - `rebuild-specs <repo-substring>`       (schedules a canonical-spec
+//!                                            rebuild from archive history
+//!                                            for the next iteration;
+//!                                            never triggers --immediate)
 
 use crate::config::RepositoryConfig;
 use async_trait::async_trait;
@@ -54,6 +58,14 @@ pub enum OperatorCommand {
     /// `wipe-workspace` was issued.
     WipeWorkspaceConfirm {
         repo_substring: Option<String>,
+    },
+    /// Schedule a canonical-spec rebuild for the next iteration of the
+    /// matched repo's polling loop. Chatops NEVER supports `--immediate`:
+    /// killing a running executor mid-iteration via chat is too easy to
+    /// fire accidentally. Operators wanting `--immediate` SSH to the
+    /// daemon host and run the CLI directly.
+    RebuildSpecs {
+        repo_substring: String,
     },
 }
 
@@ -140,6 +152,14 @@ pub fn parse_command(message: &str, bot_mention: &str) -> Option<OperatorCommand
             let substring = rest.first().map(|s| s.to_string());
             Some(OperatorCommand::WipeWorkspaceConfirm {
                 repo_substring: substring,
+            })
+        }
+        "rebuild-specs" => {
+            if rest.len() != 1 {
+                return None;
+            }
+            Some(OperatorCommand::RebuildSpecs {
+                repo_substring: rest[0].to_string(),
             })
         }
         _ => None,
@@ -616,6 +636,38 @@ impl OperatorCommandDispatcher {
                     sanitized.display()
                 )
             }
+            OperatorCommand::RebuildSpecs { repo_substring } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "rebuild_specs",
+                        "url": repo.url,
+                        "immediate": false,
+                    }))
+                    .await;
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let poll = resp
+                        .get("poll_interval_sec")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(repo.poll_interval_sec);
+                    format!(
+                        "✓ rebuild scheduled for {} — will run within ~{poll}s (current iteration must finish first)",
+                        short_repo_label(&repo.url)
+                    )
+                } else {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    format!("✗ {err}")
+                }
+            }
             OperatorCommand::WipeWorkspaceConfirm { .. } => {
                 let url = match self.pending.take_valid(channel_id) {
                     Some(u) => u,
@@ -810,6 +862,36 @@ mod tests {
                 change: "a07-bar".into(),
             }
         );
+    }
+
+    #[test]
+    fn parse_rebuild_specs_happy_path() {
+        let cmd = parse_command(&format!("{BOT} rebuild-specs myrepo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::RebuildSpecs {
+                repo_substring: "myrepo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rebuild_specs_immediate_not_recognized() {
+        // The chatops parser does NOT recognize --immediate. Per spec
+        // scenario "Chatops verb does not support --immediate": the
+        // verb parses as rebuild-specs with the entire remainder as
+        // the repo-substring (i.e. None for too-many args, or matches
+        // when the operator's literal substring includes "--immediate").
+        let cmd = parse_command(&format!("{BOT} rebuild-specs myrepo --immediate"), BOT);
+        assert!(
+            cmd.is_none(),
+            "two-arg form must not parse (--immediate is not a flag)"
+        );
+    }
+
+    #[test]
+    fn parse_rebuild_specs_missing_arg_returns_none() {
+        assert!(parse_command(&format!("{BOT} rebuild-specs"), BOT).is_none());
     }
 
     #[test]

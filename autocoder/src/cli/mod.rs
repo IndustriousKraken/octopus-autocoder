@@ -10,6 +10,7 @@ pub mod install;
 pub mod reload;
 pub mod rewind;
 pub mod run;
+pub mod sync_specs;
 
 #[derive(Parser, Debug)]
 #[command(name = "autocoder")]
@@ -48,6 +49,33 @@ pub enum Command {
     /// config prints a status line and exits 0.
     Install(install::InstallArgs),
 
+    /// Rebuild every canonical spec under `openspec/specs/` from the
+    /// archived change history under `openspec/changes/archive/`. The
+    /// rebuild iterates archives chronologically and replays each via
+    /// `openspec archive` so canonical state is exactly what it would be
+    /// if every archive had synced correctly the first time. See the
+    /// "Rebuilding canonical specs" section of the README for the
+    /// operator's perspective.
+    SyncSpecs {
+        /// Path to the workspace (the directory containing
+        /// `openspec/changes/archive/`).
+        #[arg(long)]
+        workspace: PathBuf,
+
+        /// Run the full rebuild. There is no incremental mode; this
+        /// flag exists for clarity and future-proofing. Defaults to
+        /// true.
+        #[arg(long, default_value_t = true)]
+        rebuild: bool,
+
+        /// SIGTERM the running executor subprocess (if any) before
+        /// starting the rebuild. Without this flag the CLI waits
+        /// politely for the current iteration to finish. No-op when
+        /// no daemon is running on the workspace.
+        #[arg(long, default_value_t = false)]
+        immediate: bool,
+    },
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -80,6 +108,18 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Install(args) => install::execute(args).await,
         Command::Reload => reload::execute().await,
         Command::McpAskUserServer => crate::mcp_askuser_server::run(),
+        Command::SyncSpecs {
+            workspace,
+            rebuild,
+            immediate,
+        } => {
+            sync_specs::execute(sync_specs::SyncSpecsArgs {
+                workspace,
+                rebuild,
+                immediate,
+            })
+            .await
+        }
         Command::Rewind {
             changes,
             config: config_path,

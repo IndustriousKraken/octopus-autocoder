@@ -422,6 +422,7 @@ A small set of operator-issued commands lets you handle the common SSH-and-edit 
 | `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
+| `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](#rebuilding-canonical-specs-from-archive-history). |
 
 The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](#what-gets-posted) recovery uses, deleted via a chat reply instead.
 
@@ -737,6 +738,55 @@ Requirements:
 - The flag is global on the `github:` block, not per-repository — all configured repos in a single autocoder process share the same fork owner, and the fork-recreation policy is uniform across them.
 
 Defaults to `false`. With the default, the workspace-deleted recovery preserves fork state (see [Workspace directory deleted](#workspace-directory-deleted) above).
+
+### Rebuilding canonical specs from archive history
+
+`openspec/specs/<capability>/spec.md` is rebuilt by the host's openspec install whenever an archived change has the `openspec sync` workflow enabled at archive time. When a repository was archived from a host without that workflow (or before that workflow existed), the canonical specs drift from what the archive history actually says. Symptoms: the archive contains 30 `## ADDED Requirements` blocks, but the canonical spec is missing 25 of them.
+
+autocoder ships a full rebuild path for that case. Incremental backfill is intentionally unsupported — when drift is mid-history (an earlier change was never synced but later changes were), re-applying the skipped change onto the current canonical produces an incorrect end state. Full rebuild from scratch is the only safe answer.
+
+**When to use rebuild.** When you onboard a repo that was archive-driven from a host without `openspec sync`, when `git diff openspec/specs/` after a successful archive shows nothing despite the change adding requirements, or when `openspec list` and the on-disk canonical specs disagree on capability content.
+
+**CLI invocation** (against a local clone — no daemon required):
+
+```bash
+autocoder sync-specs --rebuild --workspace /path/to/repo
+```
+
+This iterates every archived change in chronological order, replays it via `openspec archive`, and preserves each archive's original date prefix via in-place rename. The CLI prints a summary listing successful and failed changes plus a modified-vs-unchanged tally for every canonical spec file. Exit code is non-zero if any archive failed to re-archive.
+
+**Chatops invocation** (for daemon-managed repos):
+
+```
+@<bot> rebuild-specs <repo-substring>
+```
+
+This submits a `RebuildSpecs` action to the control socket, which sets a `pending_rebuild` flag on the named repo's polling task. The next iteration runs the rebuild instead of the normal queue walk. The rebuild's commits land on the agent branch via the existing push + PR flow; the PR title is `spec rebuild: <N> capability(ies) rebuilt from archive history` so operators can recognize it at a glance.
+
+When the rebuild iteration finishes, the bot posts one of three chatops messages:
+
+- `✓ rebuild complete for <repo>: PR <url> opened — <N> capability(ies) updated from <M> archived change(s)` (success with drift)
+- `✓ rebuild complete for <repo>: no drift detected, canonical specs already in sync` (success no drift)
+- `⚠️ rebuild for <repo> completed with <N> failure(s); ...` (partial failure)
+
+The completion notification fires regardless of `chatops.notifications.pr_opened` or `failure_alerts` — it is the operator's direct response to a command they issued, so they always get the completion signal.
+
+**The `--immediate` flag** (CLI only — never exposed via chatops):
+
+```bash
+autocoder sync-specs --rebuild --immediate --workspace /path/to/repo
+```
+
+Without `--immediate`, the CLI waits politely for the current iteration to release the busy marker before starting. With `--immediate`, the CLI sends `SIGTERM` to the executor subprocess (via the busy marker's recorded PID), waits up to 30 seconds for cleanup, and runs the rebuild even if the iteration was mid-flight. The cancelled iteration's partial workspace state is cleaned up by the rebuild's first dirty-workspace recovery pass.
+
+Chatops deliberately does NOT support `--immediate`: killing a running executor mid-iteration is a foot-loaded gun that should require SSH access. Operators wanting `--immediate` SSH to the daemon host and run the CLI.
+
+**What rebuild discards** — a caveat. The rebuild is "what would canonical look like if every archive had synced correctly the first time." It does NOT preserve:
+
+- `## Purpose` paragraphs hand-edited into canonical specs without an archived change introducing them. New capability spec files openspec creates from scratch get a placeholder Purpose (`TBD - created by archiving change <X>. Update Purpose after archive.`); operators replace those manually after the rebuild PR merges.
+- `### Requirement:` entries hand-added to canonical without an archive source. Anything not in the archive history is gone after rebuild.
+
+Review the rebuild PR's diff before merging; treat it like any other autocoder PR.
 
 ### Perma-stuck change detection
 
