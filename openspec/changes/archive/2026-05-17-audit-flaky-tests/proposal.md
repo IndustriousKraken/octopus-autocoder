@@ -1,6 +1,6 @@
 ## Why
 
-Autocoder has reported intermittent test failures — at least one named "weekly_creates_about_52_occurrences" — in production runs. Local searches under `autocoder/src/` cannot locate that exact test name (it may have been renamed, removed, or the name is approximate). Either way, three sequential local runs of the current 509-test suite pass cleanly, which means the flakes are either deeply intermittent (rare race) or environment-sensitive (host load on the the runtime server server, CPU contention under parallel test execution).
+Intermittent test failures have been reported in production runs — at least one named "weekly_creates_about_52_occurrences." Local searches under `autocoder/src/` cannot locate that exact test name (it may have been renamed, removed, or the name is approximate). Three sequential local runs of the current 509-test suite pass cleanly, which means the flakes are either deeply intermittent (rare race) or environment-sensitive (host load on the runtime server, CPU contention under parallel test execution).
 
 A quick survey of the codebase shows non-trivial flakiness surface area:
 
@@ -26,4 +26,4 @@ The investigation explicitly targets categories rather than guessing at test nam
 - Affected code: any test fixes are scoped per finding; expect changes under `autocoder/src/**/tests`. No production code paths should change. If a fix requires production code (e.g. wiring an injectable clock through a function signature), the proposal calls that out in the report and either implements it within this change or carves out a follow-up.
 - Operator-visible behavior: none. CI/build/runtime semantics unchanged.
 - Breaking: no.
-- Acceptance: every test category enumerated in tasks.md has an entry in `docs/test-reliability.md` with a disposition. Tests judged unfixable are documented with a reason ("inherently timing-dependent — would need to refactor production to inject a clock; out of scope for this change") and that's an acceptable disposition per the operator's instruction ("IF the test is unfixable, I think a report on the issue is sufficient to check off the item").
+- Acceptance: every test category enumerated in tasks.md has an entry in `docs/test-reliability.md` with a disposition. Tests judged unfixable are documented with a reason ("inherently timing-dependent — would need to refactor production to inject a clock; out of scope for this change") and a reasoned disposition is sufficient to mark the entry done — a fix is not required when the architectural cost outweighs the test's value.

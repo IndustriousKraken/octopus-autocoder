@@ -13,8 +13,8 @@ The initial verb set is:
 The threat model is unchanged from existing chatops behavior: write access to the channel is the trust boundary. Sites needing finer-grained control configure per-repo channels via the existing `chatops_channel_id` override.
 
 #### Scenario: status returns aggregated daemon state for the named repo
-- **WHEN** an operator posts `@<bot> status myrepo` in a
-  channel where the chatops listener is active AND `myrepo`
+- **WHEN** an operator posts `@<bot> status your-repo` in a
+  channel where the chatops listener is active AND `your-repo`
   resolves to exactly one configured repository
 - **THEN** the bot posts a single multi-line reply containing
   (any subset of these sections may be empty and omitted):
@@ -24,7 +24,7 @@ The threat model is unchanged from existing chatops behavior: write access to th
   outcome + timestamp + next-iteration estimate, AND a queue
   snapshot (pending changes, waiting/escalated changes,
   marker-excluded changes)
-- **AND** if `myrepo` matches multiple configured repos, the
+- **AND** if `your-repo` matches multiple configured repos, the
   reply lists the matches AND asks for a more specific
   substring
 - **AND** if no repo matches, the reply lists every
@@ -32,21 +32,21 @@ The threat model is unchanged from existing chatops behavior: write access to th
 
 #### Scenario: clear-perma-stuck removes the marker
 - **WHEN** an operator posts
-  `@<bot> clear-perma-stuck myrepo a06-foo`
+  `@<bot> clear-perma-stuck your-repo a06-foo`
 - **THEN** the bot resolves the repo, submits a
   `ClearPermaStuckMarker` action to the control socket
 - **AND** on success: the marker file is deleted from disk
   AND the bot posts a one-line confirmation
-  `✓ cleared .perma-stuck.json for a06-foo on myrepo`
+  `✓ cleared .perma-stuck.json for a06-foo on your-repo`
 - **AND** the next polling iteration's `list_pending`
   returns the change (assuming no other markers exclude it)
 - **AND** on marker-not-found: the bot posts
-  `✗ no perma-stuck marker for change a06-foo on myrepo`
+  `✗ no perma-stuck marker for change a06-foo on your-repo`
   (informational; not retried)
 
 #### Scenario: clear-revision removes the spec-revision marker
 - **WHEN** an operator posts
-  `@<bot> clear-revision myrepo a07-bar`
+  `@<bot> clear-revision your-repo a07-bar`
 - **THEN** the bot resolves the repo, submits a
   `ClearRevisionMarker` action, and on success deletes
   `openspec/changes/a07-bar/.needs-spec-revision.json` AND
@@ -55,8 +55,8 @@ The threat model is unchanged from existing chatops behavior: write access to th
   no-such-marker / no-such-repo errors with the same shape
 
 #### Scenario: wipe-workspace two-step confirmation
-- **WHEN** an operator posts `@<bot> wipe-workspace myrepo`
-  in channel `C` AND `myrepo` resolves to a unique repo
+- **WHEN** an operator posts `@<bot> wipe-workspace your-repo`
+  in channel `C` AND `your-repo` resolves to a unique repo
 - **THEN** the bot posts a warning
   `⚠️ This will delete /tmp/workspaces/<sanitized-url>
   (forces a re-clone on the next iteration). Reply 'confirm'
@@ -98,7 +98,7 @@ The threat model is unchanged from existing chatops behavior: write access to th
 
 #### Scenario: Repo-substring matching is case-insensitive
 - **WHEN** an operator posts `@<bot> status MYREPO`,
-  `@<bot> status Myrepo`, or `@<bot> status myrepo`
+  `@<bot> status YOUR-REPO`, or `@<bot> status your-repo`
 - **THEN** all three forms resolve to the same configured
   repository (assuming the substring is unique under
   case-insensitive matching)
@@ -117,7 +117,7 @@ The threat model is unchanged from existing chatops behavior: write access to th
   (Unix-socket-perms, daemon-user-only) applies identically
 
 #### Scenario: Pause / resume / clear-alert-throttle are deliberately absent
-- **WHEN** an operator posts `@<bot> pause myrepo` (or
+- **WHEN** an operator posts `@<bot> pause your-repo` (or
   `resume`, `clear-alert-throttle`)
 - **THEN** the message is parsed as an unknown verb AND
   silently ignored (per the unknown-verbs scenario above)

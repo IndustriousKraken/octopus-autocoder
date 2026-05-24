@@ -7960,13 +7960,13 @@ mod tests {
         );
     }
 
-    /// 5.5: regression for the myrepo incident. Both paths present →
+    /// 5.5: archive-collision regression. Both paths present →
     /// two consecutive iterations exclude the change every time; the
     /// chatops alert fires ONCE (24h throttle catches the second
     /// iteration); the executor is invoked ZERO times across both; the
     /// failure-state counter stays at 0.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn myrepo_regression_two_iterations_throttle_alert_and_zero_executor_invocations() {
+    async fn archive_collision_two_iterations_throttle_alert_and_zero_executor_invocations() {
         let (_dir, ws) = fixture_workspace_with_remote();
         add_committed_change(&ws, "stuck-change", "fixture");
         pre_create_dated_archive_entry(&ws, "stuck-change");

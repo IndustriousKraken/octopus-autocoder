@@ -20,7 +20,7 @@
   - `RepoMatch::Unique(&RepositoryConfig)` — exactly one match
   - `RepoMatch::Multiple(Vec<&RepositoryConfig>)` — multiple matches; caller formats a "be more specific" reply with the URLs
   - `RepoMatch::None` — no match; caller formats a "no repo matched; configured: ..." reply
-- [x] 2.2 Case-insensitive substring against `repository.url`. The match is liberal: `myrepo` matches `git@github.com:acme/myrepo.git`. If two repos with the same name exist under different owners, the operator must type more characters to disambiguate.
+- [x] 2.2 Case-insensitive substring against `repository.url`. The match is liberal: `your-repo` matches `git@github.com:your-org/your-repo.git`. If two repos with the same name exist under different owners, the operator must type more characters to disambiguate.
 - [x] 2.3 Tests: unique, multiple, none, case-insensitivity, empty substring (returns Multiple with all repos so the operator gets feedback rather than silent everything-match).
 
 ## 3. Control-socket action handlers
@@ -64,7 +64,7 @@
 
 - [x] 6.1 Status reply: format the `RepoStatusResponse` per the shape in the proposal — sectioned by markers / throttled alerts / last iteration / queue snapshot. Empty sections collapse (e.g. if no markers, the "active markers" section is omitted entirely; no `(none)` placeholder).
 - [x] 6.2 Action confirmations: one line, `✓ <one-line summary>`. Action errors: one line, `✗ <one-line summary>`. Verified examples:
-  - `✓ cleared .perma-stuck.json for a06-foo on myrepo`
+  - `✓ cleared .perma-stuck.json for a06-foo on your-repo`
   - `✗ no perma-stuck marker for change \`a99-nonexistent\``
   - `✗ no repo matched \`gibberish\`; configured: ...`
 

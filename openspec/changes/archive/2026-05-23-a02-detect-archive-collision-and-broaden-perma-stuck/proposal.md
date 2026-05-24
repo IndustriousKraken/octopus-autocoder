@@ -1,6 +1,6 @@
 ## Why
 
-A real incident on `myrepo` ran the executor seven times against `a24-provisioning-wizard` — roughly 22 minutes of agent invocation each — before the operator noticed and stopped the daemon. Each iteration failed at the same step: `queue::archive` returned "archive destination already exists" because main carried BOTH `openspec/changes/a24-provisioning-wizard/` (an active spec) AND `openspec/changes/archive/2026-05-22-a24-provisioning-wizard/` (an earlier archive from a successful PR merge). The active dir kept showing up in `list_pending`; the agent kept implementing it; `queue::archive` kept colliding with the dated entry. The change burned through real Anthropic API budget across seven full executor runs before any human noticed.
+A production incident exposed this failure mode: the executor ran seven times against the same change — roughly 22 minutes of agent invocation each — before the operator noticed and stopped the daemon. Each iteration failed at the same step: `queue::archive` returned "archive destination already exists" because the base branch carried BOTH the active spec at `openspec/changes/<slug>/` AND an earlier dated archive entry at `openspec/changes/archive/<date>-<slug>/` (from a previously-merged PR). The active dir kept showing up in `list_pending`; the agent kept implementing it; `queue::archive` kept colliding with the dated entry. The change burned through real Anthropic API budget across seven full executor runs before any human noticed.
 
 Two distinct gaps allowed this:
 
@@ -63,6 +63,6 @@ The alert is informational only — the iteration proceeds with the colliding ch
   - Tests in `polling_loop::tests` for both scenarios.
 - Operator-visible behavior:
   - Adversely-shaped repository state (archive collisions) gets diagnosed in one iteration instead of burning agent tokens repeatedly. The chatops alert is throttled to one per category per 24h, matching the existing failure-alert ergonomics.
-  - Operators on the existing perma-stuck behavior see no change for changes that are perma-stuck for executor reasons. They DO see the marker fire sooner for changes that loop on non-executor errors (e.g., the myrepo incident would have written the marker after 2 iterations, not run 7 times).
+  - Operators on the existing perma-stuck behavior see no change for changes that are perma-stuck for executor reasons. They DO see the marker fire sooner for changes that loop on non-executor errors (e.g., the archive-collision case above would have written the marker after 2 iterations, not run 7 times).
 - Breaking: no. The added behaviors strengthen existing contracts without modifying any user-facing API or config field.
-- Acceptance: `cargo test` passes (new tests + existing). `openspec validate detect-archive-collision-and-broaden-perma-stuck --strict` passes. A unit test reproducing the myrepo incident's preconditions (both paths present, change in pending) asserts the executor is NOT invoked AND the chatops alert is posted.
+- Acceptance: `cargo test` passes (new tests + existing). `openspec validate detect-archive-collision-and-broaden-perma-stuck --strict` passes. A unit test reproducing the archive-collision preconditions (both paths present, change in pending) asserts the executor is NOT invoked AND the chatops alert is posted.

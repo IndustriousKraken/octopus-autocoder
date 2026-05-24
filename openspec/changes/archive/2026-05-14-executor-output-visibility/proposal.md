@@ -2,7 +2,7 @@
 
 When the daemon classifies an executor run as Completed-with-no-diff (now Failed by `no-op-completion-is-failure`), the operator has no way to tell *why* Claude exited 0 without doing anything. The CLI's stdout and stderr are captured into Strings inside `run_subprocess`, used only for narrow purposes (Layer-2 AskUser heuristic, first-200-chars of stderr on non-zero exit), and then dropped on the floor.
 
-Production symptom (2026-05-14, the runtime server): two consecutive Failed-no-diff outcomes in the same pass for unrelated changes, indicating a systemic problem (likely sandbox config, missing openspec install, or environment-related). The operator cannot diagnose without re-running by hand or attaching a tracer.
+Production symptom: two consecutive Failed-no-diff outcomes in the same pass for unrelated changes, indicating a systemic problem (likely sandbox config, missing openspec install, or environment-related). The operator cannot diagnose without re-running by hand or attaching a tracer.
 
 ## What Changes
 

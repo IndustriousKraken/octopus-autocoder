@@ -112,9 +112,7 @@ The audit SHALL be idempotent: when no drift exists, no files are written and no
 
 #### Scenario: Forward compatibility with upstream OpenSpec sync fix
 - **WHEN** a future OpenSpec release re-bundles the sync
-  step into `openspec archive` (per the Fission-AI founder's
-  reply on Discord, 2026-05-23, this is expected in the
-  next release)
+  step into `openspec archive` (expected upstream)
 - **THEN** this audit's behavior on autocoder-archived
   changes becomes mostly-noop (because `openspec archive`
   itself now syncs)

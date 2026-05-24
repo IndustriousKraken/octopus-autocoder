@@ -4,7 +4,7 @@ When a fork-PR-mode workspace is freshly cloned (because the directory was missi
 
 On the first iteration's push attempt, `git push --force-with-lease fork agent-q` compares the (empty) local tracking ref against the remote's actual state and rejects with `! [rejected] agent-q -> agent-q (stale info)`. The push then fails forever — every subsequent iteration sees the same mismatch. Operators get a "branch push keeps failing" chatops alert and the bot is stuck.
 
-Observed twice in production (myrepo + openspec-autocoder, 2026-05-16 00:53 / 00:56) after `/tmp` directory cleanup. The fix is to fetch the fork remote at clone time so the local tracking ref reflects reality immediately, and `--force-with-lease`'s safety check operates on accurate data.
+Observed in production after `/tmp` directory cleanup. The fix is to fetch the fork remote at clone time so the local tracking ref reflects reality immediately, and `--force-with-lease`'s safety check operates on accurate data.
 
 ## What Changes
 

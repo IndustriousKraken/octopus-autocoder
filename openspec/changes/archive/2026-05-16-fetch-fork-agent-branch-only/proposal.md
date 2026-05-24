@@ -2,7 +2,7 @@
 
 `fetch-fork-at-workspace-init` shipped `git fetch fork` (no refspec) after the post-clone fork-remote registration. The intent was narrow: populate `refs/remotes/fork/<agent_branch>` so subsequent `git push --force-with-lease fork <agent_branch>` has accurate local tracking data and stops misfiring "stale info" rejections.
 
-The implementation overshot. `git fetch fork` (no refspec) fetches every branch on the fork — including branches with names that already exist on `origin`. Production failure observed on `myrepo` (2026-05-16):
+The implementation overshot. `git fetch fork` (no refspec) fetches every branch on the fork — including branches with names that already exist on `origin`. Production failure observed:
 
 ```
 fatal: 'dev' matched multiple (2) remote tracking branches

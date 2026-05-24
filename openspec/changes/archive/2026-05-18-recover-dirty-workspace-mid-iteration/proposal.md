@@ -1,6 +1,6 @@
 ## Why
 
-Production incident on `myrepo`: an executor invocation modified `openspec/changes/a06-refactor-portal-handlers-to-fromref/tasks.md` and `src/web/portal/admin/...`, then returned `Failed` (or timed out) without committing. The polling loop's `handle_outcome` unlocks the change but leaves tracked-file modifications in place. The NEXT iteration's pre-pass dirty check (`polling_loop::run_pass_through_commits` ~line 582) bails immediately with "workspace dirty before pass; refusing to proceed". The repo stalls until the operator manually deletes the workspace — and as soon as the next executor invocation fails the same way, the cycle repeats.
+Production incident: an executor invocation modified tracked files in the workspace, then returned `Failed` (or timed out) without committing. The polling loop's `handle_outcome` unlocks the change but leaves tracked-file modifications in place. The NEXT iteration's pre-pass dirty check (`polling_loop::run_pass_through_commits` ~line 582) bails immediately with "workspace dirty before pass; refusing to proceed". The repo stalls until the operator manually deletes the workspace — and as soon as the next executor invocation fails the same way, the cycle repeats.
 
 The startup path (`cli/run.rs::repo_passes_startup_check` ~line 594) already auto-recovers by running `git checkout <base>` + `git reset --hard origin/<base>` + `git clean -fd`. The per-iteration path doesn't — it just alerts and bails. That asymmetry is the entire reason an operator has to step in for what is otherwise a purely mechanical recovery (the agent branch is rebuilt from base each iteration via `recreate_branch` anyway, so wholesale wiping is safe).
 
@@ -22,7 +22,7 @@ A secondary nit: the alert template (`alerts.rs::format_alert_text`) hardcodes `
 
 - Affected specs: `orchestrator-cli` (one ADDED requirement, one MODIFIED scenario).
 - Affected code: `autocoder/src/polling_loop.rs` (recovery wiring + tests), `autocoder/src/alerts.rs` (template + test), `README.md` (one subsection).
-- Operator-visible behavior change: a previously stuck repo will now self-heal on the iteration after a failed executor invocation. Operators get one alert (the first failure) and then the daemon recovers automatically; if the recovery doesn't work, the alert fires again at the 24h boundary. The `myrepo`-style "5-6 iterations failed; delete workspace; same alert next iteration" loop disappears.
+- Operator-visible behavior change: a previously stuck repo will now self-heal on the iteration after a failed executor invocation. Operators get one alert (the first failure) and then the daemon recovers automatically; if the recovery doesn't work, the alert fires again at the 24h boundary. The "5-6 iterations failed; delete workspace; same alert next iteration" loop disappears.
 - Operator-visible cosmetic change: alert wording drops the misleading "for the past 24h" claim. The 24h throttle still applies; the operator just doesn't see a confusing duration claim in every alert body.
 - Breaking: no. The alert is purely informational; downstream operators who pattern-match on the alert text would need to update their regex (unlikely to exist in practice).
 - Acceptance: `cargo test` passes; new recovery test confirms a pre-dirtied workspace iterates normally without alerting; updated alert-format test confirms the new wording.

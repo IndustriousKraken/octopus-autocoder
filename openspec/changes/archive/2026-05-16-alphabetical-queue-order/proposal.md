@@ -6,7 +6,7 @@
 - A `git pull` that brings in N new commits (whether one spec per commit or N specs in one) writes the touched files at pull time → identical mtimes → alphabetical tiebreaker.
 - The only workflow where mtime captures authoring order is one-spec-per-push with a daemon poll between each, which is not how operators batch related stacked changes.
 
-In addition, `git reset --hard` (used by the startup dirty-recovery path) only rewrites files that differ from the target — so a change that *survived* a failed pass (e.g. wasn't archived) keeps its older mtime while its dependencies (which got moved and restored) get fresh mtimes. The failed change then sorts *before* its dependencies, inverting the intended order. A real instance of this was observed in production on the `myrepo` repo after a daemon restart.
+In addition, `git reset --hard` (used by the startup dirty-recovery path) only rewrites files that differ from the target — so a change that *survived* a failed pass (e.g. wasn't archived) keeps its older mtime while its dependencies (which got moved and restored) get fresh mtimes. The failed change then sorts *before* its dependencies, inverting the intended order. This was observed in production after a daemon restart.
 
 The mtime approach is structurally fragile (git doesn't propagate mtimes through commits at all, only "when did my local git write this file") and provides no real signal for the workflows it was designed for. Reverting to alphabetical-by-name is predictable, deterministic, and survives every git operation unchanged. Operators with stacked dependencies use prefixes (`01-`, `02-`) to encode order explicitly when they need it; the few keystrokes are a fair price for behavior the operator can actually predict.
 

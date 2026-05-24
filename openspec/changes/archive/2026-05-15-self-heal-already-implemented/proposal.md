@@ -1,8 +1,8 @@
 ## Why
 
-Observed in production (2026-05-15): after a rebase that dropped archive commits, four changes ended up with their implementation already in HEAD but their change directories still in active state. autocoder polled them, the agent correctly reported "already done" without modifying the workspace, and the `no-op-completion-is-failure` rule classified each as Failed. The agent then re-ran them on every 30-minute poll, burning Claude tokens to re-confirm "already done" forever.
+Observed in production: after a rebase that dropped archive commits, four changes ended up with their implementation already in HEAD but their change directories still in active state. autocoder polled them, the agent correctly reported "already done" without modifying the workspace, and the `no-op-completion-is-failure` rule classified each as Failed. The agent then re-ran them on every 30-minute poll, burning Claude tokens to re-confirm "already done" forever.
 
-The root issue: there's no path for "implementation exists, just needs archiving." Today the only way out is operator intervention (manual `openspec archive`). Across 9 repos that's enough cost exposure to warrant a structural fix.
+The root issue: there's no path for "implementation exists, just needs archiving." Today the only way out is operator intervention (manual `openspec archive`). Across a fleet of managed repos that's enough cost exposure to warrant a structural fix.
 
 ## What Changes
 
