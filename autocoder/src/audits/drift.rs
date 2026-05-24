@@ -572,7 +572,7 @@ mod tests {
         let mut settings_map = HashMap::new();
         extra.insert(
             "ignored".into(),
-            serde_yaml::Value::String("for-future-knobs".into()),
+            serde_yml::Value::String("for-future-knobs".into()),
         );
         settings_map.insert(
             DriftAudit::TYPE.to_string(),

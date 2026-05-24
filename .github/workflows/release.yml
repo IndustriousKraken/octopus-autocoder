@@ -23,7 +23,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Lint workflows with actionlint
         shell: bash
         run: |
@@ -38,9 +38,25 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Install Node.js (for openspec)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install openspec
+        # Tests in src/queue.rs, src/executor/claude_cli.rs, and many polling_loop
+        # integration tests shell out to `openspec` for change-scaffold validation
+        # and archiving. Without it on PATH the tests panic on `.unwrap()` of the
+        # spawn result.
+        run: npm install -g @fission-ai/openspec
+      - name: Configure git identity
+        # Test fixtures create commits via `git commit`; without a configured
+        # identity, commit creation aborts and the fixture build fails.
+        run: |
+          git config --global user.email "ci@autocoder.local"
+          git config --global user.name "autocoder CI"
       - name: Run tests
         working-directory: autocoder
         run: cargo test --release --all-features
@@ -66,7 +82,7 @@ jobs:
             use_cross: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable

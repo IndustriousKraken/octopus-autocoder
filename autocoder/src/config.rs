@@ -496,7 +496,7 @@ pub struct AuditSettings {
     #[serde(default)]
     pub notify_on_clean: bool,
     #[serde(default)]
-    pub extra: HashMap<String, serde_yaml::Value>,
+    pub extra: HashMap<String, serde_yml::Value>,
 }
 
 /// Cadence at which a periodic audit fires. Deserializes from a YAML
@@ -710,7 +710,7 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let cfg: Config = serde_yaml::from_str(&raw)
+        let cfg: Config = serde_yml::from_str(&raw)
             .with_context(|| format!("parsing config file {}", path.display()))?;
         Ok(cfg)
     }
@@ -1474,7 +1474,7 @@ github:
 
     #[test]
     fn secret_source_parses_bare_string_as_env_var() {
-        let s: SecretSource = serde_yaml::from_str("MY_VAR").unwrap();
+        let s: SecretSource = serde_yml::from_str("MY_VAR").unwrap();
         match s {
             SecretSource::EnvVar(name) => assert_eq!(name, "MY_VAR"),
             _ => panic!("bare string must parse as EnvVar"),
@@ -1483,7 +1483,7 @@ github:
 
     #[test]
     fn secret_source_parses_object_as_inline() {
-        let s: SecretSource = serde_yaml::from_str("value: \"abc123\"").unwrap();
+        let s: SecretSource = serde_yml::from_str("value: \"abc123\"").unwrap();
         match s {
             SecretSource::Inline { value } => assert_eq!(value, "abc123"),
             _ => panic!("`{{value: ...}}` must parse as Inline"),
@@ -2157,7 +2157,7 @@ github: {}
             Cadence::EveryNDays(1)
         );
         // Also via serde
-        let parsed: Cadence = serde_yaml::from_str("\"every-7-days\"").unwrap();
+        let parsed: Cadence = serde_yml::from_str("\"every-7-days\"").unwrap();
         assert_eq!(parsed, Cadence::EveryNDays(7));
     }
 
@@ -2166,7 +2166,7 @@ github: {}
         let err = Cadence::parse("every-0-days").expect_err("zero must be rejected");
         assert!(err.contains("0"), "error must mention zero: {err}");
         // And via serde:
-        let res: std::result::Result<Cadence, _> = serde_yaml::from_str("\"every-0-days\"");
+        let res: std::result::Result<Cadence, _> = serde_yml::from_str("\"every-0-days\"");
         assert!(res.is_err(), "serde must reject every-0-days");
     }
 

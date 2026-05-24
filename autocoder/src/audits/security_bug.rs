@@ -303,7 +303,7 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert(
             SETTINGS_KEY_MAX_PROPOSALS.into(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(6_u64)),
+            serde_yml::Value::Number(serde_yml::Number::from(6_u64)),
         );
         let mut settings_map = HashMap::new();
         settings_map.insert(

@@ -952,7 +952,7 @@ fn reviewer_env_var(p: ReviewerProviderArg) -> Option<&'static str> {
 /// operator's answers. The example is the source-of-truth for what fields
 /// exist; this function only writes the ones the wizard collected.
 pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
-    let mut cfg: Config = serde_yaml::from_str(BUNDLED_EXAMPLE)
+    let mut cfg: Config = serde_yml::from_str(BUNDLED_EXAMPLE)
         .context("bundled config.example.yaml failed to deserialize")?;
     let repo = cfg
         .repositories
@@ -1048,7 +1048,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
 }
 
 pub fn serialize_config(cfg: &Config) -> Result<String> {
-    serde_yaml::to_string(cfg).context("serialize Config to YAML")
+    serde_yml::to_string(cfg).context("serialize Config to YAML")
 }
 
 pub fn assemble_secrets_env(answers: &WizardAnswers) -> String {
@@ -1577,7 +1577,7 @@ mod tests {
         let ans = slack_answers();
         let cfg = assemble_config(&ans).unwrap();
         let yaml = serialize_config(&cfg).unwrap();
-        let round: Config = serde_yaml::from_str(&yaml)
+        let round: Config = serde_yml::from_str(&yaml)
             .expect("round-trip YAML should deserialize");
         assert_eq!(round.repositories[0].url, cfg.repositories[0].url);
         assert_eq!(round.github.token_env, cfg.github.token_env);

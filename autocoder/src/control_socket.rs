@@ -878,7 +878,7 @@ async fn build_chatops_slot(cfg: Option<&ChatOpsConfig>) -> Result<Option<ChatOp
 /// Structural-equality diff via YAML serialization. Catches changes to
 /// nested values (e.g. `SecretSource`) that raw equality would miss.
 fn yaml_repr<T: serde::Serialize>(value: &T) -> String {
-    serde_yaml::to_string(value).unwrap_or_default()
+    serde_yml::to_string(value).unwrap_or_default()
 }
 
 #[cfg(test)]

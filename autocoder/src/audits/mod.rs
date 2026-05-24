@@ -477,7 +477,7 @@ mod tests {
         use crate::config::AuditSettings;
         let audit_settings: std::collections::HashMap<String, AuditSettings> =
             std::collections::HashMap::new();
-        let executor: crate::config::ExecutorConfig = serde_yaml::from_str(
+        let executor: crate::config::ExecutorConfig = serde_yml::from_str(
             "kind: claude_cli\ncommand: claude\ntimeout_secs: 600\n",
         )
         .expect("test executor config");

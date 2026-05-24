@@ -384,7 +384,7 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert(
             SETTINGS_KEY_FILE_LINES.to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(t)),
+            serde_yml::Value::Number(serde_yml::Number::from(t)),
         );
         let mut s = HashMap::new();
         s.insert(
