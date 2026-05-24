@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -104,6 +105,11 @@ pub struct ControlState {
     pub config_path: PathBuf,
     /// Registry of running per-repo polling tasks, keyed by URL.
     pub repo_tasks: RepoTaskMap,
+    /// Notify that fires every time `repo_tasks` is mutated (insert /
+    /// remove). Both the production spawn closure and the test fixtures
+    /// notify after their map writes so consumers can wait on map state
+    /// changes without sleep-polling.
+    pub repo_tasks_changed: Arc<Notify>,
     /// Factory the reload handler uses to spawn a polling task for a
     /// newly-added repository. Captured at daemon startup so the reload
     /// handler doesn't need direct access to executor/holders.
@@ -132,25 +138,43 @@ pub async fn listen_at(
     state: ControlState,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let listener = bind_at(&path)?;
+    serve(listener, path, state, cancel).await
+}
+
+/// Bind a `UnixListener` at `path` (creating the parent directory and
+/// removing any stale socket file first). Returns synchronously once the
+/// listener is ready to accept, so test callers can spawn `serve` and
+/// know — without polling — that the socket is live.
+pub fn bind_at(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("creating control-socket directory {}", parent.display())
         })?;
     }
-    // Stale socket from a previous run is not a startup failure.
     if path.exists() {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
     }
-    let listener = UnixListener::bind(&path)
+    let listener = UnixListener::bind(path)
         .with_context(|| format!("binding control socket at {}", path.display()))?;
-    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!(
             "could not chmod control socket {} to 0600: {e}",
             path.display()
         );
     }
     tracing::info!("control socket listening at {}", path.display());
+    Ok(listener)
+}
 
+/// Run the accept loop against an already-bound `listener` until `cancel`
+/// fires. Removes the socket file on shutdown.
+pub async fn serve(
+    listener: UnixListener,
+    path: PathBuf,
+    state: ControlState,
+    cancel: CancellationToken,
+) -> Result<()> {
     let state = Arc::new(state);
     loop {
         tokio::select! {
@@ -876,7 +900,11 @@ mod tests {
     /// lifecycle without doing any real work. Lets the reload-handler
     /// tests inspect the task map without depending on real workspaces,
     /// executors, or filesystem state.
-    fn fake_spawn(task_map: RepoTaskMap, parent_cancel: CancellationToken) -> SpawnRepoFn {
+    fn fake_spawn(
+        task_map: RepoTaskMap,
+        task_map_changed: Arc<Notify>,
+        parent_cancel: CancellationToken,
+    ) -> SpawnRepoFn {
         Arc::new(move |repo: RepositoryConfig| {
             let url = repo.url.clone();
             let mut guard = task_map.lock().unwrap();
@@ -888,11 +916,15 @@ mod tests {
                 Arc::new(ArcSwap::from_pointee(repo));
             let cancel_for_task = child_cancel.clone();
             let map_for_task = task_map.clone();
+            let map_changed_for_task = task_map_changed.clone();
             let url_for_task = url.clone();
             let join: JoinHandle<()> = tokio::spawn(async move {
                 cancel_for_task.cancelled().await;
-                let mut g = map_for_task.lock().unwrap();
-                g.remove(&url_for_task);
+                {
+                    let mut g = map_for_task.lock().unwrap();
+                    g.remove(&url_for_task);
+                }
+                map_changed_for_task.notify_waiters();
             });
             guard.insert(
                 url,
@@ -903,6 +935,8 @@ mod tests {
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
+            drop(guard);
+            task_map_changed.notify_waiters();
             SpawnOutcome::Spawned
         })
     }
@@ -917,7 +951,8 @@ mod tests {
         cancel: CancellationToken,
     ) -> ControlState {
         let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
-        let spawn = fake_spawn(task_map.clone(), cancel);
+        let task_map_changed: Arc<Notify> = Arc::new(Notify::new());
+        let spawn = fake_spawn(task_map.clone(), task_map_changed.clone(), cancel);
         for repo in &cfg.repositories {
             let _ = (spawn)(repo.clone());
         }
@@ -928,6 +963,7 @@ mod tests {
             last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
             config_path,
             repo_tasks: task_map,
+            repo_tasks_changed: task_map_changed,
             spawn_repo: spawn,
         }
     }
@@ -967,19 +1003,16 @@ mod tests {
         let cancel = CancellationToken::new();
         let state = seeded_state(cfg_path.clone(), &cfg, cancel.clone());
         let socket = dir.path().join("control.sock");
+        // Bind synchronously so the test knows — without polling — that the
+        // socket is ready to accept connections by the time fixture_listener
+        // returns. Spawn only the accept loop.
+        let listener = bind_at(&socket).expect("bind control socket");
         let listener_state = state.clone();
         let listener_socket = socket.clone();
         let listener_cancel = cancel.clone();
         tokio::spawn(async move {
-            let _ = listen_at(listener_socket, listener_state, listener_cancel).await;
+            let _ = serve(listener, listener_socket, listener_state, listener_cancel).await;
         });
-        // Wait briefly for the listener to bind.
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         (dir, socket, state, cfg_path, cancel)
     }
 
@@ -1192,19 +1225,41 @@ github:
         urls
     }
 
-    /// Wait up to `timeout_ms` for `pred` to return true, polling every
-    /// 10ms. Returns `true` if the predicate became true within the
-    /// timeout, otherwise `false`.
-    async fn wait_for(timeout_ms: u64, mut pred: impl FnMut() -> bool) -> bool {
+    /// Wait up to `timeout_ms` for `pred` to return true, driven by
+    /// `notify`. The caller passes a `Notify` that fires whenever the
+    /// underlying state changes; this function only re-evaluates `pred`
+    /// in response to a notify, so the test stays event-driven instead of
+    /// sleep-polling. The `timeout` is a hard wall-clock cap (the
+    /// legitimate "I'd rather fail than hang" use of a timer), not a poll
+    /// interval.
+    async fn wait_for(
+        timeout_ms: u64,
+        notify: Arc<Notify>,
+        mut pred: impl FnMut() -> bool,
+    ) -> bool {
+        // Fast path — predicate is already true.
+        if pred() {
+            return true;
+        }
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        while std::time::Instant::now() < deadline {
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return pred();
+            }
+            // Register interest BEFORE evaluating the predicate so a notify
+            // racing with the check is not lost.
+            let notified = notify.notified();
             if pred() {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return pred();
+            }
         }
-        pred()
     }
 
     fn delta_urls(resp: &serde_json::Value, key: &str) -> Vec<String> {
@@ -1335,9 +1390,11 @@ github:
             "removed must be exactly repo-b: {resp}"
         );
         // The fake task is parked on its own child token; cancelling
-        // makes it exit and remove its map entry. Wait for that.
+        // makes it exit and remove its map entry. The fixture fires
+        // `repo_tasks_changed` on every map mutation, so we can wait
+        // event-driven instead of sleep-polling.
         let state_ref = state.clone();
-        let observed = wait_for(1000, move || {
+        let observed = wait_for(1000, state.repo_tasks_changed.clone(), move || {
             !state_ref
                 .repo_tasks
                 .lock()

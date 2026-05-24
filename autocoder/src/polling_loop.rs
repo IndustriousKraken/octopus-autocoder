@@ -79,6 +79,59 @@ pub async fn run(
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     cancel: CancellationToken,
 ) {
+    run_with_hooks(
+        repo,
+        executor,
+        github_holder,
+        reviewer_holder,
+        chatops_holder,
+        stuck_threshold_secs,
+        perma_stuck_threshold,
+        executor_max_changes_per_pr,
+        startup_jitter_max_secs,
+        inter_iteration_jitter_pct,
+        audit_registry,
+        audits_cfg,
+        audit_settings,
+        pending_rebuild,
+        cancel,
+        RunHooks::default(),
+    )
+    .await
+}
+
+/// Test-only hooks for synchronizing with the polling loop's internal
+/// state. Production code always passes `RunHooks::default()` (every
+/// field `None`); tests inject a `Notify` so they can wait on iteration
+/// boundaries event-driven instead of sleep-polling.
+#[derive(Default, Clone)]
+pub struct RunHooks {
+    /// Fires once each time the loop has finished an iteration and is
+    /// about to enter its inter-iteration sleep. Tests that need to
+    /// race a cancel against the sleep wait on this to know the loop
+    /// reached the sleep window.
+    pub on_iteration_sleep: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Same as `run` but accepts a `RunHooks` for test-only synchronization.
+pub async fn run_with_hooks(
+    repo: Arc<ArcSwap<RepositoryConfig>>,
+    executor: Arc<dyn Executor>,
+    github_holder: GithubHolder,
+    reviewer_holder: ReviewerHolder,
+    chatops_holder: ChatOpsHolder,
+    stuck_threshold_secs: u64,
+    perma_stuck_threshold: u32,
+    executor_max_changes_per_pr: Option<u32>,
+    startup_jitter_max_secs: u64,
+    inter_iteration_jitter_pct: u8,
+    audit_registry: Arc<AuditRegistry>,
+    audits_cfg: Option<Arc<AuditsConfig>>,
+    audit_settings: Arc<HashMap<String, AuditSettings>>,
+    pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
+    cancel: CancellationToken,
+    hooks: RunHooks,
+) {
     {
         let initial = repo.load();
         let workspace = workspace::resolve_path(initial.as_ref());
@@ -195,6 +248,9 @@ pub async fn run(
         drop(snapshot);
         let sleep_dur = jittered_sleep_duration(base_secs, inter_iteration_jitter_pct);
 
+        if let Some(notify) = &hooks.on_iteration_sleep {
+            notify.notify_waiters();
+        }
         tokio::select! {
             biased;
             () = cancel.cancelled() => break,
@@ -4250,13 +4306,26 @@ mod tests {
     }
 
     /// Counting failing executor: increments a shared counter on every call,
+    /// fires a `Notify` so tests can await iteration completion event-driven,
     /// always returns `Failed`.
-    struct CountingFailingExecutor(std::sync::atomic::AtomicUsize);
+    struct CountingFailingExecutor {
+        count: std::sync::atomic::AtomicUsize,
+        invoked: Arc<tokio::sync::Notify>,
+    }
+    impl CountingFailingExecutor {
+        fn new() -> Self {
+            Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+                invoked: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
     #[async_trait::async_trait]
     impl Executor for CountingFailingExecutor {
         async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
-            self.0
+            self.count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.invoked.notify_waiters();
             Ok(ExecutorOutcome::Failed {
                 reason: "fixture".into(),
             })
@@ -4300,10 +4369,9 @@ mod tests {
         // the original commit, which is fine. We don't actually need to push
         // in this test.
 
-        let executor = Arc::new(CountingFailingExecutor(
-            std::sync::atomic::AtomicUsize::new(0),
-        ));
+        let executor = Arc::new(CountingFailingExecutor::new());
         let executor_dyn: Arc<dyn Executor> = executor.clone();
+        let invoked = executor.invoked.clone();
 
         let repo = RepositoryConfig {
             url: "git@github.com:owner/fixture.git".into(),
@@ -4352,16 +4420,34 @@ mod tests {
             .await;
         });
 
-        // Let several iterations run, then cancel. The git operations are
-        // moderately slow (clone/fetch take ~tens of ms each), so we give a
-        // generous window.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait event-driven for the executor to be invoked at least
+        // twice — the proof that the loop iterated more than once. The
+        // wall-clock cap is a "fail rather than hang" guardrail, not a
+        // poll interval.
+        let two_invocations = async {
+            // notified() must be registered before the first read for
+            // the first wake. Register, then check (because the counter
+            // could already be ≥2 if we got scheduled late).
+            loop {
+                if executor.count.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                    return;
+                }
+                let n = invoked.notified();
+                if executor.count.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                    return;
+                }
+                n.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), two_invocations)
+            .await
+            .expect("expected ≥2 executor invocations within 10s");
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("loop should exit within 2s of cancel");
 
-        let count = executor.0.load(std::sync::atomic::Ordering::SeqCst);
+        let count = executor.count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             count >= 2,
             "expected ≥2 executor invocations across iterations, got {count}"
@@ -4424,8 +4510,12 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let repo_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
+        let iteration_sleep = Arc::new(tokio::sync::Notify::new());
+        let hooks = RunHooks {
+            on_iteration_sleep: Some(iteration_sleep.clone()),
+        };
         let handle = tokio::spawn(async move {
-            run(
+            run_with_hooks(
                 repo_holder,
                 executor,
                 github_holder,
@@ -4441,12 +4531,19 @@ mod tests {
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_for_task,
+                hooks,
             )
             .await;
         });
 
-        // Give the loop time to enter its sleep, then cancel.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait event-driven for the loop to reach its inter-iteration
+        // sleep — the `on_iteration_sleep` hook fires immediately before
+        // the select! enters the sleep, so a cancel after this notify is
+        // guaranteed to race against the sleep branch (the case under
+        // test). The 5s wall-clock cap is a guardrail, not a poll interval.
+        tokio::time::timeout(Duration::from_secs(5), iteration_sleep.notified())
+            .await
+            .expect("polling loop did not reach inter-iteration sleep within 5s");
         cancel.cancel();
 
         // The loop must exit within 1s of cancellation. The 60s sleep would

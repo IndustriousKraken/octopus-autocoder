@@ -421,12 +421,19 @@ impl ConfirmationStore {
     /// Record a pending wipe-workspace confirmation for `channel_id`,
     /// replacing any prior pending entry on that channel.
     pub fn record(&self, channel_id: &str, repo_url: String, ttl: Duration) {
+        self.record_at(channel_id, repo_url, Instant::now() + ttl);
+    }
+
+    /// Same as `record` but takes an absolute expiry instant. Lets tests
+    /// plant entries with an `expires_at` already in the past without
+    /// sleeping.
+    fn record_at(&self, channel_id: &str, repo_url: String, expires_at: Instant) {
         let mut g = self.pending.lock().unwrap();
         g.insert(
             channel_id.to_string(),
             PendingConfirmation {
                 repo_url,
-                expires_at: Instant::now() + ttl,
+                expires_at,
             },
         );
     }
@@ -1104,8 +1111,14 @@ mod tests {
     #[test]
     fn confirmation_store_expires_after_ttl() {
         let store = ConfirmationStore::new();
-        store.record("C1", "url".into(), Duration::from_millis(10));
-        std::thread::sleep(Duration::from_millis(50));
+        // Plant an entry whose `expires_at` is already in the past, so the
+        // expiry check exercises the same code path as a real timeout
+        // without the test having to wait for wall-clock time.
+        store.record_at(
+            "C1",
+            "url".into(),
+            Instant::now() - Duration::from_millis(1),
+        );
         // Expired → take_valid returns None AND removes the entry.
         assert!(store.take_valid("C1").is_none());
         assert_eq!(store.len(), 0);
@@ -1447,11 +1460,13 @@ mod tests {
     async fn wipe_workspace_expired_confirmation_returns_error_no_wipe() {
         let dispatcher = OperatorCommandDispatcher::new();
         let submitter = FakeSubmitter::new();
-        // Manually record a stale entry to avoid sleeping the test 60s.
-        dispatcher
-            .pending
-            .record("C1", "git@github.com:owner/repo.git".into(), Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(20));
+        // Plant an already-expired entry directly so the test doesn't depend
+        // on wall-clock time at all.
+        dispatcher.pending.record_at(
+            "C1",
+            "git@github.com:owner/repo.git".into(),
+            Instant::now() - Duration::from_millis(1),
+        );
         let reply = dispatcher
             .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
             .await

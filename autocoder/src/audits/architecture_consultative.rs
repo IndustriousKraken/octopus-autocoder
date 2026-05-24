@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::{
-    Audit, AuditContext, AuditOutcome, Finding, Severity, WritePolicy,
+    Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
     write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
@@ -186,28 +186,13 @@ impl Audit for ArchitectureConsultativeAudit {
             },
         );
 
-        if outcome.timed_out {
-            let _ = ctx.log_writer.write_section(
-                "architecture_consultative_outcome",
-                "kind: Err\nreason: timeout",
-            );
-            return Err(anyhow!(
-                "architecture_consultative: CLI exceeded the {}s timeout",
-                self.executor_timeout_secs
-            ));
-        }
-
-        if let Some(status) = outcome.exit_status
-            && !status.success()
-        {
-            let _ = ctx.log_writer.write_section(
-                "architecture_consultative_outcome",
-                &format!("kind: Err\nreason: exit {status}"),
-            );
-            return Err(anyhow!(
-                "architecture_consultative: CLI exited {status}; stderr excerpt: {}",
-                excerpt(&outcome.stderr)
-            ));
+        if let Some(err) = outcome_to_terminal_err(
+            &outcome,
+            &mut ctx.log_writer,
+            "architecture_consultative",
+            self.executor_timeout_secs,
+        ) {
+            return Err(err);
         }
 
         let findings = match parse_findings(&outcome.stdout) {
@@ -319,6 +304,44 @@ struct SubprocessOutcome {
     exit_status: Option<std::process::ExitStatus>,
     stdout: String,
     stderr: String,
+}
+
+/// Pure transformation: given a SubprocessOutcome, return Some(error) if
+/// the outcome is terminal (timed out OR non-zero exit). Returns None when
+/// the caller should continue processing (parse stdout into findings).
+///
+/// Extracted from `run()` so tests can exercise the timeout/exit error
+/// shapes by constructing synthetic SubprocessOutcome values directly,
+/// avoiding real subprocesses, timers, and the race condition that
+/// comes with them.
+fn outcome_to_terminal_err(
+    outcome: &SubprocessOutcome,
+    log_writer: &mut AuditLogWriter,
+    audit_type: &str,
+    timeout_secs: u64,
+) -> Option<anyhow::Error> {
+    if outcome.timed_out {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            "kind: Err\nreason: timeout",
+        );
+        return Some(anyhow!(
+            "{audit_type}: CLI exceeded the {timeout_secs}s timeout"
+        ));
+    }
+    if let Some(status) = outcome.exit_status
+        && !status.success()
+    {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            &format!("kind: Err\nreason: exit {status}"),
+        );
+        return Some(anyhow!(
+            "{audit_type}: CLI exited {status}; stderr excerpt: {}",
+            excerpt(&outcome.stderr)
+        ));
+    }
+    None
 }
 
 /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
@@ -750,32 +773,33 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn run_returns_err_on_subprocess_timeout() {
+    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// `timed_out: true` directly into `outcome_to_terminal_err` and
+    /// assert the resulting error + log entries. No subprocess, no
+    /// timer, no race — verifies the audit's translation logic, which
+    /// is what we actually care about. The race-condition version
+    /// (real subprocess + real timer) was deterministic locally on
+    /// some platforms and flaky on others; the pure-data version is
+    /// deterministic everywhere.
+    #[test]
+    fn outcome_to_terminal_err_translates_timed_out_to_error() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
-        let script = write_script(
-            ws_dir.path(),
-            "slow.sh",
-            "#!/bin/sh\nsleep 10\n",
-        );
-        let mut cfg = executor_cfg(&script.to_string_lossy());
-        cfg.timeout_secs = 1;
-        let settings_dir = TempDir::new().unwrap();
-        let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
-        let repo = fixture_repo();
-        let mut ctx = AuditContext {
-            workspace,
-            repo: &repo,
-            chatops_ctx: None,
-            log_writer: make_log_writer(workspace),
+        let mut log_writer = make_log_writer(workspace);
+        let log_path = log_writer.path().to_path_buf();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".into(),
         };
-        let log_path = ctx.log_writer.path().to_path_buf();
-        let err = audit
-            .run(&mut ctx)
-            .await
-            .expect_err("subprocess timeout must surface as Err");
+        let err = outcome_to_terminal_err(
+            &outcome,
+            &mut log_writer,
+            "architecture_consultative",
+            1,
+        )
+        .expect("timed_out outcome must produce Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("architecture_consultative"),
@@ -794,9 +818,52 @@ mod tests {
             log.contains("reason: timeout"),
             "log must record timeout reason: {log}"
         );
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
-        }
+    }
+
+    /// Companion: synthesized non-zero exit produces the exit-error variant.
+    #[test]
+    fn outcome_to_terminal_err_translates_nonzero_exit_to_error() {
+        use std::os::unix::process::ExitStatusExt;
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(7 << 8)),
+            stdout: String::new(),
+            stderr: "boom".into(),
+        };
+        let err = outcome_to_terminal_err(
+            &outcome,
+            &mut log_writer,
+            "architecture_consultative",
+            30,
+        )
+        .expect("nonzero exit must produce Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exit"), "error must mention exit: {msg}");
+        assert!(msg.contains("boom"), "error must include stderr excerpt: {msg}");
+    }
+
+    /// Companion: a clean outcome (no timeout, exit 0) returns None — the
+    /// caller should continue to parse stdout.
+    #[test]
+    fn outcome_to_terminal_err_returns_none_for_clean_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: r#"{"findings":[]}"#.into(),
+            stderr: String::new(),
+        };
+        assert!(
+            outcome_to_terminal_err(&outcome, &mut log_writer, "architecture_consultative", 30)
+                .is_none(),
+            "clean outcome must return None so caller proceeds to parse"
+        );
     }
 
     #[tokio::test]

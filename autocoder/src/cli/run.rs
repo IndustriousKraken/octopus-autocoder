@@ -174,6 +174,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         Arc::new(audit_settings);
 
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
+    let task_map_changed = Arc::new(tokio::sync::Notify::new());
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
@@ -192,6 +193,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         audit_settings: audit_settings_arc.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
+        task_map_changed: task_map_changed.clone(),
     });
 
     for repo in cfg.repositories.iter().cloned() {
@@ -218,6 +220,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
         config_path,
         repo_tasks: task_map.clone(),
+        repo_tasks_changed: task_map_changed.clone(),
         spawn_repo: spawn_repo.clone(),
     };
     let listener_cancel = cancel.clone();
@@ -270,6 +273,7 @@ struct SpawnDeps {
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
+    task_map_changed: Arc<tokio::sync::Notify>,
 }
 
 /// Build a `SpawnRepoFn` that runs the repo's startup check, then spawns
@@ -300,6 +304,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let cancel_for_task = child_cancel.clone();
         let config_for_task = config_holder.clone();
         let map_for_task = deps.task_map.clone();
+        let map_changed_for_task = deps.task_map_changed.clone();
         let url_for_task = url.clone();
         let executor_for_task = deps.executor.clone();
         let github_for_task = deps.github_holder.clone();
@@ -335,25 +340,34 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 cancel_for_task,
             )
             .await;
-            let mut guard = map_for_task.lock().unwrap();
-            guard.remove(&url_for_task);
+            {
+                let mut guard = map_for_task.lock().unwrap();
+                guard.remove(&url_for_task);
+            }
+            map_changed_for_task.notify_waiters();
         });
-        let mut guard = deps.task_map.lock().unwrap();
-        if guard.contains_key(&url) {
-            // Lost the race against another spawn. Cancel ours and
-            // report the URL as already present.
-            child_cancel.cancel();
-            return SpawnOutcome::AlreadyPresent;
+        let inserted = {
+            let mut guard = deps.task_map.lock().unwrap();
+            if guard.contains_key(&url) {
+                // Lost the race against another spawn. Cancel ours and
+                // report the URL as already present.
+                child_cancel.cancel();
+                return SpawnOutcome::AlreadyPresent;
+            }
+            guard.insert(
+                url,
+                RepoTaskHandle {
+                    cancel: child_cancel,
+                    config: config_holder,
+                    join,
+                    pending_rebuild,
+                },
+            );
+            true
+        };
+        if inserted {
+            deps.task_map_changed.notify_waiters();
         }
-        guard.insert(
-            url,
-            RepoTaskHandle {
-                cancel: child_cancel,
-                config: config_holder,
-                join,
-                pending_rebuild,
-            },
-        );
         SpawnOutcome::Spawned
     })
 }

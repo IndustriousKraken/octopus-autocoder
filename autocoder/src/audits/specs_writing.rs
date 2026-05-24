@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use super::{AuditContext, AuditOutcome, write_sandbox_settings};
+use super::{AuditContext, AuditLogWriter, AuditOutcome, write_sandbox_settings};
 use crate::config::ResolvedSandbox;
 
 /// Tools every spec-writing audit allows. `Write` and `Edit` are needed
@@ -130,25 +130,13 @@ pub(crate) async fn run_specs_writing_audit(
         },
     );
 
-    if outcome.timed_out {
-        let _ = ctx.log_writer.write_section(
-            &format!("{audit_type}_outcome"),
-            "kind: Err\nreason: timeout",
-        );
-        return Err(anyhow!(
-            "{audit_type}: CLI exceeded the {}s timeout",
-            params.executor_timeout_secs
-        ));
-    }
-
-    if let Some(status) = outcome.exit_status {
-        if !status.success() {
-            let _ = ctx.log_writer.write_section(
-                &format!("{audit_type}_outcome"),
-                &format!("kind: Err\nreason: exit {status}"),
-            );
-            return Err(anyhow!("{audit_type}: CLI exited {status}"));
-        }
+    if let Some(err) = outcome_to_terminal_err(
+        &outcome,
+        &mut ctx.log_writer,
+        audit_type,
+        params.executor_timeout_secs,
+    ) {
+        return Err(err);
     }
 
     let after = snapshot_change_dirs(ctx.workspace);
@@ -310,6 +298,115 @@ struct SubprocessOutcome {
     exit_status: Option<std::process::ExitStatus>,
     stdout: String,
     stderr: String,
+}
+
+/// Pure transformation: given a SubprocessOutcome, return Some(error) if
+/// the outcome is terminal (timed out OR non-zero exit). Returns None when
+/// the caller should continue processing. Mirrors the same-named helpers
+/// in the `architecture_consultative` and `drift` audit modules — kept
+/// duplicated rather than pulled to a single shared utility because each
+/// audit module owns its own private `SubprocessOutcome` struct and the
+/// duplication is intentional to avoid coupling those structs together.
+fn outcome_to_terminal_err(
+    outcome: &SubprocessOutcome,
+    log_writer: &mut AuditLogWriter,
+    audit_type: &str,
+    timeout_secs: u64,
+) -> Option<anyhow::Error> {
+    if outcome.timed_out {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            "kind: Err\nreason: timeout",
+        );
+        return Some(anyhow!(
+            "{audit_type}: CLI exceeded the {timeout_secs}s timeout"
+        ));
+    }
+    if let Some(status) = outcome.exit_status
+        && !status.success()
+    {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            &format!("kind: Err\nreason: exit {status}"),
+        );
+        return Some(anyhow!("{audit_type}: CLI exited {status}"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::audits::AuditLogWriter;
+    use tempfile::TempDir;
+
+    fn make_log_writer(workspace: &std::path::Path) -> AuditLogWriter {
+        AuditLogWriter::open(workspace, "test_audit").expect("log writer opens")
+    }
+
+    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// `timed_out: true` directly into `outcome_to_terminal_err` and
+    /// assert the resulting error + log entries. No subprocess, no
+    /// timer, no race — verifies the audit framework's translation
+    /// logic, which is what we actually care about. Replaces the
+    /// per-audit "spawn a real subprocess and time it out" tests
+    /// that were race-prone across platforms.
+    #[test]
+    fn outcome_to_terminal_err_translates_timed_out_to_error() {
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let log_path = log_writer.path().to_path_buf();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".into(),
+        };
+        let err = outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 1)
+            .expect("timed_out outcome must produce Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing_tests_audit"));
+        assert!(msg.contains("timeout"));
+        let log = std::fs::read_to_string(&log_path).expect("log readable");
+        assert!(log.contains("kind: Err"));
+        assert!(log.contains("reason: timeout"));
+    }
+
+    #[test]
+    fn outcome_to_terminal_err_translates_nonzero_exit_to_error() {
+        use std::os::unix::process::ExitStatusExt;
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(7 << 8)),
+            stdout: String::new(),
+            stderr: "boom".into(),
+        };
+        let err = outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 30)
+            .expect("nonzero exit must produce Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exit"));
+    }
+
+    #[test]
+    fn outcome_to_terminal_err_returns_none_for_clean_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(
+            outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 30).is_none()
+        );
+    }
 }
 
 async fn run_subprocess(

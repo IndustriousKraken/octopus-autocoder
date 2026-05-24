@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::{
-    Audit, AuditContext, AuditOutcome, Finding, Severity, WritePolicy,
+    Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
     write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
@@ -189,28 +189,13 @@ impl Audit for DriftAudit {
             },
         );
 
-        if outcome.timed_out {
-            let _ = ctx.log_writer.write_section(
-                "drift_audit_outcome",
-                "kind: Err\nreason: timeout",
-            );
-            return Err(anyhow!(
-                "drift_audit: CLI exceeded the {}s timeout",
-                self.executor_timeout_secs
-            ));
-        }
-
-        if let Some(status) = outcome.exit_status {
-            if !status.success() {
-                let _ = ctx.log_writer.write_section(
-                    "drift_audit_outcome",
-                    &format!("kind: Err\nreason: exit {status}"),
-                );
-                return Err(anyhow!(
-                    "drift_audit: CLI exited {status}; stderr excerpt: {}",
-                    excerpt(&outcome.stderr)
-                ));
-            }
+        if let Some(err) = outcome_to_terminal_err(
+            &outcome,
+            &mut ctx.log_writer,
+            "drift_audit",
+            self.executor_timeout_secs,
+        ) {
+            return Err(err);
         }
 
         let findings = parse_findings(&outcome.stdout)?;
@@ -322,6 +307,40 @@ struct SubprocessOutcome {
     exit_status: Option<std::process::ExitStatus>,
     stdout: String,
     stderr: String,
+}
+
+/// Pure transformation: given a SubprocessOutcome, return Some(error) if
+/// the outcome is terminal (timed out OR non-zero exit). Returns None when
+/// the caller should continue processing (parse stdout into findings).
+/// Mirrors `architecture_consultative::outcome_to_terminal_err`.
+fn outcome_to_terminal_err(
+    outcome: &SubprocessOutcome,
+    log_writer: &mut AuditLogWriter,
+    audit_type: &str,
+    timeout_secs: u64,
+) -> Option<anyhow::Error> {
+    if outcome.timed_out {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            "kind: Err\nreason: timeout",
+        );
+        return Some(anyhow!(
+            "{audit_type}: CLI exceeded the {timeout_secs}s timeout"
+        ));
+    }
+    if let Some(status) = outcome.exit_status
+        && !status.success()
+    {
+        let _ = log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            &format!("kind: Err\nreason: exit {status}"),
+        );
+        return Some(anyhow!(
+            "{audit_type}: CLI exited {status}; stderr excerpt: {}",
+            excerpt(&outcome.stderr)
+        ));
+    }
+    None
 }
 
 /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
@@ -738,53 +757,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn run_returns_err_on_subprocess_timeout() {
+    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// `timed_out: true` directly into `outcome_to_terminal_err` and
+    /// assert the resulting error + log entries. No subprocess, no
+    /// timer, no race — see architecture_consultative's equivalent
+    /// test for the architectural rationale.
+    #[test]
+    fn outcome_to_terminal_err_translates_timed_out_to_error() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
-        let script = write_script(
-            ws_dir.path(),
-            "slow.sh",
-            "#!/bin/sh\nsleep 10\n",
-        );
-        let mut cfg = executor_cfg(&script.to_string_lossy());
-        cfg.timeout_secs = 1;
-        let settings_dir = TempDir::new().unwrap();
-        let audit = DriftAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
-        let repo = fixture_repo();
-        let mut ctx = AuditContext {
-            workspace,
-            repo: &repo,
-            chatops_ctx: None,
-            log_writer: make_log_writer(workspace),
+        let mut log_writer = make_log_writer(workspace);
+        let log_path = log_writer.path().to_path_buf();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".into(),
         };
-        let log_path = ctx.log_writer.path().to_path_buf();
-        let err = audit
-            .run(&mut ctx)
-            .await
-            .expect_err("subprocess timeout must surface as Err");
+        let err = outcome_to_terminal_err(&outcome, &mut log_writer, "drift_audit", 1)
+            .expect("timed_out outcome must produce Err");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("drift_audit"),
-            "error must name the audit type: {msg}"
-        );
-        assert!(
-            msg.contains("timeout"),
-            "error must mention timeout: {msg}"
-        );
+        assert!(msg.contains("drift_audit"), "error must name the audit type: {msg}");
+        assert!(msg.contains("timeout"), "error must mention timeout: {msg}");
         let log = std::fs::read_to_string(&log_path).expect("log readable");
-        assert!(
-            log.contains("kind: Err"),
-            "log must record Err outcome: {log}"
-        );
-        assert!(
-            log.contains("reason: timeout"),
-            "log must record timeout reason: {log}"
-        );
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
-        }
+        assert!(log.contains("kind: Err"), "log must record Err outcome: {log}");
+        assert!(log.contains("reason: timeout"), "log must record timeout reason: {log}");
     }
 
     #[tokio::test]
