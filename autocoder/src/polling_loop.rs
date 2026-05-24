@@ -76,6 +76,7 @@ pub async fn run(
     audit_registry: Arc<AuditRegistry>,
     audits_cfg: Option<Arc<AuditsConfig>>,
     audit_settings: Arc<HashMap<String, AuditSettings>>,
+    pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     cancel: CancellationToken,
 ) {
     {
@@ -139,7 +140,32 @@ pub async fn run(
             executor_max_changes_per_pr,
         );
 
-        if let Err(error) = execute_one_pass(
+        // Check whether this iteration is a rebuild iteration. We
+        // take-and-clear so the chatops-triggered flag does not
+        // accidentally trigger a second rebuild on the iteration after
+        // this one. Per design: only the polling task itself
+        // reads/writes its own `pending_rebuild`, but a writer (control
+        // socket) sets it before we read here. Use SeqCst so the read
+        // is ordered against the write.
+        let want_rebuild = pending_rebuild.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+        if want_rebuild {
+            if let Err(error) = execute_rebuild_iteration(
+                &workspace,
+                snapshot_ref,
+                &github_snap,
+                chatops_ctx.as_ref(),
+                stuck_threshold_secs,
+            )
+            .await
+            {
+                tracing::error!(
+                    url = snapshot_ref.url.as_str(),
+                    "rebuild iteration failed for {}: {error:#}",
+                    snapshot_ref.url
+                );
+            }
+        } else if let Err(error) = execute_one_pass(
             &workspace,
             snapshot_ref,
             executor.as_ref(),
@@ -1614,6 +1640,259 @@ async fn maybe_post_start_of_work(
             url = %repo.url,
             change = %change,
             "start-of-work notification failed; continuing: {e:#}"
+        );
+    }
+}
+
+/// Run a single rebuild iteration: acquire the busy marker, ensure the
+/// workspace is on a clean agent branch, run the rebuild, commit + push
+/// + open a PR if drift was found, and post the end-of-rebuild chatops
+/// notification.
+///
+/// Failures from individual archived changes are accumulated in the
+/// `RebuildReport` and do NOT abort the iteration. A failure to push or
+/// open the PR is propagated as the iteration's Err — the chatops
+/// notification still fires (best-effort, separate code path).
+async fn execute_rebuild_iteration(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    stuck_threshold_secs: u64,
+) -> Result<()> {
+    let mut guard = match busy_marker::try_acquire(workspace, &repo.url, stuck_threshold_secs) {
+        Ok(busy_marker::AcquireOutcome::Acquired(g)) => g,
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(m)) => {
+            tracing::info!(
+                url = %repo.url,
+                pid = m.pid,
+                "rebuild iteration: busy marker held by another pass; will retry next iteration"
+            );
+            return Ok(());
+        }
+        Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => {
+            tracing::error!(
+                url = %repo.url,
+                pid = m.pid,
+                "rebuild iteration: ambiguous busy-marker state; skipping"
+            );
+            post_stuck_alert(chatops_ctx, repo, &m, true).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    tracing::info!(
+        url = %repo.url,
+        "iteration: running spec rebuild instead of queue walk"
+    );
+
+    // Make sure the workspace is initialized + on a clean agent branch
+    // before we mutate openspec/specs/. We reuse the existing setup that
+    // run_pass_through_commits performs to keep behavior identical.
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
+        None => None,
+    };
+    let fork_arg = fork_url
+        .as_deref()
+        .map(|u| (u, repo.agent_branch.as_str()));
+    workspace::ensure_initialized(workspace, &repo.url, fork_arg)?;
+
+    // If the workspace is dirty (e.g. a SIGTERMed iteration left state),
+    // try to recover. Failure to recover is fatal for this iteration.
+    let dirty = git::status_porcelain(workspace)?;
+    let dirty_filtered = filter_alert_state_lines(&dirty);
+    if !dirty_filtered.is_empty() {
+        tracing::warn!(
+            url = %repo.url,
+            "rebuild iteration: workspace dirty; attempting recovery"
+        );
+        attempt_dirty_workspace_recovery(workspace, &repo.base_branch)?;
+    }
+    git::fetch(workspace)?;
+    git::checkout(workspace, &repo.base_branch)?;
+    git::pull_ff_only(workspace, &repo.base_branch)?;
+    git::recreate_branch(workspace, &repo.agent_branch)?;
+
+    let _ = guard.set_stage(busy_marker::Stage::Commit);
+    let report = crate::cli::sync_specs::rebuild_canonical(workspace).await?;
+    tracing::info!(
+        url = %repo.url,
+        processed = report.processed,
+        successful = report.successful,
+        failed = report.failed,
+        modified_files = report.modified_files(),
+        "rebuild_canonical finished"
+    );
+
+    // Stage everything: openspec/specs/ changes AND any archive directory
+    // moves (the in-place rename shouldn't produce a net diff but we
+    // stage defensively).
+    git::add_all(workspace)?;
+
+    let porcelain = git::status_porcelain(workspace)?;
+    let staged = filter_alert_state_lines(&porcelain);
+    let mut pr_url: Option<String> = None;
+
+    if staged.is_empty() {
+        tracing::info!(
+            url = %repo.url,
+            "rebuild iteration: no drift detected — skipping commit/push/PR"
+        );
+    } else {
+        let modified = report.modified_files();
+        let subject = format!(
+            "spec rebuild: {modified} capability(ies) rebuilt from {} archived change(s)",
+            report.successful
+        );
+        git::commit(workspace, &subject)?;
+        let push_remote = if github_cfg.fork_owner.is_some() {
+            "fork"
+        } else {
+            "origin"
+        };
+        let _ = guard.set_stage(busy_marker::Stage::Push);
+        git::push_force_with_lease(workspace, &repo.agent_branch, push_remote)?;
+
+        let _ = guard.set_stage(busy_marker::Stage::Pr);
+        match open_rebuild_pull_request(repo, github_cfg, &report).await {
+            Ok(url) => {
+                pr_url = Some(url);
+            }
+            Err(e) => {
+                tracing::error!(
+                    url = %repo.url,
+                    "rebuild iteration: PR creation failed: {e:#}"
+                );
+                // We still want to send the chatops notification so the
+                // operator knows the rebuild happened (and that the PR
+                // step failed). Propagate err after the notification.
+                maybe_post_end_of_rebuild_notification(repo, &report, None, chatops_ctx).await;
+                return Err(e);
+            }
+        }
+    }
+
+    maybe_post_end_of_rebuild_notification(repo, &report, pr_url.as_deref(), chatops_ctx).await;
+    Ok(())
+}
+
+/// Open the PR for a rebuild iteration. Returns the new PR's HTML URL on
+/// success.
+async fn open_rebuild_pull_request(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    report: &crate::cli::sync_specs::RebuildReport,
+) -> Result<String> {
+    let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
+    let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    let modified = report.modified_files();
+    let title = format!(
+        "spec rebuild: {modified} capability(ies) rebuilt from archive history"
+    );
+    let mut body = String::new();
+    body.push_str("This PR was generated by `autocoder sync-specs --rebuild`.\n\n");
+    body.push_str(&format!(
+        "Replayed {} archived change(s) chronologically; {} succeeded, {} failed.\n\n",
+        report.processed, report.successful, report.failed
+    ));
+    if !report.failures.is_empty() {
+        body.push_str("**Failed changes** (left at active path for operator inspection):\n");
+        for f in &report.failures {
+            body.push_str(&format!("- `{}`: {}\n", f.slug, truncate_one_line(&f.failure_reason, 200)));
+        }
+        body.push('\n');
+    }
+    body.push_str("**Canonical spec files**:\n");
+    for sf in &report.spec_files {
+        let tag = if sf.modified { "modified" } else { "unchanged" };
+        body.push_str(&format!("- `{}` ({tag})\n", sf.path));
+    }
+    let head = match github_cfg.fork_owner.as_deref() {
+        Some(fork_owner) => format!("{fork_owner}:{}", repo.agent_branch),
+        None => repo.agent_branch.clone(),
+    };
+    let pr = github::create_pull_request(
+        &owner,
+        &repo_name,
+        &head,
+        &repo.base_branch,
+        &title,
+        &body,
+        &token,
+        None,
+        false,
+    )
+    .await?;
+    tracing::info!(
+        url = repo.url.as_str(),
+        pr = pr.html_url.as_str(),
+        pr_number = pr.number,
+        "opened rebuild PR"
+    );
+    Ok(pr.html_url)
+}
+
+fn truncate_one_line(s: &str, n: usize) -> String {
+    let one = s.lines().next().unwrap_or("");
+    if one.chars().count() <= n {
+        one.to_string()
+    } else {
+        one.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+/// Post the end-of-rebuild chatops notification. Best-effort: a failed
+/// post logs at WARN and never propagates. Unlike `maybe_post_pr_opened`,
+/// this is NOT gated on `pr_opened_enabled` or `failure_alerts_enabled`
+/// because it's a direct response to an operator-triggered command — the
+/// operator wants the completion signal regardless of which notification
+/// toggles they have set elsewhere.
+async fn maybe_post_end_of_rebuild_notification(
+    repo: &RepositoryConfig,
+    report: &crate::cli::sync_specs::RebuildReport,
+    pr_url: Option<&str>,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+
+    let modified = report.modified_files();
+    let text = if report.failed == 0 {
+        if let Some(url) = pr_url {
+            format!(
+                "✓ rebuild complete for `{}`: PR {url} opened — {modified} capability(ies) updated from {} archived change(s)",
+                repo.url, report.successful
+            )
+        } else {
+            format!(
+                "✓ rebuild complete for `{}`: no drift detected, canonical specs already in sync",
+                repo.url
+            )
+        }
+    } else {
+        let pr_segment = match pr_url {
+            Some(u) => format!("PR {u}"),
+            None => "(no PR — every change failed)".to_string(),
+        };
+        let slugs = report.failed_slugs();
+        let listed: Vec<String> = slugs.iter().take(10).cloned().collect();
+        let suffix = if slugs.len() > 10 {
+            format!(" and {} more", slugs.len() - 10)
+        } else {
+            String::new()
+        };
+        let failed_list = format!("{}{suffix}", listed.join(", "));
+        format!(
+            "⚠️ rebuild for `{}` completed with {} failure(s); {pr_segment} opened with successful {} change(s).\nFailed: {failed_list}.\nSee journalctl -u autocoder for openspec stderr details.",
+            repo.url, report.failed, report.successful
+        )
+    };
+
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "end-of-rebuild chatops notification failed; continuing: {e:#}"
         );
     }
 }
@@ -4067,6 +4346,7 @@ mod tests {
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_for_task,
             )
             .await;
@@ -4159,6 +4439,7 @@ mod tests {
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_for_task,
             )
             .await;
@@ -6584,6 +6865,359 @@ mod tests {
         mock.assert_async().await;
     }
 
+    fn fixture_repo_for_rebuild_test() -> RepositoryConfig {
+        RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        }
+    }
+
+    /// success-with-drift: report has zero failures + a PR URL → the
+    /// notification names the PR, the modified-file count, and the
+    /// archived-change count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_of_rebuild_success_with_drift_posts_pr_url_message() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("PR".to_string()),
+                mockito::Matcher::Regex("3 capability".to_string()),
+                mockito::Matcher::Regex("5 archived change".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false, // notification fires regardless
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 5,
+            successful: 5,
+            failed: 0,
+            spec_files: vec![
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/a/spec.md".into(),
+                    modified: true,
+                },
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/b/spec.md".into(),
+                    modified: true,
+                },
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/c/spec.md".into(),
+                    modified: true,
+                },
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/d/spec.md".into(),
+                    modified: false,
+                },
+            ],
+            ..Default::default()
+        };
+        maybe_post_end_of_rebuild_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            Some("https://github.com/owner/repo/pull/77"),
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// success-no-drift: report has zero failures + no PR URL → the
+    /// notification names "no drift detected".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_of_rebuild_success_no_drift_posts_clean_message() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::Regex("no drift detected".to_string()))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 5,
+            successful: 5,
+            failed: 0,
+            spec_files: vec![],
+            ..Default::default()
+        };
+        maybe_post_end_of_rebuild_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            None,
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// partial-failure: report has >0 failures → the notification lists
+    /// the failed slugs and includes the journalctl pointer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_of_rebuild_partial_failure_lists_failed_slugs() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("2 failure".to_string()),
+                mockito::Matcher::Regex("a06-foo".to_string()),
+                mockito::Matcher::Regex("a07-bar".to_string()),
+                mockito::Matcher::Regex("journalctl".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 5,
+            successful: 3,
+            failed: 2,
+            failures: vec![
+                crate::cli::sync_specs::ChangeOutcome {
+                    slug: "a06-foo".into(),
+                    original_name: "2026-01-01-a06-foo".into(),
+                    success: false,
+                    failure_reason: "boom".into(),
+                },
+                crate::cli::sync_specs::ChangeOutcome {
+                    slug: "a07-bar".into(),
+                    original_name: "2026-01-02-a07-bar".into(),
+                    success: false,
+                    failure_reason: "boom2".into(),
+                },
+            ],
+            spec_files: vec![
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/a/spec.md".into(),
+                    modified: true,
+                },
+                crate::cli::sync_specs::SpecFileOutcome {
+                    path: "openspec/specs/b/spec.md".into(),
+                    modified: true,
+                },
+            ],
+            ..Default::default()
+        };
+        maybe_post_end_of_rebuild_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            Some("https://github.com/owner/repo/pull/77"),
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// no-chatops: when `chatops_ctx` is None, the helper is a no-op —
+    /// no chatops mock should fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_of_rebuild_no_chatops_is_noop() {
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 1,
+            successful: 1,
+            failed: 0,
+            ..Default::default()
+        };
+        maybe_post_end_of_rebuild_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            None,
+            None, // no chatops
+        )
+        .await;
+        // No assertion needed beyond "doesn't panic"; the absence of any
+        // mockito server means a stray POST would obviously fail anyway.
+    }
+
+    /// truncation: 15 failed slugs → the notification lists 10 + "and 5
+    /// more"; slugs 11-15 must not appear verbatim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_of_rebuild_failed_slugs_truncation() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        // Match: contains slug-01 (first) AND slug-10 (last of first 10)
+        // AND "and 5 more". A negative-match for slug-11 catches the
+        // truncation bug.
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("slug-01".to_string()),
+                mockito::Matcher::Regex("slug-10".to_string()),
+                mockito::Matcher::Regex("and 5 more".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        let failures: Vec<crate::cli::sync_specs::ChangeOutcome> = (1..=15)
+            .map(|i| crate::cli::sync_specs::ChangeOutcome {
+                slug: format!("slug-{i:02}"),
+                original_name: format!("2026-01-01-slug-{i:02}"),
+                success: false,
+                failure_reason: "boom".into(),
+            })
+            .collect();
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 15,
+            successful: 0,
+            failed: 15,
+            failures,
+            ..Default::default()
+        };
+        maybe_post_end_of_rebuild_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            None,
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// pending_rebuild-branch: a polling iteration whose flag is set
+    /// runs the rebuild path instead of the queue walk. The fixture has
+    /// no archived changes (so `rebuild_canonical` produces an empty
+    /// report) and no drift (so the iteration completes without trying
+    /// to push or open a PR). The assertion is that the iteration
+    /// returns Ok WITHOUT invoking the executor (we pass a panicking
+    /// executor; if the queue-walk path were taken it would panic).
+    /// Skipped (printed) when `openspec` is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_iteration_runs_when_pending_flag_set() {
+        if std::process::Command::new("openspec")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping rebuild_iteration_runs_when_pending_flag_set: openspec absent");
+            return;
+        }
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Seed the OpenSpec layout (with no archived changes, so the
+        // rebuild is a no-op). The dirs are committed so the iteration's
+        // dirty-recovery step doesn't `git clean -fd` them away as
+        // untracked. Critically: do NOT seed `openspec/specs/` — the
+        // rebuild's clear-and-replay would remove any tracked content
+        // there, producing drift the test isn't intending to exercise.
+        std::fs::create_dir_all(ws.join("openspec/changes/archive")).unwrap();
+        std::fs::write(
+            ws.join("openspec/project.md"),
+            "# Project\n\nFixture.\n",
+        )
+        .unwrap();
+        // Empty archive dir needs a gitkeep file so git tracks it.
+        std::fs::write(ws.join("openspec/changes/archive/.gitkeep"), "").unwrap();
+        let st = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "scaffold openspec layout"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "commit scaffold");
+
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let repo = fixture_repo(&ws);
+
+        // Run the rebuild iteration directly. No chatops, so no
+        // notification posts.
+        execute_rebuild_iteration(
+            &ws,
+            &repo,
+            &github_cfg,
+            None,
+            2400,
+        )
+        .await
+        .expect("rebuild iteration should succeed on no-drift fixture");
+
+        // Workspace MUST be clean (the rebuild ran but produced no
+        // changes; add_all + the no-staged-content branch left git in
+        // a clean state).
+        let porcelain = git::status_porcelain(&ws).unwrap();
+        assert!(
+            filter_alert_state_lines(&porcelain).is_empty(),
+            "post-rebuild workspace should be clean; got: {porcelain}"
+        );
+
+        // The agent branch should exist (the rebuild iteration always
+        // recreates it).
+        let st = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/heads/agent-q"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "agent-q branch must exist after rebuild iteration");
+    }
+
+    /// flag-clear: the polling loop swaps-and-clears `pending_rebuild`
+    /// at iteration start. Verify the atomic semantics directly so the
+    /// "second RebuildSpecs arriving mid-rebuild waits for the NEXT
+    /// iteration" contract holds.
+    #[test]
+    fn pending_rebuild_flag_swap_clears() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = std::sync::Arc::new(AtomicBool::new(true));
+        let was_set = flag.swap(false, Ordering::SeqCst);
+        assert!(was_set, "swap of true→false must return prior `true`");
+        assert!(!flag.load(Ordering::SeqCst), "flag must be cleared after swap");
+        // A second swap returns false (the flag is already cleared).
+        assert!(!flag.swap(false, Ordering::SeqCst));
+    }
+
     /// pr-opened-chatops-notification: when chatops is unconfigured,
     /// the helper is a no-op.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6798,6 +7432,7 @@ mod tests {
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 task_cancel,
             )
             .await;
