@@ -1,0 +1,133 @@
+# AI Security & Guardrails
+
+Running an autonomous coding agent with push access to your repositories introduces unique risks. Adhere to the following practices.
+
+## 1. Credential scoping
+
+Never give autocoder a Personal Access Token (PAT) or SSH key with admin access to your organization. Provide it with **scoped access** strictly limited to the repositories defined in `config.yaml`. There are two paths:
+
+- **Fine-grained PAT minted by your own account**, with the PAT's repository allowlist restricted to the autocoder-managed repos. The PAT enforces the scope.
+- **Classic PAT minted by a machine user** whose account-level access is itself scoped (Read collaborator on specific repos via team membership). The minting user's permissions enforce the scope, not the PAT.
+
+Either path is acceptable; what matters is that the credential cannot push, merge, or change settings outside the configured repos. An org-wide classic PAT minted by your own admin account is the configuration to avoid.
+
+## 2. Branch protection
+
+Protect your `main` and `dev` branches. autocoder must **never** be allowed to push directly to protected branches. It pushes only to the designated `agent_branch` and opens PRs for human review. Configure GitHub branch protection to require PR approval and (optionally) require PRs not be draft, so the reviewer's `Block` verdict actually gates merge.
+
+## 3. The "self-modifying AI" risk
+
+If you point autocoder at its own repository (e.g. `cicd-impl-agents`), there is a risk of the agent modifying its own source code in unexpected ways. A "lazy" LLM under pressure might try to satisfy failing tests by deleting them, modify the OpenSpec schema to avoid spec checks, or alter its own system prompts.
+
+**Mitigation:** require human + reviewer-agent approval for any PR merged into autocoder's own repository. Never auto-merge autocoder's PRs into itself without a human in the loop.
+
+## 4. Workspace isolation
+
+autocoder clones repositories into `/tmp/workspaces/`. Ensure this partition has sufficient disk space and gets cleared of orphaned files on system restart (most distros mount `/tmp` as tmpfs by default, which handles this). Do not run autocoder with root privileges. The deploy user only needs:
+
+- Write access to `/tmp/workspaces/`
+- Write access to its own `~/.claude/` (for Claude Code credentials)
+- Read access to `/home/autocoder/autocoder/config.yaml`
+
+## 5. Secrets in `config.yaml` (inline vs env-var)
+
+Every secret-bearing field (`github.token` / `github.owner_tokens[*]` / `reviewer.api_key`) accepts EITHER an env-var name (the original pattern) OR an inline value via the `{ value: "..." }` shape. Examples:
+
+```yaml
+github:
+  token_env: GITHUB_TOKEN                   # env-var path
+  # OR
+  token:
+    value: "github_pat_xxx"                 # inline
+  owner_tokens:
+    my-personal-handle: PERSONAL_GH_TOKEN   # env-var name
+    my-org-a:                               # inline
+      value: "github_pat_for_org_a"
+
+reviewer:
+  api_key_env: ANTHROPIC_API_KEY            # env-var path
+  # OR
+  api_key:
+    value: "sk-ant-..."                     # inline
+```
+
+When both forms are set on the same logical field, the inline value wins and autocoder logs a `warn`-level line at startup naming the env var being ignored. Startup logs name the source (`inline (github.token)` or `env var GITHUB_TOKEN`) so an audit can confirm which secrets live in YAML.
+
+**Env-var form:** secrets stay out of `config.yaml`. Suits multi-user hosts and systemd deployments with `EnvironmentFile=/etc/autocoder.env`.
+
+**Inline form:** secrets live in `config.yaml`. Suits single-host, single-user deployments where one file is easier to manage than two. Requirements:
+
+- `chmod 600` on the config file, owned by the autocoder user.
+- Never commit it. The project root's `.gitignore` already excludes `config.yaml` by name.
+
+## 6. Dedicated, non-SSH user (recommended)
+
+Run autocoder as a dedicated user (`autocoder`) with no SSH login. Authenticate Claude Code as that user (`sudo -iu autocoder claude auth login`) and keep `config.yaml`, `~/.claude/`, and the daemon's process under that uid. A compromised login user must then clear an additional uid boundary to reach autocoder's secrets — meaningful when the login user is not a passwordless sudoer. The Deployment section's systemd setup follows this pattern.
+
+## 7. Fork-and-PR workflow (recommended for org repos)
+
+By default, autocoder pushes the agent branch directly to upstream and opens a same-repo PR. This requires the autocoder identity to hold push access on every managed repo. Branch protection on `main`/`dev` limits the damage of a compromise but leaves all other branches reachable.
+
+Fork-and-PR mode collapses the blast radius to "what an external open-source contributor could already do." Set `github.fork_owner` to the handle that owns the forks (typically the machine user from section 6):
+
+```yaml
+github:
+  fork_owner: my-machine-user-handle
+  owner_tokens:
+    UpstreamOrg:
+      value: "github_pat_..."
+```
+
+In this mode autocoder:
+
+- Pushes the agent branch to `git@github.com:my-machine-user-handle/<repo>.git` (the fork)
+- Opens cross-repository PRs with `head: "my-machine-user-handle:agent-q"` against the upstream
+- Never writes to upstream branches; the machine user only needs **read** access on upstream
+
+**One-time setup per repo:**
+
+1. The machine user must have **Read** access to the upstream repo (collaborator invitation, team membership, or — for public repos — no setup required). Read is enough on github.com because the only API calls the bot makes against upstream are `POST /pulls` (Read can do this), `POST /forks` (creates a fork to the bot's own account; the bot's PAT owns the destination), and — only if the host rejects drafts — `POST /labels` (this needs **Triage**, but github.com supports drafts everywhere so the label fallback never fires there). Grant Triage only if you deploy against a GitHub Enterprise host that rejects draft PRs.
+2. **Forks are created automatically.** On first startup, autocoder probes each configured repo's fork URL and, when missing, calls `POST /repos/<upstream>/<repo>/forks` to create it under `fork_owner`, then polls (up to 60s) for the fork to become reachable before proceeding. Adding a new repo to `config.yaml` and restarting the daemon is a complete workflow — no manual fork step.
+3. PATs in `github.owner_tokens` (or `github.token`) should be minted by the machine user. Fine-grained: scope to "Pull requests: read & write" + "Administration: write" (the latter is required to fork) on the upstream repo — no `Contents: write` needed. Classic: `repo` scope covers PR creation AND fork creation. The machine user's account-level access provides the actual repo scoping.
+
+**Startup check:** autocoder probes each fork with `git ls-remote` before spawning any polling task. Missing forks are created automatically via the GitHub API and then polled (up to 60s) for reachability. A creation failure (e.g. PAT lacks fork permission, or upstream is inaccessible) produces an aggregated startup error naming every repo that failed.
+
+**Rewind in fork mode:** `autocoder rewind --hard` deletes the agent branch from the fork (not upstream), since that's where it lived.
+
+**Limitations:** `fork_owner` is global; one machine user owns the forks for every repo in the config. Per-repo overrides are not supported. Two upstream repos with the same name (across different orgs) would map to the same fork URL — set explicit `local_path` and/or rename one fork to disambiguate.
+
+## 8. Executor tool sandbox
+
+The agent CLI (Claude Code by default) runs inside the workspace with whatever tool access its defaults allow. autocoder constrains this via per-iteration Claude Code settings files that block exfiltration channels by default.
+
+**Default deny rules** (active when `executor.sandbox` is absent from `config.yaml`):
+
+- **Bash commands:** `curl`, `wget`, `nc`/`ncat`/`netcat`, `ssh`/`scp`/`sftp`/`rsync`, `git push`, `git remote *`, `git fetch <url>`, `openspec archive`, `openspec unarchive`. Build/test commands (`cargo`, `npm`, `pytest`, `go test`, etc.) are not on the list.
+- **File reads:** `/home/*/.ssh/**`, `/home/*/.claude/**`, `/etc/shadow`, `/etc/ssl/private/**`.
+- **Tools:** `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` allowed. `WebFetch`, `WebSearch`, and any other tools NOT allowed.
+
+**Customizing:** set `executor.sandbox` in `config.yaml`. Each field overrides its safe default independently; omitted fields keep their defaults.
+
+```yaml
+executor:
+  kind: claude_cli
+  sandbox:
+    # If your project's build needs HTTPS (pip install, brew install, etc.),
+    # restate disallowed_bash_patterns with `curl:*` omitted:
+    disallowed_bash_patterns:
+      - "nc:*"
+      - "ncat:*"
+      - "ssh:*"
+      - "git push:*"
+      - "git remote *"
+```
+
+**What the agent sees on a denial:** the wrapped CLI tells the model the tool call was blocked. The model typically narrates the failure in its output, which surfaces in the iteration's captured stdout. If a legitimate workflow gets blocked, the iteration logs make it obvious which command was denied.
+
+**Threat model caveat:** this is a tool-routing-layer sandbox, not OS-level isolation. A determined model can in principle exec arbitrary code via the allowed `Bash` tool with command patterns that don't match the denylist. For hard isolation, run autocoder under OS-level sandboxing (firejail, bubblewrap, or systemd `ProtectHome=`/`ProtectSystem=`). The autocoder sandbox is a useful first layer.
+
+**Lazy-archive structural detection.** Beyond the sandbox, autocoder inspects the working-tree diff after every executor invocation. If the only changes are renames into `openspec/changes/archive/<date>-<name>/`, the daemon treats the iteration as Failed (not Completed), reverts the staged moves via `git reset --hard`, and leaves the change pending for retry. This catches the "agent renamed the change directory and called itself done" failure mode regardless of which command produced the moves — the openspec-CLI denials above are belt-and-suspenders for the obvious path, but the structural check is what does the real work.
+
+**Reviewer LLM is a separate data flow.** The code reviewer (if enabled) sends the diff to its configured LLM provider as a direct HTTP call. That data flow is governed by your `reviewer:` config (provider, api_key, api_base_url), NOT by `executor.sandbox`. Operators opted in to that flow by enabling the reviewer; sandbox restrictions do not apply.
+
+---
