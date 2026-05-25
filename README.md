@@ -435,7 +435,7 @@ The outbound chatops surface (notifications, AskUser questions) needs only the b
 
 To enable the inbound listener:
 
-1. In the Slack app dashboard for your bot, open **Settings → Socket Mode** and toggle it on. Slack will prompt you to generate an app-level token; give it the `connections:write` scope and copy the resulting `xapp-*` value.
+1. In your browser, go to **https://api.slack.com/apps** and click your app. (Not `slack.com/apps` — that page is the user-facing install / marketplace view and has no configuration buttons.) Open **Settings → Socket Mode** and toggle it on. Slack will prompt you to generate an app-level token; give it the `connections:write` scope and copy the resulting `xapp-*` value.
 2. In **Features → OAuth & Permissions → Bot Token Scopes**, ensure the bot has:
    - `app_mentions:read` — receive `app_mention` events over Socket Mode (the only event subscription you need).
    - `chat:write` — post the threaded reply.
