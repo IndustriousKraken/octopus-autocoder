@@ -427,6 +427,29 @@ pub async fn rebuild_canonical_with_runner(
             tracing::info!(slug = %slug, "openspec archive output: {}", out.stdout.trim());
         }
 
+        // openspec's `Aborted.` marker means it refused to apply the
+        // change but exited 0 anyway. Treat as failure regardless of
+        // exit code; the post-condition check below remains as a
+        // defense-in-depth fallback for marker-less silent skips.
+        if let Some(reason) = detect_openspec_abort(&out.stdout) {
+            let full = format_archive_output_for_report(&out);
+            let combined =
+                format!("openspec refused to apply: {reason}; full output: {full}");
+            tracing::error!(
+                slug = %slug,
+                "rebuild: openspec abort marker detected: {reason}"
+            );
+            record_failure_with_rollback(
+                workspace,
+                &archive_root,
+                &slug,
+                &original_name,
+                combined,
+                &mut report,
+            );
+            continue;
+        }
+
         match verify_archive_post_condition(workspace, &slug) {
             Ok(actual_path) => {
                 // Happy path. Rename the matched archive entry back to
@@ -555,6 +578,44 @@ pub fn run_openspec_archive(workspace: &Path, slug: &str) -> Result<ArchiveRunOu
         }
         Err(e) => Err(format!("spawning openspec: {e}")),
     }
+}
+
+/// Scan `stdout` for openspec's `Aborted.` marker — the signal openspec
+/// emits when it refuses to apply a change (e.g. a broken `MODIFIED`
+/// reference) but still exits 0. Detection is line-based: only a line
+/// whose first non-whitespace token is exactly `Aborted.` (with the
+/// trailing period) triggers a match. A line containing `aborted`
+/// lowercase, or `Aborted` without the trailing period, or `Aborted.`
+/// mid-line, does NOT match.
+///
+/// Returns `Some(reason)` where `reason` is the most informative
+/// preceding line — the nearest non-empty line above the `Aborted.` line
+/// if one exists, otherwise the trimmed `Aborted.` line itself. This
+/// captures real-world cases where openspec prints a diagnostic line
+/// (`MODIFIED failed for header "..." - not found`) immediately before
+/// `Aborted. No files were changed.`. Returns `None` when no matching
+/// `Aborted.` line is present.
+pub fn detect_openspec_abort(stdout: &str) -> Option<String> {
+    let lines: Vec<&str> = stdout.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let first_token = match line.split_whitespace().next() {
+            Some(t) => t,
+            None => continue,
+        };
+        if first_token != "Aborted." {
+            continue;
+        }
+        if i > 0 {
+            for j in (0..i).rev() {
+                let prev = lines[j].trim();
+                if !prev.is_empty() {
+                    return Some(prev.to_string());
+                }
+            }
+        }
+        return Some(line.trim().to_string());
+    }
+    None
 }
 
 /// Format an `ArchiveRunOutput` as a single failure-reason string for
@@ -1161,6 +1222,23 @@ mod tests {
         }
     }
 
+    /// Runner stub: exits 0, prints an `Aborted.` marker preceded by a
+    /// diagnostic line, performs no fs work. Reproduces openspec's
+    /// "refused to apply a delta" case observed in production when an
+    /// archived change references a header that no longer exists.
+    struct AbortedOutputArchiveRunner;
+    impl ArchiveRunner for AbortedOutputArchiveRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!(
+                    "{slug} MODIFIED failed for header \"### Requirement: X\" - not found\nAborted. No files were changed.\n"
+                ),
+                stderr: String::new(),
+            })
+        }
+    }
+
     /// Mixed-outcome runner: silent-skips slugs in `skip_slugs`, succeeds
     /// otherwise.
     struct MixedArchiveRunner {
@@ -1187,6 +1265,79 @@ mod tests {
                 })
             }
         }
+    }
+
+    // ----- detect_openspec_abort tests -----
+
+    #[test]
+    fn detect_abort_real_world_with_preceding_diagnostic() {
+        let stdout = "member-saved-cards MODIFIED failed for header \"### Requirement: Foo\" - not found\nAborted. No files were changed.\n";
+        let got = detect_openspec_abort(stdout);
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                "member-saved-cards MODIFIED failed for header \"### Requirement: Foo\" - not found"
+            )
+        );
+    }
+
+    #[test]
+    fn detect_abort_alone_with_trailing_text() {
+        let stdout = "Aborted. No files were changed.\n";
+        let got = detect_openspec_abort(stdout);
+        assert_eq!(got.as_deref(), Some("Aborted. No files were changed."));
+    }
+
+    #[test]
+    fn detect_abort_alone_no_trailing_text() {
+        let stdout = "Aborted.\n";
+        let got = detect_openspec_abort(stdout);
+        assert_eq!(got.as_deref(), Some("Aborted."));
+    }
+
+    #[test]
+    fn detect_abort_skips_blank_preceding_lines() {
+        let stdout = "real reason here\n\n\nAborted. No files were changed.\n";
+        let got = detect_openspec_abort(stdout);
+        assert_eq!(got.as_deref(), Some("real reason here"));
+    }
+
+    #[test]
+    fn detect_abort_clean_archive_returns_none() {
+        let stdout = "Specs to update: example\nApplying changes to openspec/specs/example/spec.md\nTotals: +3 lines\nSpecs updated successfully.\n";
+        assert_eq!(detect_openspec_abort(stdout), None);
+    }
+
+    #[test]
+    fn detect_abort_lowercase_aborted_returns_none() {
+        let stdout = "the operation was aborted by the user\n";
+        assert_eq!(detect_openspec_abort(stdout), None);
+    }
+
+    #[test]
+    fn detect_abort_without_trailing_period_returns_none() {
+        let stdout = "Aborted\n";
+        assert_eq!(detect_openspec_abort(stdout), None);
+    }
+
+    #[test]
+    fn detect_abort_mid_line_returns_none() {
+        let stdout = "some prefix Aborted. No files were changed.\n";
+        assert_eq!(detect_openspec_abort(stdout), None);
+    }
+
+    #[test]
+    fn detect_abort_indented_marker_still_matches() {
+        // Leading whitespace before `Aborted.` should still match — the
+        // rule is "first non-whitespace token" not "first column".
+        let stdout = "preceding reason\n    Aborted. No files were changed.\n";
+        let got = detect_openspec_abort(stdout);
+        assert_eq!(got.as_deref(), Some("preceding reason"));
+    }
+
+    #[test]
+    fn detect_abort_empty_stdout_returns_none() {
+        assert_eq!(detect_openspec_abort(""), None);
     }
 
     // ----- format_archive_output_for_report tests -----
@@ -1647,6 +1798,131 @@ mod tests {
         assert!(
             ws.join("openspec/changes/archive")
                 .join(format!("{today}-2"))
+                .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_aborted_marker_rolls_back_and_records_headline() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+
+        let report = rebuild_canonical_with_runner(ws, &AbortedOutputArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.successful, 0);
+        assert_eq!(report.rolled_back, 1);
+        let reason = &report.failures[0].failure_reason;
+        assert!(
+            reason.starts_with("openspec refused to apply:"),
+            "expected refused-to-apply headline, got: {reason}"
+        );
+        assert!(
+            reason.contains("MODIFIED failed for header"),
+            "expected diagnostic line in headline, got: {reason}"
+        );
+        // Rolled back to original archive name; active path empty.
+        assert!(ws.join("openspec/changes/archive/2026-05-15-foo").is_dir());
+        assert!(!ws.join("openspec/changes/foo").exists());
+    }
+
+    /// Mixed-outcome runner combining all three categories: clean
+    /// success, marker-less silent skip, and `Aborted.`-marker abort.
+    /// Used by `rebuild_mixed_marker_and_silent_skip_get_distinct_reasons`.
+    struct MixedAbortAndSilentRunner {
+        abort_slugs: std::collections::HashSet<String>,
+        skip_slugs: std::collections::HashSet<String>,
+    }
+    impl ArchiveRunner for MixedAbortAndSilentRunner {
+        fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            if self.abort_slugs.contains(slug) {
+                return Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: format!(
+                        "{slug} MODIFIED failed for header \"### Requirement: X\" - not found\nAborted. No files were changed.\n"
+                    ),
+                    stderr: String::new(),
+                });
+            }
+            if self.skip_slugs.contains(slug) {
+                return Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: format!("would archive {slug}\n"),
+                    stderr: String::new(),
+                });
+            }
+            let from = workspace.join("openspec/changes").join(slug);
+            let today = today_dated_name(slug);
+            let to = workspace.join("openspec/changes/archive").join(&today);
+            std::fs::rename(&from, &to)
+                .map_err(|e| format!("test runner rename failed: {e}"))?;
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!("archived {slug}\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_mixed_marker_and_silent_skip_get_distinct_reasons() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-ok");
+        make_archive_entry(ws, "2026-05-16-aborts");
+        make_archive_entry(ws, "2026-05-17-silently-skips");
+
+        let mut abort = std::collections::HashSet::new();
+        abort.insert("aborts".to_string());
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("silently-skips".to_string());
+        let runner = MixedAbortAndSilentRunner {
+            abort_slugs: abort,
+            skip_slugs: skip,
+        };
+
+        let report = rebuild_canonical_with_runner(ws, &runner).await.unwrap();
+
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.rolled_back, 2);
+
+        let abort_failure = report
+            .failures
+            .iter()
+            .find(|f| f.slug == "aborts")
+            .expect("abort entry should be in failures");
+        assert!(
+            abort_failure
+                .failure_reason
+                .starts_with("openspec refused to apply:"),
+            "abort headline mismatch, got: {}",
+            abort_failure.failure_reason
+        );
+
+        let silent_failure = report
+            .failures
+            .iter()
+            .find(|f| f.slug == "silently-skips")
+            .expect("silent-skip entry should be in failures");
+        assert!(
+            silent_failure
+                .failure_reason
+                .starts_with("openspec archive exited 0 but post-condition failed:"),
+            "silent-skip headline mismatch, got: {}",
+            silent_failure.failure_reason
+        );
+
+        // All three archive entries restored to original names.
+        assert!(ws.join("openspec/changes/archive/2026-05-15-ok").is_dir());
+        assert!(ws.join("openspec/changes/archive/2026-05-16-aborts").is_dir());
+        assert!(
+            ws.join("openspec/changes/archive/2026-05-17-silently-skips")
                 .is_dir()
         );
     }
