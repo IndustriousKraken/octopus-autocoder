@@ -5,6 +5,7 @@
 
 use crate::busy_marker;
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
 use chrono::Utc;
 use regex::Regex;
 use serde::Serialize;
@@ -30,6 +31,77 @@ pub struct ChangeOutcome {
     pub failure_reason: String,
 }
 
+/// Result of one `openspec archive <slug> -y` invocation. The outer
+/// `Result<ArchiveRunOutput, String>` from `run` reserves `Err` for spawn
+/// failure only (binary not on PATH, kernel-level spawn error). Non-zero
+/// exit codes land in `Ok` so callers can apply post-condition logic
+/// uniformly.
+#[derive(Debug, Clone)]
+pub struct ArchiveRunOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Pluggable runner for `openspec archive`, allowing tests to substitute
+/// stubs (silent-skip, mixed-outcome) without spawning subprocesses.
+pub trait ArchiveRunner: Send + Sync {
+    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String>;
+}
+
+/// Production runner — shells out to `openspec archive`.
+pub struct RealArchiveRunner;
+
+impl ArchiveRunner for RealArchiveRunner {
+    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+        run_openspec_archive(workspace, slug)
+    }
+}
+
+/// Structured post-condition failure value. Each variant pinpoints what
+/// the rebuild observed about the workspace state after an exit-zero
+/// `openspec archive` call, so failure reports name the actual problem.
+#[derive(Debug, Clone)]
+pub enum PostConditionFailure {
+    /// `openspec/changes/<slug>/` still exists after the archive call —
+    /// openspec did not move the directory. The observed real-world
+    /// silent-skip path.
+    ActivePathStillPresent { path: PathBuf },
+    /// `openspec/changes/<slug>/` is gone but no
+    /// `openspec/changes/archive/*-<slug>/` was produced. Data-loss-shaped.
+    NoArchiveEntryFound,
+    /// More than one directory matches the slug suffix — a stale archive
+    /// from a prior rebuild was not cleaned up. The operator must
+    /// manually pick the canonical one.
+    MultipleArchiveEntriesFound { matches: Vec<PathBuf> },
+}
+
+impl PostConditionFailure {
+    fn describe(&self) -> String {
+        match self {
+            Self::ActivePathStillPresent { path } => format!(
+                "active path still present at {}",
+                path.display()
+            ),
+            Self::NoArchiveEntryFound => {
+                "openspec archive reported success but the change is missing from both the active path and the archive".to_string()
+            }
+            Self::MultipleArchiveEntriesFound { matches } => {
+                let mut joined = String::from(
+                    "multiple matching archive directories — operator must consolidate: ",
+                );
+                for (i, p) in matches.iter().enumerate() {
+                    if i > 0 {
+                        joined.push_str(", ");
+                    }
+                    joined.push_str(&p.display().to_string());
+                }
+                joined
+            }
+        }
+    }
+}
+
 /// Per-spec-file record in a `RebuildReport`. `modified` reflects whether
 /// the rebuilt content differs byte-for-byte from the pre-rebuild content
 /// (or whether the file is wholly new after rebuild).
@@ -40,11 +112,15 @@ pub struct SpecFileOutcome {
 }
 
 /// Outcome of one rebuild invocation. `successful + failed == processed`.
+/// `rolled_back` counts changes whose archive call failed in a way that
+/// triggered a rollback of the active-path directory back to archive (a
+/// subset of `failed`).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RebuildReport {
     pub processed: usize,
     pub successful: usize,
     pub failed: usize,
+    pub rolled_back: usize,
     pub successes: Vec<ChangeOutcome>,
     pub failures: Vec<ChangeOutcome>,
     pub spec_files: Vec<SpecFileOutcome>,
@@ -196,6 +272,15 @@ async fn wait_for_marker_release(marker_path: &Path, max: Duration) {
 /// per-change outcomes plus per-canonical-file modified-vs-unchanged
 /// status.
 pub async fn rebuild_canonical(workspace: &Path) -> Result<RebuildReport> {
+    rebuild_canonical_with_runner(workspace, &RealArchiveRunner).await
+}
+
+/// Test-injectable variant of `rebuild_canonical`. The production entry
+/// point delegates to this with a `RealArchiveRunner`.
+pub async fn rebuild_canonical_with_runner(
+    workspace: &Path,
+    runner: &dyn ArchiveRunner,
+) -> Result<RebuildReport> {
     let archive_root = workspace.join("openspec/changes/archive");
     if !archive_root.is_dir() {
         return Err(anyhow!(
@@ -293,29 +378,84 @@ pub async fn rebuild_canonical(workspace: &Path) -> Result<RebuildReport> {
             continue;
         }
 
-        match run_openspec_archive(workspace, &slug) {
-            Ok(()) => {
-                let today_name = today_dated_name(&slug);
-                let today_path = archive_root.join(&today_name);
-                if today_name != original_name {
-                    if let Err(e) = std::fs::rename(&today_path, archive_root.join(&original_name)) {
+        let out = match runner.run(workspace, &slug) {
+            Ok(out) => out,
+            Err(spawn_err) => {
+                // Spawn failure (binary missing, kernel error). Roll the
+                // active directory back to archive so the workspace is
+                // restored to its pre-rebuild state for this slug.
+                tracing::error!(
+                    slug = %slug,
+                    "rebuild: openspec archive spawn failed: {spawn_err}"
+                );
+                let base_reason = format!("openspec spawn failed: {spawn_err}");
+                record_failure_with_rollback(
+                    workspace,
+                    &archive_root,
+                    &slug,
+                    &original_name,
+                    base_reason,
+                    &mut report,
+                );
+                continue;
+            }
+        };
+
+        if !out.status.success() {
+            // Non-zero exit. Rollback and continue.
+            let reason = format_archive_output_for_report(&out);
+            tracing::error!(
+                slug = %slug,
+                "rebuild: openspec archive failed: {reason}"
+            );
+            record_failure_with_rollback(
+                workspace,
+                &archive_root,
+                &slug,
+                &original_name,
+                reason,
+                &mut report,
+            );
+            continue;
+        }
+
+        // Exit zero: log captured output (useful confirmation line) and
+        // verify the post-condition. openspec is well-behaved on success
+        // — it usually prints a one-line confirmation we want preserved
+        // in INFO logs.
+        if !out.stdout.trim().is_empty() {
+            tracing::info!(slug = %slug, "openspec archive output: {}", out.stdout.trim());
+        }
+
+        match verify_archive_post_condition(workspace, &slug) {
+            Ok(actual_path) => {
+                // Happy path. Rename the matched archive entry back to
+                // the original date-prefixed name if they differ.
+                let original_os = std::ffi::OsStr::new(&original_name);
+                let needs_rename = actual_path.file_name() != Some(original_os);
+                if needs_rename {
+                    let target = archive_root.join(&original_name);
+                    if let Err(e) = std::fs::rename(&actual_path, &target) {
                         tracing::error!(
                             slug = %slug,
-                            "rebuild: in-place rename {} -> {} failed: {e}",
-                            today_path.display(),
-                            archive_root.join(&original_name).display()
+                            "rebuild: rename {} -> {} failed: {e}",
+                            actual_path.display(),
+                            target.display()
                         );
-                        // The change DID archive successfully; rename
-                        // failure is a record-keeping concern. Track as
-                        // a failure so the operator notices the date
-                        // prefix shifted.
+                        // The change DID archive successfully; this is a
+                        // record-keeping failure (the archive entry now
+                        // has openspec's name instead of the historical
+                        // date prefix). Report it so the operator can
+                        // notice.
                         report.failed += 1;
                         report.failures.push(ChangeOutcome {
                             slug: slug.clone(),
                             original_name: original_name.clone(),
                             success: false,
                             failure_reason: format!(
-                                "openspec archive succeeded but date-prefix restore failed: {e}"
+                                "openspec archive succeeded but rename {} -> {} failed: {e}",
+                                actual_path.display(),
+                                target.display()
                             ),
                         });
                         continue;
@@ -329,20 +469,43 @@ pub async fn rebuild_canonical(workspace: &Path) -> Result<RebuildReport> {
                     failure_reason: String::new(),
                 });
             }
-            Err(reason) => {
+            Err(pc) => {
+                let pc_desc = pc.describe();
+                let output = format_archive_output_for_report(&out);
+                let combined = format!(
+                    "openspec archive exited 0 but post-condition failed: {pc_desc}; openspec output: {output}"
+                );
                 tracing::error!(
                     slug = %slug,
-                    "rebuild: openspec archive failed: {reason}"
+                    "rebuild: post-condition failed: {pc_desc}; output: {output}"
                 );
-                // Leave the change at the active path for the operator
-                // to inspect. Continue with subsequent changes.
-                report.failed += 1;
-                report.failures.push(ChangeOutcome {
-                    slug,
-                    original_name,
-                    success: false,
-                    failure_reason: reason,
-                });
+                match pc {
+                    PostConditionFailure::ActivePathStillPresent { .. } => {
+                        // Silent skip. Rollback.
+                        record_failure_with_rollback(
+                            workspace,
+                            &archive_root,
+                            &slug,
+                            &original_name,
+                            combined,
+                            &mut report,
+                        );
+                    }
+                    PostConditionFailure::NoArchiveEntryFound
+                    | PostConditionFailure::MultipleArchiveEntriesFound { .. } => {
+                        // No rollback: active path is empty (data-loss
+                        // case) or archive has multiple matches the
+                        // rebuild cannot disambiguate. Operator must
+                        // resolve. Record as failure and continue.
+                        report.failed += 1;
+                        report.failures.push(ChangeOutcome {
+                            slug: slug.clone(),
+                            original_name: original_name.clone(),
+                            success: false,
+                            failure_reason: combined,
+                        });
+                    }
+                }
             }
         }
     }
@@ -370,31 +533,179 @@ pub async fn rebuild_canonical(workspace: &Path) -> Result<RebuildReport> {
     Ok(report)
 }
 
-/// Invoke `openspec archive <slug> -y` in `workspace`. On non-zero exit,
-/// return the (truncated) stderr as the failure reason.
-fn run_openspec_archive(workspace: &Path, slug: &str) -> Result<(), String> {
+/// Invoke `openspec archive <slug> -y` in `workspace`. Returns
+/// `Ok(ArchiveRunOutput)` for any case where the subprocess actually
+/// executed (even on non-zero exit), and `Err(String)` only for spawn
+/// failure (binary not on PATH, kernel-level spawn error). Callers apply
+/// the post-condition check uniformly to the `Ok` shape regardless of
+/// exit code.
+pub fn run_openspec_archive(workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
     match std::process::Command::new("openspec")
         .args(["archive", slug, "-y"])
         .current_dir(workspace)
         .output()
     {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let combined = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("openspec exited {:?} with no output", out.status.code())
-            };
-            Err(truncate_for_report(&combined))
-        }
+        Ok(out) => Ok(ArchiveRunOutput {
+            status: out.status,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err("openspec binary not found on PATH".to_string())
         }
         Err(e) => Err(format!("spawning openspec: {e}")),
+    }
+}
+
+/// Format an `ArchiveRunOutput` as a single failure-reason string for
+/// `ChangeOutcome.failure_reason`. Includes the exit status code and the
+/// captured stderr (or stdout when stderr is empty), truncated via
+/// `truncate_for_report`.
+pub fn format_archive_output_for_report(out: &ArchiveRunOutput) -> String {
+    let stderr = out.stderr.trim();
+    let stdout = out.stdout.trim();
+    let body = if !stderr.is_empty() {
+        truncate_for_report(stderr)
+    } else if !stdout.is_empty() {
+        truncate_for_report(stdout)
+    } else {
+        "(no output)".to_string()
+    };
+    format!("openspec exited {:?}: {}", out.status.code(), body)
+}
+
+/// Verify the post-condition after an exit-zero `openspec archive` call.
+/// Returns the actual archive directory path on success, or a structured
+/// failure value naming exactly what was wrong.
+pub fn verify_archive_post_condition(
+    workspace: &Path,
+    slug: &str,
+) -> Result<PathBuf, PostConditionFailure> {
+    let active_path = workspace.join("openspec/changes").join(slug);
+    if active_path.exists() {
+        return Err(PostConditionFailure::ActivePathStillPresent { path: active_path });
+    }
+
+    let archive_root = workspace.join("openspec/changes/archive");
+    let matches = find_archive_entries_for_slug(&archive_root, slug);
+    match matches.len() {
+        0 => Err(PostConditionFailure::NoArchiveEntryFound),
+        1 => Ok(matches.into_iter().next().expect("len == 1")),
+        _ => Err(PostConditionFailure::MultipleArchiveEntriesFound { matches }),
+    }
+}
+
+/// Read `archive_root` and return all entries whose name matches
+/// `<date>-<slug>` or `<date>-<slug>-<N>` (the openspec collision
+/// suffix), where `<date>` is `YYYY-MM-DD`. Excludes entries without a
+/// date prefix and entries that share only an unrelated suffix.
+fn find_archive_entries_for_slug(archive_root: &Path, slug: &str) -> Vec<PathBuf> {
+    // Match `<date>-<slug>` exactly, OR `<date>-<slug>-<digits>` for
+    // openspec's collision suffix. Regex-escape the slug because change
+    // slugs can contain `-` (a regex metachar in some forms but not in
+    // ours; still safer to escape).
+    let pattern = format!(
+        r"^\d{{4}}-\d{{2}}-\d{{2}}-{}(?:-\d+)?$",
+        regex::escape(slug)
+    );
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    let read = match std::fs::read_dir(archive_root) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for entry in read.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if !re.is_match(&name) {
+            continue;
+        }
+        out.push(entry.path());
+    }
+    out.sort();
+    out
+}
+
+/// Move `openspec/changes/<slug>/` back to
+/// `openspec/changes/archive/<original_name>/`. Idempotent against a
+/// missing source (no-op). Errors only on an actual rename failure or
+/// destination-already-exists.
+pub fn rollback_to_archive(
+    workspace: &Path,
+    slug: &str,
+    original_name: &str,
+) -> Result<(), std::io::Error> {
+    let active = workspace.join("openspec/changes").join(slug);
+    if !active.exists() {
+        return Ok(());
+    }
+    let archive_target = workspace
+        .join("openspec/changes/archive")
+        .join(original_name);
+    if archive_target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "rollback destination already exists: {}",
+                archive_target.display()
+            ),
+        ));
+    }
+    std::fs::rename(&active, &archive_target)
+}
+
+/// Record a per-change failure with a rollback attempt. Used for the
+/// failure paths that need to restore `changes/<slug>/` back to archive
+/// (spawn failure, non-zero exit, ActivePathStillPresent). If the
+/// rollback ITSELF fails (rare), log CRITICAL and concatenate both
+/// errors into the failure reason; the rebuild continues to the next
+/// change rather than crashing.
+fn record_failure_with_rollback(
+    workspace: &Path,
+    _archive_root: &Path,
+    slug: &str,
+    original_name: &str,
+    base_reason: String,
+    report: &mut RebuildReport,
+) {
+    match rollback_to_archive(workspace, slug, original_name) {
+        Ok(()) => {
+            report.failed += 1;
+            report.rolled_back += 1;
+            report.failures.push(ChangeOutcome {
+                slug: slug.to_string(),
+                original_name: original_name.to_string(),
+                success: false,
+                failure_reason: base_reason,
+            });
+        }
+        Err(rollback_err) => {
+            tracing::error!(
+                slug = %slug,
+                "CRITICAL: rebuild rollback failed. original={base_reason}; rollback={rollback_err}"
+            );
+            report.failed += 1;
+            report.failures.push(ChangeOutcome {
+                slug: slug.to_string(),
+                original_name: original_name.to_string(),
+                success: false,
+                failure_reason: format!(
+                    "{base_reason}; rollback ALSO failed: {rollback_err}"
+                ),
+            });
+        }
     }
 }
 
@@ -423,7 +734,10 @@ pub fn strip_date_prefix(name: &str) -> Result<&str> {
 }
 
 /// Format the dated archive directory name openspec produces today:
-/// `<UTC YYYY-MM-DD>-<slug>`.
+/// `<UTC YYYY-MM-DD>-<slug>`. Retained for test fixtures only — the
+/// production success path now observes the actual archive directory
+/// via `verify_archive_post_condition` rather than guessing today's date.
+#[cfg(test)]
 pub fn today_dated_name(slug: &str) -> String {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     format!("{today}-{slug}")
@@ -496,6 +810,13 @@ fn print_report(report: &RebuildReport) {
     );
     println!("Successful: {}", report.successful);
     println!("Failed:     {}", report.failed);
+
+    if report.rolled_back > 0 {
+        println!(
+            "{} change(s) rolled back to archive due to silent-skip or post-condition failure — see per-change reasons above",
+            report.rolled_back
+        );
+    }
 
     if !report.failures.is_empty() {
         println!();
@@ -769,5 +1090,612 @@ mod tests {
                 "archive entry {name} should still be present with its original date prefix"
             );
         }
+    }
+
+    // ----- Test helpers: workspace builder + fake archive runners -----
+
+    fn make_workspace() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/specs")).unwrap();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive")).unwrap();
+        std::fs::write(ws.join("openspec/project.md"), "# Project\nFixture.\n").unwrap();
+        std::fs::write(ws.join("openspec/AGENTS.md"), "# AGENTS\nFixture.\n").unwrap();
+        dir
+    }
+
+    /// Create a fixture archive directory at
+    /// `openspec/changes/archive/<name>/` with minimal files. Useful for
+    /// rebuild-loop tests that don't need real openspec content.
+    fn make_archive_entry(ws: &Path, name: &str) {
+        let dir = ws.join("openspec/changes/archive").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), "fixture\n").unwrap();
+    }
+
+    fn fake_exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// Runner stub: exits 0, prints `"would archive <slug>"` to stdout,
+    /// performs no fs work. Reproduces the production silent-skip case.
+    struct SilentSkipArchiveRunner;
+    impl ArchiveRunner for SilentSkipArchiveRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!("would archive {slug}\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Runner stub that performs the archive correctly (moves
+    /// `changes/<slug>/` into `archive/<today>-<slug>/`).
+    struct SuccessfulArchiveRunner;
+    impl ArchiveRunner for SuccessfulArchiveRunner {
+        fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            let from = workspace.join("openspec/changes").join(slug);
+            let today = today_dated_name(slug);
+            let to = workspace.join("openspec/changes/archive").join(&today);
+            std::fs::rename(&from, &to)
+                .map_err(|e| format!("test runner rename failed: {e}"))?;
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!("archived {slug}\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Runner stub that exits non-zero with stderr.
+    struct FailingArchiveRunner;
+    impl ArchiveRunner for FailingArchiveRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(1),
+                stdout: String::new(),
+                stderr: format!("validation error for {slug}\n"),
+            })
+        }
+    }
+
+    /// Mixed-outcome runner: silent-skips slugs in `skip_slugs`, succeeds
+    /// otherwise.
+    struct MixedArchiveRunner {
+        skip_slugs: std::collections::HashSet<String>,
+    }
+    impl ArchiveRunner for MixedArchiveRunner {
+        fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            if self.skip_slugs.contains(slug) {
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: format!("would archive {slug}\n"),
+                    stderr: String::new(),
+                })
+            } else {
+                let from = workspace.join("openspec/changes").join(slug);
+                let today = today_dated_name(slug);
+                let to = workspace.join("openspec/changes/archive").join(&today);
+                std::fs::rename(&from, &to)
+                    .map_err(|e| format!("test runner rename failed: {e}"))?;
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: format!("archived {slug}\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+
+    // ----- format_archive_output_for_report tests -----
+
+    #[test]
+    fn format_archive_output_prefers_stderr() {
+        let out = ArchiveRunOutput {
+            status: fake_exit(1),
+            stdout: "stdout-content".into(),
+            stderr: "stderr-content".into(),
+        };
+        let s = format_archive_output_for_report(&out);
+        assert!(s.contains("stderr-content"), "got {s}");
+        assert!(!s.contains("stdout-content"), "got {s}");
+        assert!(s.contains("exited"), "got {s}");
+    }
+
+    #[test]
+    fn format_archive_output_falls_back_to_stdout() {
+        let out = ArchiveRunOutput {
+            status: fake_exit(0),
+            stdout: "stdout-content".into(),
+            stderr: "   ".into(),
+        };
+        let s = format_archive_output_for_report(&out);
+        assert!(s.contains("stdout-content"), "got {s}");
+    }
+
+    #[test]
+    fn format_archive_output_handles_empty() {
+        let out = ArchiveRunOutput {
+            status: fake_exit(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let s = format_archive_output_for_report(&out);
+        assert!(s.contains("no output"), "got {s}");
+    }
+
+    #[test]
+    fn format_archive_output_truncates_long_output() {
+        let huge = "x".repeat(2000);
+        let out = ArchiveRunOutput {
+            status: fake_exit(1),
+            stdout: String::new(),
+            stderr: huge,
+        };
+        let s = format_archive_output_for_report(&out);
+        assert!(s.chars().count() < 1000, "should be truncated, got {} chars", s.chars().count());
+        assert!(s.contains("…"), "should contain truncation marker, got {s}");
+    }
+
+    // ----- verify_archive_post_condition tests -----
+
+    #[test]
+    fn post_condition_happy_path() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        let entry = ws.join("openspec/changes/archive/2026-05-25-foo");
+        std::fs::create_dir_all(&entry).unwrap();
+
+        let actual = verify_archive_post_condition(ws, "foo").unwrap();
+        assert_eq!(actual, entry);
+    }
+
+    #[test]
+    fn post_condition_silent_skip() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+
+        match verify_archive_post_condition(ws, "foo").unwrap_err() {
+            PostConditionFailure::ActivePathStillPresent { path } => {
+                assert_eq!(path, ws.join("openspec/changes/foo"));
+            }
+            other => panic!("expected ActivePathStillPresent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_condition_data_loss() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // No changes/foo, no archive/*-foo.
+        match verify_archive_post_condition(ws, "foo").unwrap_err() {
+            PostConditionFailure::NoArchiveEntryFound => {}
+            other => panic!("expected NoArchiveEntryFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_condition_collision_multiple_matches() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-24-foo")).unwrap();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
+
+        match verify_archive_post_condition(ws, "foo").unwrap_err() {
+            PostConditionFailure::MultipleArchiveEntriesFound { matches } => {
+                assert_eq!(matches.len(), 2);
+                let names: Vec<String> = matches
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str().map(String::from)))
+                    .collect();
+                assert!(names.contains(&"2026-05-24-foo".to_string()));
+                assert!(names.contains(&"2026-05-25-foo".to_string()));
+            }
+            other => panic!("expected MultipleArchiveEntriesFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_condition_ignores_entries_without_date_prefix() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/foo-foo")).unwrap();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
+
+        let actual = verify_archive_post_condition(ws, "foo").unwrap();
+        assert_eq!(
+            actual,
+            ws.join("openspec/changes/archive/2026-05-25-foo")
+        );
+    }
+
+    #[test]
+    fn post_condition_ignores_unrelated_slugs() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-bar")).unwrap();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
+
+        let actual = verify_archive_post_condition(ws, "foo").unwrap();
+        assert_eq!(
+            actual,
+            ws.join("openspec/changes/archive/2026-05-25-foo")
+        );
+    }
+
+    // ----- rollback_to_archive tests -----
+
+    #[test]
+    fn rollback_restores_active_to_archive() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        let active = ws.join("openspec/changes/foo");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("proposal.md"), "fixture\n").unwrap();
+
+        rollback_to_archive(ws, "foo", "2026-05-15-foo").unwrap();
+
+        assert!(!active.exists(), "active path should be empty after rollback");
+        let restored = ws.join("openspec/changes/archive/2026-05-15-foo");
+        assert!(restored.is_dir(), "restored archive entry should exist");
+        assert!(restored.join("proposal.md").exists());
+    }
+
+    #[test]
+    fn rollback_noop_when_source_missing() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // No changes/foo to roll back.
+        rollback_to_archive(ws, "foo", "2026-05-15-foo").unwrap();
+        // archive should still be empty.
+        let archive = ws.join("openspec/changes/archive/2026-05-15-foo");
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn rollback_errors_on_destination_collision() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-15-foo"))
+            .unwrap();
+
+        let err = rollback_to_archive(ws, "foo", "2026-05-15-foo")
+            .expect_err("destination collision should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    // ----- rebuild_canonical_with_runner tests -----
+
+    #[tokio::test]
+    async fn rebuild_silent_skip_rolls_back_all_changes() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+        make_archive_entry(ws, "2026-05-18-bar");
+        make_archive_entry(ws, "2026-05-20-baz");
+
+        let report = rebuild_canonical_with_runner(ws, &SilentSkipArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.successful, 0);
+        assert_eq!(report.failed, 3);
+        assert_eq!(report.rolled_back, 3);
+
+        // All failure reasons should include "would archive" from the stub's stdout.
+        for f in &report.failures {
+            assert!(
+                f.failure_reason.contains("would archive"),
+                "expected stub stdout in reason, got: {}",
+                f.failure_reason
+            );
+        }
+
+        // Archive entries restored with original date prefixes.
+        for name in ["2026-05-15-foo", "2026-05-18-bar", "2026-05-20-baz"] {
+            assert!(
+                ws.join("openspec/changes/archive").join(name).is_dir(),
+                "expected archive entry {name} to be restored"
+            );
+        }
+
+        // changes/ directory should contain no active-path slug entries
+        // (only the archive subdirectory).
+        let changes_root = ws.join("openspec/changes");
+        for entry in std::fs::read_dir(&changes_root).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.file_name(),
+                std::ffi::OsString::from("archive"),
+                "unexpected leftover in changes/: {:?}",
+                entry.file_name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_mixed_outcomes_rolls_back_only_skipped() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+        make_archive_entry(ws, "2026-05-18-bar");
+        make_archive_entry(ws, "2026-05-20-baz");
+
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("bar".to_string());
+        let runner = MixedArchiveRunner { skip_slugs: skip };
+
+        let report = rebuild_canonical_with_runner(ws, &runner).await.unwrap();
+
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.successful, 2);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.rolled_back, 1);
+        assert_eq!(report.failures[0].slug, "bar");
+        // Skipped slug back at original archive location.
+        assert!(
+            ws.join("openspec/changes/archive/2026-05-18-bar").is_dir(),
+            "skipped slug should be rolled back to original name"
+        );
+        // Successful slugs renamed back to original.
+        assert!(ws.join("openspec/changes/archive/2026-05-15-foo").is_dir());
+        assert!(ws.join("openspec/changes/archive/2026-05-20-baz").is_dir());
+        // No active-path leakage.
+        assert!(!ws.join("openspec/changes/foo").exists());
+        assert!(!ws.join("openspec/changes/bar").exists());
+        assert!(!ws.join("openspec/changes/baz").exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_non_zero_exit_rolls_back() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+
+        let report = rebuild_canonical_with_runner(ws, &FailingArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.rolled_back, 1);
+        assert!(
+            report.failures[0]
+                .failure_reason
+                .contains("validation error"),
+            "expected stderr in failure reason, got: {}",
+            report.failures[0].failure_reason
+        );
+        assert!(ws.join("openspec/changes/archive/2026-05-15-foo").is_dir());
+        assert!(!ws.join("openspec/changes/foo").exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_success_path_renames_to_original_when_dates_differ() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // Original archive entry has a date well in the past; the
+        // SuccessfulArchiveRunner will produce today-prefixed dirs.
+        make_archive_entry(ws, "2026-01-01-foo");
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.failed, 0);
+        // Original date prefix restored.
+        assert!(ws.join("openspec/changes/archive/2026-01-01-foo").is_dir());
+        // Today's path should NOT exist any more (it was renamed back).
+        assert!(!ws.join("openspec/changes/archive").join(today_dated_name("foo")).exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_success_path_no_rename_when_already_original() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // Original archive entry IS today-prefixed; rename is a no-op.
+        let original = today_dated_name("foo");
+        make_archive_entry(ws, &original);
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.failed, 0);
+        assert!(ws.join("openspec/changes/archive").join(&original).is_dir());
+    }
+
+    #[tokio::test]
+    async fn rebuild_success_path_handles_collision_suffix_rename() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // Original archive entry from long ago.
+        make_archive_entry(ws, "2026-01-01-foo");
+
+        // Runner that produces a collision-suffix name (`<today>-foo-2`).
+        struct CollisionRunner;
+        impl ArchiveRunner for CollisionRunner {
+            fn run(
+                &self,
+                workspace: &Path,
+                slug: &str,
+            ) -> Result<ArchiveRunOutput, String> {
+                let from = workspace.join("openspec/changes").join(slug);
+                let today = today_dated_name(slug);
+                let to = workspace
+                    .join("openspec/changes/archive")
+                    .join(format!("{today}-2"));
+                std::fs::rename(&from, &to)
+                    .map_err(|e| format!("test runner rename failed: {e}"))?;
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = rebuild_canonical_with_runner(ws, &CollisionRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.failed, 0);
+        // Renamed back to original name even with the suffix in actual_path.
+        assert!(ws.join("openspec/changes/archive/2026-01-01-foo").is_dir());
+    }
+
+    #[tokio::test]
+    async fn rebuild_data_loss_case_no_rollback_no_crash() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+
+        // Runner that pretends archive succeeded but deletes the
+        // change directory without producing an archive entry.
+        struct DataLossRunner;
+        impl ArchiveRunner for DataLossRunner {
+            fn run(
+                &self,
+                workspace: &Path,
+                slug: &str,
+            ) -> Result<ArchiveRunOutput, String> {
+                let from = workspace.join("openspec/changes").join(slug);
+                std::fs::remove_dir_all(&from)
+                    .map_err(|e| format!("test removal failed: {e}"))?;
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = rebuild_canonical_with_runner(ws, &DataLossRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        // No rollback expected (active path was already empty).
+        assert_eq!(report.rolled_back, 0);
+        assert!(
+            report.failures[0]
+                .failure_reason
+                .contains("missing from both the active path and the archive"),
+            "expected data-loss description, got: {}",
+            report.failures[0].failure_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_multiple_matches_no_rollback_no_rename() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+
+        // Runner that produces TWO archive entries for the same slug.
+        // The second uses a `-<digits>` collision suffix so both match
+        // the post-condition glob.
+        struct CollisionPairRunner;
+        impl ArchiveRunner for CollisionPairRunner {
+            fn run(
+                &self,
+                workspace: &Path,
+                slug: &str,
+            ) -> Result<ArchiveRunOutput, String> {
+                let from = workspace.join("openspec/changes").join(slug);
+                let today = today_dated_name(slug);
+                let to = workspace.join("openspec/changes/archive").join(&today);
+                std::fs::rename(&from, &to)
+                    .map_err(|e| format!("test runner rename failed: {e}"))?;
+                // And add a collision-suffix duplicate.
+                let extra = workspace
+                    .join("openspec/changes/archive")
+                    .join(format!("{today}-2"));
+                std::fs::create_dir_all(&extra)
+                    .map_err(|e| format!("test extra-dir create failed: {e}"))?;
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = rebuild_canonical_with_runner(ws, &CollisionPairRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.rolled_back, 0);
+        assert!(
+            report.failures[0]
+                .failure_reason
+                .contains("multiple matching archive directories"),
+            "expected multi-match description, got: {}",
+            report.failures[0].failure_reason
+        );
+        // Both directories still present (rebuild did not pick one).
+        let today = today_dated_name("foo");
+        assert!(ws.join("openspec/changes/archive").join(&today).is_dir());
+        assert!(
+            ws.join("openspec/changes/archive")
+                .join(format!("{today}-2"))
+                .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_rollback_collision_records_combined_failure() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry(ws, "2026-05-15-foo");
+
+        // Runner that silent-skips but also pre-creates a stale entry at
+        // the rollback destination so the rollback hits AlreadyExists.
+        struct PoisonedRunner;
+        impl ArchiveRunner for PoisonedRunner {
+            fn run(
+                &self,
+                workspace: &Path,
+                slug: &str,
+            ) -> Result<ArchiveRunOutput, String> {
+                // Pre-poison the rollback target so the rebuild's rollback
+                // can't put `changes/foo` back into archive/2026-05-15-foo.
+                std::fs::create_dir_all(
+                    workspace
+                        .join("openspec/changes/archive/2026-05-15-foo"),
+                )
+                .map_err(|e| format!("test poison failed: {e}"))?;
+                Ok(ArchiveRunOutput {
+                    status: fake_exit(0),
+                    stdout: format!("would archive {slug}\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = rebuild_canonical_with_runner(ws, &PoisonedRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        // Rollback failed, so we shouldn't count it as rolled-back.
+        assert_eq!(report.rolled_back, 0);
+        let reason = &report.failures[0].failure_reason;
+        assert!(
+            reason.contains("rollback ALSO failed"),
+            "expected combined failure reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("would archive"),
+            "expected original failure context in reason, got: {reason}"
+        );
     }
 }
