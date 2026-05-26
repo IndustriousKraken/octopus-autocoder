@@ -11,6 +11,7 @@ pub mod reload;
 pub mod rewind;
 pub mod run;
 pub mod sync_specs;
+pub mod sync_specs_deps;
 
 #[derive(Parser, Debug)]
 #[command(name = "autocoder")]
