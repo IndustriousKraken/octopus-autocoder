@@ -148,13 +148,13 @@ pub struct ControlState {
     pub spawn_repo: SpawnRepoFn,
 }
 
-/// Canonical control-socket path:
-/// `<system-temp>/autocoder/control/control.sock`.
+/// Canonical control-socket path: `<runtime_dir>/control.sock`. The
+/// runtime dir is resolved from the daemon's `DaemonPaths` (typically
+/// `/run/autocoder/` under systemd or `${XDG_RUNTIME_DIR}/autocoder/`
+/// in dev mode); reboot-cleared tmpfs is the correct location for a
+/// socket that should never outlive the process that owns it.
 pub fn socket_path() -> PathBuf {
-    std::env::temp_dir()
-        .join("autocoder")
-        .join("control")
-        .join("control.sock")
+    crate::paths::current().runtime.join("control.sock")
 }
 
 /// Bind the listener at the canonical socket path and accept connections
@@ -1407,11 +1407,10 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_is_under_temp_autocoder_control() {
+    fn socket_path_is_under_runtime_dir() {
         let p = socket_path();
         let s = p.to_string_lossy().to_string();
         assert!(s.contains("autocoder"), "expected `autocoder` in path: {s}");
-        assert!(s.contains("control"), "expected `control` in path: {s}");
         assert!(
             s.ends_with("control.sock"),
             "expected `control.sock` suffix: {s}"

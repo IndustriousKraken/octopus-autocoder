@@ -1372,10 +1372,12 @@ mod tests {
         run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
-        let log_dir = PathBuf::from("/tmp/autocoder/logs")
+        let log_dir = crate::paths::current()
+            .logs
+            .join("runs")
             .join(&basename)
             .join("audits");
-        assert!(log_dir.exists(), "audit log dir must be created");
+        assert!(log_dir.exists(), "audit log dir must be created at {}", log_dir.display());
         let entries: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .map(|e| e.unwrap())
@@ -1390,7 +1392,7 @@ mod tests {
         );
         // Clean up the global tmp dir we created.
         let _ = std::fs::remove_dir_all(
-            PathBuf::from("/tmp/autocoder/logs").join(&basename),
+            crate::paths::current().logs.join("runs").join(&basename),
         );
     }
 

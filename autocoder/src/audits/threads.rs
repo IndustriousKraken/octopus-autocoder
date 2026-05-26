@@ -77,11 +77,12 @@ pub fn state_dir(root: &Path) -> PathBuf {
     root.join("audit-threads")
 }
 
-/// Default state directory under `<system-temp>/autocoder/`. Mirrors the
-/// busy-marker / run-log convention so all daemon-owned state lives in
-/// one place.
+/// Default state directory: the daemon's resolved `state_dir`. The
+/// audit-threads files survive reboot alongside audit cadence, failure
+/// counters, and revision state — they belong to the same persistent
+/// data category.
 pub fn default_state_root() -> PathBuf {
-    std::env::temp_dir().join("autocoder")
+    crate::paths::current().state
 }
 
 /// Atomically write `state` to its canonical file. Parent directory is

@@ -291,14 +291,18 @@ pub struct AuditLogWriter {
 
 impl AuditLogWriter {
     /// Create a new log writer at
-    /// `/tmp/autocoder/logs/<workspace-basename>/audits/<audit_type>-<UTC-RFC3339-with-Z>.log`.
-    /// The directory is created if absent.
+    /// `<logs_dir>/runs/<repo-sanitized>/audits/<audit_type>-<UTC-RFC3339-with-Z>.log`.
+    /// The directory is created if absent. The per-repo subdir matches
+    /// the per-change run-log layout (see
+    /// [`crate::executor::claude_cli::run_log_path`]).
     pub fn open(workspace: &Path, audit_type: &str) -> Result<Self> {
         let basename = workspace
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("workspace");
-        let dir = PathBuf::from("/tmp/autocoder/logs")
+        let dir = crate::paths::current()
+            .logs
+            .join("runs")
             .join(basename)
             .join("audits");
         std::fs::create_dir_all(&dir)

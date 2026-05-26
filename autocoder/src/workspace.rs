@@ -5,18 +5,34 @@ use crate::config::GithubConfig;
 use crate::github::{self, DeleteOutcome};
 use crate::github_credentials::resolve_token;
 use crate::{config::RepositoryConfig, git};
+use crate::paths;
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const WORKSPACE_ROOT: &str = "/tmp/workspaces";
+/// Compute the workspace root: `<cache_dir>/workspaces/`. Resolved from
+/// the process-global `DaemonPaths` when initialized (production); in
+/// tests that haven't installed paths this falls back to a fixed root
+/// under the system temp dir, preserving pre-`DaemonPaths` behavior for
+/// existing test fixtures.
+pub fn workspace_root() -> PathBuf {
+    paths::current().cache.join("workspaces")
+}
 
-/// Derive a per-repo workspace path under `/tmp/workspaces/`. Deterministic:
-/// the same URL always produces the same path. SSH and HTTPS forms of the
-/// same repository collapse to the same derived path.
+/// Derive a per-repo workspace path under `<cache_dir>/workspaces/`.
+/// Deterministic: the same URL always produces the same path. SSH and
+/// HTTPS forms of the same repository collapse to the same derived path.
 pub fn derive_path(url: &str) -> PathBuf {
-    PathBuf::from(WORKSPACE_ROOT).join(sanitize(url))
+    workspace_root().join(sanitize(url))
+}
+
+/// URL → directory-name sanitization, exposed so other state writes
+/// (failure-state, revisions, run-log per-repo subdirs) can derive
+/// matching per-repo identifiers. Keeps the convention single-sourced.
+#[allow(dead_code)]
+pub fn sanitize_url(url: &str) -> String {
+    sanitize(url)
 }
 
 fn sanitize(url: &str) -> String {
@@ -366,13 +382,18 @@ mod tests {
     #[test]
     fn derive_path_ssh_form() {
         let p = derive_path("git@github.com:owner/repo.git");
-        assert_eq!(p, PathBuf::from("/tmp/workspaces/github_com_owner_repo"));
+        assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
+        assert_eq!(
+            p.parent().unwrap().file_name().and_then(|s| s.to_str()),
+            Some("workspaces"),
+            "parent must be the `workspaces` subdir"
+        );
     }
 
     #[test]
     fn derive_path_https_form() {
         let p = derive_path("https://github.com/owner/repo.git");
-        assert_eq!(p, PathBuf::from("/tmp/workspaces/github_com_owner_repo"));
+        assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
     }
 
     #[test]

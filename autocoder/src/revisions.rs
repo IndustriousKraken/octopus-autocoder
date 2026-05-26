@@ -4,7 +4,12 @@
 //! parses operator comments for the `@<bot> revise <text>` trigger pattern,
 //! and dispatches in-place revisions through the executor.
 //!
-//! State per PR lives at `<workspace>/.autocoder/revisions/<pr-number>.json`.
+//! State per PR lives at
+//! `<state_dir>/revisions/<repo-sanitized>/<pr-number>.json`, where
+//! `<repo-sanitized>` is the workspace's basename (already
+//! URL-sanitized per `workspace::derive_path`'s rules). Daemon-global
+//! accounting that survives reboot but does NOT live inside the git
+//! working tree.
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -18,8 +23,6 @@ use crate::config::{GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome};
 use crate::github;
 
-const REVISIONS_DIR: &str = ".autocoder/revisions";
-
 /// HTML-comment marker the reviewer-initiated revision flow writes at the
 /// top of every PR comment it posts. The dispatcher's self-author filter
 /// (which normally drops bot-authored comments to avoid recursion on its
@@ -29,9 +32,9 @@ const REVISIONS_DIR: &str = ".autocoder/revisions";
 pub const REVIEWER_REVISION_MARKER: &str = "<!-- reviewer-revision -->";
 
 /// Per-PR state file persisted under
-/// `<workspace>/.autocoder/revisions/<pr_number>.json`. The dispatcher
-/// reads it on each iteration to know which comments are already
-/// processed and how many revisions have been applied so far.
+/// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`. The
+/// dispatcher reads it on each iteration to know which comments are
+/// already processed and how many revisions have been applied so far.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevisionState {
     pub pr_number: u64,
@@ -64,16 +67,38 @@ pub struct RevisionContext {
     pub revision_text: String,
 }
 
-/// Return the path to a PR's state file inside `workspace`.
+/// Legacy per-workspace directory used as a fallback when the
+/// daemon-paths global is not installed (i.e. tests that build their
+/// workspace without going through `cli::run`). Preserves
+/// pre-`DaemonPaths` test-fixture expectations.
+const LEGACY_REVISIONS_DIR: &str = ".autocoder/revisions";
+
+/// Return the path to a PR's state file for `workspace`. In
+/// production, lives at
+/// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`. In tests
+/// where the daemon-paths global has not been installed, falls back to
+/// `<workspace>/.autocoder/revisions/<pr_number>.json`.
 pub fn state_path(workspace: &Path, pr_number: u64) -> PathBuf {
-    workspace
-        .join(REVISIONS_DIR)
-        .join(format!("{pr_number}.json"))
+    revisions_dir(workspace).join(format!("{pr_number}.json"))
 }
 
-/// Return the directory under which all per-PR state files live.
+/// Return the directory under which all per-PR state files for one
+/// repo live. Resolved to `<state_dir>/revisions/<repo-sanitized>/` in
+/// production, or `<workspace>/.autocoder/revisions/` in the
+/// global-paths-not-installed fallback.
 fn revisions_dir(workspace: &Path) -> PathBuf {
-    workspace.join(REVISIONS_DIR)
+    if crate::paths::get_global().is_some() {
+        let basename = workspace
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::paths::current()
+            .state
+            .join("revisions")
+            .join(basename)
+    } else {
+        workspace.join(LEGACY_REVISIONS_DIR)
+    }
 }
 
 /// Read the state file for `pr_number`. A missing file returns
@@ -787,7 +812,7 @@ mod tests {
     #[test]
     fn prune_ignores_non_json_files_and_garbage_names() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(REVISIONS_DIR);
+        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), "x").unwrap();
         std::fs::write(dir.join("not-a-number.json"), "x").unwrap();
@@ -810,7 +835,7 @@ mod tests {
     #[test]
     fn atomic_write_tolerates_interrupted_partial_temp() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(REVISIONS_DIR);
+        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         // Simulate a temp file left behind by a previous interrupted write.
         std::fs::write(dir.join(".tmpABCDEF"), "{incomplete json").unwrap();
@@ -825,7 +850,7 @@ mod tests {
     #[test]
     fn read_state_errors_on_corrupt_json() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(REVISIONS_DIR);
+        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("42.json"), "not json").unwrap();
         let err = read_state(tmp.path(), 42).expect_err("corrupt JSON must surface as Err");

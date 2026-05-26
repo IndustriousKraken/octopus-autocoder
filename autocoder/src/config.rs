@@ -66,6 +66,40 @@ pub struct Config {
     /// audits" path produces a YAML file without an empty `audits:` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audits: Option<AuditsConfig>,
+    /// Optional explicit overrides for the four daemon data
+    /// directories. Each field is optional; absent fields fall through
+    /// the resolution priority (`AUTOCODER_*_DIR` env var → systemd
+    /// `$STATE_DIRECTORY` family → XDG defaults → hard fallback). An
+    /// absent block is equivalent to all fields being `None`.
+    #[serde(default, skip_serializing_if = "DaemonPathsConfig::is_empty")]
+    pub paths: DaemonPathsConfig,
+}
+
+/// Operator-visible override for the four daemon data paths. Each
+/// field is optional; the absent-field path means "use the default
+/// resolution chain" (see [`crate::paths::resolve_daemon_paths`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPathsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_dir: Option<PathBuf>,
+}
+
+impl DaemonPathsConfig {
+    /// `true` when every field is `None`. Used by the serializer to
+    /// suppress empty `paths: {}` blocks from the rendered YAML.
+    pub fn is_empty(&self) -> bool {
+        self.state_dir.is_none()
+            && self.cache_dir.is_none()
+            && self.logs_dir.is_none()
+            && self.runtime_dir.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

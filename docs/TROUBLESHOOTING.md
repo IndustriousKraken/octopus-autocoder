@@ -299,8 +299,9 @@ waiting on. The per-iteration cancel token can only fire at safety
 points; a blocking syscall holds the iteration past those points.
 
 **What to do.** After the wipe completes, open the stuck iteration's
-log at `/tmp/autocoder/logs/<workspace>/<change>.log` (the workspace
-log directory persists across a workspace wipe — only the workspace
+log at `<logs_dir>/runs/<repo-sanitized>/<change>.log` (typically
+`/var/log/autocoder/runs/<repo>/<change>.log` under systemd; the log
+directory persists across a workspace wipe — only the workspace
 itself is removed). Look at the tail to see what the iteration was
 doing when the cancel signal arrived. Common findings:
 
@@ -312,3 +313,48 @@ doing when the cancel signal arrived. Common findings:
 - A long executor invocation that simply needs more time → consider
   raising `executor.wipe_drain_timeout_secs` (capped at 300) so future
   wipes give the iteration the headroom it needed.
+
+## Audit storm after reboot — daemon re-fires every audit on the first iteration
+
+**Symptom.** A few minutes after a host reboot, the chatops channel
+fills up with audit notifications — `🔍 created proposal`,
+`🔍 architecture-brightline reported N findings`, etc. — for audits
+that ran recently and were not due for hours or days.
+
+**Root cause.** Pre-`state-paths-out-of-tmp`, autocoder wrote audit-
+cadence state under `/tmp/`, which is tmpfs on most server distros and
+gets wiped on reboot. When the cadence file disappears, every audit's
+`last_run` defaults to "never" and the cadence check fires
+unconditionally on the first iteration after startup. The same
+mechanism reset failure counters and discarded operator-set markers
+(`.perma-stuck.json`, `.needs-spec-revision.json`).
+
+**Fix shipped.** Per-repo workspaces now live under `<cache_dir>/`
+(real disk, not tmpfs) and the per-audit-type cadence files live
+under `<state_dir>/audit-state/` (see [`STATE-LAYOUT.md`](STATE-LAYOUT.md)).
+The daemon also reloads the audit cadence map from
+`<state_dir>/audit-state/` before any cadence check fires, so
+on-disk timestamps are respected. After the upgrade, the first
+daemon start migrates legacy `/tmp` data into the new layout and
+writes `<state_dir>/.migration-from-tmp-done`.
+
+**If a storm still happens after this change shipped.** Check that
+your daemon actually picked up the new paths:
+
+1. `journalctl -u autocoder | grep "daemon paths resolved"` — confirms
+   the resolved `state_dir`, `cache_dir`, `logs_dir`, `runtime_dir`
+   are what you expect. If `state_dir` is still under `/tmp/`, your
+   `paths:` config or `AUTOCODER_STATE_DIR` env var is pointing
+   there.
+2. `journalctl -u autocoder | grep "legacy /tmp migration"` — confirms
+   the migration scan ran. If absent, the daemon never reached the
+   migration call; look for an earlier startup error in the same log.
+3. `ls <state_dir>/.migration-from-tmp-done` — confirms the migration
+   wrote its marker. If missing, the migration encountered errors;
+   re-check `journalctl` for the per-entry ERROR lines.
+4. `ls <cache_dir>/workspaces/` — confirms workspaces moved off
+   `/tmp/`. If empty, no workspaces have been initialized yet (first
+   iteration after install).
+
+To force a re-scan after restoring legacy data from backup, remove
+`<state_dir>/.migration-from-tmp-done` and restart the daemon.

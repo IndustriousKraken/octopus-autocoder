@@ -882,18 +882,19 @@ impl Executor for ClaudeCliExecutor {
 }
 
 /// Compute the per-change run-log path:
-/// `<system-temp>/autocoder/logs/<workspace-basename>/<change>.log`.
-/// Unified under `<system-temp>/autocoder/` alongside the busy-marker
-/// directory so operators have a single place to look for per-repo
-/// runtime state.
+/// `<logs_dir>/runs/<repo-sanitized>/<change>.log`. The repo-sanitized
+/// fragment is the workspace's basename, which is already the
+/// URL-sanitized form produced by `workspace::derive_path`; this keeps
+/// the per-repo subdirectory consistent with the workspace's own
+/// naming.
 pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    std::env::temp_dir()
-        .join("autocoder")
-        .join("logs")
+    crate::paths::current()
+        .logs
+        .join("runs")
         .join(basename)
         .join(format!("{change}.log"))
 }
@@ -1442,19 +1443,20 @@ mod tests {
         assert!(body.contains("hello-err"), "stderr text missing in:\n{body}");
     }
 
-    /// Run-log path layout: `<temp>/autocoder/logs/<workspace-basename>/<change>.log`.
-    /// All segments must be present so per-workspace and per-change
-    /// inspection is possible, and so the logs sit under the unified
-    /// `autocoder/` root alongside the busy-marker directory.
+    /// Run-log path layout: `<logs_dir>/runs/<repo-sanitized>/<change>.log`.
+    /// All segments must be present so per-repo and per-change
+    /// inspection is possible.
     #[tokio::test]
-    async fn run_log_path_is_under_workspace_basename_and_change_name() {
+    async fn run_log_path_is_under_repo_sanitized_and_change_name() {
         let (_dir, ws) = fixture_workspace_with_git();
         let path = run_log_path(&ws, "my-change");
         let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
         let s = path.to_string_lossy();
-        assert!(s.contains("autocoder/logs/") || s.contains("autocoder\\logs\\"),
-            "path missing autocoder/logs/: {s}");
-        assert!(s.contains(&*basename), "path missing workspace basename `{basename}`: {s}");
+        assert!(
+            s.contains("/runs/") || s.contains("\\runs\\"),
+            "path missing /runs/ segment: {s}"
+        );
+        assert!(s.contains(&*basename), "path missing repo-sanitized `{basename}`: {s}");
         assert!(s.ends_with("my-change.log"), "path missing change name: {s}");
     }
 

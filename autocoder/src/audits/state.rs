@@ -1,8 +1,18 @@
-//! Per-workspace state for the periodic-audit framework.
+//! Persistent state for the periodic-audit framework.
 //!
-//! Lives at `<workspace>/.audit-state.json`. The file is autocoder
-//! bookkeeping and is registered in `.git/info/exclude` at workspace
-//! init time (see [`workspace::ensure_initialized`]).
+//! In production, state lives per-audit-type at
+//! `<state_dir>/audit-state/<audit-type>.json`. Each file holds the
+//! entries for that audit-type across every repository whose workspace
+//! has ever ran the audit, keyed by the repo-sanitized fragment (the
+//! workspace's basename). A daemon restart populates the in-memory map
+//! by [`reload_from_disk`] before any cadence check fires, so audits
+//! whose cadence has not elapsed do NOT re-fire after a restart.
+//!
+//! In tests where the daemon-paths global has not been installed, the
+//! module falls back to the legacy per-workspace `.audit-state.json`
+//! file at the workspace root. Preserves pre-`DaemonPaths` test-fixture
+//! expectations without forcing every test to install paths
+//! explicitly.
 //!
 //! Distinct from `.alert-state.json` by design: audits run on N-day
 //! cadences while alerts throttle on 24h windows; the two schemas have
@@ -68,6 +78,86 @@ pub struct AuditState {
 
 fn audit_state_path(workspace: &Path) -> PathBuf {
     workspace.join(AUDIT_STATE_FILE)
+}
+
+/// Per-audit-type file path under `<state_dir>/audit-state/`. The file
+/// holds entries for every workspace that has run the audit, keyed by
+/// repo-sanitized fragment.
+#[allow(dead_code)]
+pub fn per_audit_type_path(state_dir: &Path, audit_type: &str) -> PathBuf {
+    state_dir.join("audit-state").join(format!("{audit_type}.json"))
+}
+
+/// Reload all per-audit-type state files from `<state_dir>/audit-state/`
+/// into an in-memory map keyed by audit-type. Walks the directory,
+/// parses every `<audit-type>.json` it finds via the existing
+/// [`AuditState`] serde derive, and returns the populated map.
+///
+/// Parse failures on individual files are logged at WARN and skipped
+/// (that audit treats as "never run" — the existing first-run
+/// fallback); other audits' state continues to load normally. A
+/// missing or unreadable directory returns an empty map without an
+/// error.
+///
+/// Called at daemon start, BEFORE any audit cadence check fires, so
+/// the in-memory map is populated and the cadence resolver sees
+/// preserved `last_run_at` timestamps from prior runs.
+pub fn reload_from_disk(state_dir: &Path) -> Result<HashMap<String, AuditState>> {
+    let dir = state_dir.join("audit-state");
+    let mut map: HashMap<String, AuditState> = HashMap::new();
+    let read = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(map),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                "audit-state reload: read_dir failed; treating as empty: {e}"
+            );
+            return Ok(map);
+        }
+    };
+    for entry in read {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "audit-state reload: read_dir entry error: {e}"
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let audit_type = match name.strip_suffix(".json") {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    audit_type,
+                    "audit-state reload: read failed (audit treats as first-run): {e}"
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<AuditState>(&raw) {
+            Ok(state) => {
+                map.insert(audit_type, state);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    audit_type,
+                    "audit-state file is corrupt; audit treats as first-run: {e:#}"
+                );
+            }
+        }
+    }
+    Ok(map)
 }
 
 impl AuditState {
@@ -264,6 +354,85 @@ mod tests {
         assert!(excerpt.ends_with('…'), "excerpt must end with ellipsis: {excerpt}");
         assert!(
             excerpt.chars().count() <= crate::audits::VALIDATION_ERROR_HISTORY_EXCERPT + 1
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_empty_returns_empty_map() {
+        let dir = TempDir::new().unwrap();
+        let map = reload_from_disk(dir.path()).unwrap();
+        assert!(map.is_empty(), "no audit-state dir → empty map");
+    }
+
+    #[test]
+    fn reload_from_disk_populates_map_from_per_audit_type_files() {
+        let dir = TempDir::new().unwrap();
+        let audit_dir = dir.path().join("audit-state");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let now = Utc::now();
+        // Three valid audit-type files.
+        for at in ["a1", "a2", "a3"] {
+            let mut s = AuditState::default();
+            s.record(
+                at,
+                AuditRunEntry {
+                    last_run_at: now,
+                    last_run_sha: Some(format!("sha-{at}")),
+                    last_outcome: AuditOutcomeKind::NoFindings,
+                },
+            );
+            let raw = serde_json::to_string_pretty(&s).unwrap();
+            std::fs::write(audit_dir.join(format!("{at}.json")), raw).unwrap();
+        }
+        let map = reload_from_disk(dir.path()).unwrap();
+        assert_eq!(map.len(), 3);
+        for at in ["a1", "a2", "a3"] {
+            let entry = map
+                .get(at)
+                .unwrap_or_else(|| panic!("audit-type `{at}` missing from map"));
+            assert!(
+                entry.runs.contains_key(at),
+                "loaded state for `{at}` must contain its own run entry"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_from_disk_skips_corrupt_files_and_loads_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let audit_dir = dir.path().join("audit-state");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        // Two valid + one corrupt.
+        for at in ["valid_a", "valid_b"] {
+            let mut s = AuditState::default();
+            s.record(
+                at,
+                AuditRunEntry {
+                    last_run_at: Utc::now(),
+                    last_run_sha: None,
+                    last_outcome: AuditOutcomeKind::NoFindings,
+                },
+            );
+            std::fs::write(
+                audit_dir.join(format!("{at}.json")),
+                serde_json::to_string_pretty(&s).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(audit_dir.join("corrupt.json"), "{not json").unwrap();
+        let map = reload_from_disk(dir.path()).unwrap();
+        assert!(map.contains_key("valid_a"));
+        assert!(map.contains_key("valid_b"));
+        assert!(!map.contains_key("corrupt"),
+            "corrupt audit-type must be skipped (treats as first-run)");
+    }
+
+    #[test]
+    fn per_audit_type_path_layout() {
+        let p = per_audit_type_path(Path::new("/var/lib/autocoder"), "drift_audit");
+        assert_eq!(
+            p,
+            PathBuf::from("/var/lib/autocoder/audit-state/drift_audit.json")
         );
     }
 

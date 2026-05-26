@@ -6560,10 +6560,13 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
-        // .failure-state.json must NOT have been written.
+        // The per-repo failure-state must remain empty — a transient
+        // pre-executor error must not bump the counter.
+        let state = failure_state::load(&ws).unwrap();
         assert!(
-            !ws.join(".failure-state.json").exists(),
-            "transient pre-executor errors must not bump the counter"
+            state.entries.is_empty(),
+            "transient pre-executor errors must not bump the counter; got: {:?}",
+            state.entries
         );
     }
 
@@ -6942,18 +6945,14 @@ mod tests {
         assert!(
             ws.join("openspec/changes/no-counter-bump/.needs-spec-revision.json").exists()
         );
-        // failure-state.json must NOT have an entry for this change (or
-        // the file must not exist at all). The marker handles exclusion;
-        // the counter is operator-action territory, not repeat-failure
-        // territory.
-        let counter_file = ws.join(".failure-state.json");
-        if counter_file.exists() {
-            let state = failure_state::load(&ws).unwrap();
-            assert!(
-                !state.entries.contains_key("no-counter-bump"),
-                "SpecNeedsRevision must not write a failure-state entry"
-            );
-        }
+        // failure-state must NOT have an entry for this change. The
+        // marker handles exclusion; the counter is operator-action
+        // territory, not repeat-failure territory.
+        let state = failure_state::load(&ws).unwrap();
+        assert!(
+            !state.entries.contains_key("no-counter-bump"),
+            "SpecNeedsRevision must not write a failure-state entry"
+        );
     }
 
     /// Pre-place a marker → change is excluded from list_pending → the
@@ -7535,9 +7534,11 @@ mod tests {
             "untouched ch04 still pending: {still_pending:?}"
         );
         // ch03 must not have a failure-state entry — it was never attempted.
+        let state = failure_state::load(&ws).unwrap();
         assert!(
-            !ws.join("openspec/changes/ch03/.failure-state.json").exists(),
-            "ch03 must not have a failure-state entry — walker never reached it"
+            !state.entries.contains_key("ch03"),
+            "ch03 must not have a failure-state entry — walker never reached it; got: {:?}",
+            state.entries
         );
     }
 
