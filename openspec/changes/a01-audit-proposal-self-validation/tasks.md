@@ -119,10 +119,10 @@
 
 ## 9. Spec delta
 
-- [ ] 9.1 The ADDED requirement in `openspec/changes/audit-proposal-self-validation/specs/orchestrator-cli/spec.md` codifies: the post-write validation obligation, the retry loop semantics (including the validation-error addendum on retry attempts), the discard-and-notify path on exhaustion, the chatops notification rules for both the success-with-retry and the validation-exhausted cases, the config field, and the audit-state history extension.
+- [ ] 9.1 The ADDED requirement in `openspec/changes/a01-audit-proposal-self-validation/specs/orchestrator-cli/spec.md` codifies: the post-write validation obligation, the retry loop semantics (including the validation-error addendum on retry attempts), the discard-and-notify path on exhaustion, the chatops notification rules for both the success-with-retry and the validation-exhausted cases, the config field, and the audit-state history extension.
 
 ## 10. Verification
 
 - [ ] 10.1 `cargo test` passes (new + existing).
-- [ ] 10.2 `openspec validate audit-proposal-self-validation --strict` passes.
+- [ ] 10.2 `openspec validate a01-audit-proposal-self-validation --strict` passes.
 - [ ] 10.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings.

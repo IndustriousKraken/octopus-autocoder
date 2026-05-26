@@ -15,7 +15,7 @@ Every LLM-driven audit (`architecture_consultative`, `drift_audit`, `missing_tes
 #### Scenario: ValidationExhausted does NOT fire the proposal-created notification
 - **WHEN** an LLM-driven audit's proposal fails validation through every retry and the audit returns `ValidationExhausted`
 - **THEN** the `🔍 created proposal` notification SHALL NOT fire
-- **AND** the existing `❌ <audit-type> produced an invalid proposal` notification (from `audit-proposal-self-validation`) fires instead
+- **AND** the existing `❌ <audit-type> produced an invalid proposal` notification (from `a01-audit-proposal-self-validation`) fires instead
 
 #### Scenario: notify_on_clean=false does not suppress this notification
 - **WHEN** an LLM-driven audit configured with `notify_on_clean: false` produces a valid proposal

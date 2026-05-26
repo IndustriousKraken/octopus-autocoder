@@ -4,7 +4,7 @@ When an LLM-driven audit creates a change proposal, that proposal enters the pol
 
 A real-world example: an operator observed the daemon begin implementing `secure-bound-arp-step-count` and only inferred from the `secure-` prefix that the security audit had generated the proposal. With no notification at proposal-creation time, there was no signal in the channel pointing at the audit. The operator had to reverse-engineer the chain.
 
-A dedicated "audit produced proposal" notification closes that gap. Fired right after the proposal validates successfully (the existing `Reported` outcome of the just-specced `audit-proposal-self-validation`), it tells operators in one line: which audit ran, which change was created, and a one-line summary of the finding. The next chatops message they see about that change — the existing `🚀 starting work on ...` — then has obvious context.
+A dedicated "audit produced proposal" notification closes that gap. Fired right after the proposal validates successfully (the existing `Reported` outcome of the just-specced `a01-audit-proposal-self-validation`), it tells operators in one line: which audit ran, which change was created, and a one-line summary of the finding. The next chatops message they see about that change — the existing `🚀 starting work on ...` — then has obvious context.
 
 ## What Changes
 
@@ -32,9 +32,9 @@ Fires for every LLM-driven audit type (`architecture_consultative`, `drift_audit
 
 Step 3 is the new one; everything else is unchanged.
 
-**Retry-count clause.** When `retries_used > 0`, the notification text includes a parenthetical: `— <summary> (validated on retry <N> of <max>)`. Same wording the `audit-proposal-self-validation` spec uses for the success-with-retry log line, but in the channel-visible notification rather than only the daemon's internal log. Operators see "the audit's first attempt was invalid; the retry succeeded" alongside the success itself.
+**Retry-count clause.** When `retries_used > 0`, the notification text includes a parenthetical: `— <summary> (validated on retry <N> of <max>)`. Same wording the `a01-audit-proposal-self-validation` spec uses for the success-with-retry log line, but in the channel-visible notification rather than only the daemon's internal log. Operators see "the audit's first attempt was invalid; the retry succeeded" alongside the success itself.
 
-**No notification when the audit returns `ValidationExhausted`.** That case is covered by the existing `❌ <audit-type> produced an invalid proposal` notification from `audit-proposal-self-validation`. The `🔍 created proposal` notification is the success path counterpart.
+**No notification when the audit returns `ValidationExhausted`.** That case is covered by the existing `❌ <audit-type> produced an invalid proposal` notification from `a01-audit-proposal-self-validation`. The `🔍 created proposal` notification is the success path counterpart.
 
 ## Impact
 
@@ -46,7 +46,7 @@ Step 3 is the new one; everything else is unchanged.
     - Helper unit test: given an `audit_type`, `change_slug`, `retries_used`, `why_excerpt`, the helper formats the documented `🔍` text. With `retries_used == 0` no parenthetical; with `retries_used > 0` the parenthetical is included.
     - Integration tests per audit type: stub the LLM to return a valid proposal; assert one `post_notification` call with the documented shape; assert the helper fires AFTER `validate_with_retry` returns Ok AND BEFORE the audit returns.
     - `architecture_brightline` integration test: assert NO `post_notification` call fires from that audit's success path (the brightline audit does not generate LLM proposals).
-    - `ValidationExhausted` integration test: assert the `🔍` notification does NOT fire when the audit returns `ValidationExhausted` (the `❌` notification fires instead, per `audit-proposal-self-validation`).
+    - `ValidationExhausted` integration test: assert the `🔍` notification does NOT fire when the audit returns `ValidationExhausted` (the `❌` notification fires instead, per `a01-audit-proposal-self-validation`).
 
 - **Operator-visible behavior:** every time an LLM-driven audit produces a queue-bound change proposal, operators see one `🔍` chatops message naming the audit and the change. Subsequent `🚀 starting work on ...` messages for that change have a clear provenance line in the recent channel history.
 - **Breaking:** no. Pure addition. Operators on the chatops channel see slightly more traffic (one extra message per audit-generated change). Sites that find this too noisy can disable LLM-driven audits or set their cadences to less frequent values; there is no per-notification suppression flag for the `🔍` since it is the inverse of `notify_on_clean` (the latter suppresses no-findings messages; suppressing findings messages would defeat the purpose).

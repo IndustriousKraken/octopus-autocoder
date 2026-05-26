@@ -24,7 +24,7 @@
 - [ ] 2.6 Tests per audit type:
   - Stub LLM returns valid proposal AND chatops backend captures `post_notification`: assert one `🔍` notification fires with the correct audit_type, slug, and why excerpt.
   - Stub LLM returns valid proposal after 1 retry: assert the notification's parenthetical contains `(validated on retry 1 of <max>)`.
-  - Stub LLM returns `ValidationExhausted`: assert NO `🔍` notification fires (the `❌` notification from `audit-proposal-self-validation` fires instead; this test doubles as a regression guard against double-notification).
+  - Stub LLM returns `ValidationExhausted`: assert NO `🔍` notification fires (the `❌` notification from `a01-audit-proposal-self-validation` fires instead; this test doubles as a regression guard against double-notification).
   - `architecture_brightline` runs to success with non-empty findings: assert NO `🔍` notification fires.
 
 ## 3. Order: notification fires before scheduler commits the proposal
@@ -39,10 +39,10 @@
 
 ## 5. Spec delta
 
-- [ ] 5.1 The ADDED requirement in `openspec/changes/audit-proposal-created-notification/specs/orchestrator-cli/spec.md` codifies: the fire point (after `validate_with_retry` Ok, before audit return), the notification text format including the optional retry-count parenthetical, the always-fires rule (not gated by `notify_on_clean`), the architecture_brightline carve-out, and the ValidationExhausted-does-not-fire-this rule.
+- [ ] 5.1 The ADDED requirement in `openspec/changes/a02-audit-proposal-created-notification/specs/orchestrator-cli/spec.md` codifies: the fire point (after `validate_with_retry` Ok, before audit return), the notification text format including the optional retry-count parenthetical, the always-fires rule (not gated by `notify_on_clean`), the architecture_brightline carve-out, and the ValidationExhausted-does-not-fire-this rule.
 
 ## 6. Verification
 
 - [ ] 6.1 `cargo test` passes (new + existing).
-- [ ] 6.2 `openspec validate audit-proposal-created-notification --strict` passes.
+- [ ] 6.2 `openspec validate a02-audit-proposal-created-notification --strict` passes.
 - [ ] 6.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings.
