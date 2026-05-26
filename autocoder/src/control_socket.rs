@@ -72,6 +72,15 @@ pub struct RepoTaskHandle {
     /// handler pushes here when an operator posts `@<bot> send it`; the
     /// polling loop drains the queue at the start of each iteration.
     pub pending_triages: Arc<Mutex<Vec<String>>>,
+    /// Queue of audit-type names awaiting on-demand execution
+    /// (`chatops-on-demand-audit-trigger`). The chatops `audit` verb and
+    /// the CLI `audit run` subcommand push canonical audit-type names
+    /// onto this list via the `queue_audit` control-socket action; the
+    /// polling loop drains it at the start of each iteration's audit
+    /// phase and runs each one unconditionally (bypassing cadence). The
+    /// queue is de-duplicated on insert so multiple `audit` commands
+    /// before a single iteration collapse to one run.
+    pub pending_audit_runs: Arc<Mutex<Vec<String>>>,
 }
 
 /// Daemon-level task registry keyed by repository URL. Mutated only by
@@ -271,6 +280,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "wipe_workspace" => handle_wipe_workspace(&parsed, state),
         "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
         "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
+        "queue_audit" => handle_queue_audit(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -288,6 +298,47 @@ fn find_repo(state: &ControlState, url_arg: &str) -> std::result::Result<Reposit
         .find(|r| r.url == url_arg)
         .cloned()
         .ok_or_else(|| format!("no repository configured with url `{url_arg}`"))
+}
+
+/// Look up the configured repository whose resolved workspace path
+/// matches `target` (after canonicalisation when both paths exist). Used
+/// by the `queue_audit` action's CLI path so an operator can pass
+/// `--workspace <path>` instead of the upstream URL.
+fn find_repo_by_workspace(state: &ControlState, target: &Path) -> Option<String> {
+    let cfg = state.last_config.load_full();
+    let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    for repo in cfg.repositories.iter() {
+        let ws = workspace::resolve_path(repo);
+        if ws == target {
+            return Some(repo.url.clone());
+        }
+        let ws_canon = std::fs::canonicalize(&ws).unwrap_or_else(|_| ws);
+        if ws_canon == target_canon {
+            return Some(repo.url.clone());
+        }
+    }
+    None
+}
+
+/// Render the comma-separated list of `url@workspace_path` pairs the
+/// daemon is currently managing. Used in error replies so the operator
+/// sees their configured repos.
+fn managed_repo_list_for_error(state: &ControlState) -> String {
+    let cfg = state.last_config.load_full();
+    if cfg.repositories.is_empty() {
+        return "(none)".to_string();
+    }
+    cfg.repositories
+        .iter()
+        .map(|r| {
+            format!(
+                "`{}` @ `{}`",
+                r.url,
+                workspace::resolve_path(r).display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn require_str(parsed: &Value, field: &str) -> std::result::Result<String, String> {
@@ -800,6 +851,75 @@ async fn handle_trigger_audit_action(parsed: &Value, state: &ControlState) -> Va
     })
 }
 
+/// Append `audit_type` to the named repo's `pending_audit_runs` queue
+/// so the next polling iteration's audit phase runs it unconditionally
+/// (bypassing cadence). De-duplicated: appending a value already in the
+/// queue is a no-op (the response still reports success). The request
+/// identifies the repo by `url` (chatops verb path) OR by `workspace`
+/// (CLI `audit run` path — the daemon does the workspace-to-URL
+/// resolution against its configured repo list). The response echoes
+/// the canonical `audit_type` and resolved `url` so the chatops/CLI
+/// caller can build an ack with the daemon's authoritative names;
+/// `poll_interval_sec` lets the caller compute the ETA clause.
+fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
+    let audit_type = match require_str(parsed, "audit_type") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    // Resolve target URL: explicit `url` wins; otherwise look up by
+    // `workspace` path (matched against each configured repo's
+    // `workspace::resolve_path`).
+    let url = if let Some(u) = parsed.get("url").and_then(|v| v.as_str()) {
+        u.to_string()
+    } else if let Some(ws) = parsed.get("workspace").and_then(|v| v.as_str()) {
+        match find_repo_by_workspace(state, std::path::Path::new(ws)) {
+            Some(u) => u,
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": format!(
+                        "no managed repository found for workspace path `{ws}`; the daemon is managing: {}",
+                        managed_repo_list_for_error(state)
+                    ),
+                });
+            }
+        }
+    } else {
+        return json!({"ok": false, "error": "missing `url` or `workspace` field"});
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_audit_runs.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|a| a == &audit_type) {
+            g.push(audit_type.clone());
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "audit_type": audit_type,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1144,6 +1264,7 @@ mod tests {
                     join,
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
+                    pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                 },
             );
             drop(guard);
@@ -2160,6 +2281,7 @@ github:
                     join: parked,
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
+                    pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                 },
             );
         }
@@ -2200,6 +2322,113 @@ github:
                 h.join.abort();
             }
         }
+        cancel.cancel();
+    }
+
+    // ---------- queue_audit (chatops-on-demand-audit-trigger) ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_audit_appends_to_pending_audit_runs() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = serde_json::json!({
+            "action": "queue_audit",
+            "url": "git@github.com:owner/repo.git",
+            "audit_type": "security_bug_audit",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["audit_type"], "security_bug_audit");
+        assert_eq!(resp["url"], "git@github.com:owner/repo.git");
+        assert!(resp["poll_interval_sec"].is_u64(), "poll interval echoed: {resp}");
+
+        // The handle's queue now contains the audit-type name.
+        let guard = state.repo_tasks.lock().unwrap();
+        let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
+        let q = handle.pending_audit_runs.lock().unwrap();
+        assert_eq!(*q, vec!["security_bug_audit".to_string()]);
+        drop(q);
+        drop(guard);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_audit_is_deduplicated_per_repo() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = serde_json::json!({
+            "action": "queue_audit",
+            "url": "git@github.com:owner/repo.git",
+            "audit_type": "security_bug_audit",
+        });
+        // First submit.
+        let resp1 = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp1["ok"], serde_json::Value::Bool(true));
+        // Second submit with the same audit_type → success but no
+        // duplicate entry.
+        let resp2 = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true));
+
+        let guard = state.repo_tasks.lock().unwrap();
+        let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
+        let q = handle.pending_audit_runs.lock().unwrap();
+        assert_eq!(
+            *q,
+            vec!["security_bug_audit".to_string()],
+            "duplicate audit_type must collapse to one entry"
+        );
+        drop(q);
+        drop(guard);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_audit_distinct_types_both_recorded() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        for at in ["security_bug_audit", "drift_audit"] {
+            let req = serde_json::json!({
+                "action": "queue_audit",
+                "url": "git@github.com:owner/repo.git",
+                "audit_type": at,
+            });
+            let resp = send_request(&socket, &req.to_string()).await;
+            assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        }
+        let guard = state.repo_tasks.lock().unwrap();
+        let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
+        let q = handle.pending_audit_runs.lock().unwrap();
+        assert!(q.contains(&"security_bug_audit".to_string()));
+        assert!(q.contains(&"drift_audit".to_string()));
+        assert_eq!(q.len(), 2);
+        drop(q);
+        drop(guard);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_audit_unknown_url_returns_error() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = serde_json::json!({
+            "action": "queue_audit",
+            "url": "git@github.com:owner/UNKNOWN.git",
+            "audit_type": "security_bug_audit",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("no repository configured"), "got: {err}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_audit_missing_audit_type_field_returns_error() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = serde_json::json!({
+            "action": "queue_audit",
+            "url": "git@github.com:owner/repo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("audit_type"), "got: {err}");
         cancel.cancel();
     }
 }

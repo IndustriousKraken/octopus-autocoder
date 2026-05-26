@@ -255,6 +255,7 @@ The bot recognises:
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
+| `audit` | `@<bot> audit <audit-substring> <repo-substring>` | Queues an on-demand audit run for the next polling iteration, bypassing the audit's configured cadence. Audit-substring is matched case-insensitively against the registered audit-type names (same rule the repo-substring uses). Unique match in both → ack with the canonical names and an ETA derived from the repo's `poll_interval_sec`. Ambiguous audit substring → the bot lists the matching candidates. No match → the bot lists every registered audit type. See [On-demand audit triggers](OPERATIONS.md#on-demand-audit-triggers). |
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](CHATOPS.md#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](CHATOPS.md#what-gets-posted) recovery uses, deleted via a chat reply instead.
@@ -275,6 +276,20 @@ The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of
 ```
 
 If any individual repo's state cannot be assembled (workspace mid-failure, control-socket per-repo error), that repository's section renders `(unavailable: <error excerpt>)` in place of the summary line. The menu still ships every other repository's section so a single broken workspace doesn't blank the whole list. From the menu, pick a repo and re-issue `@<bot> status <substring>` for the full per-repo detail.
+
+**`audit` — on-demand audit trigger.** Use this when you want an audit to run right now instead of waiting for its configured cadence. The verb takes two substring arguments: the audit-type substring (e.g. `sec` → `security_bug_audit`) and the repo substring. Both follow the same case-insensitive substring-matching rule as every other verb. Example:
+
+```
+@<bot> audit sec myrepo
+```
+
+becomes:
+
+```
+✓ Queued security_bug_audit for git@github.com:acme/myrepo.git. Will run on the next polling iteration (~5m).
+```
+
+The ETA is `~Nm` where `N` is `poll_interval_sec` rounded to minutes, or `imminently` when the next iteration is <30 seconds away. Queuing the same audit twice before the iteration fires collapses to a single run. Queued audits update the audit's cadence state on success, so the next scheduled fire moves forward by the cadence interval — an on-demand run "consumes" one cycle of the cadence. See [On-demand audit triggers](OPERATIONS.md#on-demand-audit-triggers) for the cadence-interaction details and the CLI variant.
 
 ### Setup (Slack)
 

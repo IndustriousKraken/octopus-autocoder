@@ -80,6 +80,7 @@ pub async fn run(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
     cancel: CancellationToken,
 ) {
     run_with_hooks(
@@ -99,6 +100,7 @@ pub async fn run(
         audit_settings,
         pending_rebuild,
         pending_triages,
+        pending_audit_runs,
         cancel,
         RunHooks::default(),
     )
@@ -137,6 +139,7 @@ pub async fn run_with_hooks(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
     cancel: CancellationToken,
     hooks: RunHooks,
 ) {
@@ -229,6 +232,18 @@ pub async fn run_with_hooks(
             ),
         }
 
+        // Drain the per-repo on-demand audit-run queue
+        // (chatops-on-demand-audit-trigger). The HashSet collapses any
+        // duplicates that survived the control-socket-level de-dup
+        // (defence in depth) so the same audit cannot run twice in one
+        // iteration. The queue is emptied unconditionally even when an
+        // entry is unknown to the registry — leaving it would cause the
+        // unknown name to be re-warned every iteration forever.
+        let queued_audit_types: std::collections::HashSet<String> = {
+            let mut g = pending_audit_runs.lock().unwrap();
+            std::mem::take(&mut *g).into_iter().collect()
+        };
+
         // Drain the per-repo triage queue (audit-reply-acts `send it`).
         // Triage runs BEFORE the rebuild check and the pending-change
         // walk so an operator's `send it` always gets attention this
@@ -286,6 +301,7 @@ pub async fn run_with_hooks(
             audit_registry.as_ref(),
             audits_cfg.as_deref(),
             audit_settings.as_ref(),
+            &queued_audit_types,
         )
         .await
         {
@@ -390,6 +406,7 @@ pub async fn execute_one_pass(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
+    queued_audit_types: &std::collections::HashSet<String>,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
@@ -466,6 +483,7 @@ pub async fn execute_one_pass(
         audit_registry,
         audits_cfg,
         audit_settings,
+        queued_audit_types,
     )
     .await?;
     if processed.is_empty() {
@@ -702,6 +720,7 @@ fn locate_archive_dir(archive_root: &Path, change: &str) -> Result<Option<std::p
 /// The caller (production: `execute_one_pass`) is responsible for the
 /// remote-side work; tests use this directly to verify commit-formation
 /// behavior without needing a live GitHub endpoint or a writable remote.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pass_through_commits(
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -713,6 +732,7 @@ pub async fn run_pass_through_commits(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
+    queued_audit_types: &std::collections::HashSet<String>,
 ) -> Result<(Vec<String>, bool)> {
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
@@ -847,6 +867,7 @@ pub async fn run_pass_through_commits(
         audits_cfg,
         audit_settings,
         chatops_ctx,
+        queued_audit_types,
     )
     .await
     {
@@ -4131,7 +4152,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
             )
             .await?;
         Ok(processed)
@@ -4410,7 +4431,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4513,7 +4534,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4629,7 +4650,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4766,7 +4787,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds without running pending");
@@ -4881,7 +4902,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5015,7 +5036,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5135,7 +5156,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
             )
             .await
             .expect("commits step succeeds");
@@ -5355,6 +5376,7 @@ mod tests {
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_for_task,
             )
             .await;
@@ -5471,6 +5493,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_for_task,
                 hooks,
@@ -5682,7 +5705,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5734,7 +5757,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5837,7 +5860,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -5936,7 +5959,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -6196,7 +6219,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await?;
         Ok(processed)
@@ -6373,7 +6396,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
@@ -6464,6 +6487,7 @@ mod tests {
             &registry,
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -6526,7 +6550,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -6595,7 +6619,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         alert_mock.assert_async().await;
@@ -6699,6 +6723,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -6985,7 +7010,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("self-heal pass succeeds");
@@ -7060,7 +7085,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
@@ -7122,7 +7147,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
@@ -7209,7 +7234,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7256,7 +7281,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7325,7 +7350,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7430,7 +7455,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7479,7 +7504,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7517,7 +7542,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7620,6 +7645,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -7705,6 +7731,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "recovery failure must surface as Err");
@@ -7764,6 +7791,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_ok(), "iteration should succeed: {result:?}");
@@ -8636,7 +8664,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -8801,6 +8829,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 task_cancel,
             )
@@ -9206,6 +9235,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("iteration should complete Ok with the change excluded");
@@ -9307,6 +9337,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("iteration should succeed");
@@ -9376,6 +9407,7 @@ mod tests {
                 &crate::audits::AuditRegistry::default(),
                 None,
                 &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("iteration succeeds");
@@ -9464,6 +9496,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -9542,6 +9575,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "iteration must surface the recovery failure");

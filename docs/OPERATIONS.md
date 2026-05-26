@@ -361,6 +361,20 @@ The polling iteration also gates the entire audit scheduler on `ensure_initializ
 
 Both triage-spawned PRs are normal autocoder-opened PRs that participate in the existing PR-comment revision loop (see [Revising an open PR via comment](#revising-an-open-pr-via-comment) below). If the agent over-promoted a finding to a spec or under-fixed by missing something obvious, `@<bot> revise <text>` on either PR gets revisions through the standard channel — the same channel the spec-driven workflow uses for correcting any other autocoder-opened PR.
 
+### On-demand audit triggers
+
+Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, which suits steady-state operation but not the production-readiness workflow ("run an architecture audit now, fix what it surfaces, run a security audit now, iterate"). On-demand triggers complement the cadence: a `@<bot> audit <substring> <repo>` chatops verb (see [CHATOPS.md → ChatOps operator commands](CHATOPS.md#chatops-operator-commands)) and an `autocoder audit run --workspace <path> --audit <name>` CLI subcommand (see [CLI Reference → audit run](CLI.md#audit-run)) both append an audit-type to a per-repo `pending_audit_runs` queue. At the start of each polling iteration's audit phase, the scheduler drains the queue and runs each queued audit unconditionally — cadence and `requires_head_change` are bypassed for queued runs. After the queued runs, the cadence-driven sweep proceeds normally, skipping any audit that already ran via the queue this iteration so the same audit cannot run twice in one pass.
+
+**Cadence interaction rule.** A queued audit's `last_run_at` state is updated on success, so the next cadence-scheduled fire shifts forward by the cadence interval from the on-demand timestamp. Concretely: if `security_bug_audit` is configured `monthly` and an operator triggers it on-demand today, the next cadence-driven fire is one month from today (not one month from the original schedule). The trade-off favors not double-running audits soon after an on-demand fire; operators who want to bypass cadence entirely can keep triggering on-demand.
+
+**De-duplication.** If the same audit-type appears in `pending_audit_runs` more than once before a single iteration fires (operator typo, double-click on a chatops command), the duplicate entries collapse to one run. The audit fires once per iteration, not once per queue entry.
+
+**Audits configured with `cadence: disabled` can still be triggered on-demand.** The on-demand path is independent of the cadence machinery; an operator who configured an audit `disabled` can still run it ad-hoc via chatops or CLI without changing the YAML. The audit's `last_run_at` is still updated, but with no cadence interval the "next scheduled fire" remains in the past — the audit stays effectively disabled for cadence-driven scheduling.
+
+**ETA in the bot ack.** The chatops verb's reply names the resolved audit-type, the repo URL, and an ETA derived from the repo's `poll_interval_sec` (`~Nm` rounded to minutes). When the daemon reports `seconds_until_next_iteration < 30`, the ETA reads `imminently` instead.
+
+**Standalone CLI mode.** When no daemon is running, `autocoder audit run` invokes the audit module directly against the named workspace and prints findings to stdout. This bypasses the daemon's scheduler entirely (no `pending_audit_runs` queue is involved) and is intended for prompt-template iteration during audit-prompt development — edit `prompts/<audit>.md`, run the CLI, observe, iterate.
+
 ## Recovering from a bad run
 
 The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](CLI.md#rewind) below.
