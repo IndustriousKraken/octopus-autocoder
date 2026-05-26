@@ -212,11 +212,60 @@ workspace state via `fs::create_dir_all` that future iterations would
 mistake for a real but broken clone.
 
 **What to do.** Fix the workspace-init issue the upstream alert
-identifies — usually re-clone manually OR wait for the next iteration's
-`ensure_initialized` to re-clone automatically. Once the workspace is
-back to a valid state, the audit will run on its next cadence (the
-skipped run did not consume cadence, so the next due window is
-unchanged). No special re-trigger is needed.
+identifies. The partial-clone case (`exists but no .git/`) is now
+self-healing — `ensure_initialized` auto-deletes the partial directory
+and re-clones; see [OPERATIONS.md → Partial-clone self-heal](OPERATIONS.md#partial-clone-self-heal).
+For other causes (auth, network, missing remote), the underlying
+`workspace_init_failure` chatops alert names the real error. Once the
+workspace is back to a valid state, the audit will run on its next
+cadence (the skipped run did not consume cadence, so the next due
+window is unchanged). No special re-trigger is needed.
+
+## Workspace exists but has no `.git/` (partial-clone artifact)
+
+A previous clone attempt left the workspace directory created but
+without a `.git/` (network drop, transient auth blip, signal). The
+daemon now self-heals this case: each `ensure_initialized` pass runs a
+safety check, deletes the partial directory, and re-clones fresh. The
+journalctl signal is a single WARN per recovery:
+
+```
+WARN workspace=<path> repo=<url> workspace exists without .git; partial clone artifact detected. Deleting and re-cloning.
+```
+
+**You should NOT need to `rm -rf` the workspace manually for this
+case.** Wait one polling cycle; either the re-clone succeeds and the
+iteration proceeds normally, or the re-clone surfaces the REAL clone
+failure (`Permission denied (publickey)`, `Could not resolve host
+github.com`, etc.) in the next iteration's log and chatops alert. The
+real cause is what to fix.
+
+### When the safety check refuses auto-cleanup
+
+If you see the daemon return:
+
+```
+workspace path exists but is not a git repository (no .git directory): <path> (partial cleanup refused: <tripwire>; manual operator inspection required)
+```
+
+the safety check found one of these in the partial directory:
+
+- `.in-progress*` lock file at any depth.
+- `openspec/changes/<slug>/.perma-stuck.json` or `.needs-spec-revision.json` at any depth.
+- `openspec/changes/<slug>/.question.json` or `.answer.json` (AskUser markers).
+
+The daemon refuses to silently destroy operator-meaningful state.
+Inspect the directory manually:
+
+```bash
+ls -la <workspace>/
+find <workspace>/openspec/changes -name '.perma-stuck.json' -o -name '.needs-spec-revision.json' -o -name '.question.json' -o -name '.answer.json' -o -name '.in-progress*' 2>/dev/null
+```
+
+Then decide:
+
+1. **If the markers are stale** (the change they reference is long gone, or the markers were left over from a prior incident you've already resolved): `rm -rf <workspace>` manually. The next iteration re-clones fresh.
+2. **If the markers are legitimate operator state you want to preserve** (e.g. an active perma-stuck change you're working on, an AskUser thread you're waiting on): the partial-clone artifact is the symptom, not the disease. The underlying clone keeps failing — the `.git/` never gets written. Diagnose why (run `git clone <url> /tmp/probe-clone` by hand and read the error), fix that, then `rm -rf <workspace>` so the next iteration starts fresh.
 
 ## `send it` got a polite refusal — what each `✗` reply means
 
