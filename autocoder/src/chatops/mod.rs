@@ -92,6 +92,22 @@ pub trait ChatOpsBackend: Send + Sync {
     /// threading). Used for start-of-work and throttled failure alerts.
     async fn post_notification(&self, channel: &str, text: &str) -> Result<()>;
 
+    /// Post a notification whose body might be long enough to warrant
+    /// threading. Backends that support native threading (Slack) post
+    /// the `top_line` as the top-level message and `thread_body` as a
+    /// threaded reply. Backends without threading (default impl)
+    /// concatenate the two with a blank-line separator and post as a
+    /// single message via `post_notification`.
+    async fn post_notification_with_thread(
+        &self,
+        channel: &str,
+        top_line: &str,
+        thread_body: &str,
+    ) -> Result<()> {
+        let combined = format!("{top_line}\n\n{thread_body}");
+        self.post_notification(channel, &combined).await
+    }
+
     /// Post `text` as a threaded reply to the message at `(channel,
     /// thread_ts)`. Used by the inbound operator-commands listener so
     /// `Sync` replies stay grouped under the original `@bot <verb>`
@@ -553,6 +569,86 @@ mod tests {
         async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
             unreachable!()
         }
+    }
+
+    /// A `ChatOpsBackend` impl that records every `post_notification`
+    /// call. Used to verify the default `post_notification_with_thread`
+    /// degrades to a single `post_notification` call whose body holds
+    /// both the top line and the thread body.
+    struct CapturingBackend {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CapturingBackend {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatOpsBackend for CapturingBackend {
+        fn provider_name(&self) -> &'static str {
+            "capturing"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(
+            &self,
+            _channel: &str,
+            _change: &str,
+            _question: &str,
+        ) -> Result<String> {
+            unreachable!()
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _channel: &str,
+            _handle: &str,
+        ) -> Result<Option<HumanReply>> {
+            unreachable!()
+        }
+        async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_post_notification_with_thread_degrades_to_post_notification() {
+        let backend = CapturingBackend::new();
+        backend
+            .post_notification_with_thread("C_FAKE", "📐 top line", "line1\nline2\nline3")
+            .await
+            .unwrap();
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "default impl must result in exactly one post_notification call"
+        );
+        assert_eq!(calls[0].0, "C_FAKE");
+        // Body contains both halves separated by a blank line.
+        assert!(
+            calls[0].1.contains("📐 top line"),
+            "body must contain top_line: {}",
+            calls[0].1
+        );
+        assert!(
+            calls[0].1.contains("line1\nline2\nline3"),
+            "body must contain thread_body: {}",
+            calls[0].1
+        );
+        assert!(
+            calls[0].1.contains("\n\n"),
+            "default impl must insert a blank-line separator: {}",
+            calls[0].1
+        );
     }
 
     #[tokio::test]

@@ -99,6 +99,39 @@ when this notification is posted, the failure is logged at WARN and
 the audit's success outcome (proposal commit, queue insertion) is
 unaffected.
 
+**Audit-finding threaded notifications.** Audit results from the
+advisory audits (`architecture_brightline`, `drift_audit`) are posted
+as a **one-line top-level message** in the channel with the full
+findings carried in a **Slack thread reply** to that message. Channel
+watchers see a clean feed of summary lines; clicking into a thread
+surfaces the per-finding detail. Per-audit-type emoji conventions:
+
+- `📐 architecture_brightline on <repo-url>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+- `🧭 drift_audit on <repo-url>: <N> spec/code divergence(s) detected`
+- `📋 <audit-type> on <repo-url>: <N> finding(s)` — generic fallback for any
+  other `Reported`-outcome audit.
+- `✅ <audit-type> on <repo-url>: no findings` — uniform shape for clean
+  runs under `notify_on_clean=true`.
+
+The thread is only used when the findings body would actually benefit
+from one: more than 3 lines OR more than 300 characters. Shorter findings
+inline into a single message — a thread for a one-line bullet is more
+friction than value. Empty findings under `notify_on_clean=true` post
+the `✅` form inline (the body is empty; nothing to thread); under
+`notify_on_clean=false` no message is posted at all (existing
+behaviour).
+
+Slack's per-message limit is 40,000 characters. When the thread body
+would exceed 35,000 characters, it is truncated to 35,000 and ends with
+a pointer at the daemon log so operators can recover the full text:
+
+```
+… [truncated; full findings at journalctl -u autocoder | grep audit_id=<repo-sanitized>:<audit-type>:<utc-timestamp>]
+```
+
+The audit-runner stamps the same `audit_id` into its daemon-log entries
+for the same run.
+
 **Validation-exhausted audit notifications.** LLM-driven audits that
 generate OpenSpec change proposals run each proposal through
 `openspec validate --strict` before committing. When validation fails and
@@ -112,6 +145,12 @@ Final validation error:
 <truncated stderr, capped at 800 chars>
 No commit was made. The audit will retry on its next scheduled cadence.
 ```
+
+When the validation error is multi-line OR exceeds 300 characters, the
+notification routes through the same threaded path used for audit
+findings: the `❌` top-line lands in the channel and the `Final
+validation error: …` body lands in the thread reply. Single-line short
+errors continue to inline into a single message as shown above.
 
 This fires **regardless of `notify_on_clean`** — an audit producing
 invalid proposals is operator-actionable feedback that the audit's
@@ -328,6 +367,17 @@ Under the hood, the chatops listener parses the command, resolves the repository
 > **No API-stability guarantees.** Discord, Microsoft Teams, Mattermost, and Matrix are implemented behind the same `ChatOpsBackend` trait as Slack but are explicitly marked experimental: their unit tests pin only the request shape against recorded fixture responses (not live services), so an upstream API change can break them silently. Each emits a loud `warn`-level startup log line stating "EXPERIMENTAL — best-effort support, may break without notice." If you select one and it stops working, **please file a bug**; that is how the experimental backends move toward official support.
 >
 > Slack remains the only officially-supported provider. Single-process autocoder runs against exactly one chat backend at a time; if you live on multiple platforms, pick the most-used one.
+>
+> **Threaded audit notifications fall back to a single message.** The
+> [audit-finding threading pattern](CHATOPS.md#progress-notifications) is
+> native to Slack only. Experimental backends inherit the trait's
+> default `post_notification_with_thread` implementation, which
+> concatenates the top-line summary and the findings body into one
+> `post_notification` call separated by a blank line. The operator-visible
+> effect is the pre-threading behaviour: walls of text in the channel.
+> Per-backend native-threading overrides may be added in future
+> changes; today's experimental backends are unchanged by this trait
+> addition.
 
 ### Discord (representative walkthrough)
 
