@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod audit;
 pub mod install;
 pub mod reload;
 pub mod rewind;
@@ -19,6 +20,26 @@ pub mod sync_specs_deps;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditSubcommand {
+    /// Trigger an audit for a workspace. With the daemon running, the
+    /// CLI sends a `queue_audit` action via the control socket so the
+    /// next polling iteration runs the audit. Without the daemon, the
+    /// audit module is invoked directly against the workspace and
+    /// findings print to stdout.
+    Run {
+        /// Path to the workspace directory.
+        #[arg(long)]
+        workspace: PathBuf,
+
+        /// Audit type name (e.g. `security_bug_audit`). The exact
+        /// `audit_type` slug — substring matching is reserved for the
+        /// chatops verb.
+        #[arg(long)]
+        audit: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -77,6 +98,16 @@ pub enum Command {
         immediate: bool,
     },
 
+    /// On-demand audit triggers (chatops-on-demand-audit-trigger). The
+    /// `run` subcommand queues an audit for the daemon's next polling
+    /// iteration when the daemon is reachable, OR invokes the audit
+    /// module directly against the named workspace when no daemon is
+    /// running (useful for prompt-template iteration).
+    Audit {
+        #[command(subcommand)]
+        command: AuditSubcommand,
+    },
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -121,6 +152,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             })
             .await
         }
+        Command::Audit { command } => match command {
+            AuditSubcommand::Run { workspace, audit } => {
+                audit::execute(workspace, audit).await
+            }
+        },
         Command::Rewind {
             changes,
             config: config_path,

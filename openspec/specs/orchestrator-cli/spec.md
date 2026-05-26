@@ -1461,3 +1461,171 @@ A `WorkspaceUnavailable` outcome SHALL NOT update the audit's cadence-state file
 - **THEN** zero chatops notifications fire for those skips
 - **AND** the daemon logs one INFO line per skipped audit (operator can `journalctl` to see exactly which audits were skipped)
 
+### Requirement: `send it` verb in an audit thread schedules a triage executor run
+The chatops listener SHALL recognize `@<bot> send it` (case-insensitive on `send it`) as the `SendItOnAudit` command ONLY when the message arrives with a non-empty `thread_ts` AND the `thread_ts` matches a tracked audit-thread state with `status: Open` OR `status: TriageFailed`. Same text outside a thread SHALL parse as the unknown-verb fallback (existing `?` reaction). When recognized, the dispatcher SHALL submit a `trigger_audit_action` control-socket action AND flip the audit-thread state's `status` to `TriagePending`. The next polling iteration drains the triage queue and runs the executor in triage mode.
+
+#### Scenario: Send-it in tracked, open audit thread schedules triage
+- **WHEN** an operator posts `@<bot> send it` as a thread reply where `thread_ts` matches an `AuditThreadState` with `status: Open` AND `posted_at` within the last 7 days
+- **THEN** the dispatcher submits `trigger_audit_action` with the `thread_ts`
+- **AND** the state file's `status` is updated to `TriagePending`
+- **AND** the bot replies in the thread `✓ Triage scheduled for <audit_type> on <repo_url>. The next polling iteration will run it (~Nm).`
+
+#### Scenario: Send-it in untracked thread is politely refused
+- **WHEN** an operator posts `@<bot> send it` in a thread that has no corresponding `AuditThreadState`
+- **THEN** the bot replies `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in audit-notification threads.`
+- **AND** no control-socket action is submitted
+
+#### Scenario: Send-it on stale audit thread is politely refused
+- **WHEN** an operator posts `@<bot> send it` in a tracked thread whose `posted_at` is older than 7 days
+- **THEN** the bot replies `✗ This audit's findings are too old to act on (>7d). Re-run the audit via @<bot> audit <type> <repo>.`
+- **AND** the state file remains unchanged (the prune-stale-entries pass will eventually remove it)
+
+#### Scenario: Send-it on already-acted thread is politely refused
+- **WHEN** an operator posts `@<bot> send it` in a thread with `status: Acted` OR `status: TriagePending`
+- **THEN** the bot replies `✗ This audit thread is already <status>. No new action taken.`
+- **AND** no new triage is scheduled
+
+#### Scenario: Send-it on TriageFailed thread re-attempts triage
+- **WHEN** an operator posts `@<bot> send it` in a thread with `status: TriageFailed`
+- **THEN** the dispatcher treats the request like the Open case (triage re-scheduled)
+- **AND** the state's `status` is reset to `TriagePending` for the new attempt
+
+### Requirement: Triage mode runs the executor with an explore-then-classify prompt
+The polling iteration SHALL drain its per-repo triage queue (alongside the existing revision-request queue) at iteration start. For each queued triage, the iteration SHALL invoke `executor.run_triage(workspace, ctx)` with a `TriageContext` carrying the audit findings, audit type, repo URL, and a brief canonical-specs index. The triage-mode prompt template (`prompts/audit-triage.md`) SHALL instruct the LLM to first explore the codebase, then triage findings into quick-fix vs spec-worthy categories, apply quick fixes directly to the working tree, and create new `openspec/changes/<derived-slug>/` directories for spec-worthy findings. The slug derives from `<audit-type>-<short-hash-of-findings>` with collision-suffixing when needed.
+
+#### Scenario: Triage mode invokes the executor with the documented context
+- **WHEN** the polling iteration drains a queued triage
+- **THEN** the executor is invoked via `run_triage` with `TriageContext { findings, audit_type, repo_url, canonical_specs_index }`
+- **AND** the prompt sent to the wrapped CLI contains the four substituted variables AND the four-step instruction (explore → classify → fix → spec)
+
+#### Scenario: Triage executor returning AskUser escalates without committing
+- **WHEN** the triage executor returns `AskUser { question, resume_handle }`
+- **THEN** the existing chatops escalation fires (the question posts to the configured channel)
+- **AND** no commit is made on any branch
+- **AND** no PR is opened
+- **AND** the audit-thread state's `status` stays `TriagePending`
+
+#### Scenario: Triage executor returning Failed flips state and posts a reply
+- **WHEN** the triage executor returns `Failed { reason }`
+- **THEN** the audit-thread state's `status` flips to `TriageFailed` with `reason` populated
+- **AND** the bot posts a reply in the audit thread naming the failure
+- **AND** no PRs are created
+
+### Requirement: Completed triage splits into one or two PRs by content path
+After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths and split them by whether each path is inside `openspec/changes/<derived-slug>/`. Paths inside that subtree go to the spec PR; all other paths go to the fixes PR. Each PR is created on its own branch off the same base, with the existing PR-creation helpers. PR bodies cross-link each other when both are created.
+
+#### Scenario: Mixed diff produces two PRs that cross-link
+- **WHEN** the triage executor's Completed diff contains code changes outside `openspec/changes/<new_slug>/` AND new files inside `openspec/changes/<new_slug>/`
+- **THEN** the daemon creates a fixes branch + PR with the code paths
+- **AND** the daemon creates a spec branch + PR with the openspec paths
+- **AND** each PR body contains a link to the other ("This PR carries the code fixes; see #<other_pr> for the new spec change." and vice versa)
+- **AND** the audit-thread state's `status` flips to `Acted`
+
+#### Scenario: Code-only triage produces only a fixes PR
+- **WHEN** the triage diff has only code paths (no new `openspec/changes/<new_slug>/`)
+- **THEN** only the fixes PR is created
+- **AND** no spec PR is created
+- **AND** the audit-thread state's `status` flips to `Acted`
+
+#### Scenario: Spec-only triage produces only a spec PR
+- **WHEN** the triage diff has only new `openspec/changes/<new_slug>/` paths
+- **THEN** only the spec PR is created
+- **AND** no fixes PR is created
+- **AND** the audit-thread state's `status` flips to `Acted`
+
+#### Scenario: Empty-diff triage posts a no-action reply
+- **WHEN** the triage executor returns Completed but the diff is empty (the LLM decided nothing was actionable)
+- **THEN** no PRs are created
+- **AND** the bot posts a reply in the audit thread containing the LLM's final-summary text explaining the decision
+- **AND** the audit-thread state's `status` flips to `Acted`
+
+#### Scenario: Slug collision is suffixed
+- **WHEN** the derived slug `<audit-type>-<hash>` already exists as `openspec/changes/<slug>/`
+- **THEN** the daemon increments a suffix (`-2`, `-3`, ...) until it finds a free path
+- **AND** the resulting spec directory uses the suffixed slug
+
+### Requirement: Triage-created PRs participate in the existing PR-comment-revision-loop
+PRs spawned by audit-reply triage SHALL be structurally identical to polling-loop-spawned PRs from the revision-loop dispatcher's perspective. Operators replying `@<bot> revise <text>` on either the fixes PR OR the spec PR get revisions through the standard channel from `a01-pr-comment-revision-loop`; the dispatcher does not need to distinguish triage-PRs from regular PRs.
+
+#### Scenario: Revision comment on a triage PR is processed normally
+- **WHEN** a triage-spawned PR has an operator comment `@<bot> revise <text>`
+- **THEN** the existing revision-loop dispatcher (per `a01-pr-comment-revision-loop`) picks up the comment
+- **AND** the revision executes against that PR's branch normally
+- **AND** the audit-thread state file is not consulted (the revision is its own scope, separate from the audit-thread tracking)
+
+### Requirement: Audit-thread state files are pruned after 7 days
+The daemon SHALL prune audit-thread state files whose `posted_at` is older than 7 days. The prune runs periodically (at iteration start, or once per day per the existing housekeeping pattern). Stale entries are removed regardless of `status` — even `Acted` entries are pruned eventually so the audit-threads directory stays bounded.
+
+#### Scenario: Stale entry is removed
+- **WHEN** the prune runs AND an `AuditThreadState` has `posted_at` more than 7 days in the past
+- **THEN** the state file is removed
+- **AND** subsequent `send it` replies in that thread fall through to the untracked-thread polite-refusal
+
+#### Scenario: Fresh entry is preserved
+- **WHEN** the prune runs AND an `AuditThreadState` has `posted_at` within the last 7 days
+- **THEN** the state file is NOT removed regardless of status
+
+### Requirement: Chatops `audit` verb queues an on-demand audit run for the next polling iteration
+The chatops listener SHALL recognize `@<bot> audit <audit-substring> <repo-substring>` as the `AuditNow` command. The audit-substring SHALL be matched case-insensitively against the registered audit-type names by substring (same rule the repo-substring uses against configured repository URLs). The repo-substring SHALL be matched per the existing repo-substring rules. On a unique match in both, the dispatcher SHALL submit a `queue_audit` control-socket action AND post a one-line ack naming the resolved audit-type and repo URL. On ambiguous or no-match, the dispatcher SHALL reply with the candidate list (mirroring the existing `match_repo` reply shapes).
+
+#### Scenario: Unique substring matches queue the audit
+- **WHEN** an operator posts `@<bot> audit sec myrepo` AND `sec` uniquely matches `security_bug_audit` AND `myrepo` uniquely matches a configured repo URL
+- **THEN** the dispatcher submits a `queue_audit` action with both resolved names
+- **AND** the bot posts a threaded reply whose first line is `✓ Queued security_bug_audit for <repo_url>. Will run on the next polling iteration (~Nm).` (where `~Nm` is the per-repo poll interval rounded to minutes, OR `imminently` when the next iteration is <30 seconds away)
+
+#### Scenario: Ambiguous audit substring lists candidates
+- **WHEN** an operator posts `@<bot> audit arch myrepo` AND `arch` matches both `architecture_brightline` and `architecture_consultative`
+- **THEN** the bot replies `✗ audit substring \`arch\` matches multiple: architecture_brightline, architecture_consultative. Be more specific.`
+- **AND** no audit is queued
+
+#### Scenario: Unknown audit substring lists all registered names
+- **WHEN** an operator posts `@<bot> audit gibberish myrepo`
+- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_brightline, architecture_consultative, drift_audit, missing_tests_audit, security_bug_audit.`
+- **AND** no audit is queued
+
+### Requirement: Queued audit runs bypass cadence on the next iteration
+The audit scheduler SHALL, at the start of each iteration's audit-scheduling phase, drain the `pending_audit_runs` queue for the repo AND run each queued audit-type unconditionally (regardless of cadence or `last_run` timestamp). After running, the audit's `last_run` timestamp SHALL be updated as if it were a cadence-driven run. Cadence-driven scheduling continues to fire for audit types NOT already run via the queue in this iteration.
+
+#### Scenario: Queued audit runs even when cadence says not due
+- **WHEN** a repo's `pending_audit_runs` contains `security_bug_audit` AND `security_bug_audit`'s cadence says "not due for 28 more days"
+- **THEN** the audit runs in this iteration
+- **AND** its `last_run` timestamp is updated to the current time
+- **AND** the cadence-based "next scheduled fire" effectively moves forward by the cadence interval from the new `last_run` (no double-run within the cadence window)
+
+#### Scenario: De-duplicated queue entries produce one run
+- **WHEN** the same audit-type appears in `pending_audit_runs` more than once for a single iteration
+- **THEN** the audit runs exactly once in that iteration
+- **AND** subsequent appearances of the same audit-type in the queue are no-ops
+
+#### Scenario: Queue is drained after the iteration
+- **WHEN** an iteration runs queued audits AND completes
+- **THEN** the repo's `pending_audit_runs` is empty
+- **AND** a subsequent iteration without new queue entries does NOT re-run those audits (cadence resumes)
+
+#### Scenario: Cadence-driven audits coexist with queued audits in the same iteration
+- **WHEN** an iteration has queued `security_bug_audit` AND cadence-due `drift_audit`
+- **THEN** both audits run in the iteration
+- **AND** the queue-drained audits run first, then the cadence-due audits
+
+### Requirement: CLI `audit run` subcommand triggers on-demand from the command line
+The `autocoder` CLI SHALL expose `audit run --workspace <path> --audit <name>` as a subcommand. The subcommand SHALL probe for the control socket at the resolved runtime path; when the socket is reachable, the subcommand sends the same `queue_audit` action a chatops `audit` verb would submit. When the socket is NOT reachable, the subcommand runs the audit standalone against the named workspace path AND prints the audit's findings to stdout.
+
+#### Scenario: CLI talks to the running daemon when the socket is present
+- **WHEN** the autocoder daemon is running on the host AND `autocoder audit run --workspace <path> --audit security_bug_audit` is invoked AND the workspace matches a repo the daemon is managing
+- **THEN** the CLI connects to the control socket
+- **AND** submits `queue_audit` with the resolved audit-type and repo URL
+- **AND** prints the daemon's ack response to stdout
+- **AND** exits 0
+
+#### Scenario: CLI runs standalone when no daemon is present
+- **WHEN** no autocoder daemon is running on the host AND `autocoder audit run --workspace <path> --audit security_bug_audit` is invoked
+- **THEN** the CLI invokes the audit module directly against the workspace path
+- **AND** prints the audit's findings to stdout
+- **AND** exits 0 on successful audit, non-zero on audit failure
+
+#### Scenario: CLI errors when daemon is running but workspace is not managed
+- **WHEN** the daemon is running AND the named workspace is NOT in the daemon's configured repo list
+- **THEN** the CLI prints a clear error naming the workspace path and the daemon's known repos
+- **AND** exits non-zero
+- **AND** does NOT fall back to standalone mode (the daemon is the owner of the workspace lifecycle when present; falling back would race the daemon)
+

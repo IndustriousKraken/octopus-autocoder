@@ -79,6 +79,8 @@ pub async fn run(
     audits_cfg: Option<Arc<AuditsConfig>>,
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
+    pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
     cancel: CancellationToken,
 ) {
     run_with_hooks(
@@ -97,6 +99,8 @@ pub async fn run(
         audits_cfg,
         audit_settings,
         pending_rebuild,
+        pending_triages,
+        pending_audit_runs,
         cancel,
         RunHooks::default(),
     )
@@ -134,6 +138,8 @@ pub async fn run_with_hooks(
     audits_cfg: Option<Arc<AuditsConfig>>,
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
+    pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
     cancel: CancellationToken,
     hooks: RunHooks,
 ) {
@@ -207,6 +213,64 @@ pub async fn run_with_hooks(
         // is ordered against the write.
         let want_rebuild = pending_rebuild.swap(false, std::sync::atomic::Ordering::SeqCst);
 
+        // Audit-thread state housekeeping runs first: prune any audit-
+        // thread state files older than 7 days regardless of status, so
+        // the audit-threads directory stays bounded. Best-effort; a
+        // failure is logged and the iteration continues.
+        let audit_state_root = crate::audits::threads::default_state_root();
+        match crate::audits::threads::prune_stale_entries(
+            &audit_state_root,
+            chrono::Duration::days(7),
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                count = n,
+                "audit-threads prune removed {n} stale entry(ies)"
+            ),
+            Err(e) => tracing::warn!(
+                "audit-threads prune failed (iteration continues): {e:#}"
+            ),
+        }
+
+        // Drain the per-repo on-demand audit-run queue
+        // (chatops-on-demand-audit-trigger). The HashSet collapses any
+        // duplicates that survived the control-socket-level de-dup
+        // (defence in depth) so the same audit cannot run twice in one
+        // iteration. The queue is emptied unconditionally even when an
+        // entry is unknown to the registry — leaving it would cause the
+        // unknown name to be re-warned every iteration forever.
+        let queued_audit_types: std::collections::HashSet<String> = {
+            let mut g = pending_audit_runs.lock().unwrap();
+            std::mem::take(&mut *g).into_iter().collect()
+        };
+
+        // Drain the per-repo triage queue (audit-reply-acts `send it`).
+        // Triage runs BEFORE the rebuild check and the pending-change
+        // walk so an operator's `send it` always gets attention this
+        // iteration. Failures inside `process_audit_triages` are logged
+        // and never abort the surrounding iteration.
+        let triage_thread_tses: Vec<String> = {
+            let mut g = pending_triages.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        if !triage_thread_tses.is_empty()
+            && let Err(error) = process_audit_triages(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+                &triage_thread_tses,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                "audit-triage processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
         if want_rebuild {
             if let Err(error) = execute_rebuild_iteration(
                 &workspace,
@@ -237,6 +301,7 @@ pub async fn run_with_hooks(
             audit_registry.as_ref(),
             audits_cfg.as_deref(),
             audit_settings.as_ref(),
+            &queued_audit_types,
         )
         .await
         {
@@ -341,6 +406,7 @@ pub async fn execute_one_pass(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
+    queued_audit_types: &std::collections::HashSet<String>,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
@@ -417,6 +483,7 @@ pub async fn execute_one_pass(
         audit_registry,
         audits_cfg,
         audit_settings,
+        queued_audit_types,
     )
     .await?;
     if processed.is_empty() {
@@ -653,6 +720,7 @@ fn locate_archive_dir(archive_root: &Path, change: &str) -> Result<Option<std::p
 /// The caller (production: `execute_one_pass`) is responsible for the
 /// remote-side work; tests use this directly to verify commit-formation
 /// behavior without needing a live GitHub endpoint or a writable remote.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pass_through_commits(
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -664,6 +732,7 @@ pub async fn run_pass_through_commits(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
+    queued_audit_types: &std::collections::HashSet<String>,
 ) -> Result<(Vec<String>, bool)> {
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
@@ -798,6 +867,7 @@ pub async fn run_pass_through_commits(
         audits_cfg,
         audit_settings,
         chatops_ctx,
+        queued_audit_types,
     )
     .await
     {
@@ -3174,6 +3244,511 @@ async fn open_pr_exists_for_agent_branch(
     open_pr_exists_for_agent_branch_at(github::DEFAULT_API_BASE, repo, github_cfg).await
 }
 
+// ====================================================================
+// Audit-triage processing (audit-reply-acts `send it` flow)
+// ====================================================================
+
+/// Process every queued audit-triage `thread_ts` for this repo. The
+/// caller passes the per-repo queue snapshot already drained; this
+/// function loads each `AuditThreadState`, runs the executor in triage
+/// mode, splits the resulting diff, and opens one or two PRs.
+///
+/// Failures inside one triage do NOT abort the others — each entry is
+/// processed independently, errors are logged and the audit-thread
+/// state's `status` is updated to `TriageFailed` so the operator can
+/// retry via `@<bot> send it` again.
+pub async fn process_audit_triages(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    executor: &dyn Executor,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    thread_tses: &[String],
+) -> Result<()> {
+    use crate::audits::threads;
+    // Workspace must be clean and on a fresh agent_branch off base
+    // before we let the executor loose on it. The downstream
+    // `run_pass_through_commits` does the same setup; we duplicate it
+    // here because triage runs OUTSIDE the normal pass and leaves the
+    // workspace in whatever state the executor produces.
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
+        None => None,
+    };
+    let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
+    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+        .with_context(|| "audit-triage: workspace ensure_initialized".to_string())?;
+    let _ = crate::queue::clear_stale_locks(workspace);
+    let _ = git::reset_hard_head(workspace);
+    let _ = git::clean_force(workspace);
+    git::fetch(workspace)
+        .with_context(|| "audit-triage: git fetch".to_string())?;
+    git::checkout(workspace, &repo.base_branch)
+        .with_context(|| format!("audit-triage: checkout `{}`", repo.base_branch))?;
+    git::pull_ff_only(workspace, &repo.base_branch)
+        .with_context(|| format!("audit-triage: pull --ff-only `{}`", repo.base_branch))?;
+    git::recreate_branch(workspace, &repo.agent_branch)
+        .with_context(|| format!("audit-triage: recreate `{}`", repo.agent_branch))?;
+
+    for thread_ts in thread_tses {
+        let state_root = threads::default_state_root();
+        let mut state = match threads::read_state(&state_root, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "audit-triage: no state file (entry pruned between trigger and processing); skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "audit-triage: state read failed: {e:#}"
+                );
+                continue;
+            }
+        };
+
+        // Build the canonical-specs index from openspec/specs/<name>/.
+        let canonical_specs_index = build_canonical_specs_index(workspace);
+        let ctx = crate::executor::TriageContext {
+            findings: state.findings_excerpt.clone(),
+            audit_type: state.audit_type.clone(),
+            repo_url: state.repo_url.clone(),
+            canonical_specs_index,
+        };
+
+        tracing::info!(
+            url = %repo.url,
+            thread_ts = %thread_ts,
+            audit_type = %state.audit_type,
+            "audit-triage: invoking executor in triage mode"
+        );
+
+        let outcome = executor.run_triage(workspace, &ctx).await;
+        match outcome {
+            Ok(crate::executor::ExecutorOutcome::Completed) => {
+                if let Err(e) = process_completed_triage(
+                    workspace,
+                    repo,
+                    github_cfg,
+                    chatops_ctx,
+                    &mut state,
+                )
+                .await
+                {
+                    tracing::error!(
+                        url = %repo.url,
+                        thread_ts = %thread_ts,
+                        "audit-triage: post-Completed processing failed: {e:#}"
+                    );
+                    mark_triage_failed(
+                        &state_root,
+                        &mut state,
+                        format!("post-Completed processing: {e:#}"),
+                        chatops_ctx,
+                    )
+                    .await;
+                }
+            }
+            Ok(crate::executor::ExecutorOutcome::Failed { reason }) => {
+                tracing::error!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor returned Failed: {reason}"
+                );
+                mark_triage_failed(&state_root, &mut state, reason, chatops_ctx).await;
+            }
+            Ok(crate::executor::ExecutorOutcome::AskUser { .. }) => {
+                // Triage's escalation: the agent asked a question. The
+                // existing chatops escalation machinery is per-change;
+                // for triage we treat AskUser as a no-op (status stays
+                // TriagePending so a future iteration could retry).
+                tracing::info!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor returned AskUser; leaving status TriagePending"
+                );
+            }
+            Ok(crate::executor::ExecutorOutcome::SpecNeedsRevision { .. }) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor returned SpecNeedsRevision; treating as failure"
+                );
+                mark_triage_failed(
+                    &state_root,
+                    &mut state,
+                    "executor flagged SpecNeedsRevision during triage".to_string(),
+                    chatops_ctx,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor task errored: {e:#}"
+                );
+                mark_triage_failed(
+                    &state_root,
+                    &mut state,
+                    format!("executor task error: {e:#}"),
+                    chatops_ctx,
+                )
+                .await;
+            }
+        }
+        // After triage (success or failure), reset to clean working tree
+        // so the next operation isn't contaminated by triage leftovers.
+        // best-effort — failures are logged but never propagated.
+        if let Err(e) = git::reset_hard_head(workspace) {
+            tracing::warn!(
+                url = %repo.url,
+                "audit-triage: post-triage reset_hard_head failed: {e:#}"
+            );
+        }
+        let _ = git::clean_force(workspace);
+        // Move back to base branch so subsequent steps in the iteration
+        // start from a known state.
+        let _ = git::checkout(workspace, &repo.base_branch);
+    }
+    Ok(())
+}
+
+/// Inspect the changed paths in `workspace` after a Completed triage,
+/// split into spec vs fixes, and open one or two PRs accordingly. On
+/// the empty-diff path, post the agent's final-summary text into the
+/// audit thread reply chain and flip the state to `Acted`.
+async fn process_completed_triage(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    state: &mut crate::audits::threads::AuditThreadState,
+) -> Result<()> {
+    use crate::audits::threads::{self, AuditThreadStatus};
+    let state_root = threads::default_state_root();
+
+    let porcelain = git::status_porcelain(workspace)
+        .with_context(|| "audit-triage: reading post-Completed git status".to_string())?;
+    let changed: Vec<String> = porcelain
+        .lines()
+        .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    // Derive the slug ahead of partitioning so the path-prefix check is
+    // anchored to a concrete slug. The slug derives from
+    // `<audit_type>-<short_hash>` with collision-suffix.
+    let new_slug = derive_unique_triage_slug(workspace, &state.audit_type, &state.findings_excerpt);
+    let slug_prefix = format!("openspec/changes/{new_slug}/");
+
+    let (fixes_paths, spec_paths): (Vec<String>, Vec<String>) = changed
+        .into_iter()
+        .partition(|p| !p.starts_with(&slug_prefix));
+
+    if fixes_paths.is_empty() && spec_paths.is_empty() {
+        // No diff. Post the bot's summary reply (placeholder text since
+        // the executor's final-summary stdout isn't structured here) and
+        // flip state to Acted.
+        if let Some(ctx) = chatops_ctx {
+            let body = format!(
+                "ℹ️ Triage for `{audit_type}` on `{repo_url}` completed with no actionable changes.",
+                audit_type = state.audit_type,
+                repo_url = state.repo_url,
+            );
+            if let Err(e) = ctx
+                .chatops
+                .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    thread_ts = %state.thread_ts,
+                    "audit-triage: empty-diff thread reply failed: {e:#}"
+                );
+            }
+        }
+        state.status = AuditThreadStatus::Acted;
+        let _ = threads::write_state(&state_root, state);
+        return Ok(());
+    }
+
+    let agent_branch = &repo.agent_branch;
+    let base_branch = &repo.base_branch;
+    // Make sure we have base as the parent for both PR branches.
+    git::checkout(workspace, base_branch)
+        .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
+
+    let mut fixes_pr_url: Option<String> = None;
+    let mut spec_pr_url: Option<String> = None;
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+
+    if !fixes_paths.is_empty() {
+        let fixes_branch = format!("{agent_branch}-triage-fixes");
+        git::recreate_branch(workspace, &fixes_branch)
+            .with_context(|| format!("audit-triage: recreate `{fixes_branch}`"))?;
+        for p in &fixes_paths {
+            // best-effort add; deleted paths still need `git add`.
+            let _ = std::process::Command::new("git")
+                .args(["add", "--", p])
+                .current_dir(workspace)
+                .status();
+        }
+        let subject = format!("audit-triage fixes from {}", state.audit_type);
+        git::commit(workspace, &subject)
+            .with_context(|| "audit-triage: commit fixes branch".to_string())?;
+        if let Err(e) = git::push_force_with_lease(workspace, &fixes_branch, push_remote) {
+            return Err(anyhow!("audit-triage: pushing fixes branch failed: {e:#}"));
+        }
+        match open_triage_pull_request(
+            repo,
+            github_cfg,
+            &fixes_branch,
+            base_branch,
+            &format!("audit-triage fixes ({})", state.audit_type),
+            &format!(
+                "This PR carries the code fixes from the `{audit_type}` audit on `{repo_url}`.\n\nA companion spec PR (if any) will cross-link here.",
+                audit_type = state.audit_type,
+                repo_url = state.repo_url,
+            ),
+        )
+        .await
+        {
+            Ok(url) => fixes_pr_url = Some(url),
+            Err(e) => tracing::error!(
+                url = %repo.url,
+                "audit-triage: fixes PR creation failed: {e:#}"
+            ),
+        }
+    }
+
+    if !spec_paths.is_empty() {
+        // Reset to base for the second branch.
+        git::checkout(workspace, base_branch)
+            .with_context(|| "audit-triage: checkout base for spec branch".to_string())?;
+        let spec_branch = format!("{agent_branch}-triage-spec");
+        git::recreate_branch(workspace, &spec_branch)
+            .with_context(|| format!("audit-triage: recreate `{spec_branch}`"))?;
+        // Stage every spec path. The triage already wrote the files in
+        // the working tree (then `git reset --hard HEAD` would have
+        // wiped them; but we only reset AFTER the loop runs). The
+        // calling sequence is: run_triage → run process_completed_triage.
+        // The files are still on disk when we get here.
+        for p in &spec_paths {
+            let _ = std::process::Command::new("git")
+                .args(["add", "--", p])
+                .current_dir(workspace)
+                .status();
+        }
+        let subject = format!("audit-triage spec proposal from {}", state.audit_type);
+        git::commit(workspace, &subject)
+            .with_context(|| "audit-triage: commit spec branch".to_string())?;
+        if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
+            return Err(anyhow!("audit-triage: pushing spec branch failed: {e:#}"));
+        }
+        let cross_link = match &fixes_pr_url {
+            Some(u) => format!("This PR carries the new spec change(s) from the `{audit_type}` audit. See {u} for the companion fixes PR.", audit_type = state.audit_type),
+            None => format!("This PR carries the new spec change(s) from the `{audit_type}` audit on `{repo_url}`.", audit_type = state.audit_type, repo_url = state.repo_url),
+        };
+        match open_triage_pull_request(
+            repo,
+            github_cfg,
+            &spec_branch,
+            base_branch,
+            &format!("audit-triage spec ({})", state.audit_type),
+            &cross_link,
+        )
+        .await
+        {
+            Ok(url) => spec_pr_url = Some(url),
+            Err(e) => tracing::error!(
+                url = %repo.url,
+                "audit-triage: spec PR creation failed: {e:#}"
+            ),
+        }
+    }
+
+    // Best-effort: post a thread reply summarising which PRs landed.
+    if let Some(ctx) = chatops_ctx {
+        let mut body = format!(
+            "✓ Triage for `{}` complete.",
+            state.audit_type
+        );
+        if let Some(u) = &fixes_pr_url {
+            body.push_str(&format!("\nFixes PR: {u}"));
+        }
+        if let Some(u) = &spec_pr_url {
+            body.push_str(&format!("\nSpec PR: {u}"));
+        }
+        let _ = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await;
+    }
+
+    state.status = AuditThreadStatus::Acted;
+    let _ = threads::write_state(&state_root, state);
+    Ok(())
+}
+
+/// Derive a unique `openspec/changes/<slug>/` path for a triage run.
+/// The slug is `<audit_type-sanitized>-<short-hash>`; if it already
+/// exists on disk, we append `-2`, `-3`, ... until we find a free path.
+fn derive_unique_triage_slug(workspace: &Path, audit_type: &str, findings: &str) -> String {
+    let mut sanitized: String = audit_type
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() {
+        sanitized = "triage".to_string();
+    }
+    // Short hash: first 8 hex chars of a non-crypto fold over the
+    // findings string. Deterministic per identical findings, so re-running
+    // the same `send it` reuses the same slug instead of forking a new one.
+    let hash = short_findings_hash(findings);
+    let base_slug = format!("{sanitized}-{hash}");
+    let mut slug = base_slug.clone();
+    let mut suffix = 2u32;
+    while workspace.join("openspec/changes").join(&slug).exists() {
+        slug = format!("{base_slug}-{suffix}");
+        suffix += 1;
+        if suffix > 100 {
+            // Pathological case: bail out with whatever we have.
+            break;
+        }
+    }
+    slug
+}
+
+/// 8-hex-char fold over `findings`. Not cryptographic — only used as a
+/// slug uniqueness suffix.
+fn short_findings_hash(findings: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for b in findings.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    format!("{:08x}", h as u32)
+}
+
+/// Pull the path out of a `git status --porcelain` line. Lines look like
+/// `XY <path>`; for renames the format is `R  <from> -> <to>` and we
+/// keep the trailing target.
+fn extract_porcelain_path(line: &str) -> Option<&str> {
+    let trimmed = line.get(3..)?.trim_start();
+    let path = if let Some(idx) = trimmed.rfind(" -> ") {
+        trimmed[idx + 4..].trim()
+    } else {
+        trimmed.trim()
+    };
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// Read the workspace's `openspec/specs/` directory and produce a brief
+/// listing of the canonical spec names available. Used by the triage
+/// prompt's `{{canonical_specs_index}}` substitution.
+fn build_canonical_specs_index(workspace: &Path) -> String {
+    let specs_dir = workspace.join("openspec/specs");
+    if !specs_dir.is_dir() {
+        return "(no openspec/specs/ directory found)".to_string();
+    }
+    let mut names: Vec<String> = match std::fs::read_dir(&specs_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(_) => return "(error reading openspec/specs/)".to_string(),
+    };
+    names.sort();
+    if names.is_empty() {
+        return "(no specs in openspec/specs/)".to_string();
+    }
+    names
+        .iter()
+        .map(|n| format!("- {n}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Flip the audit-thread state to `TriageFailed` and post the failure
+/// to the audit thread. Best-effort — every failure path here logs and
+/// continues so the surrounding iteration is unaffected.
+async fn mark_triage_failed(
+    state_root: &Path,
+    state: &mut crate::audits::threads::AuditThreadState,
+    reason: String,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    use crate::audits::threads::{self, AuditThreadStatus};
+    state.status = AuditThreadStatus::TriageFailed;
+    state.reason = Some(reason.clone());
+    if let Err(e) = threads::write_state(state_root, state) {
+        tracing::warn!(
+            thread_ts = %state.thread_ts,
+            "audit-triage: failed to record TriageFailed state: {e:#}"
+        );
+    }
+    if let Some(ctx) = chatops_ctx {
+        let body = format!(
+            "✗ Triage for `{audit_type}` on `{repo_url}` failed: {reason}\n\nReply `@<bot> send it` to retry, or revise the audit and re-run.",
+            audit_type = state.audit_type,
+            repo_url = state.repo_url,
+        );
+        if let Err(e) = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await
+        {
+            tracing::warn!(
+                thread_ts = %state.thread_ts,
+                "audit-triage: TriageFailed thread reply failed: {e:#}"
+            );
+        }
+    }
+}
+
+/// Open one of the audit-triage PRs. Mirrors the shape of
+/// `polling_loop::open_pull_request` but is purpose-built for the two-PR
+/// triage flow (no reviewer step, no change-list body).
+async fn open_triage_pull_request(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    head_branch: &str,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<String> {
+    let (owner, name) = github::parse_repo_url(&repo.url)
+        .with_context(|| "audit-triage: parsing repo URL".to_string())?;
+    let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    let head = if let Some(fork_owner) = github_cfg.fork_owner.as_deref() {
+        format!("{fork_owner}:{head_branch}")
+    } else {
+        head_branch.to_string()
+    };
+    let pr = github::create_pull_request(
+        &owner,
+        &name,
+        &head,
+        base_branch,
+        title,
+        body,
+        &token,
+        None,
+        false,
+    )
+    .await?;
+    Ok(pr.html_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3577,7 +4152,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
             )
             .await?;
         Ok(processed)
@@ -3856,7 +4431,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -3959,7 +4534,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4075,7 +4650,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4212,7 +4787,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds without running pending");
@@ -4327,7 +4902,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4461,7 +5036,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -4581,7 +5156,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
             )
             .await
             .expect("commits step succeeds");
@@ -4800,6 +5375,8 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_for_task,
             )
             .await;
@@ -4916,6 +5493,8 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_for_task,
                 hooks,
             )
@@ -5126,7 +5705,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5178,7 +5757,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -5281,7 +5860,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -5380,7 +5959,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -5640,7 +6219,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await?;
         Ok(processed)
@@ -5817,7 +6396,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
@@ -5908,6 +6487,7 @@ mod tests {
             &registry,
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -5970,7 +6550,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -6039,7 +6619,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await;
         alert_mock.assert_async().await;
@@ -6143,6 +6723,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -6429,7 +7010,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("self-heal pass succeeds");
@@ -6504,7 +7085,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
@@ -6566,7 +7147,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
 )
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
@@ -6653,7 +7234,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -6700,7 +7281,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -6769,7 +7350,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -6874,7 +7455,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -6923,7 +7504,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -6961,7 +7542,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -7064,6 +7645,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -7149,6 +7731,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "recovery failure must surface as Err");
@@ -7208,6 +7791,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_ok(), "iteration should succeed: {result:?}");
@@ -8080,7 +8664,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("pass succeeds");
@@ -8245,6 +8829,8 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 task_cancel,
             )
             .await;
@@ -8649,6 +9235,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("iteration should complete Ok with the change excluded");
@@ -8750,6 +9337,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("iteration should succeed");
@@ -8819,6 +9407,7 @@ mod tests {
                 &crate::audits::AuditRegistry::default(),
                 None,
                 &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("iteration succeeds");
@@ -8907,6 +9496,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -8985,6 +9575,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(result.is_err(), "iteration must surface the recovery failure");

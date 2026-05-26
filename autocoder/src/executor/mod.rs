@@ -35,6 +35,48 @@ pub trait Executor: Send + Sync {
         let _ = revision_context;
         self.run(workspace, change).await
     }
+
+    /// Triage-mode invocation for the `audit-reply-acts` flow: the
+    /// operator typed `@<bot> send it` in an audit thread, so the
+    /// daemon spawns the executor against the audit's findings to
+    /// classify each finding as quick-fix vs spec-worthy, apply the
+    /// quick fixes directly, and create `openspec/changes/<slug>/`
+    /// dirs for the spec-worthy ones.
+    ///
+    /// Default impl returns `Failed { reason: "triage mode not
+    /// supported" }` so a backend that hasn't been taught about
+    /// triage degrades to a polite refusal instead of a panic.
+    async fn run_triage(
+        &self,
+        workspace: &Path,
+        ctx: &TriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "triage mode not supported by this executor backend".to_string(),
+        })
+    }
+}
+
+/// Context handed to `Executor::run_triage`. Plumbed in from the
+/// dispatcher (which constructs it from the `AuditThreadState` plus the
+/// workspace's canonical-specs index). Carried verbatim through the
+/// prompt template's `{{...}}` substitutions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageContext {
+    /// The full findings excerpt (capped at 35,000 chars) the operator
+    /// saw in the audit's reply thread.
+    pub findings: String,
+    /// The audit's slug (e.g. `architecture_brightline`,
+    /// `drift_audit`, `security_bug_audit`).
+    pub audit_type: String,
+    /// The repository URL the audit ran against.
+    pub repo_url: String,
+    /// A brief listing of which canonical specs live in
+    /// `openspec/specs/`. The triage prompt instructs the LLM to read
+    /// the relevant subset before classifying findings.
+    pub canonical_specs_index: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -256,6 +256,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         &cfg,
         chatops_holder.clone(),
         task_map.clone(),
+        audit_registry.clone(),
         cancel.clone(),
     )
     .await;
@@ -309,6 +310,7 @@ async fn spawn_inbound_listener(
     cfg: &Config,
     chatops_holder: ChatOpsHolder,
     task_map: RepoTaskMap,
+    audit_registry: Arc<AuditRegistry>,
     cancel: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let slot_arc = chatops_holder.load_full();
@@ -366,7 +368,14 @@ async fn spawn_inbound_listener(
     }
 
     let dispatcher = Arc::new(
-        crate::chatops::operator_commands::OperatorCommandDispatcher::new(),
+        crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+            .with_audit_types(
+                audit_registry
+                    .known_type_names()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            ),
     );
     let task_map_for_provider = task_map.clone();
     let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
@@ -459,6 +468,12 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let pending_rebuild: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_rebuild_for_task = pending_rebuild.clone();
+        let pending_triages: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending_triages_for_task = pending_triages.clone();
+        let pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending_audit_runs_for_task = pending_audit_runs.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             polling_loop::run(
                 config_for_task,
@@ -476,6 +491,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 audits_cfg_for_task,
                 audit_settings_for_task,
                 pending_rebuild_for_task,
+                pending_triages_for_task,
+                pending_audit_runs_for_task,
                 cancel_for_task,
             )
             .await;
@@ -500,6 +517,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     config: config_holder,
                     join,
                     pending_rebuild,
+                    pending_triages,
+                    pending_audit_runs,
                 },
             );
             true

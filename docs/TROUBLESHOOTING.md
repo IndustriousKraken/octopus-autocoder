@@ -217,3 +217,66 @@ identifies — usually re-clone manually OR wait for the next iteration's
 back to a valid state, the audit will run on its next cadence (the
 skipped run did not consume cadence, so the next due window is
 unchanged). No special re-trigger is needed.
+
+## `send it` got a polite refusal — what each `✗` reply means
+
+The audit-reply-acts flow (`@<bot> send it` posted inside an audit
+notification thread) has four refusal paths, each with a distinct
+operator-facing reply. If your `send it` was refused, find your exact
+reply text below.
+
+### `✗ This reply is in a thread autocoder is not tracking. ...`
+
+The dispatcher could not find an `AuditThreadState` for the thread's
+`thread_ts`. Common causes:
+
+- The reply landed on a thread that is NOT an audit notification — for
+  example, a regular `@<bot> status` thread or an AskUser thread. The
+  `send it` verb only acts on audit-notification threads.
+- The audit-thread state file was pruned (entries older than 7 days
+  are removed regardless of status — see "stale" below).
+- The audit fired but the chatops backend doesn't support native
+  threading (the default-impl concat path returns `Ok(None)` and no
+  state is stamped). Slack supports threading; the experimental
+  backends do not.
+
+**What to do.** If you want to act on a real audit, find the audit's
+top-line message in chatops and reply inside that thread. If the audit
+was old enough to have been pruned, re-run it via the audit's normal
+cadence (or trigger it ad-hoc if your operator workflow supports
+that), then `send it` against the fresh thread.
+
+### `✗ This audit's findings are too old to act on (>7d). ...`
+
+The `posted_at` on the audit-thread state is more than 7 days old.
+Stale audit findings probably no longer match the current code; acting
+on them blindly tends to burn tokens producing a useless diff.
+
+**What to do.** Re-run the audit (`@<bot> audit <type> <repo>` or wait
+for the next cadence-driven run). The fresh audit posts a new thread,
+and `send it` in THAT thread acts on the current findings.
+
+### `✗ This audit thread is already <status>. No new action taken.`
+
+The state's `status` is either `acted` (a triage already ran against
+this thread and the bot's PRs are live) or `triage-pending` (a triage
+is queued or in-flight). The verb does NOT re-trigger an already-
+running triage; the deduplication prevents the operator from
+double-spending the LLM budget on the same findings.
+
+**What to do.**
+
+- If `status = acted`: open the bot's resulting PRs from the previous
+  triage. Revise them via `@<bot> revise <text>` on each PR if the
+  classification was off. Don't re-trigger triage — the PRs are the
+  artifact you wanted.
+- If `status = triage-pending`: the previous trigger is still being
+  processed. Wait one polling cycle; the bot posts back into the
+  thread when the triage completes (either with PR links or with the
+  agent's stated reasoning for declining to act).
+- If a prior triage failed (`status = triage-failed`), the verb DOES
+  re-schedule — `send it` again gets a fresh attempt. Watch the thread
+  for the failure reason; if it's a transient infra issue, retry; if
+  it's a real problem with the findings, revise the audit's source
+  (e.g. tweak its config or fix what produced the noise) before
+  retrying.

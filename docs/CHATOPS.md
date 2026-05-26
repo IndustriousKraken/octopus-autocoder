@@ -234,6 +234,12 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 2. **Manually delete `.question.json`** — reverts the change to pending state. The next iteration re-runs it from scratch (without the answer). Useful when the question was a false positive or the change should restart.
 3. **`autocoder rewind <change>`** — full reset: deletes the agent branch, unarchives if needed, clears all `.question.json` / `.answer.json` markers via the rewind path.
 
+### Mobile vs desktop mention forms
+
+Slack's mobile client and desktop client render `@<bot-name>` identically on screen but emit two different mention strings in the underlying message text. Desktop emits the bot's **user id** (`<@U...>`); mobile emits the bot's **bot/app id** (`<@B...>`). Both refer to the same bot. autocoder caches both ids at startup (via `auth.test`) and the inbound chatops listener accepts either form as the leading bot mention — operators don't need to do anything specific.
+
+If mobile mentions stop working after a token rotation, check the daemon log for the `auth.test response missing bot_id` WARN. Some Slack token types don't return a `bot_id` field; when that field is missing, the daemon falls back to user-id-only matching and mobile-app mentions stop being recognised while desktop continues to work. The WARN line names the gap explicitly so operators know where to look.
+
 ## `.question.json`, `.answer.json`, and `.alert-state.json` as workspace artifacts
 
 These files are written by autocoder into the workspace as bookkeeping. `.question.json` and `.answer.json` live alongside the change's `proposal.md`; `.alert-state.json` lives at the workspace root and tracks the per-(repo, category) 24h-alert throttle for [progress notifications](CHATOPS.md#progress-notifications).
@@ -255,6 +261,7 @@ The bot recognises:
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
+| `audit` | `@<bot> audit <audit-substring> <repo-substring>` | Queues an on-demand audit run for the next polling iteration, bypassing the audit's configured cadence. Audit-substring is matched case-insensitively against the registered audit-type names (same rule the repo-substring uses). Unique match in both → ack with the canonical names and an ETA derived from the repo's `poll_interval_sec`. Ambiguous audit substring → the bot lists the matching candidates. No match → the bot lists every registered audit type. See [On-demand audit triggers](OPERATIONS.md#on-demand-audit-triggers). |
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](CHATOPS.md#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](CHATOPS.md#what-gets-posted) recovery uses, deleted via a chat reply instead.
@@ -275,6 +282,20 @@ The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of
 ```
 
 If any individual repo's state cannot be assembled (workspace mid-failure, control-socket per-repo error), that repository's section renders `(unavailable: <error excerpt>)` in place of the summary line. The menu still ships every other repository's section so a single broken workspace doesn't blank the whole list. From the menu, pick a repo and re-issue `@<bot> status <substring>` for the full per-repo detail.
+
+**`audit` — on-demand audit trigger.** Use this when you want an audit to run right now instead of waiting for its configured cadence. The verb takes two substring arguments: the audit-type substring (e.g. `sec` → `security_bug_audit`) and the repo substring. Both follow the same case-insensitive substring-matching rule as every other verb. Example:
+
+```
+@<bot> audit sec myrepo
+```
+
+becomes:
+
+```
+✓ Queued security_bug_audit for git@github.com:acme/myrepo.git. Will run on the next polling iteration (~5m).
+```
+
+The ETA is `~Nm` where `N` is `poll_interval_sec` rounded to minutes, or `imminently` when the next iteration is <30 seconds away. Queuing the same audit twice before the iteration fires collapses to a single run. Queued audits update the audit's cadence state on success, so the next scheduled fire moves forward by the cadence interval — an on-demand run "consumes" one cycle of the cadence. See [On-demand audit triggers](OPERATIONS.md#on-demand-audit-triggers) for the cadence-interaction details and the CLI variant.
 
 ### Setup (Slack)
 
@@ -353,6 +374,32 @@ Branches and the busy-marker line are always present. `(none)` fills any always-
 Random chat that happens to mention the bot but doesn't match a known verb (typos, drive-by mentions, AskUser-thread replies, etc.) gets a single `?`-emoji reaction on the original message — no text reply, no thread spam. The reaction is a quiet "this didn't parse" signal: discoverable for the operator who typed the command, ignorable for everyone else. Type `@<bot> help` for the current verb list.
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
+
+### Acting on an audit's findings: `send it`
+
+When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
+
+The verb is `send it`:
+
+```
+@<bot> send it       (posted as a reply inside the audit thread)
+```
+
+Outside an audit thread, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction. Inside a tracked, fresh, open audit thread it spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** (apply directly to source) or **spec-worthy** (write a new `openspec/changes/<slug>/` proposal), then applies both kinds of output. The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced PRs within one polling cycle.
+
+**Two-PR output shape.** autocoder splits the executor's diff by path: anything under the new `openspec/changes/<slug>/` directory becomes a separate **spec PR**; everything else becomes a **fixes PR**. Each PR is created on its own branch off `base_branch` and its body cross-links the companion PR (when both are created). If the triage diff has only code, only the fixes PR is created. If it has only a new spec, only the spec PR is created. If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread.
+
+**7-day staleness rule.** Audit-thread state files are pruned after 7 days regardless of status. A `send it` against an audit older than 7 days gets a polite refusal:
+
+```
+✗ This audit's findings are too old to act on (>7d). Re-run the audit via @<bot> audit <type> <repo>.
+```
+
+This is intentional: stale audit findings probably no longer reflect the current code, and acting on them blindly burns tokens producing a useless diff.
+
+**Already-acted threads.** Once a triage has run on an audit thread, subsequent `send it` replies get a polite refusal naming the current status (`triage-pending`, `acted`). The exception is `triage-failed`: a failed triage resets back to `triage-pending` on retry, so the operator can `send it` again after fixing whatever went wrong.
+
+**Revising the produced PRs.** Both the fixes PR and the spec PR are normal autocoder-opened PRs. They participate in the existing `a01-pr-comment-revision-loop`, so `@<bot> revise <text>` on either PR gets revisions through the standard channel. If the agent over-promoted findings to specs, ask it to inline the fix via a revision comment on the spec PR; if it under-fixed, point that out via a revision comment on the fixes PR.
 
 ### Trust boundary
 

@@ -13,7 +13,7 @@
 //!      clarification regex, the executor synthesizes an AskUser from the
 //!      first matching sentence.
 
-use super::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
+use super::{Executor, ExecutorOutcome, ResumeHandle, TriageContext, UnimplementableTask};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
@@ -40,10 +40,23 @@ const DEFAULT_IMPLEMENTER_TEMPLATE: &str = include_str!("../../../prompts/implem
 const DEFAULT_REVISION_TEMPLATE: &str =
     include_str!("../../../prompts/implementer-revision.md");
 
+/// Built-in triage-mode prompt template, embedded at compile time. Used
+/// by `run_triage` for the `audit-reply-acts` flow.
+const DEFAULT_TRIAGE_TEMPLATE: &str = include_str!("../../../prompts/audit-triage.md");
+
 /// Literal placeholder replaced with `openspec instructions apply` output.
 const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
 const REVISION_DIFF_PLACEHOLDER: &str = "{{pr_diff}}";
 const REVISION_REQUEST_PLACEHOLDER: &str = "{{revision_request}}";
+const TRIAGE_FINDINGS_PLACEHOLDER: &str = "{{findings}}";
+const TRIAGE_AUDIT_TYPE_PLACEHOLDER: &str = "{{audit_type}}";
+const TRIAGE_REPO_URL_PLACEHOLDER: &str = "{{repo_url}}";
+const TRIAGE_SPECS_INDEX_PLACEHOLDER: &str = "{{canonical_specs_index}}";
+
+/// Synthetic "change" name used for the triage-mode run-log path. The
+/// triage flow does not target a specific change directory; the name is
+/// only used to produce a per-run log file on disk for diagnostics.
+const TRIAGE_LOG_CHANGE_NAME: &str = "audit-triage";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -247,6 +260,21 @@ impl ClaudeCliExecutor {
             .replace(REVISION_DIFF_PLACEHOLDER, &revision_context.pr_diff)
             .replace(REVISION_REQUEST_PLACEHOLDER, &revision_context.revision_text);
         Ok(rendered)
+    }
+
+    /// Build the triage-mode prompt by substituting the four
+    /// `TriageContext` payloads into the embedded
+    /// `prompts/audit-triage.md` template. The triage prompt is fully
+    /// self-contained — unlike `run`/`run_revision` it does NOT shell
+    /// out to `openspec instructions apply` because the LLM is asked
+    /// to explore the codebase itself rather than acting on one
+    /// pre-existing change.
+    fn build_triage_prompt(ctx: &TriageContext) -> String {
+        DEFAULT_TRIAGE_TEMPLATE
+            .replace(TRIAGE_FINDINGS_PLACEHOLDER, &ctx.findings)
+            .replace(TRIAGE_AUDIT_TYPE_PLACEHOLDER, &ctx.audit_type)
+            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
+            .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
@@ -833,6 +861,23 @@ impl Executor for ClaudeCliExecutor {
         let outcome = outcome?;
         persist_run_log(workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
+    }
+
+    async fn run_triage(
+        &self,
+        workspace: &Path,
+        ctx: &TriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let prompt = Self::build_triage_prompt(ctx);
+        // Triage mode does not target a specific change directory, so the
+        // per-change MCP marker plumbing is keyed by a synthetic name.
+        let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME)?;
+        let outcome = self.run_subprocess(workspace, &prompt).await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
+        self.classify_outcome(workspace, TRIAGE_LOG_CHANGE_NAME, outcome)
+            .await
     }
 }
 
