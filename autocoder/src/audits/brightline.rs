@@ -19,7 +19,10 @@ use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use super::{Audit, AuditContext, AuditOutcome, Finding, Severity, WritePolicy};
+use super::{
+    Audit, AuditContext, AuditOutcome, Finding, Severity, WritePolicy, workspace_is_valid,
+    workspace_unavailable_outcome,
+};
 use crate::config::AuditSettings;
 
 const DEFAULT_FILE_LINES_THRESHOLD: u64 = 800;
@@ -110,6 +113,14 @@ impl Audit for ArchitectureBrightlineAudit {
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
+        // Workspace-validity gate (see `audits-require-valid-workspace`).
+        // Brightline doesn't write proposals, but running it against a
+        // missing workspace produces garbage zero-file counts and is
+        // gated uniformly with every other audit type so the framework
+        // contract holds.
+        if !workspace_is_valid(ctx.workspace) {
+            return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
+        }
         let findings = self.analyze(ctx.workspace)?;
         let _ = ctx.log_writer.write_section(
             "brightline_summary",
@@ -576,6 +587,113 @@ mod tests {
         assert_eq!(captures[2].trim(), "a: u32");
     }
 
+    /// Workspace-validity gate (see `audits-require-valid-workspace`):
+    /// brightline must skip cleanly when the workspace is missing, even
+    /// though it doesn't write proposals. The gate is uniform across
+    /// every audit type for framework-contract consistency.
+    #[tokio::test]
+    async fn workspace_unavailable_when_path_does_not_exist() {
+        use crate::audits::{AuditContext, AuditLogWriter};
+        use crate::config::RepositoryConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("never-existed");
+        assert!(!workspace.exists());
+
+        let log_writer = AuditLogWriter::open(tmp.path(), ArchitectureBrightlineAudit::TYPE)
+            .expect("log writer opens");
+        let log_path = log_writer.path().to_path_buf();
+        let repo = RepositoryConfig {
+            url: "git@github.com:test/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer,
+            max_validation_retries: 0,
+        };
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type,
+                workspace_path,
+                reason,
+            } => {
+                assert_eq!(audit_type, ArchitectureBrightlineAudit::TYPE);
+                assert_eq!(workspace_path, workspace);
+                assert_eq!(reason, "workspace directory does not exist");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        assert!(!workspace.exists());
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Workspace-validity gate: existing directory without `.git/` →
+    /// WorkspaceUnavailable; the audit must not contribute zero-file
+    /// garbage findings.
+    #[tokio::test]
+    async fn workspace_unavailable_when_dot_git_missing() {
+        use crate::audits::{AuditContext, AuditLogWriter};
+        use crate::config::RepositoryConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws-no-git");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let before: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+
+        let log_writer = AuditLogWriter::open(tmp.path(), ArchitectureBrightlineAudit::TYPE)
+            .expect("log writer opens");
+        let log_path = log_writer.path().to_path_buf();
+        let repo = RepositoryConfig {
+            url: "git@github.com:test/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer,
+            max_validation_retries: 0,
+        };
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable { reason, .. } => {
+                assert_eq!(reason, "workspace exists but has no .git/ subdirectory");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        let after: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
     /// Regression guard for `a02-audit-proposal-created-notification`.
     /// `architecture_brightline` does NOT generate an LLM proposal, so
     /// the `🔍 created proposal` chatops notification must NEVER fire
@@ -592,6 +710,11 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        // Workspace-validity gate (see `audits-require-valid-workspace`)
+        // requires a `.git/` subdirectory; without it the audit would
+        // short-circuit to `WorkspaceUnavailable` and never reach the
+        // Reported branch this test exercises.
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
         // Force at least one finding (size + duplicate signature) so
         // the audit returns Reported with non-empty findings.
         let big: String = (0..1500)

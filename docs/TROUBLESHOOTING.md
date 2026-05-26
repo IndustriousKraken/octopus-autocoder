@@ -187,3 +187,33 @@ loop prevents the proposal from entering the queue in the first place.
 - The `attempt_history` in `.audit-state.json` is FIFO-bounded at 20
   entries per audit type. Older entries roll off automatically; nothing
   to garbage-collect by hand.
+
+## Audit log shows `audit skipped: workspace not in a valid state`
+
+Symptom: an audit run log contains an INFO line
+`audit skipped: workspace not in a valid state` with fields naming the
+audit type, the workspace path, and one of three reasons:
+`workspace directory does not exist`,
+`workspace exists but has no .git/ subdirectory`, or
+`workspace failed validity check`. No chatops notification fires for
+the skip, and the audit's `.audit-state.json` entry is unchanged from
+the previous run (cadence is not consumed).
+
+**This is informational.** The audit declined to run because the
+workspace is in a broken state — typically a `rm -rf` of
+`/tmp/workspaces/<sanitized>/` (operator action or a stale `wipe`
+chatops command) that occurred between iterations, or a partial clone
+that left a workspace directory without a `.git/`. The iteration's
+own `workspace_init_failure` log entry a few lines earlier (and the
+matching chatops alert under the `WorkspaceInitFailure` category)
+names the real problem. The audit skip is the expected downstream
+consequence: it exists to prevent audits from creating partial
+workspace state via `fs::create_dir_all` that future iterations would
+mistake for a real but broken clone.
+
+**What to do.** Fix the workspace-init issue the upstream alert
+identifies — usually re-clone manually OR wait for the next iteration's
+`ensure_initialized` to re-clone automatically. Once the workspace is
+back to a valid state, the audit will run on its next cadence (the
+skipped run did not consume cadence, so the next due window is
+unchanged). No special re-trigger is needed.

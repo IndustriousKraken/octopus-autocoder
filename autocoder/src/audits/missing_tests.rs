@@ -681,6 +681,100 @@ mod tests {
         }
     }
 
+    /// Workspace-validity gate (see `audits-require-valid-workspace`):
+    /// running the spec-writing helper against a nonexistent workspace
+    /// must return `WorkspaceUnavailable` with the documented reason
+    /// AND must NOT create the workspace path as a side effect (the
+    /// helper otherwise calls `fs::create_dir_all` for change dirs,
+    /// which would recursively create the missing workspace + openspec/
+    /// — the failure mode the gate exists to prevent).
+    #[tokio::test]
+    async fn workspace_unavailable_when_workspace_path_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("never-existed");
+        assert!(!workspace.exists());
+
+        let cfg = executor_cfg("/bin/true");
+        let settings_dir = TempDir::new().unwrap();
+        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(tmp.path()),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type,
+                workspace_path,
+                reason,
+            } => {
+                assert_eq!(audit_type, MissingTestsAudit::TYPE);
+                assert_eq!(workspace_path, workspace);
+                assert_eq!(reason, "workspace directory does not exist");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        assert!(
+            !workspace.exists(),
+            "missing workspace must NOT be created as a side effect"
+        );
+        assert!(
+            !workspace.join("openspec").exists(),
+            "openspec/ must NOT be created as a side effect"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Workspace-validity gate: existing directory without `.git/` →
+    /// WorkspaceUnavailable; no new files/subdirs are created.
+    #[tokio::test]
+    async fn workspace_unavailable_when_dot_git_missing() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws-no-git");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let before: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+
+        let cfg = executor_cfg("/bin/true");
+        let settings_dir = TempDir::new().unwrap();
+        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(tmp.path()),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable { reason, .. } => {
+                assert_eq!(reason, "workspace exists but has no .git/ subdirectory");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        let after: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "no new entries must appear in the workspace");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
     /// Parity check with `security_bug_audit`: the proposal-created
     /// `🔍` notification fires from the missing-tests audit too,
     /// because both delegate to `run_specs_writing_audit`. The full

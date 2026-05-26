@@ -24,7 +24,7 @@ use tokio::process::Command;
 
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
-    write_sandbox_settings,
+    workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 
@@ -130,6 +130,14 @@ impl Audit for ArchitectureConsultativeAudit {
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
+        // Workspace-validity gate (see `audits-require-valid-workspace`).
+        // MUST run before any other work — particularly before any
+        // `fs::create_dir_all` site — so a broken workspace cannot
+        // accumulate audit-created partial state.
+        if !workspace_is_valid(ctx.workspace) {
+            return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
+        }
+
         let prompt = self.resolve_prompt()?;
 
         let mut sandbox = self.sandbox.clone();
@@ -699,6 +707,9 @@ mod tests {
     async fn run_writes_full_stdout_to_audit_log() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
+        // Satisfy the workspace-validity gate
+        // (see `audits-require-valid-workspace`).
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
         let script = write_script(
             ws_dir.path(),
             "fake-claude.sh",
@@ -758,6 +769,9 @@ mod tests {
     async fn run_returns_err_on_malformed_stdout() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
+        // Satisfy the workspace-validity gate
+        // (see `audits-require-valid-workspace`).
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
         let script = write_script(
             ws_dir.path(),
             "bad.sh",
@@ -883,10 +897,109 @@ mod tests {
         );
     }
 
+    /// Workspace-validity gate (see `audits-require-valid-workspace`):
+    /// invoking the audit against a nonexistent workspace must return
+    /// `Ok(WorkspaceUnavailable { reason: "workspace directory does not exist" })`
+    /// immediately without creating the path as a side effect.
+    #[tokio::test]
+    async fn workspace_unavailable_when_path_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("never-existed");
+        assert!(!workspace.exists(), "fixture must start absent");
+
+        let cfg = executor_cfg("/bin/true");
+        let settings_dir = TempDir::new().unwrap();
+        let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf());
+        let repo = fixture_repo();
+        // Open the log writer against a temp dir (not the missing
+        // workspace) so the test doesn't need to materialize the path.
+        let log_workspace = tmp.path();
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(log_workspace),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type,
+                workspace_path,
+                reason,
+            } => {
+                assert_eq!(audit_type, ArchitectureConsultativeAudit::TYPE);
+                assert_eq!(workspace_path, workspace);
+                assert_eq!(reason, "workspace directory does not exist");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        assert!(
+            !workspace.exists(),
+            "audit must not create the workspace path as a side effect"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Workspace-validity gate (see `audits-require-valid-workspace`):
+    /// invoking the audit against a directory that has no `.git/`
+    /// subdirectory must return `Ok(WorkspaceUnavailable { reason:
+    /// "workspace exists but has no .git/ subdirectory" })` without
+    /// creating any new file or subdirectory in the workspace.
+    #[tokio::test]
+    async fn workspace_unavailable_when_dot_git_missing() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws-no-git");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let before: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+
+        let cfg = executor_cfg("/bin/true");
+        let settings_dir = TempDir::new().unwrap();
+        let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf());
+        let repo = fixture_repo();
+        let log_workspace = tmp.path();
+        let mut ctx = AuditContext {
+            workspace: &workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(log_workspace),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("gate returns Ok");
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable { reason, .. } => {
+                assert_eq!(reason, "workspace exists but has no .git/ subdirectory");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+        let after: Vec<std::ffi::OsString> = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "audit must not create any new entries");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
     #[tokio::test]
     async fn run_returns_err_on_nonzero_exit() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
+        // Satisfy the workspace-validity gate
+        // (see `audits-require-valid-workspace`).
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
         let script = write_script(
             ws_dir.path(),
             "fail.sh",

@@ -105,7 +105,10 @@ pub struct Finding {
 /// `NoFindings` → silent; `Reported` → chatops post unless empty + clean
 /// (controlled by `notify_on_clean`); `SpecsWritten` → info log only;
 /// `ValidationExhausted` → WARN log + `❌` chatops notification (the
-/// proposal was discarded, no commit made).
+/// proposal was discarded, no commit made);
+/// `WorkspaceUnavailable` → INFO log, no chatops, no cadence update
+/// (the audit declined to run because the workspace is in a broken
+/// state — the iteration-level workspace-init alert is the real signal).
 #[derive(Debug, Clone)]
 pub enum AuditOutcome {
     NoFindings,
@@ -132,6 +135,19 @@ pub enum AuditOutcome {
         audit_type: String,
         retries_attempted: u32,
         final_error: String,
+    },
+    /// The audit declined to run because the workspace is not in a
+    /// valid state (directory missing OR no `.git/` subdirectory). No
+    /// file IO, no LLM call, no state mutation: returning this variant
+    /// means the audit's `run` exited immediately at the workspace-
+    /// validity gate. The scheduler logs at INFO and does NOT update
+    /// the cadence-state file — the next iteration's cadence check
+    /// will re-evaluate and may try again if the workspace has become
+    /// valid.
+    WorkspaceUnavailable {
+        audit_type: String,
+        workspace_path: PathBuf,
+        reason: String,
     },
 }
 
@@ -162,14 +178,15 @@ impl AuditOutcome {
             Self::Reported { .. } => AuditOutcomeKind::Reported,
             Self::SpecsWritten { .. } => AuditOutcomeKind::SpecsWritten,
             Self::ValidationExhausted { .. } => AuditOutcomeKind::ValidationExhausted,
+            Self::WorkspaceUnavailable { .. } => AuditOutcomeKind::WorkspaceUnavailable,
         }
     }
 
     /// Retries used on this run, if any. Returns 0 for outcomes that
-    /// have no retry semantics (NoFindings) and the carried value for
-    /// the others. For `ValidationExhausted`, the value returned is
-    /// `retries_attempted` (the run reached its budget without
-    /// landing a valid proposal).
+    /// have no retry semantics (NoFindings, WorkspaceUnavailable) and
+    /// the carried value for the others. For `ValidationExhausted`,
+    /// the value returned is `retries_attempted` (the run reached its
+    /// budget without landing a valid proposal).
     pub fn retries_used(&self) -> u32 {
         match self {
             Self::NoFindings => 0,
@@ -178,6 +195,7 @@ impl AuditOutcome {
             Self::ValidationExhausted {
                 retries_attempted, ..
             } => *retries_attempted,
+            Self::WorkspaceUnavailable { .. } => 0,
         }
     }
 }
@@ -192,6 +210,7 @@ pub enum AuditOutcomeKind {
     Reported,
     SpecsWritten,
     ValidationExhausted,
+    WorkspaceUnavailable,
 }
 
 impl AuditOutcomeKind {
@@ -202,6 +221,7 @@ impl AuditOutcomeKind {
             Self::Reported => "Reported",
             Self::SpecsWritten => "SpecsWritten",
             Self::ValidationExhausted => "ValidationExhausted",
+            Self::WorkspaceUnavailable => "WorkspaceUnavailable",
         }
     }
 }
@@ -855,6 +875,63 @@ where
     }
 }
 
+/// Cheap precondition every audit runs at the top of its `run` method.
+/// "Valid" means the workspace directory exists AND it contains a
+/// `.git/` subdirectory. The check is a single stat per path; it
+/// performs NO file IO beyond `Path::is_dir` and never touches `fs::
+/// create_dir_all` (the very call this gate exists to prevent on a
+/// broken workspace).
+///
+/// Known limitation: git-worktree workspaces use a `.git` *file*
+/// (containing `gitdir: <path>`) rather than a directory. Autocoder's
+/// production workspaces are normal clones, so the directory check is
+/// correct for every operator-configured workspace today. If autocoder
+/// ever supports worktree-rooted workspaces, this check needs to allow
+/// the file form too.
+pub fn workspace_is_valid(workspace: &Path) -> bool {
+    workspace.is_dir() && workspace.join(".git").is_dir()
+}
+
+/// Build the documented `WorkspaceUnavailable` outcome for `workspace`
+/// and emit the single INFO log line every audit shares. Returns the
+/// outcome variant the caller's `Audit::run` returns immediately.
+///
+/// The reason string is one of three fixed values, picked by the
+/// specific precondition that failed:
+/// - `"workspace directory does not exist"` when `workspace.exists()`
+///   returns false.
+/// - `"workspace exists but has no .git/ subdirectory"` when the
+///   directory is present but `<workspace>/.git` is not a directory.
+/// - `"workspace failed validity check"` is the catch-all reserved for
+///   future checks (e.g. supporting `.git` files for worktrees).
+///
+/// The variant tag matches the documented strings in the
+/// `audits-require-valid-workspace` spec; callers should not invent
+/// alternate phrasings.
+pub fn workspace_unavailable_outcome(
+    audit_type: &str,
+    workspace: &Path,
+) -> AuditOutcome {
+    let reason = if !workspace.exists() {
+        "workspace directory does not exist".to_string()
+    } else if !workspace.join(".git").is_dir() {
+        "workspace exists but has no .git/ subdirectory".to_string()
+    } else {
+        "workspace failed validity check".to_string()
+    };
+    tracing::info!(
+        audit_type = %audit_type,
+        workspace = %workspace.display(),
+        reason = %reason,
+        "audit skipped: workspace not in a valid state"
+    );
+    AuditOutcome::WorkspaceUnavailable {
+        audit_type: audit_type.to_string(),
+        workspace_path: workspace.to_path_buf(),
+        reason,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::{RecordingBackend, make_recording_ctx};
@@ -1123,6 +1200,15 @@ mod tests {
             .kind(),
             AuditOutcomeKind::ValidationExhausted
         );
+        assert_eq!(
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type: "a".into(),
+                workspace_path: PathBuf::from("/no/such/path"),
+                reason: "workspace directory does not exist".into(),
+            }
+            .kind(),
+            AuditOutcomeKind::WorkspaceUnavailable
+        );
     }
 
     #[test]
@@ -1153,6 +1239,92 @@ mod tests {
             .retries_used(),
             4
         );
+        assert_eq!(
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type: "x".into(),
+                workspace_path: PathBuf::from("/no/such/path"),
+                reason: "workspace directory does not exist".into(),
+            }
+            .retries_used(),
+            0
+        );
+    }
+
+    #[test]
+    fn workspace_is_valid_returns_false_for_nonexistent_path() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(!workspace_is_valid(&missing));
+    }
+
+    #[test]
+    fn workspace_is_valid_returns_false_for_file_not_directory() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, "i am a file").unwrap();
+        assert!(!workspace_is_valid(&file));
+    }
+
+    #[test]
+    fn workspace_is_valid_returns_false_for_directory_without_dot_git() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(!workspace_is_valid(&ws));
+    }
+
+    #[test]
+    fn workspace_is_valid_returns_false_when_dot_git_is_a_file() {
+        // git-worktree case: `.git` is a file (e.g. `gitdir: ...`). The
+        // autocoder's production workspaces are normal clones so this
+        // remains a deliberate false; the limitation is documented on
+        // `workspace_is_valid`.
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(!workspace_is_valid(&ws));
+    }
+
+    #[test]
+    fn workspace_is_valid_returns_true_for_directory_with_dot_git_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        assert!(workspace_is_valid(&ws));
+    }
+
+    #[test]
+    fn workspace_unavailable_outcome_uses_nonexistent_reason_for_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("nope");
+        let outcome = workspace_unavailable_outcome("some_audit", &ws);
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type,
+                workspace_path,
+                reason,
+            } => {
+                assert_eq!(audit_type, "some_audit");
+                assert_eq!(workspace_path, ws);
+                assert_eq!(reason, "workspace directory does not exist");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_unavailable_outcome_uses_no_git_reason_for_dir_without_dot_git() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = workspace_unavailable_outcome("some_audit", &ws);
+        match outcome {
+            AuditOutcome::WorkspaceUnavailable { reason, .. } => {
+                assert_eq!(reason, "workspace exists but has no .git/ subdirectory");
+            }
+            other => panic!("expected WorkspaceUnavailable, got {other:?}"),
+        }
     }
 
     #[test]
