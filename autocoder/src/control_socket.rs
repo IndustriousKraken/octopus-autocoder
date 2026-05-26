@@ -67,6 +67,11 @@ pub struct RepoTaskHandle {
     /// polling loop checks + clears it at iteration start (see
     /// `polling_loop::run`).
     pub pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
+    /// Queue of `thread_ts` values awaiting audit-triage execution
+    /// (`audit-reply-acts`). The chatops dispatcher's `trigger_audit_action`
+    /// handler pushes here when an operator posts `@<bot> send it`; the
+    /// polling loop drains the queue at the start of each iteration.
+    pub pending_triages: Arc<Mutex<Vec<String>>>,
 }
 
 /// Daemon-level task registry keyed by repository URL. Mutated only by
@@ -265,6 +270,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
         "wipe_workspace" => handle_wipe_workspace(&parsed, state),
         "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
+        "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -729,6 +735,71 @@ async fn handle_rebuild_specs(parsed: &Value, state: &ControlState) -> Value {
     }
 }
 
+/// Queue an audit-triage run for the repo whose audit produced the
+/// thread named by `thread_ts`. Reads the audit-thread state to resolve
+/// repo URL + audit type, pushes the `thread_ts` onto the matching
+/// `RepoTaskHandle::pending_triages`, and returns the repo's poll
+/// interval so the chatops reply can name an ETA.
+async fn handle_trigger_audit_action(parsed: &Value, state: &ControlState) -> Value {
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let state_root = crate::audits::threads::default_state_root();
+    let audit_state = match crate::audits::threads::read_state(&state_root, &thread_ts) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no audit-thread state for thread_ts `{thread_ts}` (the chatops dispatcher should have caught this earlier)"
+                ),
+            });
+        }
+        Err(e) => {
+            return json!({"ok": false, "error": format!("reading audit-thread state: {e:#}")});
+        }
+    };
+
+    let repo = match find_repo(state, &audit_state.repo_url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&audit_state.repo_url).map(|h| h.pending_triages.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{}` (daemon may not have spawned it yet)",
+                    audit_state.repo_url
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        // De-dup: if the same thread_ts is already queued (e.g. the
+        // operator double-clicked `send it`), keep just the one entry.
+        if !g.iter().any(|t| t == &thread_ts) {
+            g.push(thread_ts.clone());
+        }
+    }
+
+    json!({
+        "ok": true,
+        "thread_ts": thread_ts,
+        "url": audit_state.repo_url,
+        "audit_type": audit_state.audit_type,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1072,6 +1143,7 @@ mod tests {
                     config,
                     join,
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    pending_triages: Arc::new(Mutex::new(Vec::new())),
                 },
             );
             drop(guard);
@@ -2087,6 +2159,7 @@ github:
                     config: Arc::new(ArcSwap::from_pointee(parked_repo)),
                     join: parked,
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    pending_triages: Arc::new(Mutex::new(Vec::new())),
                 },
             );
         }

@@ -43,6 +43,17 @@ use std::time::{Duration, Instant};
 /// Per spec scenario: "Reply 'confirm' within 60 seconds."
 pub const WIPE_CONFIRM_TTL_SECS: u64 = 60;
 
+/// Polite-refusal reply for `send it` posted in a thread autocoder is
+/// not tracking. Wording matches the `audit-reply-acts` spec scenario
+/// "Send-it in untracked thread is politely refused".
+pub const SEND_IT_REFUSE_UNTRACKED: &str =
+    "✗ This reply is in a thread autocoder is not tracking. The `send it` verb only acts in audit-notification threads.";
+
+/// Polite-refusal reply for `send it` against an audit thread whose
+/// `posted_at` is older than the 7-day staleness cap.
+pub const SEND_IT_REFUSE_STALE: &str =
+    "✗ This audit's findings are too old to act on (>7d). Re-run the audit via @<bot> audit <type> <repo>.";
+
 // ====================================================================
 // Reply shape
 // ====================================================================
@@ -173,6 +184,15 @@ pub enum OperatorCommand {
     /// repository (URL on top, summary on the next line). See
     /// `format_status_menu_reply` for the reply shape.
     StatusMenu,
+    /// `@<bot> send it` posted as a thread reply in an audit-notification
+    /// thread. Stamped with the thread's `thread_ts` by the chatops
+    /// listener (the parser sees the thread_ts via `parse_command_in_thread`
+    /// and embeds it on the command). Outside a thread, the same text
+    /// parses as the unknown-verb fallback so the listener reacts with
+    /// `?` rather than treating channel-level mentions as triage requests.
+    SendItOnAudit {
+        thread_ts: String,
+    },
     Help,
 }
 
@@ -201,6 +221,18 @@ enum ParseOutcome {
 }
 
 fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
+    parse_command_outcome_in_thread(message, bot_mention, None)
+}
+
+/// Same as `parse_command_outcome` but also threads through the
+/// inbound message's `thread_ts`. Required for verbs whose recognition
+/// depends on the message arriving inside a thread (currently only
+/// `send it`).
+fn parse_command_outcome_in_thread(
+    message: &str,
+    bot_mention: &str,
+    thread_ts: Option<&str>,
+) -> ParseOutcome {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return ParseOutcome::None;
@@ -320,6 +352,21 @@ fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
             }
             ParseOutcome::Ok(OperatorCommand::Help)
         }
+        "send" => {
+            // `@<bot> send it` parses ONLY when the inbound message
+            // arrived inside a thread (non-empty `thread_ts`) AND the
+            // verb takes exactly one positional `it`. Any other arg
+            // count or shape falls through to the unknown-verb path,
+            // which the listener turns into a `?` reaction.
+            if rest.len() != 1 || !rest[0].eq_ignore_ascii_case("it") {
+                return ParseOutcome::None;
+            }
+            let ts = match thread_ts {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return ParseOutcome::None,
+            };
+            ParseOutcome::Ok(OperatorCommand::SendItOnAudit { thread_ts: ts })
+        }
         _ => ParseOutcome::None,
     }
 }
@@ -335,6 +382,23 @@ fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
 #[allow(dead_code)]
 pub fn parse_command(message: &str, bot_mention: &str) -> Option<OperatorCommand> {
     match parse_command_outcome(message, bot_mention) {
+        ParseOutcome::Ok(cmd) => Some(cmd),
+        ParseOutcome::None | ParseOutcome::Invalid(_) => None,
+    }
+}
+
+/// Thread-aware variant of `parse_command`. Verbs whose recognition
+/// depends on the inbound message arriving inside a thread (currently
+/// only `send it`) require this entry point. Pass `thread_ts: Some(&str)`
+/// for messages with a non-empty thread root, `None` for channel-level
+/// mentions.
+#[allow(dead_code)]
+pub fn parse_command_in_thread(
+    message: &str,
+    bot_mention: &str,
+    thread_ts: Option<&str>,
+) -> Option<OperatorCommand> {
+    match parse_command_outcome_in_thread(message, bot_mention, thread_ts) {
         ParseOutcome::Ok(cmd) => Some(cmd),
         ParseOutcome::None | ParseOutcome::Invalid(_) => None,
     }
@@ -1000,6 +1064,12 @@ pub trait ActionSubmitter: Send + Sync {
 ///     posts the "no pending wipe-workspace confirmation" error.
 pub struct OperatorCommandDispatcher {
     pending: ConfirmationStore,
+    /// Directory under which the audit-thread state files live (the
+    /// dispatcher resolves `send it` requests against
+    /// `<audit_thread_state_dir>/audit-threads/<thread_ts>.json`).
+    /// Defaults to `crate::audits::threads::default_state_root()` —
+    /// tests override via `with_audit_thread_state_dir`.
+    audit_thread_state_dir: PathBuf,
 }
 
 impl Default for OperatorCommandDispatcher {
@@ -1012,7 +1082,17 @@ impl OperatorCommandDispatcher {
     pub fn new() -> Self {
         Self {
             pending: ConfirmationStore::new(),
+            audit_thread_state_dir: crate::audits::threads::default_state_root(),
         }
+    }
+
+    /// Override the audit-thread state directory. Used by tests to
+    /// point the dispatcher at a per-test `TempDir` so concurrent runs
+    /// can't trip over each other's state files.
+    #[allow(dead_code)]
+    pub fn with_audit_thread_state_dir(mut self, dir: PathBuf) -> Self {
+        self.audit_thread_state_dir = dir;
+        self
     }
 
     /// Parse `text` and execute the resulting command. Returns:
@@ -1030,7 +1110,31 @@ impl OperatorCommandDispatcher {
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> Option<Reply> {
-        match parse_command_outcome(text, bot_mention) {
+        self.handle_message_in_thread(
+            text,
+            channel_id,
+            None,
+            bot_mention,
+            repositories,
+            submitter,
+        )
+        .await
+    }
+
+    /// Thread-aware entry point. The Slack inbound listener uses this
+    /// so the `send it` verb (which only parses inside a thread) sees
+    /// the inbound envelope's `thread_ts`. Pass `None` for channel-level
+    /// mentions; pass `Some(&str)` (non-empty) for replies in a thread.
+    pub async fn handle_message_in_thread(
+        &self,
+        text: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        bot_mention: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<Reply> {
+        match parse_command_outcome_in_thread(text, bot_mention, thread_ts) {
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, repositories, submitter).await,
             )),
@@ -1225,8 +1329,96 @@ impl OperatorCommandDispatcher {
             OperatorCommand::StatusMenu => {
                 self.dispatch_status_menu(repositories, submitter).await
             }
+            OperatorCommand::SendItOnAudit { thread_ts } => {
+                self.dispatch_send_it_on_audit(&thread_ts, submitter).await
+            }
             OperatorCommand::Help => format_help_reply(),
         }
+    }
+
+    /// Handle the `send it` verb. Looks up the audit-thread state, runs
+    /// the four-case decision tree (untracked / stale / already-acted /
+    /// fresh-and-open), and on the accept path submits the
+    /// `trigger_audit_action` control-socket action AND flips the state
+    /// file's `status` to `TriagePending`. Returns the operator-facing
+    /// reply text.
+    async fn dispatch_send_it_on_audit(
+        &self,
+        thread_ts: &str,
+        submitter: &dyn ActionSubmitter,
+    ) -> String {
+        use crate::audits::threads::{
+            AuditThreadStatus, read_state, write_state,
+        };
+        let state_root = self.audit_thread_state_dir.as_path();
+        let mut state = match read_state(state_root, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return SEND_IT_REFUSE_UNTRACKED.to_string();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "audit-thread state read failed; treating as untracked: {e:#}"
+                );
+                return SEND_IT_REFUSE_UNTRACKED.to_string();
+            }
+        };
+
+        let age = chrono::Utc::now() - state.posted_at;
+        if age > chrono::Duration::days(7) {
+            return SEND_IT_REFUSE_STALE.to_string();
+        }
+
+        match state.status {
+            AuditThreadStatus::Open | AuditThreadStatus::TriageFailed => {
+                // Fresh request OR a retry after a prior failed attempt.
+                // Both transition into TriagePending; the polling loop
+                // drains the queue on its next iteration.
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "trigger_audit_action",
+                        "thread_ts": thread_ts,
+                    }))
+                    .await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ could not schedule triage: {err}");
+                }
+                state.status = AuditThreadStatus::TriagePending;
+                state.reason = None;
+                if let Err(e) = write_state(state_root, &state) {
+                    tracing::warn!(
+                        thread_ts = %thread_ts,
+                        "failed to flip audit-thread state to TriagePending: {e:#}"
+                    );
+                }
+                // The polling cadence varies per repo; the response shape
+                // also carries `poll_interval_sec` so we can name an
+                // estimate in the reply if the daemon told us one.
+                let poll_clause = resp
+                    .get("poll_interval_sec")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| format!(" (~{s}s)"))
+                    .unwrap_or_default();
+                format!(
+                    "✓ Triage scheduled for {audit_type} on {repo_url}. The next polling iteration will run it{poll_clause}.",
+                    audit_type = state.audit_type,
+                    repo_url = state.repo_url,
+                )
+            }
+            AuditThreadStatus::Acted | AuditThreadStatus::TriagePending => {
+                format!(
+                    "✗ This audit thread is already {status}. No new action taken.",
+                    status = state.status.label(),
+                )
+            }
+        }
+        // The threads module's notes prefix is unused here — `read_state`
+        // returns the on-disk truth and the dispatcher never invents one.
     }
 
     /// Build the per-repo menu reply: empty-slice short-circuit, otherwise
@@ -1694,6 +1886,87 @@ mod tests {
         assert!(parse_command("status myrepo", BOT).is_none());
         assert!(parse_command("hello world", BOT).is_none());
         assert!(parse_command("@somebody-else status myrepo", BOT).is_none());
+    }
+
+    // ---------- send it (audit-reply-acts) ----------
+
+    #[test]
+    fn parse_send_it_in_thread_parses_to_send_it_on_audit() {
+        let cmd = parse_command_in_thread(
+            &format!("{BOT} send it"),
+            BOT,
+            Some("1748293445.001234"),
+        )
+        .expect("send-it in a thread must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::SendItOnAudit {
+                thread_ts: "1748293445.001234".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_send_it_is_case_insensitive() {
+        let cmd = parse_command_in_thread(
+            &format!("{BOT} SEND IT"),
+            BOT,
+            Some("1748.999"),
+        )
+        .expect("SEND IT in a thread must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::SendItOnAudit {
+                thread_ts: "1748.999".into(),
+            }
+        );
+        let cmd2 = parse_command_in_thread(
+            &format!("{BOT} Send It"),
+            BOT,
+            Some("1748.999"),
+        )
+        .unwrap();
+        assert!(matches!(cmd2, OperatorCommand::SendItOnAudit { .. }));
+    }
+
+    #[test]
+    fn parse_send_it_outside_thread_returns_none() {
+        // Outside a thread → unknown-verb fallback (None) so the
+        // listener reacts with `?`.
+        assert!(parse_command_in_thread(&format!("{BOT} send it"), BOT, None).is_none());
+        assert!(
+            parse_command_in_thread(&format!("{BOT} send it"), BOT, Some("")).is_none(),
+            "empty thread_ts must also fall through"
+        );
+    }
+
+    #[test]
+    fn parse_send_without_it_returns_none() {
+        // `send` is not a verb on its own.
+        assert!(
+            parse_command_in_thread(&format!("{BOT} send"), BOT, Some("1.0")).is_none()
+        );
+    }
+
+    #[test]
+    fn parse_send_it_with_trailing_args_returns_none() {
+        // `send it` must be the entire verb. Anything after parses as
+        // unknown verb (no `send it <args>` shape in this iteration).
+        assert!(
+            parse_command_in_thread(&format!("{BOT} send it now"), BOT, Some("1.0")).is_none()
+        );
+        assert!(
+            parse_command_in_thread(&format!("{BOT} send it but ignore 3"), BOT, Some("1.0"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_command_without_thread_aware_entry_does_not_accept_send_it() {
+        // The legacy `parse_command` entry point has no thread context
+        // and so MUST refuse to recognize `send it` regardless of message
+        // shape.
+        assert!(parse_command(&format!("{BOT} send it"), BOT).is_none());
     }
 
     #[test]
@@ -2843,6 +3116,192 @@ mod tests {
         assert_eq!(
             wipe_call["url"], "git@github.com:acme/widgets.git",
             "the second wipe's URL must win"
+        );
+    }
+
+    // ---------- send it dispatcher (audit-reply-acts) ----------
+
+    fn write_audit_thread_state(
+        state_root: &std::path::Path,
+        thread_ts: &str,
+        status: crate::audits::threads::AuditThreadStatus,
+        posted_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let state = crate::audits::threads::AuditThreadState {
+            thread_ts: thread_ts.to_string(),
+            channel: "C_OPS".to_string(),
+            repo_url: "git@github.com:acme/myrepo.git".to_string(),
+            audit_type: "architecture_brightline".to_string(),
+            findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
+            posted_at,
+            status,
+            reason: None,
+        };
+        crate::audits::threads::write_state(state_root, &state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_it_in_untracked_thread_politely_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C1",
+                Some("1748.unknown"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("send-it must always produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "must be a refusal: {text}");
+        assert!(text.contains("not tracking"), "{text}");
+        assert!(submitter.calls().is_empty(), "no action should be submitted");
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_it_in_stale_thread_politely_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        // 14 days old → past the 7d cap → polite refusal.
+        write_audit_thread_state(
+            tmp.path(),
+            "1748.stale",
+            crate::audits::threads::AuditThreadStatus::Open,
+            chrono::Utc::now() - chrono::Duration::days(14),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C1",
+                Some("1748.stale"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"));
+        assert!(text.contains("too old"), "{text}");
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_it_in_fresh_open_thread_schedules_triage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "trigger_audit_action",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        write_audit_thread_state(
+            tmp.path(),
+            "1748.fresh",
+            crate::audits::threads::AuditThreadStatus::Open,
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C1",
+                Some("1748.fresh"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "must accept: {text}");
+        assert!(text.contains("Triage scheduled"), "{text}");
+        // Status flipped to TriagePending.
+        let after = crate::audits::threads::read_state(tmp.path(), "1748.fresh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            crate::audits::threads::AuditThreadStatus::TriagePending
+        );
+        // Exactly one action submitted: the trigger.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "trigger_audit_action");
+        assert_eq!(calls[0]["thread_ts"], "1748.fresh");
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_it_on_already_acted_thread_refuses_with_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        write_audit_thread_state(
+            tmp.path(),
+            "1748.acted",
+            crate::audits::threads::AuditThreadStatus::Acted,
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C1",
+                Some("1748.acted"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"));
+        assert!(text.contains("acted"), "must name the status: {text}");
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_it_on_triage_failed_thread_reschedules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "trigger_audit_action",
+            serde_json::json!({"ok": true}),
+        );
+        write_audit_thread_state(
+            tmp.path(),
+            "1748.retry",
+            crate::audits::threads::AuditThreadStatus::TriageFailed,
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C1",
+                Some("1748.retry"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "retry must be accepted: {text}");
+        let after = crate::audits::threads::read_state(tmp.path(), "1748.retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            crate::audits::threads::AuditThreadStatus::TriagePending
         );
     }
 

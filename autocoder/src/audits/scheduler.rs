@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::state::{AttemptEntry, AuditRunEntry, AuditState};
+use super::threads::{
+    self, AuditThreadState, AuditThreadStatus, cap_findings_excerpt, default_state_root,
+    write_state,
+};
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry, Finding, Severity,
     VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, format_audit_notification, truncate_chars,
@@ -536,7 +540,7 @@ async fn dispatch_reported_to_chatops(
         format_audit_notification(audit_type, repo_url, findings, notify_on_clean, Utc::now());
     if notification.should_thread {
         let top_line = format!("{}{retry_clause}", notification.top_line);
-        if let Err(e) = ctx
+        match ctx
             .chatops
             .post_notification_with_thread(
                 &ctx.channel,
@@ -545,11 +549,30 @@ async fn dispatch_reported_to_chatops(
             )
             .await
         {
-            tracing::warn!(
-                url = %repo_url,
-                audit_type,
-                "audit chatops thread post failed: {e:#}"
-            );
+            Ok(Some(thread_ts)) => {
+                // The backend supports threading; record the audit-thread
+                // state so the chatops dispatcher can resolve `@<bot> send
+                // it` against this thread in the operator's reply path.
+                stamp_audit_thread_state(
+                    repo_url,
+                    audit_type,
+                    &ctx.channel,
+                    &thread_ts,
+                    &notification.thread_body,
+                );
+            }
+            Ok(None) => {
+                // Backend without native threading (default impl) —
+                // nothing to track. Already logged inline by the
+                // backend when the inline-concatenation path runs.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    url = %repo_url,
+                    audit_type,
+                    "audit chatops thread post failed: {e:#}"
+                );
+            }
         }
     } else {
         // Inline form: top_line + (optional body), then the retry clause
@@ -571,6 +594,49 @@ async fn dispatch_reported_to_chatops(
             );
         }
     }
+}
+
+/// Write the audit-thread state file that the `audit-reply-acts` flow
+/// consults when an operator posts `@<bot> send it` in this audit's
+/// reply thread. Failures are logged at WARN and never propagated —
+/// missing the state is a degradation (the bot's polite-refusal path
+/// kicks in) but the audit notification has already landed and the
+/// scheduler's job is done.
+fn stamp_audit_thread_state(
+    repo_url: &str,
+    audit_type: &str,
+    channel: &str,
+    thread_ts: &str,
+    findings_body: &str,
+) {
+    let state = AuditThreadState {
+        thread_ts: thread_ts.to_string(),
+        channel: channel.to_string(),
+        repo_url: repo_url.to_string(),
+        audit_type: audit_type.to_string(),
+        findings_excerpt: cap_findings_excerpt(findings_body),
+        posted_at: Utc::now(),
+        status: AuditThreadStatus::Open,
+        reason: None,
+    };
+    let root = default_state_root();
+    if let Err(e) = write_state(&root, &state) {
+        tracing::warn!(
+            audit_type,
+            thread_ts = %thread_ts,
+            "failed to stamp audit-thread state (audit-reply-acts `send it` will not resolve this thread): {e:#}"
+        );
+    } else {
+        tracing::debug!(
+            audit_type,
+            thread_ts = %thread_ts,
+            "stamped audit-thread state for `send it` resolution"
+        );
+    }
+    // Silence the unused-import warning when `threads` is otherwise
+    // unused inside this module — the import is via the helper, but
+    // the explicit reference here lets `cargo` notice it.
+    let _ = threads::state_dir(&root);
 }
 
 /// Render the `" (validated on retry N of M)"` clause appended to the

@@ -353,6 +353,14 @@ The log contains: the audit type, workspace path, start/end timestamps, the reso
 
 The polling iteration also gates the entire audit scheduler on `ensure_initialized` success: if workspace init failed for the iteration, the scheduler is not invoked at all. The per-audit gate catches the rarer case where the workspace becomes invalid mid-iteration; the iteration-level gate catches the common case where the workspace was invalid at iteration start. Both gates together close the upstream gap where an audit's `fs::create_dir_all` could create the workspace's parent directories without a real clone — leaving behind a broken state that future iterations could not recover from.
 
+**Acting on findings: the audit → review → `send it` → fixes-PR + spec-PR → revise loop.** When an audit's findings post to chatops via the threaded path, autocoder stamps an audit-thread state file (`<system-temp>/autocoder/audit-threads/<thread_ts>.json`) keyed by the Slack thread's `thread_ts`. An operator reviewing the findings has three options:
+
+1. **Ignore.** The thread state file expires after 7 days and is pruned automatically.
+2. **Triage by hand.** SSH to the workspace, edit code or write a new `openspec/changes/<slug>/` proposal, push and PR like normal.
+3. **`@<bot> send it`** posted as a reply inside the audit's thread. The dispatcher validates the thread (tracked, fresh, status `open` or `triage-failed`), submits a `trigger_audit_action` to the daemon, and flips the state to `triage-pending`. The next polling iteration drains the triage queue: the executor runs in triage mode against the findings, explores the codebase, classifies each finding as quick-fix or spec-worthy, applies both kinds of output, and autocoder splits the resulting diff into up to two PRs (a **fixes PR** for code paths and a **spec PR** for new `openspec/changes/<slug>/` paths, cross-linked when both are created). The state file flips to `acted` after the PRs land. See [CHATOPS.md → Acting on an audit's findings: `send it`](CHATOPS.md#acting-on-an-audits-findings-send-it) for the full operator-facing surface.
+
+Both triage-spawned PRs are normal autocoder-opened PRs that participate in the existing PR-comment revision loop (see [Revising an open PR via comment](#revising-an-open-pr-via-comment) below). If the agent over-promoted a finding to a spec or under-fixed by missing something obvious, `@<bot> revise <text>` on either PR gets revisions through the standard channel — the same channel the spec-driven workflow uses for correcting any other autocoder-opened PR.
+
 ## Recovering from a bad run
 
 The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](CLI.md#rewind) below.

@@ -354,6 +354,32 @@ Random chat that happens to mention the bot but doesn't match a known verb (typo
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
 
+### Acting on an audit's findings: `send it`
+
+When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
+
+The verb is `send it`:
+
+```
+@<bot> send it       (posted as a reply inside the audit thread)
+```
+
+Outside an audit thread, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction. Inside a tracked, fresh, open audit thread it spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** (apply directly to source) or **spec-worthy** (write a new `openspec/changes/<slug>/` proposal), then applies both kinds of output. The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced PRs within one polling cycle.
+
+**Two-PR output shape.** autocoder splits the executor's diff by path: anything under the new `openspec/changes/<slug>/` directory becomes a separate **spec PR**; everything else becomes a **fixes PR**. Each PR is created on its own branch off `base_branch` and its body cross-links the companion PR (when both are created). If the triage diff has only code, only the fixes PR is created. If it has only a new spec, only the spec PR is created. If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread.
+
+**7-day staleness rule.** Audit-thread state files are pruned after 7 days regardless of status. A `send it` against an audit older than 7 days gets a polite refusal:
+
+```
+✗ This audit's findings are too old to act on (>7d). Re-run the audit via @<bot> audit <type> <repo>.
+```
+
+This is intentional: stale audit findings probably no longer reflect the current code, and acting on them blindly burns tokens producing a useless diff.
+
+**Already-acted threads.** Once a triage has run on an audit thread, subsequent `send it` replies get a polite refusal naming the current status (`triage-pending`, `acted`). The exception is `triage-failed`: a failed triage resets back to `triage-pending` on retry, so the operator can `send it` again after fixing whatever went wrong.
+
+**Revising the produced PRs.** Both the fixes PR and the spec PR are normal autocoder-opened PRs. They participate in the existing `a01-pr-comment-revision-loop`, so `@<bot> revise <text>` on either PR gets revisions through the standard channel. If the agent over-promoted findings to specs, ask it to inline the fix via a revision comment on the spec PR; if it under-fixed, point that out via a revision comment on the fixes PR.
+
 ### Trust boundary
 
 Whoever has write access to the configured chatops channel is treated as an operator — the same trust boundary as the existing `AskUser` reply detection. Sites that need finer-grained control configure separate channels per concern via the existing per-repo `chatops_channel_id` override.

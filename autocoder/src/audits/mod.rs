@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod security_bug;
 pub mod specs_writing;
 pub mod state;
+pub mod threads;
 #[cfg(test)]
 pub mod test_support;
 
@@ -738,6 +739,7 @@ pub async fn post_validation_exhausted_notification(
         ctx.chatops
             .post_notification_with_thread(&ctx.channel, &top_line, &thread_body)
             .await
+            .map(|_| ())
     } else {
         let text = format_validation_exhausted_message(
             repo_url,

@@ -239,7 +239,7 @@ impl ChatOpsBackend for SlackBackend {
         channel: &str,
         top_line: &str,
         thread_body: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let url = format!(
             "{}/chat.postMessage",
             self.api_base.trim_end_matches('/')
@@ -306,7 +306,7 @@ impl ChatOpsBackend for SlackBackend {
                     thread_ts = %thread_ts,
                     "slack thread reply request failed; top-line already posted: {e}"
                 );
-                return Ok(());
+                return Ok(Some(thread_ts));
             }
         };
         let status = resp.status();
@@ -316,10 +316,10 @@ impl ChatOpsBackend for SlackBackend {
                 thread_ts = %thread_ts,
                 "slack thread reply http {status}; top-line already posted",
             );
-            return Ok(());
+            return Ok(Some(thread_ts));
         }
         match resp.json::<PostMessageResponse>().await {
-            Ok(parsed) if parsed.ok => Ok(()),
+            Ok(parsed) if parsed.ok => Ok(Some(thread_ts)),
             Ok(parsed) => {
                 tracing::warn!(
                     channel = channel,
@@ -327,7 +327,7 @@ impl ChatOpsBackend for SlackBackend {
                     "slack thread reply failed: {}; top-line already posted",
                     parsed.error.unwrap_or_else(|| "unknown".to_string())
                 );
-                Ok(())
+                Ok(Some(thread_ts))
             }
             Err(e) => {
                 tracing::warn!(
@@ -335,7 +335,7 @@ impl ChatOpsBackend for SlackBackend {
                     thread_ts = %thread_ts,
                     "slack thread reply decode failed: {e}; top-line already posted",
                 );
-                Ok(())
+                Ok(Some(thread_ts))
             }
         }
     }
@@ -1340,7 +1340,7 @@ mod tests {
             .create_async()
             .await;
 
-        backend
+        let outcome = backend
             .post_notification_with_thread(
                 "C0FOO",
                 "📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)",
@@ -1348,6 +1348,13 @@ mod tests {
             )
             .await
             .expect("happy path returns Ok");
+        // Native-threading backend MUST surface the top-line `ts` so
+        // the audit-reply-acts scheduler can stamp the audit-thread state.
+        assert_eq!(
+            outcome.as_deref(),
+            Some("9999.5555"),
+            "slack threaded post must return the top-line ts"
+        );
 
         top_mock.assert_async().await;
         reply_mock.assert_async().await;

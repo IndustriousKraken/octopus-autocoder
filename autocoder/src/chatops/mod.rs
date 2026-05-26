@@ -95,17 +95,22 @@ pub trait ChatOpsBackend: Send + Sync {
     /// Post a notification whose body might be long enough to warrant
     /// threading. Backends that support native threading (Slack) post
     /// the `top_line` as the top-level message and `thread_body` as a
-    /// threaded reply. Backends without threading (default impl)
-    /// concatenate the two with a blank-line separator and post as a
-    /// single message via `post_notification`.
+    /// threaded reply, returning `Ok(Some(thread_ts))` where the
+    /// `thread_ts` names the top-level message id callers can use to
+    /// track replies (see the `audit-reply-acts` flow's audit-thread
+    /// state stamping). Backends without threading (default impl)
+    /// concatenate the two with a blank-line separator, post as a
+    /// single message via `post_notification`, and return `Ok(None)`
+    /// — there's no addressable thread to track.
     async fn post_notification_with_thread(
         &self,
         channel: &str,
         top_line: &str,
         thread_body: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let combined = format!("{top_line}\n\n{thread_body}");
-        self.post_notification(channel, &combined).await
+        self.post_notification(channel, &combined).await?;
+        Ok(None)
     }
 
     /// Post `text` as a threaded reply to the message at `(channel,
@@ -622,10 +627,15 @@ mod tests {
     #[tokio::test]
     async fn default_post_notification_with_thread_degrades_to_post_notification() {
         let backend = CapturingBackend::new();
-        backend
+        let outcome = backend
             .post_notification_with_thread("C_FAKE", "📐 top line", "line1\nline2\nline3")
             .await
             .unwrap();
+        // Default impl has no addressable thread → returns None.
+        assert!(
+            outcome.is_none(),
+            "default impl must return None for thread_ts (no native threading)"
+        );
         let calls = backend.calls.lock().unwrap();
         assert_eq!(
             calls.len(),
