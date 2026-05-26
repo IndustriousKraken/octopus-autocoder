@@ -296,3 +296,11 @@ github:
 #       # prompt_path: /etc/autocoder/prompts/arch-consult.md
 #       notify_on_clean: false
 #       extra: {}
+#
+#   # Number of retry attempts after an LLM-driven audit's generated
+#   # proposal fails `openspec validate --strict`. Each retry re-invokes
+#   # the audit's LLM with the validation error appended to the prompt.
+#   # `0` disables retries (first failure → ValidationExhausted, discard,
+#   # chatops failure notification). Values above `5` are clamped down at
+#   # startup with a WARN log. Default: 1.
+#   max_validation_retries: 1

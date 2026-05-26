@@ -379,12 +379,13 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::SpecsWritten { changes: names, .. } => {
                 assert_eq!(
                     names,
                     vec!["fix-off-by-one-in-queue-walker".to_string()]
@@ -436,12 +437,13 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::SpecsWritten { changes: names, .. } => {
                 assert_eq!(
                     names,
                     vec!["secure-sanitize-user-paths".to_string()]
@@ -502,12 +504,13 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::SpecsWritten { changes: names, .. } => {
                 assert_eq!(names.len(), 2, "cap must hold: got {names:?}");
                 // Deterministic: sorted names → fix-a, secure-b kept;
                 // secure-c dropped.
@@ -531,6 +534,211 @@ mod tests {
             log.contains("secure-c"),
             "log must name the dropped change: {log}"
         );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    // ------------- Retry-on-validation-failure scenarios -------------
+
+    /// All-invalid run with `max_validation_retries: 0` returns
+    /// `ValidationExhausted`, removes the dirs, and (when chatops is
+    /// configured) posts the `❌` notification. Mirrors the spec's
+    /// "Retry budget exhausted" scenario for the specs-writing case.
+    #[tokio::test]
+    async fn all_invalid_returns_validation_exhausted_and_discards() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let new = ws
+            .join("openspec/changes/fix-bogus")
+            .display()
+            .to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\necho '# bogus' > '{new}/proposal.md'\nexit 0\n"
+            ),
+        );
+        let bad_validator = write_script(
+            &ws,
+            "fake-openspec-fail.sh",
+            "#!/bin/sh\necho 'MODIFIED header not found' >&2\nexit 2\n",
+        );
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(bad_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::ValidationExhausted {
+                audit_type,
+                retries_attempted,
+                final_error,
+            } => {
+                assert_eq!(audit_type, "security_bug_audit");
+                assert_eq!(retries_attempted, 0);
+                assert!(
+                    final_error.contains("fix-bogus"),
+                    "final_error names failed change: {final_error}"
+                );
+            }
+            other => panic!("expected ValidationExhausted, got {other:?}"),
+        }
+        // No commit must have been made and the change dir must be gone.
+        assert!(
+            !ws.join("openspec/changes/fix-bogus").exists(),
+            "invalid change dir must be deleted in the exhausted path"
+        );
+        let head = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "5"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&head.stdout);
+        assert!(
+            !log_str.contains("security-bug proposals"),
+            "no commit must reference the audit on exhaustion: {log_str}"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// `max_validation_retries: 1` with a validator that fails the
+    /// first attempt and passes the second → the audit commits the
+    /// retried change and returns `SpecsWritten { retries_used: 1 }`.
+    /// Mirrors the spec's "Validation passes after one retry"
+    /// scenario.
+    #[tokio::test]
+    async fn invalid_then_valid_with_one_retry_succeeds_with_retries_used_one() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let new = ws
+            .join("openspec/changes/fix-retry-me")
+            .display()
+            .to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\necho '# proposal' > '{new}/proposal.md'\nexit 0\n"
+            ),
+        );
+        // Validator: fails first invocation, passes second.
+        let toggle = ws.join(".validator-toggle");
+        let validator = write_script(
+            &ws,
+            "fake-openspec-toggle.sh",
+            &format!(
+                "#!/bin/sh\nMARK='{}'\nif [ ! -f \"$MARK\" ]; then\n  touch \"$MARK\"\n  echo 'missing SHALL keyword' >&2\n  exit 2\nfi\nexit 0\n",
+                toggle.display()
+            ),
+        );
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 1,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten {
+                changes,
+                retries_used,
+            } => {
+                assert_eq!(changes, vec!["fix-retry-me".to_string()]);
+                assert_eq!(retries_used, 1);
+            }
+            other => panic!("expected SpecsWritten on retry, got {other:?}"),
+        }
+        // The validated change must have been committed.
+        let head = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "5"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&head.stdout);
+        assert!(
+            log_str.contains("security-bug proposals") && log_str.contains("1 change(s)"),
+            "commit message must reflect the validated count: {log_str}"
+        );
+        // Audit log contains the addendum-bearing prompt on attempt 1.
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("security_bug_audit_prompt_attempt_0"),
+            "attempt 0 prompt section must exist: {log}"
+        );
+        assert!(
+            log.contains("security_bug_audit_prompt_attempt_1"),
+            "attempt 1 prompt section must exist after retry: {log}"
+        );
+        assert!(
+            log.contains("Your previous response produced this proposal which failed openspec validation"),
+            "retry prompt must include the documented addendum prefix: {log}"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Zero new change dirs is a legitimate "no findings" — even when
+    /// `max_validation_retries > 0`, the audit must NOT retry (there is
+    /// nothing to validate). Empty `SpecsWritten` with `retries_used: 0`.
+    #[tokio::test]
+    async fn zero_change_dirs_is_no_findings_and_does_not_retry() {
+        let (_t, ws) = init_workspace_with(&[]);
+        // CLI produces nothing.
+        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            // Generous retry budget; the audit MUST NOT consume it just
+            // because zero change dirs were produced.
+            max_validation_retries: 3,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten {
+                changes,
+                retries_used,
+            } => {
+                assert!(changes.is_empty());
+                assert_eq!(retries_used, 0, "zero proposals must not consume retries");
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }

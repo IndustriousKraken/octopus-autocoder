@@ -21,7 +21,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use super::{AuditContext, AuditLogWriter, AuditOutcome, write_sandbox_settings};
+use super::{
+    AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
+    format_validation_exhausted_message, write_sandbox_settings,
+};
 use crate::config::ResolvedSandbox;
 
 /// Tools every spec-writing audit allows. `Write` and `Edit` are needed
@@ -69,13 +72,25 @@ pub(crate) struct SpecsWritingAuditParams<'a> {
 
 /// Execute one spec-writing audit run. Returns the outcome the framework
 /// dispatches on; never panics on agent misbehavior.
+///
+/// Validation retry semantics: when EVERY new change directory the LLM
+/// produced fails `openspec validate <name> --strict`, the LLM is
+/// re-invoked with the validation errors appended to the prompt
+/// (per [`build_validation_addendum`]). This repeats until either a
+/// valid change dir lands OR the
+/// [`AuditContext::max_validation_retries`] budget is exhausted. If
+/// the LLM produces a mix of valid and invalid change dirs, the
+/// existing per-change drop behavior wins (invalid dirs deleted, valid
+/// dirs kept, no retry). When the LLM produces zero change dirs the
+/// run is a successful "no findings" with `retries_used: 0` (zero
+/// proposals is a legitimate outcome, not a validation failure).
 pub(crate) async fn run_specs_writing_audit(
     params: SpecsWritingAuditParams<'_>,
     ctx: &mut AuditContext<'_>,
 ) -> Result<AuditOutcome> {
     let audit_type = params.audit_type;
-
-    let before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
+    let max_retries = ctx.max_validation_retries;
+    let total_attempts = max_retries.saturating_add(1);
 
     let mut sandbox = params.sandbox.clone();
     sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
@@ -84,93 +99,160 @@ pub(crate) async fn run_specs_writing_audit(
         write_sandbox_settings(&sandbox, params.settings_dir)
             .with_context(|| format!("generating {audit_type} sandbox settings file"))?;
 
+    let initial_before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
     let _ = ctx.log_writer.write_section(
         &format!("{audit_type}_preamble"),
         &format!(
-            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nsettings_file: {}\nallowed_tools: {}\npre_run_change_dirs: {}",
+            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nsettings_file: {}\nallowed_tools: {}\npre_run_change_dirs: {}",
             params.executor_command,
             params.executor_timeout_secs,
             params.prompt_source,
             params.max_proposals,
+            max_retries,
             settings_path.display(),
             sandbox.allowed_tools.join(","),
-            before.len(),
+            initial_before.len(),
         ),
     );
-    let _ = ctx
-        .log_writer
-        .write_section(&format!("{audit_type}_prompt"), params.prompt);
 
-    let outcome = run_subprocess(
-        audit_type,
-        params.executor_command,
-        &settings_path,
-        &sandbox.allowed_tools,
-        ctx.workspace,
-        params.prompt,
-        Duration::from_secs(params.executor_timeout_secs),
-    )
-    .await
-    .with_context(|| format!("spawning {audit_type} CLI subprocess"))?;
+    // Per-attempt state: dirs created on the prior attempt that we
+    // need to clear before the next LLM call (we ran into validation
+    // failures and are retrying).
+    let mut prior_attempt_dirs: Vec<String> = Vec::new();
+    // The validation error from the most recent failed attempt, fed
+    // to the LLM as a prompt addendum on the next attempt.
+    let mut last_addendum_body: Option<String> = None;
 
-    let _ = ctx.log_writer.write_section(
-        &format!("{audit_type}_stdout"),
-        if outcome.stdout.is_empty() {
-            "(empty)"
-        } else {
-            outcome.stdout.as_str()
-        },
-    );
-    let _ = ctx.log_writer.write_section(
-        &format!("{audit_type}_stderr"),
-        if outcome.stderr.is_empty() {
-            "(empty)"
-        } else {
-            outcome.stderr.as_str()
-        },
-    );
+    for attempt in 0..total_attempts {
+        // Clean up dirs produced by the prior failed attempt so they do
+        // not pollute this attempt's diff.
+        for name in &prior_attempt_dirs {
+            let path = ctx.workspace.join("openspec/changes").join(name);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        prior_attempt_dirs.clear();
 
-    if let Some(err) = outcome_to_terminal_err(
-        &outcome,
-        &mut ctx.log_writer,
-        audit_type,
-        params.executor_timeout_secs,
-    ) {
-        return Err(err);
-    }
+        let before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
 
-    let after = snapshot_change_dirs(ctx.workspace);
-    let mut new_dirs: Vec<String> = after.difference(&before).cloned().collect();
-    new_dirs.sort();
+        let effective_prompt = match &last_addendum_body {
+            None => params.prompt.to_string(),
+            Some(err) => format!(
+                "{}\n\n{}",
+                params.prompt,
+                build_validation_addendum(err)
+            ),
+        };
 
-    let cap = params.max_proposals as usize;
-    if new_dirs.len() > cap {
-        let dropped: Vec<String> = new_dirs.split_off(cap);
-        for d in &dropped {
-            let path = ctx.workspace.join("openspec/changes").join(d);
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                tracing::warn!(
-                    audit_type = audit_type,
-                    path = %path.display(),
-                    "failed to remove over-cap change dir: {e}"
-                );
+        let _ = ctx.log_writer.write_section(
+            &format!("{audit_type}_prompt_attempt_{attempt}"),
+            &effective_prompt,
+        );
+
+        let outcome = run_subprocess(
+            audit_type,
+            params.executor_command,
+            &settings_path,
+            &sandbox.allowed_tools,
+            ctx.workspace,
+            &effective_prompt,
+            Duration::from_secs(params.executor_timeout_secs),
+        )
+        .await
+        .with_context(|| format!("spawning {audit_type} CLI subprocess"))?;
+
+        let _ = ctx.log_writer.write_section(
+            &format!("{audit_type}_stdout_attempt_{attempt}"),
+            if outcome.stdout.is_empty() {
+                "(empty)"
+            } else {
+                outcome.stdout.as_str()
+            },
+        );
+        let _ = ctx.log_writer.write_section(
+            &format!("{audit_type}_stderr_attempt_{attempt}"),
+            if outcome.stderr.is_empty() {
+                "(empty)"
+            } else {
+                outcome.stderr.as_str()
+            },
+        );
+
+        if let Some(err) = outcome_to_terminal_err(
+            &outcome,
+            &mut ctx.log_writer,
+            audit_type,
+            params.executor_timeout_secs,
+        ) {
+            return Err(err);
+        }
+
+        let after = snapshot_change_dirs(ctx.workspace);
+        let mut new_dirs: Vec<String> = after.difference(&before).cloned().collect();
+        new_dirs.sort();
+
+        let cap = params.max_proposals as usize;
+        if new_dirs.len() > cap {
+            let dropped: Vec<String> = new_dirs.split_off(cap);
+            for d in &dropped {
+                let path = ctx.workspace.join("openspec/changes").join(d);
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(
+                        audit_type = audit_type,
+                        path = %path.display(),
+                        "failed to remove over-cap change dir: {e}"
+                    );
+                }
+            }
+            let _ = ctx.log_writer.write_section(
+                &format!("{audit_type}_dropped_over_cap"),
+                &format!(
+                    "cap: {}\ndropped:\n{}",
+                    params.max_proposals,
+                    dropped.join("\n")
+                ),
+            );
+        }
+
+        if new_dirs.is_empty() {
+            // Zero proposals — legitimate "no findings", not a
+            // validation failure. Exit the retry loop with empty list.
+            let _ = ctx.log_writer.write_section(
+                &format!("{audit_type}_outcome"),
+                &format!("kind: SpecsWritten\nvalidated_count: 0\nretries_used: {attempt}"),
+            );
+            return Ok(AuditOutcome::SpecsWritten {
+                changes: Vec::new(),
+                retries_used: attempt,
+            });
+        }
+
+        let mut validated: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for name in &new_dirs {
+            match validate_change(params.openspec_command, ctx.workspace, name).await {
+                Ok(()) => validated.push(name.clone()),
+                Err(e) => failures.push((name.clone(), format!("{e:#}"))),
             }
         }
-        let _ = ctx.log_writer.write_section(
-            &format!("{audit_type}_dropped_over_cap"),
-            &format!(
-                "cap: {}\ndropped:\n{}",
-                params.max_proposals,
-                dropped.join("\n")
-            ),
-        );
-    }
 
-    let mut validated: Vec<String> = Vec::new();
-    for name in &new_dirs {
-        match validate_change(params.openspec_command, ctx.workspace, name).await {
-            Ok(()) => validated.push(name.clone()),
-            Err(e) => {
+        // Log every per-change validation failure so operators can audit
+        // exactly what the LLM produced and why.
+        for (name, err) in &failures {
+            let _ = ctx.log_writer.write_section(
+                &format!("{audit_type}_validation_failure_{name}_attempt_{attempt}"),
+                &format!("change: {name}\nattempt: {attempt}\nerror: {err}"),
+            );
+            tracing::warn!(
+                audit_type = audit_type,
+                change = %name,
+                attempt = attempt,
+                "rejecting agent-produced change that failed `openspec validate --strict`: {err}"
+            );
+        }
+
+        if !validated.is_empty() {
+            // Mixed run: keep valid, drop invalid, commit, return.
+            for (name, _) in &failures {
                 let path = ctx.workspace.join("openspec/changes").join(name);
                 if let Err(rm_err) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(
@@ -179,52 +261,102 @@ pub(crate) async fn run_specs_writing_audit(
                         "failed to remove invalid change dir: {rm_err}"
                     );
                 }
-                let _ = ctx.log_writer.write_section(
-                    &format!("{audit_type}_validation_failure_{name}"),
-                    &format!("change: {name}\nerror: {e:#}"),
-                );
+            }
+            git_add_openspec_changes(ctx.workspace)
+                .with_context(|| format!("staging {audit_type}'s openspec/changes/ for commit"))?;
+            let commit_msg = format!(
+                "audit: {} ({} change(s))",
+                params.commit_subject,
+                validated.len()
+            );
+            crate::git::commit(ctx.workspace, &commit_msg).with_context(|| {
+                format!(
+                    "committing {audit_type}'s {} change(s)",
+                    validated.len()
+                )
+            })?;
+
+            let _ = ctx.log_writer.write_section(
+                &format!("{audit_type}_outcome"),
+                &format!(
+                    "kind: SpecsWritten\nvalidated_count: {}\nretries_used: {attempt}\nchanges:\n{}",
+                    validated.len(),
+                    validated.join("\n")
+                ),
+            );
+
+            return Ok(AuditOutcome::SpecsWritten {
+                changes: validated,
+                retries_used: attempt,
+            });
+        }
+
+        // All produced dirs failed validation. Drop them and either
+        // retry (if budget remains) or return ValidationExhausted.
+        prior_attempt_dirs = failures.iter().map(|(n, _)| n.clone()).collect();
+        let combined_err = failures
+            .iter()
+            .map(|(n, e)| format!("{n}: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if attempt + 1 < total_attempts {
+            // Retry. Stash the combined error as the addendum for the
+            // next LLM call. The dirs get deleted at the top of the
+            // next iteration.
+            last_addendum_body = Some(combined_err);
+            continue;
+        }
+
+        // Exhausted budget. Clean up and notify.
+        for name in &prior_attempt_dirs {
+            let path = ctx.workspace.join("openspec/changes").join(name);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        prior_attempt_dirs.clear();
+        let _ = ctx.log_writer.write_section(
+            &format!("{audit_type}_outcome"),
+            &format!(
+                "kind: ValidationExhausted\nretries_attempted: {attempt}\nfinal_error:\n{combined_err}"
+            ),
+        );
+
+        // Post the chatops `❌` notification directly so the helper's
+        // single-slug directory cleanup does not race with our multi-
+        // dir cleanup above.
+        if let Some(chat_ctx) = ctx.chatops_ctx {
+            let text = format_validation_exhausted_message(
+                &ctx.repo.url,
+                audit_type,
+                attempt,
+                &combined_err,
+            );
+            if let Err(e) = chat_ctx
+                .chatops
+                .post_notification(&chat_ctx.channel, &text)
+                .await
+            {
                 tracing::warn!(
                     audit_type = audit_type,
-                    change = %name,
-                    "rejecting agent-produced change that failed `openspec validate --strict`: {e:#}"
+                    "validation-exhausted chatops post failed: {e:#}"
                 );
             }
         }
+
+        return Ok(AuditOutcome::ValidationExhausted {
+            audit_type: audit_type.to_string(),
+            retries_attempted: attempt,
+            final_error: combined_err,
+        });
     }
 
-    if validated.is_empty() {
-        let _ = ctx.log_writer.write_section(
-            &format!("{audit_type}_outcome"),
-            "kind: SpecsWritten\nvalidated_count: 0",
-        );
-        return Ok(AuditOutcome::SpecsWritten(Vec::new()));
-    }
-
-    git_add_openspec_changes(ctx.workspace)
-        .with_context(|| format!("staging {audit_type}'s openspec/changes/ for commit"))?;
-    let commit_msg = format!(
-        "audit: {} ({} change(s))",
-        params.commit_subject,
-        validated.len()
-    );
-    crate::git::commit(ctx.workspace, &commit_msg).with_context(|| {
-        format!(
-            "committing {audit_type}'s {} change(s)",
-            validated.len()
-        )
-    })?;
-
-    let _ = ctx.log_writer.write_section(
-        &format!("{audit_type}_outcome"),
-        &format!(
-            "kind: SpecsWritten\nvalidated_count: {}\nchanges:\n{}",
-            validated.len(),
-            validated.join("\n")
-        ),
-    );
-
-    Ok(AuditOutcome::SpecsWritten(validated))
+    // Loop always returns inside; this is unreachable in practice but
+    // makes the function total without a panic.
+    unreachable!(
+        "specs-writing retry loop must return from inside; max_retries was {max_retries}"
+    )
 }
+
 
 /// Enumerate the immediate child directory names under
 /// `<workspace>/openspec/changes/`. Returns an empty set if the

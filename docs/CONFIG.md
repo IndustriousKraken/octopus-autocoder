@@ -71,6 +71,7 @@ Top-level periodic-audit framework configuration. Absent block → every audit's
 |---|---|---|
 | `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`); typos fail at config load with a list of known slugs. |
 | `settings` | `map<audit-slug, AuditSettings>` | Per-audit knobs. See below. |
+| `max_validation_retries` | `u32` (default `1`, max `5`) | Number of retry attempts after an LLM-driven audit's generated proposal fails `openspec validate --strict`. Each retry re-invokes the audit's LLM with the validation error appended to the prompt. `0` disables retries (first failure → `ValidationExhausted`, discard, chatops `❌` notification). Values above `5` are clamped at load with a WARN log. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#audit-produces-invalid-proposal--what-to-do) for the operator-side workflow. |
 
 Per-repo override: each entry under `repositories[]` accepts an `audits:` field that maps audit slugs to cadences. Per-repo entries take precedence over `audits.defaults`; an absent entry in both locations resolves to `disabled`.
 

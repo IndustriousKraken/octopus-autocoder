@@ -19,14 +19,17 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::state::{AuditRunEntry, AuditState};
+use super::state::{AttemptEntry, AuditRunEntry, AuditState};
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry, Finding, Severity,
-    WritePolicy,
+    VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, truncate_chars,
 };
 use crate::alert_state::AlertCategory;
 use crate::alerts::handle_predictable_failure;
-use crate::config::{AuditSettings, AuditsConfig, RepositoryConfig, resolved_cadence};
+use crate::config::{
+    AuditSettings, AuditsConfig, RepositoryConfig, default_max_validation_retries,
+    resolved_cadence,
+};
 use crate::polling_loop::ChatOpsContext;
 use crate::{git, workspace};
 
@@ -155,11 +158,16 @@ async fn run_one_audit(
         ),
     )?;
 
+    let max_validation_retries = audits_cfg
+        .map(|c| c.max_validation_retries)
+        .unwrap_or_else(default_max_validation_retries);
+
     let mut ctx = AuditContext {
         workspace,
         repo,
         chatops_ctx,
         log_writer: log_writer.clone(),
+        max_validation_retries,
     };
 
     let run_result = audit.run(&mut ctx).await;
@@ -268,6 +276,7 @@ async fn run_one_audit(
 
     // Outcome dispatch.
     let outcome_kind = outcome.kind();
+    let mut history_excerpt: Option<String> = None;
     match &outcome {
         AuditOutcome::NoFindings => {
             log_writer.write_section(
@@ -275,13 +284,18 @@ async fn run_one_audit(
                 &format!("kind: NoFindings\nend: {}", end_ts.to_rfc3339()),
             )?;
         }
-        AuditOutcome::Reported(findings) => {
+        AuditOutcome::Reported {
+            findings,
+            retries_used,
+        } => {
+            let retry_clause = format_retry_clause(*retries_used, max_validation_retries);
             log_writer.write_section(
                 "audit_run_outcome",
                 &format!(
-                    "kind: Reported\nend: {}\nfindings_count: {}",
+                    "kind: Reported{retry_clause}\nend: {}\nfindings_count: {}\nretries_used: {}",
                     end_ts.to_rfc3339(),
-                    findings.len()
+                    findings.len(),
+                    retries_used,
                 ),
             )?;
             // Full findings body is preserved in the log; chatops gets
@@ -298,6 +312,17 @@ async fn run_one_audit(
                     ),
                 )?;
             }
+            if *retries_used > 0 {
+                tracing::info!(
+                    url = %repo.url,
+                    audit_type,
+                    retries_used = *retries_used,
+                    max = max_validation_retries,
+                    "audit succeeded (validated on retry {} of {})",
+                    retries_used,
+                    max_validation_retries,
+                );
+            }
             let notify_on_clean = audit_settings
                 .get(audit_type)
                 .map(|s| s.notify_on_clean)
@@ -308,15 +333,22 @@ async fn run_one_audit(
                 audit_type,
                 findings,
                 notify_on_clean,
+                *retries_used,
+                max_validation_retries,
             )
             .await;
         }
-        AuditOutcome::SpecsWritten(names) => {
+        AuditOutcome::SpecsWritten {
+            changes: names,
+            retries_used,
+        } => {
+            let retry_clause = format_retry_clause(*retries_used, max_validation_retries);
             log_writer.write_section(
                 "audit_run_outcome",
                 &format!(
-                    "kind: SpecsWritten\nend: {}\nspecs:\n{}",
+                    "kind: SpecsWritten{retry_clause}\nend: {}\nretries_used: {}\nspecs:\n{}",
                     end_ts.to_rfc3339(),
+                    retries_used,
                     names.join("\n")
                 ),
             )?;
@@ -324,20 +356,56 @@ async fn run_one_audit(
                 url = %repo.url,
                 audit_type,
                 count = names.len(),
-                "audit wrote {} new spec(s); they will be picked up by this iteration's list_pending: {}",
+                retries_used = *retries_used,
+                "audit wrote {} new spec(s){}; they will be picked up by this iteration's list_pending: {}",
                 names.len(),
+                retry_clause,
                 names.join(", "),
             );
         }
+        AuditOutcome::ValidationExhausted {
+            audit_type: at,
+            retries_attempted,
+            final_error,
+        } => {
+            log_writer.write_section(
+                "audit_run_outcome",
+                &format!(
+                    "kind: ValidationExhausted\nend: {}\nretries_attempted: {}\nfinal_error:\n{}",
+                    end_ts.to_rfc3339(),
+                    retries_attempted,
+                    final_error,
+                ),
+            )?;
+            tracing::warn!(
+                url = %repo.url,
+                audit_type = at.as_str(),
+                retries_attempted = *retries_attempted,
+                final_error = %final_error,
+                "audit `{at}` produced an invalid proposal; discarded after {retries_attempted} retries",
+            );
+            history_excerpt = Some(truncate_chars(final_error, VALIDATION_ERROR_HISTORY_EXCERPT));
+        }
     }
 
-    // Success → persist state.
+    // Persist state. Validation-exhausted runs still update last_run_at
+    // so the cadence retriggers naturally on the next due-date rather
+    // than burning through retries on every iteration.
     state.record(
         audit_type,
         AuditRunEntry {
             last_run_at: now,
             last_run_sha: current_head_sha,
             last_outcome: outcome_kind,
+        },
+    );
+    state.append_history(
+        audit_type,
+        AttemptEntry {
+            when: now,
+            outcome_kind: outcome_kind.as_str().to_string(),
+            retries_used: outcome.retries_used(),
+            error_excerpt: history_excerpt,
         },
     );
     if let Err(e) = state.save(workspace) {
@@ -425,15 +493,27 @@ async fn dispatch_reported_to_chatops(
     audit_type: &str,
     findings: &[Finding],
     notify_on_clean: bool,
+    retries_used: u32,
+    max_validation_retries: u32,
 ) {
     let Some(ctx) = chatops_ctx else { return };
+    let retry_clause = format_retry_clause(retries_used, max_validation_retries);
     let text = if findings.is_empty() {
         if !notify_on_clean {
             return;
         }
-        format_clean_message(repo_url, audit_type)
+        let mut msg = format_clean_message(repo_url, audit_type);
+        msg.push_str(&retry_clause);
+        msg
     } else {
-        format_findings_message(repo_url, audit_type, findings, DEFAULT_FINDING_EXCERPT_CHARS)
+        let mut msg = format_findings_message(
+            repo_url,
+            audit_type,
+            findings,
+            DEFAULT_FINDING_EXCERPT_CHARS,
+        );
+        msg.push_str(&retry_clause);
+        msg
     };
     if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
         tracing::warn!(
@@ -441,6 +521,19 @@ async fn dispatch_reported_to_chatops(
             audit_type,
             "audit chatops post failed: {e:#}"
         );
+    }
+}
+
+/// Render the `" (validated on retry N of M)"` clause appended to the
+/// success log line and chatops notification when an audit's generated
+/// proposal validated on a retry rather than the first attempt. Returns
+/// an empty string when no retries were used (the most common case),
+/// so callers can unconditionally append the value.
+pub fn format_retry_clause(retries_used: u32, max_validation_retries: u32) -> String {
+    if retries_used == 0 {
+        String::new()
+    } else {
+        format!(" (validated on retry {retries_used} of {max_validation_retries})")
     }
 }
 
@@ -635,6 +728,7 @@ mod tests {
         AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         }
     }
 
@@ -757,6 +851,7 @@ mod tests {
         let cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         };
         run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
             .await
@@ -828,7 +923,7 @@ mod tests {
             CountingAudit::new("a7b")
                 .with_policy(WritePolicy::OpenSpecOnly)
                 .writes_file("openspec/changes/new-thing/proposal.md")
-                .with_outcome(AuditOutcome::SpecsWritten(vec!["new-thing".into()])),
+                .with_outcome(AuditOutcome::specs_written(vec!["new-thing".into()])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7b");
@@ -861,6 +956,7 @@ mod tests {
         let cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         };
         let repo = fixture_repo();
         run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
@@ -920,7 +1016,7 @@ mod tests {
             },
         ];
         let audit = Arc::new(
-            CountingAudit::new("rep1").with_outcome(AuditOutcome::Reported(findings.clone())),
+            CountingAudit::new("rep1").with_outcome(AuditOutcome::reported(findings.clone())),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("rep1");
@@ -955,7 +1051,7 @@ mod tests {
     async fn reported_no_findings_silent_unless_notify_on_clean() {
         let (_t, ws) = init_workspace();
         let audit = Arc::new(
-            CountingAudit::new("clean1").with_outcome(AuditOutcome::Reported(vec![])),
+            CountingAudit::new("clean1").with_outcome(AuditOutcome::reported(vec![])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("clean1");
@@ -987,7 +1083,7 @@ mod tests {
         // Clear state so the audit is due again.
         let _ = std::fs::remove_file(ws.join(".audit-state.json"));
         let audit2 = Arc::new(
-            CountingAudit::new("clean2").with_outcome(AuditOutcome::Reported(vec![])),
+            CountingAudit::new("clean2").with_outcome(AuditOutcome::reported(vec![])),
         );
         let registry2 = AuditRegistry::with_audits(vec![audit2.clone()]);
         let cfg2 = audits_cfg_daily("clean2");
@@ -1028,7 +1124,7 @@ mod tests {
             CountingAudit::new("sw1")
                 .with_policy(WritePolicy::OpenSpecOnly)
                 .writes_file("openspec/changes/new-spec/proposal.md")
-                .with_outcome(AuditOutcome::SpecsWritten(vec!["new-spec".into()])),
+                .with_outcome(AuditOutcome::specs_written(vec!["new-spec".into()])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("sw1");
@@ -1102,6 +1198,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(
             PathBuf::from("/tmp/autocoder/logs").join(&basename),
         );
+    }
+
+    #[tokio::test]
+    async fn scheduler_records_validation_exhausted_in_history_and_logs_warn() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("ve1")
+                .with_policy(WritePolicy::OpenSpecOnly)
+                .with_outcome(AuditOutcome::ValidationExhausted {
+                    audit_type: "ve1".into(),
+                    retries_attempted: 1,
+                    final_error: "MODIFIED header `Old name` not found".repeat(10),
+                }),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("ve1");
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .unwrap();
+        // State + history updated.
+        let state = AuditState::load_or_default(&ws);
+        let entry = state.runs.get("ve1").expect("state recorded");
+        assert_eq!(entry.last_outcome, AuditOutcomeKind::ValidationExhausted);
+        let hist = state.history("ve1");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].outcome_kind, "ValidationExhausted");
+        assert_eq!(hist[0].retries_used, 1);
+        let excerpt = hist[0]
+            .error_excerpt
+            .as_deref()
+            .expect("validation-exhausted entry must carry error_excerpt");
+        assert!(
+            excerpt.starts_with("MODIFIED header"),
+            "excerpt must be a prefix of the validation error: {excerpt}"
+        );
+        // 200-char cap + ellipsis is the documented bound.
+        assert!(
+            excerpt.chars().count() <= crate::audits::VALIDATION_ERROR_HISTORY_EXCERPT + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_appends_reported_entry_with_retries_used() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("rep_retry")
+                .with_outcome(AuditOutcome::Reported {
+                    findings: vec![],
+                    retries_used: 2,
+                }),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("rep_retry");
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .unwrap();
+        let state = AuditState::load_or_default(&ws);
+        let hist = state.history("rep_retry");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].outcome_kind, "Reported");
+        assert_eq!(hist[0].retries_used, 2);
+        assert!(
+            hist[0].error_excerpt.is_none(),
+            "Reported outcomes must NOT carry an error_excerpt"
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_with_retry_includes_validated_on_retry_clause_in_chatops() {
+        let (_t, ws) = init_workspace();
+        let findings = vec![Finding {
+            severity: Severity::Low,
+            subject: "x".into(),
+            body: "y".into(),
+            anchor: None,
+        }];
+        let audit = Arc::new(CountingAudit::new("retry-clause").with_outcome(
+            AuditOutcome::Reported {
+                findings: findings.clone(),
+                retries_used: 1,
+            },
+        ));
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("retry-clause");
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::Regex(
+                "validated on retry 1 of 1".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx))
+            .await
+            .unwrap();
+        post_mock.assert_async().await;
+    }
+
+    #[test]
+    fn format_retry_clause_renders_only_when_retries_used() {
+        assert_eq!(format_retry_clause(0, 1), "");
+        assert_eq!(format_retry_clause(1, 1), " (validated on retry 1 of 1)");
+        assert_eq!(format_retry_clause(2, 5), " (validated on retry 2 of 5)");
     }
 
     #[test]

@@ -203,7 +203,13 @@ impl Audit for DriftAudit {
             "drift_audit_outcome",
             &format!("kind: Reported\nfindings_count: {}", findings.len()),
         );
-        Ok(AuditOutcome::Reported(findings))
+        // This audit produces advisory `Reported` findings — it does NOT
+        // write a proposal directory under `openspec/changes/<slug>/`.
+        // The post-write `openspec validate --strict` retry loop in
+        // `audits::validate_with_retry` is unnecessary here: there is no
+        // proposal to validate. `retries_used` is therefore always 0.
+        // (See change `a01-audit-proposal-self-validation`.)
+        Ok(AuditOutcome::reported(findings))
     }
 }
 
@@ -671,14 +677,16 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::Reported(findings) => {
+            AuditOutcome::Reported { findings, retries_used } => {
                 assert_eq!(findings.len(), 1);
                 assert_eq!(findings[0].severity, Severity::High);
                 assert!(findings[0].subject.contains("cap1"));
+                assert_eq!(retries_used, 0, "drift audit does not validate proposals");
             }
             other => panic!("expected Reported, got {other:?}"),
         }
@@ -712,6 +720,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let _ = audit.run(&mut ctx).await.expect("run succeeds");
@@ -748,6 +757,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let err = audit.run(&mut ctx).await.expect_err("nonzero exit errors");
@@ -804,6 +814,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let err = audit

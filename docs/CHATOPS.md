@@ -63,6 +63,45 @@ All three keys are optional. An absent `notifications:` block parses to "all tru
 
 If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 
+**Validation-exhausted audit notifications.** LLM-driven audits that
+generate OpenSpec change proposals run each proposal through
+`openspec validate --strict` before committing. When validation fails and
+the configured retry budget (`audits.max_validation_retries`, default
+`1`, see [CONFIG.md](CONFIG.md)) is exhausted, the audit discards the
+proposal and posts a one-line chatops notification:
+
+```
+❌ <repo-url>: <audit-type> produced an invalid proposal that failed openspec validation after <N> retries.
+Final validation error:
+<truncated stderr, capped at 800 chars>
+No commit was made. The audit will retry on its next scheduled cadence.
+```
+
+This fires **regardless of `notify_on_clean`** — an audit producing
+invalid proposals is operator-actionable feedback that the audit's
+prompt template or LLM output is degrading; suppressing the signal
+would hide the failure mode. The audit's own cadence determines when
+it retries (no special re-trigger).
+
+Operator action when this fires repeatedly for the same audit type:
+review the audit's prompt template (`audits.settings.<slug>.prompt_path`
+or the embedded default). Repeated validation failures usually mean the
+prompt does not bind the LLM tightly enough to the OpenSpec delta
+format. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#audit-produces-invalid-proposal--what-to-do).
+
+When a `notify_on_clean=true` Reported outcome comes back with
+`retries_used > 0` (the audit succeeded after one or more retries), the
+existing success notification gains a trailing clause:
+
+```
+✅ <repo-url>: <audit-type> — no findings (validated on retry 1 of 1)
+```
+
+The clause is informational. Operators tracking audit reliability over
+time can use it as a leading indicator that a prompt template might
+benefit from tightening before it starts failing outright.
+
 **Revision cap notifications.** The PR-comment revision channel (see
 [OPERATIONS.md](OPERATIONS.md#revising-an-open-pr-via-comment)) emits a
 one-time chatops notification when an open PR hits its revision cap:
