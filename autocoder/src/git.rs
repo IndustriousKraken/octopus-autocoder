@@ -9,7 +9,13 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// Run a git command inside `workspace` and return captured `Output` on
-/// success. Returns an error containing the trimmed stderr on non-zero exit.
+/// success. On non-zero exit, builds an error string that surfaces the
+/// failed command's diagnostic output: prefer stderr, fall back to
+/// stdout when stderr is empty, include both labelled with `stderr:` /
+/// `stdout:` when both are non-empty, and name the exit code in
+/// parentheses when both streams are empty. This is the contract that
+/// keeps the self-heal flow's `git commit` "nothing to commit, working
+/// tree clean" message visible: that diagnostic line is stdout-only.
 fn run_git(workspace: &Path, op: &str, args: &[&str]) -> Result<Output> {
     let output = Command::new("git")
         .args(args)
@@ -19,7 +25,14 @@ fn run_git(workspace: &Path, op: &str, args: &[&str]) -> Result<Output> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!("git {op} failed: {stderr}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let msg = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, true) => stderr,
+            (false, false) => format!("stderr: {stderr}; stdout: {stdout}"),
+            (true, false) => stdout,
+            (true, true) => format!("(no output; exit {:?})", output.status.code()),
+        };
+        return Err(anyhow!("git {op} failed: {msg}"));
     }
     Ok(output)
 }
@@ -810,5 +823,130 @@ mod tests {
         // Idempotent: second call against an absent remote branch is Ok.
         delete_branch_remote(&ws, "doomed", "origin").unwrap();
         delete_branch_remote(&ws, "never-existed-remote", "origin").unwrap();
+    }
+
+    // ----- run_git failure-message format tests -----
+
+    /// Real `git commit` against a workspace with nothing staged
+    /// exits non-zero and prints "nothing to commit, working tree
+    /// clean" to STDOUT (not stderr). The pre-existing `run_git`
+    /// captured only stderr, masking the cause and leaving the
+    /// self-heal flow's failure_reason as a bare colon-space. Verify
+    /// the new run_git surfaces the stdout text.
+    #[test]
+    fn run_git_failure_includes_stdout_when_stderr_empty() {
+        let (_dir, path) = fixture_repo();
+        // commit with nothing staged → exit 1, stdout="nothing to commit, ...", stderr=""
+        let err = commit(&path, "should fail").expect_err("nothing to commit must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("git commit failed: "),
+            "preserves the `git commit failed: ` prefix: {msg}"
+        );
+        assert!(
+            msg.contains("nothing to commit"),
+            "stdout-only diagnostic must be surfaced: {msg}"
+        );
+        assert!(
+            !msg.ends_with("failed: "),
+            "error must NOT end in a bare colon-space: {msg:?}"
+        );
+    }
+
+    /// Drive run_git directly with a fixture `git status --porcelain
+    /// -uall --bogus-flag` invocation that produces non-empty stderr
+    /// and empty stdout. This is the existing legacy-stderr-only
+    /// pattern; the message should still contain the stderr alone
+    /// (no `stderr:` prefix, no `; stdout:` suffix when stdout is
+    /// empty).
+    #[test]
+    fn run_git_failure_with_stderr_only_keeps_legacy_format() {
+        let (_dir, path) = fixture_repo();
+        let err = run_git(&path, "bogus", &["status", "--definitely-not-a-flag"])
+            .expect_err("invalid flag must error");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("git bogus failed: "), "got: {msg}");
+        // git prints its usage/error to stderr for unknown flags. The
+        // exact text varies across git versions, but the message must
+        // NOT contain the "stderr:" / "; stdout:" labelling pattern
+        // because stdout was empty.
+        assert!(
+            !msg.contains("stdout:"),
+            "stdout-only branch should not append a stdout: clause: {msg}"
+        );
+    }
+
+    /// When both stderr and stdout carry content, both must appear in
+    /// the error labelled `stderr:` / `stdout:`. Provoking this from
+    /// git directly is awkward (git captures hook stdout and
+    /// redirects it to its own stderr), so synthesize via a git shell
+    /// alias whose pipes flow straight through to git's own.
+    #[test]
+    fn run_git_failure_with_both_streams_labels_each() {
+        let (_dir, path) = fixture_repo();
+        let err = run_git(
+            &path,
+            "alias-both",
+            &[
+                "-c",
+                "alias.both=!sh -c 'echo TO_STDOUT; echo TO_STDERR 1>&2; exit 7'",
+                "both",
+            ],
+        )
+        .expect_err("aliased shell command exiting 7 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("git alias-both failed: "),
+            "preserves the op-named prefix: {msg}"
+        );
+        assert!(
+            msg.contains("stderr:") && msg.contains("stdout:"),
+            "both streams must be labelled: {msg}"
+        );
+        assert!(
+            msg.contains("TO_STDOUT"),
+            "stdout content must appear: {msg}"
+        );
+        assert!(
+            msg.contains("TO_STDERR"),
+            "stderr content must appear: {msg}"
+        );
+    }
+
+    /// When both streams are empty (a command that exits non-zero
+    /// without printing anything), the error names the exit code in
+    /// parentheses so the operator at least knows the exit semantics.
+    #[test]
+    fn run_git_failure_with_no_output_names_exit_code() {
+        // Build a fixture: a pre-commit hook that prints nothing and
+        // exits 17. git's "pre-commit failed" stderr line is suppressed
+        // by passing --no-verify-style hook semantics... actually git
+        // always prints something on hook failure. We need a different
+        // approach: drive run_git against a custom invocation that
+        // exits non-zero with no output. Use `git rev-parse --verify
+        // --quiet <invalid>` which exits non-zero with no stderr and
+        // no stdout when the rev doesn't exist.
+        let (_dir, path) = fixture_repo();
+        let err = run_git(
+            &path,
+            "rev-parse-quiet",
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/definitely-not-a-branch",
+            ],
+        )
+        .expect_err("missing rev with --quiet must exit non-zero with no output");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("git rev-parse-quiet failed: "), "got: {msg}");
+        assert!(
+            msg.contains("(no output; exit"),
+            "must name the parenthetical exit-code clause: {msg}"
+        );
+        assert!(
+            !msg.ends_with("failed: "),
+            "error must NOT end in a bare colon-space: {msg:?}"
+        );
     }
 }

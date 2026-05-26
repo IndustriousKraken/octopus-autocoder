@@ -4,6 +4,10 @@
 //! All functions operate on a `workspace` path that contains an
 //! `openspec/changes/` directory. The filesystem is the source of truth.
 
+use crate::openspec_archive::{
+    ArchiveFailure, ArchiveRunner, RealArchiveRunner,
+    openspec_archive_with_postcondition, truncate_for_report,
+};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use regex::Regex;
@@ -269,14 +273,29 @@ pub fn would_collide_on_archive(workspace: &Path, change: &str) -> bool {
     archive_collision_path(workspace, change).exists()
 }
 
-/// Archive `<change>` by invoking `openspec archive <change> -y` as a
-/// subprocess in `workspace`. The subprocess both moves the change
-/// directory to `openspec/changes/archive/<UTC YYYY-MM-DD>-<change>/` AND
-/// merges the change's deltas into the canonical `openspec/specs/<cap>/`
-/// files (when the host's openspec profile has the `sync` workflow
-/// enabled). Returns Err with the openspec stderr on non-zero exit; the
-/// source directory is left in place for the operator to investigate.
+/// Archive `<change>` by invoking `openspec archive <change> -y` via
+/// the shared `openspec_archive_with_postcondition` helper. The
+/// helper checks BOTH openspec's exit + stdout (for the `Aborted.`
+/// marker openspec emits when it refuses to apply a delta but still
+/// exits 0) AND the on-disk post-condition (active path moved,
+/// archive entry produced). Returns `Err` with a single message that
+/// names the failure variant and includes the openspec output excerpt,
+/// so callers (notably the self-heal flow in `polling_loop.rs`) can
+/// surface an actionable cause line instead of silently swallowing
+/// the skip.
 pub fn archive(workspace: &Path, change: &str) -> Result<()> {
+    archive_with_runner(&RealArchiveRunner, workspace, change)
+}
+
+/// Test-injectable variant of `archive`. The production entry point
+/// delegates with a `RealArchiveRunner`; tests substitute mock
+/// runners to drive the four `ArchiveFailure` branches without
+/// spawning real subprocesses.
+pub fn archive_with_runner(
+    runner: &dyn ArchiveRunner,
+    workspace: &Path,
+    change: &str,
+) -> Result<()> {
     let src = change_dir(workspace, change);
     if !src.is_dir() {
         return Err(anyhow!(
@@ -284,25 +303,29 @@ pub fn archive(workspace: &Path, change: &str) -> Result<()> {
             src.display()
         ));
     }
-    let output = std::process::Command::new("openspec")
-        .args(["archive", change, "-y"])
-        .current_dir(workspace)
-        .output();
-    match output {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match openspec_archive_with_postcondition(runner, workspace, change) {
+        Ok(_archive_path) => Ok(()),
+        Err(ArchiveFailure::NonZeroExit { code, stderr, stdout }) => {
+            let body = if !stderr.trim().is_empty() {
+                truncate_for_report(stderr.trim())
+            } else if !stdout.trim().is_empty() {
+                truncate_for_report(stdout.trim())
+            } else {
+                "(no output)".to_string()
+            };
             Err(anyhow!(
-                "openspec archive `{change}` exited {code:?}: {stderr}",
-                code = out.status.code(),
+                "openspec archive `{change}` exited {code:?}: {body}"
             ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-            "openspec not found on PATH while archiving `{change}`; \
-             install openspec and ensure the daemon's PATH covers its install directory"
+        Err(ArchiveFailure::AbortedMarker { reason, full_output }) => Err(anyhow!(
+            "openspec archive `{change}` aborted by openspec: {reason}; full output: {full_output}"
         )),
-        Err(e) => Err(anyhow!(
-            "spawning `openspec archive {change} -y` errored: {e}"
+        Err(ArchiveFailure::ActivePathStillPresent { path, full_output: _ }) => Err(anyhow!(
+            "openspec archive `{change}` reported success but the change directory at {} still exists",
+            path.display()
+        )),
+        Err(ArchiveFailure::NoArchiveEntryFound { full_output }) => Err(anyhow!(
+            "openspec archive `{change}` reported success but neither the active path nor any archive entry exists; full output: {full_output}"
         )),
     }
 }
@@ -818,5 +841,212 @@ mod tests {
         let err = unarchive(ws, "x").expect_err("collision should fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("already exists"), "got: {msg}");
+    }
+
+    // ---- archive_with_runner: structured-failure mapping tests ----
+
+    use crate::openspec_archive::{ArchiveRunOutput, ArchiveRunner};
+
+    fn fake_exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// Runner stub: succeeds and moves the change dir into the
+    /// dated archive entry.
+    struct SuccessRunner;
+    impl ArchiveRunner for SuccessRunner {
+        fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            let from = workspace.join(CHANGES_SUBDIR).join(slug);
+            let today = Utc::now().format("%Y-%m-%d").to_string();
+            let to = workspace
+                .join(CHANGES_SUBDIR)
+                .join(ARCHIVE_DIR)
+                .join(format!("{today}-{slug}"));
+            std::fs::rename(&from, &to)
+                .map_err(|e| format!("test rename failed: {e}"))?;
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!("archived {slug}\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Runner stub: exit 0, emits `Aborted.` marker, performs no fs work.
+    struct AbortedRunner;
+    impl ArchiveRunner for AbortedRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!(
+                    "{slug} MODIFIED failed for header \"### Requirement: X\" - not found\nAborted. No files were changed.\n"
+                ),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Runner stub: exit non-zero with stderr.
+    struct FailingRunner;
+    impl ArchiveRunner for FailingRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(1),
+                stdout: String::new(),
+                stderr: format!("openspec validation error for {slug}\n"),
+            })
+        }
+    }
+
+    /// Runner stub: exit 0, benign stdout, performs no fs work
+    /// (silent-skip without the marker).
+    struct SilentSkipRunner;
+    impl ArchiveRunner for SilentSkipRunner {
+        fn run(&self, _workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: format!("would archive {slug}\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Runner stub: exit 0, removes the change dir but produces no
+    /// archive entry (data-loss case).
+    struct DataLossRunner;
+    impl ArchiveRunner for DataLossRunner {
+        fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+            let from = workspace.join(CHANGES_SUBDIR).join(slug);
+            std::fs::remove_dir_all(&from)
+                .map_err(|e| format!("test removal failed: {e}"))?;
+            Ok(ArchiveRunOutput {
+                status: fake_exit(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn archive_with_runner_happy_path_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "foo");
+        archive_with_runner(&SuccessRunner, ws, "foo").unwrap();
+        // Source gone; archive entry under today's date.
+        assert!(!ws.join(CHANGES_SUBDIR).join("foo").exists());
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(
+            ws.join(CHANGES_SUBDIR)
+                .join(ARCHIVE_DIR)
+                .join(format!("{today}-foo"))
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn archive_with_runner_aborted_marker_surfaces_actionable_error() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "foo");
+        let err = archive_with_runner(&AbortedRunner, ws, "foo")
+            .expect_err("aborted marker must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("openspec archive `foo` aborted by openspec:"),
+            "error must name the variant and the change: {msg}"
+        );
+        assert!(
+            msg.contains("MODIFIED failed for header"),
+            "error must include the openspec-supplied cause line: {msg}"
+        );
+        // Source directory left in place for operator to investigate.
+        assert!(ws.join(CHANGES_SUBDIR).join("foo").is_dir());
+    }
+
+    #[test]
+    fn archive_with_runner_non_zero_exit_includes_stderr() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "foo");
+        let err = archive_with_runner(&FailingRunner, ws, "foo")
+            .expect_err("non-zero exit must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("openspec archive `foo` exited"),
+            "error must name the variant: {msg}"
+        );
+        assert!(
+            msg.contains("validation error"),
+            "error must include the openspec stderr: {msg}"
+        );
+    }
+
+    #[test]
+    fn archive_with_runner_silent_skip_surfaces_active_path_message() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "foo");
+        let err = archive_with_runner(&SilentSkipRunner, ws, "foo")
+            .expect_err("silent skip must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reported success but the change directory at"),
+            "error must name the active path remaining: {msg}"
+        );
+    }
+
+    #[test]
+    fn archive_with_runner_data_loss_surfaces_no_archive_entry_message() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "foo");
+        let err = archive_with_runner(&DataLossRunner, ws, "foo")
+            .expect_err("data-loss must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("neither the active path nor any archive entry exists"),
+            "error must name the data-loss condition explicitly: {msg}"
+        );
+    }
+
+    /// Self-heal integration contract: when `queue::archive` returns
+    /// an abort-marker error, the self-heal flow in `polling_loop.rs`
+    /// wraps it with `format!("self-heal archive failed: {e:#}")`. The
+    /// resulting `QueueStep::Failed { reason }`'s reason must contain
+    /// BOTH `self-heal archive failed` AND the openspec-supplied
+    /// cause line, so operators reading the perma-stuck alert can act
+    /// on the actual failure. This test verifies that composition.
+    #[test]
+    fn self_heal_failure_reason_includes_openspec_cause_via_archive_err() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "broken-delta");
+
+        let err = archive_with_runner(&AbortedRunner, ws, "broken-delta")
+            .expect_err("aborted runner must produce Err");
+        // Reproduce the exact format string the self-heal block in
+        // polling_loop.rs uses when queue::archive returns Err.
+        let reason = format!("self-heal archive failed: {err:#}");
+
+        assert!(
+            reason.contains("self-heal archive failed"),
+            "reason must include the self-heal prefix: {reason}"
+        );
+        assert!(
+            reason.contains("aborted by openspec:"),
+            "reason must name the failure variant: {reason}"
+        );
+        assert!(
+            reason.contains("MODIFIED failed for header"),
+            "reason must include the openspec-supplied cause line: {reason}"
+        );
     }
 }

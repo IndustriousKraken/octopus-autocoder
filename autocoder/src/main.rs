@@ -17,6 +17,7 @@ mod github;
 mod github_credentials;
 mod llm;
 mod mcp_askuser_server;
+mod openspec_archive;
 mod perma_stuck;
 mod polling_loop;
 mod queue;

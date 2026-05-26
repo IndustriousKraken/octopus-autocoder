@@ -7,6 +7,9 @@ use crate::busy_marker;
 use crate::cli::sync_specs_deps::{
     self, RebuildAbortReason, RenameRecord,
 };
+use crate::openspec_archive::{
+    self, ArchiveFailure, openspec_archive_with_postcondition,
+};
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use chrono::Utc;
@@ -14,6 +17,19 @@ use regex::Regex;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+// Shared archive types now live in `crate::openspec_archive` so both
+// `queue::archive` and the rebuild loop call the same post-condition
+// logic. Re-exported here for backwards compatibility and so test
+// modules under `cli::sync_specs::*` can keep using the short names.
+// `ArchiveRunOutput` and `detect_openspec_abort` aren't referenced
+// by non-test code in this module, but the re-exports are kept so the
+// rebuild-path tests below and any external callers from prior
+// versions of `sync_specs.rs` still resolve.
+#[allow(unused_imports)]
+pub use crate::openspec_archive::{
+    ArchiveRunOutput, ArchiveRunner, RealArchiveRunner, detect_openspec_abort,
+};
 
 /// CLI args for `autocoder sync-specs`.
 #[derive(Debug, Clone)]
@@ -32,77 +48,6 @@ pub struct ChangeOutcome {
     /// Truncated openspec stderr when the archive subprocess failed; empty
     /// on success.
     pub failure_reason: String,
-}
-
-/// Result of one `openspec archive <slug> -y` invocation. The outer
-/// `Result<ArchiveRunOutput, String>` from `run` reserves `Err` for spawn
-/// failure only (binary not on PATH, kernel-level spawn error). Non-zero
-/// exit codes land in `Ok` so callers can apply post-condition logic
-/// uniformly.
-#[derive(Debug, Clone)]
-pub struct ArchiveRunOutput {
-    pub status: std::process::ExitStatus,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// Pluggable runner for `openspec archive`, allowing tests to substitute
-/// stubs (silent-skip, mixed-outcome) without spawning subprocesses.
-pub trait ArchiveRunner: Send + Sync {
-    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String>;
-}
-
-/// Production runner — shells out to `openspec archive`.
-pub struct RealArchiveRunner;
-
-impl ArchiveRunner for RealArchiveRunner {
-    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
-        run_openspec_archive(workspace, slug)
-    }
-}
-
-/// Structured post-condition failure value. Each variant pinpoints what
-/// the rebuild observed about the workspace state after an exit-zero
-/// `openspec archive` call, so failure reports name the actual problem.
-#[derive(Debug, Clone)]
-pub enum PostConditionFailure {
-    /// `openspec/changes/<slug>/` still exists after the archive call —
-    /// openspec did not move the directory. The observed real-world
-    /// silent-skip path.
-    ActivePathStillPresent { path: PathBuf },
-    /// `openspec/changes/<slug>/` is gone but no
-    /// `openspec/changes/archive/*-<slug>/` was produced. Data-loss-shaped.
-    NoArchiveEntryFound,
-    /// More than one directory matches the slug suffix — a stale archive
-    /// from a prior rebuild was not cleaned up. The operator must
-    /// manually pick the canonical one.
-    MultipleArchiveEntriesFound { matches: Vec<PathBuf> },
-}
-
-impl PostConditionFailure {
-    fn describe(&self) -> String {
-        match self {
-            Self::ActivePathStillPresent { path } => format!(
-                "active path still present at {}",
-                path.display()
-            ),
-            Self::NoArchiveEntryFound => {
-                "openspec archive reported success but the change is missing from both the active path and the archive".to_string()
-            }
-            Self::MultipleArchiveEntriesFound { matches } => {
-                let mut joined = String::from(
-                    "multiple matching archive directories — operator must consolidate: ",
-                );
-                for (i, p) in matches.iter().enumerate() {
-                    if i > 0 {
-                        joined.push_str(", ");
-                    }
-                    joined.push_str(&p.display().to_string());
-                }
-                joined
-            }
-        }
-    }
 }
 
 /// Per-spec-file record in a `RebuildReport`. `modified` reflects whether
@@ -424,80 +369,39 @@ pub async fn rebuild_canonical_with_runner(
             continue;
         }
 
-        let out = match runner.run(workspace, &slug) {
-            Ok(out) => out,
-            Err(spawn_err) => {
-                // Spawn failure (binary missing, kernel error). Roll the
-                // active directory back to archive so the workspace is
-                // restored to its pre-rebuild state for this slug.
-                tracing::error!(
-                    slug = %slug,
-                    "rebuild: openspec archive spawn failed: {spawn_err}"
-                );
-                let base_reason = format!("openspec spawn failed: {spawn_err}");
-                record_failure_with_rollback(
-                    workspace,
-                    &archive_root,
-                    &slug,
-                    &original_name,
-                    base_reason,
-                    &mut report,
-                );
-                continue;
-            }
-        };
-
-        if !out.status.success() {
-            // Non-zero exit. Rollback and continue.
-            let reason = format_archive_output_for_report(&out);
-            tracing::error!(
-                slug = %slug,
-                "rebuild: openspec archive failed: {reason}"
-            );
-            record_failure_with_rollback(
-                workspace,
-                &archive_root,
-                &slug,
-                &original_name,
-                reason,
-                &mut report,
-            );
-            continue;
-        }
-
-        // Exit zero: log captured output (useful confirmation line) and
-        // verify the post-condition. openspec is well-behaved on success
-        // — it usually prints a one-line confirmation we want preserved
-        // in INFO logs.
-        if !out.stdout.trim().is_empty() {
-            tracing::info!(slug = %slug, "openspec archive output: {}", out.stdout.trim());
-        }
-
-        // openspec's `Aborted.` marker means it refused to apply the
-        // change but exited 0 anyway. Treat as failure regardless of
-        // exit code; the post-condition check below remains as a
-        // defense-in-depth fallback for marker-less silent skips.
-        if let Some(reason) = detect_openspec_abort(&out.stdout) {
-            let full = format_archive_output_for_report(&out);
-            let combined =
-                format!("openspec refused to apply: {reason}; full output: {full}");
-            tracing::error!(
-                slug = %slug,
-                "rebuild: openspec abort marker detected: {reason}"
-            );
-            record_failure_with_rollback(
-                workspace,
-                &archive_root,
-                &slug,
-                &original_name,
-                combined,
-                &mut report,
-            );
-            continue;
-        }
-
-        match verify_archive_post_condition(workspace, &slug) {
+        // Delegate to the shared archive-with-postcondition helper. The
+        // helper performs spawn → exit check → abort-marker scan →
+        // active-path check → archive-glob check, returning a
+        // structured failure for each detected mode. The rebuild path
+        // adds its own multi-match guard on top (a rebuild-specific
+        // concern: the chronological replay can leave stale archive
+        // entries the helper can't disambiguate).
+        match openspec_archive_with_postcondition(runner, workspace, &slug) {
             Ok(actual_path) => {
+                // Rebuild-only extra check: if there are multiple
+                // archive matches for this slug (a stale entry from a
+                // prior interrupted rebuild), refuse to rename — the
+                // operator must consolidate.
+                let matches =
+                    openspec_archive::find_archive_entries_for_slug(&archive_root, &slug);
+                if matches.len() > 1 {
+                    let joined: Vec<String> =
+                        matches.iter().map(|p| p.display().to_string()).collect();
+                    let reason = format!(
+                        "openspec archive exited 0 but post-condition failed: multiple matching archive directories — operator must consolidate: {}",
+                        joined.join(", ")
+                    );
+                    tracing::error!(slug = %slug, "rebuild: post-condition failed: {reason}");
+                    report.failed += 1;
+                    report.failures.push(ChangeOutcome {
+                        slug: slug.clone(),
+                        original_name: original_name.clone(),
+                        success: false,
+                        failure_reason: reason,
+                    });
+                    continue;
+                }
+
                 // Happy path. Rename the matched archive entry back to
                 // the original date-prefixed name if they differ.
                 let original_os = std::ffi::OsStr::new(&original_name);
@@ -538,43 +442,83 @@ pub async fn rebuild_canonical_with_runner(
                     failure_reason: String::new(),
                 });
             }
-            Err(pc) => {
-                let pc_desc = pc.describe();
-                let output = format_archive_output_for_report(&out);
+            Err(ArchiveFailure::NonZeroExit { code, stderr, stdout }) => {
+                // Spawn failure encodes as `code: None`; non-zero exit
+                // as `code: Some(n)`. Both render the same way: prefer
+                // stderr, fall back to stdout, signal absence
+                // explicitly.
+                let body = if !stderr.is_empty() {
+                    openspec_archive::truncate_for_report(&stderr)
+                } else if !stdout.is_empty() {
+                    openspec_archive::truncate_for_report(&stdout)
+                } else {
+                    "(no output)".to_string()
+                };
+                let reason = format!("openspec exited {code:?}: {body}");
+                tracing::error!(
+                    slug = %slug,
+                    "rebuild: openspec archive failed: {reason}"
+                );
+                record_failure_with_rollback(
+                    workspace,
+                    &archive_root,
+                    &slug,
+                    &original_name,
+                    reason,
+                    &mut report,
+                );
+            }
+            Err(ArchiveFailure::AbortedMarker { reason, full_output }) => {
                 let combined = format!(
-                    "openspec archive exited 0 but post-condition failed: {pc_desc}; openspec output: {output}"
+                    "openspec refused to apply: {reason}; full output: {full_output}"
                 );
                 tracing::error!(
                     slug = %slug,
-                    "rebuild: post-condition failed: {pc_desc}; output: {output}"
+                    "rebuild: openspec abort marker detected: {reason}"
                 );
-                match pc {
-                    PostConditionFailure::ActivePathStillPresent { .. } => {
-                        // Silent skip. Rollback.
-                        record_failure_with_rollback(
-                            workspace,
-                            &archive_root,
-                            &slug,
-                            &original_name,
-                            combined,
-                            &mut report,
-                        );
-                    }
-                    PostConditionFailure::NoArchiveEntryFound
-                    | PostConditionFailure::MultipleArchiveEntriesFound { .. } => {
-                        // No rollback: active path is empty (data-loss
-                        // case) or archive has multiple matches the
-                        // rebuild cannot disambiguate. Operator must
-                        // resolve. Record as failure and continue.
-                        report.failed += 1;
-                        report.failures.push(ChangeOutcome {
-                            slug: slug.clone(),
-                            original_name: original_name.clone(),
-                            success: false,
-                            failure_reason: combined,
-                        });
-                    }
-                }
+                record_failure_with_rollback(
+                    workspace,
+                    &archive_root,
+                    &slug,
+                    &original_name,
+                    combined,
+                    &mut report,
+                );
+            }
+            Err(ArchiveFailure::ActivePathStillPresent { path, full_output }) => {
+                let combined = format!(
+                    "openspec archive exited 0 but post-condition failed: active path still present at {}; openspec output: {full_output}",
+                    path.display()
+                );
+                tracing::error!(
+                    slug = %slug,
+                    "rebuild: post-condition failed: active path still present at {}",
+                    path.display()
+                );
+                record_failure_with_rollback(
+                    workspace,
+                    &archive_root,
+                    &slug,
+                    &original_name,
+                    combined,
+                    &mut report,
+                );
+            }
+            Err(ArchiveFailure::NoArchiveEntryFound { full_output }) => {
+                let combined = format!(
+                    "openspec archive exited 0 but post-condition failed: openspec archive reported success but the change is missing from both the active path and the archive; openspec output: {full_output}"
+                );
+                tracing::error!(
+                    slug = %slug,
+                    "rebuild: post-condition failed (data-loss shape): {combined}"
+                );
+                report.failed += 1;
+                report.failures.push(ChangeOutcome {
+                    slug: slug.clone(),
+                    original_name: original_name.clone(),
+                    success: false,
+                    failure_reason: combined,
+                });
             }
         }
     }
@@ -600,149 +544,6 @@ pub async fn rebuild_canonical_with_runner(
     }
 
     Ok(report)
-}
-
-/// Invoke `openspec archive <slug> -y` in `workspace`. Returns
-/// `Ok(ArchiveRunOutput)` for any case where the subprocess actually
-/// executed (even on non-zero exit), and `Err(String)` only for spawn
-/// failure (binary not on PATH, kernel-level spawn error). Callers apply
-/// the post-condition check uniformly to the `Ok` shape regardless of
-/// exit code.
-pub fn run_openspec_archive(workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
-    match std::process::Command::new("openspec")
-        .args(["archive", slug, "-y"])
-        .current_dir(workspace)
-        .output()
-    {
-        Ok(out) => Ok(ArchiveRunOutput {
-            status: out.status,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err("openspec binary not found on PATH".to_string())
-        }
-        Err(e) => Err(format!("spawning openspec: {e}")),
-    }
-}
-
-/// Scan `stdout` for openspec's `Aborted.` marker — the signal openspec
-/// emits when it refuses to apply a change (e.g. a broken `MODIFIED`
-/// reference) but still exits 0. Detection is line-based: only a line
-/// whose first non-whitespace token is exactly `Aborted.` (with the
-/// trailing period) triggers a match. A line containing `aborted`
-/// lowercase, or `Aborted` without the trailing period, or `Aborted.`
-/// mid-line, does NOT match.
-///
-/// Returns `Some(reason)` where `reason` is the most informative
-/// preceding line — the nearest non-empty line above the `Aborted.` line
-/// if one exists, otherwise the trimmed `Aborted.` line itself. This
-/// captures real-world cases where openspec prints a diagnostic line
-/// (`MODIFIED failed for header "..." - not found`) immediately before
-/// `Aborted. No files were changed.`. Returns `None` when no matching
-/// `Aborted.` line is present.
-pub fn detect_openspec_abort(stdout: &str) -> Option<String> {
-    let lines: Vec<&str> = stdout.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let first_token = match line.split_whitespace().next() {
-            Some(t) => t,
-            None => continue,
-        };
-        if first_token != "Aborted." {
-            continue;
-        }
-        if i > 0 {
-            for j in (0..i).rev() {
-                let prev = lines[j].trim();
-                if !prev.is_empty() {
-                    return Some(prev.to_string());
-                }
-            }
-        }
-        return Some(line.trim().to_string());
-    }
-    None
-}
-
-/// Format an `ArchiveRunOutput` as a single failure-reason string for
-/// `ChangeOutcome.failure_reason`. Includes the exit status code and the
-/// captured stderr (or stdout when stderr is empty), truncated via
-/// `truncate_for_report`.
-pub fn format_archive_output_for_report(out: &ArchiveRunOutput) -> String {
-    let stderr = out.stderr.trim();
-    let stdout = out.stdout.trim();
-    let body = if !stderr.is_empty() {
-        truncate_for_report(stderr)
-    } else if !stdout.is_empty() {
-        truncate_for_report(stdout)
-    } else {
-        "(no output)".to_string()
-    };
-    format!("openspec exited {:?}: {}", out.status.code(), body)
-}
-
-/// Verify the post-condition after an exit-zero `openspec archive` call.
-/// Returns the actual archive directory path on success, or a structured
-/// failure value naming exactly what was wrong.
-pub fn verify_archive_post_condition(
-    workspace: &Path,
-    slug: &str,
-) -> Result<PathBuf, PostConditionFailure> {
-    let active_path = workspace.join("openspec/changes").join(slug);
-    if active_path.exists() {
-        return Err(PostConditionFailure::ActivePathStillPresent { path: active_path });
-    }
-
-    let archive_root = workspace.join("openspec/changes/archive");
-    let matches = find_archive_entries_for_slug(&archive_root, slug);
-    match matches.len() {
-        0 => Err(PostConditionFailure::NoArchiveEntryFound),
-        1 => Ok(matches.into_iter().next().expect("len == 1")),
-        _ => Err(PostConditionFailure::MultipleArchiveEntriesFound { matches }),
-    }
-}
-
-/// Read `archive_root` and return all entries whose name matches
-/// `<date>-<slug>` or `<date>-<slug>-<N>` (the openspec collision
-/// suffix), where `<date>` is `YYYY-MM-DD`. Excludes entries without a
-/// date prefix and entries that share only an unrelated suffix.
-fn find_archive_entries_for_slug(archive_root: &Path, slug: &str) -> Vec<PathBuf> {
-    // Match `<date>-<slug>` exactly, OR `<date>-<slug>-<digits>` for
-    // openspec's collision suffix. Regex-escape the slug because change
-    // slugs can contain `-` (a regex metachar in some forms but not in
-    // ours; still safer to escape).
-    let pattern = format!(
-        r"^\d{{4}}-\d{{2}}-\d{{2}}-{}(?:-\d+)?$",
-        regex::escape(slug)
-    );
-    let re = match Regex::new(&pattern) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let mut out: Vec<PathBuf> = Vec::new();
-    let read = match std::fs::read_dir(archive_root) {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-    for entry in read.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let name = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !re.is_match(&name) {
-            continue;
-        }
-        out.push(entry.path());
-    }
-    out.sort();
-    out
 }
 
 /// Move `openspec/changes/<slug>/` back to
@@ -816,15 +617,6 @@ fn record_failure_with_rollback(
     }
 }
 
-fn truncate_for_report(s: &str) -> String {
-    const MAX: usize = 500;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        s.chars().take(MAX).collect::<String>() + "…"
-    }
-}
-
 /// Strip a `YYYY-MM-DD-` date prefix from an archive directory name and
 /// return the slug. Errors if `name` doesn't match the expected shape.
 pub fn strip_date_prefix(name: &str) -> Result<&str> {
@@ -843,7 +635,8 @@ pub fn strip_date_prefix(name: &str) -> Result<&str> {
 /// Format the dated archive directory name openspec produces today:
 /// `<UTC YYYY-MM-DD>-<slug>`. Retained for test fixtures only — the
 /// production success path now observes the actual archive directory
-/// via `verify_archive_post_condition` rather than guessing today's date.
+/// via `openspec_archive::openspec_archive_with_postcondition` rather
+/// than guessing today's date.
 #[cfg(test)]
 pub fn today_dated_name(slug: &str) -> String {
     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -1313,215 +1106,11 @@ mod tests {
         }
     }
 
-    // ----- detect_openspec_abort tests -----
-
-    #[test]
-    fn detect_abort_real_world_with_preceding_diagnostic() {
-        let stdout = "member-saved-cards MODIFIED failed for header \"### Requirement: Foo\" - not found\nAborted. No files were changed.\n";
-        let got = detect_openspec_abort(stdout);
-        assert_eq!(
-            got.as_deref(),
-            Some(
-                "member-saved-cards MODIFIED failed for header \"### Requirement: Foo\" - not found"
-            )
-        );
-    }
-
-    #[test]
-    fn detect_abort_alone_with_trailing_text() {
-        let stdout = "Aborted. No files were changed.\n";
-        let got = detect_openspec_abort(stdout);
-        assert_eq!(got.as_deref(), Some("Aborted. No files were changed."));
-    }
-
-    #[test]
-    fn detect_abort_alone_no_trailing_text() {
-        let stdout = "Aborted.\n";
-        let got = detect_openspec_abort(stdout);
-        assert_eq!(got.as_deref(), Some("Aborted."));
-    }
-
-    #[test]
-    fn detect_abort_skips_blank_preceding_lines() {
-        let stdout = "real reason here\n\n\nAborted. No files were changed.\n";
-        let got = detect_openspec_abort(stdout);
-        assert_eq!(got.as_deref(), Some("real reason here"));
-    }
-
-    #[test]
-    fn detect_abort_clean_archive_returns_none() {
-        let stdout = "Specs to update: example\nApplying changes to openspec/specs/example/spec.md\nTotals: +3 lines\nSpecs updated successfully.\n";
-        assert_eq!(detect_openspec_abort(stdout), None);
-    }
-
-    #[test]
-    fn detect_abort_lowercase_aborted_returns_none() {
-        let stdout = "the operation was aborted by the user\n";
-        assert_eq!(detect_openspec_abort(stdout), None);
-    }
-
-    #[test]
-    fn detect_abort_without_trailing_period_returns_none() {
-        let stdout = "Aborted\n";
-        assert_eq!(detect_openspec_abort(stdout), None);
-    }
-
-    #[test]
-    fn detect_abort_mid_line_returns_none() {
-        let stdout = "some prefix Aborted. No files were changed.\n";
-        assert_eq!(detect_openspec_abort(stdout), None);
-    }
-
-    #[test]
-    fn detect_abort_indented_marker_still_matches() {
-        // Leading whitespace before `Aborted.` should still match — the
-        // rule is "first non-whitespace token" not "first column".
-        let stdout = "preceding reason\n    Aborted. No files were changed.\n";
-        let got = detect_openspec_abort(stdout);
-        assert_eq!(got.as_deref(), Some("preceding reason"));
-    }
-
-    #[test]
-    fn detect_abort_empty_stdout_returns_none() {
-        assert_eq!(detect_openspec_abort(""), None);
-    }
-
-    // ----- format_archive_output_for_report tests -----
-
-    #[test]
-    fn format_archive_output_prefers_stderr() {
-        let out = ArchiveRunOutput {
-            status: fake_exit(1),
-            stdout: "stdout-content".into(),
-            stderr: "stderr-content".into(),
-        };
-        let s = format_archive_output_for_report(&out);
-        assert!(s.contains("stderr-content"), "got {s}");
-        assert!(!s.contains("stdout-content"), "got {s}");
-        assert!(s.contains("exited"), "got {s}");
-    }
-
-    #[test]
-    fn format_archive_output_falls_back_to_stdout() {
-        let out = ArchiveRunOutput {
-            status: fake_exit(0),
-            stdout: "stdout-content".into(),
-            stderr: "   ".into(),
-        };
-        let s = format_archive_output_for_report(&out);
-        assert!(s.contains("stdout-content"), "got {s}");
-    }
-
-    #[test]
-    fn format_archive_output_handles_empty() {
-        let out = ArchiveRunOutput {
-            status: fake_exit(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-        let s = format_archive_output_for_report(&out);
-        assert!(s.contains("no output"), "got {s}");
-    }
-
-    #[test]
-    fn format_archive_output_truncates_long_output() {
-        let huge = "x".repeat(2000);
-        let out = ArchiveRunOutput {
-            status: fake_exit(1),
-            stdout: String::new(),
-            stderr: huge,
-        };
-        let s = format_archive_output_for_report(&out);
-        assert!(s.chars().count() < 1000, "should be truncated, got {} chars", s.chars().count());
-        assert!(s.contains("…"), "should contain truncation marker, got {s}");
-    }
-
-    // ----- verify_archive_post_condition tests -----
-
-    #[test]
-    fn post_condition_happy_path() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        let entry = ws.join("openspec/changes/archive/2026-05-25-foo");
-        std::fs::create_dir_all(&entry).unwrap();
-
-        let actual = verify_archive_post_condition(ws, "foo").unwrap();
-        assert_eq!(actual, entry);
-    }
-
-    #[test]
-    fn post_condition_silent_skip() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
-
-        match verify_archive_post_condition(ws, "foo").unwrap_err() {
-            PostConditionFailure::ActivePathStillPresent { path } => {
-                assert_eq!(path, ws.join("openspec/changes/foo"));
-            }
-            other => panic!("expected ActivePathStillPresent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn post_condition_data_loss() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        // No changes/foo, no archive/*-foo.
-        match verify_archive_post_condition(ws, "foo").unwrap_err() {
-            PostConditionFailure::NoArchiveEntryFound => {}
-            other => panic!("expected NoArchiveEntryFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn post_condition_collision_multiple_matches() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-24-foo")).unwrap();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
-
-        match verify_archive_post_condition(ws, "foo").unwrap_err() {
-            PostConditionFailure::MultipleArchiveEntriesFound { matches } => {
-                assert_eq!(matches.len(), 2);
-                let names: Vec<String> = matches
-                    .iter()
-                    .filter_map(|p| p.file_name().and_then(|n| n.to_str().map(String::from)))
-                    .collect();
-                assert!(names.contains(&"2026-05-24-foo".to_string()));
-                assert!(names.contains(&"2026-05-25-foo".to_string()));
-            }
-            other => panic!("expected MultipleArchiveEntriesFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn post_condition_ignores_entries_without_date_prefix() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/foo-foo")).unwrap();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
-
-        let actual = verify_archive_post_condition(ws, "foo").unwrap();
-        assert_eq!(
-            actual,
-            ws.join("openspec/changes/archive/2026-05-25-foo")
-        );
-    }
-
-    #[test]
-    fn post_condition_ignores_unrelated_slugs() {
-        let dir = make_workspace();
-        let ws = dir.path();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-bar")).unwrap();
-        std::fs::create_dir_all(ws.join("openspec/changes/archive/2026-05-25-foo")).unwrap();
-
-        let actual = verify_archive_post_condition(ws, "foo").unwrap();
-        assert_eq!(
-            actual,
-            ws.join("openspec/changes/archive/2026-05-25-foo")
-        );
-    }
+    // Note: `detect_openspec_abort`, `format_full_output`,
+    // `find_archive_entries_for_slug`, and the four
+    // `ArchiveFailure` post-condition variants are now exercised in
+    // `crate::openspec_archive::tests`. The rebuild loop tests below
+    // still cover end-to-end behaviour through the shared helper.
 
     // ----- rollback_to_archive tests -----
 
