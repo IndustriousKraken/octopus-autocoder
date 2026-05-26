@@ -121,7 +121,7 @@ The bot recognises:
 
 | Verb | Syntax | What it does |
 | --- | --- | --- |
-| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (`idle` or `working on <change>`), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (`idle` or `working on <change>`), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
 | `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
@@ -129,6 +129,23 @@ The bot recognises:
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](CHATOPS.md#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](CHATOPS.md#what-gets-posted) recovery uses, deleted via a chat reply instead.
+
+**Bare `status` — the per-repo menu.** When you don't remember the exact substring of a configured repo, type `@<bot> status` with no arguments. The bot returns a one-line announcement followed by one two-line section per watched repository (URL on top, summary on the next line). The summary has three clauses joined by ` · `: a queue clause (`empty queue` when all three counts are zero, otherwise `<N> pending (<list>), <M> waiting (<list>), <K> excluded` with each list truncating after 5 entries), a busy clause (`idle` or `working on <change> (started <age> ago)`), and a last-iteration clause (`last iteration <age> ago` or `no iteration yet`). Example:
+
+```
+📊 Watching 3 repositories. Reply `@<bot> status <repo-substring>` for details.
+
+  • git@github.com:acme/widgets.git
+    2 pending (a06-foo, a07-bar), 0 waiting, 0 excluded · idle · last iteration 3m ago
+
+  • git@github.com:org-b/another.git
+    empty queue · idle · last iteration 5m ago
+
+  • git@github.com:personal/foo.git
+    5 pending (a01, a02, a03, a04, a05 …+2 more), 1 waiting (a07-bar), 0 excluded · working on a05-foo (started 2m ago) · no iteration yet
+```
+
+If any individual repo's state cannot be assembled (workspace mid-failure, control-socket per-repo error), that repository's section renders `(unavailable: <error excerpt>)` in place of the summary line. The menu still ships every other repository's section so a single broken workspace doesn't blank the whole list. From the menu, pick a repo and re-issue `@<bot> status <substring>` for the full per-repo detail.
 
 ### Setup (Slack)
 

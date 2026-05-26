@@ -260,6 +260,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
     match action.as_str() {
         "reload" => handle_reload(state).await,
         "repo_status" => handle_repo_status(&parsed, state).await,
+        "repo_status_all" => handle_repo_status_all(state).await,
         "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
         "wipe_workspace" => handle_wipe_workspace(&parsed, state),
@@ -309,6 +310,52 @@ async fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
         },
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
     }
+}
+
+/// Aggregate `repo_status` for every repository currently in the live
+/// `repo_tasks` registry — one round trip instead of N. Per-repo failures
+/// are caught and recorded in the per-entry `ok` field rather than
+/// failing the whole call; the bare-status menu always ships every repo
+/// section even if one repo's workspace is mid-failure.
+async fn handle_repo_status_all(state: &ControlState) -> Value {
+    let repos: Vec<RepositoryConfig> = {
+        // Snapshot URLs from the live task registry, then look up each
+        // URL in the current config holder so the per-repo
+        // RepositoryConfig is the one polling tasks see.
+        let urls: Vec<String> = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard.keys().cloned().collect()
+        };
+        let cfg = state.last_config.load_full();
+        urls.into_iter()
+            .filter_map(|url| {
+                cfg.repositories.iter().find(|r| r.url == url).cloned()
+            })
+            .collect()
+    };
+    let github_cfg = state.github.load_full();
+    let mut results = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let workspace_path = workspace::resolve_path(&repo);
+        let url = repo.url.clone();
+        let entry = match build_repo_status(&workspace_path, &repo, &github_cfg).await {
+            Ok(resp) => match serde_json::to_value(&resp) {
+                Ok(body) => json!({"url": url, "ok": true, "status": body}),
+                Err(e) => json!({
+                    "url": url,
+                    "ok": false,
+                    "error": format!("serializing status: {e}"),
+                }),
+            },
+            Err(e) => json!({
+                "url": url,
+                "ok": false,
+                "error": format!("{e:#}"),
+            }),
+        };
+        results.push(entry);
+    }
+    json!({"ok": true, "results": results})
 }
 
 /// Build the `RepoStatusResponse` for one repo by reading the workspace's
@@ -1860,6 +1907,67 @@ github:
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(pending, vec!["a08-ready".to_string()]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_status_all_aggregates_one_round_trip_per_repo() {
+        // Two-repo fixture: the daemon should bundle both per-repo
+        // statuses into a single response so the chatops menu only
+        // pays one round trip.
+        let dir = TempDir::new().unwrap();
+        let ws_a = dir.path().join("ws-a");
+        let ws_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        make_change(&ws_a, "a06-foo");
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/aaa.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+  - url: "git@github.com:owner/bbb.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+  token:
+    value: "ghp_fixture"
+"#,
+            ws_a.display(),
+            ws_b.display()
+        );
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(&yaml).await;
+        let resp = send_request(&socket, r#"{"action":"repo_status_all"}"#).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let results = resp["results"]
+            .as_array()
+            .expect("results must be an array");
+        assert_eq!(results.len(), 2, "two repos → two results");
+        let urls: Vec<String> = results
+            .iter()
+            .map(|e| e["url"].as_str().unwrap().to_string())
+            .collect();
+        assert!(urls.contains(&"git@github.com:owner/aaa.git".to_string()));
+        assert!(urls.contains(&"git@github.com:owner/bbb.git".to_string()));
+        // Every per-repo entry is ok=true and ships a status payload.
+        for entry in results {
+            assert_eq!(
+                entry["ok"], serde_json::Value::Bool(true),
+                "every entry must be ok=true: {entry}"
+            );
+            assert!(
+                entry.get("status").is_some(),
+                "every entry must ship `status`: {entry}"
+            );
+        }
         cancel.cancel();
     }
 
