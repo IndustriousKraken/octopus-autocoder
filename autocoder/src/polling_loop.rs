@@ -81,6 +81,8 @@ pub async fn run(
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
     pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+    iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
 ) {
     run_with_hooks(
@@ -101,6 +103,8 @@ pub async fn run(
         pending_rebuild,
         pending_triages,
         pending_audit_runs,
+        iteration_cancel,
+        iteration_drained,
         cancel,
         RunHooks::default(),
     )
@@ -118,6 +122,23 @@ pub struct RunHooks {
     /// race a cancel against the sleep wait on this to know the loop
     /// reached the sleep window.
     pub on_iteration_sleep: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Drops at the end of the iteration body — including the panic-unwind
+/// path — so the per-iteration cancel handle is cleared and the
+/// `iteration_drained` Notify fires from every exit path without manual
+/// repetition. The wipe-workspace handler awaits the Notify after firing
+/// the per-iteration cancel; the drop ensures it always wakes.
+struct IterationGuard<'a> {
+    iteration_cancel: &'a std::sync::Mutex<Option<CancellationToken>>,
+    iteration_drained: &'a tokio::sync::Notify,
+}
+
+impl Drop for IterationGuard<'_> {
+    fn drop(&mut self) {
+        *self.iteration_cancel.lock().unwrap() = None;
+        self.iteration_drained.notify_waiters();
+    }
 }
 
 /// Same as `run` but accepts a `RunHooks` for test-only synchronization.
@@ -140,6 +161,8 @@ pub async fn run_with_hooks(
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
     pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+    iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     hooks: RunHooks,
 ) {
@@ -185,6 +208,20 @@ pub async fn run_with_hooks(
         if cancel.is_cancelled() {
             break;
         }
+
+        // Per-iteration cancel token — a child of the global cancel so
+        // SIGINT/SIGTERM still propagates. The wipe-workspace control-
+        // socket handler fires this token to ask the in-flight iteration
+        // to drain cleanly before deleting the workspace. The
+        // IterationGuard below clears the slot and fires the
+        // iteration_drained Notify on every exit path (normal, error,
+        // panic) so the wipe handler always wakes.
+        let iter_cancel = cancel.child_token();
+        *iteration_cancel.lock().unwrap() = Some(iter_cancel.clone());
+        let iter_guard = IterationGuard {
+            iteration_cancel: iteration_cancel.as_ref(),
+            iteration_drained: iteration_drained.as_ref(),
+        };
 
         // Single-snapshot-per-iteration: read `repo`, `github`, `reviewer`,
         // and `chatops` exactly once at the top of the iteration so a
@@ -317,6 +354,13 @@ pub async fn run_with_hooks(
         // any hot-swap that landed during the sleep.
         let base_secs = snapshot_ref.poll_interval_sec;
         drop(snapshot);
+        // Iteration body is done — drop the IterationGuard explicitly so
+        // `iteration_cancel` is cleared to `None` (the "no iteration in
+        // flight" state) and the `iteration_drained` Notify fires before
+        // we enter the inter-iteration sleep. A wipe-workspace handler
+        // arriving during the sleep then short-circuits straight to the
+        // deletion without waiting on a drain that already happened.
+        drop(iter_guard);
         let sleep_dur = jittered_sleep_duration(base_secs, inter_iteration_jitter_pct);
 
         if let Some(notify) = &hooks.on_iteration_sleep {
@@ -3041,7 +3085,7 @@ fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool)
         );
     }
     for change in changes {
-        let why = read_archived_why(workspace, change);
+        let why = read_change_why(workspace, change);
         let body = match why {
             Some(w) if !w.trim().is_empty() => w.trim().to_string(),
             _ => "_(no proposal.md available)_".to_string(),
@@ -3055,12 +3099,42 @@ fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool)
     s
 }
 
-/// Locate `<workspace>/openspec/changes/archive/*-<change>/proposal.md`
-/// (picking the lexicographically last match if multiple exist), read
-/// the file, and return the `## Why` section. Returns `None` if the
-/// directory or file is missing, the read fails, or no `## Why` heading
-/// is present.
-fn read_archived_why(workspace: &Path, change: &str) -> Option<String> {
+/// Read a change's proposal `## Why` section, preferring the archive
+/// location and falling back to the active path. Step 1 looks up
+/// `<workspace>/openspec/changes/archive/*-<change>/proposal.md` (picking
+/// the lexicographically last match if multiple exist). Step 2, on
+/// archive miss, tries `<workspace>/openspec/changes/<change>/proposal.md`.
+/// When the active-path fallback yields a parseable `## Why`, emit a
+/// per-change WARN so operators can correlate the PR with the likely
+/// upstream archive failure. Returns `None` if both paths miss or
+/// neither yields a `## Why` heading; no WARN fires in those cases.
+fn read_change_why(workspace: &Path, change: &str) -> Option<String> {
+    if let Some(why) = read_proposal_why_from_archive(workspace, change) {
+        return Some(why);
+    }
+    let active = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join("proposal.md");
+    if active.is_file() {
+        let raw = std::fs::read_to_string(&active).ok()?;
+        if let Some(why) = extract_why_section(&raw) {
+            tracing::warn!(
+                change = %change,
+                "proposal read from active path, not archive — likely indicates an upstream archive failure for this iteration"
+            );
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// Step 1 of [`read_change_why`]: locate
+/// `<workspace>/openspec/changes/archive/*-<change>/proposal.md` (picking
+/// the lexicographically last match if multiple exist), read the file,
+/// and return its `## Why` section. Returns `None` if the directory or
+/// file is missing, the read fails, or no `## Why` heading is present.
+fn read_proposal_why_from_archive(workspace: &Path, change: &str) -> Option<String> {
     let archive_root = workspace.join("openspec/changes/archive");
     let entries = std::fs::read_dir(&archive_root).ok()?;
     let suffix = format!("-{change}");
@@ -5377,6 +5451,8 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
             )
             .await;
@@ -5414,6 +5490,88 @@ mod tests {
             count >= 2,
             "expected ≥2 executor invocations across iterations, got {count}"
         );
+    }
+
+    // ============================================================
+    // Per-iteration cancel + drained Notify (IterationGuard)
+    // ============================================================
+
+    /// IterationGuard's Drop impl clears the per-iteration cancel handle
+    /// AND fires the drained Notify — exercised in isolation so we know
+    /// the cleanup runs on every exit path, including panic unwind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iteration_guard_drop_clears_handle_and_notifies() {
+        let iter_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+            Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+
+        // Subscribe to the Notify BEFORE the guard drops so we don't miss
+        // the wake. `notify_waiters()` only wakes futures that are already
+        // registered as waiters; the `.enable()` call registers the
+        // `Notified` future synchronously without polling it.
+        let notified = drained.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Run the guard in a scope so it drops at the end.
+        {
+            let _guard = IterationGuard {
+                iteration_cancel: iter_cancel.as_ref(),
+                iteration_drained: drained.as_ref(),
+            };
+            assert!(
+                iter_cancel.lock().unwrap().is_some(),
+                "handle is populated before drop"
+            );
+        }
+        // After the drop, the handle is cleared.
+        assert!(
+            iter_cancel.lock().unwrap().is_none(),
+            "IterationGuard Drop must clear the cancel handle"
+        );
+        // And the pre-registered notified future is ready.
+        tokio::time::timeout(Duration::from_secs(1), notified.as_mut())
+            .await
+            .expect("IterationGuard Drop must fire the drained Notify");
+    }
+
+    /// Panic inside the iteration scope still triggers the guard's Drop —
+    /// the Notify fires AND the handle is cleared. Verifies the
+    /// "every exit path" contract for tasks.md 1.3.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iteration_guard_clears_state_on_panic_unwind() {
+        let iter_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+            Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+
+        // Pre-register on the Notify so the panic-driven Drop's
+        // notify_waiters() has a waiter to wake.
+        let notified = drained.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let iter_cancel_for_panic = iter_cancel.clone();
+        let drained_for_panic = drained.clone();
+        let join = std::thread::spawn(move || {
+            let _guard = IterationGuard {
+                iteration_cancel: iter_cancel_for_panic.as_ref(),
+                iteration_drained: drained_for_panic.as_ref(),
+            };
+            // Force a panic inside the iteration body's scope. The Drop
+            // impl runs on unwind — that's the contract we're verifying.
+            panic!("simulated iteration-body panic");
+        });
+        // The thread panics; join returns Err(_). Drop ran nonetheless.
+        let res = join.join();
+        assert!(res.is_err(), "thread must have panicked");
+
+        assert!(
+            iter_cancel.lock().unwrap().is_none(),
+            "guard Drop must clear the handle even on panic"
+        );
+        tokio::time::timeout(Duration::from_secs(1), notified.as_mut())
+            .await
+            .expect("Notify must fire even on panic-unwind drop");
     }
 
     /// Cancellation must break the loop within the sleep window. We use a
@@ -5495,6 +5653,8 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
                 hooks,
             )
@@ -8831,6 +8991,8 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
                 task_cancel,
             )
             .await;
@@ -9024,6 +9186,127 @@ mod tests {
         assert!(
             !body.contains("More text."),
             "body must not include non-Why sections; got: {body}"
+        );
+    }
+
+    // ============================================================
+    // read_change_why — archive + active-path fallback
+    // ============================================================
+
+    /// Write a fixture active-path proposal.md at
+    /// `<workspace>/openspec/changes/<change>/proposal.md`.
+    fn write_fixture_active_proposal(workspace: &Path, change: &str, proposal: &str) {
+        let dir = workspace.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), proposal).unwrap();
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_archive_path_wins_without_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nArchive rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(
+            why.as_deref()
+                .map(|s| s.contains("Archive rationale."))
+                .unwrap_or(false),
+            "expected archive why; got: {why:?}"
+        );
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "no fallback WARN expected on archive hit"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_falls_back_to_active_with_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No archive fixture.
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## Why\n\nActive-path rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(
+            why.as_deref()
+                .map(|s| s.contains("Active-path rationale."))
+                .unwrap_or(false),
+            "expected active-path why; got: {why:?}"
+        );
+        assert!(
+            logs_contain("proposal read from active path"),
+            "expected fallback WARN naming the change"
+        );
+        assert!(
+            logs_contain("fix-thing"),
+            "WARN must name the change slug"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_active_without_why_section_returns_none_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No archive fixture; active proposal lacks a `## Why` heading.
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## What Changes\n\nstuff but no why\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(why.is_none(), "expected None; got: {why:?}");
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "WARN should not fire when fallback extracts no content"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_both_paths_missing_returns_none_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(why.is_none(), "expected None; got: {why:?}");
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "WARN should not fire when both paths miss"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_archive_present_overrides_active_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nArchive rationale.\n\n## What Changes\n\nx\n",
+        );
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## Why\n\nActive rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        let text = why.expect("expected archive why");
+        assert!(
+            text.contains("Archive rationale."),
+            "archive path must win; got: {text}"
+        );
+        assert!(
+            !text.contains("Active rationale."),
+            "active text must not leak through; got: {text}"
+        );
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "no WARN expected when archive path wins"
         );
     }
 
