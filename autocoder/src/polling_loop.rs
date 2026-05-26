@@ -8,7 +8,7 @@ use crate::audits::AuditRegistry;
 use crate::audits::scheduler::run_due_audits;
 use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
-use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
+use crate::code_reviewer::{CodeReviewer, ReviewConcern, ReviewReport, ReviewVerdict};
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
@@ -441,23 +441,37 @@ pub async fn execute_one_pass(
     // Reviewer step (if configured) runs against the produced commits BEFORE
     // the push + PR. A failed reviewer is non-fatal: PR still ships with a
     // "(reviewer failed)" note in the body.
-    let (review_report, draft) = match reviewer {
-        None => (None, false),
+    //
+    // When `reviewer.auto_revise_on_block` is enabled AND the verdict is
+    // Block, the per-concern `should_request_revision` records drive the
+    // reviewer-initiated revision pipeline. Concerns are partitioned
+    // against the per-PR cap budget here; the taken set is queued to be
+    // posted as `<!-- reviewer-revision -->` PR comments after the PR is
+    // created, and the dropped set is annotated into the `## Code Review`
+    // PR-body section so the human sees what was skipped.
+    let (review_report, draft, reviewer_revision_concerns) = match reviewer {
+        None => (None, false, Vec::new()),
         Some(r) => {
             let _ = guard.set_stage(busy_marker::Stage::Review);
             let ctx = build_review_context(workspace, repo, &processed)?;
             match r.review(&ctx).await {
-                Ok(report) => {
+                Ok(mut report) => {
                     let draft = matches!(report.verdict, ReviewVerdict::Block);
-                    (Some(report), draft)
+                    let taken = if r.auto_revise_on_block() {
+                        partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
+                    } else {
+                        Vec::new()
+                    };
+                    (Some(report), draft, taken)
                 }
                 Err(e) => {
                     tracing::error!("reviewer failed: {e:#}");
                     let synthetic = ReviewReport {
                         verdict: ReviewVerdict::Concerns,
                         markdown: format!("(reviewer failed: {e})"),
+                        concerns: Vec::new(),
                     };
-                    (Some(synthetic), false)
+                    (Some(synthetic), false, Vec::new())
                 }
             }
         }
@@ -491,6 +505,7 @@ pub async fn execute_one_pass(
         includes_self_heal,
         review_report.as_ref(),
         draft,
+        &reviewer_revision_concerns,
         chatops_ctx,
         workspace,
     )
@@ -2495,6 +2510,7 @@ fn first_line_of_section(text: &str, header: &str) -> Option<String> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_pull_request(
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
@@ -2502,6 +2518,7 @@ async fn open_pull_request(
     includes_self_heal: bool,
     review_report: Option<&ReviewReport>,
     draft: bool,
+    reviewer_revision_concerns: &[ReviewConcern],
     chatops_ctx: Option<&ChatOpsContext>,
     workspace: &Path,
 ) -> Result<()> {
@@ -2576,7 +2593,170 @@ async fn open_pull_request(
     )
     .await;
 
+    // Best-effort: post one `<!-- reviewer-revision -->` comment per
+    // taken reviewer concern, so the revision dispatcher (running on the
+    // next polling iteration) picks them up and forwards them to the
+    // implementer agent. PR creation already succeeded; per-concern post
+    // failures are logged at WARN but never propagated.
+    if !reviewer_revision_concerns.is_empty() {
+        post_reviewer_revision_comments(
+            github::DEFAULT_API_BASE,
+            &owner,
+            &repo_name,
+            pr.number,
+            reviewer_revision_concerns,
+            &token,
+        )
+        .await;
+    }
+
     Ok(())
+}
+
+/// Post one `<!-- reviewer-revision -->` PR issue comment per concern.
+/// The body shape matches the spec: marker line, then
+/// `@<bot> revise <actionable_request>`. Per-concern failures log at WARN
+/// and never abort; the iteration's PR creation has already succeeded.
+async fn post_reviewer_revision_comments(
+    api_base: &str,
+    upstream_owner: &str,
+    upstream_repo: &str,
+    pr_number: u64,
+    concerns: &[ReviewConcern],
+    token: &str,
+) {
+    // Resolve the bot's GitHub login once — the trigger pattern is
+    // `@<bot> revise ...`. Without the username we cannot construct a
+    // valid trigger, so we abort the posting step (logging a WARN); the
+    // iteration's PR creation still succeeded.
+    let bot_username = match github::self_bot_username(api_base, token).await {
+        Ok(name) => name,
+        Err(e) => {
+            tracing::warn!(
+                pr_number,
+                "reviewer-revision posting skipped: bot-username lookup failed: {e:#}"
+            );
+            return;
+        }
+    };
+    for (idx, concern) in concerns.iter().enumerate() {
+        let request = match concern.actionable_request.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => continue, // shouldn't happen; partition filters these out
+        };
+        let body = format!(
+            "{}\n@{} revise {}",
+            crate::revisions::REVIEWER_REVISION_MARKER,
+            bot_username,
+            request,
+        );
+        let post_result = if api_base == github::DEFAULT_API_BASE {
+            github::create_issue_comment(upstream_owner, upstream_repo, pr_number, &body, token)
+                .await
+        } else {
+            #[cfg(test)]
+            {
+                github::create_issue_comment_at_for_test(
+                    api_base,
+                    upstream_owner,
+                    upstream_repo,
+                    pr_number,
+                    &body,
+                    token,
+                )
+                .await
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("non-default api_base is test-only");
+            }
+        };
+        if let Err(e) = post_result {
+            tracing::warn!(
+                pr_number,
+                concern_index = idx,
+                "reviewer-revision comment post failed: {e:#}"
+            );
+        }
+    }
+}
+
+/// Decide which concerns from `report.concerns` get posted as
+/// `<!-- reviewer-revision -->` PR comments and which are dropped due to
+/// the per-PR revision-cap budget. Pre-conditions assume the caller has
+/// already gated on `reviewer.auto_revise_on_block == true`.
+///
+/// Selection rules:
+/// - The verdict gates the entire mechanism: only `Block` produces
+///   reviewer-revision posts. `Pass` and `Concerns` return an empty vec
+///   without scanning the concerns list.
+/// - Within a `Block`-verdict report, a concern is "revisable" when
+///   `should_request_revision == true` AND `actionable_request` is
+///   non-empty (whitespace-trimmed). Concerns failing either condition
+///   stay as commentary in the `## Code Review` section and do not post.
+/// - When the revisable set exceeds `budget`, the first `budget`
+///   concerns (in reviewer output order — the template instructs
+///   most-critical-first) are taken; the remainder are annotated into
+///   `report.markdown` with `(not auto-revised; cap budget exhausted)`
+///   so the human reader of the PR body sees what was skipped.
+/// - When the revisable set is empty AND the verdict is `Block`, a WARN
+///   is logged surfacing the "you flipped the flag but your template
+///   produced no actionable concerns" misconfiguration.
+fn partition_and_annotate_reviewer_revisions(
+    report: &mut ReviewReport,
+    budget: u32,
+) -> Vec<ReviewConcern> {
+    if report.verdict != ReviewVerdict::Block {
+        return Vec::new();
+    }
+    let revisable: Vec<ReviewConcern> = report
+        .concerns
+        .iter()
+        .filter(|c| {
+            c.should_request_revision
+                && c.actionable_request
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if revisable.is_empty() {
+        tracing::warn!(
+            "reviewer auto-revise is enabled but no concerns had `actionable_request` + `should_request_revision: true` populated; verify the reviewer prompt template has been updated to emit these fields."
+        );
+        return Vec::new();
+    }
+    let budget_us = budget as usize;
+    let (taken, dropped): (Vec<ReviewConcern>, Vec<ReviewConcern>) = if revisable.len() > budget_us
+    {
+        (
+            revisable[..budget_us].to_vec(),
+            revisable[budget_us..].to_vec(),
+        )
+    } else {
+        (revisable, Vec::new())
+    };
+    if !dropped.is_empty() {
+        // Ensure separation from any prior content the LLM produced.
+        if !report.markdown.ends_with("\n\n") {
+            if report.markdown.ends_with('\n') {
+                report.markdown.push('\n');
+            } else {
+                report.markdown.push_str("\n\n");
+            }
+        }
+        report
+            .markdown
+            .push_str("### Reviewer-initiated revisions: dropped (cap budget exhausted)\n");
+        for c in &dropped {
+            report.markdown.push_str(&format!(
+                "- (not auto-revised; cap budget exhausted) {}\n",
+                c.summary
+            ));
+        }
+    }
+    taken
 }
 
 /// Build the implementer-summary markdown for `processed`, truncate it to
@@ -4411,6 +4591,7 @@ mod tests {
                     Some(ReviewReport {
                         verdict: ReviewVerdict::Concerns,
                         markdown: format!("(reviewer failed: {e})"),
+                        concerns: Vec::new(),
                     }),
                     false,
                 ),
@@ -8843,5 +9024,250 @@ mod tests {
             unrolled_line.contains("rollback ALSO failed"),
             "unrolled-back entry should still surface 'rollback ALSO failed', got: {unrolled_line}"
         );
+    }
+
+    // ============================================================
+    // partition_and_annotate_reviewer_revisions (cap-budget + verdict gating)
+    // ============================================================
+
+    fn make_report(verdict: ReviewVerdict, concerns: Vec<ReviewConcern>) -> ReviewReport {
+        ReviewReport {
+            verdict,
+            markdown: "## Summary\nbase markdown.\n".to_string(),
+            concerns,
+        }
+    }
+
+    fn revisable_concern(summary: &str, request: &str) -> ReviewConcern {
+        ReviewConcern {
+            summary: summary.to_string(),
+            actionable_request: Some(request.to_string()),
+            should_request_revision: true,
+        }
+    }
+
+    fn commentary_concern(summary: &str) -> ReviewConcern {
+        ReviewConcern {
+            summary: summary.to_string(),
+            actionable_request: None,
+            should_request_revision: false,
+        }
+    }
+
+    #[test]
+    fn partition_returns_empty_on_pass_verdict() {
+        let mut r = make_report(
+            ReviewVerdict::Pass,
+            vec![revisable_concern("a", "fix a")],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert!(taken.is_empty(), "Pass must never post revision comments");
+        assert!(
+            !r.markdown.contains("cap budget exhausted"),
+            "no dropped-concern annotation on Pass"
+        );
+    }
+
+    #[test]
+    fn partition_returns_empty_on_concerns_verdict() {
+        let mut r = make_report(
+            ReviewVerdict::Concerns,
+            vec![revisable_concern("a", "fix a")],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert!(taken.is_empty(), "Concerns must never post revision comments");
+        assert!(!r.markdown.contains("cap budget exhausted"));
+    }
+
+    #[test]
+    fn partition_block_under_budget_takes_all_no_dropped() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                revisable_concern("a", "fix a"),
+                revisable_concern("b", "fix b"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].summary, "a");
+        assert_eq!(taken[1].summary, "b");
+        assert!(
+            !r.markdown.contains("cap budget exhausted"),
+            "no annotation when nothing is dropped"
+        );
+    }
+
+    #[test]
+    fn partition_block_over_budget_drops_tail_and_annotates() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                revisable_concern("a", "fix a"),
+                revisable_concern("b", "fix b"),
+                revisable_concern("c", "fix c"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].summary, "a");
+        assert_eq!(taken[1].summary, "b");
+        assert!(
+            r.markdown.contains("(not auto-revised; cap budget exhausted) c"),
+            "third concern must be annotated; got:\n{}",
+            r.markdown
+        );
+        assert!(
+            !r.markdown.contains("(not auto-revised; cap budget exhausted) a"),
+            "kept concerns must NOT appear in the dropped section"
+        );
+    }
+
+    #[test]
+    fn partition_block_zero_budget_drops_everything() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                revisable_concern("a", "fix a"),
+                revisable_concern("b", "fix b"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 0);
+        assert!(taken.is_empty());
+        assert!(r.markdown.contains("(not auto-revised; cap budget exhausted) a"));
+        assert!(r.markdown.contains("(not auto-revised; cap budget exhausted) b"));
+    }
+
+    #[test]
+    fn partition_block_with_no_revisable_concerns_returns_empty() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![commentary_concern("style nit"), commentary_concern("preference")],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert!(taken.is_empty(), "no should_request_revision => no posts");
+        // No "cap budget exhausted" annotation when nothing was revisable
+        // to begin with (this is the WARN case, not a budget case).
+        assert!(!r.markdown.contains("cap budget exhausted"));
+    }
+
+    #[test]
+    fn partition_filters_revisable_with_empty_actionable_request() {
+        // A concern with should_request_revision: true but no
+        // actionable_request body is not a valid revision request — the
+        // posting step would have nothing to put after `@<bot> revise`.
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                ReviewConcern {
+                    summary: "missing-body".into(),
+                    actionable_request: Some("   ".into()),
+                    should_request_revision: true,
+                },
+                revisable_concern("ok", "fix this"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].summary, "ok");
+    }
+
+    // ============================================================
+    // post_reviewer_revision_comments (HTTP-shape assertion)
+    // ============================================================
+
+    #[tokio::test]
+    async fn post_reviewer_revision_comments_posts_marker_and_trigger() {
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        // Expect TWO comment POSTs, each matching the canonical body shape.
+        let first = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"body":"<!-- reviewer-revision -->\n@my-bot revise fix find_user"}"#
+                    .to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"body":"<!-- reviewer-revision -->\n@my-bot revise restore the audit hook"}"#
+                    .to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":2}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let concerns = vec![
+            revisable_concern("find_user error context", "fix find_user"),
+            revisable_concern("audit hook removed", "restore the audit hook"),
+        ];
+        post_reviewer_revision_comments(
+            &server.url(),
+            "owner",
+            "repo",
+            77,
+            &concerns,
+            "test-token",
+        )
+        .await;
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// Per-concern POST failures do not abort the loop — every concern
+    /// is attempted, and the helper returns normally even when one fails.
+    #[tokio::test]
+    async fn post_reviewer_revision_comments_continues_on_partial_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        // First POST fails 500; second succeeds. The loop must attempt
+        // both — verified by `.expect(1)` on each.
+        let _fail = server
+            .mock("POST", "/repos/owner/repo/issues/88/comments")
+            .match_body(mockito::Matcher::Regex("fail this one".to_string()))
+            .with_status(500)
+            .with_body(r#"{"error":"transient"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _ok = server
+            .mock("POST", "/repos/owner/repo/issues/88/comments")
+            .match_body(mockito::Matcher::Regex("succeed this one".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":2}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let concerns = vec![
+            revisable_concern("a", "fail this one"),
+            revisable_concern("b", "succeed this one"),
+        ];
+        post_reviewer_revision_comments(
+            &server.url(),
+            "owner",
+            "repo",
+            88,
+            &concerns,
+            "test-token",
+        )
+        .await;
     }
 }

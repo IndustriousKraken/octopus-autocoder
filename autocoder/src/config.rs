@@ -345,6 +345,13 @@ pub struct ReviewerConfig {
     pub api_base_url: Option<String>,
     #[serde(default)]
     pub prompt_template_path: Option<PathBuf>,
+    /// Opt-in flag: when `true`, a reviewer `Block` verdict triggers
+    /// reviewer-authored revision-request PR comments for each concern
+    /// the reviewer marked `should_request_revision: true`. The dispatcher
+    /// from the PR-comment revision loop picks these up on the next
+    /// polling iteration. Default `false` (no behavioural change).
+    #[serde(default)]
+    pub auto_revise_on_block: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -891,6 +898,7 @@ github:
             "api_key_env",
             "api_key",
             "api_base_url",
+            "auto_revise_on_block",
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
@@ -1054,6 +1062,32 @@ reviewer:
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
+        // Default (field omitted) → false.
+        assert!(!rv.auto_revise_on_block);
+    }
+
+    #[test]
+    fn reviewer_auto_revise_on_block_explicit_true() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise_on_block: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with auto_revise_on_block should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert!(rv.auto_revise_on_block);
     }
 
     #[test]

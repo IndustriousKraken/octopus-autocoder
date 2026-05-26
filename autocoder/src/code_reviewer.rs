@@ -7,6 +7,7 @@ use crate::config::ReviewerConfig;
 use crate::llm::{self, LlmClient};
 use anyhow::{Context, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// Built-in default prompt template, embedded at compile time so the binary
@@ -31,6 +32,25 @@ pub enum ReviewVerdict {
 pub struct ReviewReport {
     pub verdict: ReviewVerdict,
     pub markdown: String,
+    /// Structured per-concern records the reviewer-initiated revision
+    /// pipeline reads. Populated from a trailing fenced YAML block in the
+    /// LLM response (info string `revision-requests`). Older templates that
+    /// don't emit the block produce an empty vec, which keeps the
+    /// reviewer-initiated revision flow off for that operator's setup.
+    pub concerns: Vec<ReviewConcern>,
+}
+
+/// One concern parsed from the reviewer's structured `revision-requests`
+/// block. The `summary` mirrors the bullet text in the existing markdown
+/// section; `actionable_request` + `should_request_revision` are the
+/// per-concern signals the reviewer-initiated revision pipeline reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewConcern {
+    pub summary: String,
+    #[serde(default)]
+    pub actionable_request: Option<String>,
+    #[serde(default)]
+    pub should_request_revision: bool,
 }
 
 /// One archived OpenSpec change's source material. Used to give the
@@ -63,11 +83,36 @@ pub struct ReviewContext {
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
+    auto_revise_on_block: bool,
 }
 
 impl CodeReviewer {
     pub fn new(client: Box<dyn LlmClient>, template: String) -> Self {
-        Self { client, template }
+        Self {
+            client,
+            template,
+            auto_revise_on_block: false,
+        }
+    }
+
+    /// Builder-style setter mirroring the config flag of the same name.
+    /// The flag controls whether `Block`-verdict concerns get forwarded
+    /// to the revision dispatcher as `<!-- reviewer-revision -->` PR
+    /// comments. Default `false` (no behavioural change). Used by
+    /// `from_config` to propagate `ReviewerConfig::auto_revise_on_block`
+    /// onto the constructed reviewer; tests use it directly when they
+    /// need the flag flipped without round-tripping a full config.
+    pub fn with_auto_revise_on_block(mut self, enabled: bool) -> Self {
+        self.auto_revise_on_block = enabled;
+        self
+    }
+
+    /// Whether reviewer-initiated revisions are enabled for this
+    /// reviewer instance. Read by the polling-loop posting step that
+    /// turns `Block`-verdict concerns into `<!-- reviewer-revision -->`
+    /// PR comments.
+    pub fn auto_revise_on_block(&self) -> bool {
+        self.auto_revise_on_block
     }
 
     /// Wire a reviewer from config: build the LLM client, load the prompt
@@ -83,7 +128,7 @@ impl CodeReviewer {
             })?,
             None => DEFAULT_TEMPLATE.to_string(),
         };
-        Ok(Self::new(client, template))
+        Ok(Self::new(client, template).with_auto_revise_on_block(cfg.auto_revise_on_block))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
@@ -220,6 +265,12 @@ fn render_sections(ctx: &ReviewContext) -> RenderedSections {
 /// If matched, the rest of the response (after that line) is the
 /// `markdown`. If unmatched, the verdict defaults to `Concerns` and a
 /// parse-failure note is prepended.
+///
+/// Additionally, a trailing fenced YAML block tagged
+/// ```` ```revision-requests ```` is parsed (when present) into
+/// `concerns`. The block is OPTIONAL — older reviewer templates that
+/// have not been updated to emit it produce an empty `concerns` vec,
+/// which keeps the reviewer-initiated revision flow inert.
 fn parse_response(raw: &str) -> ReviewReport {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"(?i)^VERDICT:\s*(Pass|Concerns|Block)\s*$").unwrap());
@@ -236,6 +287,8 @@ fn parse_response(raw: &str) -> ReviewReport {
         }
     }
 
+    let concerns = extract_revision_requests(raw);
+
     match (first_nonempty, found_idx) {
         (Some(line), Some(idx)) if re.is_match(line) => {
             let caps = re.captures(line).unwrap();
@@ -249,14 +302,49 @@ fn parse_response(raw: &str) -> ReviewReport {
             let _ = lines.nth(idx); // advances past the verdict-line index
             let remainder: Vec<&str> = lines.collect();
             let markdown = remainder.join("\n").trim_start_matches('\n').to_string();
-            ReviewReport { verdict, markdown }
+            ReviewReport {
+                verdict,
+                markdown,
+                concerns,
+            }
         }
         _ => ReviewReport {
             verdict: ReviewVerdict::Concerns,
             markdown: format!(
                 "[reviewer response did not include a valid verdict line]\n\n{raw}"
             ),
+            concerns,
         },
+    }
+}
+
+/// Extract the `revision-requests` fenced YAML block from `raw` (if any)
+/// and parse it into `Vec<ReviewConcern>`. A missing block, an unparseable
+/// block, or one that doesn't deserialize to the expected shape all yield
+/// an empty vec — the schema extension is opt-in for operator-customized
+/// reviewer templates, so anything other than a well-formed block is
+/// treated as "no concerns to act on" rather than an error.
+fn extract_revision_requests(raw: &str) -> Vec<ReviewConcern> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Match a fenced block opened with ``` (or ~~~) followed by
+    // `revision-requests` (case-insensitive) as the info string, then any
+    // body, then a closing fence on its own line. Multiline mode + dotall.
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?is)(?:^|\n)\s*```\s*revision-requests\s*\n(.*?)\n\s*```\s*(?:\n|$)")
+            .expect("static regex compiles")
+    });
+    let body = match re.captures(raw).and_then(|c| c.get(1)) {
+        Some(m) => m.as_str(),
+        None => return Vec::new(),
+    };
+    match serde_yml::from_str::<Vec<ReviewConcern>>(body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!(
+                "failed to parse reviewer `revision-requests` YAML block: {e}; treating as no concerns"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -316,6 +404,103 @@ mod tests {
         assert_eq!(r.verdict, ReviewVerdict::Pass);
         let r = parse_response("VeRdIcT: BLOCK\nbad\n");
         assert_eq!(r.verdict, ReviewVerdict::Block);
+    }
+
+    #[test]
+    fn parses_revision_requests_block_with_full_fields() {
+        let raw = r#"VERDICT: Block
+
+## Possible bugs
+- find_user drops the error context.
+- log path is computed with the wrong base directory.
+
+```revision-requests
+- summary: "find_user drops the error context"
+  actionable_request: "fix find_user to propagate the underlying error via anyhow::Context"
+  should_request_revision: true
+- summary: "log path uses the wrong base directory"
+  actionable_request: "switch the base from workspace_root to log_dir in build_log_path"
+  should_request_revision: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+        assert_eq!(r.concerns.len(), 2);
+        assert_eq!(r.concerns[0].summary, "find_user drops the error context");
+        assert_eq!(
+            r.concerns[0].actionable_request.as_deref(),
+            Some("fix find_user to propagate the underlying error via anyhow::Context")
+        );
+        assert!(r.concerns[0].should_request_revision);
+        assert_eq!(r.concerns[1].summary, "log path uses the wrong base directory");
+        assert!(r.concerns[1].should_request_revision);
+    }
+
+    #[test]
+    fn missing_revision_requests_block_yields_empty_concerns() {
+        // Older reviewer template that has not been updated to emit the
+        // structured block — parse must succeed and produce an empty
+        // concerns vec, so the auto-revise step finds nothing actionable.
+        let raw = "VERDICT: Block\n\n## Summary\nproblems here.\n";
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+        assert!(r.concerns.is_empty());
+    }
+
+    #[test]
+    fn revision_requests_block_with_missing_fields_uses_defaults() {
+        // The block is well-formed YAML but the per-concern records omit
+        // `actionable_request` and `should_request_revision`. Those fields
+        // must default to None / false respectively.
+        let raw = r#"VERDICT: Concerns
+
+```revision-requests
+- summary: "consider naming the helper better"
+- summary: "another stylistic nit"
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Concerns);
+        assert_eq!(r.concerns.len(), 2);
+        for c in &r.concerns {
+            assert!(c.actionable_request.is_none());
+            assert!(!c.should_request_revision);
+        }
+    }
+
+    #[test]
+    fn malformed_revision_requests_block_yields_empty_concerns() {
+        let raw = r#"VERDICT: Block
+
+```revision-requests
+this is not yaml: at all: ::: {{{ broken
+```
+"#;
+        let r = parse_response(raw);
+        // Verdict parses cleanly; the broken block is treated as no
+        // concerns rather than as a parse error.
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+        assert!(r.concerns.is_empty());
+    }
+
+    #[test]
+    fn revision_requests_extracted_even_when_verdict_unparseable() {
+        // Unparseable verdict line falls through to the Concerns default
+        // path. The concerns extraction is independent and should still
+        // surface any well-formed block (so operators can debug their
+        // template even when the verdict header is broken).
+        let raw = r#"oops bad header
+
+```revision-requests
+- summary: "still gets through"
+  should_request_revision: true
+  actionable_request: "do the thing"
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Concerns);
+        assert_eq!(r.concerns.len(), 1);
+        assert!(r.concerns[0].should_request_revision);
     }
 
     #[test]
@@ -531,6 +716,7 @@ mod tests {
             api_key: None,
             api_base_url: None,
             prompt_template_path: Some(template_path),
+            auto_revise_on_block: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
@@ -559,6 +745,7 @@ mod tests {
             api_key: None,
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
+            auto_revise_on_block: false,
         };
         let result = CodeReviewer::from_config(&cfg);
         let err = match result {
@@ -585,6 +772,7 @@ mod tests {
             api_key: None,
             api_base_url: None,
             prompt_template_path: None,
+            auto_revise_on_block: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
@@ -593,6 +781,30 @@ mod tests {
                 .template
                 .contains("You are reviewing code quality only"),
             "default template must be used when prompt_template_path is None"
+        );
+    }
+
+    #[test]
+    fn default_template_describes_revision_requests_block() {
+        // Operators who flip `reviewer.auto_revise_on_block` rely on the
+        // default template producing the structured `revision-requests`
+        // block. The template must instruct the LLM on it.
+        assert!(
+            DEFAULT_TEMPLATE.contains("revision-requests"),
+            "default template must mention the `revision-requests` block name"
+        );
+        assert!(
+            DEFAULT_TEMPLATE.contains("should_request_revision"),
+            "default template must document the `should_request_revision` field"
+        );
+        assert!(
+            DEFAULT_TEMPLATE.contains("actionable_request"),
+            "default template must document the `actionable_request` field"
+        );
+        assert!(
+            DEFAULT_TEMPLATE.to_lowercase().contains("most-critical-first")
+                || DEFAULT_TEMPLATE.to_lowercase().contains("most critical first"),
+            "default template must instruct on ordering for cap-budget truncation"
         );
     }
 

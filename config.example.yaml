@@ -160,6 +160,15 @@ github:
 #   #                                   #   anthropic         → https://api.anthropic.com
 #   #                                   #   openai_compatible → https://api.openai.com/v1
 #   #                                   # set this for OpenRouter, Grok, local Ollama, etc.
+#   #
+#   # Reviewer-initiated revisions on `Block` verdicts. When `true`, every
+#   # concern the reviewer marked `should_request_revision: true` posts a
+#   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
+#   # picks up on the next polling iteration. Defaults to `false`. Requires
+#   # `executor.max_revisions_per_pr > 0` (the dispatcher); operator-
+#   # customized reviewer templates must be updated to emit the new
+#   # per-concern fields. See README's "Reviewer-initiated revisions" section.
+#   # auto_revise_on_block: false
 
 # ChatOps escalation — when the agent can't proceed without human
 # input, post the question to a chat provider and resume on reply.

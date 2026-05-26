@@ -51,6 +51,62 @@ The combined prompt is capped at **2,000,000 characters** (sized for current 1M-
 
 This is a stopgap until the reviewer is upgraded to an MCP-tool-using model that can `Read`/`Grep` the codebase directly — for now, "send the whole touched surface" gives the reviewer enough information to do a real security review.
 
+## Reviewer-initiated revisions on `Block` verdicts
+
+When `reviewer.auto_revise_on_block: true` is set, every `Block` verdict additionally forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The flow:
+
+1. Reviewer returns a `Block` verdict with one or more per-concern records marked `should_request_revision: true`.
+2. Autocoder posts one PR issue comment per such concern, with body:
+
+   ```
+   <!-- reviewer-revision -->
+   @<bot-username> revise <actionable_request>
+   ```
+
+   The leading HTML-comment marker (`<!-- reviewer-revision -->`) is the dispatcher's self-author-filter bypass — without it, the dispatcher would (correctly) treat the comment as bot-authored noise and drop it.
+3. On the next polling iteration, the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks up each comment, runs the executor in revision mode, commits + force-pushes, and posts the standard `✅ Revision applied:` / `✗ Revision attempt failed:` reply.
+
+The feature is **off by default**. A reviewer template that has not been updated to emit the structured `revision-requests` YAML block (see below) silently produces no comments; a daemon `WARN` log surfaces this case on first reviewer run when the flag is enabled but no actionable concerns appear.
+
+### Per-concern revision decision
+
+The reviewer makes the per-concern decision: only concerns with a concrete, executable fix the implementer agent can apply without further clarification should set `should_request_revision: true`. Style preferences, philosophical disagreements, and "consider whether…" suggestions stay `false` — they are commentary, not revision requests. The default prompt template (`prompts/code-review-default.md`) documents this rule in detail.
+
+### Cap-budget interaction
+
+Reviewer-initiated revisions count toward the same per-PR `executor.max_revisions_per_pr` cap as human-initiated ones (default 5; see [CONFIG.md](CONFIG.md#max_revisions_per_pr)). When the reviewer would post more comments than the remaining cap allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
+
+The cap budget at posting time is a forward-looking estimate; the actual `revisions_applied` counter only increments when the dispatcher processes a comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
+
+### Operator-customized reviewer templates
+
+If you have overridden `reviewer.prompt_template_path` with a custom template that pre-dates this change, the template will need to be updated to emit the structured `revision-requests` block at the end of the response. The block shape is:
+
+````
+```revision-requests
+- summary: "find_user drops the error context"
+  actionable_request: "fix find_user to propagate the underlying error via anyhow::Context"
+  should_request_revision: true
+- summary: "consider renaming `tmp` to something more descriptive"
+  should_request_revision: false
+```
+````
+
+The fenced block tag is the literal string `revision-requests`; the body is a YAML list with one entry per concern surfaced in the markdown sections above. See the default template `prompts/code-review-default.md` for the full instructions you can copy in.
+
+### Verdict gating
+
+Only `Block` verdicts trigger reviewer-initiated revisions. `Pass` and `Concerns` verdicts deliberately do not auto-revise:
+
+- `Concerns` flags issues that warrant discussion but are mergeable as-is. Auto-revising every one of those would generate constant churn for cosmetic preferences.
+- `Pass` has nothing to revise.
+
+The operator can still manually trigger revisions on any verdict by posting `@<bot> revise <text>` as a regular PR comment.
+
+### No reviewer re-run
+
+The reviewer runs exactly once per polling iteration's executor pass. A reviewer-initiated revision committed in a later iteration does NOT trigger a re-evaluation by the reviewer; the verdict from the original pass is "frozen" for the life of the PR. The PR's draft status (set by the original `Block` verdict) is preserved through the revision cycle — the human re-reviews the post-revision PR and decides to promote it from draft.
+
 ## Custom prompt templates
 
 Override the default with `reviewer.prompt_template_path`. Custom templates are **user-owned** — autocoder does not enforce scope on overrides, so you can expand the reviewer to additional dimensions (spec compliance, style guide, etc.) by editing the template.

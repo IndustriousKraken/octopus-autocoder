@@ -20,6 +20,14 @@ use crate::github;
 
 const REVISIONS_DIR: &str = ".autocoder/revisions";
 
+/// HTML-comment marker the reviewer-initiated revision flow writes at the
+/// top of every PR comment it posts. The dispatcher's self-author filter
+/// (which normally drops bot-authored comments to avoid recursion on its
+/// own replies) checks this marker as an explicit bypass — comments the
+/// reviewer pipeline posts on the bot's behalf are parsed normally even
+/// though their author is `bot_username`.
+pub const REVIEWER_REVISION_MARKER: &str = "<!-- reviewer-revision -->";
+
 /// Per-PR state file persisted under
 /// `<workspace>/.autocoder/revisions/<pr_number>.json`. The dispatcher
 /// reads it on each iteration to know which comments are already
@@ -153,13 +161,22 @@ pub fn prune_closed_prs(workspace: &Path, open_pr_numbers: &HashSet<u64>) -> Res
 }
 
 /// Parse a PR comment body for the revision trigger pattern. Returns
-/// `Some(revision_text)` when the body begins with `@<bot_username>` (case-
-/// insensitive on the mention) followed by `revise` (case-insensitive) and
-/// at least one non-whitespace character of revision text. Otherwise
-/// `None`. The returned text has leading/trailing whitespace trimmed but
-/// preserves any internal newlines.
+/// `Some(revision_text)` when the body's first non-whitespace,
+/// non-HTML-comment line begins with `@<bot_username>` (case-insensitive
+/// on the mention) followed by `revise` (case-insensitive) and at least
+/// one non-whitespace character of revision text. Otherwise `None`. The
+/// returned text has leading/trailing whitespace trimmed but preserves
+/// any internal newlines.
+///
+/// Leading lines that are entirely an HTML comment (`<!-- ... -->`) are
+/// skipped before the mention search. This lets the reviewer-initiated
+/// revision pipeline prefix its comments with `<!-- reviewer-revision -->`
+/// (the dispatcher's self-author-filter bypass marker) without the parser
+/// needing to understand the marker's semantics — it just tolerates the
+/// leading metadata line.
 pub fn parse_revision_trigger(comment_body: &str, bot_username: &str) -> Option<String> {
-    let trimmed = comment_body.trim_start();
+    let body = strip_leading_html_comment_lines(comment_body);
+    let trimmed = body.trim_start();
     if trimmed.is_empty() {
         return None;
     }
@@ -187,6 +204,34 @@ pub fn parse_revision_trigger(comment_body: &str, bot_username: &str) -> Option<
         return None;
     }
     Some(revision_text.to_string())
+}
+
+/// Strip leading whole-line HTML comments (e.g. `<!-- reviewer-revision -->`)
+/// from `body`, returning the remainder. A line counts as "HTML comment
+/// only" when its trimmed contents start with `<!--` and end with `-->`.
+/// Non-comment lines (including blank lines that follow the comment) end
+/// the strip and are returned verbatim. Used by `parse_revision_trigger`
+/// to make the reviewer-revision marker invisible to the mention search.
+fn strip_leading_html_comment_lines(body: &str) -> &str {
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        // Skip leading whitespace within the current line slice.
+        let rest = &body[cursor..];
+        let line_end = rest.find('\n').map(|n| cursor + n + 1).unwrap_or(body.len());
+        let line = &body[cursor..line_end];
+        let line_trim = line.trim();
+        if line_trim.is_empty() {
+            // Blank line — stop stripping; let downstream `trim_start`
+            // handle it.
+            break;
+        }
+        if line_trim.starts_with("<!--") && line_trim.ends_with("-->") {
+            cursor = line_end;
+            continue;
+        }
+        break;
+    }
+    &body[cursor..]
 }
 
 /// Best-effort: extract the list of change names from the PR body's
@@ -413,8 +458,20 @@ async fn process_one_pr(
             }
             return Ok(());
         }
-        // Bot-authored comments are filtered out before parsing.
-        if comment.user_login().eq_ignore_ascii_case(bot_username) {
+        // Bot-authored comments are filtered out before parsing — UNLESS
+        // the body starts with the reviewer-revision HTML-comment marker,
+        // which is the one sanctioned bypass. The reviewer pipeline posts
+        // comments on the bot's behalf; without the bypass the dispatcher
+        // would (correctly) treat them as the bot's own replies and drop
+        // them. All other bot-authored comments (the dispatcher's own
+        // success/failure/cap-decline replies, any future bot content)
+        // continue to be filtered.
+        if comment.user_login().eq_ignore_ascii_case(bot_username)
+            && !comment
+                .body
+                .trim_start()
+                .starts_with(REVIEWER_REVISION_MARKER)
+        {
             advance_seen(&mut latest_seen, comment.created_at);
             continue;
         }
@@ -874,6 +931,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_skips_leading_reviewer_revision_marker() {
+        // The dispatcher passes the marker-bearing body through; the
+        // parser must locate the mention on the line below the marker.
+        let body = "<!-- reviewer-revision -->\n@bot revise the find_user function";
+        let got = parse_revision_trigger(body, "bot").expect("trigger");
+        assert_eq!(got, "the find_user function");
+    }
+
+    #[test]
+    fn parse_skips_arbitrary_leading_html_comments() {
+        // Any whole-line HTML comment is stripped before the mention
+        // search — the parser doesn't special-case the reviewer-revision
+        // marker, it just tolerates leading metadata lines.
+        let body = "<!-- arbitrary -->\n<!-- another -->\n@bot revise foo";
+        let got = parse_revision_trigger(body, "bot").expect("trigger");
+        assert_eq!(got, "foo");
+    }
+
+    #[test]
+    fn parse_does_not_skip_inline_html_comment() {
+        // An HTML comment that shares a line with other content does NOT
+        // count as a leading-metadata line; the mention search runs from
+        // the start of that line and fails.
+        let body = "<!-- inline --> @bot revise foo";
+        assert!(parse_revision_trigger(body, "bot").is_none());
+    }
+
+    #[test]
     fn extract_change_list_parses_polling_loop_body() {
         let body = "## change-a\n\nbody\n\n## change-b\n\nbody\n\nChanges implemented in this pass:\n\n- change-a\n- change-b\n";
         let changes = extract_change_list_from_pr_body(Some(body));
@@ -1272,6 +1357,146 @@ mod tests {
         let state = read_state(&ws, 11).unwrap().expect("state persisted");
         // last_seen advanced past the bot comment but no revision applied.
         assert_eq!(state.revisions_applied, 0);
+
+        token_env_clear(env_var);
+    }
+
+    /// Integration: a bot-authored comment whose body starts with the
+    /// reviewer-revision marker bypasses the self-author filter and is
+    /// dispatched normally. This is the only sanctioned bypass; other
+    /// bot-authored comments continue to be filtered (covered above).
+    #[tokio::test]
+    async fn dispatcher_reviewer_revision_marker_bypasses_self_author_filter() {
+        let env_var = "REVISIONS_TOKEN_REVIEWER_BYPASS";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 19,
+                    "title": "PR",
+                    "html_url": "https://example.invalid/pr/19",
+                    "state": "open",
+                    "body": "Changes implemented in this pass:\n\n- my-change",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {"ref": "agent-q"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .create_async()
+            .await;
+        // Bot-authored comment carrying the reviewer-revision marker.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/19/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "id": 1,
+                    "body": "<!-- reviewer-revision -->\n@my-bot revise fix the find_user helper",
+                    "user": {"login": "my-bot"},
+                    "created_at": "2026-05-25T11:00:00Z"
+                }]"#,
+            )
+            .create_async()
+            .await;
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/19/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        // The marker-bearing bot comment WAS passed through to the
+        // executor — proves the bypass works.
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        post_reply.assert_async().await;
+
+        token_env_clear(env_var);
+    }
+
+    /// Integration: bot-authored reply comments (which start with
+    /// `✅ Revision applied:` / `✗ Revision attempt failed:`, no marker)
+    /// continue to be filtered — proves the bypass is gated strictly on
+    /// the marker, not on bot-authorship alone.
+    #[tokio::test]
+    async fn dispatcher_unmarked_bot_reply_still_filtered() {
+        let env_var = "REVISIONS_TOKEN_UNMARKED_REPLY";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 21,
+                    "title": "PR",
+                    "html_url": "https://example.invalid/pr/21",
+                    "state": "open",
+                    "body": "Changes implemented in this pass:\n\n- my-change",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {"ref": "agent-q"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .create_async()
+            .await;
+        // Bot-authored reply (no marker); even though its body looks
+        // trigger-like, the filter must drop it.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/21/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "id": 1,
+                    "body": "@my-bot revise oops should not recurse",
+                    "user": {"login": "my-bot"},
+                    "created_at": "2026-05-25T11:00:00Z"
+                }]"#,
+            )
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(Vec::new());
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
 
         token_env_clear(env_var);
     }
