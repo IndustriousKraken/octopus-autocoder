@@ -53,7 +53,7 @@ reviewer:
 
 When both forms are set on the same logical field, the inline value wins and autocoder logs a `warn`-level line at startup naming the env var being ignored. Startup logs name the source (`inline (github.token)` or `env var GITHUB_TOKEN`) so an audit can confirm which secrets live in YAML.
 
-**Env-var form:** secrets stay out of `config.yaml`. Suits multi-user hosts and systemd deployments with `EnvironmentFile=/etc/autocoder.env`.
+**Env-var form:** secrets stay out of `config.yaml`. Suits multi-user hosts and systemd deployments with `EnvironmentFile=/etc/autocoder.env`. When the install wizard writes `secrets.env`, it creates the file with mode `0600` atomically (mode applied in the same syscall that creates the file); no world-readable window exists during install.
 
 **Inline form:** secrets live in `config.yaml`. Suits single-host, single-user deployments where one file is easier to manage than two. Requirements:
 

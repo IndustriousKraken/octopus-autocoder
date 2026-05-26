@@ -231,6 +231,34 @@ pub struct WizardAnswers {
     pub audits: HashMap<String, Cadence>,
 }
 
+// Write `contents` to `path` such that the file never exists on disk with a
+// mode wider than `mode`. On a fresh create the `mode` is applied in the same
+// syscall that creates the file. If the file already exists (re-install), it
+// is chmod'd down to `mode` BEFORE the truncate-and-rewrite, so the
+// truncated-but-not-yet-rewritten state is also not world-readable.
+#[cfg(unix)]
+fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if path.exists() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .mode(mode)
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    f.write_all(contents)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_file_with_mode(path: &Path, contents: &[u8], _mode: u32) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 // ----------------------------------------------------------------------------
 // SystemActions — the OS-mutating surface. Production impl shells out;
 // tests use RecordingActions to assert the orchestration without touching
@@ -1180,16 +1208,14 @@ pub(crate) async fn execute_inner(
 
     let cfg = assemble_config(&answers)?;
     let yaml = serialize_config(&cfg)?;
-    fs::write(&config_path, yaml.as_bytes())
-        .await
+    let config_mode = if mode == InstallMode::Server { 0o640 } else { 0o600 };
+    write_file_with_mode(&config_path, yaml.as_bytes(), config_mode)
         .with_context(|| format!("write {}", config_path.display()))?;
 
     let secrets = assemble_secrets_env(&answers);
-    fs::write(&secrets_path, secrets.as_bytes())
-        .await
+    write_file_with_mode(&secrets_path, secrets.as_bytes(), 0o600)
         .with_context(|| format!("write {}", secrets_path.display()))?;
 
-    let config_mode = if mode == InstallMode::Server { 0o640 } else { 0o600 };
     actions.chmod(&config_path, config_mode).await?;
     actions.chmod(&secrets_path, 0o600).await?;
     if mode == InstallMode::Server {
@@ -1823,5 +1849,121 @@ mod tests {
             !yaml.contains("architecture_brightline:"),
             "master switch `none` must override per-audit flag:\n{yaml}"
         );
+    }
+
+    // ----- secrets.env permissions ---------------------------------------
+
+    /// Fresh install: secrets.env must end at mode 0o600 even though the
+    /// `RecordingActions` mock turns the post-write `chmod` into a no-op.
+    /// Passing this test proves the file was *created* with 0o600, not
+    /// merely chmod'd to 0o600 after-the-fact.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secrets_env_is_created_with_0600_before_any_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = ni_args(&tmp);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let secrets_path = tmp.path().join("secrets.env");
+        let secrets_mode = std::fs::metadata(&secrets_path)
+            .expect("secrets.env should exist after install")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            secrets_mode, 0o600,
+            "secrets.env must be created with mode 0o600; got {secrets_mode:o}"
+        );
+
+        // Dev-mode config.yaml should also be born at 0o600.
+        let config_path = tmp.path().join("config.yaml");
+        let config_mode = std::fs::metadata(&config_path)
+            .expect("config.yaml should exist after install")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            config_mode, 0o600,
+            "dev-mode config.yaml must be created with mode 0o600; got {config_mode:o}"
+        );
+    }
+
+    /// Operator-rerun regression: a pre-existing world-readable
+    /// secrets.env (e.g. orphaned by a botched prior install that crashed
+    /// after writing secrets.env but before writing config.yaml) must end
+    /// up at 0o600 after the install reruns over it. `write_file_with_mode`
+    /// should tighten the file's permissions BEFORE truncating it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reinstall_over_world_readable_secrets_env_ends_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        // Pre-create a world-readable secrets.env to simulate a prior
+        // botched install. Leave config.yaml absent so the install path
+        // does not short-circuit on the existing-config check.
+        let secrets_path = tmp.path().join("secrets.env");
+        std::fs::write(&secrets_path, b"GITHUB_TOKEN=stale\n").unwrap();
+        std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&secrets_path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "preconditions: secrets.env should start at 0o644"
+        );
+
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = ni_args(&tmp);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&secrets_path)
+            .expect("secrets.env should still exist after install")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "re-install over a world-readable secrets.env must tighten to 0o600; got {mode:o}"
+        );
+    }
+
+    /// Direct unit test on the helper: covers the truncate-after-chmod
+    /// invariant in isolation. If the file existed wider than `mode`, the
+    /// helper must chmod it down BEFORE truncating, so there is no window
+    /// where the file is empty-but-still-world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_with_mode_tightens_existing_file_before_truncating() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("secret");
+        std::fs::write(&p, b"old\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file_with_mode(&p, b"new\n", 0o600).unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "helper must end at 0o600 over a pre-existing 0o644 file");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_with_mode_creates_new_file_with_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("secret");
+
+        write_file_with_mode(&p, b"hello\n", 0o600).unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh-create mode must equal requested mode");
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello\n");
     }
 }
