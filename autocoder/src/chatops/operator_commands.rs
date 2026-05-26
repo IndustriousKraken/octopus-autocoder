@@ -9,6 +9,7 @@
 //! and whitespace-tolerant.
 //!
 //! Recognized verbs:
+//!   - `status` (bare — per-repo menu of every configured repository)
 //!   - `status <repo-substring>`
 //!   - `clear-perma-stuck <repo-substring> <change-slug>`
 //!   - `clear-revision <repo-substring> <change-slug>`
@@ -167,7 +168,22 @@ pub enum OperatorCommand {
     RebuildSpecs {
         repo_substring: String,
     },
+    /// Bare `@<bot> status` (no further arguments). Returns the per-repo
+    /// menu: one announcement line + one two-line section per configured
+    /// repository (URL on top, summary on the next line). See
+    /// `format_status_menu_reply` for the reply shape.
+    StatusMenu,
     Help,
+}
+
+/// One repository whose per-repo status could not be fully assembled
+/// (control-socket error, repo-not-found, decode failure). The menu
+/// formatter still renders a section for the repository — URL on top,
+/// `(unavailable: <error excerpt>)` on the summary line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableEntry {
+    pub url: String,
+    pub error: String,
 }
 
 /// Outcome of parsing a chat message:
@@ -217,17 +233,18 @@ fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
     let rest: Vec<&str> = tokens.collect();
 
     match verb.to_ascii_lowercase().as_str() {
-        "status" => {
-            if rest.len() != 1 {
-                return ParseOutcome::None;
+        "status" => match rest.len() {
+            0 => ParseOutcome::Ok(OperatorCommand::StatusMenu),
+            1 => {
+                if !repo_substring_regex().is_match(rest[0]) {
+                    return ParseOutcome::Invalid(invalid_repo_substring_reply());
+                }
+                ParseOutcome::Ok(OperatorCommand::Status {
+                    repo_substring: rest[0].to_string(),
+                })
             }
-            if !repo_substring_regex().is_match(rest[0]) {
-                return ParseOutcome::Invalid(invalid_repo_substring_reply());
-            }
-            ParseOutcome::Ok(OperatorCommand::Status {
-                repo_substring: rest[0].to_string(),
-            })
-        }
+            _ => ParseOutcome::None,
+        },
         "clear-perma-stuck" => {
             if rest.len() != 2 {
                 return ParseOutcome::None;
@@ -741,6 +758,7 @@ pub fn format_help_reply() -> String {
     let mut out = String::new();
     out.push_str("Available commands (mention the bot to invoke):\n");
     out.push_str("  • `status <repo>` — current markers, throttled alerts, queue snapshot, last iteration\n");
+    out.push_str("  • `status` (no repo) — list every watched repository with queue summary, busy state, and last-iteration time. Use `status <repo>` for the per-repo detail.\n");
     out.push_str("  • `clear-perma-stuck <repo> <change>` — clear `.perma-stuck.json` for a change\n");
     out.push_str("  • `clear-revision <repo> <change>` — clear `.needs-spec-revision.json` for a change\n");
     out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `confirm` (60s TTL)\n");
@@ -749,6 +767,139 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
+}
+
+/// Format the bare-`status` (menu) reply: one announcement line followed by
+/// one two-line section per repository (URL on top, summary on the next
+/// line). `responses` are repos whose per-repo `RepoStatusResponse` was
+/// successfully built; `unavailable` are repos whose per-repo lookup
+/// errored — they still ship as a URL line + `(unavailable: <err>)` so the
+/// operator sees every watched repository.
+///
+/// Empty inputs (no configured repos, all lookups failed before reaching
+/// the formatter) collapse to `📊 No repositories configured.` for
+/// symmetry with the dispatcher's empty-config short-circuit.
+pub fn format_status_menu_reply(
+    responses: &[RepoStatusResponse],
+    unavailable: &[UnavailableEntry],
+) -> String {
+    let total = responses.len() + unavailable.len();
+    if total == 0 {
+        return "📊 No repositories configured.".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "📊 Watching {total} repositories. Reply `@<bot> status <repo-substring>` for details.\n"
+    ));
+    for resp in responses {
+        out.push('\n');
+        out.push_str(&format!("  • {}\n", resp.url));
+        out.push_str(&format!(
+            "    {} · {} · {}\n",
+            menu_queue_clause(resp),
+            menu_busy_clause(resp),
+            menu_last_iteration_clause(resp),
+        ));
+    }
+    for entry in unavailable {
+        out.push('\n');
+        out.push_str(&format!("  • {}\n", entry.url));
+        out.push_str(&format!(
+            "    (unavailable: {})\n",
+            truncate_error_excerpt(&entry.error)
+        ));
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Queue clause for the per-repo menu section. Collapses to `empty queue`
+/// when all three counts are zero; otherwise emits `<N> pending (<list>),
+/// <M> waiting (<list>), <K> excluded` where each list truncates after 5
+/// entries with ` …+N more`. Empty-list categories render as the count
+/// alone (no empty parens). Change names pass through `slack_escape`.
+fn menu_queue_clause(resp: &RepoStatusResponse) -> String {
+    let excluded: Vec<String> = resp
+        .perma_stuck_changes
+        .iter()
+        .chain(resp.revision_marked_changes.iter())
+        .map(|m| m.change.clone())
+        .collect();
+    let pending = &resp.pending_changes;
+    let waiting = &resp.waiting_changes;
+    if pending.is_empty() && waiting.is_empty() && excluded.is_empty() {
+        return "empty queue".to_string();
+    }
+    // Excluded never gets a parenthetical in the menu — operators
+    // drill in via `status <repo>` for the marker detail. Count alone
+    // keeps the per-repo line short.
+    let excluded_count = excluded.len();
+    format!(
+        "{}, {}, {excluded_count} excluded",
+        menu_queue_segment("pending", pending),
+        menu_queue_segment("waiting", waiting),
+    )
+}
+
+/// Render one `<N> <label> (<list>)` segment for the menu queue clause,
+/// truncating to the first 5 entries with ` …+N more` for the overflow.
+/// Empty lists render as the count alone (no parens).
+fn menu_queue_segment(label: &str, list: &[String]) -> String {
+    let n = list.len();
+    if n == 0 {
+        return format!("{n} {label}");
+    }
+    let shown: Vec<String> = list
+        .iter()
+        .take(5)
+        .map(|c| slack_escape(c))
+        .collect();
+    if n <= 5 {
+        format!("{n} {label} ({})", shown.join(", "))
+    } else {
+        let extra = n - 5;
+        format!("{n} {label} ({} …+{extra} more)", shown.join(", "))
+    }
+}
+
+/// Busy clause for the per-repo menu section: `idle` when no busy marker
+/// is held, otherwise `working on <change> (started <age> ago)`. Change
+/// name passes through `slack_escape`.
+fn menu_busy_clause(resp: &RepoStatusResponse) -> String {
+    match &resp.currently_busy {
+        None => "idle".to_string(),
+        Some(b) => {
+            let age = human_age_since(b.started_at);
+            format!(
+                "working on {} (started {age} ago)",
+                slack_escape(&b.change)
+            )
+        }
+    }
+}
+
+/// Last-iteration clause for the per-repo menu section: `no iteration
+/// yet` on a fresh-startup daemon that hasn't polled this repo yet,
+/// otherwise `last iteration <age> ago`.
+fn menu_last_iteration_clause(resp: &RepoStatusResponse) -> String {
+    match &resp.last_iteration {
+        None => "no iteration yet".to_string(),
+        Some(li) => format!("last iteration {} ago", human_age_since(li.finished_at)),
+    }
+}
+
+/// Cap the unavailable-section error excerpt at a reasonable length so a
+/// multi-line `anyhow` error chain doesn't blow out the menu reply.
+fn truncate_error_excerpt(s: &str) -> String {
+    const MAX: usize = 80;
+    let first_line = s.lines().next().unwrap_or("");
+    if first_line.chars().count() <= MAX {
+        first_line.to_string()
+    } else {
+        first_line.chars().take(MAX).collect::<String>() + "…"
+    }
 }
 
 // ====================================================================
@@ -1071,14 +1222,168 @@ impl OperatorCommandDispatcher {
                     format!("✗ wipe-workspace failed: {err}")
                 }
             }
+            OperatorCommand::StatusMenu => {
+                self.dispatch_status_menu(repositories, submitter).await
+            }
             OperatorCommand::Help => format_help_reply(),
         }
+    }
+
+    /// Build the per-repo menu reply: empty-slice short-circuit, otherwise
+    /// try the daemon's bulk `repo_status_all` action first and fall back
+    /// to N individual `repo_status` calls if the daemon doesn't support
+    /// the bulk action (older builds).
+    async fn dispatch_status_menu(
+        &self,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> String {
+        if repositories.is_empty() {
+            return "📊 No repositories configured.".to_string();
+        }
+        let (responses, unavailable) =
+            collect_menu_state(repositories, submitter).await;
+        for entry in &unavailable {
+            tracing::warn!(
+                url = %entry.url,
+                "status menu: per-repo state unavailable: {}",
+                entry.error
+            );
+        }
+        format_status_menu_reply(&responses, &unavailable)
     }
 
     #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
+}
+
+/// Aggregate per-repo state for the bare-`status` menu reply. Tries the
+/// daemon's bulk `repo_status_all` action first (one round trip); falls
+/// back to N individual `repo_status` calls if the daemon returns the
+/// `unknown action: repo_status_all` shape (older builds without bulk
+/// support).
+///
+/// Returned `Vec<RepoStatusResponse>` is in the same order as
+/// `repositories`. The order across responses and `unavailable` entries
+/// is the configured-repo order — a healthy repo stays in its position
+/// even when a sibling failed.
+async fn collect_menu_state(
+    repositories: &[RepoIdentity],
+    submitter: &dyn ActionSubmitter,
+) -> (Vec<RepoStatusResponse>, Vec<UnavailableEntry>) {
+    // 1. Try the bulk action.
+    let bulk = submitter
+        .submit(serde_json::json!({"action": "repo_status_all"}))
+        .await;
+    if bulk.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return parse_bulk_status_response(repositories, &bulk);
+    }
+    // 2. Bulk action unsupported (older daemon) → fall back to N
+    //    individual repo_status calls. Any error response shape that is
+    //    not `unknown action: repo_status_all` is treated as "daemon
+    //    doesn't speak this verb" too — the fallback path always works
+    //    and the worst case is N extra round trips.
+    let mut responses = Vec::with_capacity(repositories.len());
+    let mut unavailable = Vec::new();
+    for repo in repositories {
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "repo_status",
+                "url": repo.url,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)")
+                .to_string();
+            unavailable.push(UnavailableEntry {
+                url: repo.url.clone(),
+                error: err,
+            });
+            continue;
+        }
+        match serde_json::from_value::<RepoStatusResponse>(resp["status"].clone()) {
+            Ok(s) => responses.push(s),
+            Err(e) => unavailable.push(UnavailableEntry {
+                url: repo.url.clone(),
+                error: format!("decode failed: {e}"),
+            }),
+        }
+    }
+    (responses, unavailable)
+}
+
+/// Parse the daemon's `repo_status_all` response. The shape:
+/// ```json
+/// {"ok": true, "results": [
+///   {"url": "...", "ok": true, "status": {...}},
+///   {"url": "...", "ok": false, "error": "..."}
+/// ]}
+/// ```
+/// Any results entry whose URL is NOT in the configured `repositories`
+/// list is dropped silently — the dispatcher's repo set is authoritative.
+/// Any configured URL absent from the results list is rendered as
+/// `(unavailable: missing from daemon response)` so the operator sees
+/// every configured repo regardless.
+fn parse_bulk_status_response(
+    repositories: &[RepoIdentity],
+    bulk: &serde_json::Value,
+) -> (Vec<RepoStatusResponse>, Vec<UnavailableEntry>) {
+    let mut responses = Vec::new();
+    let mut unavailable = Vec::new();
+    let results = bulk.get("results").and_then(|v| v.as_array()).cloned()
+        .unwrap_or_default();
+    // Index results by URL for stable per-repo lookup.
+    let mut by_url: HashMap<String, &serde_json::Value> = HashMap::new();
+    for entry in &results {
+        if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+            by_url.insert(url.to_string(), entry);
+        }
+    }
+    for repo in repositories {
+        match by_url.get(&repo.url) {
+            Some(entry) => {
+                let ok = entry.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if ok {
+                    match entry.get("status").cloned() {
+                        Some(status_val) => match serde_json::from_value::<
+                            RepoStatusResponse,
+                        >(status_val)
+                        {
+                            Ok(s) => responses.push(s),
+                            Err(e) => unavailable.push(UnavailableEntry {
+                                url: repo.url.clone(),
+                                error: format!("decode failed: {e}"),
+                            }),
+                        },
+                        None => unavailable.push(UnavailableEntry {
+                            url: repo.url.clone(),
+                            error: "ok=true but `status` field missing".to_string(),
+                        }),
+                    }
+                } else {
+                    let err = entry
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)")
+                        .to_string();
+                    unavailable.push(UnavailableEntry {
+                        url: repo.url.clone(),
+                        error: err,
+                    });
+                }
+            }
+            None => unavailable.push(UnavailableEntry {
+                url: repo.url.clone(),
+                error: "missing from daemon response".to_string(),
+            }),
+        }
+    }
+    (responses, unavailable)
 }
 
 /// Production `ActionSubmitter` that writes a single JSON line to the
@@ -1326,7 +1631,9 @@ mod tests {
 
     #[test]
     fn parse_missing_arg_returns_none() {
-        assert!(parse_command(&format!("{BOT} status"), BOT).is_none());
+        // Bare `status` is its own verb (StatusMenu) — see
+        // `parse_bare_status_returns_status_menu`. Every other verb that
+        // expects positional arguments must reject the missing-arg case.
         assert!(parse_command(&format!("{BOT} clear-perma-stuck myrepo"), BOT).is_none());
         assert!(parse_command(&format!("{BOT} clear-revision"), BOT).is_none());
         assert!(parse_command(&format!("{BOT} wipe-workspace"), BOT).is_none());
@@ -1337,6 +1644,48 @@ mod tests {
         // The spec lists one substring for status; trailing junk is an
         // ambiguous typo, not a known verb.
         assert!(parse_command(&format!("{BOT} status myrepo extra"), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_bare_status_returns_status_menu() {
+        let cmd = parse_command(&format!("{BOT} status"), BOT).unwrap();
+        assert_eq!(cmd, OperatorCommand::StatusMenu);
+    }
+
+    #[test]
+    fn parse_bare_status_with_trailing_whitespace_and_caps() {
+        // Trailing whitespace + extra inter-token whitespace + mixed case
+        // all parse as StatusMenu (zero positional args).
+        for form in [
+            format!("{BOT} status   "),
+            format!("{BOT}  status"),
+            format!("{BOT} Status"),
+            format!("{BOT} STATUS"),
+            format!("{BOT}   Status   "),
+        ] {
+            let cmd = parse_command(&form, BOT)
+                .unwrap_or_else(|| panic!("`{form}` should parse as StatusMenu"));
+            assert_eq!(cmd, OperatorCommand::StatusMenu, "form: {form}");
+        }
+    }
+
+    #[test]
+    fn parse_status_one_arg_still_resolves_to_status() {
+        let cmd = parse_command(&format!("{BOT} status myrepo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Status {
+                repo_substring: "myrepo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_status_two_or_more_args_is_invalid_no_silent_menu_fallback() {
+        // Two-or-more args is the existing "invalid" error path — must
+        // not silently fall back to StatusMenu.
+        assert!(parse_command(&format!("{BOT} status myrepo extra"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} status a b c"), BOT).is_none());
     }
 
     #[test]
@@ -2077,6 +2426,29 @@ mod tests {
         assert!(out.to_lowercase().contains("readme"));
     }
 
+    #[test]
+    fn format_help_mentions_bare_status_menu() {
+        // Help text must distinguish the two `status` forms so an
+        // operator discovers both the per-repo deep dive AND the menu
+        // mode. Spec scenario "Help mentions bare status".
+        let out = format_help_reply();
+        // Both the per-repo form and the bare form must be discoverable.
+        assert!(
+            out.contains("`status <repo>`"),
+            "help must mention per-repo form: {out}"
+        );
+        assert!(
+            out.contains("`status` (no repo)"),
+            "help must mention bare `status` form: {out}"
+        );
+        // The bare-form line must describe the menu behavior.
+        let lower = out.to_lowercase();
+        assert!(
+            lower.contains("menu") || lower.contains("every watched repository"),
+            "help must describe the menu behavior on bare status: {out}"
+        );
+    }
+
     // ---------- OperatorCommandDispatcher (full flow) ----------
 
     /// Test-only `ActionSubmitter` that records every submitted action
@@ -2471,6 +2843,401 @@ mod tests {
         assert_eq!(
             wipe_call["url"], "git@github.com:acme/widgets.git",
             "the second wipe's URL must win"
+        );
+    }
+
+    // ---------- format_status_menu_reply ----------
+
+    fn empty_menu_response(url: &str) -> RepoStatusResponse {
+        RepoStatusResponse {
+            url: url.into(),
+            ..RepoStatusResponse::default()
+        }
+    }
+
+    #[test]
+    fn menu_empty_inputs_collapse_to_no_repositories_configured() {
+        let out = format_status_menu_reply(&[], &[]);
+        assert_eq!(out, "📊 No repositories configured.");
+    }
+
+    #[test]
+    fn menu_three_repo_mixed_states_renders_documented_shape() {
+        // First: idle, empty queue, recent iteration.
+        let r1 = RepoStatusResponse {
+            url: "git@github.com:acme/widgets.git".into(),
+            last_iteration: Some(LastIteration {
+                finished_at: Utc::now() - chrono::Duration::minutes(5),
+                outcome_summary: String::new(),
+                next_iteration_estimate: None,
+                poll_interval_sec: 60,
+            }),
+            ..RepoStatusResponse::default()
+        };
+        // Second: idle, has pending entries.
+        let r2 = RepoStatusResponse {
+            url: "git@github.com:org-b/another.git".into(),
+            pending_changes: vec!["a06-foo".into(), "a07-bar".into()],
+            last_iteration: Some(LastIteration {
+                finished_at: Utc::now() - chrono::Duration::minutes(3),
+                outcome_summary: String::new(),
+                next_iteration_estimate: None,
+                poll_interval_sec: 60,
+            }),
+            ..RepoStatusResponse::default()
+        };
+        // Third: working on a change, has pending+waiting, no iteration yet.
+        let r3 = RepoStatusResponse {
+            url: "git@github.com:personal/foo.git".into(),
+            pending_changes: vec![
+                "a01".into(),
+                "a02".into(),
+                "a03".into(),
+                "a04".into(),
+                "a05".into(),
+            ],
+            waiting_changes: vec!["a07-bar".into()],
+            currently_busy: Some(BusySummary {
+                change: "a05-foo".into(),
+                started_at: Utc::now() - chrono::Duration::minutes(2),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_menu_reply(&[r1, r2, r3], &[]);
+        assert!(
+            out.starts_with(
+                "📊 Watching 3 repositories. Reply `@<bot> status <repo-substring>` for details."
+            ),
+            "{out}"
+        );
+        assert!(out.contains("git@github.com:acme/widgets.git"), "{out}");
+        assert!(
+            out.contains("empty queue · idle · last iteration 5m ago"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "2 pending (a06-foo, a07-bar), 0 waiting, 0 excluded · idle · last iteration 3m ago"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "5 pending (a01, a02, a03, a04, a05), 1 waiting (a07-bar), 0 excluded · working on a05-foo (started 2m ago) · no iteration yet"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn menu_pending_list_truncates_after_five_with_extra_count() {
+        let r = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            pending_changes: vec![
+                "a01".into(),
+                "a02".into(),
+                "a03".into(),
+                "a04".into(),
+                "a05".into(),
+                "a06".into(),
+            ],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_menu_reply(&[r], &[]);
+        assert!(
+            out.contains("6 pending (a01, a02, a03, a04, a05 …+1 more)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn menu_seven_pending_truncates_with_two_more() {
+        // From the spec scenario: 7 pending entries → "…+2 more".
+        let r = RepoStatusResponse {
+            url: "u".into(),
+            pending_changes: vec![
+                "a01".into(),
+                "a02".into(),
+                "a03".into(),
+                "a04".into(),
+                "a05".into(),
+                "a06".into(),
+                "a07".into(),
+            ],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_menu_reply(&[r], &[]);
+        assert!(
+            out.contains("7 pending (a01, a02, a03, a04, a05 …+2 more)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn menu_all_zero_queue_collapses_to_empty_queue() {
+        let r = empty_menu_response("git@github.com:owner/repo.git");
+        let out = format_status_menu_reply(&[r], &[]);
+        assert!(out.contains("empty queue"), "{out}");
+        assert!(!out.contains("0 pending"), "no zero-count parts: {out}");
+    }
+
+    #[test]
+    fn menu_last_iteration_none_renders_no_iteration_yet() {
+        let r = empty_menu_response("u");
+        let out = format_status_menu_reply(&[r], &[]);
+        assert!(out.contains("no iteration yet"), "{out}");
+    }
+
+    #[test]
+    fn menu_unavailable_entry_renders_url_plus_unavailable_summary() {
+        let healthy = RepoStatusResponse {
+            url: "git@github.com:org/healthy.git".into(),
+            last_iteration: Some(LastIteration {
+                finished_at: Utc::now() - chrono::Duration::minutes(2),
+                outcome_summary: String::new(),
+                next_iteration_estimate: None,
+                poll_interval_sec: 60,
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let unavail = UnavailableEntry {
+            url: "git@github.com:org/broken.git".into(),
+            error: "control-socket call failed: no perma marker".into(),
+        };
+        let out = format_status_menu_reply(&[healthy], &[unavail]);
+        assert!(out.contains("git@github.com:org/healthy.git"), "{out}");
+        assert!(out.contains("git@github.com:org/broken.git"), "{out}");
+        assert!(
+            out.contains(
+                "(unavailable: control-socket call failed: no perma marker)"
+            ),
+            "{out}"
+        );
+        // Header counts both repos.
+        assert!(out.starts_with("📊 Watching 2 repositories."), "{out}");
+    }
+
+    #[test]
+    fn menu_unavailable_only_still_shows_announcement_and_per_repo_sections() {
+        let unavail = vec![
+            UnavailableEntry {
+                url: "git@github.com:org/a.git".into(),
+                error: "err1".into(),
+            },
+            UnavailableEntry {
+                url: "git@github.com:org/b.git".into(),
+                error: "err2".into(),
+            },
+        ];
+        let out = format_status_menu_reply(&[], &unavail);
+        assert!(out.starts_with("📊 Watching 2 repositories."), "{out}");
+        assert!(out.contains("git@github.com:org/a.git"), "{out}");
+        assert!(out.contains("git@github.com:org/b.git"), "{out}");
+        assert!(out.contains("(unavailable: err1)"), "{out}");
+        assert!(out.contains("(unavailable: err2)"), "{out}");
+    }
+
+    #[test]
+    fn menu_change_name_with_angle_brackets_is_slack_escaped() {
+        // The parser's regex would normally reject `<`, but the formatter
+        // belt-and-braces escapes anyway so an upstream bug can't leak a
+        // raw `<!channel>` ping into the reply.
+        let r = RepoStatusResponse {
+            url: "u".into(),
+            pending_changes: vec!["<bad>".into()],
+            currently_busy: Some(BusySummary {
+                change: "<also-bad>".into(),
+                started_at: Utc::now() - chrono::Duration::minutes(1),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_menu_reply(&[r], &[]);
+        assert!(out.contains("&lt;bad&gt;"), "{out}");
+        assert!(out.contains("&lt;also-bad&gt;"), "{out}");
+        assert!(!out.contains("<bad>"), "{out}");
+        assert!(!out.contains("<also-bad>"), "{out}");
+    }
+
+    // ---------- StatusMenu dispatcher ----------
+
+    #[tokio::test]
+    async fn dispatch_status_menu_empty_repositories_returns_no_repos_configured_line() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} status"), "C1", BOT, &[], &submitter)
+            .await
+            .expect("StatusMenu always produces a reply");
+        let text = unwrap_sync(reply);
+        assert_eq!(text, "📊 No repositories configured.");
+        // No bulk call needed.
+        assert!(submitter.calls().is_empty());
+    }
+
+    /// Build a minimal "ok" RepoStatusResponse JSON for FakeSubmitter
+    /// responses.
+    fn status_json(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "perma_stuck_changes": [],
+            "revision_marked_changes": [],
+            "throttled_alerts": [],
+            "pending_changes": [],
+            "waiting_changes": [],
+            "last_iteration": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_menu_bulk_action_three_repos_all_ok() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let repos = vec![
+            ident("git@github.com:owner/a.git"),
+            ident("git@github.com:owner/b.git"),
+            ident("git@github.com:owner/c.git"),
+        ];
+        submitter.set_response(
+            "repo_status_all",
+            serde_json::json!({
+                "ok": true,
+                "results": [
+                    {"url": "git@github.com:owner/a.git", "ok": true, "status": status_json("git@github.com:owner/a.git")},
+                    {"url": "git@github.com:owner/b.git", "ok": true, "status": status_json("git@github.com:owner/b.git")},
+                    {"url": "git@github.com:owner/c.git", "ok": true, "status": status_json("git@github.com:owner/c.git")},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} status"), "C1", BOT, &repos, &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("📊 Watching 3 repositories."), "{text}");
+        for repo in &repos {
+            assert!(text.contains(&repo.url), "URL missing: {} in {text}", repo.url);
+        }
+        // One round trip — the bulk action only.
+        assert_eq!(submitter.calls().len(), 1);
+        assert_eq!(submitter.calls()[0]["action"], "repo_status_all");
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_menu_bulk_action_one_unavailable_two_healthy() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let repos = vec![
+            ident("git@github.com:owner/a.git"),
+            ident("git@github.com:owner/b.git"),
+            ident("git@github.com:owner/c.git"),
+        ];
+        submitter.set_response(
+            "repo_status_all",
+            serde_json::json!({
+                "ok": true,
+                "results": [
+                    {"url": "git@github.com:owner/a.git", "ok": true, "status": status_json("git@github.com:owner/a.git")},
+                    {"url": "git@github.com:owner/b.git", "ok": false, "error": "workspace missing"},
+                    {"url": "git@github.com:owner/c.git", "ok": true, "status": status_json("git@github.com:owner/c.git")},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} status"), "C1", BOT, &repos, &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        // All three URLs appear.
+        for repo in &repos {
+            assert!(text.contains(&repo.url), "URL missing: {} in {text}", repo.url);
+        }
+        // The errored repo shows the (unavailable) clause.
+        assert!(text.contains("(unavailable: workspace missing)"), "{text}");
+        // The healthy repos show the standard summary.
+        let healthy_a_pos = text
+            .find("git@github.com:owner/a.git")
+            .unwrap();
+        assert!(
+            text[healthy_a_pos..].contains("empty queue · idle · no iteration yet"),
+            "healthy repo a must have a summary line: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_menu_falls_back_to_n_repo_status_calls_when_bulk_unknown() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let repos = vec![
+            ident("git@github.com:owner/a.git"),
+            ident("git@github.com:owner/b.git"),
+        ];
+        // Older daemon: bulk action errors out.
+        submitter.set_response(
+            "repo_status_all",
+            serde_json::json!({"ok": false, "error": "unknown action: repo_status_all"}),
+        );
+        // Fallback path uses per-repo repo_status. The fake submitter's
+        // response table is keyed by action name only, so both repos
+        // share the same response — fine for this test, which only
+        // checks the URL list / call counts.
+        submitter.set_response(
+            "repo_status",
+            serde_json::json!({
+                "ok": true,
+                "status": status_json("placeholder"),
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} status"), "C1", BOT, &repos, &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("📊 Watching 2 repositories."), "{text}");
+        // 1 bulk attempt + 2 individual calls = 3.
+        assert_eq!(submitter.calls().len(), 3);
+        assert_eq!(submitter.calls()[0]["action"], "repo_status_all");
+        assert_eq!(submitter.calls()[1]["action"], "repo_status");
+        assert_eq!(submitter.calls()[2]["action"], "repo_status");
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_menu_fallback_records_per_call_failures_as_unavailable() {
+        // Bulk unsupported → fallback → one of the N per-repo calls
+        // errors out. The dispatcher must still ship every other repo's
+        // section.
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let repos = vec![
+            ident("git@github.com:owner/a.git"),
+            ident("git@github.com:owner/b.git"),
+        ];
+        submitter.set_response(
+            "repo_status_all",
+            serde_json::json!({"ok": false, "error": "unknown action"}),
+        );
+        // Both repos get the same hard error response from the fake
+        // submitter — both end up in `unavailable`.
+        submitter.set_response(
+            "repo_status",
+            serde_json::json!({"ok": false, "error": "workspace exploded"}),
+        );
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} status"), "C1", BOT, &repos, &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("📊 Watching 2 repositories."), "{text}");
+        // Both URLs are present and both show the unavailable clause.
+        for repo in &repos {
+            assert!(text.contains(&repo.url), "URL missing: {} in {text}", repo.url);
+        }
+        // The error excerpt for both repos is identical (same fake
+        // response shared by action name), so we expect at least two
+        // occurrences of the same `(unavailable:` clause.
+        assert_eq!(
+            text.matches("(unavailable: workspace exploded)").count(),
+            2,
+            "{text}"
         );
     }
 }
