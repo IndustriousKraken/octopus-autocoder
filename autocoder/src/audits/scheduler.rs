@@ -184,6 +184,32 @@ async fn run_one_audit(
         }
     };
 
+    // `WorkspaceUnavailable` is the documented "audit declined to run"
+    // outcome (see `audits-require-valid-workspace`). The audit did NO
+    // file IO, NO LLM call, and NO state mutation, so there is no
+    // post-hoc diff to enforce against the write policy — invoking
+    // `git status` against a missing/non-git workspace would fail and
+    // mis-report the skip as an audit error. Skip post-hoc enforcement,
+    // skip chatops, and do NOT update the cadence-state file so the
+    // next iteration's cadence check re-evaluates and may try again
+    // if the workspace becomes valid in the meantime.
+    if let AuditOutcome::WorkspaceUnavailable {
+        audit_type: at,
+        workspace_path,
+        reason,
+    } = &outcome
+    {
+        log_writer.write_section(
+            "audit_run_outcome",
+            &format!(
+                "kind: WorkspaceUnavailable\nend: {}\naudit_type: {at}\nworkspace_path: {wp}\nreason: {reason}",
+                end_ts.to_rfc3339(),
+                wp = workspace_path.display(),
+            ),
+        )?;
+        return Ok(());
+    }
+
     // Post-hoc write-policy enforcement. Use `-uall` so untracked
     // directories are expanded to per-file paths; otherwise an audit
     // could write `openspec/changes/new-thing/proposal.md` and git
@@ -385,6 +411,14 @@ async fn run_one_audit(
                 "audit `{at}` produced an invalid proposal; discarded after {retries_attempted} retries",
             );
             history_excerpt = Some(truncate_chars(final_error, VALIDATION_ERROR_HISTORY_EXCERPT));
+        }
+        AuditOutcome::WorkspaceUnavailable { .. } => {
+            // Handled by the early-return above. Unreachable here, but
+            // the match must remain exhaustive so future additions of
+            // outcome variants force a deliberate decision at this site.
+            unreachable!(
+                "WorkspaceUnavailable is handled by the dedicated early return before outcome dispatch"
+            );
         }
     }
 
@@ -1198,6 +1232,151 @@ mod tests {
         let _ = std::fs::remove_dir_all(
             PathBuf::from("/tmp/autocoder/logs").join(&basename),
         );
+    }
+
+    /// When the audit returns `WorkspaceUnavailable`, the scheduler must
+    /// NOT update the cadence-state file. The next iteration's cadence
+    /// check sees the unchanged timestamp and treats the audit as
+    /// still-due (so it retries when the workspace becomes valid).
+    #[tokio::test]
+    async fn workspace_unavailable_outcome_does_not_update_cadence_state() {
+        let (_t, ws) = init_workspace();
+        // Seed a state entry from 30 days ago, simulating a long-due
+        // audit that has been blocked by a broken workspace state.
+        let mut state = AuditState::default();
+        let original_last_run = Utc::now() - chrono::Duration::days(30);
+        state.record(
+            "wsu1",
+            AuditRunEntry {
+                last_run_at: original_last_run,
+                last_run_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                last_outcome: AuditOutcomeKind::NoFindings,
+            },
+        );
+        state.save(&ws).unwrap();
+
+        let audit = Arc::new(CountingAudit::new("wsu1").with_outcome(
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type: "wsu1".into(),
+                workspace_path: PathBuf::from("/some/missing/path"),
+                reason: "workspace directory does not exist".into(),
+            },
+        ));
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("wsu1");
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        // State is unchanged: last_run_at still the original 30-day-old
+        // timestamp, last_outcome still `NoFindings` (not overwritten).
+        let after = AuditState::load_or_default(&ws);
+        let entry = after.runs.get("wsu1").expect("entry must remain");
+        assert_eq!(
+            entry.last_run_at, original_last_run,
+            "skipped runs must NOT advance last_run_at"
+        );
+        assert_eq!(
+            entry.last_outcome,
+            AuditOutcomeKind::NoFindings,
+            "skipped runs must NOT overwrite the recorded outcome"
+        );
+        // History must NOT have a new entry either.
+        let hist = after.history("wsu1");
+        assert!(
+            hist.is_empty(),
+            "skipped runs must NOT append to attempt history: {hist:?}"
+        );
+    }
+
+    /// Sibling audits in the same iteration still run when one returns
+    /// `WorkspaceUnavailable`. (In practice they'll all hit the same
+    /// invalid workspace and all return the same outcome — but the
+    /// scheduler loop must not abort the iteration on the first skip.)
+    #[tokio::test]
+    async fn workspace_unavailable_does_not_abort_iteration() {
+        let (_t, ws) = init_workspace();
+        let audit_a = Arc::new(CountingAudit::new("wsu_a").with_outcome(
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type: "wsu_a".into(),
+                workspace_path: ws.clone(),
+                reason: "workspace directory does not exist".into(),
+            },
+        ));
+        let audit_b = Arc::new(CountingAudit::new("wsu_b"));
+        let counter_b = audit_b.invocations.clone();
+        let registry =
+            AuditRegistry::with_audits(vec![audit_a.clone(), audit_b.clone()]);
+        let mut defaults = HashMap::new();
+        defaults.insert("wsu_a".to_string(), Cadence::Daily);
+        defaults.insert("wsu_b".to_string(), Cadence::Daily);
+        let cfg = AuditsConfig {
+            defaults,
+            settings: HashMap::new(),
+            ..AuditsConfig::default()
+        };
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .expect("scheduler must keep going");
+        assert_eq!(
+            *counter_b.lock().unwrap(),
+            1,
+            "subsequent audits must still run after a workspace-unavailable skip"
+        );
+        // wsu_a's state must NOT have been recorded.
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            !state.runs.contains_key("wsu_a"),
+            "WorkspaceUnavailable must NOT consume cadence"
+        );
+        // wsu_b's state IS recorded (it ran normally).
+        assert!(state.runs.contains_key("wsu_b"));
+    }
+
+    /// Skipped audits must NOT fire any chatops notification — the
+    /// iteration-level workspace-init alert is the operator-facing
+    /// signal of the upstream problem. Per-audit skip notifications
+    /// would flood the channel.
+    #[tokio::test]
+    async fn workspace_unavailable_does_not_post_chatops() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("wsu_quiet")
+                .with_outcome(AuditOutcome::WorkspaceUnavailable {
+                    audit_type: "wsu_quiet".into(),
+                    workspace_path: ws.clone(),
+                    reason: "workspace exists but has no .git/ subdirectory".into(),
+                }),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("wsu_quiet");
+        // notify_on_clean = true to prove the skip path doesn't
+        // accidentally route through the "clean findings" notifier.
+        let mut settings = HashMap::new();
+        settings.insert(
+            "wsu_quiet".to_string(),
+            AuditSettings {
+                prompt_path: None,
+                notify_on_clean: true,
+                extra: HashMap::new(),
+            },
+        );
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        let no_post = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0) // skipped audits must NEVER post
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx))
+            .await
+            .unwrap();
+        no_post.assert_async().await;
     }
 
     #[tokio::test]

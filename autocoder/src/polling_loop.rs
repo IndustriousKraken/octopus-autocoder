@@ -781,6 +781,16 @@ pub async fn run_pass_through_commits(
     // spec-writing audit creates are picked up by this same iteration's
     // queue walk). Per design: audit failures inside the scheduler are
     // logged and never abort the iteration.
+    //
+    // Iteration-level workspace-validity gate (see
+    // `audits-require-valid-workspace`): the audit scheduler is only
+    // reached when `ensure_initialized` returned Ok for this iteration.
+    // The early `return Err(e)` on init failure above is the gate: if
+    // the workspace can't be brought to a valid state at the start of
+    // the iteration, this site is unreachable and `run_due_audits` is
+    // never called, so audits cannot create broken-state side effects.
+    // (Per-audit gates in each `Audit::run` catch the rarer case where
+    // the workspace becomes invalid mid-iteration.)
     if let Err(e) = run_due_audits(
         audit_registry,
         workspace,
@@ -5807,7 +5817,7 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
+
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
@@ -5815,6 +5825,99 @@ mod tests {
         assert!(
             !ws.join(".failure-state.json").exists(),
             "transient pre-executor errors must not bump the counter"
+        );
+    }
+
+    /// Iteration-level workspace-validity gate (see
+    /// `audits-require-valid-workspace`): when `ensure_initialized`
+    /// returns Err for the iteration, the audit scheduler must NOT be
+    /// invoked. The registry can carry an audit fixture that records
+    /// its invocations; after the iteration, the counter must be zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_scheduler_not_invoked_when_ensure_initialized_fails() {
+        use crate::audits::{
+            Audit, AuditContext, AuditOutcome, AuditRegistry, WritePolicy,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingAudit {
+            invocations: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl Audit for CountingAudit {
+            fn audit_type(&self) -> &'static str {
+                "iter_gate_probe"
+            }
+            fn description(&self) -> &'static str {
+                "test probe for the iteration-level workspace-validity gate"
+            }
+            fn requires_head_change(&self) -> bool {
+                false
+            }
+            fn write_policy(&self) -> WritePolicy {
+                WritePolicy::None
+            }
+            async fn run(
+                &self,
+                _ctx: &mut AuditContext<'_>,
+            ) -> Result<AuditOutcome> {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(AuditOutcome::NoFindings)
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("placeholder.txt"), "x").unwrap();
+
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/missing.git".into(),
+            local_path: Some(ws.clone()),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let executor = AlwaysFailingExecutor;
+
+        let invocations = Arc::new(AtomicU32::new(0));
+        let probe = CountingAudit {
+            invocations: invocations.clone(),
+        };
+        let registry =
+            AuditRegistry::with_audits(vec![Arc::new(probe) as Arc<dyn Audit>]);
+
+        let result = run_pass_through_commits(
+            &ws,
+            &repo,
+            &github_cfg,
+            &executor,
+            None,
+            1,
+            u32::MAX,
+            &registry,
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "ensure_initialized failure must propagate; the iteration's audit-scheduler call is unreachable"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "iteration-level gate: audit scheduler must NOT be invoked when ensure_initialized fails"
         );
     }
 

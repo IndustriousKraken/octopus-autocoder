@@ -24,7 +24,8 @@ use tokio::process::Command;
 use super::{
     AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
     format_validation_exhausted_message, post_proposal_created_notification,
-    read_proposal_why_first_line, write_sandbox_settings,
+    read_proposal_why_first_line, workspace_is_valid, workspace_unavailable_outcome,
+    write_sandbox_settings,
 };
 use crate::config::ResolvedSandbox;
 
@@ -90,6 +91,15 @@ pub(crate) async fn run_specs_writing_audit(
     ctx: &mut AuditContext<'_>,
 ) -> Result<AuditOutcome> {
     let audit_type = params.audit_type;
+    // Workspace-validity gate (see `audits-require-valid-workspace`).
+    // The spec-writing helpers are the audits that would otherwise call
+    // `fs::create_dir_all(<workspace>/openspec/changes/<slug>)` and
+    // recreate workspace + openspec/ on a wiped workspace — the very
+    // failure mode the gate exists to prevent.
+    if !workspace_is_valid(ctx.workspace) {
+        return Ok(workspace_unavailable_outcome(audit_type, ctx.workspace));
+    }
+
     let max_retries = ctx.max_validation_retries;
     let total_attempts = max_retries.saturating_add(1);
 
