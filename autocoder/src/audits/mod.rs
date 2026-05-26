@@ -694,13 +694,15 @@ pub async fn discard_proposal_and_notify(
         );
     }
     if let Some(ctx) = chatops_ctx {
-        let text = format_validation_exhausted_message(
+        let post_result = post_validation_exhausted_notification(
+            ctx,
             repo_url,
             audit_type,
             retries_attempted,
             final_error,
-        );
-        if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        )
+        .await;
+        if let Err(e) = post_result {
             tracing::warn!(
                 audit_type = audit_type,
                 slug = %slug,
@@ -711,8 +713,68 @@ pub async fn discard_proposal_and_notify(
     Ok(())
 }
 
-/// Render the documented `❌` notification text shown when an audit's
-/// generated proposal failed validation after retries.
+/// Post the `❌` validation-exhausted notification via the threaded path
+/// when the error is multi-line OR exceeds 300 characters; inline
+/// otherwise. The top-line names the repo, audit type, and retry count;
+/// the (optional) thread body carries the captured validation-error
+/// excerpt + the closing instruction.
+pub async fn post_validation_exhausted_notification(
+    ctx: &ChatOpsContext,
+    repo_url: &str,
+    audit_type: &str,
+    retries_attempted: u32,
+    final_error: &str,
+) -> Result<()> {
+    let excerpt = truncate_chars(final_error, VALIDATION_ERROR_NOTIFICATION_CAP);
+    let top_line = format_validation_exhausted_top_line(
+        repo_url,
+        audit_type,
+        retries_attempted,
+    );
+    if should_thread_validation_error(&excerpt) {
+        let thread_body = format!(
+            "Final validation error:\n{excerpt}\nNo commit was made. The audit will retry on its next scheduled cadence."
+        );
+        ctx.chatops
+            .post_notification_with_thread(&ctx.channel, &top_line, &thread_body)
+            .await
+    } else {
+        let text = format_validation_exhausted_message(
+            repo_url,
+            audit_type,
+            retries_attempted,
+            final_error,
+        );
+        ctx.chatops.post_notification(&ctx.channel, &text).await
+    }
+}
+
+/// Threading predicate for `ValidationExhausted` notifications: a
+/// validation error spanning more than one line OR more than 300
+/// characters routes through the threaded path. Single-line short
+/// errors continue to use the inline single-message form.
+pub fn should_thread_validation_error(excerpt: &str) -> bool {
+    excerpt.lines().count() > 1 || excerpt.chars().count() > 300
+}
+
+/// Render the `❌` top-line shared by the inline + threaded notification
+/// paths. The threaded path uses just this string; the inline path
+/// composes it with the validation-error body via
+/// [`format_validation_exhausted_message`].
+pub fn format_validation_exhausted_top_line(
+    repo_url: &str,
+    audit_type: &str,
+    retries_attempted: u32,
+) -> String {
+    format!(
+        "❌ {repo_url}: {audit_type} produced an invalid proposal that failed openspec validation after {retries_attempted} retries."
+    )
+}
+
+/// Render the inline single-message form of the `❌` validation-exhausted
+/// notification. Used by the inline-path branch of
+/// [`post_validation_exhausted_notification`] AND by callers that want
+/// the legacy single-message rendering directly.
 pub fn format_validation_exhausted_message(
     repo_url: &str,
     audit_type: &str,
@@ -720,8 +782,9 @@ pub fn format_validation_exhausted_message(
     final_error: &str,
 ) -> String {
     let excerpt = truncate_chars(final_error, VALIDATION_ERROR_NOTIFICATION_CAP);
+    let top_line = format_validation_exhausted_top_line(repo_url, audit_type, retries_attempted);
     format!(
-        "❌ {repo_url}: {audit_type} produced an invalid proposal that failed openspec validation after {retries_attempted} retries.\n\
+        "{top_line}\n\
          Final validation error:\n{excerpt}\nNo commit was made. The audit will retry on its next scheduled cadence."
     )
 }
@@ -930,6 +993,189 @@ pub fn workspace_unavailable_outcome(
         workspace_path: workspace.to_path_buf(),
         reason,
     }
+}
+
+// =====================================================================
+// Audit notification formatter (chatops-audit-findings-in-threads)
+// =====================================================================
+
+/// Threading threshold: notifications whose `thread_body` exceeds either
+/// of these dimensions warrant a thread; otherwise the body inlines into
+/// the top-line message. Documented in the `chatops-manager` spec's
+/// "Audit findings post via the threaded-notification path …" requirement.
+pub const AUDIT_THREAD_LINE_THRESHOLD: usize = 3;
+pub const AUDIT_THREAD_CHAR_THRESHOLD: usize = 300;
+
+/// Slack's per-message limit is 40,000 characters; cap the thread body
+/// at 35,000 to leave a 5,000-char safety margin for any backend-side
+/// envelope overhead.
+pub const AUDIT_THREAD_BODY_CHAR_CAP: usize = 35_000;
+
+/// Output of [`format_audit_notification`]. The scheduler decides which
+/// `ChatOpsBackend` method to invoke based on `should_thread`:
+/// `true`  → `post_notification_with_thread(top_line, thread_body)`;
+/// `false` → `post_notification(<top_line + body>)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditNotification {
+    pub top_line: String,
+    pub thread_body: String,
+    pub should_thread: bool,
+}
+
+/// Build the per-audit-type chatops notification (top-line summary,
+/// full findings body, and threading decision). `notify_on_clean`
+/// distinguishes "audit ran clean, post the ✅ form" from "audit ran
+/// clean, post nothing" — the latter case is gated by the scheduler
+/// before calling this helper.
+///
+/// `now` is plumbed in so tests can pin the audit_id used in truncation
+/// pointers; production callers pass `chrono::Utc::now()`.
+pub fn format_audit_notification(
+    audit_type: &str,
+    repo_url: &str,
+    findings: &[Finding],
+    notify_on_clean: bool,
+    now: chrono::DateTime<Utc>,
+) -> AuditNotification {
+    let top_line =
+        format_audit_top_line(audit_type, repo_url, findings, notify_on_clean);
+    let mut thread_body = if findings.is_empty() {
+        String::new()
+    } else {
+        format_audit_thread_body(findings)
+    };
+
+    // Length cap: truncate to 35,000 chars and append a pointer naming
+    // the audit_id operators can grep in the daemon log.
+    if thread_body.chars().count() > AUDIT_THREAD_BODY_CHAR_CAP {
+        let audit_id = make_audit_id(repo_url, audit_type, now);
+        let truncated: String = thread_body
+            .chars()
+            .take(AUDIT_THREAD_BODY_CHAR_CAP)
+            .collect();
+        thread_body = format!(
+            "{truncated}\n\n… [truncated; full findings at journalctl -u autocoder | grep audit_id={audit_id}]"
+        );
+    }
+
+    let should_thread = thread_body.lines().count() > AUDIT_THREAD_LINE_THRESHOLD
+        || thread_body.chars().count() > AUDIT_THREAD_CHAR_THRESHOLD;
+
+    AuditNotification {
+        top_line,
+        thread_body,
+        should_thread,
+    }
+}
+
+/// Build the per-audit-type top-line string. Documented shapes:
+/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+/// - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
+/// - other audits: generic `📋 <audit_type> on <repo>: <N> finding(s)`
+///
+/// Empty findings with `notify_on_clean=true` → uniform
+/// `✅ <audit_type> on <repo>: no findings`.
+fn format_audit_top_line(
+    audit_type: &str,
+    repo_url: &str,
+    findings: &[Finding],
+    notify_on_clean: bool,
+) -> String {
+    if findings.is_empty() && notify_on_clean {
+        return format!("✅ {audit_type} on {repo_url}: no findings");
+    }
+    match audit_type {
+        "architecture_brightline" => {
+            let (files, dupes) = count_brightline_findings(findings);
+            format!(
+                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {dupes} duplicate signature(s)"
+            )
+        }
+        "drift_audit" => {
+            format!(
+                "🧭 drift_audit on {repo_url}: {n} spec/code divergence(s) detected",
+                n = findings.len()
+            )
+        }
+        _ => {
+            format!(
+                "📋 {audit_type} on {repo_url}: {n} finding(s)",
+                n = findings.len()
+            )
+        }
+    }
+}
+
+/// Partition brightline findings by subject shape. Files-over-threshold
+/// subjects start with `"file "` and contain `" lines (threshold:"`;
+/// duplicate-signature subjects start with `"duplicate signature "`.
+/// Any other finding shape falls into neither bucket and is not counted
+/// in either total (the per-finding body still appears in the thread).
+fn count_brightline_findings(findings: &[Finding]) -> (usize, usize) {
+    let mut files = 0usize;
+    let mut dupes = 0usize;
+    for f in findings {
+        let s = f.subject.as_str();
+        if s.starts_with("file ") && s.contains(" lines (threshold:") {
+            files += 1;
+        } else if s.starts_with("duplicate signature ") {
+            dupes += 1;
+        }
+    }
+    (files, dupes)
+}
+
+/// Render the per-finding body the thread reply carries. Same shape as
+/// the prior `format_findings_message` body (severity glyph + subject +
+/// optional `(anchor)`) so operators reading the thread see the same
+/// content they used to see inline.
+fn format_audit_thread_body(findings: &[Finding]) -> String {
+    let mut out = String::new();
+    for (i, f) in findings.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let glyph = f.severity.glyph();
+        out.push_str("  ");
+        out.push_str(glyph);
+        out.push(' ');
+        out.push_str(&f.subject);
+        if let Some(anchor) = f.anchor.as_deref() {
+            out.push_str(" (");
+            out.push_str(anchor);
+            out.push(')');
+        }
+    }
+    out
+}
+
+/// Deterministic id used in the truncation pointer. Shape:
+/// `<repo-sanitized>:<audit-type>:<utc-timestamp>`. The audit-runner
+/// stamps this same id into its daemon log entries so operators can
+/// grep the daemon log for the full content.
+pub fn make_audit_id(
+    repo_url: &str,
+    audit_type: &str,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let sanitized = sanitize_for_audit_id(repo_url);
+    let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    format!("{sanitized}:{audit_type}:{timestamp}")
+}
+
+/// Sanitize a repo URL into a token safe for a shell grep argument:
+/// replace any character outside `[A-Za-z0-9._-]` with `_`. Mirrors the
+/// workspace-basename sanitisation pattern used elsewhere in the daemon.
+fn sanitize_for_audit_id(repo_url: &str) -> String {
+    let mut out = String::with_capacity(repo_url.len());
+    for c in repo_url.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1636,6 +1882,353 @@ mod tests {
         assert_eq!(Severity::Low.glyph(), "•");
         assert_eq!(Severity::Medium.glyph(), "⚠");
         assert_eq!(Severity::High.glyph(), "🔴");
+    }
+
+    // ====================================================================
+    // format_audit_notification tests (chatops-audit-findings-in-threads)
+    // ====================================================================
+
+    fn brightline_file_finding(rel: &str, n: u64) -> Finding {
+        Finding {
+            severity: Severity::Medium,
+            subject: format!("file {rel} is {n} lines (threshold: 800)"),
+            body: format!("path: {rel}\nlines: {n}\nthreshold: 800"),
+            anchor: Some(format!("{rel}:1")),
+        }
+    }
+
+    fn brightline_dup_finding(sig: &str) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!("duplicate signature `{sig}` across 2 files"),
+            body: "mod_a.rs:1\nmod_b.rs:1".to_string(),
+            anchor: Some("mod_a.rs:1".into()),
+        }
+    }
+
+    fn drift_finding(divergence: &str) -> Finding {
+        Finding {
+            severity: Severity::Medium,
+            subject: "[capX] reqY".to_string(),
+            body: divergence.to_string(),
+            anchor: Some("src/foo.rs:1".into()),
+        }
+    }
+
+    fn ts() -> chrono::DateTime<Utc> {
+        // Stable timestamp so audit_id assertions are deterministic.
+        "2026-05-26T15:30:45Z".parse().unwrap()
+    }
+
+    #[test]
+    fn format_audit_notification_brightline_counts_files_and_dupes_in_top_line() {
+        let mut findings = Vec::new();
+        for i in 0..7 {
+            findings.push(brightline_file_finding(&format!("src/file{i}.rs"), 1000 + i));
+        }
+        for i in 0..3 {
+            findings.push(brightline_dup_finding(&format!("fn helper{i}")));
+        }
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.contains("📐 architecture_brightline on git@github.com:o/r.git"),
+            "top_line: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("7 file(s) over line threshold"),
+            "top_line should report 7 files: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("3 duplicate signature(s)"),
+            "top_line should report 3 dupes: {}",
+            n.top_line
+        );
+        assert!(n.thread_body.contains("src/file0.rs"));
+        assert!(n.thread_body.contains("duplicate signature `fn helper0`"));
+        assert!(
+            n.should_thread,
+            "10 findings exceed the threshold, must thread"
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_drift_counts_divergences() {
+        let findings = vec![
+            drift_finding("spec X says A; code says B."),
+            drift_finding("spec Y says C; code says D."),
+        ];
+        // Threshold for threading: 5 lines OR 300 chars. With 2 short
+        // findings, the body is 2 lines and a few dozen chars — inline.
+        let n = format_audit_notification(
+            "drift_audit",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.starts_with("🧭 drift_audit on git@github.com:o/r.git"),
+            "top_line: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("2 spec/code divergence(s) detected"),
+            "top_line must report 2 divergences: {}",
+            n.top_line
+        );
+        assert!(!n.should_thread, "two short divergences inline");
+    }
+
+    #[test]
+    fn format_audit_notification_drift_long_findings_thread() {
+        let findings: Vec<Finding> = (0..5)
+            .map(|i| drift_finding(&format!("divergence {i}")))
+            .collect();
+        let n = format_audit_notification(
+            "drift_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(n.should_thread, "5 findings → >3 lines → thread");
+    }
+
+    #[test]
+    fn format_audit_notification_empty_findings_with_notify_on_clean_uses_check_form() {
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &[],
+            true,
+            ts(),
+        );
+        assert_eq!(
+            n.top_line,
+            "✅ architecture_brightline on git@github.com:o/r.git: no findings"
+        );
+        assert!(n.thread_body.is_empty(), "no findings → empty body");
+        assert!(!n.should_thread, "empty body → no thread");
+    }
+
+    #[test]
+    fn format_audit_notification_single_line_below_threshold_inlines() {
+        let findings = vec![drift_finding("one short divergence")];
+        let n = format_audit_notification(
+            "drift_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            !n.should_thread,
+            "1 short finding → inline; should_thread must be false"
+        );
+        assert!(n.top_line.starts_with("🧭 drift_audit on u"));
+        assert!(n.thread_body.contains("[capX] reqY"));
+    }
+
+    #[test]
+    fn format_audit_notification_truncates_thread_body_over_35k() {
+        // Construct a body that exceeds 35,000 chars by stuffing one
+        // gigantic finding subject in. The exact count must be > the
+        // cap so the truncation branch fires.
+        let huge_subject = "duplicate signature `fn x` across 2 files: ".to_string()
+            + &"y".repeat(40_000);
+        let findings = vec![Finding {
+            severity: Severity::Low,
+            subject: huge_subject,
+            body: "details".into(),
+            anchor: None,
+        }];
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        // The pointer is appended; thread_body chars count must be at
+        // most cap + pointer length. Pointer is bounded by audit_id +
+        // boilerplate (well under 500 chars in practice).
+        let body_chars = n.thread_body.chars().count();
+        assert!(
+            body_chars > AUDIT_THREAD_BODY_CHAR_CAP,
+            "truncated body should still include the pointer (longer than cap by pointer length): {}",
+            body_chars
+        );
+        assert!(
+            body_chars < AUDIT_THREAD_BODY_CHAR_CAP + 1_000,
+            "truncated body must be within cap + pointer overhead, got {}",
+            body_chars
+        );
+        assert!(
+            n.thread_body.contains("[truncated; full findings at journalctl -u autocoder | grep audit_id="),
+            "truncated body must end with the documented pointer"
+        );
+        // The audit_id is derived from the repo + audit_type + timestamp.
+        // sanitize_for_audit_id replaces ':', '@', '/' with '_'.
+        assert!(
+            n.thread_body.contains("git_github.com_o_r.git:architecture_brightline:"),
+            "audit_id should sanitize repo url: {}",
+            n.thread_body
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_under_cap_has_no_truncation_pointer() {
+        let findings = vec![drift_finding("a small divergence")];
+        let n = format_audit_notification(
+            "drift_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            !n.thread_body.contains("[truncated"),
+            "small body must not get a truncation pointer: {}",
+            n.thread_body
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_unknown_audit_type_uses_generic_top_line() {
+        let findings = vec![drift_finding("x")];
+        let n = format_audit_notification(
+            "architecture_consultative",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.starts_with("📋 architecture_consultative on u"),
+            "unknown audit_type falls back to generic format: {}",
+            n.top_line
+        );
+        assert!(n.top_line.contains("1 finding(s)"));
+    }
+
+    #[test]
+    fn make_audit_id_sanitizes_repo_and_includes_timestamp() {
+        let id = make_audit_id(
+            "git@github.com:o/r.git",
+            "drift_audit",
+            ts(),
+        );
+        assert_eq!(
+            id,
+            "git_github.com_o_r.git:drift_audit:2026-05-26T15:30:45Z"
+        );
+    }
+
+    // ====================================================================
+    // ValidationExhausted threaded-notification tests
+    // ====================================================================
+
+    #[test]
+    fn should_thread_validation_error_single_line_short_inlines() {
+        assert!(!should_thread_validation_error("MODIFIED header not found"));
+    }
+
+    #[test]
+    fn should_thread_validation_error_multi_line_threads() {
+        assert!(should_thread_validation_error("line one\nline two"));
+    }
+
+    #[test]
+    fn should_thread_validation_error_over_300_chars_threads() {
+        let long = "x".repeat(400);
+        assert!(should_thread_validation_error(&long));
+    }
+
+    #[tokio::test]
+    async fn post_validation_exhausted_short_error_posts_inline() {
+        let backend = Arc::new(RecordingBackend::new());
+        let ctx = make_recording_ctx(backend.clone());
+        post_validation_exhausted_notification(
+            &ctx,
+            "git@github.com:o/r.git",
+            "security_bug_audit",
+            1,
+            "short single-line error",
+        )
+        .await
+        .unwrap();
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "short error → exactly one inline post");
+        let text = &calls[0].text;
+        assert!(
+            text.starts_with("❌ git@github.com:o/r.git: security_bug_audit"),
+            "top-line present: {text}"
+        );
+        assert!(
+            text.contains("short single-line error"),
+            "inline body contains the validation error: {text}"
+        );
+        assert!(
+            text.contains("Final validation error:"),
+            "inline body retains the documented header: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_validation_exhausted_multi_line_error_uses_thread() {
+        // RecordingBackend does not override post_notification_with_thread,
+        // so it routes through the default-impl concatenation. We assert
+        // the SHAPE (one call, body contains both top-line and the
+        // error excerpt with a blank-line separator) which is what the
+        // default-impl contract documents.
+        let backend = Arc::new(RecordingBackend::new());
+        let ctx = make_recording_ctx(backend.clone());
+        let err = "line1\nline2\nline3\nline4";
+        post_validation_exhausted_notification(
+            &ctx,
+            "git@github.com:o/r.git",
+            "missing_tests_audit",
+            2,
+            err,
+        )
+        .await
+        .unwrap();
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "default-impl concat → one underlying call");
+        let text = &calls[0].text;
+        assert!(
+            text.starts_with("❌ git@github.com:o/r.git: missing_tests_audit"),
+            "top-line: {text}"
+        );
+        assert!(text.contains("after 2 retries"));
+        assert!(
+            text.contains("\n\n"),
+            "default-impl separator: {text}"
+        );
+        assert!(text.contains("line1"));
+        assert!(text.contains("line4"));
+        assert!(text.contains("No commit was made"));
+    }
+
+    #[test]
+    fn format_validation_exhausted_top_line_matches_spec() {
+        let top = format_validation_exhausted_top_line(
+            "git@github.com:o/r.git",
+            "security_bug_audit",
+            3,
+        );
+        assert_eq!(
+            top,
+            "❌ git@github.com:o/r.git: security_bug_audit produced an invalid proposal that failed openspec validation after 3 retries."
+        );
     }
 
     #[test]

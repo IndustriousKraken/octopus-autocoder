@@ -22,7 +22,7 @@ use std::path::Path;
 use super::state::{AttemptEntry, AuditRunEntry, AuditState};
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry, Finding, Severity,
-    VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, truncate_chars,
+    VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, format_audit_notification, truncate_chars,
 };
 use crate::alert_state::AlertCategory;
 use crate::alerts::handle_predictable_failure;
@@ -32,11 +32,6 @@ use crate::config::{
 };
 use crate::polling_loop::ChatOpsContext;
 use crate::{git, workspace};
-
-/// Default per-finding excerpt cap for chatops output. The full body
-/// always lives in the audit-run log; the chatops post just lists
-/// subject lines.
-pub const DEFAULT_FINDING_EXCERPT_CHARS: usize = 200;
 
 /// Iterate the registry, run every due audit, and enforce write
 /// policies. Failures inside one audit do NOT abort the iteration —
@@ -531,30 +526,50 @@ async fn dispatch_reported_to_chatops(
     max_validation_retries: u32,
 ) {
     let Some(ctx) = chatops_ctx else { return };
+    if findings.is_empty() && !notify_on_clean {
+        // No findings and operator opted out of the clean signal: post
+        // nothing. Existing behaviour preserved.
+        return;
+    }
     let retry_clause = format_retry_clause(retries_used, max_validation_retries);
-    let text = if findings.is_empty() {
-        if !notify_on_clean {
-            return;
+    let notification =
+        format_audit_notification(audit_type, repo_url, findings, notify_on_clean, Utc::now());
+    if notification.should_thread {
+        let top_line = format!("{}{retry_clause}", notification.top_line);
+        if let Err(e) = ctx
+            .chatops
+            .post_notification_with_thread(
+                &ctx.channel,
+                &top_line,
+                &notification.thread_body,
+            )
+            .await
+        {
+            tracing::warn!(
+                url = %repo_url,
+                audit_type,
+                "audit chatops thread post failed: {e:#}"
+            );
         }
-        let mut msg = format_clean_message(repo_url, audit_type);
-        msg.push_str(&retry_clause);
-        msg
     } else {
-        let mut msg = format_findings_message(
-            repo_url,
-            audit_type,
-            findings,
-            DEFAULT_FINDING_EXCERPT_CHARS,
-        );
-        msg.push_str(&retry_clause);
-        msg
-    };
-    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
-        tracing::warn!(
-            url = %repo_url,
-            audit_type,
-            "audit chatops post failed: {e:#}"
-        );
+        // Inline form: top_line + (optional body), then the retry clause
+        // appended to the top-line portion so the result keeps the same
+        // shape regardless of body presence.
+        let text = if notification.thread_body.is_empty() {
+            format!("{}{retry_clause}", notification.top_line)
+        } else {
+            format!(
+                "{}{retry_clause}\n{}",
+                notification.top_line, notification.thread_body
+            )
+        };
+        if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+            tracing::warn!(
+                url = %repo_url,
+                audit_type,
+                "audit chatops post failed: {e:#}"
+            );
+        }
     }
 }
 
@@ -568,47 +583,6 @@ pub fn format_retry_clause(retries_used: u32, max_validation_retries: u32) -> St
         String::new()
     } else {
         format!(" (validated on retry {retries_used} of {max_validation_retries})")
-    }
-}
-
-/// Render a `Reported(findings)` outcome as the chatops post body. The
-/// caller is responsible for not invoking this with an empty `findings`
-/// when `notify_on_clean = false`.
-pub fn format_findings_message(
-    repo_url: &str,
-    audit_type: &str,
-    findings: &[Finding],
-    per_finding_max_chars: usize,
-) -> String {
-    let mut out = format!(
-        "📋 `{repo_url}`: {audit_type} — {n} finding(s)",
-        n = findings.len()
-    );
-    for f in findings {
-        let glyph = f.severity.glyph();
-        let subject = truncate(&f.subject, per_finding_max_chars);
-        if let Some(anchor) = f.anchor.as_deref() {
-            out.push_str(&format!("\n  {glyph} {subject} ({anchor})"));
-        } else {
-            out.push_str(&format!("\n  {glyph} {subject}"));
-        }
-    }
-    out
-}
-
-/// Render the "no findings" chatops post used when `notify_on_clean`
-/// is true.
-pub fn format_clean_message(repo_url: &str, audit_type: &str) -> String {
-    format!("✅ `{repo_url}`: {audit_type} — no findings")
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -1484,66 +1458,247 @@ mod tests {
         post_mock.assert_async().await;
     }
 
+    fn brightline_file_finding(n: usize) -> Finding {
+        Finding {
+            severity: Severity::Medium,
+            subject: format!("file src/file{n}.rs is {lines} lines (threshold: 800)", lines = 1000 + n),
+            body: format!("path: src/file{n}.rs\nlines: {lines}\nthreshold: 800", lines = 1000 + n),
+            anchor: Some(format!("src/file{n}.rs:1")),
+        }
+    }
+
+    #[tokio::test]
+    async fn brightline_many_findings_post_via_thread() {
+        // 5 file findings + 2 dup findings → 7 body lines → above the
+        // threading threshold. The Slack backend issues TWO
+        // chat.postMessage calls under the hood: the top-line, then the
+        // threaded reply. The mockito server expects both.
+        let (_t, ws) = init_workspace();
+        let mut findings = Vec::new();
+        for i in 0..5 {
+            findings.push(brightline_file_finding(i));
+        }
+        for i in 0..2 {
+            findings.push(Finding {
+                severity: Severity::Low,
+                subject: format!("duplicate signature `fn helper{i}` across 2 files"),
+                body: "mod_a.rs:1\nmod_b.rs:1".into(),
+                anchor: Some("mod_a.rs:1".into()),
+            });
+        }
+        let audit = Arc::new(
+            CountingAudit::new("architecture_brightline")
+                .with_outcome(AuditOutcome::reported(findings)),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("architecture_brightline");
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        // Top-line POST: matches the brightline emoji + counts.
+        let top_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("📐 architecture_brightline".into()),
+                mockito::Matcher::Regex("5 file\\(s\\) over line threshold".into()),
+                mockito::Matcher::Regex("2 duplicate signature\\(s\\)".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"9999.0001"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // Threaded-reply POST: carries thread_ts AND the body lines.
+        let reply_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("9999.0001".into()),
+                mockito::Matcher::Regex("file src/file0.rs is".into()),
+                mockito::Matcher::Regex("duplicate signature `fn helper0`".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"9999.0002"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx))
+            .await
+            .unwrap();
+        top_mock.assert_async().await;
+        reply_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn brightline_no_findings_notify_on_clean_posts_check_inline() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("architecture_brightline")
+                .with_outcome(AuditOutcome::reported(vec![])),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("architecture_brightline");
+        let repo = fixture_repo();
+        let mut settings = HashMap::new();
+        settings.insert(
+            "architecture_brightline".to_string(),
+            AuditSettings {
+                prompt_path: None,
+                notify_on_clean: true,
+                extra: HashMap::new(),
+            },
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        // Exactly ONE post_notification call carrying the ✅ form. No
+        // thread reply (empty body → should_thread=false).
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("✅ architecture_brightline".into()),
+                mockito::Matcher::Regex("no findings".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx))
+            .await
+            .unwrap();
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn brightline_no_findings_without_notify_on_clean_posts_nothing() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("architecture_brightline")
+                .with_outcome(AuditOutcome::reported(vec![])),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("architecture_brightline");
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        // No notify_on_clean → no chat.postMessage at all.
+        let silent_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx))
+            .await
+            .unwrap();
+        silent_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn drift_short_findings_post_inline() {
+        // One short divergence → body is 1 line, well under 300 chars
+        // → inline (single post_notification call, no thread).
+        let (_t, ws) = init_workspace();
+        let findings = vec![Finding {
+            severity: Severity::Medium,
+            subject: "[orchestrator-cli] timeout".into(),
+            body: "spec X says A; code says B.".into(),
+            anchor: Some("src/cli.rs:1".into()),
+        }];
+        let audit = Arc::new(
+            CountingAudit::new("drift_audit")
+                .with_outcome(AuditOutcome::reported(findings)),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("drift_audit");
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        // One inline POST whose body holds the top-line + the bullet.
+        // No thread_ts on the call.
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("🧭 drift_audit".into()),
+                mockito::Matcher::Regex("1 spec/code divergence\\(s\\) detected".into()),
+                mockito::Matcher::Regex("\\[orchestrator-cli\\]".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx))
+            .await
+            .unwrap();
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn drift_long_findings_post_via_thread() {
+        // 5 short findings → 5 body lines → above the 3-line threshold
+        // → thread. Two chat.postMessage calls expected.
+        let (_t, ws) = init_workspace();
+        let findings: Vec<Finding> = (0..5)
+            .map(|i| Finding {
+                severity: Severity::Medium,
+                subject: format!("[cap{i}] requirement{i}"),
+                body: "divergence detail".into(),
+                anchor: Some(format!("src/file{i}.rs:1")),
+            })
+            .collect();
+        let audit = Arc::new(
+            CountingAudit::new("drift_audit")
+                .with_outcome(AuditOutcome::reported(findings)),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("drift_audit");
+        let repo = fixture_repo();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops(&mut server).await;
+        let top_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("🧭 drift_audit".into()),
+                mockito::Matcher::Regex("5 spec/code divergence\\(s\\) detected".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"42.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let reply_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("42.0".into()),
+                mockito::Matcher::Regex("\\[cap0\\]".into()),
+                mockito::Matcher::Regex("\\[cap4\\]".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"42.1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = make_ctx(chatops);
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx))
+            .await
+            .unwrap();
+        top_mock.assert_async().await;
+        reply_mock.assert_async().await;
+    }
+
     #[test]
     fn format_retry_clause_renders_only_when_retries_used() {
         assert_eq!(format_retry_clause(0, 1), "");
         assert_eq!(format_retry_clause(1, 1), " (validated on retry 1 of 1)");
         assert_eq!(format_retry_clause(2, 5), " (validated on retry 2 of 5)");
-    }
-
-    #[test]
-    fn format_findings_message_renders_header_and_glyphs() {
-        let findings = vec![
-            Finding {
-                severity: Severity::High,
-                subject: "critical issue".into(),
-                body: "x".into(),
-                anchor: Some("file.rs:42".into()),
-            },
-            Finding {
-                severity: Severity::Medium,
-                subject: "moderate".into(),
-                body: "x".into(),
-                anchor: None,
-            },
-            Finding {
-                severity: Severity::Low,
-                subject: "minor".into(),
-                body: "x".into(),
-                anchor: None,
-            },
-        ];
-        let msg = format_findings_message("git@github.com:o/r.git", "type1", &findings, 200);
-        assert!(msg.contains("📋"));
-        assert!(msg.contains("git@github.com:o/r.git"));
-        assert!(msg.contains("type1"));
-        assert!(msg.contains("3 finding(s)"));
-        assert!(msg.contains("🔴"));
-        assert!(msg.contains("⚠"));
-        assert!(msg.contains("•"));
-        assert!(msg.contains("file.rs:42"));
-    }
-
-    #[test]
-    fn format_findings_message_truncates_long_subjects() {
-        let long = "x".repeat(500);
-        let findings = vec![Finding {
-            severity: Severity::Low,
-            subject: long,
-            body: "x".into(),
-            anchor: None,
-        }];
-        let msg = format_findings_message("u", "t", &findings, 50);
-        assert!(msg.contains('…'), "long subject should be truncated: {msg}");
-    }
-
-    #[test]
-    fn format_clean_message_uses_check_glyph() {
-        let msg = format_clean_message("git@github.com:o/r.git", "x");
-        assert!(msg.starts_with("✅"));
-        assert!(msg.contains("git@github.com:o/r.git"));
-        assert!(msg.contains("x"));
-        assert!(msg.contains("no findings"));
     }
 
     #[test]

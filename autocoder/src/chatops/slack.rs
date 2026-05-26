@@ -234,6 +234,112 @@ impl ChatOpsBackend for SlackBackend {
         Ok(())
     }
 
+    async fn post_notification_with_thread(
+        &self,
+        channel: &str,
+        top_line: &str,
+        thread_body: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/chat.postMessage",
+            self.api_base.trim_end_matches('/')
+        );
+        // First POST: the top-line. Failure aborts before threading.
+        let top_payload = serde_json::json!({
+            "channel": channel,
+            "text": top_line,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&top_payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("slack post_notification_with_thread top-line request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "slack post_notification_with_thread top-line http {status}"
+            ));
+        }
+        let parsed: PostMessageResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("slack post_notification_with_thread top-line decode failed: {e}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "slack post_notification_with_thread top-line failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        let thread_ts = match parsed.ts {
+            Some(ts) => ts,
+            None => {
+                return Err(anyhow!(
+                    "slack post_notification_with_thread top-line response missing ts"
+                ));
+            }
+        };
+
+        // Second POST: the thread reply. Failure here does NOT bubble up;
+        // the top-line already landed and is the operator-facing signal.
+        let reply_payload = serde_json::json!({
+            "channel": channel,
+            "text": thread_body,
+            "thread_ts": thread_ts,
+        });
+        let reply_result = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&reply_payload)
+            .send()
+            .await;
+        let resp = match reply_result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    channel = channel,
+                    thread_ts = %thread_ts,
+                    "slack thread reply request failed; top-line already posted: {e}"
+                );
+                return Ok(());
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(
+                channel = channel,
+                thread_ts = %thread_ts,
+                "slack thread reply http {status}; top-line already posted",
+            );
+            return Ok(());
+        }
+        match resp.json::<PostMessageResponse>().await {
+            Ok(parsed) if parsed.ok => Ok(()),
+            Ok(parsed) => {
+                tracing::warn!(
+                    channel = channel,
+                    thread_ts = %thread_ts,
+                    "slack thread reply failed: {}; top-line already posted",
+                    parsed.error.unwrap_or_else(|| "unknown".to_string())
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    channel = channel,
+                    thread_ts = %thread_ts,
+                    "slack thread reply decode failed: {e}; top-line already posted",
+                );
+                Ok(())
+            }
+        }
+    }
+
     async fn post_threaded_reply(
         &self,
         channel: &str,
@@ -1199,6 +1305,122 @@ mod tests {
             format!("{err:#}").contains("channel_not_found"),
             "error must contain slack error field verbatim; got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn post_notification_with_thread_happy_path_carries_thread_ts() {
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server).await;
+
+        // Top-line POST: no `thread_ts`. Captures the response `ts` for
+        // the threaded reply.
+        let top_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0FOO","text":"📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)"}"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"9999.5555"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Threaded-reply POST: matches both the top-line's `ts` carried
+        // as `thread_ts` AND the documented body shape.
+        let reply_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0FOO","text":"file foo.rs is 1234 lines","thread_ts":"9999.5555"}"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"9999.5556"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        backend
+            .post_notification_with_thread(
+                "C0FOO",
+                "📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)",
+                "file foo.rs is 1234 lines",
+            )
+            .await
+            .expect("happy path returns Ok");
+
+        top_mock.assert_async().await;
+        reply_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_notification_with_thread_top_line_failure_aborts_before_reply() {
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server).await;
+
+        // The top-line returns ok:false. The reply must NEVER be
+        // attempted — set `.expect(1)` on the first call only; if a
+        // second call leaks through, mockito would silently match this
+        // mock again (no separate matcher would catch it). Use
+        // `expect_at_most` semantics via a wide matcher and verify by
+        // checking the bubble-up Err.
+        let _top_mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = backend
+            .post_notification_with_thread("CBAD", "top", "body")
+            .await
+            .expect_err("top-line failure must bubble up");
+        assert!(
+            format!("{err:#}").contains("channel_not_found"),
+            "err must surface the slack error field: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_notification_with_thread_reply_failure_returns_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server).await;
+
+        // Two POSTs: top-line succeeds (returns ts), reply fails.
+        // mockito matches mocks in declaration order, so we set up the
+        // top-line matcher first (matching the top-line body exactly)
+        // and the reply matcher second (matching thread_ts).
+        let top_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0","text":"top"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let reply_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"channel":"C0","text":"body","thread_ts":"1.0"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"slack_internal"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Top-line landed → function returns Ok even though the reply
+        // post errored. The top-line is the operator-visible signal.
+        backend
+            .post_notification_with_thread("C0", "top", "body")
+            .await
+            .expect("reply failure must not propagate; top-line is the signal");
+
+        top_mock.assert_async().await;
+        reply_mock.assert_async().await;
     }
 
     #[tokio::test]

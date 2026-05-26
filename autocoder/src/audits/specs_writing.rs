@@ -23,7 +23,7 @@ use tokio::process::Command;
 
 use super::{
     AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
-    format_validation_exhausted_message, post_proposal_created_notification,
+    post_proposal_created_notification, post_validation_exhausted_notification,
     read_proposal_why_first_line, workspace_is_valid, workspace_unavailable_outcome,
     write_sandbox_settings,
 };
@@ -356,24 +356,23 @@ pub(crate) async fn run_specs_writing_audit(
 
         // Post the chatops `❌` notification directly so the helper's
         // single-slug directory cleanup does not race with our multi-
-        // dir cleanup above.
-        if let Some(chat_ctx) = ctx.chatops_ctx {
-            let text = format_validation_exhausted_message(
+        // dir cleanup above. Multi-line / long errors route through the
+        // threaded notification path; short single-line errors continue
+        // to use the inline single-message form.
+        if let Some(chat_ctx) = ctx.chatops_ctx
+            && let Err(e) = post_validation_exhausted_notification(
+                chat_ctx,
                 &ctx.repo.url,
                 audit_type,
                 attempt,
                 &combined_err,
+            )
+            .await
+        {
+            tracing::warn!(
+                audit_type = audit_type,
+                "validation-exhausted chatops post failed: {e:#}"
             );
-            if let Err(e) = chat_ctx
-                .chatops
-                .post_notification(&chat_ctx.channel, &text)
-                .await
-            {
-                tracing::warn!(
-                    audit_type = audit_type,
-                    "validation-exhausted chatops post failed: {e:#}"
-                );
-            }
         }
 
         return Ok(AuditOutcome::ValidationExhausted {
