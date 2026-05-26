@@ -86,6 +86,28 @@ sudo systemctl start autocoder
 
 The per-change run logs (`/tmp/autocoder/logs/<basename>/<change>.log`) and the busy markers share the same `/tmp/autocoder/` root.
 
+## Partial-clone self-heal
+
+When a `git clone` is interrupted mid-flight (network drop, signal, transient auth blip), git leaves the destination directory created but without a `.git/` subdirectory. Previously this state hard-stuck the daemon — every subsequent iteration logged `workspace path exists but is not a git repository (no .git directory): <path>` and never attempted recovery; the only way out was an operator-side `rm -rf`.
+
+The daemon now auto-recovers. When `workspace::ensure_initialized` detects that the workspace path exists AND has no `.git/`, it runs a safety check, deletes the partial directory, and re-attempts the clone as if the workspace had never existed. If the re-clone succeeds, the iteration proceeds normally; if it fails, the returned error carries the real clone failure (auth, network, etc.) — operators see the actual cause in journalctl and in any chatops `WorkspaceInitFailure` alert, rather than the misleading secondary detection.
+
+**WARN log line.** Each auto-cleanup emits exactly one WARN naming the workspace path, the repo URL, and the action:
+
+```
+WARN workspace=/path/to/ws repo=<url> workspace exists without .git; partial clone artifact detected. Deleting and re-cloning.
+```
+
+**Safety-check tripwires.** Before deleting, the daemon refuses auto-cleanup if the partial directory contains any of:
+
+- `.in-progress*` lock files at any depth (would suggest an active iteration somehow racing this path).
+- `openspec/changes/<slug>/.perma-stuck.json` or `openspec/changes/<slug>/.needs-spec-revision.json` at any depth (operator-managed markers that survived a previous successful clone).
+- `openspec/changes/<slug>/.question.json` or `openspec/changes/<slug>/.answer.json` (AskUser markers).
+
+When a tripwire fires, the daemon returns the original "exists but no `.git`" error extended with `(partial cleanup refused: <tripwire>; manual operator inspection required)` and the directory is NOT deleted. Operators inspect the directory and decide manually. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the manual recovery flow.
+
+**Not a tripwire:** `.alert-state.json` at the workspace root. It is daemon-written and will be re-created on the next failure if any, so destroying it is harmless.
+
 ## Workspace directory deleted
 
 If a workspace directory under `/tmp/workspaces/` is removed while autocoder is running (or while stopped), the daemon's next iteration treats this as a fresh-clone case: it clones upstream into the path again. In fork-PR mode it also fetches ONLY the configured agent branch from the `fork` remote at that time (via `git fetch fork +refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>`) so the local `refs/remotes/fork/<agent_branch>` tracking ref reflects the fork's actual state. Without that fetch the next `git push --force-with-lease fork <agent_branch>` would compare an empty local tracking value against the fork's existing commits and reject with `! [rejected] <agent_branch> -> <agent_branch> (stale info)`, leaving the daemon stuck. The fetch deliberately restricts itself to one branch: a wholesale `git fetch fork` would populate `refs/remotes/fork/<every-branch>`, and if any fork branch shadows an upstream name (e.g. both `origin/dev` and `fork/dev` exist), the next `git checkout <base_branch>` would fail with `fatal: 'dev' matched multiple (2) remote tracking branches`. The post-clone fork fetch is best-effort: if it fails (network blip, fork doesn't yet exist, agent branch doesn't yet exist on the fork), the daemon proceeds and the next push will surface any real divergence via the existing branch-push-failure alert.

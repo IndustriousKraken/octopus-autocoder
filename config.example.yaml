@@ -313,3 +313,24 @@ github:
 #   # chatops failure notification). Values above `5` are clamped down at
 #   # startup with a WARN log. Default: 1.
 #   max_validation_retries: 1
+
+# Daemon data directories. Each field is optional; absent fields fall
+# through to (in order): AUTOCODER_*_DIR env vars → systemd-set
+# $STATE_DIRECTORY family (auto-populated when running under the unit
+# template) → XDG defaults under $HOME (dev mode) → hard fallback to
+# `/var/lib/autocoder` etc. The four roles must resolve to distinct
+# directories — same path for two roles is rejected at startup.
+#
+# Categories:
+#   state    — persistent state (audit cadence, failure counters,
+#              revisions, alert throttles). Survives reboot.
+#   cache    — repo workspaces (re-clonable but kept). Survives reboot.
+#   logs     — per-change run logs + audit logs. Survives reboot.
+#   runtime  — control socket, transient pid/lock files. Cleared on
+#              reboot by design.
+#
+# paths:
+#   state_dir: /var/lib/autocoder
+#   cache_dir: /var/cache/autocoder
+#   logs_dir: /var/log/autocoder
+#   runtime_dir: /run/autocoder

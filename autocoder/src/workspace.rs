@@ -5,18 +5,34 @@ use crate::config::GithubConfig;
 use crate::github::{self, DeleteOutcome};
 use crate::github_credentials::resolve_token;
 use crate::{config::RepositoryConfig, git};
+use crate::paths;
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const WORKSPACE_ROOT: &str = "/tmp/workspaces";
+/// Compute the workspace root: `<cache_dir>/workspaces/`. Resolved from
+/// the process-global `DaemonPaths` when initialized (production); in
+/// tests that haven't installed paths this falls back to a fixed root
+/// under the system temp dir, preserving pre-`DaemonPaths` behavior for
+/// existing test fixtures.
+pub fn workspace_root() -> PathBuf {
+    paths::current().cache.join("workspaces")
+}
 
-/// Derive a per-repo workspace path under `/tmp/workspaces/`. Deterministic:
-/// the same URL always produces the same path. SSH and HTTPS forms of the
-/// same repository collapse to the same derived path.
+/// Derive a per-repo workspace path under `<cache_dir>/workspaces/`.
+/// Deterministic: the same URL always produces the same path. SSH and
+/// HTTPS forms of the same repository collapse to the same derived path.
 pub fn derive_path(url: &str) -> PathBuf {
-    PathBuf::from(WORKSPACE_ROOT).join(sanitize(url))
+    workspace_root().join(sanitize(url))
+}
+
+/// URL → directory-name sanitization, exposed so other state writes
+/// (failure-state, revisions, run-log per-repo subdirs) can derive
+/// matching per-repo identifiers. Keeps the convention single-sourced.
+#[allow(dead_code)]
+pub fn sanitize_url(url: &str) -> String {
+    sanitize(url)
 }
 
 fn sanitize(url: &str) -> String {
@@ -67,17 +83,40 @@ pub fn ensure_initialized(
     url: &str,
     fork: Option<(&str, &str)>,
 ) -> Result<()> {
+    // Partial-clone self-heal: if the directory exists but has no
+    // `.git/`, it is almost certainly leftover from a previously
+    // interrupted clone. Verify there is no operator-meaningful state
+    // we'd be destroying, then wipe and re-clone fresh. See
+    // `workspace-self-heal-partial-clone` for the full safety contract.
+    if workspace.is_dir() && !workspace.join(".git").is_dir() {
+        match safe_to_auto_clean(workspace) {
+            Ok(()) => {
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    repo = %url,
+                    "workspace exists without .git; partial clone artifact detected. Deleting and re-cloning."
+                );
+                std::fs::remove_dir_all(workspace).with_context(|| {
+                    format!(
+                        "auto-cleanup of partial workspace at {} failed",
+                        workspace.display()
+                    )
+                })?;
+            }
+            Err(tripwire) => {
+                return Err(anyhow!(
+                    "workspace path exists but is not a git repository (no .git directory): {} \
+                     (partial cleanup refused: {tripwire}; manual operator inspection required)",
+                    workspace.display()
+                ));
+            }
+        }
+    }
     let did_clone = !workspace.exists();
     if did_clone {
         git::clone(workspace, url)
             .with_context(|| format!("cloning {url} into {}", workspace.display()))?;
     } else {
-        if !workspace.join(".git").is_dir() {
-            return Err(anyhow!(
-                "workspace path exists but is not a git repository (no .git directory): {}",
-                workspace.display()
-            ));
-        }
         git::fetch(workspace)
             .with_context(|| format!("fetching origin in {}", workspace.display()))?;
     }
@@ -152,6 +191,63 @@ pub fn ensure_initialized(
         );
     }
     Ok(())
+}
+
+/// Inspect a `<workspace>` directory that has no `.git/` and decide
+/// whether auto-cleanup (delete + re-clone) is safe. Returns `Ok(())`
+/// when the directory is structurally a partial-clone artifact with no
+/// operator-meaningful state. Returns `Err(tripwire)` describing the
+/// first marker found if the directory contains anything that must not
+/// be silently destroyed (operator-managed change markers, in-progress
+/// locks). The `.alert-state.json` at the workspace root is explicitly
+/// NOT a tripwire — it is daemon-written and reproducible.
+fn safe_to_auto_clean(workspace: &Path) -> Result<(), &'static str> {
+    fn walk(
+        dir: &Path,
+        under_openspec_changes: bool,
+    ) -> Result<(), &'static str> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_file() || file_type.is_symlink() {
+                if name.starts_with(".in-progress") {
+                    return Err("contains .in-progress lock file");
+                }
+                if under_openspec_changes {
+                    if name == ".perma-stuck.json" || name == ".needs-spec-revision.json" {
+                        return Err(
+                            "contains .perma-stuck.json or .needs-spec-revision.json marker",
+                        );
+                    }
+                    if name == ".question.json" || name == ".answer.json" {
+                        return Err("contains AskUser .question.json or .answer.json marker");
+                    }
+                }
+            } else if file_type.is_dir() {
+                let next_under_changes = under_openspec_changes
+                    || (dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|p| p == "openspec")
+                        .unwrap_or(false)
+                        && name == "changes");
+                walk(&path, next_under_changes)?;
+            }
+        }
+        Ok(())
+    }
+    walk(workspace, false)
 }
 
 /// Append `entry` to `<workspace>/.git/info/exclude` if it is not already
@@ -366,13 +462,18 @@ mod tests {
     #[test]
     fn derive_path_ssh_form() {
         let p = derive_path("git@github.com:owner/repo.git");
-        assert_eq!(p, PathBuf::from("/tmp/workspaces/github_com_owner_repo"));
+        assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
+        assert_eq!(
+            p.parent().unwrap().file_name().and_then(|s| s.to_str()),
+            Some("workspaces"),
+            "parent must be the `workspaces` subdir"
+        );
     }
 
     #[test]
     fn derive_path_https_form() {
         let p = derive_path("https://github.com/owner/repo.git");
-        assert_eq!(p, PathBuf::from("/tmp/workspaces/github_com_owner_repo"));
+        assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
     }
 
     #[test]
@@ -783,16 +884,255 @@ mod tests {
         }
     }
 
+    // ============================================================
+    // safe_to_auto_clean: unit tests for the safety check.
+    // ============================================================
+
     #[test]
-    fn ensure_initialized_errors_on_non_git_directory() {
+    fn safe_to_auto_clean_empty_directory_is_ok() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        safe_to_auto_clean(&workspace).expect("empty dir must be safe to auto-clean");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_alert_state_only_is_ok() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".alert-state.json"), r#"{"x":1}"#).unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect(".alert-state.json is daemon-written and must not be a tripwire");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_partial_clone_tree_no_markers_is_ok() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "## proposal").unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "## tasks").unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect("partial tree without markers must be safe to auto-clean");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_perma_stuck_marker_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".perma-stuck.json"), "{}").unwrap();
+        let err = safe_to_auto_clean(&workspace)
+            .expect_err(".perma-stuck.json marker must block auto-cleanup");
+        assert!(
+            err.contains(".perma-stuck.json") || err.contains(".needs-spec-revision.json"),
+            "tripwire description must name the marker: {err}"
+        );
+    }
+
+    #[test]
+    fn safe_to_auto_clean_needs_revision_marker_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".needs-spec-revision.json"), "{}").unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect_err(".needs-spec-revision.json marker must block auto-cleanup");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_question_marker_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".question.json"), "{}").unwrap();
+        let err = safe_to_auto_clean(&workspace)
+            .expect_err(".question.json marker must block auto-cleanup");
+        assert!(err.contains("AskUser"), "tripwire must name AskUser: {err}");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_answer_marker_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".answer.json"), "{}").unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect_err(".answer.json marker must block auto-cleanup");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_in_progress_lock_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".in-progress-bar"), "").unwrap();
+        let err = safe_to_auto_clean(&workspace)
+            .expect_err(".in-progress* lock file must block auto-cleanup");
+        assert!(
+            err.contains(".in-progress"),
+            "tripwire must name the in-progress lock: {err}"
+        );
+    }
+
+    #[test]
+    fn safe_to_auto_clean_in_progress_lock_at_depth_blocks() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".in-progress"), "").unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect_err(".in-progress lock at any depth must block auto-cleanup");
+    }
+
+    #[test]
+    fn safe_to_auto_clean_marker_outside_openspec_changes_is_ignored() {
+        // A `.perma-stuck.json` directly at the workspace root is NOT a
+        // tripwire — only files under `openspec/changes/` are operator-
+        // meaningful change markers. (A file by that name at root would
+        // be uncategorized junk and the marker-prefix check should not
+        // misfire on it.)
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".perma-stuck.json"), "{}").unwrap();
+        safe_to_auto_clean(&workspace)
+            .expect("marker at root (outside openspec/changes) must not block");
+    }
+
+    // ============================================================
+    // ensure_initialized: auto-cleanup integration tests.
+    // ============================================================
+
+    #[test]
+    fn ensure_initialized_auto_cleans_partial_clone_and_re_clones() {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        // Fixture: workspace dir exists, has openspec partial-clone
+        // content but no .git/. ensure_initialized must auto-clean and
+        // re-clone.
+        std::fs::create_dir_all(workspace.join("openspec/changes/foo")).unwrap();
+        std::fs::write(
+            workspace.join("openspec/changes/foo/proposal.md"),
+            "## proposal\n",
+        )
+        .unwrap();
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &url, None)
+            .expect("auto-cleanup + re-clone must succeed on a partial-clone artifact");
+        assert!(
+            workspace.join(".git").is_dir(),
+            ".git/ must exist after auto-clean + re-clone"
+        );
+        assert!(
+            workspace.join("README.md").is_file(),
+            "remote's README.md must exist after re-clone (the auto-cleaned partial tree must be replaced)"
+        );
+        assert!(
+            !workspace.join("openspec/changes/foo/proposal.md").exists(),
+            "partial-clone artifact under openspec/changes/foo must NOT survive auto-cleanup"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_auto_clean_refuses_on_marker() {
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("not-a-repo");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("hello.txt"), "x").unwrap();
+        let change_dir = workspace.join("openspec/changes/foo");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".perma-stuck.json"), "{}").unwrap();
         let err = ensure_initialized(&workspace, "irrelevant-url", None)
-            .expect_err("should error when path is not a git repo");
+            .expect_err("auto-cleanup must be refused when a marker is present");
         let msg = format!("{err:#}");
         assert!(msg.contains(".git"), "error should mention missing .git: {msg}");
+        assert!(
+            msg.contains("partial cleanup refused"),
+            "error must mention partial-cleanup refusal: {msg}"
+        );
+        assert!(
+            msg.contains(".perma-stuck.json")
+                || msg.contains(".needs-spec-revision.json"),
+            "error must name the tripwire: {msg}"
+        );
+        assert!(
+            workspace.join("openspec/changes/foo/.perma-stuck.json").exists(),
+            "marker must NOT be deleted when auto-cleanup is refused"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_re_clone_failure_surfaces_real_error() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("local");
+        // Workspace exists with partial-clone-shape content but no .git/.
+        std::fs::create_dir_all(workspace.join("openspec/changes/foo")).unwrap();
+        std::fs::write(
+            workspace.join("openspec/changes/foo/proposal.md"),
+            "## proposal\n",
+        )
+        .unwrap();
+        // Bogus URL guarantees the second clone fails.
+        let bogus_url = dir.path().join("does-not-exist").to_string_lossy().to_string();
+        let err = ensure_initialized(&workspace, &bogus_url, None)
+            .expect_err("re-clone must fail when remote URL is bogus");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cloning") || msg.contains("clone") || msg.to_lowercase().contains("does not exist"),
+            "error must surface the real clone failure, not 'exists but no .git': {msg}"
+        );
+        assert!(
+            !msg.contains("exists but is not a git repository"),
+            "secondary detection text must NOT appear after auto-cleanup ran: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_does_not_auto_clean_when_workspace_absent() {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("never-existed");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        // Workspace doesn't exist at all → fresh-clone path; auto-clean
+        // branch must NOT be entered. The outcome is identical to the
+        // happy-path clone.
+        ensure_initialized(&workspace, &url, None).unwrap();
+        assert!(workspace.join(".git").is_dir());
+        assert!(workspace.join("README.md").is_file());
+    }
+
+    #[test]
+    fn ensure_initialized_does_not_auto_clean_when_git_present() {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        // First call clones normally.
+        ensure_initialized(&workspace, &url, None).unwrap();
+        // Plant a marker INSIDE openspec/changes/ to prove the safety
+        // check is NOT invoked on the existing-with-.git/ path: if the
+        // auto-cleanup branch were taken, the marker would trip the
+        // safety check and return Err.
+        std::fs::create_dir_all(workspace.join("openspec/changes/foo")).unwrap();
+        std::fs::write(
+            workspace.join("openspec/changes/foo/.perma-stuck.json"),
+            "{}",
+        )
+        .unwrap();
+        ensure_initialized(&workspace, &url, None)
+            .expect("existing .git/ takes the fetch path; auto-clean branch must not fire");
+        // Marker survives because we took the fetch path, not auto-clean.
+        assert!(workspace.join("openspec/changes/foo/.perma-stuck.json").exists());
     }
 
     /// Build a `GithubConfig` whose token resolves inline (no env vars

@@ -3,7 +3,7 @@
 //! all tasks to finish.
 
 use crate::audits::{
-    Audit, AuditRegistry,
+    AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
     drift::DriftAudit,
@@ -22,7 +22,7 @@ use crate::control_socket::{
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
-use crate::{git, polling_loop, workspace};
+use crate::{git, migration, paths, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -32,6 +32,75 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
+    // Resolve + install the daemon-paths global BEFORE any callsite
+    // that reads workspace / control-socket / log / state paths. The
+    // resolution order (config → AUTOCODER_*_DIR → systemd → XDG →
+    // hard fallback) is owned by `paths::resolve_daemon_paths`. After
+    // the install, every callsite that previously read
+    // `<system-temp>/autocoder/...` paths reads the resolved locations
+    // (state on /var/lib, cache on /var/cache, etc.).
+    let daemon_paths = paths::resolve_daemon_paths(&cfg)
+        .context("resolving daemon data paths")?;
+    paths::ensure_directories(&daemon_paths)
+        .context("creating daemon data directories")?;
+    tracing::info!(
+        state = %daemon_paths.state.display(),
+        cache = %daemon_paths.cache.display(),
+        logs = %daemon_paths.logs.display(),
+        runtime = %daemon_paths.runtime.display(),
+        "daemon paths resolved"
+    );
+    paths::install_global(daemon_paths.clone())
+        .context("installing global daemon paths")?;
+
+    // Migrate any legacy /tmp paths into the new layout. Logged but
+    // never fatal — operators see ERROR lines in journalctl and can
+    // clean up any orphan /tmp entries manually. If the marker file
+    // is missing AND every entry succeeded, the marker is written so
+    // subsequent startups skip the scan.
+    match migration::migrate_legacy_tmp_paths(&daemon_paths) {
+        Ok(report) => {
+            tracing::info!(
+                workspaces_moved = report.workspaces_moved,
+                state_files_moved = report.state_files_moved,
+                log_files_moved = report.log_files_moved,
+                errors = report.errors.len(),
+                "legacy /tmp migration: scan complete"
+            );
+            for e in &report.errors {
+                tracing::error!("legacy /tmp migration: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "legacy /tmp migration: scan failed (daemon continues): {e:#}"
+            );
+        }
+    }
+
+    // Reload audit cadence state from `<state_dir>/audit-state/` so
+    // a daemon restart respects on-disk `last_run_at` timestamps and
+    // does NOT re-fire audits whose cadence has not elapsed.
+    // Currently advisory — the in-memory map is populated at
+    // iteration start by `AuditState::load_or_default(workspace)`
+    // reading the workspace-local file, which now lives on disk via
+    // the workspace move to `cache_dir`. The aggregated
+    // `<state_dir>/audit-state/<audit-type>.json` files are a parallel
+    // store; reload makes them available for any future cadence
+    // resolver that prefers the daemon-global view over the
+    // workspace-local view.
+    match crate::audits::state::reload_from_disk(&daemon_paths.state) {
+        Ok(map) => {
+            tracing::info!(
+                count = map.len(),
+                "audit-state reload: loaded entries from <state_dir>/audit-state/"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("audit-state reload failed (daemon continues): {e:#}");
+        }
+    }
+
     openspec_preflight()?;
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;

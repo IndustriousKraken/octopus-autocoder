@@ -193,7 +193,37 @@ executor:
 See [OPERATIONS.md](OPERATIONS.md#revising-an-open-pr-via-comment) for the
 full revision-loop flow. The cap is per PR (not per repository); each PR
 tracks its own count under
-`<workspace>/.autocoder/revisions/<pr-number>.json`. When a PR is closed
+`<state_dir>/revisions/<repo-sanitized>/<pr-number>.json`. When a PR is closed
 or merged, its state file is pruned automatically — the cap resets if the
 PR is re-opened.
+
+## `paths:` (optional)
+
+Operator-visible overrides for the four daemon data directories. Each
+field is optional; absent fields fall through to the default
+resolution chain (`AUTOCODER_*_DIR` env var → systemd-set
+`$STATE_DIRECTORY` family → XDG defaults under `$HOME` → hard
+fallback to `/var/lib/autocoder` etc.).
+
+| Field         | Description                                                                                       |
+|---------------|---------------------------------------------------------------------------------------------------|
+| `state_dir`   | Persistent state: audit cadence, failure counters, revision state, alert throttles.               |
+| `cache_dir`   | Re-creatable but kept: repo workspaces under `<cache_dir>/workspaces/<sanitized>/`.               |
+| `logs_dir`    | Per-change run logs (`<logs_dir>/runs/<repo>/<change>.log`) and audit logs.                       |
+| `runtime_dir` | Control socket and transient pid/lock files; cleared on reboot.                                   |
+
+Each value must be absolute. No two fields may resolve to the same
+directory — a collision is a startup error.
+
+```yaml
+paths:
+  state_dir: /var/lib/autocoder
+  cache_dir: /var/cache/autocoder
+  logs_dir: /var/log/autocoder
+  runtime_dir: /run/autocoder
+```
+
+See [`STATE-LAYOUT.md`](STATE-LAYOUT.md) for the full directory
+layout, the resolution precedence, and the migration behaviour on
+first startup after upgrade.
 

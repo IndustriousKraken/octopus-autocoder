@@ -101,20 +101,24 @@ impl Drop for BusyGuard {
 }
 
 /// Compute the busy-marker path for the given workspace.
-/// `<system-temp>/autocoder/busy/<workspace-basename>.json`.
+/// `<runtime_dir>/busy/<workspace-basename>.json`. Lives under the
+/// daemon's runtime dir (tmpfs-cleared by reboot) so an unclean shutdown
+/// never leaves a stale marker file across the next host boot — by
+/// design ephemeral, matching the semantics of an "is the daemon
+/// currently working on this repo?" question.
 pub fn marker_path(workspace: &Path) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    std::env::temp_dir()
-        .join("autocoder")
+    crate::paths::current()
+        .runtime
         .join("busy")
         .join(format!("{basename}.json"))
 }
 
 /// Compute the subprocess-sidecar path for the given workspace.
-/// `<system-temp>/autocoder/busy/<workspace-basename>.subprocess`. The file
+/// `<runtime_dir>/busy/<workspace-basename>.subprocess`. The file
 /// holds the spawned subprocess's PID (= PGID, since the executor spawns
 /// with `process_group(0)`) so stuck-state recovery can target the right
 /// process group when the daemon's own pgid does not cover orphaned
@@ -124,8 +128,8 @@ pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    std::env::temp_dir()
-        .join("autocoder")
+    crate::paths::current()
+        .runtime
         .join("busy")
         .join(format!("{basename}.subprocess"))
 }

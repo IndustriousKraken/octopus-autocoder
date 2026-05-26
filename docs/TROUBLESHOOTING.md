@@ -212,11 +212,60 @@ workspace state via `fs::create_dir_all` that future iterations would
 mistake for a real but broken clone.
 
 **What to do.** Fix the workspace-init issue the upstream alert
-identifies — usually re-clone manually OR wait for the next iteration's
-`ensure_initialized` to re-clone automatically. Once the workspace is
-back to a valid state, the audit will run on its next cadence (the
-skipped run did not consume cadence, so the next due window is
-unchanged). No special re-trigger is needed.
+identifies. The partial-clone case (`exists but no .git/`) is now
+self-healing — `ensure_initialized` auto-deletes the partial directory
+and re-clones; see [OPERATIONS.md → Partial-clone self-heal](OPERATIONS.md#partial-clone-self-heal).
+For other causes (auth, network, missing remote), the underlying
+`workspace_init_failure` chatops alert names the real error. Once the
+workspace is back to a valid state, the audit will run on its next
+cadence (the skipped run did not consume cadence, so the next due
+window is unchanged). No special re-trigger is needed.
+
+## Workspace exists but has no `.git/` (partial-clone artifact)
+
+A previous clone attempt left the workspace directory created but
+without a `.git/` (network drop, transient auth blip, signal). The
+daemon now self-heals this case: each `ensure_initialized` pass runs a
+safety check, deletes the partial directory, and re-clones fresh. The
+journalctl signal is a single WARN per recovery:
+
+```
+WARN workspace=<path> repo=<url> workspace exists without .git; partial clone artifact detected. Deleting and re-cloning.
+```
+
+**You should NOT need to `rm -rf` the workspace manually for this
+case.** Wait one polling cycle; either the re-clone succeeds and the
+iteration proceeds normally, or the re-clone surfaces the REAL clone
+failure (`Permission denied (publickey)`, `Could not resolve host
+github.com`, etc.) in the next iteration's log and chatops alert. The
+real cause is what to fix.
+
+### When the safety check refuses auto-cleanup
+
+If you see the daemon return:
+
+```
+workspace path exists but is not a git repository (no .git directory): <path> (partial cleanup refused: <tripwire>; manual operator inspection required)
+```
+
+the safety check found one of these in the partial directory:
+
+- `.in-progress*` lock file at any depth.
+- `openspec/changes/<slug>/.perma-stuck.json` or `.needs-spec-revision.json` at any depth.
+- `openspec/changes/<slug>/.question.json` or `.answer.json` (AskUser markers).
+
+The daemon refuses to silently destroy operator-meaningful state.
+Inspect the directory manually:
+
+```bash
+ls -la <workspace>/
+find <workspace>/openspec/changes -name '.perma-stuck.json' -o -name '.needs-spec-revision.json' -o -name '.question.json' -o -name '.answer.json' -o -name '.in-progress*' 2>/dev/null
+```
+
+Then decide:
+
+1. **If the markers are stale** (the change they reference is long gone, or the markers were left over from a prior incident you've already resolved): `rm -rf <workspace>` manually. The next iteration re-clones fresh.
+2. **If the markers are legitimate operator state you want to preserve** (e.g. an active perma-stuck change you're working on, an AskUser thread you're waiting on): the partial-clone artifact is the symptom, not the disease. The underlying clone keeps failing — the `.git/` never gets written. Diagnose why (run `git clone <url> /tmp/probe-clone` by hand and read the error), fix that, then `rm -rf <workspace>` so the next iteration starts fresh.
 
 ## `send it` got a polite refusal — what each `✗` reply means
 
@@ -299,8 +348,9 @@ waiting on. The per-iteration cancel token can only fire at safety
 points; a blocking syscall holds the iteration past those points.
 
 **What to do.** After the wipe completes, open the stuck iteration's
-log at `/tmp/autocoder/logs/<workspace>/<change>.log` (the workspace
-log directory persists across a workspace wipe — only the workspace
+log at `<logs_dir>/runs/<repo-sanitized>/<change>.log` (typically
+`/var/log/autocoder/runs/<repo>/<change>.log` under systemd; the log
+directory persists across a workspace wipe — only the workspace
 itself is removed). Look at the tail to see what the iteration was
 doing when the cancel signal arrived. Common findings:
 
@@ -312,3 +362,48 @@ doing when the cancel signal arrived. Common findings:
 - A long executor invocation that simply needs more time → consider
   raising `executor.wipe_drain_timeout_secs` (capped at 300) so future
   wipes give the iteration the headroom it needed.
+
+## Audit storm after reboot — daemon re-fires every audit on the first iteration
+
+**Symptom.** A few minutes after a host reboot, the chatops channel
+fills up with audit notifications — `🔍 created proposal`,
+`🔍 architecture-brightline reported N findings`, etc. — for audits
+that ran recently and were not due for hours or days.
+
+**Root cause.** Pre-`state-paths-out-of-tmp`, autocoder wrote audit-
+cadence state under `/tmp/`, which is tmpfs on most server distros and
+gets wiped on reboot. When the cadence file disappears, every audit's
+`last_run` defaults to "never" and the cadence check fires
+unconditionally on the first iteration after startup. The same
+mechanism reset failure counters and discarded operator-set markers
+(`.perma-stuck.json`, `.needs-spec-revision.json`).
+
+**Fix shipped.** Per-repo workspaces now live under `<cache_dir>/`
+(real disk, not tmpfs) and the per-audit-type cadence files live
+under `<state_dir>/audit-state/` (see [`STATE-LAYOUT.md`](STATE-LAYOUT.md)).
+The daemon also reloads the audit cadence map from
+`<state_dir>/audit-state/` before any cadence check fires, so
+on-disk timestamps are respected. After the upgrade, the first
+daemon start migrates legacy `/tmp` data into the new layout and
+writes `<state_dir>/.migration-from-tmp-done`.
+
+**If a storm still happens after this change shipped.** Check that
+your daemon actually picked up the new paths:
+
+1. `journalctl -u autocoder | grep "daemon paths resolved"` — confirms
+   the resolved `state_dir`, `cache_dir`, `logs_dir`, `runtime_dir`
+   are what you expect. If `state_dir` is still under `/tmp/`, your
+   `paths:` config or `AUTOCODER_STATE_DIR` env var is pointing
+   there.
+2. `journalctl -u autocoder | grep "legacy /tmp migration"` — confirms
+   the migration scan ran. If absent, the daemon never reached the
+   migration call; look for an earlier startup error in the same log.
+3. `ls <state_dir>/.migration-from-tmp-done` — confirms the migration
+   wrote its marker. If missing, the migration encountered errors;
+   re-check `journalctl` for the per-entry ERROR lines.
+4. `ls <cache_dir>/workspaces/` — confirms workspaces moved off
+   `/tmp/`. If empty, no workspaces have been initialized yet (first
+   iteration after install).
+
+To force a re-scan after restoring legacy data from backup, remove
+`<state_dir>/.migration-from-tmp-done` and restart the daemon.

@@ -43,7 +43,7 @@ sudo -u autocoder openspec config profile
 This launches an interactive picker. Choose **Delivery: Both (skills + commands)** and at minimum tick **Sync specs** in the workflow list. Then in each project the daemon operates on, refresh the project's openspec install so the new workflows take effect:
 
 ```bash
-sudo -u autocoder bash -c 'cd /tmp/workspaces/<sanitized-url> && openspec update'
+sudo -u autocoder bash -c 'cd /var/cache/autocoder/workspaces/<sanitized-url> && openspec update'
 ```
 
 autocoder's archive step shells out to `openspec archive`, which performs both the file move AND the merge of change deltas into canonical capability specs — but the merge step is only available when `sync` is enabled in the openspec profile. Without it, `openspec archive` will move the change directory but won't update canonical specs; autocoder iterations succeed but drift accumulates in `openspec/specs/`. To reconcile drift after the fact (e.g. for repos with pre-existing drift, or after onboarding a repo from a host that didn't have `sync` enabled), see the companion `rebuild-canonical-specs-from-archive` change.
@@ -150,7 +150,7 @@ RestartSec=60
 WantedBy=multi-user.target
 ```
 
-`openspec` must be on autocoder's PATH. The daemon runs `openspec --version` at startup and exits non-zero with a clear stderr message if the binary is missing. Confirm with `sudo -u autocoder which openspec`. The per-change run log at `/tmp/autocoder/logs/<workspace>/<change>.log` records the prompt sent to Claude under a `=== PROMPT (n bytes) ===` header for inspection.
+`openspec` must be on autocoder's PATH. The daemon runs `openspec --version` at startup and exits non-zero with a clear stderr message if the binary is missing. Confirm with `sudo -u autocoder which openspec`. The per-change run log at `<logs_dir>/runs/<repo>/<change>.log` (typically `/var/log/autocoder/runs/<repo>/<change>.log` under systemd) records the prompt sent to Claude under a `=== PROMPT (n bytes) ===` header for inspection.
 
 ### Path B — env-var secrets (multi-user hosts, classical production pattern)
 
@@ -223,7 +223,7 @@ Edit `config.yaml`, then run:
 sudo -u autocoder autocoder reload
 ```
 
-The `autocoder reload` subcommand connects to the daemon's control socket at `/tmp/autocoder/control/control.sock`. That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, `chatops`, and `repositories` sections at the next iteration boundary for each repo. Only changes to `executor:` are not hot-applied; the response names that under `requires_restart` so you know it still needs `systemctl restart autocoder`. See [Runtime control: live config reload](OPERATIONS.md#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
+The `autocoder reload` subcommand connects to the daemon's control socket at `<runtime_dir>/control.sock` (typically `/run/autocoder/control.sock` under systemd, or `${XDG_RUNTIME_DIR}/autocoder/control.sock` in dev mode). That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, `chatops`, and `repositories` sections at the next iteration boundary for each repo. Only changes to `executor:` are not hot-applied; the response names that under `requires_restart` so you know it still needs `systemctl restart autocoder`. See [Runtime control: live config reload](OPERATIONS.md#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
 
 ## Upgrading
 

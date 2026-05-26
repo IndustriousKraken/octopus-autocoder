@@ -12,12 +12,21 @@ ExecStart=/usr/local/bin/autocoder run --config /etc/autocoder/config.yaml
 Restart=on-failure
 RestartSec=10
 
+# Standard data directories. systemd auto-creates these owned by the
+# service user at unit-start time and sets $STATE_DIRECTORY,
+# $CACHE_DIRECTORY, $LOGS_DIRECTORY, $RUNTIME_DIRECTORY env vars,
+# which the daemon's path resolution reads (config → AUTOCODER_*_DIR →
+# these systemd-set vars → XDG → hard fallback).
+StateDirectory=autocoder
+CacheDirectory=autocoder
+LogsDirectory=autocoder
+RuntimeDirectory=autocoder
+
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/autocoder /tmp
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

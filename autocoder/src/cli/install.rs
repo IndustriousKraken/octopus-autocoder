@@ -976,6 +976,40 @@ fn reviewer_env_var(p: ReviewerProviderArg) -> Option<&'static str> {
 // Config + secrets assembly.
 // ----------------------------------------------------------------------------
 
+/// Resolve XDG-derived defaults for the daemon data paths under
+/// `$HOME` (or whatever `$HOME` is set to in the calling environment).
+/// Used by dev-mode install to write explicit `paths:` values into the
+/// generated `config.yaml` so operators can see exactly where their
+/// state is being written without re-deriving the XDG layout.
+pub fn xdg_paths_for_dev_mode() -> crate::config::DaemonPathsConfig {
+    let home = std::env::var("HOME").ok().unwrap_or_else(|| ".".to_string());
+    let home = PathBuf::from(home);
+    let xdg_state = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/state"));
+    let xdg_cache = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache"));
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("{uid}-runtime"))
+        });
+    crate::config::DaemonPathsConfig {
+        state_dir: Some(xdg_state.join("autocoder")),
+        cache_dir: Some(xdg_cache.join("autocoder")),
+        logs_dir: Some(xdg_state.join("autocoder/logs")),
+        runtime_dir: Some(xdg_runtime.join("autocoder")),
+    }
+}
+
 /// Deserialize the bundled `config.example.yaml` and mutate it with the
 /// operator's answers. The example is the source-of-truth for what fields
 /// exist; this function only writes the ones the wizard collected.
@@ -1206,7 +1240,18 @@ pub(crate) async fn execute_inner(
         .await
         .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
 
-    let cfg = assemble_config(&answers)?;
+    let mut cfg = assemble_config(&answers)?;
+    // Dev-mode install: write the XDG-derived paths into the
+    // generated `config.yaml` so operators can see exactly where
+    // their state is being written (the values would otherwise be
+    // resolved at startup via the env-var / XDG-default chain).
+    // Server-mode install leaves `paths:` absent — the rendered
+    // systemd unit's StateDirectory/CacheDirectory/etc. populate
+    // $STATE_DIRECTORY family at unit-start time and the daemon's
+    // resolver picks them up automatically.
+    if mode == InstallMode::Dev {
+        cfg.paths = xdg_paths_for_dev_mode();
+    }
     let yaml = serialize_config(&cfg)?;
     let config_mode = if mode == InstallMode::Server { 0o640 } else { 0o600 };
     write_file_with_mode(&config_path, yaml.as_bytes(), config_mode)
@@ -1600,6 +1645,74 @@ mod tests {
         assert!(yaml.contains("model: claude-sonnet-4-6"), "YAML missing reviewer model:\n{yaml}");
         let env = assemble_secrets_env(&ans);
         assert!(env.contains("ANTHROPIC_API_KEY=sk-ant-test"), "secrets.env missing reviewer key:\n{env}");
+    }
+
+    #[test]
+    fn systemd_unit_declares_four_standard_directories() {
+        // The bundled unit template must declare the four
+        // *Directory=autocoder directives so systemd auto-creates
+        // /var/lib/autocoder, /var/cache/autocoder, /var/log/autocoder,
+        // and /run/autocoder owned by the service user and populates
+        // $STATE_DIRECTORY, $CACHE_DIRECTORY, $LOGS_DIRECTORY, and
+        // $RUNTIME_DIRECTORY for the daemon's path resolver to pick
+        // up.
+        for directive in [
+            "StateDirectory=autocoder",
+            "CacheDirectory=autocoder",
+            "LogsDirectory=autocoder",
+            "RuntimeDirectory=autocoder",
+        ] {
+            assert!(
+                SYSTEMD_UNIT.contains(directive),
+                "rendered unit must contain `{directive}`:\n{SYSTEMD_UNIT}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_mode_assemble_writes_xdg_paths_into_config() {
+        // Set HOME to a fixture path; the dev-mode install renders
+        // the XDG defaults into the generated config so operators
+        // see the resolved values without re-deriving them.
+        let prior_home = std::env::var_os("HOME");
+        let prior_state = std::env::var_os("XDG_STATE_HOME");
+        let prior_cache = std::env::var_os("XDG_CACHE_HOME");
+        let prior_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("HOME", "/home/fixture");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let paths = xdg_paths_for_dev_mode();
+        assert_eq!(
+            paths.state_dir,
+            Some(PathBuf::from("/home/fixture/.local/state/autocoder"))
+        );
+        assert_eq!(
+            paths.cache_dir,
+            Some(PathBuf::from("/home/fixture/.cache/autocoder"))
+        );
+        assert_eq!(
+            paths.logs_dir,
+            Some(PathBuf::from("/home/fixture/.local/state/autocoder/logs"))
+        );
+        assert!(paths.runtime_dir.is_some());
+        unsafe {
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(v) = prior_state {
+                std::env::set_var("XDG_STATE_HOME", v);
+            }
+            if let Some(v) = prior_cache {
+                std::env::set_var("XDG_CACHE_HOME", v);
+            }
+            if let Some(v) = prior_runtime {
+                std::env::set_var("XDG_RUNTIME_DIR", v);
+            }
+        }
     }
 
     #[tokio::test]

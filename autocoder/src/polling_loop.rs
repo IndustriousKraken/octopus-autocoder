@@ -6560,10 +6560,13 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
-        // .failure-state.json must NOT have been written.
+        // The per-repo failure-state must remain empty — a transient
+        // pre-executor error must not bump the counter.
+        let state = failure_state::load(&ws).unwrap();
         assert!(
-            !ws.join(".failure-state.json").exists(),
-            "transient pre-executor errors must not bump the counter"
+            state.entries.is_empty(),
+            "transient pre-executor errors must not bump the counter; got: {:?}",
+            state.entries
         );
     }
 
@@ -6658,6 +6661,101 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             0,
             "iteration-level gate: audit scheduler must NOT be invoked when ensure_initialized fails"
+        );
+    }
+
+    /// End-to-end: when the workspace dir exists with partial-clone-shape
+    /// content but no `.git/`, the iteration's auto-cleanup + re-clone
+    /// runs internally and the iteration's outcome is a normal success
+    /// (not Failed). The recovery is invisible to the iteration's
+    /// reporting layer — only the WARN log signals it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iteration_auto_recovers_partial_clone_without_failure() {
+        use std::process::Command;
+        // Set up a real local fixture remote so the re-clone after
+        // auto-cleanup actually succeeds (no network access required).
+        let dir = tempfile::TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        fn run(path: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", path.display());
+        }
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "user.email", "test@example.com"]);
+        run(&remote, &["config", "user.name", "test"]);
+        std::fs::write(remote.join("README.md"), "fixture\n").unwrap();
+        run(&remote, &["add", "README.md"]);
+        run(&remote, &["commit", "-q", "-m", "initial"]);
+
+        // Workspace dir exists with openspec partial-clone artifacts and
+        // NO `.git/`. The safety check must pass (nothing operator-
+        // meaningful here) and the auto-cleanup must run, then the
+        // re-clone from the local fixture remote succeeds.
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/foo/proposal.md"),
+            "## proposal\n",
+        )
+        .unwrap();
+
+        let remote_url = remote.to_string_lossy().to_string();
+        let repo = RepositoryConfig {
+            url: remote_url,
+            local_path: Some(ws.clone()),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let executor = AlwaysFailingExecutor; // unused: no pending changes after re-clone
+
+        let result = run_pass_through_commits(
+            &ws,
+            &repo,
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .await;
+        let (processed, _self_heal) = result.expect(
+            "iteration must report normal success after internal auto-cleanup + re-clone; \
+             the recovery is invisible to the outcome layer",
+        );
+        assert!(
+            processed.is_empty(),
+            "the fixture remote has no pending changes, so nothing should be archived"
+        );
+        // The workspace is now a fresh clone of the remote — `.git/`
+        // present, partial-clone artifact gone, remote's README in place.
+        assert!(ws.join(".git").is_dir(), "auto-cleanup + re-clone must produce a valid .git/");
+        assert!(
+            ws.join("README.md").is_file(),
+            "remote's README.md must exist after re-clone"
+        );
+        assert!(
+            !ws.join("openspec/changes/foo/proposal.md").exists(),
+            "partial-clone artifact must not survive auto-cleanup"
         );
     }
 
@@ -6942,18 +7040,14 @@ mod tests {
         assert!(
             ws.join("openspec/changes/no-counter-bump/.needs-spec-revision.json").exists()
         );
-        // failure-state.json must NOT have an entry for this change (or
-        // the file must not exist at all). The marker handles exclusion;
-        // the counter is operator-action territory, not repeat-failure
-        // territory.
-        let counter_file = ws.join(".failure-state.json");
-        if counter_file.exists() {
-            let state = failure_state::load(&ws).unwrap();
-            assert!(
-                !state.entries.contains_key("no-counter-bump"),
-                "SpecNeedsRevision must not write a failure-state entry"
-            );
-        }
+        // failure-state must NOT have an entry for this change. The
+        // marker handles exclusion; the counter is operator-action
+        // territory, not repeat-failure territory.
+        let state = failure_state::load(&ws).unwrap();
+        assert!(
+            !state.entries.contains_key("no-counter-bump"),
+            "SpecNeedsRevision must not write a failure-state entry"
+        );
     }
 
     /// Pre-place a marker → change is excluded from list_pending → the
@@ -7535,9 +7629,11 @@ mod tests {
             "untouched ch04 still pending: {still_pending:?}"
         );
         // ch03 must not have a failure-state entry — it was never attempted.
+        let state = failure_state::load(&ws).unwrap();
         assert!(
-            !ws.join("openspec/changes/ch03/.failure-state.json").exists(),
-            "ch03 must not have a failure-state entry — walker never reached it"
+            !state.entries.contains_key("ch03"),
+            "ch03 must not have a failure-state entry — walker never reached it; got: {:?}",
+            state.entries
         );
     }
 
