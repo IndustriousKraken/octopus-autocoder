@@ -1788,8 +1788,26 @@ async fn execute_rebuild_iteration(
         successful = report.successful,
         failed = report.failed,
         modified_files = report.modified_files(),
+        prefix_renames = report.prefix_renames.len(),
+        aborted = report.abort_reason.is_some(),
         "rebuild_canonical finished"
     );
+
+    // If the dependency pre-pass aborted the rebuild, there is no PR to
+    // open and no canonical-spec drift to push. Post the `❌` chatops
+    // notification and exit early.
+    if report.abort_reason.is_some() {
+        maybe_post_rebuild_abort_notification(repo, &report, chatops_ctx).await;
+        return Ok(());
+    }
+
+    // If the pre-pass applied prefix renames, post the `🔀` chatops
+    // notification BEFORE staging/pushing/PR so operators see the
+    // renames first. Best-effort: a failed post does not block PR
+    // creation.
+    if !report.prefix_renames.is_empty() {
+        maybe_post_rebuild_renames_notification(repo, &report, chatops_ctx).await;
+    }
 
     // Stage everything: openspec/specs/ changes AND any archive directory
     // moves (the in-place rename shouldn't produce a net diff but we
@@ -1915,6 +1933,11 @@ fn build_rebuild_pr_body(report: &crate::cli::sync_specs::RebuildReport) -> Stri
         }
         body.push('\n');
     }
+    if !report.prefix_renames.is_empty() {
+        body.push_str("**Applied dependency-prefix renames**:\n\n");
+        body.push_str(&render_prefix_renames_markdown(&report.prefix_renames));
+        body.push('\n');
+    }
     body.push_str("**Canonical spec files**:\n");
     for sf in &report.spec_files {
         let tag = if sf.modified { "modified" } else { "unchanged" };
@@ -1929,6 +1952,109 @@ fn truncate_one_line(s: &str, n: usize) -> String {
         one.to_string()
     } else {
         one.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+/// Render a list of `RenameRecord`s grouped by day, in the format shared
+/// between the `🔀` chatops notification and the PR body's renames
+/// section. Each entry: `<from> → <to>` followed by an indented
+/// parenthetical `(<dependency_summary>)`.
+fn render_prefix_renames_markdown(
+    renames: &[crate::cli::sync_specs_deps::RenameRecord],
+) -> String {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<&str, Vec<&crate::cli::sync_specs_deps::RenameRecord>> =
+        BTreeMap::new();
+    for r in renames {
+        grouped.entry(r.day.as_str()).or_default().push(r);
+    }
+    let mut out = String::new();
+    for (day, group) in grouped {
+        out.push_str(&format!("  {day}:\n"));
+        for r in group {
+            out.push_str(&format!("    {} → {}\n", r.from, r.to));
+            if !r.dependency_summary.is_empty() {
+                out.push_str(&format!("      ({})\n", r.dependency_summary));
+            }
+        }
+    }
+    out
+}
+
+/// Count how many distinct days appear in a list of `RenameRecord`s.
+fn count_distinct_days(renames: &[crate::cli::sync_specs_deps::RenameRecord]) -> usize {
+    use std::collections::BTreeSet;
+    renames.iter().map(|r| r.day.as_str()).collect::<BTreeSet<_>>().len()
+}
+
+/// Format the `🔀` chatops notification text announcing applied
+/// dependency-prefix renames. Pure function for snapshot-testing.
+fn format_rebuild_renames_notification(
+    repo_url: &str,
+    renames: &[crate::cli::sync_specs_deps::RenameRecord],
+) -> String {
+    let n_days = count_distinct_days(renames);
+    let mut out = format!(
+        "🔀 `{repo_url}`: rebuild applied dependency-prefix renames in {n_days} day-group(s)\n"
+    );
+    out.push_str(&render_prefix_renames_markdown(renames));
+    // Trim trailing newline for a cleaner one-message look.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Format the `❌` chatops notification text when the rebuild's
+/// dependency pre-pass aborted (cycle, cross-day backward dep, scan
+/// failure). Pure function for snapshot-testing.
+fn format_rebuild_abort_notification(
+    repo_url: &str,
+    reason: &crate::cli::sync_specs_deps::RebuildAbortReason,
+) -> String {
+    format!(
+        "❌ `{repo_url}`: rebuild aborted — {}. No archives were renamed; no canonical specs were modified. Operator action required.",
+        reason.summary()
+    )
+}
+
+/// Post the `🔀` rename-list notification. Best-effort: a failed post
+/// logs at ERROR and does NOT block PR creation.
+async fn maybe_post_rebuild_renames_notification(
+    repo: &RepositoryConfig,
+    report: &crate::cli::sync_specs::RebuildReport,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if report.prefix_renames.is_empty() {
+        return;
+    }
+    let text = format_rebuild_renames_notification(&repo.url, &report.prefix_renames);
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::error!(
+            url = %repo.url,
+            "rebuild-renames chatops notification failed; continuing: {e:#}"
+        );
+    }
+}
+
+/// Post the `❌` rebuild-aborted notification. Best-effort: a failed
+/// post logs at ERROR and does not propagate.
+async fn maybe_post_rebuild_abort_notification(
+    repo: &RepositoryConfig,
+    report: &crate::cli::sync_specs::RebuildReport,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    let Some(reason) = report.abort_reason.as_ref() else {
+        return;
+    };
+    let text = format_rebuild_abort_notification(&repo.url, reason);
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::error!(
+            url = %repo.url,
+            "rebuild-abort chatops notification failed; continuing: {e:#}"
+        );
     }
 }
 
@@ -7346,6 +7472,239 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst), "flag must be cleared after swap");
         // A second swap returns false (the flag is already cleared).
         assert!(!flag.swap(false, Ordering::SeqCst));
+    }
+
+    // ----- rebuild rename + abort notification tests -----
+
+    fn make_rename_record(
+        from: &str,
+        to: &str,
+        day: &str,
+        summary: &str,
+    ) -> crate::cli::sync_specs_deps::RenameRecord {
+        crate::cli::sync_specs_deps::RenameRecord {
+            from: from.into(),
+            to: to.into(),
+            day: day.into(),
+            dependency_summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn format_renames_notification_single_rename_one_day() {
+        let renames = vec![make_rename_record(
+            "2026-05-14-self-healing-deployment",
+            "2026-05-14-a01-self-healing-deployment",
+            "2026-05-14",
+            "dependency of `2026-05-14-no-op-completion-is-failure`, which MODIFIES requirement \"Reject archive-only iterations as Failed\" added here",
+        )];
+        let text = format_rebuild_renames_notification("owner/repo", &renames);
+        assert!(text.starts_with("🔀 `owner/repo`: rebuild applied dependency-prefix renames in 1 day-group(s)"));
+        assert!(text.contains("2026-05-14:"));
+        assert!(text.contains("2026-05-14-self-healing-deployment → 2026-05-14-a01-self-healing-deployment"));
+        assert!(text.contains("(dependency of"));
+        assert!(text.contains("MODIFIES requirement"));
+    }
+
+    #[test]
+    fn format_renames_notification_multiple_days_grouped() {
+        let renames = vec![
+            make_rename_record("2026-05-14-x", "2026-05-14-a01-x", "2026-05-14", "reason A"),
+            make_rename_record("2026-05-15-y", "2026-05-15-a01-y", "2026-05-15", "reason B"),
+        ];
+        let text = format_rebuild_renames_notification("owner/repo", &renames);
+        assert!(text.contains("2 day-group(s)"));
+        // Both day-group headers appear.
+        assert!(text.contains("2026-05-14:"));
+        assert!(text.contains("2026-05-15:"));
+        // Each rename listed under its day.
+        let idx_14 = text.find("2026-05-14:").unwrap();
+        let idx_15 = text.find("2026-05-15:").unwrap();
+        assert!(idx_14 < idx_15, "days should appear in chronological order");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renames_notification_fires_when_prefix_renames_present() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("🔀".to_string()),
+                mockito::Matcher::Regex("self-healing-deployment".to_string()),
+                mockito::Matcher::Regex("a01-self-healing-deployment".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 2,
+            successful: 2,
+            failed: 0,
+            prefix_renames: vec![make_rename_record(
+                "2026-05-14-self-healing-deployment",
+                "2026-05-14-a01-self-healing-deployment",
+                "2026-05-14",
+                "dependency of `2026-05-14-no-op-completion-is-failure`",
+            )],
+            ..Default::default()
+        };
+        maybe_post_rebuild_renames_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renames_notification_noop_when_empty() {
+        // No mockito server: any POST would fail to match. The helper
+        // must short-circuit when `prefix_renames` is empty.
+        let ctx_dummy = None; // also no-op without chatops; double-safety
+        let report = crate::cli::sync_specs::RebuildReport::default();
+        maybe_post_rebuild_renames_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            ctx_dummy,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renames_notification_post_failure_does_not_panic() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        // Server returns 500 → post_notification errors. The helper
+        // must log+continue (no panic).
+        let _mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(500)
+            .with_body("nope")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            prefix_renames: vec![make_rename_record(
+                "2026-05-14-x",
+                "2026-05-14-a01-x",
+                "2026-05-14",
+                "r",
+            )],
+            ..Default::default()
+        };
+        maybe_post_rebuild_renames_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            Some(&ctx),
+        )
+        .await;
+        // Survival is the test.
+    }
+
+    #[test]
+    fn format_abort_notification_cycle_names_both_changes() {
+        let reason = crate::cli::sync_specs_deps::RebuildAbortReason::Cycle {
+            changes: vec!["2026-05-14-a".into(), "2026-05-14-b".into()],
+            requirements: vec![
+                ("cap".into(), "Foo".into()),
+                ("cap".into(), "Bar".into()),
+            ],
+        };
+        let text = format_rebuild_abort_notification("owner/repo", &reason);
+        assert!(text.starts_with("❌ `owner/repo`: rebuild aborted —"));
+        assert!(text.contains("2026-05-14-a"));
+        assert!(text.contains("2026-05-14-b"));
+        assert!(text.contains("No archives were renamed"));
+        assert!(text.contains("Operator action required"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_notification_fires_with_cycle() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("❌".to_string()),
+                mockito::Matcher::Regex("2026-05-14-a".to_string()),
+                mockito::Matcher::Regex("2026-05-14-b".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        let report = crate::cli::sync_specs::RebuildReport {
+            abort_reason: Some(crate::cli::sync_specs_deps::RebuildAbortReason::Cycle {
+                changes: vec!["2026-05-14-a".into(), "2026-05-14-b".into()],
+                requirements: vec![("cap".into(), "Foo".into())],
+            }),
+            ..Default::default()
+        };
+        maybe_post_rebuild_abort_notification(
+            &fixture_repo_for_rebuild_test(),
+            &report,
+            Some(&ctx),
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn pr_body_includes_renames_section_before_canonical_specs() {
+        let report = crate::cli::sync_specs::RebuildReport {
+            processed: 2,
+            successful: 2,
+            failed: 0,
+            spec_files: vec![crate::cli::sync_specs::SpecFileOutcome {
+                path: "openspec/specs/orchestrator/spec.md".into(),
+                modified: true,
+            }],
+            prefix_renames: vec![make_rename_record(
+                "2026-05-14-self-healing-deployment",
+                "2026-05-14-a01-self-healing-deployment",
+                "2026-05-14",
+                "dependency of `2026-05-14-no-op-completion-is-failure`",
+            )],
+            ..Default::default()
+        };
+        let body = build_rebuild_pr_body(&report);
+        let renames_idx = body
+            .find("Applied dependency-prefix renames")
+            .expect("renames section present");
+        let canonical_idx = body
+            .find("Canonical spec files")
+            .expect("canonical section present");
+        assert!(
+            renames_idx < canonical_idx,
+            "renames section must precede canonical-spec-files section"
+        );
+        assert!(body.contains("2026-05-14-self-healing-deployment → 2026-05-14-a01-self-healing-deployment"));
     }
 
     /// pr-opened-chatops-notification: when chatops is unconfigured,

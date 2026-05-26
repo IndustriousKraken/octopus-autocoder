@@ -4,6 +4,9 @@
 //! the why-incremental-is-unsafe rationale.
 
 use crate::busy_marker;
+use crate::cli::sync_specs_deps::{
+    self, RebuildAbortReason, RenameRecord,
+};
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use chrono::Utc;
@@ -115,6 +118,13 @@ pub struct SpecFileOutcome {
 /// `rolled_back` counts changes whose archive call failed in a way that
 /// triggered a rollback of the active-path directory back to archive (a
 /// subset of `failed`).
+///
+/// `prefix_renames` records the dependency-aware ordering pre-pass's
+/// applied renames; empty when the pre-pass produced no renames.
+/// `abort_reason` is `Some(_)` when the pre-pass aborted the rebuild
+/// (cycle, cross-day backward dependency, scan failure); in that case the
+/// per-change-loop ran with zero entries and no canonical specs were
+/// modified.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RebuildReport {
     pub processed: usize,
@@ -124,6 +134,10 @@ pub struct RebuildReport {
     pub successes: Vec<ChangeOutcome>,
     pub failures: Vec<ChangeOutcome>,
     pub spec_files: Vec<SpecFileOutcome>,
+    #[serde(default)]
+    pub prefix_renames: Vec<RenameRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_reason: Option<RebuildAbortReason>,
 }
 
 impl RebuildReport {
@@ -289,6 +303,37 @@ pub async fn rebuild_canonical_with_runner(
         ));
     }
 
+    // 0. Dependency-aware ordering pre-pass: scan every archived change's
+    //    spec deltas, build a dependency graph, and topologically reorder
+    //    same-day archives by `aNN-` directory-name prefix. On a graph
+    //    that cannot be resolved by within-day prefix renames (cycle, or
+    //    cross-day backward dependency), abort the rebuild before any
+    //    canonical-spec mutation.
+    let plan = match sync_specs_deps::compute_dependency_prefix_renames(&archive_root) {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::error!(
+                "rebuild aborted by dependency pre-pass: {}",
+                reason.summary()
+            );
+            let report = RebuildReport {
+                abort_reason: Some(reason),
+                ..RebuildReport::default()
+            };
+            return Ok(report);
+        }
+    };
+
+    let prefix_renames: Vec<RenameRecord> = plan.iter().map(RenameRecord::from).collect();
+    if !plan.is_empty()
+        && let Err(e) = sync_specs_deps::apply_rename_plan(&archive_root, &plan)
+    {
+        tracing::error!("apply_rename_plan returned at least one io error: {e}");
+        // Per-rename failures were logged; the plan tried every rename.
+        // The subsequent chronological loop will pick up whatever ended
+        // up on disk.
+    }
+
     // 1. Snapshot existing canonical content for the modified-vs-unchanged
     //    diff at the end.
     let specs_root = workspace.join("openspec/specs");
@@ -332,6 +377,7 @@ pub async fn rebuild_canonical_with_runner(
 
     let mut report = RebuildReport {
         processed: archived.len(),
+        prefix_renames,
         ..RebuildReport::default()
     };
 
@@ -1973,5 +2019,169 @@ mod tests {
             reason.contains("would archive"),
             "expected original failure context in reason, got: {reason}"
         );
+    }
+
+    // ----- pre-pass integration tests -----
+
+    /// Write a minimal archived-change fixture with a `specs/<cap>/spec.md`
+    /// file carrying `body`. Used by pre-pass integration tests below.
+    fn make_archive_entry_with_delta(ws: &Path, name: &str, cap: &str, body: &str) {
+        let entry = ws.join("openspec/changes/archive").join(name);
+        std::fs::create_dir_all(entry.join("specs").join(cap)).unwrap();
+        std::fs::write(entry.join("proposal.md"), "fixture\n").unwrap();
+        std::fs::write(entry.join("specs").join(cap).join("spec.md"), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebuild_pre_pass_renames_inversion() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // The canonical inversion case: a MODIFIES requirement F added
+        // by another same-day change, but the MODIFIER sorts alphabetically
+        // first ("no-op…" < "self-healing…"). The pre-pass must prefix
+        // the ADD with `a01-` so it sorts first within the day-group.
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-no-op-completion-is-failure",
+            "orchestrator",
+            "## MODIFIED Requirements\n\n### Requirement: Reject archive-only iterations as Failed\nBody.\n",
+        );
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-self-healing-deployment",
+            "orchestrator",
+            "## ADDED Requirements\n\n### Requirement: Reject archive-only iterations as Failed\nBody.\n",
+        );
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.prefix_renames.len(),
+            1,
+            "expected one prefix rename, got {:?}",
+            report.prefix_renames
+        );
+        let rn = &report.prefix_renames[0];
+        assert_eq!(rn.from, "2026-05-14-self-healing-deployment");
+        assert_eq!(rn.to, "2026-05-14-a01-self-healing-deployment");
+        assert_eq!(rn.day, "2026-05-14");
+        assert!(!rn.dependency_summary.is_empty(), "expected a summary");
+
+        // The directory was actually renamed on disk before the
+        // chronological loop ran. The post-rebuild canonical-spec
+        // contents prove the loop processed both successfully (the
+        // SuccessfulArchiveRunner's rename-back-to-original step
+        // restores the date-prefixed name, so we cannot assert on the
+        // post-rebuild directory name; but the prefix_renames record is
+        // proof the pre-pass fired).
+        assert_eq!(report.processed, 2);
+        // SuccessfulArchiveRunner only performs the fs rename; it does
+        // not actually apply deltas to canonical specs. So we don't
+        // assert anything about canonical content here.
+    }
+
+    #[tokio::test]
+    async fn rebuild_pre_pass_no_dependencies_zero_renames() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-foo",
+            "cap",
+            "## ADDED Requirements\n\n### Requirement: Foo\nBody.\n",
+        );
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-bar",
+            "cap",
+            "## ADDED Requirements\n\n### Requirement: Bar\nBody.\n",
+        );
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+        assert!(
+            report.prefix_renames.is_empty(),
+            "expected no renames, got {:?}",
+            report.prefix_renames
+        );
+        assert!(report.abort_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_pre_pass_cycle_aborts_without_mutation() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        // Pre-populate a canonical spec file; we'll verify it's UNTOUCHED
+        // after the abort (no canonical mutation must occur).
+        std::fs::create_dir_all(ws.join("openspec/specs/cap")).unwrap();
+        let canonical_path = ws.join("openspec/specs/cap/spec.md");
+        std::fs::write(&canonical_path, b"pre-existing\n").unwrap();
+
+        // A ADDs Foo and MODIFIES Bar; B ADDs Bar and MODIFIES Foo. Cycle.
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-a",
+            "cap",
+            "## ADDED Requirements\n\n### Requirement: Foo\nBody.\n\n## MODIFIED Requirements\n\n### Requirement: Bar\nBody.\n",
+        );
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-14-b",
+            "cap",
+            "## ADDED Requirements\n\n### Requirement: Bar\nBody.\n\n## MODIFIED Requirements\n\n### Requirement: Foo\nBody.\n",
+        );
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.abort_reason,
+            Some(crate::cli::sync_specs_deps::RebuildAbortReason::Cycle { .. })
+        ));
+        assert!(report.prefix_renames.is_empty());
+        assert_eq!(report.processed, 0, "no entries should have been processed");
+        // Canonical spec file untouched.
+        let after = std::fs::read(&canonical_path).unwrap();
+        assert_eq!(after, b"pre-existing\n");
+        // Archive directories unrenamed.
+        assert!(ws.join("openspec/changes/archive/2026-05-14-a").is_dir());
+        assert!(ws.join("openspec/changes/archive/2026-05-14-b").is_dir());
+    }
+
+    #[tokio::test]
+    async fn rebuild_pre_pass_cross_day_backward_dependency_aborts() {
+        let dir = make_workspace();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("openspec/specs/cap")).unwrap();
+        let canonical_path = ws.join("openspec/specs/cap/spec.md");
+        std::fs::write(&canonical_path, b"pre-existing\n").unwrap();
+
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-10-modify-foo",
+            "cap",
+            "## MODIFIED Requirements\n\n### Requirement: Foo\nBody.\n",
+        );
+        make_archive_entry_with_delta(
+            ws,
+            "2026-05-15-add-foo",
+            "cap",
+            "## ADDED Requirements\n\n### Requirement: Foo\nBody.\n",
+        );
+
+        let report = rebuild_canonical_with_runner(ws, &SuccessfulArchiveRunner)
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.abort_reason,
+            Some(crate::cli::sync_specs_deps::RebuildAbortReason::CrossDayBackwardDependency { .. })
+        ));
+        assert!(report.prefix_renames.is_empty());
+        assert_eq!(report.processed, 0);
+        let after = std::fs::read(&canonical_path).unwrap();
+        assert_eq!(after, b"pre-existing\n");
     }
 }
