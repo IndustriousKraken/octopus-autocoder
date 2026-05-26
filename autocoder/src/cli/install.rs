@@ -1040,7 +1040,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
     } else {
         Some(AuditsConfig {
             defaults: enabled,
-            settings: Default::default(),
+            ..AuditsConfig::default()
         })
     };
 

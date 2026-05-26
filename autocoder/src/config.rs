@@ -518,13 +518,63 @@ impl NotificationsConfig {
 /// their global cadence; `settings` carries per-audit knobs (prompt
 /// override path, notify-on-clean flag, free-form `extra` for per-audit
 /// thresholds like brightline's `file_lines_threshold`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditsConfig {
     #[serde(default)]
     pub defaults: HashMap<String, Cadence>,
     #[serde(default)]
     pub settings: HashMap<String, AuditSettings>,
+    /// Number of retry attempts after a generated proposal fails
+    /// `openspec validate --strict`. Each retry re-invokes the audit's
+    /// LLM with the validation error appended to its prompt. `0` disables
+    /// retries (first failure → `ValidationExhausted`). Values above
+    /// [`MAX_VALIDATION_RETRIES_CEILING`] are clamped down at startup
+    /// with a WARN.
+    #[serde(default = "default_max_validation_retries")]
+    pub max_validation_retries: u32,
+}
+
+impl Default for AuditsConfig {
+    fn default() -> Self {
+        Self {
+            defaults: HashMap::new(),
+            settings: HashMap::new(),
+            max_validation_retries: default_max_validation_retries(),
+        }
+    }
+}
+
+/// Default retry budget when the operator does not configure
+/// `audits.max_validation_retries`. One retry handles the common case
+/// where the LLM made a single fixable error (wrong header name, missing
+/// `SHALL`, etc.) and can self-correct when shown the error.
+pub fn default_max_validation_retries() -> u32 {
+    1
+}
+
+/// Upper bound on `audits.max_validation_retries`. Anything above this is
+/// clamped down at startup with a WARN log. The ceiling is arbitrary but
+/// reasonable — operators who think they need 6+ retries probably have a
+/// different problem.
+pub const MAX_VALIDATION_RETRIES_CEILING: u32 = 5;
+
+/// If `audits.max_validation_retries` exceeds the ceiling, return the
+/// clamped value AND the WARN message that should be emitted at startup.
+/// Returns `(clamped_value, Option<warn_message>)`. The caller is
+/// responsible for actually emitting the warn (the daemon does at config-
+/// load; tests assert on the returned message).
+pub fn clamp_max_validation_retries(requested: u32) -> (u32, Option<String>) {
+    if requested > MAX_VALIDATION_RETRIES_CEILING {
+        let msg = format!(
+            "audits.max_validation_retries: requested {requested} exceeds ceiling \
+             {MAX_VALIDATION_RETRIES_CEILING}; clamping to {MAX_VALIDATION_RETRIES_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (MAX_VALIDATION_RETRIES_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
 }
 
 /// Per-audit settings keyed by audit type name. `prompt_path` overrides
@@ -789,8 +839,12 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let cfg: Config = serde_yml::from_str(&raw)
+        let mut cfg: Config = serde_yml::from_str(&raw)
             .with_context(|| format!("parsing config file {}", path.display()))?;
+        if let Some(audits) = cfg.audits.as_mut() {
+            let (clamped, _) = clamp_max_validation_retries(audits.max_validation_retries);
+            audits.max_validation_retries = clamped;
+        }
         Ok(cfg)
     }
 }
@@ -916,6 +970,7 @@ github:
             "prompt_path",
             "notify_on_clean",
             "extra",
+            "max_validation_retries",
         ];
 
         let path = example_yaml_path();
@@ -2485,6 +2540,107 @@ github: {}
     }
 
     #[test]
+    fn max_validation_retries_defaults_to_one_when_field_absent() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_validation_retries, 1);
+    }
+
+    #[test]
+    fn max_validation_retries_zero_is_permitted() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  max_validation_retries: 0
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_validation_retries, 0);
+        let (clamped, warn) = clamp_max_validation_retries(0);
+        assert_eq!(clamped, 0);
+        assert!(warn.is_none(), "no warn for 0");
+    }
+
+    #[test]
+    fn max_validation_retries_five_is_permitted_no_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  max_validation_retries: 5
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_validation_retries, 5);
+        let (clamped, warn) = clamp_max_validation_retries(5);
+        assert_eq!(clamped, 5);
+        assert!(warn.is_none(), "no warn at ceiling");
+    }
+
+    #[test]
+    fn max_validation_retries_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  max_validation_retries: 10
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_validation_retries, MAX_VALIDATION_RETRIES_CEILING);
+        let (clamped, warn) = clamp_max_validation_retries(10);
+        assert_eq!(clamped, MAX_VALIDATION_RETRIES_CEILING);
+        let msg = warn.expect("warn must be emitted when above ceiling");
+        assert!(msg.contains("10"), "warn names requested value: {msg}");
+        assert!(
+            msg.contains(&MAX_VALIDATION_RETRIES_CEILING.to_string()),
+            "warn names clamped value: {msg}"
+        );
+    }
+
+    #[test]
     fn audits_block_parses() {
         let yaml = r#"
 repositories:
@@ -2588,6 +2744,7 @@ github: {}
         let audits_cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         };
         let mut overrides = HashMap::new();
         overrides.insert(
@@ -2614,6 +2771,7 @@ github: {}
         let audits_cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         };
         let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
         assert_eq!(
@@ -2630,6 +2788,7 @@ github: {}
         let audits_cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            ..AuditsConfig::default()
         };
         let repo = make_repo("git@github.com:o/r.git", None);
         let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");

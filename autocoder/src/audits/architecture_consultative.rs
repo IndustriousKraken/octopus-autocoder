@@ -209,7 +209,13 @@ impl Audit for ArchitectureConsultativeAudit {
             "architecture_consultative_outcome",
             &format!("kind: Reported\nfindings_count: {}", findings.len()),
         );
-        Ok(AuditOutcome::Reported(findings))
+        // This audit produces advisory findings (`Reported`) — it does NOT
+        // write a proposal directory under `openspec/changes/<slug>/`.
+        // The post-write `openspec validate --strict` retry loop in
+        // `audits::validate_with_retry` is unnecessary here: there is no
+        // proposal to validate. `retries_used` is therefore always 0.
+        // (See change `a01-audit-proposal-self-validation`.)
+        Ok(AuditOutcome::reported(findings))
     }
 }
 
@@ -702,11 +708,12 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::Reported(findings) => {
+            AuditOutcome::Reported { findings, retries_used } => {
                 assert_eq!(findings.len(), 1);
                 assert_eq!(findings[0].severity, Severity::Medium);
                 assert!(findings[0].subject.starts_with("Should"));
@@ -714,6 +721,7 @@ mod tests {
                     findings[0].anchor.as_deref(),
                     Some("src/foo.rs:1")
                 );
+                assert_eq!(retries_used, 0, "architecture_consultative does not validate proposals");
             }
             other => panic!("expected Reported, got {other:?}"),
         }
@@ -758,6 +766,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let err = audit
@@ -886,6 +895,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let err = audit

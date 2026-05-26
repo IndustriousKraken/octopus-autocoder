@@ -113,7 +113,12 @@ impl Audit for ArchitectureBrightlineAudit {
                 findings.len()
             ),
         );
-        Ok(AuditOutcome::Reported(findings))
+        // The architecture_brightline audit is pure-data file-line-counting
+        // — it does NOT invoke an LLM and does NOT write proposals. The
+        // post-write `openspec validate --strict` retry machinery in
+        // `audits::validate_with_retry` does not apply here. (See change
+        // `a01-audit-proposal-self-validation`.)
+        Ok(AuditOutcome::reported(findings))
     }
 }
 

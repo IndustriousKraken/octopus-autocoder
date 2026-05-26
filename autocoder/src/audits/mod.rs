@@ -27,12 +27,29 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{RepositoryConfig, ResolvedSandbox};
 use crate::polling_loop::ChatOpsContext;
+
+/// Per-attempt log section names for the validation retry loop. Public
+/// so tests can grep for them.
+pub const VALIDATION_ADDENDUM_PREFIX: &str =
+    "Your previous response produced this proposal which failed openspec validation:";
+pub const VALIDATION_ADDENDUM_SUFFIX: &str =
+    "Please correct the proposal and reply with the full revised content.";
+
+/// Cap on the chatops `❌` notification's quoted validation stderr. The
+/// full stderr always lives in the audit-run log; chatops gets a slice.
+pub const VALIDATION_ERROR_NOTIFICATION_CAP: usize = 800;
+
+/// Cap on the `error_excerpt` field recorded in the audit-state history
+/// for a `ValidationExhausted` outcome. Shorter than the chatops cap to
+/// keep the state file bounded.
+pub const VALIDATION_ERROR_HISTORY_EXCERPT: usize = 200;
 
 /// What the audit is permitted to do to the workspace. The framework
 /// enforces this via a post-hoc `git status --porcelain` check (and, for
@@ -84,20 +101,81 @@ pub struct Finding {
 
 /// Outcome of one audit's `run`. The scheduler dispatches on the variant:
 /// `NoFindings` → silent; `Reported` → chatops post unless empty + clean
-/// (controlled by `notify_on_clean`); `SpecsWritten` → info log only.
+/// (controlled by `notify_on_clean`); `SpecsWritten` → info log only;
+/// `ValidationExhausted` → WARN log + `❌` chatops notification (the
+/// proposal was discarded, no commit made).
 #[derive(Debug, Clone)]
 pub enum AuditOutcome {
     NoFindings,
-    Reported(Vec<Finding>),
-    SpecsWritten(Vec<String>),
+    /// Successful audit run. `retries_used` is `0` when the audit's
+    /// generated proposal (if any) validated on first attempt, and
+    /// `>0` when it took N validation retries to land. Non-LLM-driven
+    /// audits and audits that do not generate proposals always report
+    /// `retries_used: 0`.
+    Reported {
+        findings: Vec<Finding>,
+        retries_used: u32,
+    },
+    /// Spec-writing audit run. `retries_used` is the per-audit retry
+    /// count used to land the validated set of change directories.
+    SpecsWritten {
+        changes: Vec<String>,
+        retries_used: u32,
+    },
+    /// The audit's LLM produced a proposal that failed
+    /// `openspec validate --strict` after exhausting the configured
+    /// retry budget. The proposal directory was deleted and a chatops
+    /// `❌` notification was posted. No commit was made.
+    ValidationExhausted {
+        audit_type: String,
+        retries_attempted: u32,
+        final_error: String,
+    },
 }
 
 impl AuditOutcome {
+    /// Convenience constructor for a no-retries successful Reported
+    /// outcome — used by the many sites that produced findings before
+    /// the retry loop existed.
+    pub fn reported(findings: Vec<Finding>) -> Self {
+        Self::Reported {
+            findings,
+            retries_used: 0,
+        }
+    }
+
+    /// Convenience constructor for a no-retries successful SpecsWritten
+    /// outcome.
+    #[allow(dead_code)]
+    pub fn specs_written(changes: Vec<String>) -> Self {
+        Self::SpecsWritten {
+            changes,
+            retries_used: 0,
+        }
+    }
+
     pub fn kind(&self) -> AuditOutcomeKind {
         match self {
             Self::NoFindings => AuditOutcomeKind::NoFindings,
-            Self::Reported(_) => AuditOutcomeKind::Reported,
-            Self::SpecsWritten(_) => AuditOutcomeKind::SpecsWritten,
+            Self::Reported { .. } => AuditOutcomeKind::Reported,
+            Self::SpecsWritten { .. } => AuditOutcomeKind::SpecsWritten,
+            Self::ValidationExhausted { .. } => AuditOutcomeKind::ValidationExhausted,
+        }
+    }
+
+    /// Retries used on this run, if any. Returns 0 for outcomes that
+    /// have no retry semantics (NoFindings) and the carried value for
+    /// the others. For `ValidationExhausted`, the value returned is
+    /// `retries_attempted` (the run reached its budget without
+    /// landing a valid proposal).
+    pub fn retries_used(&self) -> u32 {
+        match self {
+            Self::NoFindings => 0,
+            Self::Reported { retries_used, .. } => *retries_used,
+            Self::SpecsWritten { retries_used, .. } => *retries_used,
+            Self::ValidationExhausted {
+                retries_attempted, ..
+            } => *retries_attempted,
         }
     }
 }
@@ -111,6 +189,19 @@ pub enum AuditOutcomeKind {
     NoFindings,
     Reported,
     SpecsWritten,
+    ValidationExhausted,
+}
+
+impl AuditOutcomeKind {
+    /// Human-readable label for log lines and the state file.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoFindings => "NoFindings",
+            Self::Reported => "Reported",
+            Self::SpecsWritten => "SpecsWritten",
+            Self::ValidationExhausted => "ValidationExhausted",
+        }
+    }
 }
 
 /// Context handed to each audit's `run`. Carries the workspace path,
@@ -123,6 +214,15 @@ pub struct AuditContext<'a> {
     pub repo: &'a RepositoryConfig,
     pub chatops_ctx: Option<&'a ChatOpsContext>,
     pub log_writer: AuditLogWriter,
+    /// Number of retry attempts for the post-write
+    /// `openspec validate --strict` loop. Resolved from
+    /// [`crate::config::AuditsConfig::max_validation_retries`] at
+    /// scheduler-dispatch time and clamped to
+    /// [`crate::config::MAX_VALIDATION_RETRIES_CEILING`] at config-load.
+    /// Audits that produce LLM-generated proposals consult this; audits
+    /// that produce advisory findings (`drift`, `architecture_consultative`,
+    /// `architecture_brightline`) ignore it.
+    pub max_validation_retries: u32,
 }
 
 /// Periodic audit interface. Implementations are constructed once at
@@ -340,6 +440,270 @@ pub fn write_sandbox_settings(
     Ok((path.clone(), SandboxSettingsGuard(path)))
 }
 
+/// Returned by [`validate_with_retry`] on success: the proposal
+/// validated, possibly after `retries_used` retry attempts.
+///
+/// The `specs-writing` audits implement their own retry loop inline
+/// (because they produce a *set* of change dirs per run, not a single
+/// `<slug>`). This struct + the [`validate_with_retry`] helper exist
+/// for future single-proposal audits to consume; the API is part of
+/// the spec for `a01-audit-proposal-self-validation`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryOutcome {
+    pub retries_used: u32,
+}
+
+/// Returned by [`validate_with_retry`] when the retry budget was
+/// exhausted before a valid proposal could be produced. Carries the
+/// number of retry attempts made (i.e. the budget) and the final
+/// validation-error string the audit can record / surface.
+///
+/// Reserved for future single-proposal audits; the `specs-writing`
+/// audits build their own `AuditOutcome::ValidationExhausted` directly
+/// from the per-attempt failures.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ValidationExhausted {
+    pub retries_attempted: u32,
+    pub final_error: String,
+}
+
+/// Shell out to `openspec validate <slug> --strict` in `workspace`.
+/// Returns:
+/// - `Ok(())` on exit 0.
+/// - `Err(stderr)` on non-zero exit (trimmed stderr text).
+/// - `Err("openspec validate spawn failed: ...")` on spawn failure.
+///
+/// Uses the `openspec` binary on `PATH`. Callers needing a test
+/// override should use [`validate_proposal_with_command`].
+///
+/// Used directly by tests; the in-tree audit modules call this
+/// through the inline validation step that runs after each LLM
+/// invocation in [`crate::audits::specs_writing`].
+#[allow(dead_code)]
+pub fn validate_proposal(workspace: &Path, slug: &str) -> std::result::Result<(), String> {
+    validate_proposal_with_command("openspec", workspace, slug)
+}
+
+/// Same as [`validate_proposal`] but with an injectable `openspec`
+/// command path. Tests point at a shell script.
+pub fn validate_proposal_with_command(
+    openspec_command: &str,
+    workspace: &Path,
+    slug: &str,
+) -> std::result::Result<(), String> {
+    // Brief ETXTBSY retry. Linux races a parallel test's `std::fs::write`
+    // of one shell script with this thread's `Command::spawn` of a
+    // sibling script — see [`spawn_with_etxtbsy_retry`] for the longer
+    // analysis. The same mitigation applies here in synchronous form.
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt: u32 = 0;
+    let out = loop {
+        let res = std::process::Command::new(openspec_command)
+            .arg("validate")
+            .arg(slug)
+            .arg("--strict")
+            .current_dir(workspace)
+            .output();
+        match res {
+            Ok(o) => break Ok(o),
+            Err(e)
+                if e.raw_os_error() == Some(libc::ETXTBSY)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if stderr.is_empty() {
+                // openspec failed but said nothing useful on stderr;
+                // include stdout so the caller has something to forward.
+                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                Err(if stdout.is_empty() {
+                    format!("openspec validate {slug} --strict exited {}", o.status)
+                } else {
+                    stdout
+                })
+            } else {
+                Err(stderr)
+            }
+        }
+        Err(e) => Err(format!("openspec validate spawn failed: {e}")),
+    }
+}
+
+/// Run the closure `llm_call` to write a proposal under
+/// `openspec/changes/<slug>/`, then validate it. On validation failure
+/// with retry budget remaining, re-invoke `llm_call` with `Some(<error>)`
+/// so the audit can amend its LLM prompt with the validation error, and
+/// retry. Returns `Ok(RetryOutcome)` on first or eventual success; on
+/// exhaustion returns `Err(ValidationExhausted)`.
+///
+/// `llm_call`'s `Option<&str>` parameter is `None` on the first attempt
+/// and `Some(validation_stderr)` on retries. The closure is responsible
+/// for overwriting the change directory; the helper does not delete it
+/// between attempts (audits typically delete-and-rewrite or rely on the
+/// LLM producing a fresh response that overwrites the prior content).
+///
+/// Errors returned by `llm_call` propagate as `ValidationExhausted`
+/// with `final_error` prefixed `"llm-call failed: "` and
+/// `retries_attempted` set to the attempt index at which the call
+/// failed (so a first-attempt LLM failure produces `retries_attempted:
+/// 0`).
+#[allow(dead_code)]
+pub async fn validate_with_retry<F, Fut>(
+    workspace: &Path,
+    slug: &str,
+    max_retries: u32,
+    llm_call: F,
+) -> std::result::Result<RetryOutcome, ValidationExhausted>
+where
+    F: FnMut(Option<&str>) -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
+    validate_with_retry_with_command("openspec", workspace, slug, max_retries, llm_call).await
+}
+
+/// Test/internal variant of [`validate_with_retry`] that takes the
+/// `openspec` binary path. Production calls through to this with
+/// `"openspec"`.
+#[allow(dead_code)]
+pub async fn validate_with_retry_with_command<F, Fut>(
+    openspec_command: &str,
+    workspace: &Path,
+    slug: &str,
+    max_retries: u32,
+    mut llm_call: F,
+) -> std::result::Result<RetryOutcome, ValidationExhausted>
+where
+    F: FnMut(Option<&str>) -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
+    let mut last_error: String = String::new();
+    let total_attempts = max_retries.saturating_add(1);
+    for attempt in 0..total_attempts {
+        let addendum: Option<&str> = if attempt == 0 {
+            None
+        } else {
+            Some(last_error.as_str())
+        };
+        if let Err(e) = llm_call(addendum).await {
+            return Err(ValidationExhausted {
+                retries_attempted: attempt,
+                final_error: format!("llm-call failed: {e}"),
+            });
+        }
+        match validate_proposal_with_command(openspec_command, workspace, slug) {
+            Ok(()) => {
+                return Ok(RetryOutcome {
+                    retries_used: attempt,
+                });
+            }
+            Err(e) => {
+                last_error = e;
+            }
+        }
+    }
+    Err(ValidationExhausted {
+        retries_attempted: max_retries,
+        final_error: last_error,
+    })
+}
+
+/// Render the validation error in the form callers should hand to the
+/// LLM on the retry attempt. The text is shaped to match the
+/// `<VALIDATION_ADDENDUM_PREFIX> <error> <VALIDATION_ADDENDUM_SUFFIX>`
+/// pattern documented in the spec.
+pub fn build_validation_addendum(validation_error: &str) -> String {
+    format!(
+        "{VALIDATION_ADDENDUM_PREFIX}\n\n{validation_error}\n\n{VALIDATION_ADDENDUM_SUFFIX}"
+    )
+}
+
+/// Truncate `s` to at most `cap` characters, appending `…` when
+/// truncation occurred. Counts unicode characters, not bytes, so the
+/// result is always a valid string boundary.
+pub fn truncate_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(cap).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Remove `<workspace>/openspec/changes/<slug>/` recursively (NotFound
+/// is silently ignored). When `chatops_ctx` is `Some`, post the
+/// documented `❌` failure notification. Notification failures are
+/// logged but do not propagate — the discard path's purpose is to
+/// clean up; surfacing a downstream chatops error would mask the
+/// underlying validation failure.
+///
+/// `repo_url` is rendered into the notification text so operators can
+/// tell which repo's audit fired the alert when one channel is shared.
+#[allow(dead_code)]
+pub async fn discard_proposal_and_notify(
+    workspace: &Path,
+    slug: &str,
+    audit_type: &str,
+    retries_attempted: u32,
+    final_error: &str,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo_url: &str,
+) -> Result<()> {
+    let change_dir = workspace.join("openspec/changes").join(slug);
+    if let Err(e) = std::fs::remove_dir_all(&change_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            slug = %slug,
+            audit_type = audit_type,
+            path = %change_dir.display(),
+            "failed to remove invalid proposal directory: {e}"
+        );
+    }
+    if let Some(ctx) = chatops_ctx {
+        let text = format_validation_exhausted_message(
+            repo_url,
+            audit_type,
+            retries_attempted,
+            final_error,
+        );
+        if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+            tracing::warn!(
+                audit_type = audit_type,
+                slug = %slug,
+                "validation-exhausted chatops post failed: {e:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Render the documented `❌` notification text shown when an audit's
+/// generated proposal failed validation after retries.
+pub fn format_validation_exhausted_message(
+    repo_url: &str,
+    audit_type: &str,
+    retries_attempted: u32,
+    final_error: &str,
+) -> String {
+    let excerpt = truncate_chars(final_error, VALIDATION_ERROR_NOTIFICATION_CAP);
+    format!(
+        "❌ {repo_url}: {audit_type} produced an invalid proposal that failed openspec validation after {retries_attempted} retries.\n\
+         Final validation error:\n{excerpt}\nNo commit was made. The audit will retry on its next scheduled cadence."
+    )
+}
+
 /// Spawn a child process, retrying briefly on `ETXTBSY`.
 ///
 /// Linux returns `ETXTBSY` when a `Command::spawn` execve targets a file
@@ -456,13 +820,356 @@ mod tests {
             AuditOutcomeKind::NoFindings
         );
         assert_eq!(
-            AuditOutcome::Reported(vec![]).kind(),
+            AuditOutcome::reported(vec![]).kind(),
             AuditOutcomeKind::Reported
         );
         assert_eq!(
-            AuditOutcome::SpecsWritten(vec!["x".into()]).kind(),
+            AuditOutcome::specs_written(vec!["x".into()]).kind(),
             AuditOutcomeKind::SpecsWritten
         );
+        assert_eq!(
+            AuditOutcome::ValidationExhausted {
+                audit_type: "a".into(),
+                retries_attempted: 1,
+                final_error: "e".into(),
+            }
+            .kind(),
+            AuditOutcomeKind::ValidationExhausted
+        );
+    }
+
+    #[test]
+    fn retries_used_returns_inner_value_for_each_variant() {
+        assert_eq!(AuditOutcome::NoFindings.retries_used(), 0);
+        assert_eq!(
+            AuditOutcome::Reported {
+                findings: vec![],
+                retries_used: 2
+            }
+            .retries_used(),
+            2
+        );
+        assert_eq!(
+            AuditOutcome::SpecsWritten {
+                changes: vec![],
+                retries_used: 3
+            }
+            .retries_used(),
+            3
+        );
+        assert_eq!(
+            AuditOutcome::ValidationExhausted {
+                audit_type: "x".into(),
+                retries_attempted: 4,
+                final_error: "boom".into()
+            }
+            .retries_used(),
+            4
+        );
+    }
+
+    #[test]
+    fn truncate_chars_caps_and_appends_ellipsis() {
+        let s = "x".repeat(500);
+        let t = truncate_chars(&s, 100);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 101);
+        let short = truncate_chars("hi", 100);
+        assert_eq!(short, "hi");
+    }
+
+    #[test]
+    fn build_validation_addendum_contains_prefix_suffix_and_error() {
+        let s = build_validation_addendum("missing SHALL in requirement body");
+        assert!(s.contains(VALIDATION_ADDENDUM_PREFIX));
+        assert!(s.contains(VALIDATION_ADDENDUM_SUFFIX));
+        assert!(s.contains("missing SHALL in requirement body"));
+    }
+
+    #[test]
+    fn format_validation_exhausted_message_shape() {
+        let msg = format_validation_exhausted_message(
+            "git@github.com:o/r.git",
+            "security_bug_audit",
+            1,
+            "stderr text",
+        );
+        assert!(msg.starts_with("❌"));
+        assert!(msg.contains("git@github.com:o/r.git"));
+        assert!(msg.contains("security_bug_audit"));
+        assert!(msg.contains("1 retries"));
+        assert!(msg.contains("stderr text"));
+        assert!(msg.contains("No commit was made"));
+    }
+
+    #[test]
+    fn format_validation_exhausted_message_truncates_long_stderr() {
+        let huge = "z".repeat(2000);
+        let msg = format_validation_exhausted_message("u", "t", 1, &huge);
+        assert!(msg.contains('…'), "long stderr should be truncated: {msg}");
+        // Bounded length: header + truncated stderr (cap+1 for ellipsis) +
+        // footer fits well under e.g. 1500 chars.
+        assert!(msg.chars().count() < 1500, "msg too long: {}", msg.chars().count());
+    }
+
+    #[tokio::test]
+    async fn validate_with_retry_returns_ok_when_first_attempt_validates() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-a")).unwrap();
+        let validator = ws.join("ok.sh");
+        std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+        let calls = Arc::new(Mutex::new(0u32));
+        let calls_inner = calls.clone();
+        let res = validate_with_retry_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "feature-a",
+            0,
+            move |addendum| {
+                let calls_inner = calls_inner.clone();
+                let captured = addendum.map(|s| s.to_string());
+                async move {
+                    *calls_inner.lock().unwrap() += 1;
+                    assert!(captured.is_none(), "first call must have no addendum");
+                    Ok::<_, String>(())
+                }
+            },
+        )
+        .await;
+        let outcome = res.expect("valid first attempt returns Ok");
+        assert_eq!(outcome.retries_used, 0);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn validate_with_retry_exhausts_with_zero_retries_when_invalid() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-b")).unwrap();
+        let validator = ws.join("bad.sh");
+        std::fs::write(
+            &validator,
+            "#!/bin/sh\necho 'MODIFIED header not found' >&2\nexit 2\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+        let res = validate_with_retry_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "feature-b",
+            0,
+            |_| async { Ok::<_, String>(()) },
+        )
+        .await;
+        let err = res.expect_err("invalid w/ 0 retries → ValidationExhausted");
+        assert_eq!(err.retries_attempted, 0);
+        assert!(
+            err.final_error.contains("MODIFIED header not found"),
+            "final_error must carry the validator stderr: {}",
+            err.final_error
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_with_retry_passes_addendum_to_retry_call() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-c")).unwrap();
+        // Validator: fails first time, succeeds second time. Uses a
+        // marker file inside the workspace (deterministic path; tied to
+        // this test's TempDir so concurrent tests cannot collide).
+        let mark = ws.join(".retry-toggle-mark");
+        let validator = ws.join("toggle.sh");
+        let body = format!(
+            "#!/bin/sh\nMARK='{}'\nif [ ! -f \"$MARK\" ]; then\n  touch \"$MARK\"\n  echo 'missing SHALL keyword' >&2\n  exit 2\nfi\nrm -f \"$MARK\"\nexit 0\n",
+            mark.display()
+        );
+        std::fs::write(&validator, body).unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let seen_inner = seen.clone();
+        let res = validate_with_retry_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "feature-c",
+            1,
+            move |addendum| {
+                let seen_inner = seen_inner.clone();
+                let captured: Option<String> = addendum.map(|s| s.to_string());
+                async move {
+                    seen_inner.lock().unwrap().push(captured);
+                    Ok::<_, String>(())
+                }
+            },
+        )
+        .await;
+        let outcome = res.expect("retry should land");
+        assert_eq!(outcome.retries_used, 1);
+        let log = seen.lock().unwrap();
+        assert_eq!(log.len(), 2, "must invoke llm_call twice");
+        assert!(log[0].is_none(), "first call: no addendum");
+        let addendum = log[1].as_deref().expect("second call: addendum");
+        assert!(
+            addendum.contains("missing SHALL keyword"),
+            "addendum must carry the validator's stderr: {addendum}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_with_retry_exhausts_after_max_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-d")).unwrap();
+        let validator = ws.join("always-fail.sh");
+        std::fs::write(
+            &validator,
+            "#!/bin/sh\necho 'never valid' >&2\nexit 2\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+        let calls = Arc::new(Mutex::new(0u32));
+        let calls_inner = calls.clone();
+        let res = validate_with_retry_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "feature-d",
+            1,
+            move |_| {
+                let calls_inner = calls_inner.clone();
+                async move {
+                    *calls_inner.lock().unwrap() += 1;
+                    Ok::<_, String>(())
+                }
+            },
+        )
+        .await;
+        let err = res.expect_err("exhausted retries");
+        assert_eq!(err.retries_attempted, 1);
+        assert!(err.final_error.contains("never valid"));
+        assert_eq!(*calls.lock().unwrap(), 2, "max_retries=1 → 2 total LLM calls");
+    }
+
+    #[tokio::test]
+    async fn validate_with_retry_two_retries_valid_on_third() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-e")).unwrap();
+        let validator = ws.join("third-wins.sh");
+        let counter_path = ws.join(".attempt-counter");
+        std::fs::write(&counter_path, "0").unwrap();
+        let body = format!(
+            "#!/bin/sh\nC=\"$(cat '{}')\"\nN=$((C+1))\necho \"$N\" > '{}'\nif [ \"$N\" -lt 3 ]; then\n  echo \"attempt $N invalid\" >&2\n  exit 2\nfi\nexit 0\n",
+            counter_path.display(),
+            counter_path.display(),
+        );
+        std::fs::write(&validator, body).unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+
+        let res = validate_with_retry_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "feature-e",
+            2,
+            |_| async { Ok::<_, String>(()) },
+        )
+        .await;
+        let outcome = res.expect("valid on third attempt");
+        assert_eq!(outcome.retries_used, 2);
+    }
+
+    #[tokio::test]
+    async fn discard_proposal_and_notify_removes_dir_and_no_panic_without_chatops() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let target = ws.join("openspec/changes/to-discard/proposal.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content").unwrap();
+        discard_proposal_and_notify(
+            ws,
+            "to-discard",
+            "security_bug_audit",
+            1,
+            "validation error",
+            None,
+            "git@github.com:o/r.git",
+        )
+        .await
+        .expect("discard ok");
+        assert!(!ws.join("openspec/changes/to-discard").exists());
+    }
+
+    #[tokio::test]
+    async fn discard_proposal_and_notify_handles_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // No directory exists; helper must not panic.
+        discard_proposal_and_notify(
+            ws,
+            "never-existed",
+            "missing_tests_audit",
+            1,
+            "validation error",
+            None,
+            "u",
+        )
+        .await
+        .expect("ok even when dir absent");
+    }
+
+    #[test]
+    fn validate_proposal_with_command_spawn_failure_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let err = validate_proposal_with_command(
+            "/definitely/not/a/real/openspec/binary",
+            tmp.path(),
+            "x",
+        )
+        .expect_err("spawn failure must produce Err");
+        assert!(
+            err.contains("openspec validate spawn failed:"),
+            "spawn failure must use the prefix: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_returns_stderr_on_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let validator = ws.join("fail.sh");
+        std::fs::write(
+            &validator,
+            "#!/bin/sh\necho 'broken MODIFIED header' >&2\nexit 7\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&validator).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&validator, perms).unwrap();
+        let err = validate_proposal_with_command(
+            &validator.to_string_lossy(),
+            ws,
+            "any",
+        )
+        .expect_err("nonzero exit → Err");
+        assert!(err.contains("broken MODIFIED header"), "got: {err}");
     }
 
     #[test]

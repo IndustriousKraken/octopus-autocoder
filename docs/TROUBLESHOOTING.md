@@ -116,3 +116,74 @@ The expected `✅ Revision applied` / `✗ Revision attempt failed` /
   log lines — if `self_bot_username` or `list_open_prs_for_head` failed
   at startup of the iteration, no PR was processed. The dispatcher logs
   at WARN on every per-PR error so the next iteration retries.
+
+## Audit produces invalid proposal — what to do
+
+Symptom: a chatops `❌ <repo-url>: <audit-type> produced an invalid
+proposal that failed openspec validation after <N> retries` notification
+fires (see
+[CHATOPS.md](CHATOPS.md#progress-notifications)), and the next iteration
+shows no commit from the audit on the agent branch. The audit's state
+file (`.audit-state.json` at the workspace root) has an
+`attempt_history` entry with `outcome_kind: "ValidationExhausted"` and
+an `error_excerpt` field containing the first 200 chars of the
+validator's stderr.
+
+**What this means.** The audit's LLM produced one or more
+`openspec/changes/<slug>/` directories that `openspec validate
+<slug> --strict` rejected — typically a hallucinated `## MODIFIED
+Requirements` block whose target header does not exist in canonical
+state, or a requirement body missing the `SHALL` keyword. The audit
+re-prompted the LLM (with the validation error appended) up to
+`audits.max_validation_retries` times. None of the attempts produced a
+valid proposal, so the audit deleted the change directory and gave up
+for this run. No commit was made, no PR was opened, no downstream
+cascade occurred.
+
+**This is the right outcome.** Catching the invalid proposal at the
+audit boundary is precisely what this validation loop is for. The
+related cascade-prevention specs (`queue-archive-aborted-detection` and
+`pr-body-proposal-active-path-fallback`) make the *symptoms* of
+audit-generated invalid proposals visible downstream; this validation
+loop prevents the proposal from entering the queue in the first place.
+
+**What to do.**
+
+1. **If this is a one-off:** ignore it. The audit will re-run on its
+   next scheduled cadence (`audits.defaults.<slug>` /
+   `repositories[].audits.<slug>`), with no special re-trigger needed.
+   LLMs occasionally produce hallucinated headers; one validation
+   failure with `max_validation_retries: 1` exhausted means two
+   consecutive bad responses, which is unusual but not necessarily a
+   pattern.
+2. **If the same audit type fails repeatedly:** read the
+   `error_excerpt` from `.audit-state.json` to see what the LLM keeps
+   getting wrong. Then inspect the audit's prompt template. If you have
+   not configured `audits.settings.<slug>.prompt_path`, the embedded
+   default lives in `autocoder/prompts/<slug>.md` (cargo built-in). If
+   you HAVE configured it, the override file is the place to tighten
+   instructions — usually the OpenSpec delta-format rules (the
+   `## ADDED Requirements` / `## MODIFIED Requirements` headers, the
+   `### Requirement:` line followed by `SHALL`, the `#### Scenario:`
+   block format).
+3. **If many audit types fail in close succession:** the LLM model
+   itself may have degraded (a routing change, a context-window
+   regression). The chatops `❌` notification names the audit type so
+   you can confirm whether the failures are concentrated in one audit
+   or spread across the LLM-driven set (`drift_audit`,
+   `missing_tests_audit`, `security_bug_audit`,
+   `architecture_consultative`).
+4. **If you want to disable retries entirely** (e.g. during a known
+   LLM-side outage to stop burning calls): set
+   `audits.max_validation_retries: 0`. The first failure becomes
+   `ValidationExhausted` immediately. The
+   [config field documentation](CONFIG.md) covers the clamp + default.
+
+**Knobs.**
+
+- `audits.max_validation_retries: u32` (default `1`, max `5`). Set to
+  `0` to disable retries; higher values trade LLM calls for the chance
+  to land a proposal that needed multiple corrections.
+- The `attempt_history` in `.audit-state.json` is FIFO-bounded at 20
+  entries per audit type. Older entries roll off automatically; nothing
+  to garbage-collect by hand.

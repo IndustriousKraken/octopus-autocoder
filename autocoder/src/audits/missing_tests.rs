@@ -421,10 +421,11 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::SpecsWritten { changes: names, .. } => {
                 assert_eq!(names, vec!["tests-new-thing".to_string()]);
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
@@ -468,18 +469,31 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        // With `max_validation_retries: 0`, all-invalid runs return
+        // ValidationExhausted (no retry attempted, proposal discarded).
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::ValidationExhausted {
+                audit_type,
+                retries_attempted,
+                final_error,
+            } => {
+                assert_eq!(audit_type, "missing_tests_audit");
+                assert_eq!(retries_attempted, 0);
                 assert!(
-                    names.is_empty(),
-                    "validation failure must reject the change: got {names:?}"
+                    final_error.contains("tests-bad-shape"),
+                    "final_error must name the failed change: {final_error}"
+                );
+                assert!(
+                    final_error.contains("spec missing scenarios"),
+                    "final_error must include the validator stderr: {final_error}"
                 );
             }
-            other => panic!("expected SpecsWritten(empty), got {other:?}"),
+            other => panic!("expected ValidationExhausted, got {other:?}"),
         }
         // The invalid change directory must have been removed.
         assert!(
@@ -490,8 +504,8 @@ mod tests {
         // Audit log captured the validation failure.
         let log = std::fs::read_to_string(&log_path).unwrap();
         assert!(
-            log.contains("missing_tests_audit_validation_failure_tests-bad-shape"),
-            "validation failure must be logged: {log}"
+            log.contains("missing_tests_audit_validation_failure_tests-bad-shape_attempt_0"),
+            "validation failure must be logged with attempt index: {log}"
         );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
@@ -525,6 +539,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let _ = audit.run(&mut ctx).await.expect("run succeeds");
@@ -583,6 +598,7 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
 
@@ -590,7 +606,7 @@ mod tests {
         let head_before = crate::git::rev_parse(&ws, "HEAD").unwrap();
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => assert!(names.is_empty()),
+            AuditOutcome::SpecsWritten { changes: names, .. } => assert!(names.is_empty()),
             other => panic!("expected SpecsWritten(empty), got {other:?}"),
         }
         // HEAD must not have moved (no commit made).
@@ -646,11 +662,12 @@ mod tests {
             repo: &repo,
             chatops_ctx: None,
             log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten(names) => {
+            AuditOutcome::SpecsWritten { changes: names, .. } => {
                 assert_eq!(names.len(), 2, "cap must hold: got {names:?}");
                 // Deterministic: sorted names → tests-a, tests-b kept.
                 assert_eq!(names, vec!["tests-a".to_string(), "tests-b".to_string()]);
