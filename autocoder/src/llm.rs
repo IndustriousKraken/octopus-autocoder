@@ -214,6 +214,7 @@ mod tests {
             api_key: None,
             api_base_url: None,
             prompt_template_path: None,
+            auto_revise_on_block: false,
         };
         let err = match build_from_config(&cfg) {
             Ok(_) => panic!("no key source must error"),
@@ -248,6 +249,7 @@ mod tests {
             }),
             api_base_url: Some(server.url()),
             prompt_template_path: None,
+            auto_revise_on_block: false,
         };
         let client = build_from_config(&cfg)
             .expect("inline api_key with no api_key_env should succeed");
@@ -289,6 +291,7 @@ mod tests {
             }),
             api_base_url: Some(server.url()),
             prompt_template_path: None,
+            auto_revise_on_block: false,
         };
         let client = build_from_config(&cfg).expect("inline build should succeed");
         let _ = client.complete("hi").await.expect("complete succeeds");

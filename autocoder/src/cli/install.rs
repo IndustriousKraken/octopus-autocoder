@@ -1020,6 +1020,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 api_key: None,
                 api_base_url: None,
                 prompt_template_path: None,
+                auto_revise_on_block: false,
             })
         }
     };

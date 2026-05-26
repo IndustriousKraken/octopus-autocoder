@@ -1164,6 +1164,7 @@ mod tests {
         let report = ReviewReport {
             verdict: ReviewVerdict::Pass,
             markdown: "VERDICT details".to_string(),
+            concerns: Vec::new(),
         };
         create_pull_request_at(
             &server.url(),

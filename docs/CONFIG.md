@@ -46,6 +46,17 @@ A list of one or more repositories to manage. Each entry:
 
 See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 
+| Field                      | Required | Default | Description |
+|----------------------------|----------|---------|-------------|
+| `enabled`                  | no       | `false` | Master toggle. When `false`, the reviewer step is skipped entirely even if the block is present. |
+| `provider`                 | yes      | —       | `anthropic` or `openai_compatible`. |
+| `model`                    | yes      | —       | Provider-specific model identifier. |
+| `api_key_env`              | no       | _absent_ | Name of the env var holding the provider API key. Used when `api_key` is unset. |
+| `api_key`                  | no       | _absent_ | Inline alternative to `api_key_env` (`{ value: "..." }`); when set, `api_key_env` is ignored. |
+| `api_base_url`             | no       | provider default | Override the base URL — useful for OpenRouter, Grok, local Ollama, etc. |
+| `prompt_template_path`     | no       | _embedded_ | Path to a file overriding the built-in reviewer prompt template. Must contain `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders. |
+| `auto_revise_on_block`     | no       | `false` | When `true`, every `Block` verdict additionally posts one `<!-- reviewer-revision -->` PR comment per concern the reviewer marked `should_request_revision: true`. The [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks them up on the next iteration. Reviewer-initiated revisions share the per-PR `executor.max_revisions_per_pr` cap with operator-initiated ones; concerns dropped due to the cap are annotated in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)`. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on Block verdicts](CODE-REVIEW.md#reviewer-initiated-revisions-on-block-verdicts) for the schema and the operator-template migration steps. Default `false` (no behavioural change for sites already running the reviewer). |
+
 ## `chatops:` (optional)
 
 See [ChatOps Escalation](CHATOPS.md). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](CHATOPS.md#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.

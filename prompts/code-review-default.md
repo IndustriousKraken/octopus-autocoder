@@ -56,6 +56,40 @@ The first non-empty line MUST be `VERDICT:` followed by exactly one of `Pass`, `
 
 If you see a `## Skipped (budget exhausted)` line under "Changed files" or a `(diff omitted: budget exhausted by change context and changed files)` line under "Diff", some context was dropped to fit the prompt budget. Acknowledge the missing context in your first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
 
+# Structured revision-requests block (REQUIRED, may be empty)
+
+After the markdown sections above, append ONE additional fenced code block tagged `revision-requests`. The block contains a YAML list — one entry per concern surfaced in the markdown sections — that lets the daemon decide which concerns are actionable enough to forward to the implementer agent as revision requests.
+
+Schema for each entry:
+
+```
+- summary: <short text mirroring the bullet you wrote above>
+  actionable_request: <text suitable for an implementer agent to act on, OR omit when none applies>
+  should_request_revision: <true | false>
+```
+
+Rules:
+
+- One entry per concern listed in the markdown sections, in **most-critical-first** order. The daemon caps revision-request comments at a per-PR budget (`executor.max_revisions_per_pr`); when the cap forces truncation, the lowest-priority entries are the ones that get dropped, so order matters.
+- Set `should_request_revision: true` ONLY when:
+  - the concern has a concrete, executable fix the implementer agent can apply without further clarification, AND
+  - `actionable_request` is non-empty and unambiguous.
+- Style preferences, philosophical disagreements, and "consider whether..." suggestions stay `should_request_revision: false`. They are commentary, not revision requests.
+- When in doubt, prefer `false` — a false positive generates a wasted revision cycle and noisy PR comments; a false negative just leaves the concern as commentary for the human reviewer.
+- If you have no concerns at all (`VERDICT: Pass`), emit an empty list (`[]`) rather than omitting the block.
+
+Format the block exactly like:
+
+```revision-requests
+- summary: "find_user drops the error context"
+  actionable_request: "fix find_user to propagate the underlying error via anyhow::Context"
+  should_request_revision: true
+- summary: "consider renaming `tmp` to something more descriptive"
+  should_request_revision: false
+```
+
+The block is the LAST thing in your response, after every markdown section above. The daemon uses it to drive the reviewer-initiated revision pipeline (when enabled via `reviewer.auto_revise_on_block`); omitting the block silently disables that pipeline for this PR.
+
 # Change context
 
 {{change_context}}

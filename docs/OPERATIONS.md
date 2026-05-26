@@ -469,4 +469,19 @@ Files for closed/merged PRs are pruned automatically at iteration start.
 **Disabling.** Set `executor.max_revisions_per_pr: 0` to opt out of the
 PR-comment revision channel entirely.
 
+### Reviewer-initiated revisions (cross-reference)
+
+The same revision dispatcher described above also processes
+`<!-- reviewer-revision -->`-marked comments posted by the code-quality
+reviewer when `reviewer.auto_revise_on_block: true`. Both flows share the
+per-PR `executor.max_revisions_per_pr` cap and the same per-PR state file
+(`<workspace>/.autocoder/revisions/<pr-number>.json`); a reviewer-initiated
+revision applied in iteration N counts against the same budget a
+subsequent human `@<bot> revise ...` would consume.
+
+See [Reviewer-initiated revisions on Block verdicts](CODE-REVIEW.md#reviewer-initiated-revisions-on-block-verdicts)
+for the full reviewer-side flow, the per-concern decision the reviewer
+makes, and the operator-template migration steps for sites that have
+overridden the default reviewer prompt.
+
 ---
