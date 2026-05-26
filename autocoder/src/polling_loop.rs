@@ -3085,7 +3085,7 @@ fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool)
         );
     }
     for change in changes {
-        let why = read_archived_why(workspace, change);
+        let why = read_change_why(workspace, change);
         let body = match why {
             Some(w) if !w.trim().is_empty() => w.trim().to_string(),
             _ => "_(no proposal.md available)_".to_string(),
@@ -3099,12 +3099,42 @@ fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool)
     s
 }
 
-/// Locate `<workspace>/openspec/changes/archive/*-<change>/proposal.md`
-/// (picking the lexicographically last match if multiple exist), read
-/// the file, and return the `## Why` section. Returns `None` if the
-/// directory or file is missing, the read fails, or no `## Why` heading
-/// is present.
-fn read_archived_why(workspace: &Path, change: &str) -> Option<String> {
+/// Read a change's proposal `## Why` section, preferring the archive
+/// location and falling back to the active path. Step 1 looks up
+/// `<workspace>/openspec/changes/archive/*-<change>/proposal.md` (picking
+/// the lexicographically last match if multiple exist). Step 2, on
+/// archive miss, tries `<workspace>/openspec/changes/<change>/proposal.md`.
+/// When the active-path fallback yields a parseable `## Why`, emit a
+/// per-change WARN so operators can correlate the PR with the likely
+/// upstream archive failure. Returns `None` if both paths miss or
+/// neither yields a `## Why` heading; no WARN fires in those cases.
+fn read_change_why(workspace: &Path, change: &str) -> Option<String> {
+    if let Some(why) = read_proposal_why_from_archive(workspace, change) {
+        return Some(why);
+    }
+    let active = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join("proposal.md");
+    if active.is_file() {
+        let raw = std::fs::read_to_string(&active).ok()?;
+        if let Some(why) = extract_why_section(&raw) {
+            tracing::warn!(
+                change = %change,
+                "proposal read from active path, not archive — likely indicates an upstream archive failure for this iteration"
+            );
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// Step 1 of [`read_change_why`]: locate
+/// `<workspace>/openspec/changes/archive/*-<change>/proposal.md` (picking
+/// the lexicographically last match if multiple exist), read the file,
+/// and return its `## Why` section. Returns `None` if the directory or
+/// file is missing, the read fails, or no `## Why` heading is present.
+fn read_proposal_why_from_archive(workspace: &Path, change: &str) -> Option<String> {
     let archive_root = workspace.join("openspec/changes/archive");
     let entries = std::fs::read_dir(&archive_root).ok()?;
     let suffix = format!("-{change}");
@@ -9156,6 +9186,127 @@ mod tests {
         assert!(
             !body.contains("More text."),
             "body must not include non-Why sections; got: {body}"
+        );
+    }
+
+    // ============================================================
+    // read_change_why — archive + active-path fallback
+    // ============================================================
+
+    /// Write a fixture active-path proposal.md at
+    /// `<workspace>/openspec/changes/<change>/proposal.md`.
+    fn write_fixture_active_proposal(workspace: &Path, change: &str, proposal: &str) {
+        let dir = workspace.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), proposal).unwrap();
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_archive_path_wins_without_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nArchive rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(
+            why.as_deref()
+                .map(|s| s.contains("Archive rationale."))
+                .unwrap_or(false),
+            "expected archive why; got: {why:?}"
+        );
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "no fallback WARN expected on archive hit"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_falls_back_to_active_with_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No archive fixture.
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## Why\n\nActive-path rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(
+            why.as_deref()
+                .map(|s| s.contains("Active-path rationale."))
+                .unwrap_or(false),
+            "expected active-path why; got: {why:?}"
+        );
+        assert!(
+            logs_contain("proposal read from active path"),
+            "expected fallback WARN naming the change"
+        );
+        assert!(
+            logs_contain("fix-thing"),
+            "WARN must name the change slug"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_active_without_why_section_returns_none_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No archive fixture; active proposal lacks a `## Why` heading.
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## What Changes\n\nstuff but no why\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(why.is_none(), "expected None; got: {why:?}");
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "WARN should not fire when fallback extracts no content"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_both_paths_missing_returns_none_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let why = read_change_why(tmp.path(), "fix-thing");
+        assert!(why.is_none(), "expected None; got: {why:?}");
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "WARN should not fire when both paths miss"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn read_change_why_archive_present_overrides_active_no_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nArchive rationale.\n\n## What Changes\n\nx\n",
+        );
+        write_fixture_active_proposal(
+            tmp.path(),
+            "fix-thing",
+            "## Why\n\nActive rationale.\n\n## What Changes\n\nx\n",
+        );
+        let why = read_change_why(tmp.path(), "fix-thing");
+        let text = why.expect("expected archive why");
+        assert!(
+            text.contains("Archive rationale."),
+            "archive path must win; got: {text}"
+        );
+        assert!(
+            !text.contains("Active rationale."),
+            "active text must not leak through; got: {text}"
+        );
+        assert!(
+            !logs_contain("proposal read from active path"),
+            "no WARN expected when archive path wins"
         );
     }
 
