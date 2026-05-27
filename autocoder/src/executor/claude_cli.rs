@@ -15,7 +15,10 @@
 
 use super::event_log::{self, ActionKind, StructuredLogWriter};
 use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
-use super::{Executor, ExecutorOutcome, ResumeHandle, TriageContext, UnimplementableTask};
+use super::{
+    ChatTriageContext, Executor, ExecutorOutcome, ResumeHandle, TriageContext,
+    UnimplementableTask,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
@@ -46,6 +49,11 @@ const DEFAULT_REVISION_TEMPLATE: &str =
 /// by `run_triage` for the `audit-reply-acts` flow.
 const DEFAULT_TRIAGE_TEMPLATE: &str = include_str!("../../../prompts/audit-triage.md");
 
+/// Built-in chat-triage prompt template, embedded at compile time. Used
+/// by `run_chat_triage` for the `chat-request-triage` (`propose`) flow.
+const DEFAULT_CHAT_TRIAGE_TEMPLATE: &str =
+    include_str!("../../../prompts/chat-request-triage.md");
+
 /// Literal placeholder replaced with `openspec instructions apply` output.
 const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
 const REVISION_DIFF_PLACEHOLDER: &str = "{{pr_diff}}";
@@ -54,11 +62,17 @@ const TRIAGE_FINDINGS_PLACEHOLDER: &str = "{{findings}}";
 const TRIAGE_AUDIT_TYPE_PLACEHOLDER: &str = "{{audit_type}}";
 const TRIAGE_REPO_URL_PLACEHOLDER: &str = "{{repo_url}}";
 const TRIAGE_SPECS_INDEX_PLACEHOLDER: &str = "{{canonical_specs_index}}";
+const CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER: &str = "{{request_text}}";
 
 /// Synthetic "change" name used for the triage-mode run-log path. The
 /// triage flow does not target a specific change directory; the name is
 /// only used to produce a per-run log file on disk for diagnostics.
 const TRIAGE_LOG_CHANGE_NAME: &str = "audit-triage";
+
+/// Synthetic "change" name used for the chat-triage run-log path. The
+/// `propose` flow does not target a specific change directory either;
+/// the name is only used to produce a per-run log file for diagnostics.
+const CHAT_TRIAGE_LOG_CHANGE_NAME: &str = "chat-request-triage";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -293,6 +307,18 @@ impl ClaudeCliExecutor {
         DEFAULT_TRIAGE_TEMPLATE
             .replace(TRIAGE_FINDINGS_PLACEHOLDER, &ctx.findings)
             .replace(TRIAGE_AUDIT_TYPE_PLACEHOLDER, &ctx.audit_type)
+            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
+            .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
+    }
+
+    /// Build the chat-triage prompt by substituting the three
+    /// `ChatTriageContext` payloads into the embedded
+    /// `prompts/chat-request-triage.md` template. Like `build_triage_prompt`,
+    /// this does NOT shell out to `openspec instructions apply` because the
+    /// LLM is asked to classify and explore the codebase itself.
+    fn build_chat_triage_prompt(ctx: &ChatTriageContext) -> String {
+        DEFAULT_CHAT_TRIAGE_TEMPLATE
+            .replace(CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER, &ctx.request_text)
             .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
             .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
     }
@@ -1121,6 +1147,23 @@ impl Executor for ClaudeCliExecutor {
         let outcome = outcome?;
         persist_run_log(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, TRIAGE_LOG_CHANGE_NAME, outcome)
+            .await
+    }
+
+    async fn run_chat_triage(
+        &self,
+        workspace: &Path,
+        ctx: &ChatTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let prompt = Self::build_chat_triage_prompt(ctx);
+        let _mcp_path = Self::write_mcp_config(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME)?;
+        let outcome = self
+            .run_subprocess(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
+        self.classify_outcome(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
 }

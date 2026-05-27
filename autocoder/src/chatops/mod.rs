@@ -135,6 +135,22 @@ pub trait ChatOpsBackend: Send + Sync {
         ))
     }
 
+    /// Post `text` as a top-level channel message AND return the
+    /// resulting message's `ts`. Used by the `propose` chatops verb so
+    /// the dispatcher can anchor subsequent thread replies on the bot's
+    /// own ack message (per the `chat-request-triage` spec). Backends
+    /// without threading return an error whose text names the provider.
+    async fn post_message_capturing_ts(
+        &self,
+        _channel: &str,
+        _text: &str,
+    ) -> Result<String> {
+        Err(anyhow!(
+            "backend `{}` does not support capturing a posted message's ts",
+            self.provider_name()
+        ))
+    }
+
     /// Add the reaction emoji `name` (without surrounding colons) to
     /// the message at `(channel, message_ts)`. Used by the inbound
     /// operator-commands listener to react with `?` on unrecognized

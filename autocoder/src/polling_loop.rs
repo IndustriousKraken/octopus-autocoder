@@ -81,6 +81,9 @@ pub async fn run(
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
     pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_proposal_requests: Arc<
+        std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -103,6 +106,7 @@ pub async fn run(
         pending_rebuild,
         pending_triages,
         pending_audit_runs,
+        pending_proposal_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -161,6 +165,9 @@ pub async fn run_with_hooks(
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
     pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_proposal_requests: Arc<
+        std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -269,6 +276,24 @@ pub async fn run_with_hooks(
             ),
         }
 
+        // Same housekeeping for proposal-request state files (per
+        // `chat-request-triage`). Stale entries (>7 days) are removed
+        // regardless of status so the directory stays bounded.
+        let proposal_state_root = crate::proposal_requests::default_state_root();
+        match crate::proposal_requests::prune_stale_entries(
+            &proposal_state_root,
+            chrono::Duration::days(7),
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                count = n,
+                "proposal-requests prune removed {n} stale entry(ies)"
+            ),
+            Err(e) => tracing::warn!(
+                "proposal-requests prune failed (iteration continues): {e:#}"
+            ),
+        }
+
         // Drain the per-repo on-demand audit-run queue
         // (chatops-on-demand-audit-trigger). The HashSet collapses any
         // duplicates that survived the control-socket-level de-dup
@@ -304,6 +329,34 @@ pub async fn run_with_hooks(
             tracing::error!(
                 url = snapshot_ref.url.as_str(),
                 "audit-triage processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain the per-repo proposal-request queue (chat-request-triage
+        // `propose`). Same placement contract as the audit-triage drain
+        // above: runs BEFORE the rebuild check and the pending-change
+        // walk so an operator's `propose` always gets attention this
+        // iteration. Failures inside `process_proposal_requests` are
+        // logged and never abort the surrounding iteration.
+        let proposal_requests_batch: Vec<crate::control_socket::ProposalRequest> = {
+            let mut g = pending_proposal_requests.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        if !proposal_requests_batch.is_empty()
+            && let Err(error) = process_proposal_requests(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+                &proposal_requests_batch,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                "proposal-request processing errored for {}: {error:#}",
                 snapshot_ref.url
             );
         }
@@ -3837,6 +3890,488 @@ async fn open_triage_pull_request(
     Ok(pr.html_url)
 }
 
+/// Drain handler for chat-driven proposal requests. The polling loop's
+/// `run` calls this once per iteration with the per-iteration drained
+/// queue snapshot. Each entry loads its `ProposalRequestState`, runs
+/// the chat-triage executor, and routes the outcome through:
+///   - QUESTION → post `.chat-reply.md` contents to the lifecycle
+///     thread, set status to `Discussed`.
+///   - DIRECTIVE → split the diff and open one or two PRs (reusing the
+///     same helper that powers `audit-reply-acts`), set status to
+///     `Acted`.
+///   - AskUser → leave status at `TriagePending` (existing chatops
+///     escalation posts the question into the lifecycle thread).
+///   - Failed → post a failure reply, set status to `TriageFailed`.
+///
+/// Failures inside one entry do NOT abort the others — each is processed
+/// independently.
+pub async fn process_proposal_requests(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    executor: &dyn Executor,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    requests: &[crate::control_socket::ProposalRequest],
+) -> Result<()> {
+    // Workspace preparation mirrors the audit-triage path: ensure clean
+    // base branch checkout, recreate the agent branch, so the chat-triage
+    // executor sees a known state. The downstream pass-through uses the
+    // same convention; we duplicate it here because chat-triage runs
+    // OUTSIDE the normal pass.
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
+        None => None,
+    };
+    let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
+    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+        .with_context(|| "chat-triage: workspace ensure_initialized".to_string())?;
+    let _ = crate::queue::clear_stale_locks(workspace);
+    let _ = git::reset_hard_head(workspace);
+    let _ = git::clean_force(workspace);
+    git::fetch(workspace).with_context(|| "chat-triage: git fetch".to_string())?;
+    git::checkout(workspace, &repo.base_branch)
+        .with_context(|| format!("chat-triage: checkout `{}`", repo.base_branch))?;
+    git::pull_ff_only(workspace, &repo.base_branch)
+        .with_context(|| format!("chat-triage: pull --ff-only `{}`", repo.base_branch))?;
+    git::recreate_branch(workspace, &repo.agent_branch)
+        .with_context(|| format!("chat-triage: recreate `{}`", repo.agent_branch))?;
+
+    let state_root = crate::proposal_requests::default_state_root();
+    for request in requests {
+        let mut state = match crate::proposal_requests::read_state(
+            &state_root,
+            &repo.url,
+            &request.request_id,
+        ) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    "chat-triage: no state file (entry pruned between enqueue and processing); skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    "chat-triage: state read failed: {e:#}"
+                );
+                continue;
+            }
+        };
+
+        // Flip Pending → TriagePending up front so a daemon crash mid-
+        // run is observable on disk.
+        state.status = crate::proposal_requests::ProposalRequestStatus::TriagePending;
+        let _ = crate::proposal_requests::write_state(&state_root, &state);
+
+        let canonical_specs_index = build_canonical_specs_index(workspace);
+        let ctx = crate::executor::ChatTriageContext {
+            request_text: state.request_text.clone(),
+            repo_url: state.repo_url.clone(),
+            canonical_specs_index,
+        };
+
+        tracing::info!(
+            url = %repo.url,
+            request_id = %state.request_id,
+            "chat-triage: invoking executor"
+        );
+        let outcome = executor.run_chat_triage(workspace, &ctx).await;
+        match outcome {
+            Ok(crate::executor::ExecutorOutcome::Completed { .. }) => {
+                if let Err(e) = process_completed_proposal(
+                    workspace,
+                    repo,
+                    github_cfg,
+                    chatops_ctx,
+                    &mut state,
+                )
+                .await
+                {
+                    tracing::error!(
+                        url = %repo.url,
+                        request_id = %state.request_id,
+                        "chat-triage: post-Completed processing failed: {e:#}"
+                    );
+                    mark_proposal_failed(
+                        &state_root,
+                        &mut state,
+                        format!("post-Completed processing: {e:#}"),
+                        chatops_ctx,
+                    )
+                    .await;
+                }
+            }
+            Ok(crate::executor::ExecutorOutcome::Failed { reason }) => {
+                tracing::error!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor returned Failed: {reason}"
+                );
+                mark_proposal_failed(&state_root, &mut state, reason, chatops_ctx).await;
+            }
+            Ok(crate::executor::ExecutorOutcome::AskUser { .. }) => {
+                tracing::info!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor returned AskUser; leaving status TriagePending"
+                );
+            }
+            Ok(crate::executor::ExecutorOutcome::SpecNeedsRevision { .. }) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor returned SpecNeedsRevision; treating as failure"
+                );
+                mark_proposal_failed(
+                    &state_root,
+                    &mut state,
+                    "executor flagged SpecNeedsRevision during chat-triage".to_string(),
+                    chatops_ctx,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor task errored: {e:#}"
+                );
+                mark_proposal_failed(
+                    &state_root,
+                    &mut state,
+                    format!("executor task error: {e:#}"),
+                    chatops_ctx,
+                )
+                .await;
+            }
+        }
+        // Always reset to clean working tree so the next operation isn't
+        // contaminated by leftovers. Best-effort — failures are logged.
+        if let Err(e) = git::reset_hard_head(workspace) {
+            tracing::warn!(
+                url = %repo.url,
+                "chat-triage: post-run reset_hard_head failed: {e:#}"
+            );
+        }
+        let _ = git::clean_force(workspace);
+        let _ = git::checkout(workspace, &repo.base_branch);
+    }
+    Ok(())
+}
+
+/// Handle a `Completed` chat-triage outcome. Checks for the
+/// `.chat-reply.md` marker FIRST; if present, posts the contents to the
+/// lifecycle thread and flips to `Discussed`. Otherwise runs the
+/// diff-split + two-PR creation, identical in shape to the audit-triage
+/// handler.
+async fn process_completed_proposal(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    state: &mut crate::proposal_requests::ProposalRequestState,
+) -> Result<()> {
+    use crate::proposal_requests::{self, ProposalRequestStatus};
+    let state_root = proposal_requests::default_state_root();
+
+    // 1. Marker-file check first. The `.chat-reply.md` file at the
+    //    workspace root indicates the LLM classified as QUESTION.
+    let chat_reply_path = workspace.join(".chat-reply.md");
+    if chat_reply_path.exists() {
+        let contents = match std::fs::read_to_string(&chat_reply_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    path = %chat_reply_path.display(),
+                    "chat-triage: reading .chat-reply.md failed: {e}; treating as empty"
+                );
+                String::new()
+            }
+        };
+        // Non-empty? Treat as a QUESTION outcome.
+        if !contents.trim().is_empty() {
+            let truncated = proposal_requests::truncate_chat_reply_with_pointer(
+                &contents,
+                &state.request_id,
+                proposal_requests::CHAT_REPLY_BODY_CAP,
+            );
+            if let Some(ctx) = chatops_ctx
+                && let Err(e) = ctx
+                    .chatops
+                    .post_threaded_reply(&state.channel, &state.thread_ts, &truncated)
+                    .await
+            {
+                tracing::warn!(
+                    request_id = %state.request_id,
+                    "chat-triage: posting Discussed reply failed: {e:#}"
+                );
+            }
+            // Best-effort: delete the marker.
+            if let Err(e) = std::fs::remove_file(&chat_reply_path) {
+                tracing::warn!(
+                    path = %chat_reply_path.display(),
+                    "chat-triage: removing .chat-reply.md failed: {e}"
+                );
+            }
+            // Detect any OTHER modifications and WARN + revert.
+            let porcelain = git::status_porcelain(workspace)
+                .unwrap_or_default();
+            let unexpected: Vec<String> = porcelain
+                .lines()
+                .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+                .filter(|p| !p.is_empty() && p != ".chat-reply.md")
+                .collect();
+            if !unexpected.is_empty() {
+                tracing::warn!(
+                    request_id = %state.request_id,
+                    "chat-triage: Discussed-mode run produced unexpected modifications: {unexpected:?} — reverting"
+                );
+                let _ = git::reset_hard_head(workspace);
+                let _ = git::clean_force(workspace);
+            }
+            state.status = ProposalRequestStatus::Discussed;
+            let _ = proposal_requests::write_state(&state_root, state);
+            return Ok(());
+        }
+        // Empty file: treat as "no reply"; fall through to the
+        // diff-split path (likely an empty diff too, which posts the
+        // no-action reply).
+        let _ = std::fs::remove_file(&chat_reply_path);
+    }
+
+    // 2. No `.chat-reply.md`. Proceed with the diff-split + two-PR
+    //    creation, mirroring `process_completed_triage` for audits.
+    let porcelain = git::status_porcelain(workspace)
+        .with_context(|| "chat-triage: reading post-Completed git status".to_string())?;
+    let changed: Vec<String> = porcelain
+        .lines()
+        .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let new_slug = derive_unique_chat_request_slug(workspace, &state.request_text);
+    let slug_prefix = format!("openspec/changes/{new_slug}/");
+
+    let (fixes_paths, spec_paths): (Vec<String>, Vec<String>) = changed
+        .into_iter()
+        .partition(|p| !p.starts_with(&slug_prefix));
+
+    if fixes_paths.is_empty() && spec_paths.is_empty() {
+        // Empty diff AND no chat-reply.md: post a no-action reply and
+        // flip to Acted (the LLM decided there was nothing to do).
+        if let Some(ctx) = chatops_ctx {
+            let body = format!(
+                "ℹ️ Chat-triage for `{repo_url}` completed with no actionable changes.",
+                repo_url = state.repo_url,
+            );
+            if let Err(e) = ctx
+                .chatops
+                .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    request_id = %state.request_id,
+                    "chat-triage: empty-diff thread reply failed: {e:#}"
+                );
+            }
+        }
+        state.status = ProposalRequestStatus::Acted;
+        let _ = proposal_requests::write_state(&state_root, state);
+        return Ok(());
+    }
+
+    let agent_branch = &repo.agent_branch;
+    let base_branch = &repo.base_branch;
+    git::checkout(workspace, base_branch)
+        .with_context(|| format!("chat-triage: checkout base branch `{base_branch}`"))?;
+
+    let mut fixes_pr_url: Option<String> = None;
+    let mut spec_pr_url: Option<String> = None;
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+
+    if !fixes_paths.is_empty() {
+        let fixes_branch = format!("{agent_branch}-chat-fixes");
+        git::recreate_branch(workspace, &fixes_branch)
+            .with_context(|| format!("chat-triage: recreate `{fixes_branch}`"))?;
+        for p in &fixes_paths {
+            let _ = std::process::Command::new("git")
+                .args(["add", "--", p])
+                .current_dir(workspace)
+                .status();
+        }
+        let subject = format!("chat-triage fixes (request {})", state.request_id);
+        git::commit(workspace, &subject)
+            .with_context(|| "chat-triage: commit fixes branch".to_string())?;
+        if let Err(e) = git::push_force_with_lease(workspace, &fixes_branch, push_remote) {
+            return Err(anyhow!("chat-triage: pushing fixes branch failed: {e:#}"));
+        }
+        match open_triage_pull_request(
+            repo,
+            github_cfg,
+            &fixes_branch,
+            base_branch,
+            &format!("chat-triage fixes ({})", short_request_excerpt(&state.request_text)),
+            &format!(
+                "This PR carries the code fixes for chat-driven request `{request_id}` against `{repo_url}`.\n\nOperator's request:\n\n> {request_excerpt}\n\nA companion spec PR (if any) will cross-link here.",
+                request_id = state.request_id,
+                repo_url = state.repo_url,
+                request_excerpt = short_request_excerpt(&state.request_text),
+            ),
+        )
+        .await
+        {
+            Ok(url) => fixes_pr_url = Some(url),
+            Err(e) => tracing::error!(
+                url = %repo.url,
+                "chat-triage: fixes PR creation failed: {e:#}"
+            ),
+        }
+    }
+
+    if !spec_paths.is_empty() {
+        git::checkout(workspace, base_branch)
+            .with_context(|| "chat-triage: checkout base for spec branch".to_string())?;
+        let spec_branch = format!("{agent_branch}-chat-spec");
+        git::recreate_branch(workspace, &spec_branch)
+            .with_context(|| format!("chat-triage: recreate `{spec_branch}`"))?;
+        for p in &spec_paths {
+            let _ = std::process::Command::new("git")
+                .args(["add", "--", p])
+                .current_dir(workspace)
+                .status();
+        }
+        let subject = format!("chat-triage spec proposal (request {})", state.request_id);
+        git::commit(workspace, &subject)
+            .with_context(|| "chat-triage: commit spec branch".to_string())?;
+        if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
+            return Err(anyhow!("chat-triage: pushing spec branch failed: {e:#}"));
+        }
+        let cross_link = match &fixes_pr_url {
+            Some(u) => format!(
+                "This PR carries the new spec change(s) for chat-driven request `{request_id}`. See {u} for the companion fixes PR.",
+                request_id = state.request_id,
+            ),
+            None => format!(
+                "This PR carries the new spec change(s) for chat-driven request `{request_id}` against `{repo_url}`.\n\nOperator's request:\n\n> {request_excerpt}",
+                request_id = state.request_id,
+                repo_url = state.repo_url,
+                request_excerpt = short_request_excerpt(&state.request_text),
+            ),
+        };
+        match open_triage_pull_request(
+            repo,
+            github_cfg,
+            &spec_branch,
+            base_branch,
+            &format!("chat-triage spec ({})", short_request_excerpt(&state.request_text)),
+            &cross_link,
+        )
+        .await
+        {
+            Ok(url) => spec_pr_url = Some(url),
+            Err(e) => tracing::error!(
+                url = %repo.url,
+                "chat-triage: spec PR creation failed: {e:#}"
+            ),
+        }
+    }
+
+    // Best-effort: post a thread reply summarising which PRs landed.
+    if let Some(ctx) = chatops_ctx {
+        let mut body = "✓ Chat-triage complete.".to_string();
+        if let Some(u) = &fixes_pr_url {
+            body.push_str(&format!("\nFixes PR: {u}"));
+        }
+        if let Some(u) = &spec_pr_url {
+            body.push_str(&format!("\nSpec PR: {u}"));
+        }
+        let _ = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await;
+    }
+
+    state.status = ProposalRequestStatus::Acted;
+    let _ = proposal_requests::write_state(&state_root, state);
+    Ok(())
+}
+
+/// Flip the proposal-request state to `TriageFailed` and post the
+/// failure to the request's lifecycle thread. Best-effort — every
+/// failure path here logs and continues.
+async fn mark_proposal_failed(
+    state_root: &Path,
+    state: &mut crate::proposal_requests::ProposalRequestState,
+    reason: String,
+    chatops_ctx: Option<&ChatOpsContext>,
+) {
+    use crate::proposal_requests::{self, ProposalRequestStatus};
+    state.status = ProposalRequestStatus::TriageFailed;
+    state.reason = Some(reason.clone());
+    if let Err(e) = proposal_requests::write_state(state_root, state) {
+        tracing::warn!(
+            request_id = %state.request_id,
+            "chat-triage: recording TriageFailed state failed: {e:#}"
+        );
+    }
+    if let Some(ctx) = chatops_ctx {
+        let body = format!(
+            "✗ Chat-triage for `{repo_url}` failed: {reason}",
+            repo_url = state.repo_url,
+        );
+        if let Err(e) = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await
+        {
+            tracing::warn!(
+                request_id = %state.request_id,
+                "chat-triage: TriageFailed thread reply failed: {e:#}"
+            );
+        }
+    }
+}
+
+/// Derive a unique `openspec/changes/<slug>/` path for a chat-triage
+/// run. The slug is `chat-request-<short-hash-of-request-text>`; if it
+/// already exists on disk, we append `-2`, `-3`, ... until we find a
+/// free path.
+fn derive_unique_chat_request_slug(workspace: &Path, request_text: &str) -> String {
+    let hash = short_findings_hash(request_text);
+    let base_slug = format!("chat-request-{hash}");
+    let mut slug = base_slug.clone();
+    let mut suffix = 2u32;
+    while workspace.join("openspec/changes").join(&slug).exists() {
+        slug = format!("{base_slug}-{suffix}");
+        suffix += 1;
+        if suffix > 100 {
+            break;
+        }
+    }
+    slug
+}
+
+/// Render a short single-line excerpt of the operator's request for PR
+/// titles. Replaces internal newlines with spaces and truncates at 60
+/// chars with a trailing `…`.
+fn short_request_excerpt(request_text: &str) -> String {
+    let one_line = request_text.replace('\n', " ");
+    let cleaned: String = one_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= 60 {
+        cleaned
+    } else {
+        let mut out: String = cleaned.chars().take(60).collect();
+        out.push('…');
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5465,6 +6000,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -5665,6 +6201,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -9185,6 +9722,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),

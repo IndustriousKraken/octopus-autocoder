@@ -417,6 +417,49 @@ impl ChatOpsBackend for SlackBackend {
         Ok(())
     }
 
+    async fn post_message_capturing_ts(
+        &self,
+        channel: &str,
+        text: &str,
+    ) -> Result<String> {
+        let url = format!(
+            "{}/chat.postMessage",
+            self.api_base.trim_end_matches('/')
+        );
+        let payload = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("slack post_message_capturing_ts request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "slack post_message_capturing_ts http {status}"
+            ));
+        }
+        let parsed: PostMessageResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("slack post_message_capturing_ts decode failed: {e}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "slack post_message_capturing_ts failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        parsed.ts.ok_or_else(|| {
+            anyhow!("slack post_message_capturing_ts response missing ts")
+        })
+    }
+
     async fn add_reaction(
         &self,
         channel: &str,
@@ -1162,6 +1205,11 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
             {
                 tracing::warn!("slack inbound: add_reaction failed: {e}");
             }
+        }
+        Some(Reply::Silent) => {
+            // The dispatcher posted its own chat side-effects (the
+            // `propose` verb posts a top-level ack itself). No listener
+            // action — neither a threaded reply nor a `?` reaction.
         }
         Some(Reply::Sync(text)) | Some(Reply::Acked { ack_text: text, .. }) => {
             if let Err(e) = surface

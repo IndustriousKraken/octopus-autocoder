@@ -80,6 +80,12 @@ pub enum Reply {
         ack_text: String,
         job_id: uuid::Uuid,
     },
+    /// The dispatcher handled all chat side-effects internally (posting
+    /// its own ack via the chatops backend). The listener should take no
+    /// further action — neither a threaded reply nor a `?` reaction.
+    /// Used by the `propose` verb whose ack must be a top-level message
+    /// in the channel whose `ts` becomes the request's lifecycle thread.
+    Silent,
 }
 
 // ====================================================================
@@ -119,6 +125,10 @@ const MAX_REPO_SUBSTRING_LEN: usize = 128;
 /// Reasonable upper bound on an audit-substring arg. Same shape as a
 /// change-slug: alphanumerics + `_` + `-`, cap at 64 chars.
 const MAX_AUDIT_SUBSTRING_LEN: usize = 64;
+/// Cap on the free-form request text accepted by the `propose` verb.
+/// Operators wanting more than this should put it in an issue/doc and
+/// reference it; the cap keeps the inbound dispatch path bounded.
+pub const MAX_PROPOSE_REQUEST_TEXT_LEN: usize = 10_000;
 
 fn change_slug_regex() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
@@ -150,6 +160,27 @@ fn invalid_repo_substring_reply() -> Reply {
 fn invalid_audit_substring_reply() -> Reply {
     Reply::Sync(format!(
         "✗ invalid audit substring (must match ^[a-zA-Z0-9_-]+$, max {MAX_AUDIT_SUBSTRING_LEN} chars)"
+    ))
+}
+
+fn missing_request_text_reply() -> Reply {
+    Reply::Sync(
+        "✗ propose: missing request text. Usage: @<bot> propose <repo> <free-form description>"
+            .to_string(),
+    )
+}
+
+fn missing_repo_substring_reply() -> Reply {
+    Reply::Sync(
+        "✗ propose: missing repo-substring. Usage: @<bot> propose <repo> <free-form description>"
+            .to_string(),
+    )
+}
+
+fn oversize_request_text_reply() -> Reply {
+    Reply::Sync(format!(
+        "✗ propose: request text exceeds {MAX_PROPOSE_REQUEST_TEXT_LEN} characters. \
+         Put longer descriptions in an issue or doc and reference it in a shorter request."
     ))
 }
 
@@ -216,6 +247,18 @@ pub enum OperatorCommand {
     AuditNow {
         audit_substring: String,
         repo_substring: String,
+    },
+    /// `@<bot> propose <repo-substring> <free-form text>` — queue a
+    /// chat-driven triage request against the matched repo. The
+    /// dispatcher posts a top-level ack message in the channel (whose
+    /// `ts` becomes the request's lifecycle thread), writes a
+    /// `ProposalRequestState` file, and submits a
+    /// `queue_proposal_request` control-socket action so the next
+    /// polling iteration runs the triage. See `proposal_requests` for
+    /// the state-file shape and lifecycle.
+    ProposeRequest {
+        repo_substring: String,
+        request_text: String,
     },
     Help,
 }
@@ -390,6 +433,49 @@ fn parse_command_outcome_in_thread(
                 return ParseOutcome::None;
             }
             ParseOutcome::Ok(OperatorCommand::Help)
+        }
+        "propose" => {
+            // `@<bot> propose <repo-substring> <free-form text>` — the
+            // repo substring is the first whitespace-separated token
+            // after `propose`; the request text is everything after
+            // that, preserving internal whitespace/newlines, with only
+            // leading/trailing whitespace trimmed. The parser keys off
+            // the body string directly (not `rest`) so multi-line
+            // request text doesn't collapse.
+            //
+            // The body shape is:
+            //     after_mention = "propose <substring> <free-form...>"
+            // After stripping the verb literal we have:
+            //     body = " <substring> <free-form...>"
+            // Find the first whitespace-bounded token (the substring)
+            // and consume everything after the FIRST whitespace
+            // boundary following it as the request text.
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..];
+            // Skip leading whitespace before the substring.
+            let after_verb = after_verb.trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(missing_repo_substring_reply());
+            }
+            // Find end of the substring (first whitespace char).
+            let sub_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let repo_substring = &after_verb[..sub_end];
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let rest_after_sub = after_verb[sub_end..].trim();
+            if rest_after_sub.is_empty() {
+                return ParseOutcome::Invalid(missing_request_text_reply());
+            }
+            if rest_after_sub.chars().count() > MAX_PROPOSE_REQUEST_TEXT_LEN {
+                return ParseOutcome::Invalid(oversize_request_text_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::ProposeRequest {
+                repo_substring: repo_substring.to_string(),
+                request_text: rest_after_sub.to_string(),
+            })
         }
         "send" => {
             // `@<bot> send it` parses ONLY when the inbound message
@@ -1062,6 +1148,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `confirm` — second step for `wipe-workspace` (same channel, within 60s)\n");
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
+    out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -1304,11 +1391,22 @@ pub struct OperatorCommandDispatcher {
     /// Defaults to `crate::audits::threads::default_state_root()` —
     /// tests override via `with_audit_thread_state_dir`.
     audit_thread_state_dir: PathBuf,
+    /// Directory under which proposal-request state files live (the
+    /// dispatcher writes `<proposal_request_state_dir>/proposal-requests/<repo-sanitized>/<request_id>.json`
+    /// in the `propose` branch). Defaults to
+    /// `crate::proposal_requests::default_state_root()`.
+    proposal_request_state_dir: PathBuf,
     /// Registered audit-type names. The `AuditNow` branch uses these to
     /// resolve operator-supplied audit substrings. Defaults to empty;
     /// the daemon's `cli/run.rs` wires the live registry's
     /// `known_type_names()` in via `with_audit_types`.
     audit_types: Vec<String>,
+    /// Optional ChatOps backend handle. The `propose` branch uses this
+    /// to post a top-level ack message AND capture its `ts` so the
+    /// returned ts becomes the proposal-request's lifecycle thread.
+    /// When `None` (some test paths), the `propose` branch returns a
+    /// `Reply::Sync(...)` failure noting chatops is not configured.
+    chatops: Option<std::sync::Arc<dyn crate::chatops::ChatOpsBackend>>,
 }
 
 impl Default for OperatorCommandDispatcher {
@@ -1322,7 +1420,10 @@ impl OperatorCommandDispatcher {
         Self {
             pending: ConfirmationStore::new(),
             audit_thread_state_dir: crate::audits::threads::default_state_root(),
+            proposal_request_state_dir:
+                crate::proposal_requests::default_state_root(),
             audit_types: Vec::new(),
+            chatops: None,
         }
     }
 
@@ -1332,6 +1433,26 @@ impl OperatorCommandDispatcher {
     #[allow(dead_code)]
     pub fn with_audit_thread_state_dir(mut self, dir: PathBuf) -> Self {
         self.audit_thread_state_dir = dir;
+        self
+    }
+
+    /// Override the proposal-request state directory. Tests use this
+    /// the same way `with_audit_thread_state_dir` is used.
+    #[allow(dead_code)]
+    pub fn with_proposal_request_state_dir(mut self, dir: PathBuf) -> Self {
+        self.proposal_request_state_dir = dir;
+        self
+    }
+
+    /// Inject the ChatOps backend the `propose` branch uses to post its
+    /// top-level ack and capture the resulting `ts`. Production wiring
+    /// (in `cli/run.rs`) installs the live backend; tests pass a mock
+    /// that records the post and returns a deterministic ts.
+    pub fn with_chatops(
+        mut self,
+        chatops: std::sync::Arc<dyn crate::chatops::ChatOpsBackend>,
+    ) -> Self {
+        self.chatops = Some(chatops);
         self
     }
 
@@ -1363,9 +1484,10 @@ impl OperatorCommandDispatcher {
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> Option<Reply> {
-        self.handle_message_in_thread(
+        self.handle_message_with_context(
             text,
             channel_id,
+            None,
             None,
             bot_mention,
             repositories,
@@ -1378,6 +1500,7 @@ impl OperatorCommandDispatcher {
     /// so the `send it` verb (which only parses inside a thread) sees
     /// the inbound envelope's `thread_ts`. Pass `None` for channel-level
     /// mentions; pass `Some(&str)` (non-empty) for replies in a thread.
+    #[allow(dead_code)] // used by tests; production path goes via handle_message_with_context
     pub async fn handle_message_in_thread(
         &self,
         text: &str,
@@ -1387,7 +1510,49 @@ impl OperatorCommandDispatcher {
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> Option<Reply> {
+        self.handle_message_with_context(
+            text,
+            channel_id,
+            thread_ts,
+            None,
+            bot_mention,
+            repositories,
+            submitter,
+        )
+        .await
+    }
+
+    /// Most-comprehensive entry point. Accepts both `thread_ts` (for
+    /// verbs whose recognition depends on threading, e.g. `send it`)
+    /// AND `operator_user` (for verbs whose state files record who
+    /// issued the command, e.g. `propose`). Existing call sites that
+    /// don't have one or both pass `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_message_with_context(
+        &self,
+        text: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        operator_user: Option<&str>,
+        bot_mention: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<Reply> {
         match parse_command_outcome_in_thread(text, bot_mention, thread_ts) {
+            ParseOutcome::Ok(OperatorCommand::ProposeRequest {
+                repo_substring,
+                request_text,
+            }) => Some(
+                self.dispatch_propose_request(
+                    &repo_substring,
+                    &request_text,
+                    channel_id,
+                    operator_user,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, repositories, submitter).await,
             )),
@@ -1636,7 +1801,146 @@ impl OperatorCommandDispatcher {
                 .await
             }
             OperatorCommand::Help => format_help_reply(),
+            // The `propose` verb is routed via `handle_message_with_context`
+            // BEFORE reaching this dispatch fn, because its side effects
+            // (posting a top-level ack via chatops, writing a state file)
+            // produce a `Reply::Silent` that doesn't fit the `String`-
+            // returning shape of this method. Reaching this arm means an
+            // upstream change forgot to route — fail loudly.
+            OperatorCommand::ProposeRequest { .. } => {
+                "✗ propose: internal routing error (the dispatcher saw \
+                 ProposeRequest in the String-returning dispatch fn). \
+                 Please file a bug."
+                    .to_string()
+            }
         }
+    }
+
+    /// Handle the `propose` verb. Resolves the repo, posts a top-level
+    /// ack message via the configured chatops backend (capturing the
+    /// ack's `ts` as the request's lifecycle thread), writes a
+    /// `ProposalRequestState` file with `status: Pending`, and submits a
+    /// `queue_proposal_request` control-socket action so the next
+    /// polling iteration picks up the request. Returns `Reply::Silent`
+    /// on success (the dispatcher has already posted the ack) and
+    /// `Reply::Sync(...)` on every failure shape so the operator's
+    /// `propose` message gets a threaded reply explaining what went
+    /// wrong.
+    async fn dispatch_propose_request(
+        &self,
+        repo_substring: &str,
+        request_text: &str,
+        channel_id: &str,
+        operator_user: Option<&str>,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        // 1. Repo substring resolution.
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+
+        // 2. Generate a fresh request_id.
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // 3. Build the ack text. The trailing "Follow along in this thread."
+        //    is mandatory per spec so operators know subsequent updates
+        //    will land in the thread.
+        let ack_text = format!(
+            "✓ Queued proposal request for {repo_url}. \
+             The next polling iteration will run it. Follow along in this thread.",
+            repo_url = repo.url,
+        );
+
+        // 4. Post the ack via the chatops backend and capture the `ts`.
+        //    Without chatops we cannot produce the lifecycle thread anchor
+        //    the spec requires — surface that as an error reply.
+        let backend = match self.chatops.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                return Reply::Sync(
+                    "✗ propose: chatops backend not configured; cannot post the proposal-request ack"
+                        .to_string(),
+                );
+            }
+        };
+        let ack_ts = match backend.post_message_capturing_ts(channel_id, &ack_text).await {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!("propose: backend post_message_capturing_ts failed: {e:#}");
+                return Reply::Sync(format!(
+                    "✗ propose: could not post ack to chat: {e}"
+                ));
+            }
+        };
+
+        // 5. Write the state file.
+        let state = crate::proposal_requests::ProposalRequestState {
+            request_id: request_id.clone(),
+            repo_url: repo.url.clone(),
+            channel: channel_id.to_string(),
+            thread_ts: ack_ts.clone(),
+            ack_message_ts: ack_ts.clone(),
+            operator_user: operator_user.unwrap_or("").to_string(),
+            request_text: request_text.to_string(),
+            submitted_at: chrono::Utc::now(),
+            status: crate::proposal_requests::ProposalRequestStatus::Pending,
+            reason: None,
+        };
+        if let Err(e) =
+            crate::proposal_requests::write_state(&self.proposal_request_state_dir, &state)
+        {
+            tracing::warn!(request_id = %request_id, "propose: write_state failed: {e:#}");
+            // Best-effort: tell the chat thread the ack landed but the
+            // state file didn't.
+            if let Err(reply_err) = backend
+                .post_threaded_reply(
+                    channel_id,
+                    &ack_ts,
+                    &format!("✗ propose: could not persist state file: {e}"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "propose: subsequent thread reply for state-write failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        // 6. Submit the queue_proposal_request control-socket action.
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "queue_proposal_request",
+                "url": repo.url,
+                "request_id": request_id,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            // Tell the operator in the thread.
+            let body = format!("✗ propose: could not enqueue proposal-request: {err}");
+            if let Err(reply_err) = backend
+                .post_threaded_reply(channel_id, &ack_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    "propose: subsequent thread reply for queue failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        Reply::Silent
     }
 
     /// Handle the `audit` verb. Resolves the audit substring against the
@@ -4694,5 +4998,384 @@ mod tests {
             2,
             "{text}"
         );
+    }
+
+    // ---------- propose verb (chat-request-triage) ----------
+
+    /// Test ChatOpsBackend that records every post and returns a
+    /// deterministic ts. Suitable for driving the propose dispatcher's
+    /// post-then-state-file path without a real backend.
+    struct FakeChatOpsBackend {
+        posts: Mutex<Vec<(String, String)>>,
+        threaded_replies: Mutex<Vec<(String, String, String)>>,
+        capture_ts: String,
+        // Force `post_message_capturing_ts` to fail with this error
+        // (for "backend post failed" tests).
+        capture_should_fail: Mutex<bool>,
+    }
+
+    impl FakeChatOpsBackend {
+        fn new(capture_ts: &str) -> Self {
+            Self {
+                posts: Mutex::new(Vec::new()),
+                threaded_replies: Mutex::new(Vec::new()),
+                capture_ts: capture_ts.to_string(),
+                capture_should_fail: Mutex::new(false),
+            }
+        }
+
+        fn force_capture_failure(&self) {
+            *self.capture_should_fail.lock().unwrap() = true;
+        }
+    }
+
+    #[async_trait]
+    impl crate::chatops::ChatOpsBackend for FakeChatOpsBackend {
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+        fn is_experimental(&self) -> bool {
+            false
+        }
+        async fn post_question(
+            &self,
+            _channel: &str,
+            _change: &str,
+            _question: &str,
+        ) -> anyhow::Result<String> {
+            Ok("fake-question-id".to_string())
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _channel: &str,
+            _handle: &str,
+        ) -> anyhow::Result<Option<crate::chatops::HumanReply>> {
+            Ok(None)
+        }
+        async fn post_notification(&self, _channel: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_threaded_reply(
+            &self,
+            channel: &str,
+            thread_ts: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.threaded_replies.lock().unwrap().push((
+                channel.to_string(),
+                thread_ts.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
+        async fn post_message_capturing_ts(
+            &self,
+            channel: &str,
+            text: &str,
+        ) -> anyhow::Result<String> {
+            if *self.capture_should_fail.lock().unwrap() {
+                return Err(anyhow::anyhow!("simulated capture failure"));
+            }
+            self.posts
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), text.to_string()));
+            Ok(self.capture_ts.clone())
+        }
+    }
+
+    fn unwrap_silent(reply: Reply) {
+        match reply {
+            Reply::Silent => {}
+            other => panic!("expected Silent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_happy_path() {
+        let cmd = parse_command(&format!("{BOT} propose myrepo add a healthz endpoint"), BOT)
+            .unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ProposeRequest {
+                repo_substring: "myrepo".into(),
+                request_text: "add a healthz endpoint".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_propose_case_insensitive_verb() {
+        for verb in ["propose", "Propose", "PROPOSE", "ProPosE"] {
+            let cmd = parse_command(&format!("{BOT} {verb} myrepo add X"), BOT)
+                .unwrap_or_else(|| panic!("{verb} should parse"));
+            assert_eq!(
+                cmd,
+                OperatorCommand::ProposeRequest {
+                    repo_substring: "myrepo".into(),
+                    request_text: "add X".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_propose_missing_request_text_via_parse_command_returns_none() {
+        // parse_command turns Invalid into None — the dispatcher path
+        // exercises the error reply directly (see the
+        // dispatch_propose_missing_request_text_returns_error test).
+        assert!(parse_command(&format!("{BOT} propose myrepo"), BOT).is_none());
+        // Trailing whitespace doesn't count as text.
+        assert!(parse_command(&format!("{BOT} propose myrepo   "), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_propose_missing_repo_substring_returns_none() {
+        assert!(parse_command(&format!("{BOT} propose"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} propose   "), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_propose_preserves_multiline_text() {
+        let msg = format!(
+            "{BOT} propose myrepo line1\nline2\n\nthird para after blank"
+        );
+        let cmd = parse_command(&msg, BOT).expect("multi-line must parse");
+        match cmd {
+            OperatorCommand::ProposeRequest {
+                repo_substring,
+                request_text,
+            } => {
+                assert_eq!(repo_substring, "myrepo");
+                assert_eq!(request_text, "line1\nline2\n\nthird para after blank");
+            }
+            other => panic!("expected ProposeRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_over_cap_returns_invalid() {
+        // 10,001-char request text — over the cap. The dispatcher must
+        // surface the error reply; through `parse_command` we just see
+        // None.
+        let big: String = std::iter::repeat_n('a', MAX_PROPOSE_REQUEST_TEXT_LEN + 1).collect();
+        let msg = format!("{BOT} propose myrepo {big}");
+        assert!(
+            parse_command(&msg, BOT).is_none(),
+            "oversize text must fail parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_happy_path_posts_ack_and_writes_state_and_submits_action() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748399999.001234"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_proposal_request",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        let reply = dispatcher
+            .handle_message_with_context(
+                &format!("{BOT} propose myrepo add a /healthz endpoint"),
+                "C_OPS",
+                None,
+                Some("U_RAB"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("propose must produce a reply");
+        unwrap_silent(reply);
+
+        // Backend captured the top-level ack post.
+        let posts = backend.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "exactly one top-level ack post: {posts:?}");
+        let (channel, ack_text) = &posts[0];
+        assert_eq!(channel, "C_OPS");
+        assert!(ack_text.starts_with("✓ Queued proposal request for "), "{ack_text}");
+        assert!(
+            ack_text.contains("git@github.com:acme/myrepo.git"),
+            "{ack_text}"
+        );
+        assert!(ack_text.contains("Follow along in this thread."), "{ack_text}");
+
+        // Exactly one control-socket action was submitted.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_proposal_request");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        let request_id = calls[0]["request_id"]
+            .as_str()
+            .expect("action carries request_id")
+            .to_string();
+
+        // State file exists with the expected fields.
+        let st = crate::proposal_requests::read_state(
+            tmp.path(),
+            "git@github.com:acme/myrepo.git",
+            &request_id,
+        )
+        .unwrap()
+        .expect("state file present");
+        assert_eq!(st.thread_ts, "1748399999.001234");
+        assert_eq!(st.ack_message_ts, "1748399999.001234");
+        assert_eq!(st.channel, "C_OPS");
+        assert_eq!(st.operator_user, "U_RAB");
+        assert_eq!(st.request_text, "add a /healthz endpoint");
+        assert_eq!(
+            st.status,
+            crate::proposal_requests::ProposalRequestStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_ambiguous_repo_returns_be_more_specific_no_post() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        // Both fixture repos contain the substring "acme" → ambiguous.
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose acme add X"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("be more specific"), "{text}");
+        // No backend posts, no control-socket action, no state file.
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_no_repo_match_returns_no_match_no_post() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose nonexistent add X"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("nonexistent"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_missing_request_text_returns_error() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher =
+            OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("missing-text propose must produce an error reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("missing request text"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_oversize_text_returns_error() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher =
+            OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let big: String = std::iter::repeat_n('a', MAX_PROPOSE_REQUEST_TEXT_LEN + 1).collect();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose myrepo {big}"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("oversize-text propose must produce an error reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("10000"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_without_chatops_backend_returns_error() {
+        // No `.with_chatops(...)` call → the dispatcher cannot post the
+        // top-level ack so it surfaces an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_proposal_request_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose myrepo add X"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("chatops backend not configured"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_backend_post_failure_returns_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        backend.force_capture_failure();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} propose myrepo add X"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("could not post ack"), "{text}");
+        // No control-socket call submitted on backend failure.
+        assert!(submitter.calls().is_empty());
     }
 }
