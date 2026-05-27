@@ -892,7 +892,23 @@ impl ClaudeCliExecutor {
         // status so an agent that exits non-zero after flagging is still
         // honored, and so the dispatcher's no-diff-Failed fallback never
         // sees the workspace ahead of the signal.
-        if let Some(payload) = Self::extract_outcome_sentinel(&outcome.stdout) {
+        //
+        // Scope-narrow the sentinel scan to the FINAL ANSWER (the
+        // `result`-event text in JSON streaming mode) when available,
+        // falling back to full stdout in text-mode opt-out. The
+        // sentinel is meant to be the agent's deliberate signal at
+        // end-of-run, NOT something autocoder false-positives on when
+        // the agent's tool_result content (e.g. a Read of
+        // `prompts/implementer.md`) happens to contain the documented
+        // marker text. The marker appears as documentation in this very
+        // file's prompt template, so any Read of it during streaming
+        // captures the documentation into stdout and used to confuse
+        // the parser.
+        let sentinel_source: &str = outcome
+            .final_answer
+            .as_deref()
+            .unwrap_or(&outcome.stdout);
+        if let Some(payload) = Self::extract_outcome_sentinel(sentinel_source) {
             match Self::try_parse_spec_needs_revision(&payload) {
                 Ok(Some(spec_revision)) => return Ok(spec_revision),
                 Ok(None) => {
