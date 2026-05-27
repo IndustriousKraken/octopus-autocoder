@@ -102,8 +102,68 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     }
 
     openspec_preflight()?;
-    workspace::detect_collisions(&cfg.repositories)?;
-    validate_github_token_routes(&cfg.github, &cfg.repositories)?;
+
+    // Shared startup-time validation: schema, token-route, workspace
+    // collision, audit slug, path collision, secret source. Errors block
+    // startup with an aggregated message; warnings log and continue.
+    // The same `validate_config` function powers `autocoder check-config`
+    // so the two surfaces never drift.
+    let report = crate::config::validate_config(&cfg);
+    for w in &report.warnings {
+        tracing::warn!(
+            category = w.category.slug(),
+            pointer = w.config_pointer.as_deref().unwrap_or(""),
+            "{}",
+            w.message
+        );
+    }
+    if report.has_errors() {
+        let mut msg = format!(
+            "startup config validation failed with {} error(s):",
+            report.errors.len()
+        );
+        for e in &report.errors {
+            msg.push_str("\n  - ");
+            msg.push_str(e.category.slug());
+            msg.push_str(": ");
+            msg.push_str(&e.message);
+        }
+        return Err(anyhow!(msg));
+    }
+
+    // Per-repo startup info log naming the resolved token source. Preserved
+    // from the pre-validate_config validate_github_token_routes path so
+    // operators still see one info line per repo at startup.
+    for repo in &cfg.repositories {
+        let owner = match parse_repo_url(&repo.url) {
+            Ok((o, _r)) => o,
+            Err(_) => continue,
+        };
+        if let Ok((_value, source_desc)) = resolve_token_with_source(&cfg.github, &owner) {
+            tracing::info!(
+                "repository {} will use GitHub token from {}",
+                repo.url,
+                source_desc
+            );
+        }
+    }
+    // Precedence advisory: if `github.token` is inline AND `github.token_env`
+    // is also set, the inline value wins; tell the operator their env var is
+    // being ignored on this field.
+    if cfg
+        .github
+        .token
+        .as_ref()
+        .map(|s| s.is_inline())
+        .unwrap_or(false)
+        && std::env::var(&cfg.github.token_env).is_ok()
+    {
+        tracing::warn!(
+            "github.token (inline) takes precedence; env var `{}` is being ignored for the global GitHub token",
+            cfg.github.token_env
+        );
+    }
+
     if cfg.github.recreate_fork_on_reinit && cfg.github.fork_owner.is_none() {
         tracing::info!(
             "github.recreate_fork_on_reinit is true but fork_owner is unset; flag will have no effect"
