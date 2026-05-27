@@ -285,6 +285,16 @@ sudo cp target/release/autocoder /usr/local/bin/autocoder
 sudo systemctl restart autocoder
 ```
 
+**Previewing release notes before tagging.** Operators about to push a new release tag can preview the changelog locally to confirm the harvested `## Why` paragraphs read sensibly before the GitHub release publishes:
+
+```bash
+# From inside an autocoder checkout — emits the markdown that the release
+# workflow will publish as the GitHub Release body.
+autocoder changelog --since v0.4.0 --to HEAD
+```
+
+See [docs/CLI.md `changelog`](CLI.md#changelog) for the full flag surface, frontmatter overrides (`changelog: skip`, `changelog.summary: "..."`), and the cross-project usage path (`--workspace <path>` from the daemon host).
+
 If you were on an older version that installed under `/usr/local/bin/openspec-orchestrator` or used a service unit named `openspec-orchestrator.service`, remove those before installing the rename:
 
 ```bash

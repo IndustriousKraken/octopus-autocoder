@@ -154,6 +154,135 @@ autocoder audit run --workspace /path/to/checkout --audit architecture_brightlin
 
 Exit codes: 0 on success (queue ack OR standalone success), non-zero on any error (unknown audit, daemon refused the request, audit `run` errored, …).
 
+## `changelog`
+
+Harvest a release-notes changelog from the OpenSpec archive of a workspace. The subcommand walks `openspec/changes/archive/`, finds archive directories added between two git refs, pulls the first paragraph of `## Why` from each archive's `proposal.md` (or a frontmatter override), groups entries by primary affected capability, and emits markdown (default) or JSON to stdout.
+
+```bash
+# Default: changelog since the most recent tag on HEAD's ancestry,
+# emitted as markdown to stdout.
+autocoder changelog
+
+# Bound the range explicitly.
+autocoder changelog --since v0.3.0 --to v0.4.0
+
+# First-release run when no tags exist yet:
+autocoder changelog --since ever --to HEAD
+
+# Run against a different OpenSpec checkout (or a daemon-managed workspace):
+autocoder changelog --workspace /tmp/workspaces/github_com_acme_widgets
+```
+
+It is a pure-data extractor: no LLM involvement, no mutation, no daemon work, no external network. Same archive contents + same tag range produce the same output every invocation. The harvested prose is the operator's own — the `## Why` paragraphs already written in OpenSpec proposals.
+
+**Flags:**
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--workspace <path>` | current working directory | Directory containing `openspec/changes/archive/`. Set this to run the subcommand against a managed workspace from the daemon host (see [Workspace path derivation](OPERATIONS.md#workspace-path-derivation) for the `<cache_dir>/workspaces/<sanitized-url>/` path layout). |
+| `--since <tag-or-sentinel>` | most recent tag on `HEAD`'s ancestry (`git describe --tags --abbrev=0 HEAD`) | Lower bound (exclusive). The literal value `ever` is a sentinel meaning "from the beginning of archive history" — explicit form for first-release runs. |
+| `--to <tag-or-ref>` | `HEAD` | Upper bound (inclusive). |
+| `--format markdown\|json` | `markdown` | Output shape. |
+
+**No-tags fallback.** When `--since` is unset AND `git describe` exits non-zero (no tags exist on `HEAD`'s ancestry), the subcommand falls back to `ever` AND emits one INFO line to stderr:
+
+```
+No tags found in this repo; emitting full archive history. Pass --since ever to suppress this notice.
+```
+
+Exit code is `0` regardless — operators get useful output on the first-release case without inventing a fake tag. Passing `--since ever` explicitly suppresses the INFO line (the INFO line only fires under the implicit fallback path).
+
+**Frontmatter overrides.** A change's `openspec/changes/<slug>/proposal.md` MAY carry YAML frontmatter that the extractor honors:
+
+```markdown
+---
+changelog: skip                    # this change does not appear in the changelog
+# OR
+changelog: internal                # alias for `skip`
+# OR
+changelog: hidden                  # alias for `skip`
+# OR
+changelog:
+  summary: "One-line override for the changelog entry"
+---
+## Why
+...
+```
+
+- **No frontmatter** OR no `changelog:` field → default behavior: use the first paragraph of `## Why` as the entry summary.
+- **`changelog: skip`** (or `internal`, `hidden`) → omit the change from the entries list AND record it in the JSON `skipped` array OR a markdown `### Skipped` footer.
+- **`changelog: { summary: "..." }`** → use the override summary verbatim instead of the first-`## Why` paragraph.
+- **Unrecognized value** → emit a WARN to stderr naming the value, then fall through to default behavior.
+
+The frontmatter is harmless when no extractor reads it; pre-spec proposals work unchanged.
+
+**Range filtering.** Archive discovery uses git addition commits (`git log --diff-filter=A ... -- openspec/changes/archive/`), NOT the directory name's date prefix. An archive appears in the output if and only if its addition commit is reachable from `--to` but not from `--since`. The directory's `YYYY-MM-DD` prefix is used only for the entry's `shipped_date` field, so a manually-renamed archive directory does not affect what changelogs include.
+
+**Markdown output shape:**
+
+```markdown
+## v0.4.0 — 2026-05-28
+
+### chatops-manager
+- **Chat-driven proposals via `@<bot> propose`** (chat-request-triage) — Operators can now ask autocoder to act on a free-form request from chat. The agent classifies the request as DIRECTIVE, QUESTION, or AMBIGUOUS and produces a fixes PR and/or a spec PR.
+- **Audit-finding triage via `@<bot> send it`** (audit-reply-acts) — Reply inside an audit's threaded findings to spawn a triage run.
+
+### orchestrator-cli
+- **Streaming JSON output capture** (executor-streams-output-incrementally) — Per-change logs gain PROMPT / ACTIONS / FINAL ANSWER / STDERR sections.
+
+### Skipped
+- `internal-only-refactor` — changelog: skip
+```
+
+Entries group under `### <capability>` where `<capability>` is the alphabetically-first directory under the change's `specs/` tree. The bullet form is `- **<summary-first-line>** (<slug>) — <rest-of-summary-if-any>`. The slug parenthetical is the archive directory's name with the date prefix stripped, so a reader can grep back to the source proposal. Archives without spec deltas group under `### Other`. Skipped entries (frontmatter `skip` / `internal` / `hidden`) appear in a `### Skipped` footer when at least one was skipped.
+
+**JSON output shape:**
+
+```json
+{
+  "version": "v0.4.0",
+  "date": "2026-05-28",
+  "since": "v0.3.0",
+  "to": "HEAD",
+  "entries": [
+    {
+      "slug": "chat-request-triage",
+      "archive_dir": "/tmp/workspaces/.../openspec/changes/archive/2026-05-22-chat-request-triage",
+      "primary_capability": "chatops-manager",
+      "summary": "Chat-driven proposals via @<bot> propose...",
+      "shipped_commit": "abc123def456...",
+      "shipped_date": "2026-05-22"
+    }
+  ],
+  "skipped": [
+    { "slug": "internal-only-refactor", "reason": "changelog: skip" }
+  ]
+}
+```
+
+Pretty-printed with 2-space indents for human readability AND scripting alike. Downstream tooling (e.g. an LLM-stylist that produces a hand-edited `CHANGELOG.md`) consumes the JSON variant; the markdown variant is what the release workflow ships as the GitHub Release body.
+
+**Cross-project usage.** The subcommand's only invariants are `openspec/changes/archive/` existing AND a git history in the workspace — it works against any OpenSpec checkout, not just autocoder's own repo. Two common patterns:
+
+1. **From inside any OpenSpec checkout** (operator's laptop, a CI runner):
+
+   ```bash
+   cd /path/to/some-other-openspec-repo
+   autocoder changelog --since v1.4.0
+   ```
+
+2. **From the daemon host pointing at a managed workspace** (no `cd` needed):
+
+   ```bash
+   sudo -u autocoder autocoder changelog \
+       --workspace /tmp/workspaces/github_com_acme_widgets \
+       --since v2.0.0
+   ```
+
+   The managed-workspace path layout under `<cache_dir>/workspaces/<sanitized-url>/` is documented in [Workspace path derivation](OPERATIONS.md#workspace-path-derivation).
+
+**Release workflow integration.** `.github/workflows/release.yml` invokes `autocoder changelog --since <previous-tag> --to <new-tag>` between the test gate AND the publish step AND passes the output to the GitHub Release body. A failing changelog generation does NOT block the binary release — the workflow logs the error, writes an empty notes file, and continues. The binary upload is the primary artifact; notes are a best-effort enhancement.
+
 ## `rewind`
 
 Discard the in-flight agent branch and re-queue one or more archived changes. Use this when an agent produced unusable work or a PR was rejected and you want the daemon to try again.

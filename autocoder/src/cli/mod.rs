@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod audit;
+pub mod changelog;
 pub mod check_config;
 pub mod install;
 pub mod reload;
@@ -117,6 +118,14 @@ pub enum Command {
         command: AuditSubcommand,
     },
 
+    /// Harvest a release-notes changelog from the OpenSpec archive of a
+    /// workspace. Walks `openspec/changes/archive/`, finds archive
+    /// directories added within a tag range, and renders markdown (default)
+    /// or JSON to stdout. Pure-data extractor: no LLM, no mutation, no
+    /// daemon work. Same archive contents + same tag range produce the
+    /// same output every invocation.
+    Changelog(changelog::ChangelogArgs),
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -162,6 +171,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             })
             .await
         }
+        Command::Changelog(args) => changelog::execute(args).await,
         Command::Audit { command } => match command {
             AuditSubcommand::Run { workspace, audit } => {
                 audit::execute(workspace, audit).await
