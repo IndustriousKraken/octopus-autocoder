@@ -440,6 +440,40 @@ This is intentional: stale audit findings probably no longer reflect the current
 
 **Revising the produced PRs.** Both the fixes PR and the spec PR are normal autocoder-opened PRs. They participate in the existing `a01-pr-comment-revision-loop`, so `@<bot> revise <text>` on either PR gets revisions through the standard channel. If the agent over-promoted findings to specs, ask it to inline the fix via a revision comment on the spec PR; if it under-fixed, point that out via a revision comment on the fixes PR.
 
+### Chat-driven proposals: `propose`
+
+The `propose` verb is the chat entry point for "I want autocoder to look at this and either fix it or talk about it":
+
+```
+@<bot> propose <repo-substring> <free-form text>
+```
+
+Examples:
+
+- `@<bot> propose myrepo add a /healthz endpoint that returns 200 OK with the daemon's version and uptime` — directive; triage produces a fixes PR (and maybe a spec PR).
+- `@<bot> propose myrepo what would it take to extract the auth logic into a separate module?` — question; triage replies in the thread, no PR.
+- `@<bot> propose myrepo something something handler logic` — ambiguous; triage emits AskUser, the standard chatops escalation fires, the operator clarifies, the executor resumes.
+
+**Ack and lifecycle thread.** The bot's response to `@<bot> propose ...` is a top-level message in the channel:
+
+```
+✓ Queued proposal request for <repo_url>. The next polling iteration will run it. Follow along in this thread.
+```
+
+The ack message's `ts` becomes the proposal-request's lifecycle thread. Subsequent status updates, the LLM's discussion reply (when the input is a question), and any AskUser escalations all post into that thread.
+
+**Three-way classification.** The chat-triage prompt instructs the LLM to classify the operator's text into one of three buckets BEFORE acting:
+
+- **DIRECTIVE** — a specific action a reasonable engineer would know how to build. The LLM proceeds to explore the codebase, classify each work item as quick-fix vs spec-worthy, apply the fixes, and create new `openspec/changes/chat-request-<short-hash>/` proposals for the spec-worthy items. The diff splits into a fixes PR and a spec PR exactly like `send it`.
+- **QUESTION** — the operator is asking for analysis or opinion, not asking for code changes. The LLM writes its reply to `<workspace>/.chat-reply.md` and stops. The polling iteration then reads the file, posts the contents (truncated to 35,000 chars with a daemon-log pointer when over) as a threaded reply in the lifecycle thread, deletes the file, and sets the proposal-request's status to `Discussed`. No PRs are created.
+- **AMBIGUOUS** — the request might be a directive but the LLM can't pin down what to build. The LLM calls the `ask_user` MCP tool. The existing chatops escalation posts the clarifying question into the lifecycle thread and resumes the executor once the operator replies.
+
+**Two output paths.** Same shape as the `send it` two-PR mechanic: a fixes PR carrying any code changes and a spec PR carrying any new `openspec/changes/chat-request-<short-hash>/` directory. Both PRs are normal autocoder-opened PRs and participate in `a01-pr-comment-revision-loop`, so `@<bot> revise <text>` on either gets revisions through the standard channel.
+
+**7-day staleness rule.** Proposal-request state files are pruned after 7 days regardless of terminal status (`Acted`, `Discussed`, `TriageFailed`). The directory stays bounded the same way audit-thread state does.
+
+**Polite-refusal cases.** A request whose repo substring resolves to multiple repos gets the standard "be more specific" reply with the candidate URLs. A request with no text after the substring gets `✗ propose: missing request text.`. A request whose text exceeds the 10,000-character cap gets `✗ propose: request text exceeds 10000 characters.` — put longer descriptions in an issue or doc and reference it in a shorter request.
+
 ### Trust boundary
 
 Whoever has write access to the configured chatops channel is treated as an operator — the same trust boundary as the existing `AskUser` reply detection. Sites that need finer-grained control configure separate channels per concern via the existing per-repo `chatops_channel_id` override.

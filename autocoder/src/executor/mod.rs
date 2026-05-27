@@ -59,6 +59,29 @@ pub trait Executor: Send + Sync {
             reason: "triage mode not supported by this executor backend".to_string(),
         })
     }
+
+    /// Chat-driven triage for the `chat-request-triage` flow: the
+    /// operator typed `@<bot> propose <repo> <text>` in chat. The
+    /// executor classifies the request as DIRECTIVE / QUESTION /
+    /// AMBIGUOUS (per the `prompts/chat-request-triage.md` template),
+    /// and for DIRECTIVE applies code fixes and/or creates
+    /// `openspec/changes/<chat-derived-slug>/`; for QUESTION writes a
+    /// `<workspace>/.chat-reply.md` and finishes; for AMBIGUOUS calls
+    /// the `ask_user` MCP tool.
+    ///
+    /// Default impl returns `Failed { reason: "chat-triage mode not
+    /// supported" }`.
+    async fn run_chat_triage(
+        &self,
+        workspace: &Path,
+        ctx: &ChatTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "chat-triage mode not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -78,6 +101,24 @@ pub struct TriageContext {
     /// A brief listing of which canonical specs live in
     /// `openspec/specs/`. The triage prompt instructs the LLM to read
     /// the relevant subset before classifying findings.
+    pub canonical_specs_index: String,
+}
+
+/// Context handed to `Executor::run_chat_triage`. Plumbed in from the
+/// chat-driven `propose` flow. Carried verbatim through the
+/// `prompts/chat-request-triage.md` template's `{{...}}` substitutions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTriageContext {
+    /// The operator's free-form request text (trimmed, capped at 10,000
+    /// chars by the parser). Internal whitespace + line breaks are
+    /// preserved.
+    pub request_text: String,
+    /// The repository URL the request targets (for the prompt's
+    /// context-banner line, not for git operations).
+    pub repo_url: String,
+    /// A brief listing of which canonical specs live in
+    /// `openspec/specs/`. The triage prompt instructs the LLM to read
+    /// the relevant subset before deciding how to act on the directive.
     pub canonical_specs_index: String,
 }
 

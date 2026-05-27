@@ -52,6 +52,31 @@ pub type ReviewerHolder = Arc<ArcSwap<Option<Arc<CodeReviewer>>>>;
 pub type ChatOpsHolder = Arc<ArcSwap<Option<ChatOpsSlot>>>;
 pub type ConfigHolder = Arc<ArcSwap<Config>>;
 
+/// One in-flight chat-driven proposal-request awaiting triage. The
+/// chatops dispatcher's `propose` verb appends to
+/// `RepoTaskHandle::pending_proposal_requests`; the polling loop drains
+/// it at iteration start (alongside the existing revision-request queue,
+/// audit-thread `send it` queue, and on-demand audit queue). The full
+/// `ProposalRequestState` lives on disk; this in-memory shape carries
+/// only the minimum the polling loop needs to look the state up.
+///
+/// Most fields mirror the on-disk state file so a caller that only has
+/// the in-memory queue entry (no disk read) still has the full request
+/// context. The polling loop today only reads `request_id` and then
+/// loads the state file for the rest — keeping the other fields here
+/// is forward-compat shape, not current consumption.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ProposalRequest {
+    pub request_id: String,
+    pub channel: String,
+    /// Bot's ack-message ts; the request's lifecycle thread.
+    pub thread_ts: String,
+    pub operator_user: String,
+    pub request_text: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -81,6 +106,16 @@ pub struct RepoTaskHandle {
     /// queue is de-duplicated on insert so multiple `audit` commands
     /// before a single iteration collapse to one run.
     pub pending_audit_runs: Arc<Mutex<Vec<String>>>,
+    /// Queue of chat-driven proposal requests awaiting triage
+    /// (`chat-request-triage`). The chatops dispatcher's `propose` verb
+    /// pushes here via the `queue_proposal_request` control-socket
+    /// action; the polling loop drains the queue at the start of each
+    /// iteration AFTER the revision-loop processing AND the on-demand
+    /// audit processing AND BEFORE the pending-change walk. Each entry
+    /// keys into the on-disk `ProposalRequestState` file via
+    /// `request_id` so a daemon restart between enqueue and drain does
+    /// not lose the operator's request.
+    pub pending_proposal_requests: Arc<Mutex<Vec<ProposalRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -295,6 +330,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
         "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
         "queue_audit" => handle_queue_audit(&parsed, state),
+        "queue_proposal_request" => handle_queue_proposal_request(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -1024,6 +1060,89 @@ fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
     })
 }
 
+/// Queue a chat-driven proposal-request for the repo's next polling
+/// iteration. The request was already persisted to disk as a
+/// `ProposalRequestState` file by the chatops dispatcher; this handler's
+/// job is to look up the repo's live polling-task handle, load the
+/// state from disk, and push a `ProposalRequest` onto the handle's
+/// `pending_proposal_requests` queue so the polling loop drains it.
+///
+/// On success returns `{ok: true, url, request_id, poll_interval_sec}`.
+/// On any failure (unknown repo, missing state file, etc.) returns
+/// `{ok: false, error}` and does NOT enqueue.
+fn handle_queue_proposal_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    // Load the on-disk state file the chatops dispatcher just wrote.
+    let state_root = crate::proposal_requests::default_state_root();
+    let proposal_state =
+        match crate::proposal_requests::read_state(&state_root, &url, &request_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": format!(
+                        "no proposal-request state file found for request_id `{request_id}` under repo `{url}`"
+                    ),
+                });
+            }
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("reading proposal-request state: {e:#}")
+                });
+            }
+        };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_proposal_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        // De-dup: if the same request_id is somehow queued twice (e.g.
+        // chatops retried), keep only one entry.
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push(ProposalRequest {
+                request_id: proposal_state.request_id.clone(),
+                channel: proposal_state.channel.clone(),
+                thread_ts: proposal_state.thread_ts.clone(),
+                operator_user: proposal_state.operator_user.clone(),
+                request_text: proposal_state.request_text.clone(),
+                submitted_at: proposal_state.submitted_at,
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1369,6 +1488,7 @@ mod tests {
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
+                    pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -2528,6 +2648,7 @@ github:
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
+                    pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },

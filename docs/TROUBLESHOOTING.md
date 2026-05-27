@@ -384,6 +384,81 @@ double-spending the LLM budget on the same findings.
   (e.g. tweak its config or fix what produced the noise) before
   retrying.
 
+## `propose` got a polite refusal — what each `✗` reply means
+
+The chat-request-triage flow (`@<bot> propose <repo> <free-form text>`)
+has several refusal paths, each with a distinct operator-facing reply.
+The most common ones:
+
+### `✗ propose: missing request text. ...`
+
+The operator typed `@<bot> propose myrepo` with nothing after the
+repo-substring (or only trailing whitespace). The dispatcher needs a
+non-empty description to hand to the chat-triage LLM.
+
+**What to do.** Re-send the verb with a description: `@<bot> propose
+myrepo add a /healthz endpoint that returns the daemon's version and
+uptime`.
+
+### `✗ propose: missing repo-substring. ...`
+
+The operator typed `@<bot> propose` with nothing after the verb. The
+dispatcher needs a repo-substring to pick which configured repository
+the request targets.
+
+**What to do.** Re-send with `<repo-substring> <text>` after the verb.
+
+### `✗ propose: request text exceeds 10000 characters. ...`
+
+The free-form text after the repo-substring is over the 10,000-character
+cap. The cap keeps the inbound dispatch path bounded and the chat-triage
+prompt's token budget predictable.
+
+**What to do.** Put longer descriptions in an issue, doc, or RFC and
+reference it in a shorter request — e.g.
+`@<bot> propose myrepo see ISSUE-123 for the auth-extraction plan;
+implement the storage-layer changes from the "Phase 1" section`.
+
+### `✗ propose: chatops backend not configured; ...`
+
+The daemon's `OperatorCommandDispatcher` was constructed without a
+chatops backend. This is a configuration error — the `propose` verb
+needs the backend to post its top-level ack (whose `ts` becomes the
+proposal-request's lifecycle thread).
+
+**What to do.** Make sure the daemon is started via the production
+path that wires `.with_chatops(slot.backend.clone())` into the
+dispatcher (the install / systemd path does this automatically). The
+in-process test harness wires it through `with_chatops` directly.
+
+### `✗ propose: could not post ack to chat: <reason>`
+
+The dispatcher reached the chatops backend but the post request itself
+failed (HTTP error, Slack API error, etc.). The state file is NOT
+written and the control-socket action is NOT submitted — the operator
+sees the refusal in the same channel/thread the verb came from.
+
+**What to do.** Read the `<reason>` for the underlying error. Common
+causes: bot token revoked, channel-write permission missing, Slack
+rate-limit. Fix the upstream issue and re-send the verb; the request
+is idempotent — a successful retry generates a new `request_id`.
+
+### Untracked / stale / status-conflict cases
+
+The `propose` lifecycle has no "untracked thread" path the way `send
+it` does — the verb fires at channel level, not in a thread. But the
+proposal-request's state file has the same 7-day staleness rule:
+state files whose `submitted_at` is older than 7 days are pruned at
+iteration start regardless of terminal status (`Acted`, `Discussed`,
+`TriageFailed`). A pruned state file means the lifecycle thread is no
+longer authoritative — subsequent `@<bot> revise` comments on the
+PRs spawned from that request still work (revisions key off the PR's
+branch, not the state file), but the request itself is closed.
+
+If you need to start a fresh triage on the same topic after a stale
+prune, just `@<bot> propose <repo> <text>` again; the verb generates
+a new `request_id` and a new lifecycle thread.
+
 ### `✓ Wiped <path> (drain timeout — iteration may have been stuck)`
 
 The wipe-workspace flow on `confirm` signals the in-flight per-repo

@@ -23,6 +23,7 @@ mod openspec_archive;
 mod paths;
 mod perma_stuck;
 mod polling_loop;
+mod proposal_requests;
 mod queue;
 mod revisions;
 mod spec_revision;
