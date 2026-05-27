@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 use super::{ChatOpsBackend, HumanReply, urlencode};
+use crate::chatops::event_dedup::{CheckResult, DedupKey, EventDedupCache};
 use crate::chatops::operator_commands::{
     OperatorCommandDispatcher, RepoIdentityProvider, Reply,
 };
@@ -41,6 +42,12 @@ pub struct SlackBackend {
     /// (`apps.connections.open`). When `None`, the inbound listener is
     /// not started — outbound chatops continues to work.
     app_token: Option<String>,
+    /// Maximum number of recently-processed events kept in the
+    /// inbound dedup cache. Default `100`. `0` disables dedup.
+    dedup_cache_capacity: usize,
+    /// Per-entry TTL (seconds) for the inbound dedup cache. Default
+    /// `600` (10 minutes).
+    dedup_cache_ttl_secs: u64,
 }
 
 impl SlackBackend {
@@ -97,6 +104,8 @@ impl SlackBackend {
             bot_user_id,
             bot_id,
             app_token: None,
+            dedup_cache_capacity: crate::config::default_dedup_cache_capacity(),
+            dedup_cache_ttl_secs: crate::config::default_dedup_cache_ttl_secs(),
         })
     }
 
@@ -105,6 +114,17 @@ impl SlackBackend {
     /// Bearer` header for `apps.connections.open`.
     pub fn with_app_token(mut self, app_token: String) -> Self {
         self.app_token = Some(app_token);
+        self
+    }
+
+    /// Builder-style setter for the inbound dedup-cache configuration.
+    /// `capacity` is the maximum number of recently-processed
+    /// `app_mention` events the listener remembers; `0` disables
+    /// dedup. `ttl_secs` is the per-entry TTL — entries older than
+    /// this are treated as not-present on the next lookup.
+    pub fn with_dedup_cache_config(mut self, capacity: usize, ttl_secs: u64) -> Self {
+        self.dedup_cache_capacity = capacity;
+        self.dedup_cache_ttl_secs = ttl_secs;
         self
     }
 
@@ -461,6 +481,14 @@ impl ChatOpsBackend for SlackBackend {
                 ));
             }
         };
+        // Construct the dedup cache once per listener lifetime; the
+        // same Arc is shared across every reconnect cycle (the outer
+        // reconnect loop in `run_inbound_listener` holds the ctx by
+        // reference, so the cache outlives reconnects).
+        let dedup_cache = Arc::new(EventDedupCache::new(
+            self.dedup_cache_capacity,
+            Duration::from_secs(self.dedup_cache_ttl_secs),
+        ));
         let ctx = InboundListenerContext {
             client: self.client.clone(),
             api_base: self.api_base.clone(),
@@ -471,6 +499,7 @@ impl ChatOpsBackend for SlackBackend {
             dispatcher,
             repos,
             allowed_channels,
+            dedup_cache,
         };
         let handle = tokio::spawn(run_inbound_listener(ctx, cancel));
         Ok(handle)
@@ -789,6 +818,11 @@ struct InboundListenerContext {
     dispatcher: Arc<OperatorCommandDispatcher>,
     repos: Arc<dyn RepoIdentityProvider>,
     allowed_channels: Arc<HashSet<String>>,
+    /// Per-listener-task dedup cache. Constructed once at startup AND
+    /// shared across every reconnect cycle within the listener's
+    /// lifetime — reconnects do NOT clear the cache. Drops when the
+    /// listener task exits (daemon shutdown).
+    pub dedup_cache: Arc<EventDedupCache>,
 }
 
 /// Outer reconnect loop. Calls `open_socket_mode_url` + connect,
@@ -1049,6 +1083,29 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
         }
         FilterDecision::Dispatch(f) => f,
     };
+
+    // Dedup AFTER drop-before-dispatch filters but BEFORE invoking the
+    // dispatcher. The envelope ack was already sent earlier in the
+    // event loop, so Slack knows we received the event — we just
+    // skip the redundant dispatch on a cache hit.
+    let dedup_key = DedupKey {
+        channel: event.channel.clone(),
+        ts: event.ts.clone(),
+        user: event.user.clone().unwrap_or_default(),
+    };
+    match ctx.dedup_cache.check_and_insert(dedup_key.clone()) {
+        CheckResult::Fresh => {}
+        CheckResult::Duplicate { suppressed_count } => {
+            tracing::info!(
+                channel = dedup_key.channel.as_str(),
+                ts = dedup_key.ts.as_str(),
+                user = dedup_key.user.as_str(),
+                suppressed_count = suppressed_count,
+                "slack inbound: deduplicated event"
+            );
+            return false;
+        }
+    }
 
     let bot_mention = format!("<@{}>", ctx.bot_user_id);
     // Normalise mobile-client mentions (`<@B...>`) to the canonical
@@ -2100,6 +2157,31 @@ mod tests {
             dispatcher: Arc::new(OperatorCommandDispatcher::new()),
             repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new)),
             allowed_channels: Arc::new(channels.iter().map(|s| s.to_string()).collect()),
+            dedup_cache: Arc::new(EventDedupCache::new(100, Duration::from_secs(600))),
+        }
+    }
+
+    /// Variant for tests that need to control the dedup cache directly
+    /// (e.g. to assert cache persistence across reconnects, or to
+    /// supply a cache populated with a specific prior entry).
+    fn test_ctx_with_dedup_cache(
+        api_base: String,
+        bot_token: String,
+        bot_user_id: &str,
+        channels: &[&str],
+        dedup_cache: Arc<EventDedupCache>,
+    ) -> InboundListenerContext {
+        InboundListenerContext {
+            client: reqwest::Client::new(),
+            api_base,
+            bot_token,
+            bot_user_id: bot_user_id.to_string(),
+            bot_id: None,
+            app_token: "xapp-1-test".into(),
+            dispatcher: Arc::new(OperatorCommandDispatcher::new()),
+            repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new)),
+            allowed_channels: Arc::new(channels.iter().map(|s| s.to_string()).collect()),
+            dedup_cache,
         }
     }
 
@@ -2504,6 +2586,274 @@ mod tests {
             )))
             .unwrap();
         let _exit = run_event_loop(&ctx, stream, &cancel).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Dedup cache: listener integration
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn event_loop_dispatches_once_when_event_delivered_once() {
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"channel":"C_OPS","thread_ts":"1.0"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let env = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@UBOT> help",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        });
+        in_tx
+            .send(Ok(WsMessage::Text(env.to_string().into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
+        // Mockito asserts: exactly 1 post.
+    }
+
+    #[tokio::test]
+    async fn event_loop_dispatches_once_when_event_redelivered_twice() {
+        // Two identical app_mention envelopes (simulating Slack's
+        // at-least-once redelivery) → dispatcher fires exactly once;
+        // the second is suppressed by the dedup cache.
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"channel":"C_OPS","thread_ts":"1.0"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let env_text = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@UBOT> help",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        })
+        .to_string();
+        // First delivery.
+        in_tx
+            .send(Ok(WsMessage::Text(env_text.clone().into())))
+            .unwrap();
+        // Redelivery — same event payload, different envelope_id (Slack
+        // assigns a fresh envelope_id per redelivery).
+        let redeliv = env_text.replace("env-1", "env-2");
+        in_tx.send(Ok(WsMessage::Text(redeliv.into()))).unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
+        // Mockito asserts: exactly 1 post despite 2 deliveries.
+    }
+
+    #[tokio::test]
+    async fn event_loop_dispatches_each_distinct_event() {
+        // Events with different (channel,ts,user) tuples do not collide
+        // in the dedup cache; each fires the dispatcher.
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.1"}"#)
+            .expect(3)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let mk = |ts: &str, user: &str, envelope_id: &str| -> String {
+            serde_json::json!({
+                "type": "events_api",
+                "envelope_id": envelope_id,
+                "payload": {
+                    "event": {
+                        "type": "app_mention",
+                        "text": "<@UBOT> help",
+                        "user": user,
+                        "channel": "C_OPS",
+                        "ts": ts
+                    }
+                }
+            })
+            .to_string()
+        };
+        in_tx
+            .send(Ok(WsMessage::Text(mk("1.0", "U_A", "e1").into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(mk("2.0", "U_A", "e2").into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(mk("1.0", "U_B", "e3").into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
+    }
+
+    #[tokio::test]
+    async fn dedup_cache_persists_across_simulated_reconnect() {
+        // Listener processes an event on connection A; the connection
+        // dies and a fresh event-loop is invoked on connection B with
+        // the SAME dedup cache (modeling the reconnect persistence
+        // property). Slack redelivers the event on B → dispatcher does
+        // NOT fire a second time.
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let dedup_cache = Arc::new(EventDedupCache::new(64, Duration::from_secs(600)));
+
+        // ---- Connection A ----
+        let (stream_a, in_tx_a, _out_rx_a) = make_fake_stream();
+        let cancel_a = CancellationToken::new();
+        let ctx_a = test_ctx_with_dedup_cache(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+            dedup_cache.clone(),
+        );
+        let env_text = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@UBOT> help",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        })
+        .to_string();
+        in_tx_a
+            .send(Ok(WsMessage::Text(env_text.clone().into())))
+            .unwrap();
+        in_tx_a
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"server-rotation"}"#
+                    .to_string()
+                    .into(),
+            )))
+            .unwrap();
+        let _exit_a = run_event_loop(&ctx_a, stream_a, &cancel_a).await;
+
+        // ---- Connection B (reconnect) — same dedup cache! ----
+        let (stream_b, in_tx_b, _out_rx_b) = make_fake_stream();
+        let cancel_b = CancellationToken::new();
+        let ctx_b = test_ctx_with_dedup_cache(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+            dedup_cache,
+        );
+        // Slack redelivers the same event with a fresh envelope_id.
+        let redeliv = env_text.replace("env-1", "env-2");
+        in_tx_b.send(Ok(WsMessage::Text(redeliv.into()))).unwrap();
+        in_tx_b
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit_b = run_event_loop(&ctx_b, stream_b, &cancel_b).await;
+        // Mockito asserts: exactly 1 post despite the event being
+        // delivered on both connections.
+    }
+
+    #[tokio::test]
+    async fn start_inbound_listener_constructs_cache_with_configured_values() {
+        // Build a SlackBackend via the test fixture, then `.with_app_token`
+        // and `.with_dedup_cache_config`. Spawn the listener; observe
+        // that the construction succeeds (the listener's `Drop` on the
+        // CancellationToken will cause it to exit cleanly).
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server)
+            .await
+            .with_app_token("xapp-1-test".to_string())
+            .with_dedup_cache_config(42, 77);
+        assert_eq!(backend.dedup_cache_capacity, 42);
+        assert_eq!(backend.dedup_cache_ttl_secs, 77);
+
+        let dispatcher = Arc::new(OperatorCommandDispatcher::new());
+        let repos: Arc<dyn RepoIdentityProvider> =
+            Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new));
+        let channels = Arc::new(HashSet::<String>::new());
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // pre-cancel so the listener exits quickly
+        // We don't await the handle (the apps.connections.open call
+        // would hang on the test base URL); the important assertion
+        // is that listener startup accepts the dedup config without
+        // error.
+        let _handle = backend
+            .start_inbound_listener(dispatcher, repos, channels, cancel)
+            .await
+            .expect("listener should start with dedup config");
     }
 
     #[tokio::test]

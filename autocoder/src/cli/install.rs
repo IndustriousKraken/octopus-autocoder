@@ -1046,6 +1046,8 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 app_token_env: None,
                 app_token: None,
                 listen_channels: Vec::new(),
+                dedup_cache_capacity: crate::config::default_dedup_cache_capacity(),
+                dedup_cache_ttl_secs: crate::config::default_dedup_cache_ttl_secs(),
             }),
             discord: None,
             teams: None,

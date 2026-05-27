@@ -123,6 +123,36 @@ If the timeout is recurring on the same change, consider:
 - Splitting the change into smaller pieces if the agent's action stream shows it bouncing between unrelated subsystems.
 - Switching the change to `output_format: text` if you suspect the JSON-stream parsing itself is suspicious — text mode replicates the pre-streaming behavior verbatim.
 
+## Bot replied multiple times to a single message
+
+Slack's Socket Mode delivery contract is explicitly at-least-once: if
+the WebSocket ack for an event doesn't reach Slack (transient network
+blip, connection rotation, reconnect race), Slack redelivers the same
+event on the next connection. Without protection, each redelivery
+flows through the full listener pipeline and produces a duplicate
+reply.
+
+The inbound listener defends against this with an in-memory dedup
+cache keyed by `(channel, ts, user)`. First delivery dispatches
+normally; subsequent redeliveries within the cache window are
+suppressed and logged at INFO. If you're still seeing duplicates,
+check `journalctl -u autocoder | grep 'deduplicated event'` to
+confirm the dedup is firing:
+
+- If you see `deduplicated event` lines naming your message, the
+  dedup is working — the duplicates were already suppressed; check
+  whether your client is rendering a single message twice
+  (rare client-side cache bug) versus the bot posting twice (look
+  for two `chat.postMessage` calls in the journal).
+- If you see NO `deduplicated event` lines for the redelivered
+  message, your `dedup_cache_capacity` may be `0` (disabled) or
+  too small for your traffic volume. Check `config.yaml` under
+  `chatops.slack:`. Defaults are capacity `100` and TTL `600`
+  seconds; raise either as needed.
+
+See [CHATOPS.md](CHATOPS.md) "Duplicate-delivery suppression" for
+the full picture.
+
 ## Bot didn't reply at all (no success, no failure)
 
 The expected `✅ Revision applied` / `✗ Revision attempt failed` /

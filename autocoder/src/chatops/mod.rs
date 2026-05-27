@@ -22,6 +22,7 @@ use crate::chatops::operator_commands::{
 use crate::config::{ChatOpsConfig, ChatOpsProvider, RepositoryConfig, SecretSource};
 
 pub mod discord;
+pub mod event_dedup;
 pub mod matrix;
 pub mod mattermost;
 pub mod operator_commands;
@@ -284,6 +285,10 @@ pub async fn from_config(cfg: &ChatOpsConfig) -> Result<Arc<dyn ChatOpsBackend>>
             if let Some(at) = app_token {
                 backend = backend.with_app_token(at);
             }
+            backend = backend.with_dedup_cache_config(
+                sub.dedup_cache_capacity,
+                sub.dedup_cache_ttl_secs,
+            );
             Ok(Arc::new(backend))
         }
         ChatOpsProvider::Discord => {
