@@ -294,4 +294,52 @@ sudo rm -f /etc/systemd/system/openspec-orchestrator.service /usr/local/bin/open
 sudo systemctl daemon-reload
 ```
 
+## Unattended updates via cron
+
+For single-host SBC, indie VPS, and homelab deployments where set-and-forget is the explicit goal, `update.sh` ships at the repo root as a cron-friendly companion to `install.sh`. The script resolves the installed version, fetches the latest non-prerelease tag, downloads + checksum-verifies the binary, runs `autocoder check-config` against the downloaded binary as a preflight, atomically swaps the binary aside to `/usr/local/bin/autocoder.previous`, restarts the systemd unit, and rolls back automatically if the daemon does not reach `active` within 30 seconds.
+
+**Audience caveat.** This workflow is for homelab / indie / SBC deployments where the operator wants binary updates without intervention. **Do not use it** in enterprise change-control environments where Ansible, apt repositories, container registries, or k8s pipelines already own update orchestration — those tools have richer rollback, staging, and audit semantics than `update.sh` provides. If you are upgrading an existing source-built deployment onto the binary-update workflow, follow [Switching from source-build to binary updates](#switching-from-source-build-to-binary-updates) first; once you are on a binary install, this section's cron entry takes over.
+
+**Stage the script.** Place `update.sh` somewhere the autocoder user can run it. The conventional location is `/home/autocoder/update.sh`:
+
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/update.sh \
+  -o /home/autocoder/update.sh
+sudo chown autocoder:autocoder /home/autocoder/update.sh
+sudo chmod 0755 /home/autocoder/update.sh
+```
+
+**Cron entry.** Add the following to root's crontab (`sudo crontab -e`) — the script uses `sudo` internally for `mv`, `install`, and `systemctl restart`, but running it as root sidesteps the sudo prompt entirely:
+
+```cron
+0 3 * * * /home/autocoder/update.sh >> /var/log/autocoder-update.log 2>&1
+```
+
+The `0 3 * * *` runs once a day at 03:00 local time — low-traffic on most homelab hosts. The redirect captures both stdout and stderr so any failure leaves a paper trail; if you'd rather see only failures, `MAILTO=` at the top of the crontab plus a non-redirected entry mails the output of any non-zero exit.
+
+When running across a small fleet, jitter the minute field so hosts do not all hit the GitHub Releases API at the same second:
+
+```cron
+# Per-host: pick a stable minute 0..59 (e.g. `awk 'BEGIN { srand(); print int(rand()*60) }'`).
+17 3 * * * /home/autocoder/update.sh >> /var/log/autocoder-update.log 2>&1
+```
+
+**`--version <tag>` for explicit pinning.** Operators who freeze on a known-good release between manual upgrade reviews can pin the cron entry:
+
+```cron
+0 3 * * * /home/autocoder/update.sh --version v0.7.2 >> /var/log/autocoder-update.log 2>&1
+```
+
+Pre-release tags (e.g. `v2.0.0-rc1`) are accepted only via `--version`; the default flow uses the latest non-prerelease tag via `GET /repos/<owner>/<repo>/releases/latest`, which by GitHub's contract excludes pre-releases.
+
+**`--dry-run` for the first scheduled run.** When you first set up the cron job, run `update.sh --dry-run` interactively from the host so you can inspect the preflight output without committing to a swap:
+
+```bash
+sudo -i /home/autocoder/update.sh --dry-run
+```
+
+The script reports the resolved current + target versions, downloads + verifies the binary, runs `check-config --json`, prints `[dry-run] Would swap to <tag>`, and exits 0. Nothing on disk or in systemd changes.
+
+**Operator-visibility loop.** When chatops is configured, the daemon posts a `🆙 autocoder vX.Y.Z started — N repository(ies) configured` notification on every successful startup — so after a cron-driven update lands, the chat channel records the version transition automatically. See [CLI.md `run`](CLI.md#run) for the notification's format.
+
 ---

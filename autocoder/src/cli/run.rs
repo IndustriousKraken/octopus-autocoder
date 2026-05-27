@@ -215,6 +215,12 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     };
 
+    // Lifecycle signal: post a one-line version + repo-count notification
+    // before any polling task starts. Independent of `notifications.*`
+    // flags. Suppressed (with a journalctl-bound INFO log) when no chatops
+    // backend is configured.
+    dispatch_startup_notification(chatops_initial.as_ref(), cfg.repositories.len()).await;
+
     // Hot-swappable holders. The control socket swaps into these on
     // `autocoder reload`; the polling loops read snapshots once per pass.
     let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
@@ -697,6 +703,48 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         }
         SpawnOutcome::Spawned
     })
+}
+
+/// Format the startup version notification text. Lives in its own helper
+/// so unit tests can assert the message shape without invoking the
+/// async dispatch path.
+pub fn startup_version_message(version: &str, repo_count: usize) -> String {
+    format!(
+        "🆙 autocoder v{version} started — {repo_count} repository(ies) configured"
+    )
+}
+
+/// Fire the daemon-lifecycle startup notification exactly once per boot.
+/// When a chatops backend is configured, post a one-line `🆙` notification
+/// to the resolved default channel. When not, emit a journalctl-bound
+/// INFO line so operators still have a startup-version signal in logs.
+///
+/// This is independent of `chatops.notifications.*` flags (those gate
+/// per-change signals; the startup line is a daemon-lifecycle signal).
+/// A `post_notification` failure is logged at WARN level and does NOT
+/// block the daemon from proceeding to the polling loop.
+pub async fn dispatch_startup_notification(
+    chatops: Option<&ChatOpsSlot>,
+    repo_count: usize,
+) {
+    let version = env!("CARGO_PKG_VERSION");
+    let msg = startup_version_message(version, repo_count);
+    match chatops {
+        Some(slot) => {
+            if let Err(e) = slot
+                .backend
+                .post_notification(&slot.default_channel_id, &msg)
+                .await
+            {
+                tracing::warn!("startup version notification failed: {e}");
+            }
+        }
+        None => {
+            tracing::info!(
+                "startup version: v{version}; {repo_count} repositories"
+            );
+        }
+    }
 }
 
 /// Emit the one-shot startup log line for the active ChatOps backend.
@@ -1306,6 +1354,82 @@ mod tests {
         assert!(logs_contain("EXPERIMENTAL"));
         assert!(logs_contain("best-effort"));
         assert!(logs_contain("discord"));
+    }
+
+    #[test]
+    fn startup_version_message_includes_version_and_repo_count() {
+        let msg = startup_version_message("1.2.3", 3);
+        assert!(msg.starts_with("🆙 "), "must start with the 🆙 prefix: {msg}");
+        assert!(msg.contains("autocoder v1.2.3"), "must contain version: {msg}");
+        assert!(
+            msg.contains("3 repository(ies) configured"),
+            "must contain repo count: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_startup_notification_posts_one_message_when_chatops_configured() {
+        let backend = Arc::new(crate::audits::test_support::RecordingBackend::new());
+        let slot = ChatOpsSlot {
+            backend: backend.clone() as Arc<dyn crate::chatops::ChatOpsBackend>,
+            default_channel_id: "C_DEFAULT".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        dispatch_startup_notification(Some(&slot), 3).await;
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "exactly one post_notification call expected");
+        assert_eq!(calls[0].channel, "C_DEFAULT");
+        assert!(
+            calls[0].text.contains(&format!("autocoder v{}", env!("CARGO_PKG_VERSION"))),
+            "message must name CARGO_PKG_VERSION: {}",
+            calls[0].text
+        );
+        assert!(
+            calls[0].text.contains("3 repository(ies) configured"),
+            "message must include repo count: {}",
+            calls[0].text
+        );
+        assert!(
+            calls[0].text.starts_with("🆙 "),
+            "message must begin with the 🆙 prefix: {}",
+            calls[0].text
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn dispatch_startup_notification_logs_info_when_no_chatops() {
+        dispatch_startup_notification(None, 2).await;
+        assert!(
+            logs_contain("startup version"),
+            "INFO log must mention startup version"
+        );
+        assert!(
+            logs_contain("2 repositories"),
+            "INFO log must include repo count"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn dispatch_startup_notification_failure_is_non_fatal() {
+        let backend = Arc::new(crate::audits::test_support::RecordingBackend::failing(
+            "simulated chatops failure",
+        ));
+        let slot = ChatOpsSlot {
+            backend: backend.clone() as Arc<dyn crate::chatops::ChatOpsBackend>,
+            default_channel_id: "C_DEFAULT".to_string(),
+            start_work_enabled: false,
+            failure_alerts_enabled: false,
+            pr_opened_enabled: false,
+        };
+        dispatch_startup_notification(Some(&slot), 1).await;
+        assert!(
+            logs_contain("startup version notification failed"),
+            "WARN log must name the failure"
+        );
     }
 
     #[test]

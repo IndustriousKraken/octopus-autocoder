@@ -14,6 +14,8 @@ autocoder run --config <path-to-config.yaml>
 
 The daemon polls every configured repository on its interval, processes ready OpenSpec changes, and opens monolithic PRs. Terminates only on SIGINT, SIGTERM, or a fatal initialization error. Logs go to stderr; control verbosity with `RUST_LOG=info` (default), `RUST_LOG=debug`, etc.
 
+If a chatops backend is configured, the daemon posts a one-line `🆙 autocoder vX.Y.Z started` notification on every successful startup. Operators tracking unattended-update transitions watch this line in chat.
+
 ## `install`
 
 First-run wizard / re-install entry point. The `install.sh` bootstrap swaps the binary then execs `autocoder install`; on an existing install with the systemd unit loaded, the subcommand short-circuits with the three-verb status block (update, reconfigure, wipe).
