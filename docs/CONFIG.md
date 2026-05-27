@@ -64,6 +64,16 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 
 See [ChatOps Escalation](CHATOPS.md). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](CHATOPS.md#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
 
+### `chatops.slack:` (when `provider: slack`)
+
+| Field | Type | Description |
+|---|---|---|
+| `bot_token_env` / `bot_token` | string / inline | Slack bot token (`xoxb-*`). Set one or the other; inline takes precedence. |
+| `app_token_env` / `app_token` | string / inline (optional) | Slack app-level token (`xapp-*`) used by the Socket Mode inbound listener. When absent, the listener is not started; outbound chatops still works. |
+| `listen_channels` | `[string]` (optional) | Extra channel IDs the inbound listener honours commands in, on top of every `repositories[].chatops_channel_id` and `chatops.default_channel_id`. |
+| `dedup_cache_capacity` | `usize` (default `100`, max `10000`) | Maximum number of recently-processed `app_mention` events the inbound listener remembers in its dedup cache. Slack's Socket Mode delivery is at-least-once; the cache suppresses redeliveries so a single operator message never produces a duplicate bot reply. Values above the cap are clamped to `10000` with a WARN log at startup. Setting `0` disables dedup entirely (every redelivery is dispatched — pre-spec behaviour). See [CHATOPS.md → Duplicate-delivery suppression](CHATOPS.md#duplicate-delivery-suppression). |
+| `dedup_cache_ttl_secs` | `u64` (default `600`, max `3600`) | Per-entry TTL (seconds) for the dedup cache — entries older than this are treated as not-present on the next lookup. Values above the cap are clamped with a WARN log; `0` is clamped to `1` with a WARN (use `dedup_cache_capacity: 0` to disable dedup, not TTL `0`). Raise to e.g. `3600` only when Slack-side redelivery storms span more than the default 10 minutes (rare). |
+
 ## `audits:` (optional)
 
 Top-level periodic-audit framework configuration. Absent block → every audit's effective cadence is `disabled` and the daemon behaves identically to a build without the framework. See [Periodic audits](OPERATIONS.md#periodic-audits) for the full operational model.

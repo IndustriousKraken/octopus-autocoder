@@ -229,6 +229,16 @@ github:
 #     # the resulting allowlist are silently dropped (no `?` reaction).
 #     # listen_channels: ["C0OPS", "C0OPS2"]
 #
+#     # OPTIONAL: dedup-cache tuning. Slack's Socket Mode delivery is
+#     # at-least-once; the listener remembers recently-processed
+#     # `app_mention` events keyed by `(channel, ts, user)` and skips
+#     # the dispatch on redelivery so a single operator command never
+#     # produces a duplicate bot reply. Capacity defaults to `100`
+#     # (max `10000`; `0` disables dedup); TTL defaults to `600`
+#     # seconds (max `3600`). Raise for high-traffic channels.
+#     # dedup_cache_capacity: 100
+#     # dedup_cache_ttl_secs: 600
+#
 #   # Progress notifications. Each key defaults to `true` when the block is
 #   # omitted. Set any to `false` to suppress that stream.
 #   #   start_work: a one-line message each time autocoder picks up a change.

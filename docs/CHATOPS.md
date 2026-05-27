@@ -327,6 +327,24 @@ To enable the inbound listener:
 
 By default the inbound listener honours commands in any channel already used by the outbound side — the union of every `repositories[].chatops_channel_id` plus `chatops.default_channel_id`. Operators who want a separate listen-only channel add it to the optional `chatops.slack.listen_channels` list. Messages from channels outside this allowlist are silently dropped (no `?` reaction either — silent drop keeps the bot's presence invisible in channels it is not authorized to command from).
 
+#### Duplicate-delivery suppression
+
+Slack's Socket Mode contract is explicitly *at-least-once*: if the WebSocket ack for an event doesn't reach Slack — typically because the connection dropped before Slack confirmed receipt, or across a reconnect cycle — Slack redelivers the same event on the next connection. Without protection, each redelivery would flow through the full listener pipeline a second time and produce a duplicate bot reply.
+
+The inbound listener defends against this with an in-memory dedup cache, keyed by `(channel, ts, user)` — the tuple that uniquely identifies a Slack message regardless of how many times it's delivered. The first delivery of an event dispatches normally and records the key; subsequent redeliveries of the same key are skipped (the envelope ack is still sent so Slack stops redelivering, but no reply is posted and no control-socket action is submitted). Each suppression logs at INFO with the dedup key and the running suppressed-count:
+
+```
+INFO slack inbound: deduplicated event channel=C_OPS ts=1700000000.000100 user=U_OPER suppressed_count=1
+```
+
+The cache persists across the listener's reconnect cycles (otherwise we'd lose the signal exactly when we need it most) and is dropped on daemon shutdown.
+
+Two knobs live under `chatops.slack:`:
+- `dedup_cache_capacity` (default `100`, max `10000`, set `0` to disable): the maximum number of recently-processed events the listener remembers. Raise for high-traffic channels.
+- `dedup_cache_ttl_secs` (default `600` = 10 minutes, max `3600` = 1 hour): per-entry TTL. Slack's redelivery window is typically minutes; the default is generous.
+
+Most operators will not need to touch these. If you're seeing duplicate replies under heavy traffic and `journalctl -u autocoder | grep "deduplicated event"` shows hits being missed (e.g. the key for the duplicate isn't logged), the cache is probably evicting under LRU pressure — raise `dedup_cache_capacity`. If the duplicates are arriving long after the original (rare; only happens during prolonged Slack-side outages), raise `dedup_cache_ttl_secs`.
+
 ### Repo substring matching
 
 You type the short name; the bot resolves it. The match is case-insensitive substring search against the full configured `repositories[].url`. `myrepo` matches `git@github.com:acme/myrepo.git`; `MYREPO` does too. If two repos with the same trailing name exist under different owners, the bot replies with the candidate list and asks for a more specific substring. If nothing matches, the bot replies with the full list of configured URLs so you can copy one back.

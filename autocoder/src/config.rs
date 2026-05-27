@@ -574,6 +574,84 @@ pub struct SlackProviderConfig {
     /// the resulting allowlist are silently dropped.
     #[serde(default)]
     pub listen_channels: Vec<String>,
+    /// Maximum number of recently-processed `app_mention` events the
+    /// inbound listener remembers for dedup. Slack's Socket Mode
+    /// delivery is at-least-once; the dedup cache suppresses
+    /// redeliveries of an event that has already been dispatched.
+    /// Default `100`. Maximum `10000` (operator values above the cap
+    /// are clamped to `10000` with a WARN). Value `0` disables dedup
+    /// entirely (every event is dispatched).
+    #[serde(default = "default_dedup_cache_capacity")]
+    pub dedup_cache_capacity: usize,
+    /// Per-entry TTL for the dedup cache, in seconds. Entries older
+    /// than this are treated as not-present and replaced on the next
+    /// lookup. Default `600` (10 minutes). Maximum `3600` (operator
+    /// values above the cap are clamped with a WARN). `0` is not
+    /// permitted — it's clamped to `1` with a WARN to keep the
+    /// semantics clear (use `dedup_cache_capacity: 0` to disable
+    /// dedup).
+    #[serde(default = "default_dedup_cache_ttl_secs")]
+    pub dedup_cache_ttl_secs: u64,
+}
+
+/// Default dedup-cache capacity for the Slack inbound listener.
+pub fn default_dedup_cache_capacity() -> usize {
+    100
+}
+
+/// Default dedup-cache TTL (seconds) for the Slack inbound listener.
+pub fn default_dedup_cache_ttl_secs() -> u64 {
+    600
+}
+
+/// Upper bound on `chatops.slack.dedup_cache_capacity`. Values above
+/// are clamped down with a WARN.
+pub const DEDUP_CACHE_CAPACITY_CEILING: usize = 10_000;
+
+/// Upper bound on `chatops.slack.dedup_cache_ttl_secs`. Values above
+/// are clamped down with a WARN.
+pub const DEDUP_CACHE_TTL_SECS_CEILING: u64 = 3_600;
+
+/// Clamp the configured dedup-cache capacity. Values above the ceiling
+/// are clamped down AND a `tracing::warn!` is emitted naming both the
+/// requested and clamped values. `0` is a valid configuration (dedup
+/// disabled) and is passed through without warning.
+pub fn clamp_dedup_cache_capacity(requested: usize) -> (usize, Option<String>) {
+    if requested > DEDUP_CACHE_CAPACITY_CEILING {
+        let msg = format!(
+            "chatops.slack.dedup_cache_capacity ({requested}) is above the ceiling of \
+             {DEDUP_CACHE_CAPACITY_CEILING}; clamping to {DEDUP_CACHE_CAPACITY_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (DEDUP_CACHE_CAPACITY_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
+}
+
+/// Clamp the configured dedup-cache TTL. Values above the ceiling are
+/// clamped down to the ceiling with a WARN. A configured value of `0`
+/// is also clamped (to `1`) because the TTL has no "disabled" meaning
+/// — use `dedup_cache_capacity: 0` to disable dedup.
+pub fn clamp_dedup_cache_ttl_secs(requested: u64) -> (u64, Option<String>) {
+    if requested == 0 {
+        let msg =
+            "chatops.slack.dedup_cache_ttl_secs (0) is not permitted; clamping to 1 \
+             (use dedup_cache_capacity=0 to disable dedup)"
+                .to_string();
+        tracing::warn!("{msg}");
+        return (1, Some(msg));
+    }
+    if requested > DEDUP_CACHE_TTL_SECS_CEILING {
+        let msg = format!(
+            "chatops.slack.dedup_cache_ttl_secs ({requested}) is above the ceiling of \
+             {DEDUP_CACHE_TTL_SECS_CEILING}; clamping to {DEDUP_CACHE_TTL_SECS_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (DEDUP_CACHE_TTL_SECS_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,6 +1079,16 @@ impl Config {
         let (retention_clamped, _) =
             clamp_log_retention_days(cfg.executor.log_retention_days);
         cfg.executor.log_retention_days = retention_clamped;
+        if let Some(slack) = cfg
+            .chatops
+            .as_mut()
+            .and_then(|c| c.slack.as_mut())
+        {
+            let (cap, _) = clamp_dedup_cache_capacity(slack.dedup_cache_capacity);
+            slack.dedup_cache_capacity = cap;
+            let (ttl, _) = clamp_dedup_cache_ttl_secs(slack.dedup_cache_ttl_secs);
+            slack.dedup_cache_ttl_secs = ttl;
+        }
         Ok(cfg)
     }
 }
@@ -1118,6 +1206,8 @@ github:
             "app_token_env",
             "app_token",
             "listen_channels",
+            "dedup_cache_capacity",
+            "dedup_cache_ttl_secs",
             "default_channel_id",
             "notifications",
             "start_work",
@@ -3171,6 +3261,180 @@ audits:
             Cadence::Quarterly.interval(),
             Some(chrono::Duration::days(90))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // chatops.slack.dedup_cache_capacity / dedup_cache_ttl_secs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dedup_cache_defaults_when_omitted() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0FOO
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("default dedup config should parse");
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.dedup_cache_capacity, default_dedup_cache_capacity());
+        assert_eq!(slack.dedup_cache_ttl_secs, default_dedup_cache_ttl_secs());
+    }
+
+    #[test]
+    fn dedup_cache_explicit_values_within_bounds_pass_through() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0FOO
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    dedup_cache_capacity: 500
+    dedup_cache_ttl_secs: 120
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.dedup_cache_capacity, 500);
+        assert_eq!(slack.dedup_cache_ttl_secs, 120);
+    }
+
+    #[test]
+    fn dedup_cache_capacity_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0FOO
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    dedup_cache_capacity: 50000
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.dedup_cache_capacity, DEDUP_CACHE_CAPACITY_CEILING);
+
+        let (clamped, warn) = clamp_dedup_cache_capacity(50_000);
+        assert_eq!(clamped, DEDUP_CACHE_CAPACITY_CEILING);
+        let msg = warn.expect("warn must fire when above ceiling");
+        assert!(msg.contains("50000"), "warn names requested value: {msg}");
+        assert!(
+            msg.contains(&DEDUP_CACHE_CAPACITY_CEILING.to_string()),
+            "warn names clamped value: {msg}"
+        );
+    }
+
+    #[test]
+    fn dedup_cache_ttl_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0FOO
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    dedup_cache_ttl_secs: 7200
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.dedup_cache_ttl_secs, DEDUP_CACHE_TTL_SECS_CEILING);
+
+        let (clamped, warn) = clamp_dedup_cache_ttl_secs(7200);
+        assert_eq!(clamped, DEDUP_CACHE_TTL_SECS_CEILING);
+        let msg = warn.expect("warn must fire when above ceiling");
+        assert!(msg.contains("7200"), "warn names requested value: {msg}");
+        assert!(
+            msg.contains(&DEDUP_CACHE_TTL_SECS_CEILING.to_string()),
+            "warn names clamped value: {msg}"
+        );
+    }
+
+    #[test]
+    fn dedup_cache_ttl_zero_is_clamped_to_one_with_warn() {
+        let (clamped, warn) = clamp_dedup_cache_ttl_secs(0);
+        assert_eq!(clamped, 1, "0 must be clamped to 1");
+        let msg = warn.expect("warn must fire for ttl=0");
+        assert!(msg.contains('0'), "warn references the original 0 value: {msg}");
+    }
+
+    #[test]
+    fn dedup_cache_capacity_zero_parses_without_warn_and_disables_dedup() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0FOO
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    dedup_cache_capacity: 0
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("capacity 0 should parse");
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.dedup_cache_capacity, 0);
+
+        // No WARN for capacity 0.
+        let (clamped, warn) = clamp_dedup_cache_capacity(0);
+        assert_eq!(clamped, 0);
+        assert!(warn.is_none(), "no warn for capacity 0 (opt-out)");
+
+        // Behavioural check: capacity 0 disables dedup at the cache layer.
+        let cache = crate::chatops::event_dedup::EventDedupCache::new(
+            slack.dedup_cache_capacity,
+            std::time::Duration::from_secs(slack.dedup_cache_ttl_secs),
+        );
+        let key = crate::chatops::event_dedup::DedupKey {
+            channel: "C".into(),
+            ts: "1.0".into(),
+            user: "U".into(),
+        };
+        for _ in 0..3 {
+            assert!(matches!(
+                cache.check_and_insert(key.clone()),
+                crate::chatops::event_dedup::CheckResult::Fresh
+            ));
+        }
     }
 
     #[test]
