@@ -84,6 +84,9 @@ pub async fn run(
     pending_proposal_requests: Arc<
         std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
     >,
+    pending_changelog_requests: Arc<
+        std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -107,6 +110,7 @@ pub async fn run(
         pending_triages,
         pending_audit_runs,
         pending_proposal_requests,
+        pending_changelog_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -167,6 +171,9 @@ pub async fn run_with_hooks(
     pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
     pending_proposal_requests: Arc<
         std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
+    >,
+    pending_changelog_requests: Arc<
+        std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
@@ -294,6 +301,24 @@ pub async fn run_with_hooks(
             ),
         }
 
+        // Same housekeeping for changelog-request state files (per
+        // `a06-chat-driven-changelog`). Stale entries (>7 days) are
+        // removed regardless of status so the directory stays bounded.
+        let changelog_state_root = crate::changelog_requests::default_state_root();
+        match crate::changelog_requests::prune_stale_entries(
+            &changelog_state_root,
+            chrono::Duration::days(7),
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                count = n,
+                "changelog-requests prune removed {n} stale entry(ies)"
+            ),
+            Err(e) => tracing::warn!(
+                "changelog-requests prune failed (iteration continues): {e:#}"
+            ),
+        }
+
         // Drain the per-repo on-demand audit-run queue
         // (chatops-on-demand-audit-trigger). The HashSet collapses any
         // duplicates that survived the control-socket-level de-dup
@@ -356,7 +381,34 @@ pub async fn run_with_hooks(
         {
             tracing::error!(
                 url = snapshot_ref.url.as_str(),
-                "proposal-request processing errored for {}: {error:#}",
+                "chat-triage processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain the per-repo changelog-request queue
+        // (`a06-chat-driven-changelog`). Runs immediately after the
+        // proposal-request drain AND before the pending-change walk so an
+        // operator's `@<bot> changelog ...` always gets attention this
+        // iteration.
+        let changelog_requests_batch: Vec<crate::control_socket::ChangelogRequest> = {
+            let mut g = pending_changelog_requests.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        if !changelog_requests_batch.is_empty()
+            && let Err(error) = crate::changelog_triage::process_changelog_requests(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+                &changelog_requests_batch,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                "changelog-request processing errored for {}: {error:#}",
                 snapshot_ref.url
             );
         }
@@ -558,6 +610,23 @@ pub async fn execute_one_pass(
             tracing::warn!(
                 url = %repo.url,
                 "revision dispatcher errored (iteration continues): {e:#}"
+            );
+        }
+        // Same dispatcher pattern for chat-driven changelog PRs (per
+        // `a06-chat-driven-changelog`): walk open PRs whose head matches
+        // `changelog-*` AND re-run the stylist on revision triggers.
+        if let Err(e) = crate::changelog_triage::process_changelog_revision_requests(
+            workspace,
+            repo,
+            github_cfg,
+            executor,
+            chatops_ctx,
+        )
+        .await
+        {
+            tracing::warn!(
+                url = %repo.url,
+                "changelog-revision dispatcher errored (iteration continues): {e:#}"
             );
         }
     }
@@ -6001,6 +6070,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -6201,6 +6271,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -9722,6 +9793,7 @@ mod tests {
                 None,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),

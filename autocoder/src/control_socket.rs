@@ -77,6 +77,23 @@ pub struct ProposalRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight chat-driven changelog-request awaiting stylist run. The
+/// chatops dispatcher's `changelog` verb appends to
+/// `RepoTaskHandle::pending_changelog_requests`; the polling loop drains
+/// it at iteration start. The full `ChangelogRequestState` lives on
+/// disk; this in-memory shape carries only what the polling loop needs.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ChangelogRequest {
+    pub request_id: String,
+    pub repo_url: String,
+    pub raw_args: String,
+    pub channel: String,
+    /// Bot's ack-message ts; the request's lifecycle thread.
+    pub lifecycle_thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -116,6 +133,14 @@ pub struct RepoTaskHandle {
     /// `request_id` so a daemon restart between enqueue and drain does
     /// not lose the operator's request.
     pub pending_proposal_requests: Arc<Mutex<Vec<ProposalRequest>>>,
+    /// Queue of chat-driven changelog requests awaiting stylist run
+    /// (`@<bot> changelog`). The chatops dispatcher's `changelog` verb
+    /// pushes here via the `queue_changelog_request` control-socket
+    /// action; the polling loop drains the queue at the start of each
+    /// iteration AFTER the proposal-request drain AND BEFORE the
+    /// pending-change walk. Each entry keys into the on-disk
+    /// `ChangelogRequestState` file via `request_id`.
+    pub pending_changelog_requests: Arc<Mutex<Vec<ChangelogRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -331,6 +356,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
         "queue_audit" => handle_queue_audit(&parsed, state),
         "queue_proposal_request" => handle_queue_proposal_request(&parsed, state),
+        "queue_changelog_request" => handle_queue_changelog_request(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -1143,6 +1169,82 @@ fn handle_queue_proposal_request(parsed: &Value, state: &ControlState) -> Value 
     })
 }
 
+/// Queue a chat-driven changelog request for the repo's next polling
+/// iteration. The request was already persisted to disk as a
+/// `ChangelogRequestState` file by the chatops dispatcher; this
+/// handler's job is to look up the repo's live polling-task handle,
+/// load the state from disk, and push a `ChangelogRequest` onto the
+/// handle's `pending_changelog_requests` queue.
+fn handle_queue_changelog_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let state_root = crate::changelog_requests::default_state_root();
+    let changelog_state =
+        match crate::changelog_requests::read_state(&state_root, &url, &request_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": format!(
+                        "no changelog-request state file found for request_id `{request_id}` under repo `{url}`"
+                    ),
+                });
+            }
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("reading changelog-request state: {e:#}")
+                });
+            }
+        };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_changelog_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push(ChangelogRequest {
+                request_id: changelog_state.request_id.clone(),
+                repo_url: changelog_state.repo_url.clone(),
+                raw_args: changelog_state.raw_args.clone(),
+                channel: changelog_state.channel.clone(),
+                lifecycle_thread_ts: changelog_state.lifecycle_thread_ts.clone(),
+                submitted_at: changelog_state.submitted_at,
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1489,6 +1591,7 @@ mod tests {
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
+                    pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -2649,6 +2752,7 @@ github:
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
+                    pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },

@@ -283,6 +283,8 @@ Pretty-printed with 2-space indents for human readability AND scripting alike. D
 
 **Release workflow integration.** `.github/workflows/release.yml` invokes `autocoder changelog --since <previous-tag> --to <new-tag>` between the test gate AND the publish step AND passes the output to the GitHub Release body. A failing changelog generation does NOT block the binary release — the workflow logs the error, writes an empty notes file, and continues. The binary upload is the primary artifact; notes are a best-effort enhancement.
 
+For an LLM-styled draft that opens a PR for review, use the `@<bot> changelog` chatops verb instead. See [CHATOPS.md → Generating a changelog](CHATOPS.md#generating-a-changelog-changelog).
+
 ## `rewind`
 
 Discard the in-flight agent branch and re-queue one or more archived changes. Use this when an agent produced unusable work or a PR was rejected and you want the daemon to try again.

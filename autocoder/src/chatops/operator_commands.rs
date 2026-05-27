@@ -130,6 +130,12 @@ const MAX_AUDIT_SUBSTRING_LEN: usize = 64;
 /// reference it; the cap keeps the inbound dispatch path bounded.
 pub const MAX_PROPOSE_REQUEST_TEXT_LEN: usize = 10_000;
 
+/// Cap on the raw-args remainder accepted by the `changelog` verb. Long
+/// enough to hold any reasonable `--since vX.Y.Z --to vA.B.C` arg
+/// combination plus comfortable headroom; narrow enough to bound the
+/// state-file size.
+pub const MAX_CHANGELOG_RAW_ARGS_LEN: usize = 512;
+
 fn change_slug_regex() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
     R.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").unwrap())
@@ -259,6 +265,18 @@ pub enum OperatorCommand {
     ProposeRequest {
         repo_substring: String,
         request_text: String,
+    },
+    /// `@<bot> changelog <repo-substring> [<args>]` — queue a chat-driven
+    /// changelog generation request against the matched repo. The
+    /// dispatcher posts a top-level ack message in the channel (whose
+    /// `ts` becomes the request's lifecycle thread), writes a
+    /// `ChangelogRequestState` file, AND submits a
+    /// `queue_changelog_request` control-socket action so the next
+    /// polling iteration runs the stylist. See
+    /// `crate::changelog_requests` for the state-file shape AND lifecycle.
+    ChangelogRequest {
+        repo_substring: String,
+        raw_args: String,
     },
     Help,
 }
@@ -477,6 +495,38 @@ fn parse_command_outcome_in_thread(
                 request_text: rest_after_sub.to_string(),
             })
         }
+        "changelog" => {
+            // `@<bot> changelog <repo-substring> [<args>]` — the repo
+            // substring is the first whitespace-separated token after
+            // `changelog`; the args remainder is everything after that.
+            // Args may be empty (run with defaults) AND are passed
+            // verbatim to `parse_changelog_args` by the dispatcher.
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..];
+            let after_verb = after_verb.trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ changelog: missing repo-substring.".to_string(),
+                ));
+            }
+            let sub_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let repo_substring = &after_verb[..sub_end];
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let rest_after_sub = after_verb[sub_end..].trim();
+            if rest_after_sub.chars().count() > MAX_CHANGELOG_RAW_ARGS_LEN {
+                return ParseOutcome::Invalid(Reply::Sync(format!(
+                    "✗ changelog: args exceed {MAX_CHANGELOG_RAW_ARGS_LEN} characters."
+                )));
+            }
+            ParseOutcome::Ok(OperatorCommand::ChangelogRequest {
+                repo_substring: repo_substring.to_string(),
+                raw_args: rest_after_sub.to_string(),
+            })
+        }
         "send" => {
             // `@<bot> send it` parses ONLY when the inbound message
             // arrived inside a thread (non-empty `thread_ts`) AND the
@@ -527,6 +577,78 @@ pub fn parse_command_in_thread(
         ParseOutcome::Ok(cmd) => Some(cmd),
         ParseOutcome::None | ParseOutcome::Invalid(_) => None,
     }
+}
+
+// ====================================================================
+// Changelog raw-args parser
+// ====================================================================
+
+/// Result of parsing the `<args>` remainder from
+/// `@<bot> changelog <repo> [<args>]`. Mirrors the flag surface of
+/// `autocoder changelog`: `--since <tag>`, `--to <tag>`. The
+/// `--workspace <path>` flag is parsed BUT default-denied for chatops
+/// (operators picking workspaces via chat would let any unprivileged
+/// channel member point the stylist at an arbitrary directory). The
+/// `workspace_override` field is populated only when an explicit
+/// trust-elevated path bypasses the deny — production wiring sets the
+/// trust gate to `false`, so the field stays `None` in normal use.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedChangelogArgs {
+    pub since: Option<String>,
+    pub to: Option<String>,
+    pub workspace_override: Option<String>,
+}
+
+/// Parse the raw-args remainder of `@<bot> changelog <repo> [<args>]`.
+/// Accepts a subset of the CLI's flag surface (`--since`, `--to`, AND
+/// `--workspace`, the last of which is default-denied at higher layers).
+/// Bad flags surface as descriptive errors so the dispatcher can post
+/// `✗ changelog: bad arg: <text>`.
+pub fn parse_changelog_args(raw: &str) -> Result<ParsedChangelogArgs, String> {
+    let mut out = ParsedChangelogArgs::default();
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        match tok {
+            "--since" => {
+                let val = tokens.get(i + 1).copied().ok_or_else(|| {
+                    "missing value after `--since`".to_string()
+                })?;
+                if val.starts_with("--") {
+                    return Err(format!("missing value after `--since` (got `{val}`)"));
+                }
+                out.since = Some(val.to_string());
+                i += 2;
+            }
+            "--to" => {
+                let val = tokens.get(i + 1).copied().ok_or_else(|| {
+                    "missing value after `--to`".to_string()
+                })?;
+                if val.starts_with("--") {
+                    return Err(format!("missing value after `--to` (got `{val}`)"));
+                }
+                out.to = Some(val.to_string());
+                i += 2;
+            }
+            "--workspace" => {
+                let val = tokens.get(i + 1).copied().ok_or_else(|| {
+                    "missing value after `--workspace`".to_string()
+                })?;
+                if val.starts_with("--") {
+                    return Err(format!(
+                        "missing value after `--workspace` (got `{val}`)"
+                    ));
+                }
+                out.workspace_override = Some(val.to_string());
+                i += 2;
+            }
+            other => {
+                return Err(format!("unrecognized arg `{other}`"));
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ====================================================================
@@ -1149,6 +1271,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
     out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
+    out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -1396,6 +1519,12 @@ pub struct OperatorCommandDispatcher {
     /// in the `propose` branch). Defaults to
     /// `crate::proposal_requests::default_state_root()`.
     proposal_request_state_dir: PathBuf,
+    /// Directory under which changelog-request state files live (the
+    /// dispatcher writes
+    /// `<changelog_request_state_dir>/changelog-requests/<repo-sanitized>/<request_id>.json`
+    /// in the `changelog` branch). Defaults to
+    /// `crate::changelog_requests::default_state_root()`.
+    changelog_request_state_dir: PathBuf,
     /// Registered audit-type names. The `AuditNow` branch uses these to
     /// resolve operator-supplied audit substrings. Defaults to empty;
     /// the daemon's `cli/run.rs` wires the live registry's
@@ -1422,6 +1551,8 @@ impl OperatorCommandDispatcher {
             audit_thread_state_dir: crate::audits::threads::default_state_root(),
             proposal_request_state_dir:
                 crate::proposal_requests::default_state_root(),
+            changelog_request_state_dir:
+                crate::changelog_requests::default_state_root(),
             audit_types: Vec::new(),
             chatops: None,
         }
@@ -1441,6 +1572,14 @@ impl OperatorCommandDispatcher {
     #[allow(dead_code)]
     pub fn with_proposal_request_state_dir(mut self, dir: PathBuf) -> Self {
         self.proposal_request_state_dir = dir;
+        self
+    }
+
+    /// Override the changelog-request state directory. Tests use this
+    /// the same way `with_proposal_request_state_dir` is used.
+    #[allow(dead_code)]
+    pub fn with_changelog_request_state_dir(mut self, dir: PathBuf) -> Self {
+        self.changelog_request_state_dir = dir;
         self
     }
 
@@ -1548,6 +1687,19 @@ impl OperatorCommandDispatcher {
                     &request_text,
                     channel_id,
                     operator_user,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::ChangelogRequest {
+                repo_substring,
+                raw_args,
+            }) => Some(
+                self.dispatch_changelog_request(
+                    &repo_substring,
+                    &raw_args,
+                    channel_id,
                     repositories,
                     submitter,
                 )
@@ -1813,6 +1965,12 @@ impl OperatorCommandDispatcher {
                  Please file a bug."
                     .to_string()
             }
+            OperatorCommand::ChangelogRequest { .. } => {
+                "✗ changelog: internal routing error (the dispatcher saw \
+                 ChangelogRequest in the String-returning dispatch fn). \
+                 Please file a bug."
+                    .to_string()
+            }
         }
     }
 
@@ -1935,6 +2093,152 @@ impl OperatorCommandDispatcher {
             {
                 tracing::warn!(
                     "propose: subsequent thread reply for queue failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        Reply::Silent
+    }
+
+    /// Handle the `changelog` verb. Resolves the repo, validates the
+    /// raw-args remainder via `parse_changelog_args` (default-denying
+    /// `--workspace` overrides arriving via chat), posts a top-level
+    /// ack message via the configured chatops backend (capturing the
+    /// ack's `ts` as the request's lifecycle thread), writes a
+    /// `ChangelogRequestState` file with `status: Pending`, and submits
+    /// a `queue_changelog_request` control-socket action so the next
+    /// polling iteration picks up the request. Returns `Reply::Silent`
+    /// on success (the dispatcher has already posted the ack) and
+    /// `Reply::Sync(...)` on every failure shape so the operator's
+    /// message gets a threaded reply explaining what went wrong.
+    async fn dispatch_changelog_request(
+        &self,
+        repo_substring: &str,
+        raw_args: &str,
+        channel_id: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        // 1. Repo substring resolution.
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+
+        // 2. Validate args. Bad flags are surfaced inline.
+        match parse_changelog_args(raw_args) {
+            Ok(parsed) => {
+                if parsed.workspace_override.is_some() {
+                    // Default-deny the `--workspace` override in chatops
+                    // (it would let any channel member point the stylist
+                    // at an arbitrary directory). WARN log + refusal.
+                    tracing::warn!(
+                        repo_url = %repo.url,
+                        "changelog: refusing `--workspace` override arriving via chatops"
+                    );
+                    return Reply::Sync(
+                        "✗ changelog: `--workspace` override is not accepted via chatops; \
+                         run `autocoder changelog --workspace <path>` on the daemon host instead."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                return Reply::Sync(format!("✗ changelog: bad arg: {e}"));
+            }
+        }
+
+        // 3. Fresh request_id.
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // 4. Ack text. Mirrors the `propose` ack so operators learn one
+        //    pattern.
+        let ack_text = format!(
+            "✓ Queued changelog request for {repo_url}. \
+             The next polling iteration will run it. Follow along in this thread.",
+            repo_url = repo.url,
+        );
+
+        // 5. Post the ack via the chatops backend AND capture the `ts`.
+        let backend = match self.chatops.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                return Reply::Sync(
+                    "✗ changelog: chatops backend not configured.".to_string(),
+                );
+            }
+        };
+        let ack_ts = match backend
+            .post_message_capturing_ts(channel_id, &ack_text)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!("changelog: backend post_message_capturing_ts failed: {e:#}");
+                return Reply::Sync(format!(
+                    "✗ changelog: could not post ack to chat: {e}"
+                ));
+            }
+        };
+
+        // 6. Write the state file BEFORE submitting the control-socket
+        //    action so the polling-iteration handler always finds it.
+        let state = crate::changelog_requests::ChangelogRequestState {
+            request_id: request_id.clone(),
+            repo_url: repo.url.clone(),
+            raw_args: raw_args.to_string(),
+            channel: channel_id.to_string(),
+            lifecycle_thread_ts: ack_ts.clone(),
+            status: crate::changelog_requests::ChangelogStatus::Pending,
+            submitted_at: chrono::Utc::now(),
+            reason: None,
+        };
+        if let Err(e) = crate::changelog_requests::write_state(
+            &self.changelog_request_state_dir,
+            &state,
+        ) {
+            tracing::warn!(request_id = %request_id, "changelog: write_state failed: {e:#}");
+            if let Err(reply_err) = backend
+                .post_threaded_reply(
+                    channel_id,
+                    &ack_ts,
+                    &format!("✗ changelog: could not persist state file: {e}"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "changelog: subsequent thread reply for state-write failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        // 7. Submit the queue_changelog_request control-socket action.
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "queue_changelog_request",
+                "url": repo.url,
+                "request_id": request_id,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            let body = format!("✗ changelog: could not enqueue request: {err}");
+            if let Err(reply_err) = backend
+                .post_threaded_reply(channel_id, &ack_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    "changelog: subsequent thread reply for queue failure also failed: {reply_err:#}"
                 );
             }
             return Reply::Silent;
@@ -5376,6 +5680,297 @@ mod tests {
         assert!(text.starts_with("✗"), "{text}");
         assert!(text.contains("could not post ack"), "{text}");
         // No control-socket call submitted on backend failure.
+        assert!(submitter.calls().is_empty());
+    }
+
+    // ---------- changelog verb (a06-chat-driven-changelog) ----------
+
+    #[test]
+    fn parse_changelog_happy_path_no_args() {
+        let cmd = parse_command(&format!("{BOT} changelog myrepo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ChangelogRequest {
+                repo_substring: "myrepo".into(),
+                raw_args: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_changelog_happy_path_with_args() {
+        let cmd = parse_command(
+            &format!("{BOT} changelog myrepo --since v0.1.0 --to v0.2.0"),
+            BOT,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ChangelogRequest {
+                repo_substring: "myrepo".into(),
+                raw_args: "--since v0.1.0 --to v0.2.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_changelog_case_insensitive_verb() {
+        for verb in ["changelog", "CHANGELOG", "Changelog", "ChangeLog"] {
+            let cmd = parse_command(&format!("{BOT} {verb} myrepo"), BOT)
+                .unwrap_or_else(|| panic!("{verb} should parse"));
+            assert!(matches!(cmd, OperatorCommand::ChangelogRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn parse_changelog_missing_repo_returns_none() {
+        assert!(parse_command(&format!("{BOT} changelog"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} changelog   "), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_changelog_args_parses_since_and_to() {
+        let p = parse_changelog_args("--since v0.1.0 --to v0.2.0").unwrap();
+        assert_eq!(p.since.as_deref(), Some("v0.1.0"));
+        assert_eq!(p.to.as_deref(), Some("v0.2.0"));
+        assert!(p.workspace_override.is_none());
+    }
+
+    #[test]
+    fn parse_changelog_args_empty_input_is_ok() {
+        let p = parse_changelog_args("").unwrap();
+        assert!(p.since.is_none());
+        assert!(p.to.is_none());
+        assert!(p.workspace_override.is_none());
+    }
+
+    #[test]
+    fn parse_changelog_args_unknown_flag_errors() {
+        let err = parse_changelog_args("--unknown foo").unwrap_err();
+        assert!(err.contains("unrecognized arg"));
+        assert!(err.contains("--unknown"));
+    }
+
+    #[test]
+    fn parse_changelog_args_missing_value_errors() {
+        let err = parse_changelog_args("--since").unwrap_err();
+        assert!(err.contains("missing value"));
+        // A second flag in place of a value is also an error.
+        let err = parse_changelog_args("--since --to v1").unwrap_err();
+        assert!(err.contains("missing value"));
+    }
+
+    #[test]
+    fn parse_changelog_args_accepts_workspace_for_higher_layers_to_reject() {
+        let p = parse_changelog_args("--workspace /tmp/ws").unwrap();
+        assert_eq!(p.workspace_override.as_deref(), Some("/tmp/ws"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_happy_path_posts_ack_writes_state_submits_action() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748400000.001234"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_changelog_request",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog myrepo --since v0.1.0"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("changelog must produce a reply");
+        unwrap_silent(reply);
+
+        let posts = backend.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "exactly one top-level ack post");
+        let (channel, ack_text) = &posts[0];
+        assert_eq!(channel, "C_OPS");
+        assert!(
+            ack_text.starts_with("✓ Queued changelog request for "),
+            "{ack_text}"
+        );
+        assert!(
+            ack_text.contains("git@github.com:acme/myrepo.git"),
+            "{ack_text}"
+        );
+        assert!(ack_text.contains("Follow along in this thread."), "{ack_text}");
+
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_changelog_request");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        let request_id = calls[0]["request_id"]
+            .as_str()
+            .expect("action carries request_id")
+            .to_string();
+
+        let st = crate::changelog_requests::read_state(
+            tmp.path(),
+            "git@github.com:acme/myrepo.git",
+            &request_id,
+        )
+        .unwrap()
+        .expect("state file present");
+        assert_eq!(st.lifecycle_thread_ts, "1748400000.001234");
+        assert_eq!(st.channel, "C_OPS");
+        assert_eq!(st.raw_args, "--since v0.1.0");
+        assert_eq!(
+            st.status,
+            crate::changelog_requests::ChangelogStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_missing_repo_substring_refuses_with_no_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("missing-repo must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.contains("missing repo-substring"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_no_match_lists_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog gibberish"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("gibberish"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_ambiguous_lists_candidates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog acme"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("be more specific"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_without_chatops_backend_returns_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("chatops backend not configured"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_workspace_override_default_denied() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog myrepo --workspace /tmp/ws"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("--workspace"), "{text}");
+        // No backend posts AND no state file AND no action submitted.
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_changelog_bad_arg_returns_descriptive_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_changelog_request_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} changelog myrepo --bogus xyz"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗ changelog: bad arg:"), "{text}");
+        assert!(text.contains("--bogus"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
         assert!(submitter.calls().is_empty());
     }
 }

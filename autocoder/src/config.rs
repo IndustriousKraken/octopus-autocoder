@@ -147,6 +147,13 @@ pub struct ExecutorConfig {
     /// `openspec instructions apply` for each change.
     #[serde(default)]
     pub implementer_prompt_path: Option<PathBuf>,
+    /// Optional path to a custom changelog-stylist prompt template. When
+    /// unset, the binary uses the template embedded at compile time from
+    /// `prompts/changelog-stylist.md`. An empty file at the override path
+    /// is rejected at executor-construction time so the daemon does not
+    /// feed an empty prompt to the wrapped CLI.
+    #[serde(default)]
+    pub changelog_stylist_prompt_path: Option<PathBuf>,
     /// Number of consecutive Failed outcomes for a single change before
     /// autocoder marks it perma-stuck (writes `.perma-stuck.json` in the
     /// change directory, posts a chatops alert, and excludes the change
@@ -1722,6 +1729,7 @@ github:
             "timeout_secs",
             "sandbox",
             "implementer_prompt_path",
+            "changelog_stylist_prompt_path",
             "perma_stuck_after_failures",
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",

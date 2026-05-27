@@ -192,6 +192,7 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
         timeout_secs: 600,
         sandbox: None,
         implementer_prompt_path: None,
+        changelog_stylist_prompt_path: None,
         perma_stuck_after_failures: None,
         max_changes_per_pr: None,
         startup_jitter_max_secs: None,

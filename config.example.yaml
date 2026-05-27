@@ -67,6 +67,13 @@ executor:
   # Unset → use the prompt compiled into the binary.
   # implementer_prompt_path: /etc/autocoder/implementer.md
 
+  # Path to a file overriding the built-in changelog-stylist prompt
+  # template used by the `@<bot> changelog` chatops verb. Unset → use
+  # the prompt compiled into the binary from `prompts/changelog-stylist.md`.
+  # An empty file is rejected at startup so the daemon does not feed an
+  # empty prompt to the wrapped CLI.
+  # changelog_stylist_prompt_path: /etc/autocoder/changelog-stylist.md
+
   # Consecutive Failed iterations after which a change is marked
   # perma-stuck (writes `.perma-stuck.json`, posts a chatops alert, and
   # is excluded from `list_pending` until the marker is removed). A

@@ -16,8 +16,8 @@
 use super::event_log::{self, ActionKind, StructuredLogWriter};
 use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
 use super::{
-    ChatTriageContext, Executor, ExecutorOutcome, ResumeHandle, TriageContext,
-    UnimplementableTask,
+    ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome, ResumeHandle,
+    TriageContext, UnimplementableTask,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -54,6 +54,11 @@ const DEFAULT_TRIAGE_TEMPLATE: &str = include_str!("../../../prompts/audit-triag
 const DEFAULT_CHAT_TRIAGE_TEMPLATE: &str =
     include_str!("../../../prompts/chat-request-triage.md");
 
+/// Built-in changelog-stylist prompt template, embedded at compile time.
+/// Used by `run_changelog` for the chat-driven `changelog` flow.
+pub const DEFAULT_CHANGELOG_STYLIST_TEMPLATE: &str =
+    include_str!("../../../prompts/changelog-stylist.md");
+
 /// Literal placeholder replaced with `openspec instructions apply` output.
 const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
 const REVISION_DIFF_PLACEHOLDER: &str = "{{pr_diff}}";
@@ -63,6 +68,8 @@ const TRIAGE_AUDIT_TYPE_PLACEHOLDER: &str = "{{audit_type}}";
 const TRIAGE_REPO_URL_PLACEHOLDER: &str = "{{repo_url}}";
 const TRIAGE_SPECS_INDEX_PLACEHOLDER: &str = "{{canonical_specs_index}}";
 const CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER: &str = "{{request_text}}";
+const CHANGELOG_JSON_PLACEHOLDER: &str = "{{changelog_json}}";
+const CHANGELOG_REVISION_TEXT_PLACEHOLDER: &str = "{{revision_text}}";
 
 /// Synthetic "change" name used for the triage-mode run-log path. The
 /// triage flow does not target a specific change directory; the name is
@@ -74,12 +81,19 @@ const TRIAGE_LOG_CHANGE_NAME: &str = "audit-triage";
 /// the name is only used to produce a per-run log file for diagnostics.
 const CHAT_TRIAGE_LOG_CHANGE_NAME: &str = "chat-request-triage";
 
+/// Synthetic "change" name used for the changelog-stylist run-log path.
+const CHANGELOG_STYLIST_LOG_CHANGE_NAME: &str = "changelog-stylist";
+
 pub struct ClaudeCliExecutor {
     command: String,
     args: Vec<String>,
     timeout: Duration,
     sandbox: crate::config::ResolvedSandbox,
     template: String,
+    /// Stylist prompt template for the chat-driven `changelog` flow.
+    /// Resolved from `executor.changelog_stylist_prompt_path` when set;
+    /// otherwise the embedded `prompts/changelog-stylist.md` template.
+    changelog_stylist_template: String,
     /// Output format mode for the wrapped CLI. `Json` (default) → stream
     /// `--output-format stream-json` events through the parser and
     /// structured log writer; `Text` → preserve today's at-exit capture
@@ -124,6 +138,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
@@ -159,12 +174,32 @@ impl ClaudeCliExecutor {
             }
             None => DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
         };
+        let changelog_stylist_template =
+            match &cfg.changelog_stylist_prompt_path {
+                Some(path) => {
+                    let s = std::fs::read_to_string(path).with_context(|| {
+                        format!(
+                            "reading changelog-stylist prompt template at {}",
+                            path.display()
+                        )
+                    })?;
+                    if s.trim().is_empty() {
+                        return Err(anyhow!(
+                            "changelog-stylist prompt template at {} is empty",
+                            path.display()
+                        ));
+                    }
+                    s
+                }
+                None => DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
+            };
         Ok(Self {
             command: cfg.command.clone(),
             args: Vec::new(),
             timeout: Duration::from_secs(cfg.timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
             template,
+            changelog_stylist_template,
             output_format: cfg.output_format,
             settings_dir: None,
         })
@@ -180,6 +215,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(None),
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
@@ -321,6 +357,17 @@ impl ClaudeCliExecutor {
             .replace(CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER, &ctx.request_text)
             .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
             .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
+    }
+
+    /// Build the changelog-stylist prompt by substituting the
+    /// `ChangelogContext` payloads into the resolved stylist template
+    /// (embedded default OR override loaded from
+    /// `executor.changelog_stylist_prompt_path`).
+    fn build_changelog_prompt(&self, ctx: &ChangelogContext) -> String {
+        self.changelog_stylist_template
+            .replace(CHANGELOG_JSON_PLACEHOLDER, &ctx.changelog_json)
+            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
+            .replace(CHANGELOG_REVISION_TEXT_PLACEHOLDER, &ctx.revision_text)
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
@@ -1166,6 +1213,28 @@ impl Executor for ClaudeCliExecutor {
         self.classify_outcome(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
+
+    async fn run_changelog(
+        &self,
+        workspace: &Path,
+        ctx: &ChangelogContext,
+    ) -> Result<ExecutorOutcome> {
+        let prompt = self.build_changelog_prompt(ctx);
+        let _mcp_path = Self::write_mcp_config(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME)?;
+        let outcome = self
+            .run_subprocess(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, &prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(
+            workspace,
+            CHANGELOG_STYLIST_LOG_CHANGE_NAME,
+            &prompt,
+            &outcome,
+        );
+        self.classify_outcome(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, outcome)
+            .await
+    }
 }
 
 /// Parse a stdout line as a JSON event and append a corresponding
@@ -1772,6 +1841,7 @@ mod tests {
             timeout_secs: 30,
             sandbox: None,
             implementer_prompt_path: None,
+            changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
@@ -1797,6 +1867,7 @@ mod tests {
             timeout_secs: 30,
             sandbox: None,
             implementer_prompt_path: Some(path),
+            changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
@@ -1819,6 +1890,7 @@ mod tests {
             timeout_secs: 30,
             sandbox: None,
             implementer_prompt_path: Some(PathBuf::from("/definitely/not/a/real/path.md")),
+            changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
@@ -1836,6 +1908,109 @@ mod tests {
         assert!(s.contains("implementer prompt template"), "error: {s}");
     }
 
+    /// The embedded changelog-stylist template is non-empty AND contains
+    /// the documented placeholders.
+    #[test]
+    fn embedded_changelog_stylist_template_is_loaded() {
+        assert!(!DEFAULT_CHANGELOG_STYLIST_TEMPLATE.trim().is_empty());
+        assert!(DEFAULT_CHANGELOG_STYLIST_TEMPLATE.contains(CHANGELOG_JSON_PLACEHOLDER));
+        assert!(DEFAULT_CHANGELOG_STYLIST_TEMPLATE.contains(TRIAGE_REPO_URL_PLACEHOLDER));
+        assert!(
+            DEFAULT_CHANGELOG_STYLIST_TEMPLATE.contains(CHANGELOG_REVISION_TEXT_PLACEHOLDER)
+        );
+        assert!(DEFAULT_CHANGELOG_STYLIST_TEMPLATE.contains("CHANGELOG.md"));
+        assert!(DEFAULT_CHANGELOG_STYLIST_TEMPLATE.contains("Keep a Changelog"));
+    }
+
+    /// `from_config`: with no override path, the embedded stylist
+    /// template is used.
+    #[test]
+    fn from_config_uses_default_changelog_stylist_when_path_unset() {
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: None,
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
+        };
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert_eq!(
+            executor.changelog_stylist_template,
+            DEFAULT_CHANGELOG_STYLIST_TEMPLATE
+        );
+    }
+
+    /// `from_config`: with an override path set, the file contents
+    /// replace the embedded stylist template.
+    #[test]
+    fn from_config_loads_override_changelog_stylist_when_path_set() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("custom-stylist.md");
+        std::fs::write(&path, "CUSTOM_STYLIST_SENTINEL {{changelog_json}}").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: Some(path),
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
+        };
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert!(
+            executor.changelog_stylist_template.contains("CUSTOM_STYLIST_SENTINEL"),
+            "{}",
+            executor.changelog_stylist_template
+        );
+    }
+
+    /// `from_config`: an empty changelog-stylist override file errors.
+    #[test]
+    fn from_config_errors_when_changelog_stylist_file_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.md");
+        std::fs::write(&path, "   \n  \n").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: Some(path),
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
+        };
+        let err = match ClaudeCliExecutor::from_config(&cfg) {
+            Ok(_) => panic!("empty changelog-stylist file must error"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(s.contains("changelog-stylist"), "{s}");
+        assert!(s.contains("empty"), "{s}");
+    }
+
     /// `from_config`: an empty override file errors (otherwise the
     /// daemon would feed an empty wrapper to Claude on every run).
     #[test]
@@ -1849,6 +2024,7 @@ mod tests {
             timeout_secs: 30,
             sandbox: None,
             implementer_prompt_path: Some(path),
+            changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
