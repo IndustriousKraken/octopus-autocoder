@@ -14,6 +14,28 @@ autocoder run --config <path-to-config.yaml>
 
 The daemon polls every configured repository on its interval, processes ready OpenSpec changes, and opens monolithic PRs. Terminates only on SIGINT, SIGTERM, or a fatal initialization error. Logs go to stderr; control verbosity with `RUST_LOG=info` (default), `RUST_LOG=debug`, etc.
 
+## `install`
+
+First-run wizard / re-install entry point. The `install.sh` bootstrap swaps the binary then execs `autocoder install`; on an existing install with the systemd unit loaded, the subcommand short-circuits with the three-verb status block (update, reconfigure, wipe).
+
+```bash
+autocoder install [--reconfigure <section>] [--upgrade] [--non-interactive ...]
+```
+
+**`--reconfigure <section>`** re-prompts ONE section of an existing install and patches the existing `config.yaml`. Accepted values:
+
+- `audits` — re-prompts every audit cadence with the operator's current cadence as the default, then writes the new `audits.defaults.*` in place via atomic temp-file-then-rename.
+- `reviewer` — re-prompts provider, model, and api-key env-var, then shows a unified diff against the current file AND prompts `Apply this patch? [y/N]`. The patch lands only on `y/Y`.
+- `chatops` — re-prompts the backend and default channel id, then diff-confirms the same way as `reviewer`.
+
+The flag is mutually exclusive with `--non-interactive` AND with every prefill flag (`--repo-url`, `--token-env-var`, etc.) — reconfigure is interactive and section-scoped by definition. clap rejects the combination at argument-parse time.
+
+Values not in the accepted list are rejected (e.g. `--reconfigure repositories` exits non-zero with the standard `possible values: audits, reviewer, chatops` clap error). The wizard intentionally excludes several knobs: `repositories` (use `autocoder reload` which hot-applies add/remove without a restart), `paths.*` (destructive, restart-required), `executor.*` (restart-required), and `audits.settings.*.prompt_path` / `audits.settings.*.extra.*` (advanced overrides — edit YAML directly).
+
+After a successful patch, the subcommand prints `Patched <section> in <path>. To apply: sudo -u autocoder autocoder reload`. The wizard does NOT auto-reload — the operator decides when to apply.
+
+If neither the systemd probe nor `<default-config-dir>/config.yaml` resolves to an existing file, `--reconfigure` exits non-zero with `no existing install detected; run install.sh for first-time setup`.
+
 ## `reload`
 
 Ask a running daemon to re-read its YAML config and hot-apply the `github`, `reviewer`, and `chatops` sections.

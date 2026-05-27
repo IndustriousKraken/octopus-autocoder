@@ -44,6 +44,14 @@ sudo systemctl restart autocoder
 
 This path does not touch your config, secrets, or systemd unit at all — only the binary at `/usr/local/bin/autocoder` is swapped.
 
+### Editing one section without re-doing the whole wizard
+
+`autocoder install --reconfigure <section>` re-prompts ONE block of an existing install and patches the existing `config.yaml`. Use it when you want to change cadences, swap reviewer providers, or move chatops to a different channel without walking through the full first-run questionnaire again. Accepted values: `audits`, `reviewer`, `chatops`.
+
+The most common use is `autocoder install --reconfigure audits` after deciding that the conservative first-install defaults are too quiet (or too loud): the wizard re-prompts every audit cadence with the current value as the default, writes the new `audits.defaults.*` in place, then prints the `sudo -u autocoder autocoder reload` command to hot-apply. The `reviewer` and `chatops` variants show a unified diff before applying so you can catch hand-edited overrides (custom `api_base_url`, notifications block) that would otherwise be lost on round-trip.
+
+Sections NOT covered: `repositories` (use `autocoder reload`, which hot-applies add/remove without a restart — `--reconfigure repos` is intentionally absent), `paths.*` (destructive, restart-required), and `executor.*` (restart-required). See [docs/CLI.md](CLI.md) for the full flag reference.
+
 For ongoing unattended updates (cron-driven binary swaps that watch the releases feed), see [Unattended updates via cron](DEPLOYMENT.md#unattended-updates-via-cron).
 
 ## 1. Install the binary
