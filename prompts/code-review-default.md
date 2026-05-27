@@ -25,26 +25,17 @@ Out of scope:
 
 # Format
 
-Respond with EXACTLY this structure:
+Respond with the exact structure described below. Do NOT wrap your response in a code fence. Do NOT prefix with any preamble like "Here's my review:" — your first non-empty line MUST be the literal text `VERDICT:` followed by Pass, Concerns, or Block.
 
-```
-VERDICT: <Pass | Concerns | Block>
+The structure is:
 
-## Summary
-2-4 sentences naming the files and code surfaces you actually examined, the kinds of issues you specifically looked for given the change's character (e.g. "checked the input-validation path on the new HTTP handler", "audited the lock acquisition order in the new RAII guard", "traced the error propagation through the new module's public API"), and a one-line overall impression. Do NOT recap the diff or restate the change description; demonstrate engagement with the code itself, not the change brief.
+- First line: `VERDICT: <Pass | Concerns | Block>`
+- Then a blank line
+- Then four markdown sections in order: `## Summary`, `## Security`, `## Error handling`, `## Naming, style, idioms`, `## Possible bugs`
 
-## Security
-- <bullet, or "None observed in the reviewed surface.">
+For the `## Summary` section, write 2-4 sentences naming the files and code surfaces you actually examined, the kinds of issues you specifically looked for given the change's character (e.g. "checked the input-validation path on the new HTTP handler", "audited the lock acquisition order in the new RAII guard", "traced the error propagation through the new module's public API"), and a one-line overall impression. Do NOT recap the diff or restate the change description; demonstrate engagement with the code itself, not the change brief.
 
-## Error handling
-- <bullet, or "None observed in the reviewed surface.">
-
-## Naming, style, idioms
-- <bullet, or "None observed in the reviewed surface.">
-
-## Possible bugs
-- <bullet, or "None observed in the reviewed surface.">
-```
+For each of the four concern sections (`## Security`, `## Error handling`, `## Naming, style, idioms`, `## Possible bugs`), emit either a bulleted list of concerns OR the literal text `None observed in the reviewed surface.` when there's nothing to flag.
 
 The Summary section is mandatory. If a reviewer cannot describe what was examined, the review is not credible — be specific about which files and which patterns were inspected; do not generalize.
 
@@ -56,17 +47,17 @@ The first non-empty line MUST be `VERDICT:` followed by exactly one of `Pass`, `
 
 If you see a `## Skipped (budget exhausted)` line under "Changed files" or a `(diff omitted: budget exhausted by change context and changed files)` line under "Diff", some context was dropped to fit the prompt budget. Acknowledge the missing context in your first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
 
-# Structured revision-requests block (REQUIRED, may be empty)
+# Structured revision-requests block (when you surfaced concerns)
 
-After the markdown sections above, append ONE additional fenced code block tagged `revision-requests`. The block contains a YAML list — one entry per concern surfaced in the markdown sections — that lets the daemon decide which concerns are actionable enough to forward to the implementer agent as revision requests.
+When your markdown sections above contain one or more concerns, append ONE additional fenced YAML block tagged `revision-requests` as the LAST thing in your response. The block contains a YAML list — one entry per concern — that lets the daemon decide which concerns are actionable enough to forward to the implementer agent as revision requests.
 
-Schema for each entry:
+When you have no concerns at all (`VERDICT: Pass` AND every concern section reads `None observed in the reviewed surface.`), OMIT the revision-requests block entirely. Do not emit an empty list, do not emit an empty fence — simply end your response after the last markdown section. The daemon treats an absent block as "no actionable revisions" and proceeds normally.
 
-```
-- summary: <short text mirroring the bullet you wrote above>
-  actionable_request: <text suitable for an implementer agent to act on, OR omit when none applies>
-  should_request_revision: <true | false>
-```
+Schema for each entry in the block:
+
+- `summary`: short text mirroring the bullet you wrote in the markdown sections above
+- `actionable_request`: text suitable for an implementer agent to act on, OR omit the field when no concrete fix applies
+- `should_request_revision`: `true` or `false`
 
 Rules:
 
@@ -76,9 +67,8 @@ Rules:
   - `actionable_request` is non-empty and unambiguous.
 - Style preferences, philosophical disagreements, and "consider whether..." suggestions stay `should_request_revision: false`. They are commentary, not revision requests.
 - When in doubt, prefer `false` — a false positive generates a wasted revision cycle and noisy PR comments; a false negative just leaves the concern as commentary for the human reviewer.
-- If you have no concerns at all (`VERDICT: Pass`), emit an empty list (`[]`) rather than omitting the block.
 
-Format the block exactly like:
+Concrete example of the block you should produce when there are two concerns to report:
 
 ```revision-requests
 - summary: "find_user drops the error context"
@@ -88,7 +78,7 @@ Format the block exactly like:
   should_request_revision: false
 ```
 
-The block is the LAST thing in your response, after every markdown section above. The daemon uses it to drive the reviewer-initiated revision pipeline (when enabled via `reviewer.auto_revise_on_block`); omitting the block silently disables that pipeline for this PR.
+The example above is what should appear in your output verbatim (fence open with ```` ```revision-requests ````, YAML content, fence close with ```` ``` ````). The daemon uses it to drive the reviewer-initiated revision pipeline (when enabled via `reviewer.auto_revise_on_block`).
 
 # Change context
 
