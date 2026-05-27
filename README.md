@@ -38,19 +38,54 @@ Re-running `install.sh` downloads the latest binary (or a specific tag — pass 
 
 ---
 
-## Architecture
+## What you can do with it
 
-autocoder is a single tokio-based daemon with one polling task per configured repository. Each iteration follows a fixed workflow: fetch + branch init → process waiting (escalated) changes → process pending changes → push + PR if any commits were produced. The serial-per-repo invariant guarantees that change B does not run while change A is mid-flight or waiting on human input.
+Once the daemon is running, this is the day-to-day surface.
+
+**Implement specs autonomously.** Drop an OpenSpec change into `openspec/changes/<slug>/`, push to the base branch. The next polling iteration drives the wrapped agent through it, opens a PR with the diff, and archives the change on merge. Failures surface via chatops; per-change `.perma-stuck.json` and `.needs-spec-revision.json` markers signal when human action is needed.
+
+**Talk to autocoder in chat** (Slack officially supported; Discord, Teams, Mattermost, Matrix [experimental](docs/CHATOPS.md#experimental-chatops-backends)). With Slack Socket Mode wired in:
+
+| Verb | What it does |
+| --- | --- |
+| `@<bot> propose <repo> <text>` | Free-form request. The agent classifies it as a **directive** (produces a fixes PR and/or a spec PR), a **question** (replies in-thread, no PR), or **ambiguous** (asks for clarification via the standard `ask_user` escalation). See [docs/CHATOPS.md → Chat-driven proposals](docs/CHATOPS.md#chat-driven-proposals-propose). |
+| `@<bot> send it` *(inside an audit thread)* | Act on the audit's findings. Same two-PR shape as `propose`. See [docs/CHATOPS.md → Acting on audit findings](docs/CHATOPS.md#acting-on-audit-findings-send-it). |
+| `@<bot> audit <type> <repo>` | Run any registered audit on demand, bypassing its cadence. CLI variant: `autocoder audit run`. See [docs/CLI.md → audit run](docs/CLI.md#audit-run). |
+| `@<bot> revise <text>` *(on a PR comment)* | Re-run the agent against the original change plus your text and force-push the updated diff. Per-PR cap (default 5, configurable, max 20). See [docs/OPERATIONS.md → Revising an open PR via comment](docs/OPERATIONS.md#revising-an-open-pr-via-comment). |
+| `@<bot> status [<repo>]` | Live workspace snapshot — branches, last commits, latest PR, busy state, queue. Bare `status` returns the per-repo menu. |
+| Recovery verbs | `@<bot> clear-perma-stuck`, `clear-revision`, `wipe-workspace` (two-step confirm), `rebuild-specs`, `help`. See [docs/CHATOPS.md → Operator recovery commands](docs/CHATOPS.md#operator-recovery-commands). |
+
+**Periodic audits.** Five audits run on configurable cadences. All `disabled` by default; opt in globally via `audits.defaults.<slug>` or per-repo. The install wizard offers a single fast-path to enable the recommended cadences.
+
+| Audit | What it does | LLM | Output |
+| --- | --- | --- | --- |
+| `architecture_brightline` | Pure-code metrics: oversize files, duplicate signatures across files. | No | Reported findings (chatops `📐`) |
+| `architecture_consultative` | Anchored architectural questions tied to specific `file:line` ranges. Read-only sandbox. | Yes | Reported findings (chatops `📋`) |
+| `drift_audit` | Each canonical-spec requirement vs. observable code behavior, plus spec-vs-spec contradiction detection. Read-only sandbox. | Yes | Reported findings (chatops `🧭`) |
+| `missing_tests_audit` | Surveys for uncovered error paths; writes `openspec/changes/tests-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
+| `security_bug_audit` | Surveys for security issues and bugs; writes `openspec/changes/fix-*` / `secure-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
+
+Spec-writing audits enqueue their new proposals into the same iteration's queue walk — implementer commit and audit's creation commit ship in one PR. Generated proposals run through `openspec validate --strict` before commit; invalid proposals are discarded and a `❌` chatops notification fires. See [docs/OPERATIONS.md → Periodic audits](docs/OPERATIONS.md#periodic-audits).
+
+**Optional code-quality reviewer.** Each PR gains a `## Code Review` section produced by a separately-configured LLM (Anthropic, or any OpenAI-compatible endpoint — Grok, OpenRouter, local Ollama). A `Block` verdict marks the PR as draft. With `auto_revise_on_block: true`, per-concern fixes feed back into the same revision dispatcher operator `@<bot> revise` uses. See [docs/CODE-REVIEW.md](docs/CODE-REVIEW.md).
+
+**Beyond the daily surface.** Fork-and-PR mode ([SECURITY.md](docs/SECURITY.md#7-fork-and-pr-workflow-recommended-for-org-repos)) collapses the blast radius — the bot account only needs Read on upstream. Per-owner PAT routing ([CONFIG.md](docs/CONFIG.md#multiple-github-tokens)) handles multi-org setups. `autocoder reload` hot-applies `github`, `reviewer`, `chatops`, and `repositories` config changes without a restart, including adding/removing repos at runtime ([OPERATIONS.md](docs/OPERATIONS.md#runtime-control-live-config-reload)). `autocoder sync-specs --rebuild` (or `@<bot> rebuild-specs`) reconciles canonical specs from archive history when the openspec `sync` workflow was missing upstream ([OPERATIONS.md](docs/OPERATIONS.md#rebuilding-canonical-specs-from-archive-history)). Per-change logs use JSON-stream parsing by default and split into PROMPT / ACTIONS / FINAL ANSWER / STDERR sections so a timeout-killed run still shows what the agent was doing ([OPERATIONS.md](docs/OPERATIONS.md#per-change-run-log-shape)).
+
+---
+
+## How it works
+
+autocoder is a single tokio-based daemon with one polling task per configured repository. Each iteration follows a fixed workflow: fetch + branch init → run any due audits → process waiting (escalated) changes → process pending changes → push + PR if any commits were produced. The serial-per-repo invariant guarantees that change B does not run while change A is mid-flight or waiting on human input.
 
 Built capabilities (each is a baseline spec under `openspec/specs/`):
 
-1. **orchestrator-cli** — the `run` daemon entry point and the `rewind` recovery subcommand. Multi-repo dispatch with a shared cancellation token; per-repo polling tasks; SIGINT/SIGTERM drain.
-2. **workspace-manager** — deterministic per-repo workspace paths under `/tmp/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, and a startup dirty-workspace check that skips a dirty repo for the process lifetime.
-3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion with `YYYY-MM-DD-<change>` date prefix, unarchive on rewind.
-4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout and two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop).
+1. **orchestrator-cli** — `run` daemon entry point, the `rewind` recovery subcommand, the `reload` runtime-control subcommand, and the `audit run` on-demand audit subcommand. Multi-repo dispatch with a shared cancellation token; per-repo polling tasks; SIGINT/SIGTERM drain; the periodic-audit framework, PR-comment revision dispatcher, `send it` and `propose` triage flows, canonical-spec rebuild, and standard data-directory layout all live here.
+2. **workspace-manager** — deterministic per-repo workspace paths under `<cache_dir>/workspaces/`, idempotent clone-or-fetch, startup-time cross-repo collision detection, startup dirty-workspace check, partial-clone self-heal, and dirty-workspace auto-recovery between iterations.
+3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion via `openspec archive`, unarchive on rewind.
+4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess (default `--output-format stream-json`), captures the tool-call action stream and the final result event separately, applies a per-iteration sandbox, and detects `AskUser` via an MCP-tool marker file plus a stdout-regex backstop.
 5. **git-workflow-manager** — branch init (`fetch → checkout base → pull --ff-only → checkout -B agent`), per-change commits with `<change>: <first line of ## Why>` subject truncated to 72 chars, monolithic PR creation via the GitHub REST API with `--force-with-lease` push.
-6. **chatops-manager** — chat-platform escalation behind a `ChatOpsBackend` trait. Slack is the officially-supported provider; Discord, Teams, Mattermost, and Matrix are [experimental backends](docs/CHATOPS.md#experimental-chatops-backends) with no API-stability guarantees. On `AskUser`, the daemon posts a question to a configured channel and persists `.question.json` to disk. On the next iteration it polls the thread; when the first non-bot reply arrives it writes `.answer.json` and resumes the executor. Same-repo serial-queue invariant is preserved: any waiting change in a repository blocks all pending-change processing for that repo until resolved.
-7. **code-reviewer** — opt-in AI code-quality review of the diff between base and agent branches. Configurable LLM provider (Anthropic or any OpenAI-compatible endpoint, including Grok, OpenRouter, local Ollama). A `Block` verdict creates the PR as a draft (with a `do-not-merge` label fallback on hosts that reject drafts).
+6. **chatops-manager** — chat-platform integration behind a `ChatOpsBackend` trait. Slack is the officially-supported provider; Discord, Teams, Mattermost, and Matrix are [experimental backends](docs/CHATOPS.md#experimental-chatops-backends) with no API-stability guarantees. Outbound surface covers `AskUser` escalation, progress notifications, threaded audit-finding notifications, and the proposal-created / validation-exhausted / revision-cap notifications. The Slack Socket Mode inbound listener parses operator verbs (`propose`, `send it`, `audit`, `status`, `revise`, the recovery verbs) and submits actions over the daemon's Unix-domain control socket.
+7. **code-reviewer** — opt-in AI code-quality review of the diff between base and agent branches. Configurable LLM provider (Anthropic or any OpenAI-compatible endpoint). A `Block` verdict creates the PR as a draft (with a `do-not-merge` label fallback on hosts that reject drafts). When `auto_revise_on_block: true`, per-concern actionable fixes are posted as `<!-- reviewer-revision -->`-marked PR comments that the same revision dispatcher picks up.
 
 The default executor backend wraps `claude` as a subprocess. The daemon writes a per-workspace `.mcp.json` pointing at itself as an MCP server exposing the `ask_user` tool; when the agent calls it, a marker file is written and the daemon picks it up after the child exits. The MCP server is hosted as a hidden subcommand of the autocoder binary, so deployment is a single-binary install.
 
@@ -58,34 +93,31 @@ The default executor backend wraps `claude` as a subprocess. The daemon writes a
 
 ## Documentation
 
-Everything beyond the quick install lives under [`docs/`](docs/). The index there has one-line summaries for each file. Direct links:
+Everything beyond the quick install lives under [`docs/`](docs/README.md) — grouped by getting started, feature surfaces, operating the daemon, reference, and internals. Highlights:
 
-- [Manual install from source](docs/INSTALL.md)
-- [Configuration reference](docs/CONFIG.md) (full `config.yaml` schema, multi-token routing)
-- [ChatOps escalation](docs/CHATOPS.md) (Slack setup, operator commands, inbound listener, experimental backends)
-- [Code review](docs/CODE-REVIEW.md) (the optional AI reviewer's scope and prompt template)
-- [Operating notes](docs/OPERATIONS.md) (workspace layout, queue order, recovery flows, audits, rebuilding canonical specs)
-- [Deployment](docs/DEPLOYMENT.md) (binary install, systemd unit, SSH keys, upgrades)
-- [Security & guardrails](docs/SECURITY.md) (credentials, branch protection, self-modification, sandbox)
-- [CLI reference](docs/CLI.md) (`run`, `reload`, `rewind`)
-- [Troubleshooting](docs/TROUBLESHOOTING.md) (rebuild failures and other diagnostic flows)
+- [Configuration reference](docs/CONFIG.md) — full `config.yaml` schema, multi-token routing, `paths:` block.
+- [ChatOps](docs/CHATOPS.md) — chat-driven workflows (`propose`, `send it`, `audit`, `revise`), operator recovery verbs, Slack Socket Mode setup, experimental backends.
+- [Operating notes](docs/OPERATIONS.md) — periodic audits, on-demand triggers, perma-stuck/needs-revision recovery, PR-comment revisions, live config reload, canonical spec rebuild.
+- [Deployment](docs/DEPLOYMENT.md) — systemd unit, SSH keys, upgrades.
+- [Security & guardrails](docs/SECURITY.md) — credential scoping, fork-and-PR mode, executor sandbox.
+- [CLI reference](docs/CLI.md) — `run`, `reload`, `rewind`, `audit run`, `sync-specs`.
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — rebuild failures, revision misfires, audit timeouts, post-reboot audit storms.
 
 ---
 
 ## Status & Roadmap
 
-The seven capabilities listed under [Architecture](#architecture) are all **implemented and tested**. autocoder runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the officially-supported escalation channel. The four experimental ChatOps backends (Discord, Teams, Mattermost, Matrix) compile and have unit-test coverage against recorded fixtures but no live-service validation; operators who deliberately select one are the ones surfacing bugs.
+The seven capabilities listed under [How it works](#how-it-works) are all **implemented and tested**. autocoder runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the officially-supported escalation channel. The four experimental ChatOps backends (Discord, Teams, Mattermost, Matrix) compile and have unit-test coverage against recorded fixtures but no live-service validation; operators who deliberately select one are the ones surfacing bugs.
 
-The following capabilities are **explicitly aspirational** — referenced in design documents but not built:
+The following capability is **explicitly aspirational**:
 
-- **Verifier** *(planned; not in any active change)*: a spec-audit step that runs alongside the code reviewer and asks "did the diff actually implement the spec?" The reviewer agent currently focuses on code quality and explicitly does not assess spec compliance. Until the verifier ships, spec correctness is a human-review concern.
-- **Drift audit** *(planned; not in any active change)*: a periodic whole-repo verification that catches gradual divergence between the baseline `openspec/specs/` and the code. Until this ships, the per-change architecture cross-reference (run once at change-archive time) is the closest equivalent.
+- **Verifier** *(planned; not in any active change)*: a spec-audit step that runs alongside the code reviewer and asks "did the diff actually implement the spec?" The reviewer agent currently focuses on code quality and explicitly does not assess spec compliance. Until the verifier ships, spec correctness is a human-review concern. The shipped `drift_audit` is a related but distinct signal — periodic spec-vs-code divergence detection across the whole repo, separate from per-change verification.
 
 Other items deferred without a current owner:
 
 - **Multi-instance distributed deployment.** autocoder assumes single-instance ownership of each configured workspace; running two daemons against the same `local_path` would race. Out of scope for the current architecture.
 - **Per-repo executor configuration overrides.** The `executor:` block is global; mixing Claude on one repo and a different backend on another in the same config is not supported.
-- **Streaming or incremental code review.** The reviewer sends the full diff in one LLM call; truncation at 100k chars is documented in `prompts/code-review-default.md`.
+- **Streaming or incremental code review.** The reviewer sends the diff plus full file contents in one LLM call; truncation at the prompt-budget ceiling is documented in `prompts/code-review-default.md`. The executor's own output IS streamed (JSON event stream parsed live into the per-change log); the review LLM is the remaining single-shot call.
 
 To request an aspirational item, file an issue or open an OpenSpec change proposal in this repository. Self-modification guardrails apply when autocoder works on its own codebase; see [docs/SECURITY.md](docs/SECURITY.md).
 

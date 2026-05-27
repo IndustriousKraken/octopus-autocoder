@@ -62,7 +62,7 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 
 ## `chatops:` (optional)
 
-See [ChatOps Escalation](CHATOPS.md). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](CHATOPS.md#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
+See [ChatOps](CHATOPS.md). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](CHATOPS.md#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
 
 ### `chatops.slack:` (when `provider: slack`)
 

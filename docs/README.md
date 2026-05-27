@@ -1,17 +1,30 @@
 # Documentation
 
-This directory holds the long-form documentation for autocoder. The main [README](../README.md) covers what it is, how to install it, and where to find everything else; the files here are the reference material an operator consults occasionally.
+This directory holds the long-form documentation for autocoder. The main [README](../README.md) covers what it is, how to install it, and [what you can do with it](../README.md#what-you-can-do-with-it). The files below are the reference material an operator consults occasionally.
 
-## Index
+## Getting started
 
 - [INSTALL.md](INSTALL.md) — Manual install from source. The `autocoder install` wizard handles most cases; use this for contributor setups, air-gapped builds, or installs that need to inspect the build itself.
 - [CONFIG.md](CONFIG.md) — Full `config.yaml` schema. Every field, every default. Includes the multi-token routing for operators running across more than one GitHub owner.
-- [CHATOPS.md](CHATOPS.md) — ChatOps escalation, operator commands, the Socket-Mode inbound listener setup, and the experimental non-Slack backends.
-- [CODE-REVIEW.md](CODE-REVIEW.md) — The optional AI code-reviewer's scope, verdict semantics, prompt template, and PR composition rules.
-- [OPERATIONS.md](OPERATIONS.md) — Operating notes: workspace paths, queue order, busy markers, perma-stuck recovery, spec-needs-revision recovery, self-heal, audits, rebuilding canonical specs, runtime config reload, dirty-workspace auto-recovery.
 - [DEPLOYMENT.md](DEPLOYMENT.md) — Recommended binary deploy with systemd: user setup, SSH keys, the unit file, env-var layout, upgrade workflow, applying config changes without a restart.
+
+## Feature surfaces
+
+- [CHATOPS.md](CHATOPS.md) — Chat-driven workflows (`propose`, `send it`, `audit`, `revise`), operator recovery verbs, `AskUser` escalation, progress notifications, Slack Socket Mode inbound listener, experimental non-Slack backends.
+- [CODE-REVIEW.md](CODE-REVIEW.md) — The optional AI code-reviewer: scope, verdict semantics, prompt template, reviewer-initiated revisions, PR composition.
+
+## Operating the daemon
+
+- [OPERATIONS.md](OPERATIONS.md) — Operating notes: workspace paths, polling cadence + firewall considerations, queue order, busy markers, perma-stuck recovery, spec-needs-revision recovery, self-heal, periodic audits + on-demand triggers, on-demand audit triggers, rebuilding canonical specs, runtime config reload, dirty-workspace auto-recovery, revising an open PR via comment.
+- [CLI.md](CLI.md) — `run`, `reload`, `rewind`, `audit run`, `sync-specs` subcommand reference.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Diagnosing common failure modes: rebuild failures, revision-loop misfires, audit timeouts, partial-clone artifacts, post-reboot audit storms, `send it` and `propose` polite refusals.
+
+## Reference
+
 - [SECURITY.md](SECURITY.md) — AI security & guardrails: credential scoping, branch protection, the self-modifying-AI risk, workspace isolation, secrets in config (inline vs env-var), dedicated user, fork-and-PR workflow, executor tool sandbox.
-- [CLI.md](CLI.md) — `run`, `reload`, `rewind` subcommand reference.
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Diagnosing common failure modes, including rebuild failures.
-- [foundation-smoke-test.md](foundation-smoke-test.md) — Manual smoke-test walkthrough for first-time deploys.
-- [test-reliability.md](test-reliability.md) — Notes on the test suite's reliability story.
+- [STATE-LAYOUT.md](STATE-LAYOUT.md) — The four daemon data directories (`state`, `cache`, `logs`, `runtime`), resolution precedence, and the legacy-`/tmp` migration on first startup.
+
+## Internals
+
+- [foundation-smoke-test.md](foundation-smoke-test.md) — Optional manual end-to-end procedure against throwaway GitHub repos. The in-tree `cargo test` suite is the primary coverage; this is operator confidence-building before pointing the daemon at a repo you care about.
+- [test-reliability.md](test-reliability.md) — Living reference of known test-suite flakes, root causes, and dispositions. Updated by implementing agents under the `project-documentation` spec.
