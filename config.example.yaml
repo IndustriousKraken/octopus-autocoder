@@ -105,6 +105,22 @@ executor:
   # long and almost always indicates misconfiguration.
   # wipe_drain_timeout_secs: 30
 
+  # Output format for the wrapped Claude CLI. `json` (the default)
+  # invokes the CLI with `--output-format stream-json` and writes a
+  # structured per-change log with PROMPT / ACTIONS / FINAL ANSWER /
+  # STDERR sections — operators can read the ACTIONS section after a
+  # timeout-kill to see what the agent was doing. `text` opts out
+  # entirely: legacy at-exit capture with PROMPT / STDOUT / STDERR
+  # sections (today's 0-bytes-on-timeout shape).
+  # output_format: json
+
+  # Per-change run-log retention window (days). At daemon startup and
+  # every 24 hours during operation, logs older than this window whose
+  # change directory is no longer active under
+  # `openspec/changes/<change>/` are deleted. Active changes' logs are
+  # always preserved regardless of age. Default `30`. Clamped at `365`.
+  # log_retention_days: 30
+
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.

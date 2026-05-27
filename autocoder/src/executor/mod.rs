@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub mod claude_cli;
+pub mod event_log;
+pub mod json_event;
 
 #[async_trait]
 pub trait Executor: Send + Sync {
@@ -82,8 +84,15 @@ pub struct TriageContext {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutorOutcome {
     /// The underlying agent reported successful completion of the change.
-    /// autocoder decides what to do with a no-diff `Completed`.
-    Completed,
+    /// autocoder decides what to do with a no-diff `Completed`. The
+    /// optional `final_answer` carries the agent's conversational
+    /// summary captured from the JSON-event stream's terminal `result`
+    /// event; `None` when streaming-JSON mode is off (legacy text mode)
+    /// OR when no `result` event was emitted before the child exited.
+    Completed {
+        #[doc(hidden)]
+        final_answer: Option<String>,
+    },
     /// The agent has signaled ambiguity. autocoder persists the
     /// `resume_handle` to `.question.json`, posts the question to ChatOps,
     /// and unlocks the change.

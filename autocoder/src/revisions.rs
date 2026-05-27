@@ -563,7 +563,7 @@ async fn process_one_pr(
         let outcome =
             execute_revision(workspace, repo, executor, &change_name, &revision_text).await;
         match outcome {
-            Ok(ExecutorOutcome::Completed) => {
+            Ok(ExecutorOutcome::Completed { .. }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
                 if let Err(e) = apply_revision_commit(workspace, repo, push_remote, &commit_subject)
                 {
@@ -1069,14 +1069,14 @@ mod tests {
     #[async_trait]
     impl Executor for StubExecutor {
         async fn run(&self, _workspace: &Path, _change: &str) -> Result<ExecutorOutcome> {
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
         async fn resume(
             &self,
             _handle: ResumeHandle,
             _answer: &str,
         ) -> Result<ExecutorOutcome> {
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
         async fn run_revision(
             &self,
@@ -1087,14 +1087,14 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut guard = self.scripted.lock().unwrap();
             let outcome = if guard.is_empty() {
-                ExecutorOutcome::Completed
+                ExecutorOutcome::Completed { final_answer: None }
             } else {
                 guard.remove(0)
             };
             // Simulate the executor writing a file so the `git add -A`
             // path in the dispatcher's Completed branch has something to
             // commit.
-            if matches!(outcome, ExecutorOutcome::Completed) {
+            if matches!(outcome, ExecutorOutcome::Completed { .. }) {
                 let _ = std::fs::write(workspace.join("rev-marker.txt"), "rev");
             }
             Ok(outcome)
@@ -1306,7 +1306,7 @@ mod tests {
         let (_dir, ws) = init_git_workspace();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
-        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed]);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
@@ -1446,7 +1446,7 @@ mod tests {
         let (_dir, ws) = init_git_workspace();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
-        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed]);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),

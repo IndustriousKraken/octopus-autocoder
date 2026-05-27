@@ -198,6 +198,70 @@ pub struct ExecutorConfig {
     /// listener busy for too long.
     #[serde(default = "default_wipe_drain_timeout_secs")]
     pub wipe_drain_timeout_secs: u64,
+    /// Output format for the wrapped Claude CLI. `"json"` (the default)
+    /// invokes the CLI with `--output-format stream-json`, runs the
+    /// streaming-event parser, and writes the structured log shape
+    /// (PROMPT / ACTIONS / FINAL ANSWER / STDERR). `"text"` opts out of
+    /// the streaming path entirely and preserves today's at-exit
+    /// capture (PROMPT / STDOUT / STDERR sections) — useful when a
+    /// custom Claude CLI build lacks the streaming JSON format OR when
+    /// debugging the executor itself.
+    #[serde(default = "default_output_format")]
+    pub output_format: ExecutorOutputFormat,
+    /// Per-change run-log retention window (days). At daemon startup
+    /// AND once every 24 hours during operation, logs older than
+    /// `now - log_retention_days * 86400 seconds` whose corresponding
+    /// change directory is no longer in the active path are deleted.
+    /// Logs for active changes are preserved regardless of age.
+    /// Defaults to `30`. Values above `LOG_RETENTION_DAYS_CEILING`
+    /// (365) are clamped down with a WARN log at startup.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorOutputFormat {
+    /// Stream JSON events from the wrapped CLI's stdout, build the
+    /// structured per-change log incrementally, and route the final
+    /// `result` event's text to the PR comment. Default.
+    Json,
+    /// Legacy at-exit capture: no JSON streaming, log uses
+    /// `=== STDOUT ===` / `=== STDERR ===` sections, PR comment reads
+    /// raw stdout. Preserves today's "0-bytes STDOUT on timeout-kill"
+    /// behavior.
+    Text,
+}
+
+pub fn default_output_format() -> ExecutorOutputFormat {
+    ExecutorOutputFormat::Json
+}
+
+pub fn default_log_retention_days() -> u32 {
+    30
+}
+
+/// Upper bound on `executor.log_retention_days`. Anything above is
+/// clamped down at startup with a WARN log so the operator notices.
+pub const LOG_RETENTION_DAYS_CEILING: u32 = 365;
+
+/// Clamp the configured log-retention window. Values above
+/// `LOG_RETENTION_DAYS_CEILING` are clamped down to the ceiling AND
+/// a `tracing::warn!` is emitted naming both the requested and
+/// clamped values. Returns `(clamped_value, Option<warn_message>)` so
+/// callers can observe whether a WARN was issued without scraping
+/// the tracing log.
+pub fn clamp_log_retention_days(requested: u32) -> (u32, Option<String>) {
+    if requested > LOG_RETENTION_DAYS_CEILING {
+        let msg = format!(
+            "executor.log_retention_days ({requested}) is above the ceiling of \
+             {LOG_RETENTION_DAYS_CEILING}; clamping to {LOG_RETENTION_DAYS_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (LOG_RETENTION_DAYS_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
 }
 
 /// Default seconds the wipe-workspace handler waits for the per-iteration
@@ -934,6 +998,9 @@ impl Config {
         let (drain_clamped, _) =
             clamp_wipe_drain_timeout_secs(cfg.executor.wipe_drain_timeout_secs);
         cfg.executor.wipe_drain_timeout_secs = drain_clamped;
+        let (retention_clamped, _) =
+            clamp_log_retention_days(cfg.executor.log_retention_days);
+        cfg.executor.log_retention_days = retention_clamped;
         Ok(cfg)
     }
 }
@@ -1026,6 +1093,8 @@ github:
             "inter_iteration_jitter_pct",
             "max_revisions_per_pr",
             "wipe_drain_timeout_secs",
+            "output_format",
+            "log_retention_days",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -2658,6 +2727,92 @@ github: {}
             msg.contains(&WIPE_DRAIN_TIMEOUT_CEILING_SECS.to_string()),
             "warn names clamped value: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // executor.output_format and executor.log_retention_days
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn output_format_defaults_to_json() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.output_format, ExecutorOutputFormat::Json);
+    }
+
+    #[test]
+    fn output_format_text_opt_out_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  output_format: text
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.output_format, ExecutorOutputFormat::Text);
+    }
+
+    #[test]
+    fn log_retention_days_defaults_to_30() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.log_retention_days, 30);
+    }
+
+    #[test]
+    fn log_retention_days_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  log_retention_days: 1000
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.log_retention_days, LOG_RETENTION_DAYS_CEILING);
+        let (clamped, warn) = clamp_log_retention_days(1000);
+        assert_eq!(clamped, LOG_RETENTION_DAYS_CEILING);
+        let msg = warn.expect("warn must be emitted when above ceiling");
+        assert!(msg.contains("1000"));
+        assert!(msg.contains(&LOG_RETENTION_DAYS_CEILING.to_string()));
+    }
+
+    #[test]
+    fn log_retention_days_at_ceiling_no_warn() {
+        let (clamped, warn) = clamp_log_retention_days(LOG_RETENTION_DAYS_CEILING);
+        assert_eq!(clamped, LOG_RETENTION_DAYS_CEILING);
+        assert!(warn.is_none(), "ceiling value is not clamped");
     }
 
     // -----------------------------------------------------------------

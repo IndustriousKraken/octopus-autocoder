@@ -84,7 +84,43 @@ sudo -u autocoder rm /tmp/autocoder/busy/<basename>.json
 sudo systemctl start autocoder
 ```
 
-The per-change run logs (`/tmp/autocoder/logs/<basename>/<change>.log`) and the busy markers share the same `/tmp/autocoder/` root.
+The per-change run logs (`<logs_dir>/runs/<basename>/<change>.log`) and the busy markers share the same daemon-paths root.
+
+## Per-change run log shape
+
+Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/<change>.log`. The default shape (with `executor.output_format: json`) splits the log into four sections so operators can quickly judge what the agent was doing without scrolling through the raw JSON event stream:
+
+```
+=== PROMPT (<n> bytes) ===
+<the full prompt sent to the wrapped Claude CLI>
+
+=== ACTIONS ===
+[tool_use] Read autocoder/src/foo.rs
+[tool_result] (4128 bytes returned)
+[tool_use] Edit autocoder/src/foo.rs
+[tool_result] (200 bytes returned)
+[assistant] I've identified the issue in line 42 and applied the fix.
+[tool_use] Bash cargo test --lib
+[tool_result] (1024 bytes returned)
+...
+
+=== FINAL ANSWER (<n> bytes) ===
+<the agent's closing conversational summary — same content the PR comment shows>
+
+=== STDERR (<n> bytes) ===
+<anything the wrapped CLI emitted on stderr, typically empty>
+```
+
+- **PROMPT** — exactly what autocoder sent on stdin (template + `openspec instructions apply` output + the per-change context). Use this when an agent ran on the wrong prompt.
+- **ACTIONS** — one line per JSON event the wrapped CLI emitted (Read/Edit/Bash tool calls, tool results with byte counts, intermediate assistant text). Each line is prefixed `[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]` (for lines that failed JSON parsing) or `[unknown:<type>]` (for forward-compat event types). Use this when triaging a timeout — the last action line names what the agent was doing when the kill fired. On a successful run, scanning the ACTIONS section gives you a fast read of the work.
+- **FINAL ANSWER** — the closing `result` event's text, captured separately so it is the ONE thing the PR's `## Agent implementation notes` comment shows. Empty when the run timed out before reaching `result`.
+- **STDERR** — bytes the wrapped CLI wrote on stderr. Usually empty; populated on framework errors.
+
+The legacy log shape (`=== STDOUT === / === STDERR ===`) is preserved when `executor.output_format: text` is set; that mode skips JSON event parsing entirely and uses today's at-exit capture.
+
+**Retention.** Per-change logs are pruned at daemon startup and once every 24 hours during operation. A log is eligible for deletion when its mtime is older than `executor.log_retention_days` (default 30) AND its corresponding change directory under `openspec/changes/<change>/` no longer exists. Active changes' logs are preserved regardless of age — operators triaging a long-running stuck change want its log even if it's months old.
+
+**PR-comment stability.** The `## Agent implementation notes` comment on every PR continues to contain ONLY the agent's closing conversational summary — the same content operators have always seen since the section was introduced. With JSON streaming mode on, autocoder captures that text more precisely (from the closing `result` event) instead of slicing it out of the raw stdout buffer, but reviewers see the same shape. The intermediate tool-call stream stays in the log file and never ships to GitHub. Existing PR-review workflows do not change.
 
 ## Partial-clone self-heal
 

@@ -173,6 +173,30 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
 
     let cancel = CancellationToken::new();
 
+    // Log-retention pass: prune per-change logs older than the
+    // configured window whose corresponding change directory is no
+    // longer active. Runs immediately at startup, then once per day
+    // until shutdown. A misconfigured retention_days above the ceiling
+    // is clamped in `Config::load_from` already; this WARN surfaces
+    // the original-vs-clamped delta to the operator at startup.
+    let raw_retention = cfg.executor.log_retention_days;
+    if raw_retention > crate::config::LOG_RETENTION_DAYS_CEILING {
+        tracing::warn!(
+            configured = raw_retention,
+            ceiling = crate::config::LOG_RETENTION_DAYS_CEILING,
+            "executor.log_retention_days is above the ceiling; clamped to ceiling"
+        );
+    }
+    let retention_cfg = crate::log_retention::RetentionConfig {
+        days: cfg.executor.log_retention_days,
+    };
+    let _retention_handle = crate::log_retention::spawn_periodic(
+        daemon_paths.logs.clone(),
+        daemon_paths.cache.join("workspaces"),
+        retention_cfg,
+        cancel.clone(),
+    );
+
     // Busy-marker stuck threshold: how long an in-flight iteration is
     // allowed to hold the marker before the next pass treats it as
     // potentially crashed. Sized as the executor's wall-clock budget
