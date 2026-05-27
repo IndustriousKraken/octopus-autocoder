@@ -1125,7 +1125,7 @@ async fn process_one_waiting(
             // NOT increment the counter; we treat resume errors the same.
             (ResumeDisposition::Errored, None)
         }
-        Ok(ExecutorOutcome::Completed) => {
+        Ok(ExecutorOutcome::Completed { .. }) => {
             // The porcelain output here will include the .question.json
             // deletion (and possibly an .answer.json transient) that
             // autocoder itself just performed above. Those are
@@ -2421,7 +2421,7 @@ async fn handle_outcome(
                 Ok(QueueStep::AskUserExitEarly)
             }
         },
-        Ok(ExecutorOutcome::Completed) => {
+        Ok(ExecutorOutcome::Completed { .. }) => {
             // Remove the `.in-progress` lock BEFORE inspecting the working
             // tree: the lock file is untracked and would otherwise show up
             // in `git status --porcelain`, contaminating the dirty check
@@ -2947,6 +2947,8 @@ async fn post_implementer_summary_comment(
 /// section per change. If a log is unreadable, the change is skipped with
 /// a WARN. If ALL changes' logs are unreadable, returns an empty string.
 fn build_implementer_summary(workspace: &Path, processed: &[String]) -> String {
+    let timeout_fallback =
+        "(executor timed out before final summary; see daemon log for action stream)";
     let mut sections = Vec::new();
     for change in processed {
         let path = crate::executor::claude_cli::run_log_path(workspace, change);
@@ -2961,12 +2963,24 @@ fn build_implementer_summary(workspace: &Path, processed: &[String]) -> String {
                 continue;
             }
         };
-        let stdout = extract_stdout_section(&raw);
-        let trimmed = stdout.trim_end();
-        let body = if trimmed.is_empty() {
-            "_(no implementer output captured)_".to_string()
+        // Prefer the FINAL ANSWER section (JSON streaming mode). Fall
+        // back to the legacy STDOUT section (text-mode opt-out OR a
+        // legacy log carried over from before this change shipped).
+        let body = if let Some(final_answer) =
+            crate::executor::event_log::read_final_answer(&path)
+        {
+            final_answer
+        } else if raw.contains("=== FINAL ANSWER (") {
+            // FINAL ANSWER section present but empty → timeout-kill case.
+            timeout_fallback.to_string()
         } else {
-            trimmed.to_string()
+            let stdout = extract_stdout_section(&raw);
+            let trimmed = stdout.trim_end();
+            if trimmed.is_empty() {
+                "_(no implementer output captured)_".to_string()
+            } else {
+                trimmed.to_string()
+            }
         };
         sections.push(format!("### {change}\n\n{body}"));
     }
@@ -3402,7 +3416,7 @@ pub async fn process_audit_triages(
 
         let outcome = executor.run_triage(workspace, &ctx).await;
         match outcome {
-            Ok(crate::executor::ExecutorOutcome::Completed) => {
+            Ok(crate::executor::ExecutorOutcome::Completed { .. }) => {
                 if let Err(e) = process_completed_triage(
                     workspace,
                     repo,
@@ -4156,7 +4170,7 @@ mod tests {
     impl Executor for CompletingExecutorWithDiff {
         async fn run(&self, workspace: &Path, _c: &str) -> Result<ExecutorOutcome> {
             std::fs::write(workspace.join(&self.artifact_name), &self.artifact_text)?;
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
         async fn resume(
             &self,
@@ -4173,7 +4187,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Executor for CompletingExecutorNoDiff {
         async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
         async fn resume(
             &self,
@@ -4458,7 +4472,7 @@ mod tests {
         }
         async fn resume(&self, _h: ResumeHandle, answer: &str) -> Result<ExecutorOutcome> {
             std::fs::write(self.ws.join("RESUME_ARTIFACT.txt"), answer.as_bytes())?;
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
     }
 
@@ -4695,7 +4709,7 @@ mod tests {
                 })
             }
             async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
         }
         let executor = ResumeReturnsCompletedNoDiff;
@@ -4934,7 +4948,7 @@ mod tests {
                     self.ws.join(format!("RUN_{change}.txt")),
                     "from run",
                 )?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -4943,7 +4957,7 @@ mod tests {
             ) -> Result<ExecutorOutcome> {
                 self.invocations.lock().unwrap().push("resume".to_string());
                 std::fs::write(self.ws.join("RESUMED.txt"), "from resume")?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
         }
         let executor = ResumeAndRunBoth {
@@ -5068,7 +5082,7 @@ mod tests {
                     self.ws.join(format!("RUN_{change}.txt")),
                     format!("artifact for {change}"),
                 )?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -5077,7 +5091,7 @@ mod tests {
             ) -> Result<ExecutorOutcome> {
                 self.invocations.lock().unwrap().push("resume".to_string());
                 std::fs::write(self.ws.join("RESUMED.txt"), "from resume")?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
         }
         let executor = ResumeAndRunPerChange {
@@ -6243,6 +6257,92 @@ mod tests {
         assert!(out.contains("_(no implementer output captured)_"));
     }
 
+    /// Write a fixture run-log in the new JSON-streaming shape
+    /// (PROMPT, ACTIONS, FINAL ANSWER, STDERR sections). Used by
+    /// tests that verify the PR-comment construction path reads from
+    /// FINAL ANSWER, not the action stream.
+    fn write_fixture_json_run_log(
+        workspace: &Path,
+        change: &str,
+        prompt: &str,
+        actions_lines: &[&str],
+        final_answer: &str,
+        stderr: &str,
+    ) {
+        let path = crate::executor::claude_cli::run_log_path(workspace, change);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = format!(
+            "=== PROMPT ({p} bytes) ===\n{prompt}\n\n=== ACTIONS ===\n",
+            p = prompt.len()
+        );
+        for line in actions_lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "\n=== FINAL ANSWER ({n} bytes) ===\n{final_answer}\n\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+            n = final_answer.len(),
+            m = stderr.len(),
+        ));
+        std::fs::write(&path, body).unwrap();
+    }
+
+    #[test]
+    fn build_implementer_summary_reads_final_answer_from_json_log() {
+        let dir = unique_workspace("final-answer");
+        let ws = dir.path();
+        write_fixture_json_run_log(
+            ws,
+            "alpha",
+            "PROMPT_BODY",
+            &[
+                "[tool_use] Read foo.rs",
+                "[tool_result] (123 bytes returned)",
+                "[assistant] looking at the code",
+            ],
+            "FINAL_SUMMARY_TEXT",
+            "",
+        );
+        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        assert!(out.contains("FINAL_SUMMARY_TEXT"));
+        // Action stream MUST NOT leak into the PR comment.
+        assert!(!out.contains("[tool_use]"));
+        assert!(!out.contains("[tool_result]"));
+        assert!(!out.contains("[assistant]"));
+        assert!(!out.contains("Read foo.rs"));
+    }
+
+    #[test]
+    fn build_implementer_summary_falls_back_to_timeout_placeholder() {
+        let dir = unique_workspace("timeout-fallback");
+        let ws = dir.path();
+        write_fixture_json_run_log(
+            ws,
+            "alpha",
+            "p",
+            &["[tool_use] Read a"],
+            "", // empty FINAL ANSWER → timeout case
+            "",
+        );
+        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        assert!(
+            out.contains("(executor timed out before final summary; see daemon log for action stream)"),
+            "expected timeout fallback in: {out}"
+        );
+    }
+
+    #[test]
+    fn build_implementer_summary_legacy_text_mode_log_still_works() {
+        // Operators with `output_format: text` produce the legacy
+        // STDOUT/STDERR log shape; the PR comment must still surface
+        // the raw stdout (today's behavior preserved).
+        let dir = unique_workspace("legacy-shape");
+        let ws = dir.path();
+        write_fixture_run_log(ws, "alpha", "p", "LEGACY_STDOUT_CONTENT", "");
+        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        assert!(out.contains("LEGACY_STDOUT_CONTENT"));
+    }
+
     #[test]
     fn truncate_to_fit_appends_marker_when_exceeded() {
         let body = "x".repeat(100_000);
@@ -7071,7 +7171,7 @@ mod tests {
         impl Executor for Counter {
             async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -7448,7 +7548,7 @@ mod tests {
                 workspace.join(format!("artifact-{change}.txt")),
                 format!("contents for {change}\n"),
             )?;
-            Ok(ExecutorOutcome::Completed)
+            Ok(ExecutorOutcome::Completed { final_answer: None })
         }
         async fn resume(
             &self,
@@ -7574,7 +7674,7 @@ mod tests {
                     workspace.join(format!("artifact-{change}.txt")),
                     format!("contents for {change}\n"),
                 )?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -7674,7 +7774,7 @@ mod tests {
                     workspace.join(format!("artifact-{change}.txt")),
                     format!("contents for {change}\n"),
                 )?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -9694,7 +9794,7 @@ mod tests {
                     workspace.join("artifact-bar.txt"),
                     "bar contents\n",
                 )?;
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,
@@ -9841,7 +9941,7 @@ mod tests {
                 // Race the archive step: create the dated dir now.
                 let collision = queue::archive_collision_path(workspace, change);
                 std::fs::create_dir_all(&collision).unwrap();
-                Ok(ExecutorOutcome::Completed)
+                Ok(ExecutorOutcome::Completed { final_answer: None })
             }
             async fn resume(
                 &self,

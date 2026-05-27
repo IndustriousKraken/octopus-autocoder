@@ -16,6 +16,7 @@ mod git;
 mod github;
 mod github_credentials;
 mod llm;
+mod log_retention;
 mod mcp_askuser_server;
 mod migration;
 mod openspec_archive;

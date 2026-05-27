@@ -13,6 +13,8 @@
 //!      clarification regex, the executor synthesizes an AskUser from the
 //!      first matching sentence.
 
+use super::event_log::{self, ActionKind, StructuredLogWriter};
+use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
 use super::{Executor, ExecutorOutcome, ResumeHandle, TriageContext, UnimplementableTask};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -64,6 +66,11 @@ pub struct ClaudeCliExecutor {
     timeout: Duration,
     sandbox: crate::config::ResolvedSandbox,
     template: String,
+    /// Output format mode for the wrapped CLI. `Json` (default) → stream
+    /// `--output-format stream-json` events through the parser and
+    /// structured log writer; `Text` → preserve today's at-exit capture
+    /// behavior with the legacy log shape.
+    output_format: crate::config::ExecutorOutputFormat,
     /// Override for the directory the per-iteration sandbox settings file
     /// is written to. `None` (production) means `std::env::temp_dir()`.
     /// Tests use this to isolate their settings file from concurrent
@@ -103,6 +110,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
     }
@@ -143,6 +151,7 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(cfg.timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
             template,
+            output_format: cfg.output_format,
             settings_dir: None,
         })
     }
@@ -157,8 +166,19 @@ impl ClaudeCliExecutor {
             timeout: Duration::from_secs(timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(None),
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
+            output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
+    }
+
+    /// Test-only override for the executor's output mode.
+    #[cfg(test)]
+    pub(crate) fn with_output_format(
+        mut self,
+        format: crate::config::ExecutorOutputFormat,
+    ) -> Self {
+        self.output_format = format;
+        self
     }
 
     /// Build the prompt for `change` by running `openspec instructions
@@ -558,6 +578,7 @@ impl ClaudeCliExecutor {
     async fn run_subprocess(
         &self,
         workspace: &Path,
+        change: &str,
         prompt: &str,
     ) -> Result<SubprocessOutcome> {
         let settings_path = self
@@ -565,14 +586,29 @@ impl ClaudeCliExecutor {
             .context("generating sandbox settings file")?;
         let _settings_guard = TempFileGuard(settings_path.clone());
 
-        let mut child = Command::new(&self.command)
-            .args(&self.args)
+        let json_mode = matches!(
+            self.output_format,
+            crate::config::ExecutorOutputFormat::Json
+        );
+
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--allowedTools")
             .arg(self.sandbox.allowed_tools.join(","))
             .arg("--permission-mode")
-            .arg("acceptEdits")
+            .arg("acceptEdits");
+        if json_mode {
+            // `--verbose` is required by Claude CLI alongside
+            // `stream-json` for non-interactive sessions; without it the
+            // CLI emits the legacy single result envelope rather than
+            // streaming events as they happen.
+            cmd.arg("--verbose")
+                .arg("--output-format")
+                .arg("stream-json");
+        }
+        let mut child = cmd
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -610,9 +646,39 @@ impl ClaudeCliExecutor {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes()).await;
         }
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
+        if json_mode {
+            // Streaming path: build the structured log incrementally so
+            // that on a timeout-kill, every event the child wrote before
+            // the kill is durably on disk.
+            self.run_subprocess_streaming(
+                child,
+                stdout_pipe,
+                stderr_pipe,
+                workspace,
+                change,
+                prompt,
+            )
+            .await
+        } else {
+            // Legacy at-exit capture: today's behavior preserved for
+            // `output_format: text`.
+            self.run_subprocess_legacy(child, stdout_pipe, stderr_pipe).await
+        }
+    }
+
+    /// Legacy capture: wait for child exit (or timeout) then read
+    /// stdout + stderr in one shot. Returns the populated
+    /// `SubprocessOutcome` without writing the log file (the caller
+    /// invokes `persist_run_log` for that). Used in `output_format: text`.
+    async fn run_subprocess_legacy(
+        &self,
+        mut child: tokio::process::Child,
+        mut stdout_pipe: Option<tokio::process::ChildStdout>,
+        mut stderr_pipe: Option<tokio::process::ChildStderr>,
+    ) -> Result<SubprocessOutcome> {
         let sleeper = tokio::time::sleep(self.timeout);
         tokio::pin!(sleeper);
 
@@ -631,6 +697,8 @@ impl ClaudeCliExecutor {
                     exit_status: None,
                     stdout: String::new(),
                     stderr: "timeout".to_string(),
+                    final_answer: None,
+                    streamed_log: false,
                 })
             }
             Some(Err(e)) => Err(e).context("waiting on executor child process"),
@@ -648,9 +716,156 @@ impl ClaudeCliExecutor {
                     exit_status: Some(status),
                     stdout: stdout_text,
                     stderr: stderr_text,
+                    final_answer: None,
+                    streamed_log: false,
                 })
             }
         }
+    }
+
+    /// Streaming capture: open the structured log writer, spawn one
+    /// task that reads stdout line-by-line and dispatches parsed events
+    /// to the log + one task that reads stderr into the writer's
+    /// buffer, then race `child.wait()` against the configured timeout.
+    /// On timeout-kill the partial action stream is already on disk —
+    /// the writer is `finalize`d unconditionally.
+    async fn run_subprocess_streaming(
+        &self,
+        mut child: tokio::process::Child,
+        stdout_pipe: Option<tokio::process::ChildStdout>,
+        stderr_pipe: Option<tokio::process::ChildStderr>,
+        workspace: &Path,
+        change: &str,
+        prompt: &str,
+    ) -> Result<SubprocessOutcome> {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let log_path = run_log_path(workspace, change);
+        let writer = match event_log::open(&log_path) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::warn!(
+                    log_file = %log_path.display(),
+                    "could not open structured log; falling back to legacy capture: {e:#}"
+                );
+                return self
+                    .run_subprocess_legacy(child, stdout_pipe, stderr_pipe)
+                    .await;
+            }
+        };
+        if let Err(e) = writer.write_prompt(prompt) {
+            tracing::warn!(
+                log_file = %log_path.display(),
+                "writing prompt header to structured log failed: {e:#}"
+            );
+        }
+
+        // Stdout reader: parse one JSON event per line; dispatch each to
+        // the structured log. Accumulates the raw lines too so the
+        // caller's `outcome.stdout` still reflects what was emitted —
+        // legacy callsites (sentinel extraction, the Layer-2 heuristic)
+        // expect a non-empty string for non-empty output.
+        let stdout_writer = writer.clone();
+        let stdout_handle: tokio::task::JoinHandle<String> = match stdout_pipe {
+            Some(pipe) => tokio::spawn(async move {
+                let mut buf = String::new();
+                let mut reader = BufReader::new(pipe).lines();
+                loop {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            buf.push_str(&line);
+                            buf.push('\n');
+                            dispatch_event_to_log(&stdout_writer, &line);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!("stdout reader error: {e}");
+                            break;
+                        }
+                    }
+                }
+                buf
+            }),
+            None => tokio::spawn(async { String::new() }),
+        };
+
+        // Stderr reader: stream bytes into the writer's buffer so the
+        // STDERR section's annotation reflects the true byte count and
+        // the bytes themselves land in the log.
+        let stderr_writer = writer.clone();
+        let stderr_handle: tokio::task::JoinHandle<String> = match stderr_pipe {
+            Some(mut pipe) => tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                            let _ = stderr_writer.append_stderr(&chunk[..n]);
+                        }
+                        Err(e) => {
+                            tracing::warn!("stderr reader error: {e}");
+                            break;
+                        }
+                    }
+                }
+                buf
+            }),
+            None => tokio::spawn(async { String::new() }),
+        };
+
+        let sleeper = tokio::time::sleep(self.timeout);
+        tokio::pin!(sleeper);
+
+        let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
+            biased;
+            () = &mut sleeper => None,
+            res = child.wait() => Some(res),
+        };
+
+        let timed_out = exit_status.is_none();
+        let status_opt: Option<std::process::ExitStatus> = match exit_status {
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                None
+            }
+            Some(Err(e)) => return Err(e).context("waiting on executor child process"),
+            Some(Ok(s)) => Some(s),
+        };
+
+        // The reader tasks return when their pipe hits EOF, which
+        // happens when the child closes its end. After `child.wait()` /
+        // `child.start_kill()` returned the child is reaped; awaiting
+        // the readers is safe.
+        let stdout_text = stdout_handle.await.unwrap_or_default();
+        let stderr_text = stderr_handle.await.unwrap_or_default();
+
+        // Flush the structured log AFTER readers finished so the FINAL
+        // ANSWER section reflects whatever set_final_answer captured.
+        if let Err(e) = writer.finalize() {
+            tracing::warn!(
+                log_file = %log_path.display(),
+                "finalizing structured log failed: {e:#}"
+            );
+        }
+        let final_answer = writer.final_answer();
+
+        Ok(SubprocessOutcome {
+            timed_out,
+            exit_status: status_opt,
+            stdout: stdout_text,
+            stderr: if timed_out && stderr_text.is_empty() {
+                "timeout".to_string()
+            } else {
+                stderr_text
+            },
+            final_answer,
+            streamed_log: true,
+        })
     }
 
     /// Classify a subprocess outcome into an `ExecutorOutcome`, applying
@@ -745,7 +960,9 @@ impl ClaudeCliExecutor {
             );
         }
 
-        Ok(ExecutorOutcome::Completed)
+        Ok(ExecutorOutcome::Completed {
+            final_answer: outcome.final_answer.clone(),
+        })
     }
 }
 
@@ -763,6 +980,15 @@ struct SubprocessOutcome {
     exit_status: Option<std::process::ExitStatus>,
     stdout: String,
     stderr: String,
+    /// Populated by the JSON streaming path with the agent's
+    /// conversational summary from the `result` event. `None` in legacy
+    /// text mode (no streaming) AND when the run timed out before the
+    /// result event arrived.
+    final_answer: Option<String>,
+    /// True when the JSON streaming path built the log file itself (so
+    /// the legacy `persist_run_log` writer should skip it). False in
+    /// text mode where `persist_run_log` still owns the log shape.
+    streamed_log: bool,
 }
 
 /// RAII guard that removes a temp file when dropped. Used so the sandbox
@@ -809,7 +1035,7 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, &prompt).await;
+        let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(workspace, change, &prompt, &outcome);
@@ -833,7 +1059,7 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, &prompt).await;
+        let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(workspace, change, &prompt, &outcome);
@@ -856,7 +1082,7 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, &prompt).await;
+        let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(workspace, change, &prompt, &outcome);
@@ -872,12 +1098,160 @@ impl Executor for ClaudeCliExecutor {
         // Triage mode does not target a specific change directory, so the
         // per-change MCP marker plumbing is keyed by a synthetic name.
         let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME)?;
-        let outcome = self.run_subprocess(workspace, &prompt).await;
+        let outcome = self
+            .run_subprocess(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
+    }
+}
+
+/// Parse a stdout line as a JSON event and append a corresponding
+/// ACTIONS-section line (or, for the `result` event, capture the final
+/// answer in the writer's buffer). Malformed JSON lands as `[raw]`;
+/// unknown event types as `[unknown:<type>]` — neither aborts the
+/// stream-reader loop.
+fn dispatch_event_to_log(writer: &StructuredLogWriter, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    match json_event::parse_event_line(line) {
+        Ok(event) => dispatch_parsed_event(writer, event),
+        Err(e) => {
+            tracing::warn!(
+                "claude stream-json: malformed line, recording as [raw]: {e}"
+            );
+            let _ = writer.append_action(ActionKind::Raw, line);
+        }
+    }
+}
+
+fn dispatch_parsed_event(writer: &StructuredLogWriter, event: JsonEvent) {
+    match event {
+        JsonEvent::System { .. } => {
+            // Init metadata isn't actionable for operators; suppress.
+        }
+        JsonEvent::Assistant { content_blocks } => {
+            for block in content_blocks {
+                match block {
+                    AssistantBlock::Text { text } => {
+                        for line in wrap_assistant_text(&text) {
+                            let _ = writer.append_action(ActionKind::Assistant, &line);
+                        }
+                    }
+                    AssistantBlock::ToolUse {
+                        tool_name,
+                        tool_input,
+                    } => {
+                        let summary = format_tool_input_summary(&tool_input);
+                        let content = if summary.is_empty() {
+                            tool_name
+                        } else {
+                            format!("{tool_name} {summary}")
+                        };
+                        let _ = writer.append_action(ActionKind::ToolUse, &content);
+                    }
+                }
+            }
+        }
+        JsonEvent::User { content_blocks } => {
+            for block in content_blocks {
+                match block {
+                    UserBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        if is_error {
+                            let msg: String =
+                                content.chars().take(200).collect();
+                            let _ = writer.append_action(
+                                ActionKind::Unknown("tool_result:error".into()),
+                                &msg,
+                            );
+                        } else {
+                            let line = format!("({n} bytes returned)", n = content.len());
+                            let _ = writer.append_action(ActionKind::ToolResult, &line);
+                        }
+                    }
+                }
+            }
+        }
+        JsonEvent::Result { final_text, .. } => {
+            let _ = writer.set_final_answer(final_text);
+        }
+        JsonEvent::Unknown { event_type, raw } => {
+            let body = serde_json::to_string(&raw).unwrap_or_default();
+            let _ = writer.append_action(ActionKind::Unknown(event_type), &body);
+        }
+    }
+}
+
+/// Wrap assistant text at ~80 columns on whitespace boundaries; long
+/// single-line runs (URLs, code) get returned as a single chunk to
+/// avoid mid-token splits.
+fn wrap_assistant_text(text: &str) -> Vec<String> {
+    const WIDTH: usize = 80;
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in para.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.len() + 1 + word.len() <= WIDTH {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Format a `tool_input` JSON value into a one-line summary suitable
+/// for a `[tool_use]` log line. Truncates at ~200 chars to keep the
+/// log readable; the full input was emitted on the stream and is no
+/// longer addressable, but operators can re-run the change with text
+/// mode to capture the raw bytes if they need them.
+fn format_tool_input_summary(input: &serde_json::Value) -> String {
+    let raw = match input {
+        serde_json::Value::Object(map) => {
+            // Pick a small set of recognizable shape clues without
+            // dumping the entire object; falls through to to_string
+            // when no recognizable key is present.
+            if let Some(p) = map.get("file_path").and_then(|v| v.as_str()) {
+                p.to_string()
+            } else if let Some(p) = map.get("path").and_then(|v| v.as_str()) {
+                p.to_string()
+            } else if let Some(c) = map.get("command").and_then(|v| v.as_str()) {
+                c.to_string()
+            } else if let Some(p) = map.get("pattern").and_then(|v| v.as_str()) {
+                p.to_string()
+            } else {
+                serde_json::to_string(input).unwrap_or_default()
+            }
+        }
+        _ => serde_json::to_string(input).unwrap_or_default(),
+    };
+    if raw.chars().count() > 200 {
+        let mut truncated: String = raw.chars().take(200).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        raw
     }
 }
 
@@ -904,6 +1278,11 @@ pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
 /// but never propagated; the executor outcome must not depend on
 /// diagnostic side-effects.
 fn persist_run_log(workspace: &Path, change: &str, prompt: &str, outcome: &SubprocessOutcome) {
+    // The JSON-streaming path already wrote the structured log
+    // incrementally; overwriting here would discard the ACTIONS section.
+    if outcome.streamed_log {
+        return;
+    }
     let path = run_log_path(workspace, change);
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -1047,7 +1426,7 @@ mod tests {
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
         let outcome = executor.run(&ws, "x").await.unwrap();
-        assert!(matches!(outcome, ExecutorOutcome::Completed), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
     }
 
     #[tokio::test]
@@ -1189,7 +1568,7 @@ mod tests {
         );
         let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
         let outcome = executor.run(&ws, "x").await.unwrap();
-        assert!(matches!(outcome, ExecutorOutcome::Completed), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
     }
 
     /// Layer-2 does NOT fire on benign stdout that doesn't match.
@@ -1226,7 +1605,7 @@ mod tests {
             .unwrap(),
         );
         let outcome = executor.resume(handle, "use SAMPLE").await.unwrap();
-        assert!(matches!(outcome, ExecutorOutcome::Completed));
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
     }
 
     #[tokio::test]
@@ -1340,6 +1719,8 @@ mod tests {
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1363,6 +1744,8 @@ mod tests {
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1383,6 +1766,8 @@ mod tests {
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1411,6 +1796,8 @@ mod tests {
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),
@@ -1430,9 +1817,11 @@ mod tests {
             "echoes.sh",
             "#!/bin/sh\necho hello-out\necho hello-err >&2\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        // Text-mode opt-out path: legacy STDOUT/STDERR section names.
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+            .with_output_format(crate::config::ExecutorOutputFormat::Text);
         let outcome = executor.run(&ws, "x").await.unwrap();
-        assert!(matches!(outcome, ExecutorOutcome::Completed), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
 
         let log = run_log_path(&ws, "x");
         let body = std::fs::read_to_string(&log)
@@ -1498,6 +1887,8 @@ mod tests {
             exit_status: None,
             stdout: "STDOUT_SENTINEL".to_string(),
             stderr: "STDERR_SENTINEL".to_string(),
+            final_answer: None,
+            streamed_log: false,
         };
         persist_run_log(&ws, "my-change", "PROMPT_SENTINEL", &outcome);
 
@@ -1724,5 +2115,256 @@ some narrative output before the sentinel\n\
             !body.contains("=== PROMPT (0 bytes)"),
             "prompt was empty:\n{body}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // JSON streaming-mode tests
+    // ------------------------------------------------------------------
+
+    /// JSON streaming: a fixture script that emits a few tool_use
+    /// events followed by a result event must produce a structured log
+    /// with PROMPT / ACTIONS / FINAL ANSWER / STDERR sections.
+    #[tokio::test]
+    async fn json_streaming_log_has_structured_sections() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "stream.sh",
+            r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"s1"}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"src/a.rs"}}]}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file body","is_error":false}]}}'
+echo '{"type":"assistant","message":[{"type":"text","text":"checking next file"}]}'
+echo '{"type":"result","stop_reason":"end_turn","result":"Done — the change is implemented."}'
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(
+                    final_answer.as_deref(),
+                    Some("Done — the change is implemented."),
+                    "final answer must round-trip from the result event"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(body.contains("=== PROMPT ("));
+        assert!(body.contains("=== ACTIONS ==="));
+        assert!(body.contains("=== FINAL ANSWER ("));
+        assert!(body.contains("=== STDERR ("));
+        assert!(body.contains("[tool_use] Read src/a.rs"));
+        assert!(body.contains("[tool_result] (9 bytes returned)"));
+        assert!(body.contains("Done — the change is implemented."));
+        // FINAL ANSWER must not leak the ACTIONS material.
+        let final_section = body
+            .split("=== FINAL ANSWER (")
+            .nth(1)
+            .unwrap()
+            .split("=== STDERR (")
+            .next()
+            .unwrap();
+        assert!(!final_section.contains("[tool_use]"));
+        assert!(!final_section.contains("[tool_result]"));
+    }
+
+    /// JSON streaming: a fixture child that gets killed mid-stream
+    /// (script never emits the `result` event) produces a log with
+    /// ACTIONS for the events that DID arrive, empty FINAL ANSWER,
+    /// and the outcome's `final_answer` is None.
+    ///
+    /// The script closes stdout/stderr after emitting its two events
+    /// so the executor's reader tasks see EOF immediately — without
+    /// the redirect, `sleep` would inherit the open pipe and block
+    /// our readers for the full 30s (see the `#[ignore]`d
+    /// `timeout_kills_child` test for the same pipe-inheritance issue
+    /// on the legacy path).
+    #[tokio::test]
+    async fn json_streaming_timeout_kill_preserves_partial_actions() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "slow.sh",
+            r#"#!/bin/sh
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"a"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"path":"b"}}]}}'
+exec </dev/null >/dev/null 2>&1
+sleep 30
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Failed { reason } => {
+                assert_eq!(reason, "timeout");
+            }
+            other => panic!("expected Failed timeout, got {other:?}"),
+        }
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).expect("log written");
+        assert!(body.contains("[tool_use] Read a"));
+        assert!(body.contains("[tool_use] Edit b"));
+        assert!(
+            body.contains("=== FINAL ANSWER (0 bytes) ==="),
+            "FINAL ANSWER must be empty after timeout-kill:\n{body}"
+        );
+    }
+
+    /// JSON streaming: malformed JSON line lands in ACTIONS as `[raw]`.
+    /// Subsequent valid events continue to be processed.
+    #[tokio::test]
+    async fn json_streaming_malformed_line_becomes_raw_action() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "mixed.sh",
+            r#"#!/bin/sh
+echo 'this is not json'
+echo '{"type":"result","stop_reason":"end_turn","result":"ok"}'
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
+        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        assert!(
+            body.contains("[raw] this is not json"),
+            "malformed line missing in:\n{body}"
+        );
+        // The valid `result` event after the bad line must still be
+        // captured.
+        assert!(body.contains("ok"));
+    }
+
+    /// JSON streaming: an unknown event type lands in ACTIONS as
+    /// `[unknown:<type>]`; processing continues normally.
+    #[tokio::test]
+    async fn json_streaming_unknown_event_type_becomes_unknown_action() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "unknown.sh",
+            r#"#!/bin/sh
+echo '{"type":"future_event_kind","foo":"bar"}'
+echo '{"type":"result","stop_reason":"end_turn","result":"done"}'
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let _ = executor.run(&ws, "x").await.unwrap();
+        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        assert!(
+            body.contains("[unknown:future_event_kind]"),
+            "unknown prefix missing in:\n{body}"
+        );
+    }
+
+    /// JSON streaming: stderr from the child lands in the STDERR
+    /// section alongside the ACTIONS content from stdout.
+    #[tokio::test]
+    async fn json_streaming_stderr_lands_in_stderr_section() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "both.sh",
+            r#"#!/bin/sh
+echo '{"type":"result","stop_reason":"end_turn","result":"ok"}'
+echo 'stderr noise' >&2
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let _ = executor.run(&ws, "x").await.unwrap();
+        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        let stderr_section = body.split("=== STDERR (").nth(1).unwrap();
+        assert!(
+            stderr_section.contains("stderr noise"),
+            "stderr noise not in STDERR section:\n{body}"
+        );
+    }
+
+    /// Outcome shape: Completed carries final_answer Some(text) from
+    /// the result event.
+    #[tokio::test]
+    async fn completed_outcome_carries_final_answer_from_result_event() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "answer.sh",
+            r#"#!/bin/sh
+echo '{"type":"result","stop_reason":"end_turn","result":"FINAL_ANSWER_SENTINEL"}'
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(
+                    final_answer.as_deref(),
+                    Some("FINAL_ANSWER_SENTINEL"),
+                    "outcome must surface the final answer text"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Outcome shape: Failed (timeout) carries no final answer.
+    /// Uses the closed-stdout/stderr trick so the readers see EOF and
+    /// the test doesn't have to wait for `sleep 30` to die.
+    #[tokio::test]
+    async fn failed_outcome_has_no_final_answer() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "slow.sh",
+            "#!/bin/sh\nexec </dev/null >/dev/null 2>&1\nsleep 30\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Failed { .. } => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Text-mode opt-out: spawn does NOT include `--output-format`,
+    /// log shape uses legacy STDOUT/STDERR section names, outcome's
+    /// final_answer is None.
+    #[tokio::test]
+    async fn text_mode_opt_out_produces_legacy_log_shape() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(
+            &ws,
+            "text.sh",
+            "#!/bin/sh\necho 'final summary text from text mode'\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+            .with_output_format(crate::config::ExecutorOutputFormat::Text);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert!(
+                    final_answer.is_none(),
+                    "text mode must NOT populate final_answer (no JSON parser ran)"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        assert!(body.contains("=== STDOUT ("), "legacy STDOUT section missing");
+        assert!(body.contains("=== STDERR ("), "legacy STDERR section missing");
+        assert!(!body.contains("=== ACTIONS ==="), "JSON-mode ACTIONS section must be absent");
+        assert!(
+            !body.contains("=== FINAL ANSWER ("),
+            "JSON-mode FINAL ANSWER section must be absent"
+        );
+        assert!(body.contains("final summary text from text mode"));
     }
 }

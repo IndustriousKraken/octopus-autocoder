@@ -463,6 +463,8 @@ mod tests {
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
         }
     }
 

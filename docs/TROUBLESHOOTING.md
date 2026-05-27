@@ -99,6 +99,30 @@ No bot reply, no apparent action. Check:
 - **Feature disabled:** `executor.max_revisions_per_pr: 0` in config
   disables the dispatcher entirely. Check `config.yaml`.
 
+## Agent timed out — what was it doing?
+
+When a change hits `executor.timeout_secs`, autocoder SIGKILLs the wrapped Claude CLI and the iteration returns `Failed { reason: "timeout" }`. The PR comment for that change shows the fallback `(executor timed out before final summary; see daemon log for action stream)` rather than a normal summary.
+
+To see what the agent was doing when the kill fired, read the per-change log:
+
+```bash
+sudo -u autocoder cat /<logs_dir>/runs/<workspace-basename>/<change>.log
+```
+
+The `=== ACTIONS ===` section is a chronological line-per-event record of every tool call (Read/Edit/Bash) and intermediate assistant text the agent emitted before the kill. **The last action line names what the agent was doing when timeout fired** — usually one of:
+
+- `[tool_use] Bash ...` running a long-running command (test suite, build, network call). Increase `executor.timeout_secs` or narrow the prompt.
+- `[tool_use] Read ...` repeating the same file. The agent is in a re-read loop; the spec may be ambiguous and the agent is hunting for context that isn't there.
+- `[tool_use] Grep ...` searching broadly. The agent is exploring the codebase methodically — likely a high-complexity change that just needs more wall-clock budget.
+- `[assistant] ...` with no follow-up tool call. The model returned a long reasoning paragraph and was killed mid-emission of the next action.
+
+The `=== FINAL ANSWER (0 bytes) ===` section is empty by definition on timeout — the closing `result` event never arrived, so there is no conversational summary to surface in the PR. This is expected behavior, not a log-write bug.
+
+If the timeout is recurring on the same change, consider:
+- Raising `executor.timeout_secs` if the work genuinely takes longer than the default (1800s = 30min).
+- Splitting the change into smaller pieces if the agent's action stream shows it bouncing between unrelated subsystems.
+- Switching the change to `output_format: text` if you suspect the JSON-stream parsing itself is suspicious — text mode replicates the pre-streaming behavior verbatim.
+
 ## Bot didn't reply at all (no success, no failure)
 
 The expected `✅ Revision applied` / `✗ Revision attempt failed` /
