@@ -6,6 +6,46 @@ For production, run autocoder as a systemd service on a dedicated Linux host. Th
 
 For most operators, the [Quick install](../README.md#quick-install) one-liner is the right path. It downloads a pre-built binary from the [GitHub Releases](https://github.com/IndustriousKraken/openspec-autocoder/releases) page (per tag, for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`), verifies its SHA-256, and then runs `autocoder install` to set up the systemd service and configuration. Releases are versioned with SemVer tags (`vX.Y.Z`); dash-suffixed tags such as `vX.Y.Z-rc1` are pre-releases that the installer skips by default. The rest of this section covers the manual / source-build path for operators who specifically want to avoid downloaded binaries.
 
+## Switching from source-build to binary updates
+
+If your existing autocoder deployment was built from source — typically the layout in this guide, with `config.yaml` under `/home/autocoder/autocoder/` and a hand-written `/etc/systemd/system/autocoder.service` — and you want to switch onto the released-binary upgrade path, you have two options.
+
+**Before `autocoder install` learned to probe systemd:** re-running `install.sh` against such a host triggered the full wizard, overwrote the systemd unit, and produced a daemon pointed at a fresh wizard-generated config instead of your existing one. Any custom `Environment="PATH=..."` entries you'd added — a common case is the openspec CLI living under `~/.nvm/versions/node/<v>/bin/` — were lost, along with `WorkingDirectory` and the unit's `--config` path. The install wizard's systemd probe now prevents that outcome, but only when the operator passes `--config-dir <existing-config-dir>` OR the existing unit can be detected via `systemctl show autocoder.service`.
+
+### Option 1 — Re-run `install.sh` against your existing config
+
+Run the standard one-liner, passing `--config-dir` pointing at where your existing `config.yaml` lives:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/install.sh \
+  | bash -s -- --config-dir /home/autocoder/autocoder
+```
+
+The installer downloads the binary, verifies its SHA-256, copies it to `/usr/local/bin/autocoder`, and execs `autocoder install`. The new systemd probe finds your loaded `autocoder.service`, reads its `ExecStart=` line, sees the `--config /home/autocoder/autocoder/config.yaml` flag, and exits without running the wizard. Your existing config, secrets, and systemd unit are untouched. Then restart the daemon to pick up the new binary:
+
+```bash
+sudo systemctl restart autocoder
+```
+
+### Option 2 — Manual binary swap (no `install.sh` involvement)
+
+If you'd rather skip the bash wrapper entirely, replicate what `install.sh` does internally. Release assets are named `autocoder-<tag>-<triple>` (e.g. `autocoder-v0.5.0-x86_64-unknown-linux-gnu`) and each has a companion `.sha256` sidecar:
+
+```bash
+TAG=v0.5.0
+TRIPLE=x86_64-unknown-linux-gnu
+BASE=https://github.com/IndustriousKraken/openspec-autocoder/releases/download/${TAG}
+curl -fsSL -o autocoder "${BASE}/autocoder-${TAG}-${TRIPLE}"
+curl -fsSL -o autocoder.sha256 "${BASE}/autocoder-${TAG}-${TRIPLE}.sha256"
+sha256sum -c autocoder.sha256
+sudo install -m 755 autocoder /usr/local/bin/autocoder
+sudo systemctl restart autocoder
+```
+
+This path does not touch your config, secrets, or systemd unit at all — only the binary at `/usr/local/bin/autocoder` is swapped.
+
+For ongoing unattended updates (cron-driven binary swaps that watch the releases feed), see [Unattended updates via cron](DEPLOYMENT.md#unattended-updates-via-cron).
+
 ## 1. Install the binary
 
 ```bash

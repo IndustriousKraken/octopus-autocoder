@@ -272,6 +272,20 @@ pub struct SubprocessOutcome {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemdUnitProbe {
+    pub load_state: LoadState,
+    pub fragment_path: Option<PathBuf>,
+    pub exec_start_config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadState {
+    Loaded,
+    NotFound,
+    Other(String),
+}
+
 #[async_trait]
 pub trait SystemActions: Send + Sync {
     async fn which(&self, command: &str) -> Option<PathBuf>;
@@ -283,6 +297,7 @@ pub trait SystemActions: Send + Sync {
     async fn daemon_reload(&self) -> Result<()>;
     async fn enable_systemd_unit(&self, name: &str) -> Result<()>;
     async fn start_systemd_unit(&self, name: &str) -> Result<()>;
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe>;
 }
 
 pub struct RealSystemActions;
@@ -425,6 +440,97 @@ impl SystemActions for RealSystemActions {
         }
         Ok(())
     }
+
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe> {
+        let out = tokio::process::Command::new("systemctl")
+            .args([
+                "show",
+                unit_name,
+                "-p",
+                "LoadState",
+                "-p",
+                "FragmentPath",
+                "-p",
+                "ExecStart",
+            ])
+            .output()
+            .await;
+        let stdout = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            // Treat any failure to invoke or run systemctl as "no unit found";
+            // we don't want a non-systemd host to fail the install.
+            _ => {
+                return Ok(SystemdUnitProbe {
+                    load_state: LoadState::NotFound,
+                    fragment_path: None,
+                    exec_start_config_path: None,
+                });
+            }
+        };
+        Ok(parse_systemctl_show(&stdout))
+    }
+}
+
+/// Parse the stdout of `systemctl show <unit> -p LoadState -p FragmentPath -p ExecStart`.
+/// systemd emits one `KEY=VALUE` line per requested property. Unknown / unset
+/// values come back as empty strings. The `ExecStart=` value is a structured
+/// `{ path=... ; argv[]=... ; ... }` block; we scan it for the first
+/// `--config <path>` pair.
+pub(crate) fn parse_systemctl_show(stdout: &str) -> SystemdUnitProbe {
+    let mut load_state = LoadState::NotFound;
+    let mut fragment_path: Option<PathBuf> = None;
+    let mut exec_start_config_path: Option<PathBuf> = None;
+
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("LoadState=") {
+            load_state = match rest.trim() {
+                "loaded" => LoadState::Loaded,
+                "not-found" => LoadState::NotFound,
+                other => LoadState::Other(other.to_string()),
+            };
+        } else if let Some(rest) = line.strip_prefix("FragmentPath=") {
+            let trimmed = rest.trim();
+            fragment_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            };
+        } else if let Some(rest) = line.strip_prefix("ExecStart=") {
+            // Only set exec_start_config_path from the first ExecStart line
+            // that yields one. systemd may emit multiple ExecStart= entries
+            // when there are multiple ExecStart directives in the unit, but
+            // the wizard cares about the first one that actually launches
+            // autocoder.
+            if exec_start_config_path.is_none() {
+                exec_start_config_path = extract_config_arg(rest);
+            }
+        }
+    }
+
+    SystemdUnitProbe { load_state, fragment_path, exec_start_config_path }
+}
+
+/// Scan a systemd `ExecStart=` value for the first `--config <path>` token.
+/// Returns `None` when `--config` is absent OR when the next token is another
+/// `--<flag>` (operator wrote `--config` with no value).
+fn extract_config_arg(exec_start: &str) -> Option<PathBuf> {
+    let tokens: Vec<&str> = exec_start.split_whitespace().collect();
+    let mut iter = tokens.iter().peekable();
+    while let Some(tok) = iter.next() {
+        if *tok == "--config" {
+            if let Some(next) = iter.peek() {
+                if next.starts_with("--") {
+                    return None;
+                }
+                return Some(PathBuf::from(*next));
+            }
+            return None;
+        }
+        if let Some(rest) = tok.strip_prefix("--config=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +544,7 @@ pub enum RecordedCall {
     DaemonReload,
     EnableSystemdUnit(String),
     StartSystemdUnit(String),
+    ProbeSystemdUnit(String),
 }
 
 #[derive(Default)]
@@ -445,6 +552,7 @@ pub struct RecordingActions {
     pub calls: Mutex<Vec<RecordedCall>>,
     pub which_overrides: Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
     pub apt_get_available: bool,
+    pub probe_systemd_unit_responses: Mutex<HashMap<String, SystemdUnitProbe>>,
 }
 
 impl RecordingActions {
@@ -460,6 +568,13 @@ impl RecordingActions {
     }
     pub fn with_apt(mut self, available: bool) -> Self {
         self.apt_get_available = available;
+        self
+    }
+    pub fn with_probe_response(self, unit_name: &str, probe: SystemdUnitProbe) -> Self {
+        self.probe_systemd_unit_responses
+            .lock()
+            .unwrap()
+            .insert(unit_name.to_string(), probe);
         self
     }
     pub fn record(&self, call: RecordedCall) {
@@ -530,6 +645,22 @@ impl SystemActions for RecordingActions {
     async fn start_systemd_unit(&self, name: &str) -> Result<()> {
         self.record(RecordedCall::StartSystemdUnit(name.to_string()));
         Ok(())
+    }
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe> {
+        self.record(RecordedCall::ProbeSystemdUnit(unit_name.to_string()));
+        if let Some(p) = self
+            .probe_systemd_unit_responses
+            .lock()
+            .unwrap()
+            .get(unit_name)
+        {
+            return Ok(p.clone());
+        }
+        Ok(SystemdUnitProbe {
+            load_state: LoadState::NotFound,
+            fragment_path: None,
+            exec_start_config_path: None,
+        })
     }
 }
 
@@ -1163,6 +1294,53 @@ pub(crate) async fn execute_inner(
     let config_path = config_dir.join("config.yaml");
     let secrets_path = config_dir.join("secrets.env");
 
+    // 0. Systemd-probe existing-install detection. Operators who built from
+    //    source and wrote their own systemd unit are invisible to the
+    //    default-path config.yaml check below; the probe finds them.
+    //    Skipped in dev mode (no systemd unit by definition) and when
+    //    --upgrade is set (operator explicitly opted into the wizard rerun).
+    if mode == InstallMode::Server && !args.upgrade {
+        let probe = actions.probe_systemd_unit("autocoder.service").await?;
+        match probe.load_state {
+            LoadState::Loaded => match &probe.exec_start_config_path {
+                Some(unit_config_path) => {
+                    if unit_config_path.exists() {
+                        print_existing_install_verbs(unit_config_path);
+                        return Ok(());
+                    }
+                    let frag = probe
+                        .fragment_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    bail!(
+                        "autocoder.service is loaded (unit file: {frag}) but its \
+                         --config path {missing} does not exist on disk. \
+                         Either restore the config file from backup, or remove \
+                         the unit file (`sudo rm {frag} && sudo systemctl daemon-reload`) \
+                         and re-run install.sh to start fresh.",
+                        missing = unit_config_path.display(),
+                    );
+                }
+                None => {
+                    let frag = probe
+                        .fragment_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "WARN: autocoder.service is loaded (unit: {frag}) but its \
+                         ExecStart has no --config <path> flag; falling through to \
+                         the default-path config.yaml check."
+                    );
+                }
+            },
+            LoadState::NotFound | LoadState::Other(_) => {
+                // Fall through to the default-path check.
+            }
+        }
+    }
+
     // 1. Idempotency check.
     if config_path.exists() && !args.upgrade {
         println!(
@@ -1314,6 +1492,28 @@ pub(crate) async fn execute_inner(
     println!("  add more repositories by editing config.yaml and running `autocoder reload`.");
 
     Ok(())
+}
+
+/// Print the three-verb status block shown when an existing install is
+/// detected via the systemd probe. Wired into the post-detection short-circuit
+/// in `execute_inner`. The `--reconfigure` and `update.sh` hints reference
+/// follow-on changes (`a02`, `a04`); the verbs are correct regardless of
+/// whether those changes have merged yet.
+fn print_existing_install_verbs(config_path: &Path) {
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<config-dir>".to_string());
+    println!(
+        "autocoder is already installed (config: {}).",
+        config_path.display()
+    );
+    println!();
+    println!("To update the binary:        ./update.sh        (or wire into cron)");
+    println!("To reconfigure a section:    autocoder install --reconfigure <audits|reviewer|chatops>");
+    println!("To wipe and reinstall:       sudo rm -rf {config_dir} && ./install.sh");
+    println!();
+    println!("No changes made.");
 }
 
 fn resolve_mode(explicit: Option<InstallMode>) -> InstallMode {
@@ -2080,5 +2280,287 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "fresh-create mode must equal requested mode");
         assert_eq!(std::fs::read(&p).unwrap(), b"hello\n");
+    }
+
+    // ----- systemd probe parsing -----------------------------------------
+
+    #[test]
+    fn parse_systemctl_show_loaded_unit_with_config_flag() {
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config /home/autocoder/autocoder/config.yaml ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Loaded);
+        assert_eq!(
+            probe.fragment_path,
+            Some(PathBuf::from("/etc/systemd/system/autocoder.service"))
+        );
+        assert_eq!(
+            probe.exec_start_config_path,
+            Some(PathBuf::from("/home/autocoder/autocoder/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn parse_systemctl_show_loaded_unit_without_config_flag() {
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Loaded);
+        assert!(probe.fragment_path.is_some());
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_not_found_unit() {
+        let fixture = "\
+LoadState=not-found
+FragmentPath=
+ExecStart=
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::NotFound);
+        assert_eq!(probe.fragment_path, None);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_masked_unit() {
+        let fixture = "\
+LoadState=masked
+FragmentPath=
+ExecStart=
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Other("masked".to_string()));
+        assert_eq!(probe.fragment_path, None);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_config_equals_form() {
+        // `--config=path` (single-token form) is also a legitimate way to
+        // write the flag; the parser must accept it.
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config=/srv/autocoder/config.yaml ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(
+            probe.exec_start_config_path,
+            Some(PathBuf::from("/srv/autocoder/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn parse_systemctl_show_config_flag_with_no_value_returns_none() {
+        // Operator wrote `--config --other-flag` — no value. Must not
+        // misinterpret `--other-flag` as the config path.
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    // ----- detect_existing_install execute_inner integration -------------
+
+    fn loaded_probe(config_path: &Path) -> SystemdUnitProbe {
+        SystemdUnitProbe {
+            load_state: LoadState::Loaded,
+            fragment_path: Some(PathBuf::from("/etc/systemd/system/autocoder.service")),
+            exec_start_config_path: Some(config_path.to_path_buf()),
+        }
+    }
+
+    fn server_ni_args(config_dir: PathBuf) -> InstallArgs {
+        InstallArgs {
+            mode: Some(InstallMode::Server),
+            config_dir: Some(config_dir),
+            non_interactive: true,
+            repo_url: Some("git@github.com:acme/widgets.git".to_string()),
+            token_env_var: Some("GITHUB_TOKEN".to_string()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            ..InstallArgs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_with_existing_config_short_circuits() {
+        let tmp = TempDir::new().unwrap();
+        let unit_config = tmp.path().join("home-autocoder-config.yaml");
+        std::fs::write(&unit_config, b"# placeholder\n").unwrap();
+
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", loaded_probe(&unit_config));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("fresh-config-dir"));
+        let r = execute_inner(args, &mut io, &actions, tmp.path().join("systemd")).await;
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+
+        let calls = actions.calls();
+        // Probe was invoked exactly once with the correct unit name.
+        let probe_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ProbeSystemdUnit(n) if n == "autocoder.service"))
+            .collect();
+        assert_eq!(probe_calls.len(), 1, "probe called once: {calls:?}");
+
+        // No mutation-side-effect calls fired.
+        for c in &calls {
+            match c {
+                RecordedCall::CreateUser { .. }
+                | RecordedCall::AptInstall(_)
+                | RecordedCall::DaemonReload
+                | RecordedCall::EnableSystemdUnit(_)
+                | RecordedCall::StartSystemdUnit(_)
+                | RecordedCall::Chown { .. }
+                | RecordedCall::Chmod { .. } => {
+                    panic!("unexpected side-effect call after probe short-circuit: {c:?}");
+                }
+                _ => {}
+            }
+        }
+
+        // The fresh-config-dir was NOT created (no wizard run, no config
+        // write).
+        assert!(
+            !tmp.path().join("fresh-config-dir").join("config.yaml").exists(),
+            "wizard must not have written config.yaml after short-circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_with_missing_config_errors() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.yaml");
+
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", loaded_probe(&missing));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        let err = execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .expect_err("expected broken-install error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/etc/systemd/system/autocoder.service"),
+            "error must name FragmentPath: {msg}"
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error must name missing config path: {msg}"
+        );
+        assert!(
+            msg.contains("restore") && msg.contains("rm "),
+            "error must hint at remediations: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_not_found_falls_through_to_default_path() {
+        let tmp = TempDir::new().unwrap();
+        // No probe response → default-fixture is NotFound.
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        // Probe was invoked.
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ProbeSystemdUnit(n) if n == "autocoder.service")),
+            "probe must run in server mode: {calls:?}"
+        );
+        // ... and the wizard proceeded to write the config.
+        assert!(
+            tmp.path().join("conf").join("config.yaml").exists(),
+            "wizard must have written config.yaml when probe found no unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_not_found_with_default_path_config_hits_idempotency() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join("conf");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(conf.join("config.yaml"), b"# placeholder\n").unwrap();
+        // No probe response → NotFound; default-path config exists → should
+        // hit the existing idempotency short-circuit.
+        let actions = RecordingActions::new();
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(conf.clone());
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        for c in &calls {
+            match c {
+                RecordedCall::CreateUser { .. }
+                | RecordedCall::AptInstall(_)
+                | RecordedCall::DaemonReload
+                | RecordedCall::EnableSystemdUnit(_)
+                | RecordedCall::StartSystemdUnit(_) => {
+                    panic!("unexpected wizard call after default-path idempotency exit: {c:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_dev_mode_skips_probe() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = ni_args(&tmp);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ProbeSystemdUnit(_))),
+            "dev-mode install must NOT invoke probe_systemd_unit: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_no_config_flag_falls_through() {
+        let tmp = TempDir::new().unwrap();
+        // Loaded unit but no exec_start_config_path (parser couldn't extract
+        // it). Should fall through to the default-path check and proceed
+        // with the wizard since no config.yaml exists there.
+        let probe = SystemdUnitProbe {
+            load_state: LoadState::Loaded,
+            fragment_path: Some(PathBuf::from("/etc/systemd/system/autocoder.service")),
+            exec_start_config_path: None,
+        };
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", probe)
+            .with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        // Wizard proceeded — config.yaml exists at the default path.
+        assert!(
+            tmp.path().join("conf").join("config.yaml").exists(),
+            "wizard must have written config.yaml after fall-through with WARN"
+        );
     }
 }
