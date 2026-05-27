@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod audit;
+pub mod check_config;
 pub mod install;
 pub mod reload;
 pub mod rewind;
@@ -51,6 +52,14 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+
+    /// Validate a config file against this binary's schema, without
+    /// running the daemon. Exits 0 on a clean config, 1 on
+    /// warnings-only (typically unset env vars referenced by `*_env`
+    /// fields), 2 on at least one hard error. Use this as a CI gate
+    /// AND as the preflight before `update.sh` swaps a new binary into
+    /// place.
+    CheckConfig(check_config::CheckConfigArgs),
 
     /// Internal: stdio MCP server exposing the `ask_user` tool. Launched
     /// by the wrapped CLI agent (via the workspace's `.mcp.json` config),
@@ -137,6 +146,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = config::Config::load_from(&config)?;
             run::execute(cfg, config).await
         }
+        Command::CheckConfig(args) => check_config::execute(args).await,
         Command::Install(args) => install::execute(args).await,
         Command::Reload => reload::execute().await,
         Command::McpAskUserServer => crate::mcp_askuser_server::run(),

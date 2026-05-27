@@ -46,6 +46,34 @@ pub struct InstallArgs {
     #[arg(long, default_value_t = false)]
     pub upgrade: bool,
 
+    /// Re-prompt one section of the install wizard against an existing
+    /// install and patch the existing `config.yaml` in place. Accepted
+    /// values: `audits`, `reviewer`, `chatops`. See [`ReconfigureSection`]
+    /// for the rationale on what is excluded.
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with_all = [
+            "non_interactive",
+            "repo_url",
+            "base_branch",
+            "agent_branch",
+            "poll_interval_sec",
+            "token_env_var",
+            "chatops_backend",
+            "chatops_channel_id",
+            "reviewer_provider",
+            "reviewer_model",
+            "audits_llm_driven",
+            "audit_architecture_brightline",
+            "audit_architecture_consultative",
+            "audit_drift_audit",
+            "audit_missing_tests_audit",
+            "audit_security_bug_audit",
+        ]
+    )]
+    pub reconfigure: Option<ReconfigureSection>,
+
     // ---------- wizard pre-fill / non-interactive answers ----------
     #[arg(long)]
     pub repo_url: Option<String>,
@@ -92,6 +120,27 @@ pub struct InstallArgs {
 pub enum InstallMode {
     Server,
     Dev,
+}
+
+/// Which slice of `config.yaml` the operator wants to re-prompt for via
+/// `autocoder install --reconfigure <section>`. The wizard intentionally
+/// excludes several knobs from this surface:
+///
+/// - `repositories`: add/remove flows hot-apply via `autocoder reload`; the
+///   reconfigure verb deliberately does not grow into that space.
+/// - `paths.*`: relocating the daemon data directories is a destructive
+///   operation that needs explicit operator action AND a daemon restart.
+/// - `executor.*`: every executor knob requires a restart; reconfigure
+///   stays in the hot-applicable space.
+/// - `audits.settings.*.prompt_path` and `audits.settings.*.extra.*`:
+///   advanced per-audit overrides. The wizard handles only the
+///   `audits.defaults.*` cadences; operators editing prompts or
+///   thresholds edit YAML directly.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ReconfigureSection {
+    Audits,
+    Reviewer,
+    Chatops,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -272,6 +321,20 @@ pub struct SubprocessOutcome {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemdUnitProbe {
+    pub load_state: LoadState,
+    pub fragment_path: Option<PathBuf>,
+    pub exec_start_config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadState {
+    Loaded,
+    NotFound,
+    Other(String),
+}
+
 #[async_trait]
 pub trait SystemActions: Send + Sync {
     async fn which(&self, command: &str) -> Option<PathBuf>;
@@ -283,6 +346,7 @@ pub trait SystemActions: Send + Sync {
     async fn daemon_reload(&self) -> Result<()>;
     async fn enable_systemd_unit(&self, name: &str) -> Result<()>;
     async fn start_systemd_unit(&self, name: &str) -> Result<()>;
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe>;
 }
 
 pub struct RealSystemActions;
@@ -425,6 +489,97 @@ impl SystemActions for RealSystemActions {
         }
         Ok(())
     }
+
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe> {
+        let out = tokio::process::Command::new("systemctl")
+            .args([
+                "show",
+                unit_name,
+                "-p",
+                "LoadState",
+                "-p",
+                "FragmentPath",
+                "-p",
+                "ExecStart",
+            ])
+            .output()
+            .await;
+        let stdout = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            // Treat any failure to invoke or run systemctl as "no unit found";
+            // we don't want a non-systemd host to fail the install.
+            _ => {
+                return Ok(SystemdUnitProbe {
+                    load_state: LoadState::NotFound,
+                    fragment_path: None,
+                    exec_start_config_path: None,
+                });
+            }
+        };
+        Ok(parse_systemctl_show(&stdout))
+    }
+}
+
+/// Parse the stdout of `systemctl show <unit> -p LoadState -p FragmentPath -p ExecStart`.
+/// systemd emits one `KEY=VALUE` line per requested property. Unknown / unset
+/// values come back as empty strings. The `ExecStart=` value is a structured
+/// `{ path=... ; argv[]=... ; ... }` block; we scan it for the first
+/// `--config <path>` pair.
+pub(crate) fn parse_systemctl_show(stdout: &str) -> SystemdUnitProbe {
+    let mut load_state = LoadState::NotFound;
+    let mut fragment_path: Option<PathBuf> = None;
+    let mut exec_start_config_path: Option<PathBuf> = None;
+
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("LoadState=") {
+            load_state = match rest.trim() {
+                "loaded" => LoadState::Loaded,
+                "not-found" => LoadState::NotFound,
+                other => LoadState::Other(other.to_string()),
+            };
+        } else if let Some(rest) = line.strip_prefix("FragmentPath=") {
+            let trimmed = rest.trim();
+            fragment_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            };
+        } else if let Some(rest) = line.strip_prefix("ExecStart=") {
+            // Only set exec_start_config_path from the first ExecStart line
+            // that yields one. systemd may emit multiple ExecStart= entries
+            // when there are multiple ExecStart directives in the unit, but
+            // the wizard cares about the first one that actually launches
+            // autocoder.
+            if exec_start_config_path.is_none() {
+                exec_start_config_path = extract_config_arg(rest);
+            }
+        }
+    }
+
+    SystemdUnitProbe { load_state, fragment_path, exec_start_config_path }
+}
+
+/// Scan a systemd `ExecStart=` value for the first `--config <path>` token.
+/// Returns `None` when `--config` is absent OR when the next token is another
+/// `--<flag>` (operator wrote `--config` with no value).
+fn extract_config_arg(exec_start: &str) -> Option<PathBuf> {
+    let tokens: Vec<&str> = exec_start.split_whitespace().collect();
+    let mut iter = tokens.iter().peekable();
+    while let Some(tok) = iter.next() {
+        if *tok == "--config" {
+            if let Some(next) = iter.peek() {
+                if next.starts_with("--") {
+                    return None;
+                }
+                return Some(PathBuf::from(*next));
+            }
+            return None;
+        }
+        if let Some(rest) = tok.strip_prefix("--config=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +593,7 @@ pub enum RecordedCall {
     DaemonReload,
     EnableSystemdUnit(String),
     StartSystemdUnit(String),
+    ProbeSystemdUnit(String),
 }
 
 #[derive(Default)]
@@ -445,6 +601,7 @@ pub struct RecordingActions {
     pub calls: Mutex<Vec<RecordedCall>>,
     pub which_overrides: Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
     pub apt_get_available: bool,
+    pub probe_systemd_unit_responses: Mutex<HashMap<String, SystemdUnitProbe>>,
 }
 
 impl RecordingActions {
@@ -460,6 +617,13 @@ impl RecordingActions {
     }
     pub fn with_apt(mut self, available: bool) -> Self {
         self.apt_get_available = available;
+        self
+    }
+    pub fn with_probe_response(self, unit_name: &str, probe: SystemdUnitProbe) -> Self {
+        self.probe_systemd_unit_responses
+            .lock()
+            .unwrap()
+            .insert(unit_name.to_string(), probe);
         self
     }
     pub fn record(&self, call: RecordedCall) {
@@ -530,6 +694,22 @@ impl SystemActions for RecordingActions {
     async fn start_systemd_unit(&self, name: &str) -> Result<()> {
         self.record(RecordedCall::StartSystemdUnit(name.to_string()));
         Ok(())
+    }
+    async fn probe_systemd_unit(&self, unit_name: &str) -> Result<SystemdUnitProbe> {
+        self.record(RecordedCall::ProbeSystemdUnit(unit_name.to_string()));
+        if let Some(p) = self
+            .probe_systemd_unit_responses
+            .lock()
+            .unwrap()
+            .get(unit_name)
+        {
+            return Ok(p.clone());
+        }
+        Ok(SystemdUnitProbe {
+            load_state: LoadState::NotFound,
+            fragment_path: None,
+            exec_start_config_path: None,
+        })
     }
 }
 
@@ -1163,6 +1343,63 @@ pub(crate) async fn execute_inner(
     let config_path = config_dir.join("config.yaml");
     let secrets_path = config_dir.join("secrets.env");
 
+    // --reconfigure short-circuits the entire fresh-install flow: the
+    // operator explicitly asked to re-prompt one section of an existing
+    // install. The dispatch resolves the existing-config path via the
+    // a01 systemd probe (or the default-path fallback), parses the
+    // existing config, re-prompts the chosen section, and patches the
+    // file in place (audits) or with diff-confirm (reviewer / chatops).
+    if let Some(section) = args.reconfigure {
+        return execute_reconfigure(&args, section, io, actions, mode).await;
+    }
+
+    // 0. Systemd-probe existing-install detection. Operators who built from
+    //    source and wrote their own systemd unit are invisible to the
+    //    default-path config.yaml check below; the probe finds them.
+    //    Skipped in dev mode (no systemd unit by definition) and when
+    //    --upgrade is set (operator explicitly opted into the wizard rerun).
+    if mode == InstallMode::Server && !args.upgrade {
+        let probe = actions.probe_systemd_unit("autocoder.service").await?;
+        match probe.load_state {
+            LoadState::Loaded => match &probe.exec_start_config_path {
+                Some(unit_config_path) => {
+                    if unit_config_path.exists() {
+                        print_existing_install_verbs(unit_config_path);
+                        return Ok(());
+                    }
+                    let frag = probe
+                        .fragment_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    bail!(
+                        "autocoder.service is loaded (unit file: {frag}) but its \
+                         --config path {missing} does not exist on disk. \
+                         Either restore the config file from backup, or remove \
+                         the unit file (`sudo rm {frag} && sudo systemctl daemon-reload`) \
+                         and re-run install.sh to start fresh.",
+                        missing = unit_config_path.display(),
+                    );
+                }
+                None => {
+                    let frag = probe
+                        .fragment_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "WARN: autocoder.service is loaded (unit: {frag}) but its \
+                         ExecStart has no --config <path> flag; falling through to \
+                         the default-path config.yaml check."
+                    );
+                }
+            },
+            LoadState::NotFound | LoadState::Other(_) => {
+                // Fall through to the default-path check.
+            }
+        }
+    }
+
     // 1. Idempotency check.
     if config_path.exists() && !args.upgrade {
         println!(
@@ -1316,6 +1553,28 @@ pub(crate) async fn execute_inner(
     Ok(())
 }
 
+/// Print the three-verb status block shown when an existing install is
+/// detected via the systemd probe. Wired into the post-detection short-circuit
+/// in `execute_inner`. The `--reconfigure` and `update.sh` hints reference
+/// follow-on changes (`a02`, `a04`); the verbs are correct regardless of
+/// whether those changes have merged yet.
+fn print_existing_install_verbs(config_path: &Path) {
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<config-dir>".to_string());
+    println!(
+        "autocoder is already installed (config: {}).",
+        config_path.display()
+    );
+    println!();
+    println!("To update the binary:        ./update.sh        (or wire into cron)");
+    println!("To reconfigure a section:    autocoder install --reconfigure <audits|reviewer|chatops>");
+    println!("To wipe and reinstall:       sudo rm -rf {config_dir} && ./install.sh");
+    println!();
+    println!("No changes made.");
+}
+
 fn resolve_mode(explicit: Option<InstallMode>) -> InstallMode {
     if let Some(m) = explicit {
         return m;
@@ -1423,6 +1682,440 @@ fn lookup_per_audit_override(p: &WizardPrefill, slug: &str) -> Option<AuditCaden
         "security_bug_audit" => p.audit_security_bug_audit,
         _ => None,
     }
+}
+
+// ----------------------------------------------------------------------------
+// --reconfigure: re-prompt one section of an existing install.
+// ----------------------------------------------------------------------------
+
+const RECONFIGURE_NO_INSTALL_HINT: &str =
+    "no existing install detected; run install.sh for first-time setup";
+
+/// Default server-mode config path used as the systemd-probe fallback when
+/// the unit isn't loaded (or has no `--config` flag).
+pub(crate) const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/autocoder/config.yaml";
+
+/// Resolve the path to the existing `config.yaml` for `--reconfigure`.
+///
+/// Resolution priority:
+///
+/// 1. `args.config_dir.join("config.yaml")` if the override exists.
+/// 2. Server mode: probe `autocoder.service`; if loaded AND its
+///    `exec_start_config_path` exists on disk, use it.
+/// 3. Server mode: fall back to `/etc/autocoder/config.yaml`.
+/// 4. Dev mode: `~/.config/autocoder/config.yaml`.
+///
+/// Bails with `RECONFIGURE_NO_INSTALL_HINT` if none of the above resolves
+/// to a file that exists on disk.
+pub(crate) async fn resolve_existing_config_path(
+    args: &InstallArgs,
+    actions: &dyn SystemActions,
+    mode: InstallMode,
+) -> Result<PathBuf> {
+    if let Some(dir) = args.config_dir.as_ref() {
+        let candidate = dir.join("config.yaml");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        bail!(RECONFIGURE_NO_INSTALL_HINT);
+    }
+
+    match mode {
+        InstallMode::Server => {
+            let probe = actions.probe_systemd_unit("autocoder.service").await?;
+            if matches!(probe.load_state, LoadState::Loaded)
+                && let Some(p) = probe.exec_start_config_path.as_ref()
+                && p.exists()
+            {
+                return Ok(p.clone());
+            }
+            let fallback = PathBuf::from(DEFAULT_SERVER_CONFIG_PATH);
+            if fallback.exists() {
+                return Ok(fallback);
+            }
+            bail!(RECONFIGURE_NO_INSTALL_HINT);
+        }
+        InstallMode::Dev => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let candidate = home.join(".config/autocoder/config.yaml");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            bail!(RECONFIGURE_NO_INSTALL_HINT);
+        }
+    }
+}
+
+/// Per-section dispatcher invoked from `execute_inner` when
+/// `args.reconfigure` is `Some`. Resolves the existing config path,
+/// parses it, calls the section-specific re-prompt helper, and applies
+/// the result (audits → in-place patch; reviewer / chatops → diff-confirm).
+pub(crate) async fn execute_reconfigure(
+    args: &InstallArgs,
+    section: ReconfigureSection,
+    io: &mut dyn WizardIo,
+    actions: &dyn SystemActions,
+    mode: InstallMode,
+) -> Result<()> {
+    let config_path = resolve_existing_config_path(args, actions, mode).await?;
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("read existing config at {}", config_path.display()))?;
+    let existing: Config = serde_yml::from_str(&raw)
+        .with_context(|| format!("parse existing config at {}", config_path.display()))?;
+
+    match section {
+        ReconfigureSection::Audits => {
+            let new_config = reconfigure_audits(&existing, io).await?;
+            apply_in_place_patch(&config_path, &new_config)?;
+            print_restart_guidance(&config_path, section);
+        }
+        ReconfigureSection::Reviewer => {
+            let new_config = reconfigure_reviewer(&existing, io).await?;
+            let applied =
+                confirm_diff_and_apply(&config_path, &new_config, io).await?;
+            if applied {
+                print_restart_guidance(&config_path, section);
+            } else {
+                io.print("no changes made\n");
+            }
+        }
+        ReconfigureSection::Chatops => {
+            let new_config = reconfigure_chatops(&existing, io).await?;
+            let applied =
+                confirm_diff_and_apply(&config_path, &new_config, io).await?;
+            if applied {
+                print_restart_guidance(&config_path, section);
+            } else {
+                io.print("no changes made\n");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn section_label(section: ReconfigureSection) -> &'static str {
+    match section {
+        ReconfigureSection::Audits => "audits.defaults.*",
+        ReconfigureSection::Reviewer => "reviewer:",
+        ReconfigureSection::Chatops => "chatops:",
+    }
+}
+
+fn print_restart_guidance(config_path: &Path, section: ReconfigureSection) {
+    println!(
+        "Patched {} in {}.\nTo apply: sudo -u autocoder autocoder reload",
+        section_label(section),
+        config_path.display()
+    );
+}
+
+/// Re-prompt the audit cadences with the operator's current values shown
+/// as defaults, returning a clone of `existing` with the updated
+/// `audits.defaults`. Decline (`never`) drops the slug from the map.
+pub(crate) async fn reconfigure_audits(
+    existing: &Config,
+    io: &mut dyn WizardIo,
+) -> Result<Config> {
+    let current: HashMap<String, Cadence> = existing
+        .audits
+        .as_ref()
+        .map(|a| a.defaults.clone())
+        .unwrap_or_default();
+
+    io.print("\nReconfigure audit cadences\n");
+    io.print(
+        "  Each prompt's default is the existing cadence. Pick `n` to disable.\n",
+    );
+
+    let mut updated: HashMap<String, Cadence> = HashMap::new();
+    for (slug, rec) in LLM_DRIVEN_SLUGS {
+        let existing_cadence = current
+            .get(*slug)
+            .copied()
+            .unwrap_or(Cadence::Disabled);
+        io.print(&format!("\n  {slug} ({})\n", audit_description(slug)));
+        let label = format!("  Cadence (recommended: {})", cadence_label(*rec));
+        let chosen = ask_audit_cadence(io, &label, existing_cadence, "never").await?;
+        if chosen != Cadence::Disabled {
+            updated.insert((*slug).to_string(), chosen);
+        }
+    }
+
+    let mut new_config = existing.clone();
+    if updated.is_empty() {
+        new_config.audits = None;
+    } else {
+        let mut audits = existing.audits.clone().unwrap_or_default();
+        audits.defaults = updated;
+        new_config.audits = Some(audits);
+    }
+    Ok(new_config)
+}
+
+/// Re-prompt the reviewer block (provider + model + api-key env-var) with
+/// existing values as defaults. Returns a clone of `existing` with the
+/// updated `reviewer:` block.
+pub(crate) async fn reconfigure_reviewer(
+    existing: &Config,
+    io: &mut dyn WizardIo,
+) -> Result<Config> {
+    let current_provider_arg = match existing.reviewer.as_ref().map(|r| r.provider) {
+        Some(ReviewerProvider::Anthropic) => ReviewerProviderArg::Anthropic,
+        Some(ReviewerProvider::OpenAiCompatible) => ReviewerProviderArg::OpenAiCompatible,
+        None => ReviewerProviderArg::None,
+    };
+
+    io.print("\nReconfigure reviewer\n");
+    let idx = io
+        .choose(
+            "Reviewer provider",
+            REVIEWER_OPTIONS,
+            reviewer_arg_to_idx(current_provider_arg),
+        )
+        .await?;
+    let provider_arg = idx_to_reviewer_arg(idx);
+
+    let mut new_config = existing.clone();
+    new_config.reviewer = match provider_arg {
+        ReviewerProviderArg::None => None,
+        ReviewerProviderArg::Anthropic | ReviewerProviderArg::OpenAiCompatible => {
+            let provider = match provider_arg {
+                ReviewerProviderArg::Anthropic => ReviewerProvider::Anthropic,
+                ReviewerProviderArg::OpenAiCompatible => ReviewerProvider::OpenAiCompatible,
+                _ => unreachable!(),
+            };
+            let default_model = existing
+                .reviewer
+                .as_ref()
+                .map(|r| r.model.clone())
+                .unwrap_or_else(|| match provider_arg {
+                    ReviewerProviderArg::Anthropic => "claude-sonnet-4-6".to_string(),
+                    _ => "gpt-4o-mini".to_string(),
+                });
+            let model = ask_default(io, "Reviewer model", &default_model).await?;
+            let default_env = existing
+                .reviewer
+                .as_ref()
+                .and_then(|r| r.api_key_env.clone())
+                .or_else(|| reviewer_env_var(provider_arg).map(String::from))
+                .unwrap_or_default();
+            let api_key_env_raw = ask_default(io, "Reviewer API key env var", &default_env).await?;
+            let api_key_env = if api_key_env_raw.is_empty() {
+                None
+            } else {
+                Some(api_key_env_raw)
+            };
+            // Preserve all other reviewer fields (inline `api_key`,
+            // `api_base_url`, `prompt_template_path`, etc.) from the
+            // existing config — only provider/model/api_key_env are
+            // reconfigured here.
+            let mut reviewer = existing.reviewer.clone().unwrap_or_else(|| ReviewerConfig {
+                enabled: true,
+                provider,
+                model: model.clone(),
+                api_key_env: api_key_env.clone(),
+                api_key: None,
+                api_base_url: None,
+                prompt_template_path: None,
+                auto_revise_on_block: false,
+            });
+            reviewer.provider = provider;
+            reviewer.model = model;
+            reviewer.api_key_env = api_key_env;
+            Some(reviewer)
+        }
+    };
+    Ok(new_config)
+}
+
+/// Re-prompt the chatops block (provider + default channel id) with
+/// existing values as defaults. Returns a clone of `existing` with the
+/// updated `chatops:` block (or absent, if the operator picks `none`).
+pub(crate) async fn reconfigure_chatops(
+    existing: &Config,
+    io: &mut dyn WizardIo,
+) -> Result<Config> {
+    let current_backend_arg = match existing.chatops.as_ref().map(|c| c.provider) {
+        Some(ChatOpsProvider::Slack) => ChatOpsBackendArg::Slack,
+        Some(ChatOpsProvider::Discord) => ChatOpsBackendArg::Discord,
+        Some(ChatOpsProvider::Teams) => ChatOpsBackendArg::Teams,
+        Some(ChatOpsProvider::Mattermost) => ChatOpsBackendArg::Mattermost,
+        Some(ChatOpsProvider::Matrix) => ChatOpsBackendArg::Matrix,
+        None => ChatOpsBackendArg::None,
+    };
+
+    io.print("\nReconfigure chatops\n");
+    let idx = io
+        .choose(
+            "ChatOps backend",
+            CHATOPS_OPTIONS,
+            chatops_arg_to_idx(current_backend_arg),
+        )
+        .await?;
+    let backend_arg = idx_to_chatops_arg(idx);
+
+    let mut new_config = existing.clone();
+    if backend_arg == ChatOpsBackendArg::None {
+        new_config.chatops = None;
+        return Ok(new_config);
+    }
+    let default_channel = existing
+        .chatops
+        .as_ref()
+        .map(|c| c.default_channel_id.clone())
+        .unwrap_or_default();
+    let channel = ask_default(io, "ChatOps default channel id", &default_channel).await?;
+
+    // Build the new ChatOpsConfig. If the operator kept the same provider,
+    // preserve all unchanged fields (provider-specific tokens, notification
+    // settings, etc.); otherwise start from the wizard's slack default
+    // (only slack is implemented end-to-end in the wizard today).
+    let preserved = existing
+        .chatops
+        .as_ref()
+        .filter(|c| {
+            ChatOpsBackendArg::from_provider(c.provider) == backend_arg
+        })
+        .cloned();
+    let mut chatops = match preserved {
+        Some(mut existing_chatops) => {
+            existing_chatops.default_channel_id = channel.clone();
+            existing_chatops
+        }
+        None => {
+            if backend_arg != ChatOpsBackendArg::Slack {
+                bail!(
+                    "chatops backend `{}` is experimental and not supported by the wizard yet; pick `none` or `slack`",
+                    chatops_backend_label(backend_arg)
+                );
+            }
+            ChatOpsConfig {
+                provider: ChatOpsProvider::Slack,
+                default_channel_id: channel.clone(),
+                notifications: None,
+                slack: Some(SlackProviderConfig {
+                    bot_token_env: Some("SLACK_BOT_TOKEN".to_string()),
+                    bot_token: None,
+                    app_token_env: None,
+                    app_token: None,
+                    listen_channels: Vec::new(),
+                    dedup_cache_capacity: crate::config::default_dedup_cache_capacity(),
+                    dedup_cache_ttl_secs: crate::config::default_dedup_cache_ttl_secs(),
+                }),
+                discord: None,
+                teams: None,
+                mattermost: None,
+                matrix: None,
+            }
+        }
+    };
+    chatops.default_channel_id = channel;
+    new_config.chatops = Some(chatops);
+    Ok(new_config)
+}
+
+impl ChatOpsBackendArg {
+    fn from_provider(p: ChatOpsProvider) -> Self {
+        match p {
+            ChatOpsProvider::Slack => Self::Slack,
+            ChatOpsProvider::Discord => Self::Discord,
+            ChatOpsProvider::Teams => Self::Teams,
+            ChatOpsProvider::Mattermost => Self::Mattermost,
+            ChatOpsProvider::Matrix => Self::Matrix,
+        }
+    }
+}
+
+/// Serialize `new_config` and atomically replace `config_path`. On unix,
+/// the new file inherits the prior file's mode and owner where stat
+/// allows. `serde_yml` does not preserve comments; the wizard-generated
+/// audits block carries none so this is acceptable for `--reconfigure
+/// audits` and the operator confirms the diff explicitly for reviewer /
+/// chatops.
+pub(crate) fn apply_in_place_patch(config_path: &Path, new_config: &Config) -> Result<()> {
+    let yaml = serialize_config(new_config)?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path {} has no parent", config_path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.reconfigure.tmp",
+        config_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config.yaml")
+    ));
+
+    let prior_mode = prior_file_mode(config_path);
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(yaml.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
+
+    std::fs::rename(&tmp, config_path).with_context(|| {
+        format!("rename {} -> {}", tmp.display(), config_path.display())
+    })?;
+
+    #[cfg(unix)]
+    if let Some(mode) = prior_mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("restore mode on {}", config_path.display()))?;
+    }
+    let _ = prior_mode;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prior_file_mode(p: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn prior_file_mode(_p: &Path) -> Option<u32> {
+    None
+}
+
+/// Compute a unified diff between the on-disk YAML and the serialized
+/// `new_config`, print it via `io`, and prompt `Apply this patch? [y/N]`.
+/// On accept, writes the patch via [`apply_in_place_patch`] and returns
+/// `Ok(true)`. On decline, the file is unchanged and returns `Ok(false)`.
+pub(crate) async fn confirm_diff_and_apply(
+    config_path: &Path,
+    new_config: &Config,
+    io: &mut dyn WizardIo,
+) -> Result<bool> {
+    let current = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let new_yaml = serialize_config(new_config)?;
+    let diff = similar::TextDiff::from_lines(&current, &new_yaml);
+    let unified = diff
+        .unified_diff()
+        .header("current", "proposed")
+        .to_string();
+    io.print("\n");
+    if unified.trim().is_empty() {
+        io.print("No changes between current and proposed config.\n");
+    } else {
+        io.print(&unified);
+        if !unified.ends_with('\n') {
+            io.print("\n");
+        }
+    }
+    let accept = io.confirm("Apply this patch?", false).await?;
+    if !accept {
+        return Ok(false);
+    }
+    apply_in_place_patch(config_path, new_config)?;
+    Ok(true)
 }
 
 // ----------------------------------------------------------------------------
@@ -2080,5 +2773,826 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "fresh-create mode must equal requested mode");
         assert_eq!(std::fs::read(&p).unwrap(), b"hello\n");
+    }
+
+    // ----- systemd probe parsing -----------------------------------------
+
+    #[test]
+    fn parse_systemctl_show_loaded_unit_with_config_flag() {
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config /home/autocoder/autocoder/config.yaml ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Loaded);
+        assert_eq!(
+            probe.fragment_path,
+            Some(PathBuf::from("/etc/systemd/system/autocoder.service"))
+        );
+        assert_eq!(
+            probe.exec_start_config_path,
+            Some(PathBuf::from("/home/autocoder/autocoder/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn parse_systemctl_show_loaded_unit_without_config_flag() {
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Loaded);
+        assert!(probe.fragment_path.is_some());
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_not_found_unit() {
+        let fixture = "\
+LoadState=not-found
+FragmentPath=
+ExecStart=
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::NotFound);
+        assert_eq!(probe.fragment_path, None);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_masked_unit() {
+        let fixture = "\
+LoadState=masked
+FragmentPath=
+ExecStart=
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.load_state, LoadState::Other("masked".to_string()));
+        assert_eq!(probe.fragment_path, None);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    #[test]
+    fn parse_systemctl_show_config_equals_form() {
+        // `--config=path` (single-token form) is also a legitimate way to
+        // write the flag; the parser must accept it.
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config=/srv/autocoder/config.yaml ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(
+            probe.exec_start_config_path,
+            Some(PathBuf::from("/srv/autocoder/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn parse_systemctl_show_config_flag_with_no_value_returns_none() {
+        // Operator wrote `--config --other-flag` — no value. Must not
+        // misinterpret `--other-flag` as the config path.
+        let fixture = "\
+LoadState=loaded
+FragmentPath=/etc/systemd/system/autocoder.service
+ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_errors=no }
+";
+        let probe = parse_systemctl_show(fixture);
+        assert_eq!(probe.exec_start_config_path, None);
+    }
+
+    // ----- detect_existing_install execute_inner integration -------------
+
+    fn loaded_probe(config_path: &Path) -> SystemdUnitProbe {
+        SystemdUnitProbe {
+            load_state: LoadState::Loaded,
+            fragment_path: Some(PathBuf::from("/etc/systemd/system/autocoder.service")),
+            exec_start_config_path: Some(config_path.to_path_buf()),
+        }
+    }
+
+    fn server_ni_args(config_dir: PathBuf) -> InstallArgs {
+        InstallArgs {
+            mode: Some(InstallMode::Server),
+            config_dir: Some(config_dir),
+            non_interactive: true,
+            repo_url: Some("git@github.com:acme/widgets.git".to_string()),
+            token_env_var: Some("GITHUB_TOKEN".to_string()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            ..InstallArgs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_with_existing_config_short_circuits() {
+        let tmp = TempDir::new().unwrap();
+        let unit_config = tmp.path().join("home-autocoder-config.yaml");
+        std::fs::write(&unit_config, b"# placeholder\n").unwrap();
+
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", loaded_probe(&unit_config));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("fresh-config-dir"));
+        let r = execute_inner(args, &mut io, &actions, tmp.path().join("systemd")).await;
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+
+        let calls = actions.calls();
+        // Probe was invoked exactly once with the correct unit name.
+        let probe_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ProbeSystemdUnit(n) if n == "autocoder.service"))
+            .collect();
+        assert_eq!(probe_calls.len(), 1, "probe called once: {calls:?}");
+
+        // No mutation-side-effect calls fired.
+        for c in &calls {
+            match c {
+                RecordedCall::CreateUser { .. }
+                | RecordedCall::AptInstall(_)
+                | RecordedCall::DaemonReload
+                | RecordedCall::EnableSystemdUnit(_)
+                | RecordedCall::StartSystemdUnit(_)
+                | RecordedCall::Chown { .. }
+                | RecordedCall::Chmod { .. } => {
+                    panic!("unexpected side-effect call after probe short-circuit: {c:?}");
+                }
+                _ => {}
+            }
+        }
+
+        // The fresh-config-dir was NOT created (no wizard run, no config
+        // write).
+        assert!(
+            !tmp.path().join("fresh-config-dir").join("config.yaml").exists(),
+            "wizard must not have written config.yaml after short-circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_with_missing_config_errors() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.yaml");
+
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", loaded_probe(&missing));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        let err = execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .expect_err("expected broken-install error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/etc/systemd/system/autocoder.service"),
+            "error must name FragmentPath: {msg}"
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error must name missing config path: {msg}"
+        );
+        assert!(
+            msg.contains("restore") && msg.contains("rm "),
+            "error must hint at remediations: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_not_found_falls_through_to_default_path() {
+        let tmp = TempDir::new().unwrap();
+        // No probe response → default-fixture is NotFound.
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        // Probe was invoked.
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ProbeSystemdUnit(n) if n == "autocoder.service")),
+            "probe must run in server mode: {calls:?}"
+        );
+        // ... and the wizard proceeded to write the config.
+        assert!(
+            tmp.path().join("conf").join("config.yaml").exists(),
+            "wizard must have written config.yaml when probe found no unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_not_found_with_default_path_config_hits_idempotency() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join("conf");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(conf.join("config.yaml"), b"# placeholder\n").unwrap();
+        // No probe response → NotFound; default-path config exists → should
+        // hit the existing idempotency short-circuit.
+        let actions = RecordingActions::new();
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(conf.clone());
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        for c in &calls {
+            match c {
+                RecordedCall::CreateUser { .. }
+                | RecordedCall::AptInstall(_)
+                | RecordedCall::DaemonReload
+                | RecordedCall::EnableSystemdUnit(_)
+                | RecordedCall::StartSystemdUnit(_) => {
+                    panic!("unexpected wizard call after default-path idempotency exit: {c:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_dev_mode_skips_probe() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = ni_args(&tmp);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let calls = actions.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ProbeSystemdUnit(_))),
+            "dev-mode install must NOT invoke probe_systemd_unit: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_install_loaded_unit_no_config_flag_falls_through() {
+        let tmp = TempDir::new().unwrap();
+        // Loaded unit but no exec_start_config_path (parser couldn't extract
+        // it). Should fall through to the default-path check and proceed
+        // with the wizard since no config.yaml exists there.
+        let probe = SystemdUnitProbe {
+            load_state: LoadState::Loaded,
+            fragment_path: Some(PathBuf::from("/etc/systemd/system/autocoder.service")),
+            exec_start_config_path: None,
+        };
+        let actions = RecordingActions::new()
+            .with_probe_response("autocoder.service", probe)
+            .with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = server_ni_args(tmp.path().join("conf"));
+        execute_inner(args, &mut io, &actions, tmp.path().join("systemd"))
+            .await
+            .unwrap();
+        // Wizard proceeded — config.yaml exists at the default path.
+        assert!(
+            tmp.path().join("conf").join("config.yaml").exists(),
+            "wizard must have written config.yaml after fall-through with WARN"
+        );
+    }
+
+    // ----- --reconfigure -------------------------------------------------
+
+    /// Build a fixture `config.yaml` with audits/reviewer/chatops set so
+    /// reconfigure tests have realistic state to mutate.
+    fn fixture_install_yaml() -> String {
+        // Assemble via the wizard's `assemble_config` so the YAML stays in
+        // sync with whatever fields the bundled example carries.
+        let ans = WizardAnswers {
+            chatops_backend: ChatOpsBackendArg::Slack,
+            chatops_channel_id: Some("C0123456789".to_string()),
+            chatops_token: Some("xoxb-test".to_string()),
+            reviewer_provider: ReviewerProviderArg::Anthropic,
+            reviewer_model: Some("claude-sonnet-4-6".to_string()),
+            reviewer_api_key: Some("sk-ant-test".to_string()),
+            audits: {
+                let mut m = HashMap::new();
+                m.insert("drift_audit".to_string(), Cadence::Weekly);
+                m
+            },
+            ..baseline_answers()
+        };
+        let cfg = assemble_config(&ans).expect("fixture assemble_config");
+        serialize_config(&cfg).expect("fixture serialize_config")
+    }
+
+    fn write_fixture_config(tmp: &TempDir) -> PathBuf {
+        let p = tmp.path().join("config.yaml");
+        std::fs::write(&p, fixture_install_yaml()).unwrap();
+        p
+    }
+
+    // --- 2.2 resolve_existing_config_path -----------------------------------
+
+    #[tokio::test]
+    async fn resolve_existing_config_path_dev_uses_home_default() {
+        let tmp = TempDir::new().unwrap();
+        let prior_home = std::env::var_os("HOME");
+        let home = tmp.path().to_path_buf();
+        let cfg_dir = home.join(".config/autocoder");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.yaml"), b"# dev fixture\n").unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = InstallArgs::default();
+        let actions = RecordingActions::new();
+        let got = resolve_existing_config_path(&args, &actions, InstallMode::Dev)
+            .await
+            .unwrap();
+        assert_eq!(got, cfg_dir.join("config.yaml"));
+        unsafe {
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        // Dev mode must not invoke the systemd probe.
+        for c in actions.calls() {
+            assert!(
+                !matches!(c, RecordedCall::ProbeSystemdUnit(_)),
+                "dev mode must skip probe; saw {c:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_config_path_server_probe_loaded_with_path() {
+        let tmp = TempDir::new().unwrap();
+        let unit_config = tmp.path().join("custom-config.yaml");
+        std::fs::write(&unit_config, b"# unit config\n").unwrap();
+        let actions = RecordingActions::new().with_probe_response(
+            "autocoder.service",
+            loaded_probe(&unit_config),
+        );
+        let args = InstallArgs::default();
+        let got = resolve_existing_config_path(&args, &actions, InstallMode::Server)
+            .await
+            .unwrap();
+        assert_eq!(got, unit_config);
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_config_path_server_probe_not_found_no_default_bails() {
+        let actions = RecordingActions::new(); // default probe: NotFound
+        let args = InstallArgs::default();
+        // /etc/autocoder/config.yaml almost certainly does not exist in
+        // the sandbox. Assert the bail message rather than the path.
+        let err = resolve_existing_config_path(&args, &actions, InstallMode::Server)
+            .await
+            .expect_err("expected bail when no probe + no default");
+        assert!(
+            format!("{err}").contains("no existing install detected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_config_path_honors_config_dir_override() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.yaml"), b"# override\n").unwrap();
+        let actions = RecordingActions::new();
+        let args = InstallArgs {
+            config_dir: Some(tmp.path().to_path_buf()),
+            ..InstallArgs::default()
+        };
+        let got = resolve_existing_config_path(&args, &actions, InstallMode::Server)
+            .await
+            .unwrap();
+        assert_eq!(got, tmp.path().join("config.yaml"));
+        // Override must short-circuit before the probe runs.
+        for c in actions.calls() {
+            assert!(
+                !matches!(c, RecordedCall::ProbeSystemdUnit(_)),
+                "config_dir override must skip probe; saw {c:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_config_path_override_missing_bails() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new();
+        let args = InstallArgs {
+            config_dir: Some(tmp.path().to_path_buf()),
+            ..InstallArgs::default()
+        };
+        let err = resolve_existing_config_path(&args, &actions, InstallMode::Server)
+            .await
+            .expect_err("expected bail when override path is empty");
+        assert!(
+            format!("{err}").contains("no existing install detected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- 4.4 per-section helpers --------------------------------------------
+
+    #[tokio::test]
+    async fn reconfigure_audits_updates_defaults_and_drops_disabled() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        // LLM_DRIVEN_SLUGS order is: architecture_brightline, drift_audit,
+        // missing_tests_audit, security_bug_audit, architecture_consultative.
+        // The wizard re-prompts each one in turn — answers in that order.
+        let mut io = ScriptedIo::new(vec![
+            "w", // architecture_brightline -> weekly
+            "m", // drift_audit -> monthly (was weekly)
+            "n", // missing_tests_audit -> never (drop)
+            "d", // security_bug_audit -> daily
+            "",  // architecture_consultative -> default (existing = disabled)
+        ]);
+        let new_cfg = reconfigure_audits(&existing, &mut io).await.unwrap();
+        let defaults = new_cfg
+            .audits
+            .as_ref()
+            .expect("audits block present")
+            .defaults
+            .clone();
+        assert_eq!(defaults.get("architecture_brightline"), Some(&Cadence::Weekly));
+        assert_eq!(defaults.get("drift_audit"), Some(&Cadence::Monthly));
+        assert!(!defaults.contains_key("missing_tests_audit"));
+        assert_eq!(defaults.get("security_bug_audit"), Some(&Cadence::Daily));
+        assert!(!defaults.contains_key("architecture_consultative"));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_audits_all_never_drops_block() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        let mut io = ScriptedIo::new(vec!["n", "n", "n", "n", "n"]);
+        let new_cfg = reconfigure_audits(&existing, &mut io).await.unwrap();
+        assert!(new_cfg.audits.is_none(), "no audits enabled → block omitted");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reviewer_switches_provider_and_model() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        let mut io = ScriptedIo::new(vec![
+            "3",                  // provider choice: openai_compatible (index 2 + 1)
+            "grok-3",             // model
+            "OPENAI_API_KEY",     // env var (bare-Enter would accept the existing default)
+        ]);
+        let new_cfg = reconfigure_reviewer(&existing, &mut io).await.unwrap();
+        let r = new_cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.provider, ReviewerProvider::OpenAiCompatible);
+        assert_eq!(r.model, "grok-3");
+        assert_eq!(r.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reviewer_pick_none_clears_block() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        let mut io = ScriptedIo::new(vec!["1"]); // "none"
+        let new_cfg = reconfigure_reviewer(&existing, &mut io).await.unwrap();
+        assert!(new_cfg.reviewer.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconfigure_chatops_updates_channel_id() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        let mut io = ScriptedIo::new(vec![
+            "2",            // slack (idx 1 + 1)
+            "C9999999999",  // new channel id
+        ]);
+        let new_cfg = reconfigure_chatops(&existing, &mut io).await.unwrap();
+        let c = new_cfg.chatops.expect("chatops block present");
+        assert_eq!(c.provider, ChatOpsProvider::Slack);
+        assert_eq!(c.default_channel_id, "C9999999999");
+        // Existing slack sub-block (with bot_token_env) preserved.
+        let slack = c.slack.expect("slack sub-block preserved");
+        assert_eq!(slack.bot_token_env.as_deref(), Some("SLACK_BOT_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_chatops_pick_none_drops_block() {
+        let raw = fixture_install_yaml();
+        let existing: Config = serde_yml::from_str(&raw).unwrap();
+        let mut io = ScriptedIo::new(vec!["1"]); // "none"
+        let new_cfg = reconfigure_chatops(&existing, &mut io).await.unwrap();
+        assert!(new_cfg.chatops.is_none());
+    }
+
+    // --- 5.2 apply_in_place_patch -------------------------------------------
+
+    #[test]
+    fn apply_in_place_patch_updates_audits_subtree_only() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        let raw_before = std::fs::read_to_string(&cfg_path).unwrap();
+        let mut new_cfg: Config = serde_yml::from_str(&raw_before).unwrap();
+        // Pre-condition: existing config carries drift_audit=weekly.
+        {
+            let defaults = new_cfg
+                .audits
+                .as_ref()
+                .map(|a| a.defaults.clone())
+                .unwrap_or_default();
+            assert_eq!(defaults.get("drift_audit"), Some(&Cadence::Weekly));
+        }
+        // Mutate the audits subtree only.
+        let mut audits = new_cfg.audits.clone().unwrap_or_default();
+        audits
+            .defaults
+            .insert("drift_audit".to_string(), Cadence::Monthly);
+        new_cfg.audits = Some(audits);
+
+        apply_in_place_patch(&cfg_path, &new_cfg).unwrap();
+
+        let raw_after = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed: Config = serde_yml::from_str(&raw_after).unwrap();
+        // Audits update landed.
+        let defaults = parsed
+            .audits
+            .as_ref()
+            .map(|a| a.defaults.clone())
+            .unwrap_or_default();
+        assert_eq!(defaults.get("drift_audit"), Some(&Cadence::Monthly));
+        // Other top-level keys still parse to their prior values.
+        let before_parsed: Config = serde_yml::from_str(&raw_before).unwrap();
+        assert_eq!(parsed.github.token_env, before_parsed.github.token_env);
+        assert_eq!(parsed.repositories.len(), before_parsed.repositories.len());
+        assert_eq!(parsed.chatops.is_some(), before_parsed.chatops.is_some());
+        assert_eq!(parsed.reviewer.is_some(), before_parsed.reviewer.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_in_place_patch_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let raw_before = std::fs::read_to_string(&cfg_path).unwrap();
+        let cfg: Config = serde_yml::from_str(&raw_before).unwrap();
+        apply_in_place_patch(&cfg_path, &cfg).unwrap();
+
+        let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "patch must preserve the pre-existing file mode");
+    }
+
+    // --- 6.3 confirm_diff_and_apply -----------------------------------------
+
+    #[tokio::test]
+    async fn confirm_diff_and_apply_accept_writes_and_prints_headers() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let mut new_cfg: Config = serde_yml::from_str(&raw).unwrap();
+        // Mutate reviewer model so the diff is non-empty.
+        if let Some(r) = new_cfg.reviewer.as_mut() {
+            r.model = "grok-3".to_string();
+        }
+
+        let mut io = ScriptedIo::new(vec!["y"]);
+        let applied = confirm_diff_and_apply(&cfg_path, &new_cfg, &mut io)
+            .await
+            .unwrap();
+        assert!(applied);
+        let out = io.output_str();
+        assert!(out.contains("current"), "diff must print `current` header:\n{out}");
+        assert!(out.contains("proposed"), "diff must print `proposed` header:\n{out}");
+        assert!(out.contains("+"), "diff must show added line:\n{out}");
+        assert!(out.contains("-"), "diff must show removed line:\n{out}");
+
+        let parsed_after: Config =
+            serde_yml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed_after.reviewer.as_ref().unwrap().model,
+            "grok-3"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_diff_and_apply_decline_leaves_file_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        let raw_before = std::fs::read_to_string(&cfg_path).unwrap();
+
+        let mut new_cfg: Config = serde_yml::from_str(&raw_before).unwrap();
+        if let Some(r) = new_cfg.reviewer.as_mut() {
+            r.model = "grok-3".to_string();
+        }
+
+        for answer in ["n", "", "q"] {
+            let mut io = ScriptedIo::new(vec![answer]);
+            let applied = confirm_diff_and_apply(&cfg_path, &new_cfg, &mut io)
+                .await
+                .unwrap();
+            assert!(!applied, "answer `{answer}` should not apply");
+            let raw_after = std::fs::read_to_string(&cfg_path).unwrap();
+            assert_eq!(
+                raw_after, raw_before,
+                "decline must leave file unchanged (answer={answer})"
+            );
+        }
+    }
+
+    // --- 3.2 / 3.3 execute_reconfigure integration --------------------------
+
+    fn dev_reconfigure_args(tmp: &TempDir, section: ReconfigureSection) -> InstallArgs {
+        InstallArgs {
+            mode: Some(InstallMode::Dev),
+            config_dir: Some(tmp.path().to_path_buf()),
+            reconfigure: Some(section),
+            ..InstallArgs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_reconfigure_audits_in_place_patch_and_restart_guidance() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        let mut io = ScriptedIo::new(vec![
+            "w", // architecture_brightline
+            "m", // drift_audit
+            "n", // missing_tests_audit
+            "d", // security_bug_audit
+            "",  // architecture_consultative
+        ]);
+        let actions = RecordingActions::new();
+        let args = dev_reconfigure_args(&tmp, ReconfigureSection::Audits);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let parsed: Config =
+            serde_yml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let defaults = parsed
+            .audits
+            .as_ref()
+            .map(|a| a.defaults.clone())
+            .unwrap_or_default();
+        assert_eq!(defaults.get("drift_audit"), Some(&Cadence::Monthly));
+        assert_eq!(defaults.get("security_bug_audit"), Some(&Cadence::Daily));
+    }
+
+    #[tokio::test]
+    async fn execute_reconfigure_reviewer_decline_leaves_file_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        let raw_before = std::fs::read_to_string(&cfg_path).unwrap();
+        // Provider -> openai_compatible, model -> grok-3, env var bare-Enter,
+        // then decline at the diff prompt.
+        let mut io = ScriptedIo::new(vec!["3", "grok-3", "", "n"]);
+        let actions = RecordingActions::new();
+        let args = dev_reconfigure_args(&tmp, ReconfigureSection::Reviewer);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let raw_after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(raw_before, raw_after, "decline must leave file unchanged");
+        let out = io.output_str();
+        assert!(out.contains("no changes made"), "expected `no changes made`:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn execute_reconfigure_chatops_accept_applies_patch() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = write_fixture_config(&tmp);
+        // slack -> slack, channel C9999999999, accept the diff.
+        let mut io = ScriptedIo::new(vec!["2", "C9999999999", "y"]);
+        let actions = RecordingActions::new();
+        let args = dev_reconfigure_args(&tmp, ReconfigureSection::Chatops);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let parsed: Config =
+            serde_yml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.chatops.as_ref().unwrap().default_channel_id,
+            "C9999999999"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reconfigure_no_existing_install_bails() {
+        let tmp = TempDir::new().unwrap();
+        // No config.yaml under the override dir.
+        let mut io = ScriptedIo::new(vec![]);
+        let actions = RecordingActions::new();
+        let args = dev_reconfigure_args(&tmp, ReconfigureSection::Audits);
+        let err = execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .expect_err("expected bail with no install detected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no existing install detected"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("install.sh"),
+            "error should hint at install.sh: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reconfigure_honors_probe_resolved_path_over_default() {
+        // Server mode without a --config-dir override: the probe returns a
+        // custom path that exists; the reconfigure flow must read AND write
+        // there (not the /etc default).
+        let tmp = TempDir::new().unwrap();
+        let probe_cfg = tmp.path().join("probe-config.yaml");
+        std::fs::write(&probe_cfg, fixture_install_yaml()).unwrap();
+        let actions = RecordingActions::new().with_probe_response(
+            "autocoder.service",
+            loaded_probe(&probe_cfg),
+        );
+        let mut io = ScriptedIo::new(vec![
+            "w", // architecture_brightline
+            "m", // drift_audit
+            "n", // missing_tests_audit
+            "d", // security_bug_audit
+            "",  // architecture_consultative
+        ]);
+        let args = InstallArgs {
+            mode: Some(InstallMode::Server),
+            reconfigure: Some(ReconfigureSection::Audits),
+            ..InstallArgs::default()
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let parsed: Config =
+            serde_yml::from_str(&std::fs::read_to_string(&probe_cfg).unwrap()).unwrap();
+        let defaults = parsed
+            .audits
+            .as_ref()
+            .map(|a| a.defaults.clone())
+            .unwrap_or_default();
+        assert_eq!(defaults.get("drift_audit"), Some(&Cadence::Monthly));
+    }
+
+    // --- 7.3 clap mutual-exclusion and unknown-value rejection --------------
+
+    #[test]
+    fn reconfigure_rejects_repositories_value() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(flatten)]
+            inst: InstallArgs,
+        }
+        let err = Wrapper::try_parse_from(["test", "--reconfigure", "repositories"])
+            .expect_err("clap must reject `repositories` value");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("audits") && msg.contains("reviewer") && msg.contains("chatops"),
+            "clap usage error should list valid values: {msg}"
+        );
+    }
+
+    #[test]
+    fn reconfigure_conflicts_with_non_interactive() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(flatten)]
+            inst: InstallArgs,
+        }
+        let err = Wrapper::try_parse_from([
+            "test",
+            "--reconfigure",
+            "audits",
+            "--non-interactive",
+        ])
+        .expect_err("clap must reject the combination");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-interactive") || msg.contains("non_interactive"),
+            "clap error should name --non-interactive: {msg}"
+        );
+    }
+
+    #[test]
+    fn reconfigure_conflicts_with_prefill_flag() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(flatten)]
+            inst: InstallArgs,
+        }
+        let err = Wrapper::try_parse_from([
+            "test",
+            "--reconfigure",
+            "reviewer",
+            "--repo-url",
+            "git@github.com:acme/x.git",
+        ])
+        .expect_err("clap must reject reconfigure + prefill");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("repo-url") || msg.contains("repo_url"),
+            "clap error should name --repo-url: {msg}"
+        );
     }
 }

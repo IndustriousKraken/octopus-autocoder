@@ -193,3 +193,60 @@ The asset naming convention is contractual — a downstream install script relie
   architecture-detection logic is updated to match, so all three
   artifacts (workflow, this spec, install script) stay aligned
 
+### Requirement: DEPLOYMENT.md documents switching from source-build to binary upgrades
+`docs/DEPLOYMENT.md` SHALL include a section titled `Switching from source-build to binary updates` that targets operators whose existing deployment was built from source — typically a hand-written systemd unit pointing at a config under the operator's home directory — and who want to switch to the released-binary upgrade path. The section SHALL document two paths: the `install.sh --config-dir <existing-config-dir>` invocation that leverages the systemd-probe detection AND a manual `curl + sha256sum + install -m 755` sequence for operators who prefer to skip the bash wrapper entirely.
+
+#### Scenario: Section exists and names both upgrade paths
+- **WHEN** an operator reads `docs/DEPLOYMENT.md`
+- **THEN** a section titled `Switching from source-build to binary updates` appears between `Recommended: install from a binary release` and `## 1. Install the binary`
+- **AND** the section names the `install.sh --config-dir <path>` invocation
+- **AND** the section names the manual-download alternative using the contractual asset name pattern `autocoder-<tag>-<triple>`
+- **AND** the section names the post-update step `sudo systemctl restart autocoder`
+
+#### Scenario: Section explains why a bare install.sh re-run is unsafe pre-systemd-probe
+- **WHEN** the operator reads the section
+- **THEN** the text explains that an unqualified `install.sh` re-run on a source-built deployment would have overwritten the systemd unit AND lost any custom `Environment="PATH=..."` entries the operator added (a common case is the openspec CLI living under `~/.nvm/versions/node/<v>/bin/`)
+- **AND** the text explains that the install wizard's systemd probe now prevents that outcome — but only when the operator passes `--config-dir <existing-config-dir>` OR the existing unit can be detected via `systemctl show autocoder.service`
+
+#### Scenario: Cross-link forward to unattended-update story is correct when it lands
+- **WHEN** the section completes its source-to-binary content
+- **THEN** the closing paragraph cross-links to `Unattended updates via cron` (the anchor lands when `update.sh` ships under a later stacked change)
+- **AND** until that change merges, the cross-link is a dead anchor within the same file — acceptable for a stacked-dependency change and resolves automatically when the dependent change merges
+
+### Requirement: Documentation surfaces the `--reconfigure` verb across CLI, DEPLOYMENT, and CONFIG
+The repository SHALL document the `autocoder install --reconfigure <section>` verb in three places, each scoped to its audience: `docs/CLI.md` (the CLI reference, for operators looking up the flag), `docs/DEPLOYMENT.md` (in the source-to-binary switching section, as one of the post-install workflows), AND `docs/CONFIG.md` (near the `audits.defaults.*` schema table, as a cross-link for operators looking up that block).
+
+#### Scenario: CLI.md documents the verb with its three accepted values
+- **WHEN** an operator reads `docs/CLI.md`
+- **THEN** the page contains an `install` entry naming the `--reconfigure <section>` flag
+- **AND** the documented accepted values are `audits`, `reviewer`, and `chatops` (exact strings, no additional values)
+- **AND** the entry names the mutual-exclusion with `--non-interactive` and the per-section behavior (audits patches in place; reviewer / chatops diff-confirm)
+- **AND** the entry names the post-patch `sudo -u autocoder autocoder reload` step
+
+#### Scenario: DEPLOYMENT.md mentions `--reconfigure` as the section-edit alternative
+- **WHEN** an operator reads `docs/DEPLOYMENT.md`'s `Switching from source-build to binary updates` section (added by `a01`)
+- **THEN** the section contains a paragraph describing `--reconfigure` as the "edit one section without re-doing the whole wizard" tool
+- **AND** the paragraph uses the audits example as the most common use case
+- **AND** the paragraph explains that `repositories` changes are handled via `autocoder reload` instead, so `--reconfigure repos` is intentionally absent
+
+#### Scenario: CONFIG.md cross-links from the audits schema
+- **WHEN** an operator reads `docs/CONFIG.md`'s `audits:` block
+- **THEN** the section contains a one-line note: `Operators can re-prompt these cadences via \`autocoder install --reconfigure audits\` as an alternative to editing YAML directly.`
+- **AND** the note links to `docs/CLI.md` for the full flag reference
+
+### Requirement: CLI.md documents the `check-config` subcommand
+`docs/CLI.md` SHALL include a `## \`check-config\`` section documenting the new subcommand's invocation, exit-code matrix, output formats, and intended use cases.
+
+#### Scenario: CLI.md section exists with full coverage
+- **WHEN** an operator reads `docs/CLI.md`
+- **THEN** a section titled `## \`check-config\`` appears between the existing subcommand entries
+- **AND** the section documents the required `--config <path>` argument
+- **AND** the section documents the optional `--json` flag with the structured per-line JSON output
+- **AND** the section enumerates the exit codes: `0` (valid), `1` (warnings only), `2` (hard errors)
+- **AND** the section names the two intended audiences: operators editing YAML by hand AND scripted preflight (specifically `update.sh`, landing in a later stacked change)
+
+#### Scenario: Section provides a copy-paste example for each exit code
+- **WHEN** the operator reads the section
+- **THEN** the page contains at least one example invocation each for an exit-0, exit-1, and exit-2 scenario
+- **AND** each example shows both the stdout and stderr the operator would observe
+

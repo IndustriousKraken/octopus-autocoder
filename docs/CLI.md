@@ -14,6 +14,113 @@ autocoder run --config <path-to-config.yaml>
 
 The daemon polls every configured repository on its interval, processes ready OpenSpec changes, and opens monolithic PRs. Terminates only on SIGINT, SIGTERM, or a fatal initialization error. Logs go to stderr; control verbosity with `RUST_LOG=info` (default), `RUST_LOG=debug`, etc.
 
+## `install`
+
+First-run wizard / re-install entry point. The `install.sh` bootstrap swaps the binary then execs `autocoder install`; on an existing install with the systemd unit loaded, the subcommand short-circuits with the three-verb status block (update, reconfigure, wipe).
+
+```bash
+autocoder install [--reconfigure <section>] [--upgrade] [--non-interactive ...]
+```
+
+**`--reconfigure <section>`** re-prompts ONE section of an existing install and patches the existing `config.yaml`. Accepted values:
+
+- `audits` — re-prompts every audit cadence with the operator's current cadence as the default, then writes the new `audits.defaults.*` in place via atomic temp-file-then-rename.
+- `reviewer` — re-prompts provider, model, and api-key env-var, then shows a unified diff against the current file AND prompts `Apply this patch? [y/N]`. The patch lands only on `y/Y`.
+- `chatops` — re-prompts the backend and default channel id, then diff-confirms the same way as `reviewer`.
+
+The flag is mutually exclusive with `--non-interactive` AND with every prefill flag (`--repo-url`, `--token-env-var`, etc.) — reconfigure is interactive and section-scoped by definition. clap rejects the combination at argument-parse time.
+
+Values not in the accepted list are rejected (e.g. `--reconfigure repositories` exits non-zero with the standard `possible values: audits, reviewer, chatops` clap error). The wizard intentionally excludes several knobs: `repositories` (use `autocoder reload` which hot-applies add/remove without a restart), `paths.*` (destructive, restart-required), `executor.*` (restart-required), and `audits.settings.*.prompt_path` / `audits.settings.*.extra.*` (advanced overrides — edit YAML directly).
+
+After a successful patch, the subcommand prints `Patched <section> in <path>. To apply: sudo -u autocoder autocoder reload`. The wizard does NOT auto-reload — the operator decides when to apply.
+
+If neither the systemd probe nor `<default-config-dir>/config.yaml` resolves to an existing file, `--reconfigure` exits non-zero with `no existing install detected; run install.sh for first-time setup`.
+
+## `check-config`
+
+Validate a config file against this binary's schema, without starting the daemon. Runs the same pipeline `autocoder run` executes at startup (YAML parse, schema validation, token-route resolution, workspace-collision check, audit-slug validation, path-collision check, secret-source check) and reports the outcome to stdout / stderr.
+
+```bash
+autocoder check-config --config <path-to-config.yaml> [--json]
+```
+
+`--config <path>` is **required**. The subcommand has no global config-default resolution — every invocation names the file explicitly.
+
+**Intended audiences:**
+
+- **Operators editing YAML by hand.** Ask "does this file parse and validate?" without standing up the full daemon against your live repositories.
+- **Scripted preflight.** The cron-updater (landing in a follow-up change as `update.sh`) calls `autocoder check-config --json --config /etc/autocoder/config.yaml` against the new binary before swapping it in. A non-zero exit aborts the swap and avoids the `Restart=on-failure` loop that a schema regression would otherwise cause.
+
+**Exit codes:**
+
+| Code | Meaning                                                       |
+|------|----------------------------------------------------------------|
+| `0`  | Config parses and every check passes with zero findings.       |
+| `1`  | Config is valid but at least one WARN-level finding (typically an unset env var referenced by a `*_env` field). |
+| `2`  | At least one hard error (parse failure, schema violation, unresolvable token route, workspace collision, audit-slug typo, path collision). |
+
+**Default (human-readable) output.** One line per check on stdout, prefixed `OK:` / `WARN:` / `ERROR:`. Each finding's `config_pointer` (a JSON-Pointer-style locator into the YAML, e.g. `repositories/0/poll_interval_sec`) is appended in parentheses when present. On exit 1 or exit 2, stderr carries a one-line summary: `check-config: <N> error(s), <M> warning(s) in <path>`.
+
+**`--json` output.** One JSON object per line on stdout. Each finding has the shape `{"level":"error"|"warn"|"ok", "category":"<slug>", "message":"<text>", "config_pointer":"..."|null}`. The final line is `{"level":"summary","errors":N,"warnings":M,"config":"<path>"}`. Every line is independently parseable, suitable for `jq` pipelines.
+
+**Example — exit 0 (valid config).**
+
+```bash
+$ autocoder check-config --config /etc/autocoder/config.yaml
+OK: schema — all required fields present and value ranges respected
+OK: token-route — every repository has a resolvable GitHub token route
+OK: workspace-collision — every repository resolves to a distinct workspace path
+OK: audit-slug — every audit slug names a registered audit type
+OK: path-collision — every paths.* role resolves to a distinct directory
+OK: secret-source — every referenced env-var-sourced secret is set
+$ echo $?
+0
+```
+
+Stderr is empty.
+
+**Example — exit 1 (warnings only, unset env var).**
+
+```bash
+$ autocoder check-config --config /etc/autocoder/config.yaml
+OK: schema — all required fields present and value ranges respected
+OK: token-route — every repository has a resolvable GitHub token route
+OK: workspace-collision — every repository resolves to a distinct workspace path
+OK: audit-slug — every audit slug names a registered audit type
+OK: path-collision — every paths.* role resolves to a distinct directory
+WARN: secret-source: github.token_env references `GITHUB_TOKEN` which is not set in the calling environment (github/token_env)
+$ echo $?
+1
+```
+
+Stderr:
+
+```
+check-config: 0 error(s), 1 warning(s) in /etc/autocoder/config.yaml
+```
+
+The WARN does not block: a config with only warnings still exits 1 (never 2). Unset env vars are common when the secrets are injected by systemd via `EnvironmentFile=` at unit start; running `check-config` from a shell without those vars set is the expected case.
+
+**Example — exit 2 (schema violation).**
+
+```bash
+$ autocoder check-config --config /etc/autocoder/config.yaml
+ERROR: schema: repositories[0].poll_interval_sec must be > 0 (got 0) (repositories/0/poll_interval_sec)
+OK: token-route — every repository has a resolvable GitHub token route
+OK: workspace-collision — every repository resolves to a distinct workspace path
+OK: audit-slug — every audit slug names a registered audit type
+OK: path-collision — every paths.* role resolves to a distinct directory
+OK: secret-source — every referenced env-var-sourced secret is set
+$ echo $?
+2
+```
+
+Stderr:
+
+```
+check-config: 1 error(s), 0 warning(s) in /etc/autocoder/config.yaml
+```
+
 ## `reload`
 
 Ask a running daemon to re-read its YAML config and hot-apply the `github`, `reviewer`, and `chatops` sections.

@@ -3958,3 +3958,172 @@ The daemon SHALL prune `ProposalRequestState` files whose `submitted_at` is olde
 - **WHEN** the prune runs AND a `ProposalRequestState` has `submitted_at` within the last 7 days
 - **THEN** the state file is NOT removed regardless of status
 
+### Requirement: Install wizard probes systemd for an existing installation before falling through to default-path checks
+`autocoder install` SHALL probe `systemctl show autocoder.service` before its default-path idempotency check to detect existing installations whose config is at a non-default location. The probe SHALL extract three properties: `LoadState`, `FragmentPath`, and the `--config <path>` argument from `ExecStart`. The result SHALL drive a three-way branch:
+
+- `LoadState=loaded` AND `--config <path>` extracted AND `<path>` exists → existing-install detected. The subcommand SHALL print a status block naming the existing config path and the three remediation verbs (`./update.sh` for binary update, `autocoder install --reconfigure <section>` for section-level re-prompt, `sudo rm -rf <config-dir> && ./install.sh` for full reset) AND exit 0 without invoking the wizard, creating users, installing packages, or rewriting any file.
+- `LoadState=loaded` AND `--config <path>` extracted AND `<path>` does NOT exist → broken install. The subcommand SHALL exit non-zero with a diagnostic naming the unit's `FragmentPath`, the missing config path, and the suggested remediations.
+- `LoadState=not-found` OR the probe itself fails (no systemd, command errors) OR `--config <path>` cannot be extracted from `ExecStart` → fall through to the existing `<config-dir>/config.yaml` idempotency check. Pre-spec behavior preserved.
+
+Dev mode (`autocoder install --mode dev`, or auto-detected dev mode on macOS / non-systemd Linux) SHALL skip the probe entirely — dev mode has no systemd unit, and running `systemctl show` would either error or report `not-found`.
+
+#### Scenario: Existing install at a non-default config location is detected and respected
+- **WHEN** an operator runs `autocoder install` on a server-mode host AND `systemctl show autocoder.service` reports `LoadState=loaded` AND `ExecStart` contains `--config /home/autocoder/autocoder/config.yaml` AND that file exists
+- **THEN** the subcommand prints a status block naming `/home/autocoder/autocoder/config.yaml` AND the three remediation verbs
+- **AND** the subcommand exits 0
+- **AND** the operator's existing config, secrets, and systemd unit are NOT modified
+- **AND** `useradd`, `apt-get install`, `daemon-reload`, `enable_systemd_unit`, and `start_systemd_unit` are NOT called (verifiable via the `RecordedCall` log in `cargo test`)
+
+#### Scenario: Broken install (unit loaded, config missing) is refused with a diagnostic
+- **WHEN** the operator runs `autocoder install` AND `systemctl show autocoder.service` reports `LoadState=loaded` AND `ExecStart` contains `--config <path>` AND `<path>` does NOT exist on disk
+- **THEN** the subcommand exits non-zero
+- **AND** the error message names the unit's `FragmentPath`
+- **AND** the error message names the missing config path
+- **AND** the error message lists at least two remediation hints (restore the config from backup OR remove the unit file and re-run `install.sh`)
+- **AND** no file is created or modified by the install subcommand
+
+#### Scenario: No existing unit falls through to default-path check
+- **WHEN** the operator runs `autocoder install` AND `systemctl show autocoder.service` reports `LoadState=not-found`
+- **THEN** the subcommand proceeds to the existing default-path check at `<config-dir>/config.yaml`
+- **AND** if that file exists, behavior matches the pre-spec "Existing config detected" scenario
+- **AND** if that file does not exist, the wizard runs as it did pre-spec
+
+#### Scenario: `systemctl` itself fails (host has no systemd binary)
+- **WHEN** the operator runs `autocoder install` AND the `systemctl` command exits non-zero OR the binary is not on PATH
+- **THEN** `probe_systemd_unit` returns `LoadState::NotFound` (treating the failure as "no unit found")
+- **AND** the subcommand falls through to the default-path check
+- **AND** the operator is not blocked from completing a fresh install on a non-systemd host
+
+#### Scenario: Loaded unit with no `--config` flag falls through with a WARN
+- **WHEN** the unit's `ExecStart` does NOT include `--config <path>` (operator launches autocoder against a config implied via env var, for example)
+- **THEN** the subcommand logs a WARN naming the unit's `FragmentPath` and noting the missing `--config` flag
+- **AND** the subcommand falls through to the default-path check (the parser cannot determine which config to respect; refusing to proceed on this ambiguity is worse than the default-path fallback)
+
+#### Scenario: Dev mode skips the systemd probe
+- **WHEN** the operator runs `autocoder install --mode dev` on any platform OR `autocoder install` on macOS / non-systemd Linux
+- **THEN** `probe_systemd_unit` is NOT invoked (verifiable via the `RecordedCall` log)
+- **AND** the existing dev-mode flow (write to `~/.config/autocoder/`, no systemd work) proceeds unchanged
+
+#### Scenario: Probe surface is testable via the `SystemActions` trait
+- **WHEN** the install-subcommand tests run under `cargo test`
+- **THEN** every test uses a `RecordingActions` impl whose `probe_systemd_unit` returns a configured `SystemdUnitProbe` fixture
+- **AND** tests cover at minimum: a loaded unit with a valid `--config` path; a loaded unit with a missing `--config` path; a not-found unit; a loaded unit with no `--config` flag; a probe-fails-entirely case
+- **AND** no test invokes the production `RealSystemActions::probe_systemd_unit`
+
+### Requirement: Install wizard `--reconfigure` flag re-runs one section against an existing install
+`autocoder install` SHALL accept a `--reconfigure <section>` flag whose value is one of `audits`, `reviewer`, or `chatops`. The flag SHALL operate only against a detected existing install (located via the `a01` systemd probe OR the default-config-path fallback). The flag SHALL be mutually exclusive with `--non-interactive` AND with every prefill flag (`--repo-url`, `--token-env-var`, `--chatops-backend`, etc.); reconfigure is interactive and section-scoped by definition.
+
+Per-section behavior:
+
+- **`--reconfigure audits`** SHALL re-prompt every audit cadence with the operator's current cadence as the default, then patch ONLY the `audits.defaults.*` subtree of the existing `config.yaml` in place via atomic temp-file-then-rename. The patch overwrites the file; YAML comments outside the audits subtree are not preserved because `serde_yaml` does not round-trip comments.
+- **`--reconfigure reviewer`** AND **`--reconfigure chatops`** SHALL re-prompt the relevant section, then show the operator a unified diff between the current `config.yaml` and the proposed new YAML AND prompt `Apply this patch? [y/N]`. The patch is applied only on `y/Y`; any other answer (including the default) leaves the file unchanged.
+
+After a successful patch, the subcommand SHALL print restart guidance naming `sudo -u autocoder autocoder reload` as the apply step. The wizard SHALL NOT auto-reload — the operator decides when to apply.
+
+The following knobs SHALL NOT be accessible via `--reconfigure`:
+
+- `repositories` (use `autocoder reload`, which hot-applies add/remove without a daemon restart)
+- `paths.*` (relocating data directories is destructive and restart-required)
+- `executor.*` (the only block that requires a daemon restart)
+- `audits.settings.*.prompt_path` and `audits.settings.*.extra.*` (advanced overrides; edit YAML directly)
+
+#### Scenario: `--reconfigure audits` re-prompts cadences and patches in place
+- **WHEN** the operator runs `autocoder install --reconfigure audits` against an existing server-mode install whose `audits.defaults.drift_audit` is `weekly`
+- **THEN** the wizard prompts for each audit's cadence with the existing value as the displayed default
+- **AND** if the operator answers `monthly` for `drift_audit`, the patched config has `audits.defaults.drift_audit: monthly`
+- **AND** other top-level keys in `config.yaml` (`github`, `repositories`, `executor`, etc.) parse to the same values they had pre-patch
+- **AND** the file is written via atomic temp-file-then-rename, preserving the existing mode and owner
+- **AND** the wizard prints `Patched audits.defaults.* in <path>. To apply: sudo -u autocoder autocoder reload`
+
+#### Scenario: `--reconfigure reviewer` shows a diff and applies only on confirmation
+- **WHEN** the operator runs `autocoder install --reconfigure reviewer` against an existing install whose `reviewer.provider` is `anthropic` AND `reviewer.model` is `claude-sonnet-4-6`
+- **AND** the operator answers `openai_compatible` for provider AND `grok-3` for model
+- **THEN** the wizard generates the proposed full YAML
+- **AND** prints a unified diff between the current file and the proposed file
+- **AND** prompts `Apply this patch? [y/N]`
+- **AND** if the operator answers `y`, the file is overwritten via atomic temp-file-then-rename
+- **AND** if the operator answers `n` (or presses Enter to accept the default), the file is unchanged AND the wizard prints `no changes made`
+
+#### Scenario: `--reconfigure` against a host with no existing install exits non-zero
+- **WHEN** the operator runs `autocoder install --reconfigure audits` AND neither the systemd probe NOR `<default-config-dir>/config.yaml` resolves to an existing file
+- **THEN** the subcommand exits non-zero
+- **AND** the error message reads `no existing install detected; run install.sh for first-time setup`
+- **AND** no file is created
+
+#### Scenario: `--reconfigure` is mutually exclusive with `--non-interactive`
+- **WHEN** the operator runs `autocoder install --reconfigure audits --non-interactive`
+- **THEN** clap rejects the invocation at argument-parse time
+- **AND** the error message names both flags AND the conflict
+- **AND** no file is created or modified
+
+#### Scenario: `--reconfigure repositories` is rejected (excluded from the surface)
+- **WHEN** the operator runs `autocoder install --reconfigure repositories`
+- **THEN** clap rejects the value with the standard `possible values: audits, reviewer, chatops` message
+- **AND** the wizard does NOT prompt and does NOT modify any file
+- **AND** the operator workflow for repository changes (`autocoder reload`) is documented in the help text or docs
+
+#### Scenario: Probe-resolved config path is honored over default
+- **WHEN** the systemd probe (from `a01`) reports an existing unit with `--config /home/autocoder/autocoder/config.yaml`
+- **AND** the operator runs `autocoder install --reconfigure audits`
+- **THEN** the wizard reads from AND writes to `/home/autocoder/autocoder/config.yaml`, NOT the default `/etc/autocoder/config.yaml`
+- **AND** the operator's existing config location is respected throughout the reconfigure flow
+
+#### Scenario: Reconfigure handlers are testable via ScriptedIo
+- **WHEN** the reconfigure tests run under `cargo test`
+- **THEN** each test uses a `ScriptedIo` impl with a pre-loaded answer queue
+- **AND** the `apply_in_place_patch` and `confirm_diff_and_apply` helpers are exercised against temp files
+- **AND** the recorded calls assert what was prompted AND what was written
+- **AND** no test invokes systemctl, useradd, or any other OS-mutating action
+
+### Requirement: `check-config` subcommand validates a config file without side effects
+autocoder SHALL ship a `check-config` subcommand alongside `run`, `reload`, `rewind`, `audit run`, and `install`. The subcommand SHALL accept `--config <path>` (required) AND `--json` (optional flag). It SHALL run the same validation pipeline `autocoder run` executes at startup (YAML parse, schema validation, token-route resolution, workspace-collision check, audit-slug validation, path-collision check, secret-source check) AND exit with one of three codes: `0` on a fully-valid config, `1` on a config that passes hard-error checks but has at least one WARN-level finding, `2` on at least one hard error. The subcommand SHALL NOT spawn any daemon work, SHALL NOT mutate any file, AND SHALL NOT contact any external service.
+
+A shared free function `validate_config(config: &Config) -> ValidationReport` SHALL host every check. The `check-config` subcommand AND the `autocoder run` startup path SHALL both call this function so the surface stays in sync — there is no "check-config validates extra things" OR "autocoder run skips a check" drift.
+
+#### Scenario: Valid config exits 0 with OK lines
+- **WHEN** an operator runs `autocoder check-config --config <valid-config-path>`
+- **THEN** the subcommand exits 0
+- **AND** stdout contains one `OK:` line per validated category (schema, token-route, workspace-collision, audit-slug, path-collision, secret-source)
+- **AND** stderr is empty
+
+#### Scenario: Schema violation exits 2 with an ERROR line and stderr summary
+- **WHEN** the config has `repositories[0].poll_interval_sec: 0` (a schema violation)
+- **AND** the operator runs `autocoder check-config --config <path>`
+- **THEN** the subcommand exits 2
+- **AND** stdout contains a line starting with `ERROR: schema:` naming the offending field AND its `config_pointer` (e.g. `repositories/0/poll_interval_sec`)
+- **AND** stderr contains a summary line: `check-config: 1 error(s), 0 warning(s) in <path>`
+
+#### Scenario: Missing env var produces a WARN and exits 1
+- **WHEN** the config references `github.token_env: GITHUB_TOKEN` AND the `GITHUB_TOKEN` env var is unset in the calling environment AND no inline `github.token` is set
+- **AND** the operator runs `autocoder check-config --config <path>`
+- **THEN** the subcommand exits 1
+- **AND** stdout contains a line starting with `WARN: secret-source:` naming the env var
+- **AND** stderr contains `check-config: 0 error(s), 1 warning(s) in <path>`
+- **AND** the WARN does not block: a config that has only WARNs but no ERRORs still exits 1 (not 2)
+
+#### Scenario: Parse failure exits 2 with the serde_yaml diagnostic
+- **WHEN** the config file contains malformed YAML
+- **AND** the operator runs `autocoder check-config --config <path>`
+- **THEN** the subcommand exits 2
+- **AND** stdout contains a line starting with `ERROR: parse:` AND the serde_yaml error message (including line/column where available)
+- **AND** no other validation categories are reported (validation cannot continue past a parse failure)
+
+#### Scenario: Token-route gap exits 2 with a structured diagnostic
+- **WHEN** the config has `repositories[1].url` with owner `my-org-b` AND `github.owner_tokens` has no `my-org-b` entry AND `github.token_env` references an unset env var AND no inline `github.token` is set
+- **AND** the operator runs `autocoder check-config --config <path>`
+- **THEN** the subcommand exits 2
+- **AND** stdout contains a line starting with `ERROR: token-route:` naming the unresolved owner AND the repo's `config_pointer`
+
+#### Scenario: --json flag emits one JSON object per finding plus a summary
+- **WHEN** the operator runs `autocoder check-config --config <path> --json`
+- **THEN** stdout contains one JSON object per line, each shaped `{"level": "error"|"warn"|"ok", "category": "<slug>", "message": "<text>", "config_pointer": "..."}`
+- **AND** the final line is `{"level": "summary", "errors": N, "warnings": M, "config": "<path>"}`
+- **AND** every line is independently parseable as JSON
+- **AND** exit code matches the non-JSON behavior (0 / 1 / 2)
+
+#### Scenario: `autocoder run` startup uses the same validation pipeline
+- **WHEN** `autocoder run` starts up against a config with a hard error
+- **THEN** the startup path invokes `validate_config(&config)` AND reads `report.errors`
+- **AND** if any errors are present, the daemon exits non-zero with the same error message `check-config` would produce
+- **AND** the existing startup-error tests continue to pass without modification
+

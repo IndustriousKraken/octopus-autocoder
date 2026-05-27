@@ -1093,6 +1093,552 @@ impl Config {
     }
 }
 
+// --------------------------------------------------------------------------
+// Validation surface shared by `autocoder run` startup AND `autocoder
+// check-config`. Side-effect-free: every check inspects the parsed
+// `Config` (and the process environment for env-var existence) and pushes
+// findings into the returned report. Callers decide how to react.
+// --------------------------------------------------------------------------
+
+/// Slug enum for every category the validator examines. The slug strings
+/// here are the operator-visible labels (`OK: schema — ...`,
+/// `ERROR: token-route: ...`) and the `category` field of `--json` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingCategory {
+    Parse,
+    Schema,
+    TokenRoute,
+    WorkspaceCollision,
+    AuditSlug,
+    PathCollision,
+    SecretSource,
+}
+
+impl FindingCategory {
+    /// Operator-visible slug used in stdout lines (`ERROR: <slug>: ...`)
+    /// and the `category` JSON field. Stable string IDs — these are part
+    /// of the CLI's documented contract.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::Schema => "schema",
+            Self::TokenRoute => "token-route",
+            Self::WorkspaceCollision => "workspace-collision",
+            Self::AuditSlug => "audit-slug",
+            Self::PathCollision => "path-collision",
+            Self::SecretSource => "secret-source",
+        }
+    }
+
+    /// One-line summary printed for a passing category (`OK: <slug> — <summary>`).
+    pub fn ok_summary(self) -> &'static str {
+        match self {
+            Self::Parse => "config parsed successfully",
+            Self::Schema => "all required fields present and value ranges respected",
+            Self::TokenRoute => "every repository has a resolvable GitHub token route",
+            Self::WorkspaceCollision => "every repository resolves to a distinct workspace path",
+            Self::AuditSlug => "every audit slug names a registered audit type",
+            Self::PathCollision => "every paths.* role resolves to a distinct directory",
+            Self::SecretSource => "every referenced env-var-sourced secret is set",
+        }
+    }
+}
+
+/// A single finding emitted by `validate_config`. `config_pointer` is a
+/// JSON-Pointer-style locator into the YAML (e.g. `repositories/0/url`)
+/// when the finding maps to a specific field; `None` for whole-config
+/// findings (e.g. parse failures).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub category: FindingCategory,
+    pub message: String,
+    pub config_pointer: Option<String>,
+}
+
+/// Result of running every validation check. Errors are hard failures
+/// (would block daemon startup or produce a non-zero `check-config`
+/// exit); warnings are advisory (e.g. an env-var-sourced secret is
+/// unset, which may resolve at systemd-unit-start time but is worth
+/// surfacing now).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ValidationReport {
+    pub errors: Vec<Finding>,
+    pub warnings: Vec<Finding>,
+}
+
+impl ValidationReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True iff the report has zero errors AND zero warnings.
+    /// Part of the documented `ValidationReport` API even if the daemon
+    /// uses [`Self::has_errors`] for its own gating.
+    #[allow(dead_code)]
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
+
+    /// True iff at least one error is present.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    fn push_error(
+        &mut self,
+        category: FindingCategory,
+        message: impl Into<String>,
+        config_pointer: Option<String>,
+    ) {
+        self.errors.push(Finding {
+            category,
+            message: message.into(),
+            config_pointer,
+        });
+    }
+
+    fn push_warn(
+        &mut self,
+        category: FindingCategory,
+        message: impl Into<String>,
+        config_pointer: Option<String>,
+    ) {
+        self.warnings.push(Finding {
+            category,
+            message: message.into(),
+            config_pointer,
+        });
+    }
+}
+
+/// Audit type slugs known to the daemon's audit registry. Used by the
+/// validator's audit-slug check; kept in sync with `cli/run.rs` where
+/// the actual `AuditRegistry` is built. A drift between the two would
+/// either silently accept a typo (validator too lenient) or reject a
+/// valid slug (validator too strict).
+pub const KNOWN_AUDIT_TYPES: &[&str] = &[
+    "architecture_brightline",
+    "drift_audit",
+    "missing_tests_audit",
+    "security_bug_audit",
+    "architecture_consultative",
+];
+
+/// Run every config validation check and return a structured report.
+/// Side-effect-free apart from reading process env vars for the
+/// `SecretSource` check. The caller decides how to surface the report
+/// (block startup, render to stdout, emit JSON, log).
+pub fn validate_config(config: &Config) -> ValidationReport {
+    let mut report = ValidationReport::new();
+    check_schema(config, &mut report);
+    check_token_routes(config, &mut report);
+    check_workspace_collisions(config, &mut report);
+    check_audit_slugs(config, &mut report);
+    check_path_collisions(config, &mut report);
+    check_secret_sources(config, &mut report);
+    report
+}
+
+/// Schema check: required fields are non-empty and value-range invariants
+/// hold (positive `poll_interval_sec`, etc.). One error per violation.
+fn check_schema(config: &Config, report: &mut ValidationReport) {
+    if config.repositories.is_empty() {
+        report.push_error(
+            FindingCategory::Schema,
+            "repositories list is empty; at least one repository must be configured",
+            Some("repositories".into()),
+        );
+    }
+    for (idx, repo) in config.repositories.iter().enumerate() {
+        if repo.url.trim().is_empty() {
+            report.push_error(
+                FindingCategory::Schema,
+                format!("repositories[{idx}].url must not be empty"),
+                Some(format!("repositories/{idx}/url")),
+            );
+        }
+        if repo.base_branch.trim().is_empty() {
+            report.push_error(
+                FindingCategory::Schema,
+                format!("repositories[{idx}].base_branch must not be empty"),
+                Some(format!("repositories/{idx}/base_branch")),
+            );
+        }
+        if repo.agent_branch.trim().is_empty() {
+            report.push_error(
+                FindingCategory::Schema,
+                format!("repositories[{idx}].agent_branch must not be empty"),
+                Some(format!("repositories/{idx}/agent_branch")),
+            );
+        }
+        if repo.poll_interval_sec == 0 {
+            report.push_error(
+                FindingCategory::Schema,
+                format!(
+                    "repositories[{idx}].poll_interval_sec must be > 0 (got 0)"
+                ),
+                Some(format!("repositories/{idx}/poll_interval_sec")),
+            );
+        }
+    }
+    if config.executor.command.trim().is_empty() {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.command must not be empty",
+            Some("executor/command".into()),
+        );
+    }
+    if config.executor.timeout_secs == 0 {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.timeout_secs must be > 0 (got 0)",
+            Some("executor/timeout_secs".into()),
+        );
+    }
+}
+
+/// Token-route check: for each repo URL, derive owner and verify SOME
+/// token source resolves. The check accepts EITHER an explicit
+/// `owner_tokens` entry (whose env var is set or whose value is
+/// inline), OR a global `github.token` (inline or env-var-set), OR a
+/// `github.token_env` env var that is currently set. The repo is in
+/// trouble only when none of those produces a usable secret.
+fn check_token_routes(config: &Config, report: &mut ValidationReport) {
+    for (idx, repo) in config.repositories.iter().enumerate() {
+        let owner = match crate::github::parse_repo_url(&repo.url) {
+            Ok((o, _r)) => o,
+            Err(e) => {
+                report.push_error(
+                    FindingCategory::TokenRoute,
+                    format!(
+                        "repositories[{idx}].url could not be parsed: {e}"
+                    ),
+                    Some(format!("repositories/{idx}/url")),
+                );
+                continue;
+            }
+        };
+        if token_route_resolves(&config.github, &owner) {
+            continue;
+        }
+        report.push_error(
+            FindingCategory::TokenRoute,
+            format!(
+                "repositories[{idx}].url (owner `{owner}`) has no matching `owner_tokens` entry AND `github.token` is unset AND `github.token_env` ({env}) is not set in the environment",
+                env = config.github.token_env,
+            ),
+            Some(format!("repositories/{idx}/url")),
+        );
+    }
+}
+
+/// True if `owner` has a resolvable token route under `github`. Checks,
+/// in order: an `owner_tokens` entry whose source resolves, the global
+/// `github.token` whose source resolves, or `github.token_env`'s env
+/// var being set. Side-effect: reads env vars (no writes).
+fn token_route_resolves(github: &GithubConfig, owner: &str) -> bool {
+    if let Some(map) = github.owner_tokens.as_ref()
+        && let Some((_k, src)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case(owner))
+        && secret_source_resolves(src)
+    {
+        return true;
+    }
+    if let Some(src) = github.token.as_ref()
+        && secret_source_resolves(src)
+    {
+        return true;
+    }
+    std::env::var(&github.token_env).is_ok()
+}
+
+/// True if the secret source can produce a value right now. `Inline`
+/// always resolves; `EnvVar` resolves iff `std::env::var(name)` succeeds.
+fn secret_source_resolves(src: &SecretSource) -> bool {
+    match src {
+        SecretSource::Inline { .. } => true,
+        SecretSource::EnvVar(name) => std::env::var(name).is_ok(),
+    }
+}
+
+/// Workspace-collision check: two repos that resolve to the same
+/// `local_path` would race each other. Emit ONE error per repo in the
+/// colliding group so the operator sees both indices.
+fn check_workspace_collisions(config: &Config, report: &mut ValidationReport) {
+    use std::collections::HashMap;
+    let mut by_path: HashMap<std::path::PathBuf, Vec<usize>> = HashMap::new();
+    for (idx, repo) in config.repositories.iter().enumerate() {
+        let path = crate::workspace::resolve_path(repo);
+        by_path.entry(path).or_default().push(idx);
+    }
+    for (path, indices) in by_path {
+        if indices.len() < 2 {
+            continue;
+        }
+        let others: Vec<String> = indices.iter().map(|i| i.to_string()).collect();
+        for &idx in &indices {
+            report.push_error(
+                FindingCategory::WorkspaceCollision,
+                format!(
+                    "repositories[{idx}] resolves to workspace path `{}` which is shared with repositories[{others}]",
+                    path.display(),
+                    others = others.join(", "),
+                ),
+                Some(format!("repositories/{idx}")),
+            );
+        }
+    }
+}
+
+/// Audit-slug check: every name under `audits.defaults`,
+/// `audits.settings`, and each repo's per-repo `audits` map must match
+/// a slug in `KNOWN_AUDIT_TYPES`. Unknown slugs silently never fire,
+/// so we flag them at startup with one error per typo.
+fn check_audit_slugs(config: &Config, report: &mut ValidationReport) {
+    let known: std::collections::HashSet<&str> = KNOWN_AUDIT_TYPES.iter().copied().collect();
+    if let Some(audits) = config.audits.as_ref() {
+        for name in audits.defaults.keys() {
+            if !known.contains(name.as_str()) {
+                report.push_error(
+                    FindingCategory::AuditSlug,
+                    format!(
+                        "audits.defaults.{name}: `{name}` is not a registered audit type (known: {})",
+                        KNOWN_AUDIT_TYPES.join(", ")
+                    ),
+                    Some(format!("audits/defaults/{name}")),
+                );
+            }
+        }
+        for name in audits.settings.keys() {
+            if !known.contains(name.as_str()) {
+                report.push_error(
+                    FindingCategory::AuditSlug,
+                    format!(
+                        "audits.settings.{name}: `{name}` is not a registered audit type (known: {})",
+                        KNOWN_AUDIT_TYPES.join(", ")
+                    ),
+                    Some(format!("audits/settings/{name}")),
+                );
+            }
+        }
+    }
+    for (idx, repo) in config.repositories.iter().enumerate() {
+        if let Some(overrides) = repo.audits.as_ref() {
+            for name in overrides.keys() {
+                if !known.contains(name.as_str()) {
+                    report.push_error(
+                        FindingCategory::AuditSlug,
+                        format!(
+                            "repositories[{idx}].audits.{name}: `{name}` is not a registered audit type (known: {})",
+                            KNOWN_AUDIT_TYPES.join(", ")
+                        ),
+                        Some(format!("repositories/{idx}/audits/{name}")),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Path-collision check: the four `paths.*` roles (state, cache, logs,
+/// runtime) must resolve to distinct absolute paths. Reuses the same
+/// resolution + collision detection that `paths::resolve_daemon_paths`
+/// runs at startup, so a passing `check-config` matches startup
+/// behaviour byte-for-byte.
+fn check_path_collisions(config: &Config, report: &mut ValidationReport) {
+    if let Err(e) = crate::paths::resolve_daemon_paths(config) {
+        report.push_error(
+            FindingCategory::PathCollision,
+            format!("{e:#}"),
+            Some("paths".into()),
+        );
+    }
+}
+
+/// Secret-source check (WARN-only): for each `*_env`-style reference
+/// AND each `SecretSource::EnvVar(...)`, verify the named env var is
+/// set in the calling environment. Misses are advisory because the
+/// daemon may run under a systemd unit that injects secrets at unit
+/// start via `EnvironmentFile=` not visible to the CLI. Inline-only
+/// fields are never warned.
+fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
+    let github_inline = config
+        .github
+        .token
+        .as_ref()
+        .map(|s| s.is_inline())
+        .unwrap_or(false);
+    if !github_inline && std::env::var(&config.github.token_env).is_err() {
+        report.push_warn(
+            FindingCategory::SecretSource,
+            format!(
+                "github.token_env references `{}` which is not set in the calling environment",
+                config.github.token_env
+            ),
+            Some("github/token_env".into()),
+        );
+    }
+    if let Some(SecretSource::EnvVar(name)) = config.github.token.as_ref()
+        && std::env::var(name).is_err()
+    {
+        report.push_warn(
+            FindingCategory::SecretSource,
+            format!("github.token references env var `{name}` which is not set"),
+            Some("github/token".into()),
+        );
+    }
+    if let Some(map) = config.github.owner_tokens.as_ref() {
+        for (owner, src) in map {
+            if let SecretSource::EnvVar(name) = src
+                && std::env::var(name).is_err()
+            {
+                report.push_warn(
+                    FindingCategory::SecretSource,
+                    format!(
+                        "github.owner_tokens[{owner}] references env var `{name}` which is not set"
+                    ),
+                    Some(format!("github/owner_tokens/{owner}")),
+                );
+            }
+        }
+    }
+    if let Some(reviewer) = config.reviewer.as_ref() {
+        let has_inline = reviewer
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = reviewer.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "reviewer.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("reviewer/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = reviewer.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!("reviewer.api_key references env var `{name}` which is not set"),
+                Some("reviewer/api_key".into()),
+            );
+        }
+    }
+    if let Some(chatops) = config.chatops.as_ref() {
+        if let Some(slack) = chatops.slack.as_ref() {
+            let bot_inline = slack
+                .bot_token
+                .as_ref()
+                .map(|s| s.is_inline())
+                .unwrap_or(false);
+            if !bot_inline
+                && let Some(name) = slack.bot_token_env.as_deref()
+                && std::env::var(name).is_err()
+            {
+                report.push_warn(
+                    FindingCategory::SecretSource,
+                    format!(
+                        "chatops.slack.bot_token_env references `{name}` which is not set in the calling environment"
+                    ),
+                    Some("chatops/slack/bot_token_env".into()),
+                );
+            }
+            if let Some(SecretSource::EnvVar(name)) = slack.bot_token.as_ref()
+                && std::env::var(name).is_err()
+            {
+                report.push_warn(
+                    FindingCategory::SecretSource,
+                    format!(
+                        "chatops.slack.bot_token references env var `{name}` which is not set"
+                    ),
+                    Some("chatops/slack/bot_token".into()),
+                );
+            }
+            let app_inline = slack
+                .app_token
+                .as_ref()
+                .map(|s| s.is_inline())
+                .unwrap_or(false);
+            if !app_inline
+                && let Some(name) = slack.app_token_env.as_deref()
+                && std::env::var(name).is_err()
+            {
+                report.push_warn(
+                    FindingCategory::SecretSource,
+                    format!(
+                        "chatops.slack.app_token_env references `{name}` which is not set in the calling environment"
+                    ),
+                    Some("chatops/slack/app_token_env".into()),
+                );
+            }
+            if let Some(SecretSource::EnvVar(name)) = slack.app_token.as_ref()
+                && std::env::var(name).is_err()
+            {
+                report.push_warn(
+                    FindingCategory::SecretSource,
+                    format!(
+                        "chatops.slack.app_token references env var `{name}` which is not set"
+                    ),
+                    Some("chatops/slack/app_token".into()),
+                );
+            }
+        }
+        if let Some(discord) = chatops.discord.as_ref()
+            && std::env::var(&discord.bot_token_env).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "chatops.discord.bot_token_env references `{}` which is not set",
+                    discord.bot_token_env
+                ),
+                Some("chatops/discord/bot_token_env".into()),
+            );
+        }
+        if let Some(teams) = chatops.teams.as_ref()
+            && std::env::var(&teams.client_secret_env).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "chatops.teams.client_secret_env references `{}` which is not set",
+                    teams.client_secret_env
+                ),
+                Some("chatops/teams/client_secret_env".into()),
+            );
+        }
+        if let Some(mm) = chatops.mattermost.as_ref()
+            && std::env::var(&mm.access_token_env).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "chatops.mattermost.access_token_env references `{}` which is not set",
+                    mm.access_token_env
+                ),
+                Some("chatops/mattermost/access_token_env".into()),
+            );
+        }
+        if let Some(matrix) = chatops.matrix.as_ref()
+            && std::env::var(&matrix.access_token_env).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "chatops.matrix.access_token_env references `{}` which is not set",
+                    matrix.access_token_env
+                ),
+                Some("chatops/matrix/access_token_env".into()),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3455,6 +4001,332 @@ github: {}
         assert!(
             msg.to_lowercase().contains("gpt_cli") || msg.to_lowercase().contains("variant"),
             "error should reject unknown variant; got: {msg}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // validate_config — shared validation surface
+    // ----------------------------------------------------------------
+
+    /// Env-var mutation is process-global; tests that touch
+    /// SecretSource env vars take this mutex.
+    static VALIDATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn valid_single_repo_yaml() -> &'static str {
+        r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  command: claude
+github:
+  token: { value: "inline-pat" }
+"#
+    }
+
+    #[test]
+    fn validate_config_valid_returns_empty_report() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let (_dir, path) = write_config(valid_single_repo_yaml());
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        assert!(
+            report.errors.is_empty(),
+            "valid config should have zero errors; got: {:?}",
+            report.errors
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "valid config (inline token) should have zero warnings; got: {:?}",
+            report.warnings
+        );
+        assert!(report.is_ok());
+    }
+
+    #[test]
+    fn validate_config_schema_violation_emits_error_with_pointer() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 0
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let schema_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::Schema)
+            .collect();
+        assert!(
+            !schema_errs.is_empty(),
+            "expected at least one schema error; got: {:?}",
+            report.errors
+        );
+        let f = schema_errs
+            .iter()
+            .find(|f| f.message.contains("poll_interval_sec"))
+            .expect("must include the offending field name");
+        assert_eq!(
+            f.config_pointer.as_deref(),
+            Some("repositories/0/poll_interval_sec")
+        );
+    }
+
+    #[test]
+    fn validate_config_empty_repositories_is_schema_error() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories: []
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.category == FindingCategory::Schema
+                    && f.message.contains("repositories list is empty")),
+            "expected an empty-repos schema error; got: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_config_token_route_gap_emits_error_naming_owner() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let env_var = "AUTOCODER_TEST_VALIDATE_UNROUTED_FALLBACK";
+        unsafe { std::env::remove_var(env_var) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:my-org-b/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: {env_var}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let route_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::TokenRoute)
+            .collect();
+        assert!(
+            !route_errs.is_empty(),
+            "expected at least one token-route error; got: {:?}",
+            report.errors
+        );
+        assert!(
+            route_errs[0].message.contains("my-org-b"),
+            "error must name the missing owner; got: {}",
+            route_errs[0].message
+        );
+        assert_eq!(
+            route_errs[0].config_pointer.as_deref(),
+            Some("repositories/0/url")
+        );
+    }
+
+    #[test]
+    fn validate_config_workspace_collision_emits_one_error_per_repo() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    local_path: /tmp/shared-workspace
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+  - url: "git@github.com:other/repo.git"
+    local_path: /tmp/shared-workspace
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let coll_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::WorkspaceCollision)
+            .collect();
+        assert_eq!(
+            coll_errs.len(),
+            2,
+            "expected one error per colliding repo; got: {:?}",
+            coll_errs
+        );
+    }
+
+    #[test]
+    fn validate_config_audit_slug_typo_emits_error_naming_slug() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+audits:
+  defaults:
+    typo_audit_name: weekly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let slug_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::AuditSlug)
+            .collect();
+        assert!(
+            !slug_errs.is_empty(),
+            "expected at least one audit-slug error; got: {:?}",
+            report.errors
+        );
+        assert!(
+            slug_errs[0].message.contains("typo_audit_name"),
+            "error must name the offending slug; got: {}",
+            slug_errs[0].message
+        );
+    }
+
+    #[test]
+    fn validate_config_path_collision_emits_error() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+paths:
+  state_dir: /collide
+  cache_dir: /collide
+  logs_dir: /distinct-logs
+  runtime_dir: /distinct-runtime
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.category == FindingCategory::PathCollision),
+            "expected a path-collision error; got: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_config_missing_env_emits_warn_finding() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let env_var = "AUTOCODER_TEST_VALIDATE_MISSING_TOKEN_ENV";
+        unsafe { std::env::remove_var(env_var) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: {env_var}
+  owner_tokens:
+    owner: {{ value: "inline-owner-pat" }}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        // The repo has an owner_tokens inline route, so TokenRoute passes;
+        // but `github.token_env` references an unset env var → WARN.
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|f| f.category != FindingCategory::TokenRoute),
+            "inline owner_tokens must satisfy token-route; got: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|f| f.category == FindingCategory::SecretSource
+                    && f.message.contains(env_var)),
+            "expected a secret-source WARN naming the unset env var; got: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_config_inline_secret_does_not_warn() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let env_var = "AUTOCODER_TEST_VALIDATE_INLINE_NO_WARN";
+        unsafe { std::env::remove_var(env_var) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: {env_var}
+  token: {{ value: "inline-pat" }}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|f| f.category != FindingCategory::SecretSource),
+            "inline github.token must suppress the token_env WARN; got: {:?}",
+            report.warnings
         );
     }
 }
