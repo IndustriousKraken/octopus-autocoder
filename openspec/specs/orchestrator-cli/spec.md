@@ -4154,3 +4154,161 @@ After `autocoder run`'s startup pipeline completes (configs validated, chatops b
 - **THEN** the daemon logs a WARN naming the error AND proceeds to the polling loop
 - **AND** no startup is blocked by a notification failure
 
+### Requirement: `changelog` subcommand harvests changelog entries from the OpenSpec archive
+autocoder SHALL ship a `changelog` subcommand alongside `run`, `reload`, `rewind`, `audit run`, `install`, and `check-config`. The subcommand SHALL walk the OpenSpec archive directory (`openspec/changes/archive/`) of a target workspace, identify archives added within a tag range, extract per-archive summary text from `proposal.md`, group by primary affected capability, AND emit either markdown (default) or structured JSON to stdout.
+
+The subcommand SHALL NOT spawn any daemon work, mutate any file, contact any external service, or invoke any LLM. It is a pure-data extractor — same archive contents + same tag range produce the same output every invocation.
+
+**Flag surface:**
+
+- `--workspace <path>`: directory containing `openspec/changes/archive/`. Defaults to the current working directory. Operators running against a managed workspace from the daemon host use this flag.
+- `--since <tag-or-sentinel>`: lower bound (exclusive). Defaults to the most recent tag on `HEAD`'s ancestry as reported by `git describe --tags --abbrev=0 HEAD`. The literal value `ever` is a sentinel meaning "from the beginning of archive history" — useful for first-release runs.
+- `--to <tag-or-ref>`: upper bound (inclusive). Defaults to `HEAD`.
+- `--format markdown|json`: output shape. Default `markdown`.
+
+**Tag-range resolution edge cases:**
+
+- `--since` unset AND `git describe --tags --abbrev=0 HEAD` exits non-zero (no tags exist) → fall back to "from ever" AND emit one stderr line: `No tags found in this repo; emitting full archive history. Pass --since ever to suppress this notice.` Exit 0.
+- `--since <tag>` referencing a tag that does not exist → exit non-zero with a clear error naming the missing tag.
+
+**Frontmatter overrides** on a change's `proposal.md`:
+
+- Absent OR no `changelog:` field → default behavior: use the first paragraph of `## Why` as the entry's summary.
+- `changelog: skip` (or `internal`, `hidden` — accept synonyms) → omit the change from output AND record it in the `skipped` list (JSON output) or a footer (markdown output, when at least one change was skipped).
+- `changelog: { summary: "<text>" }` → use the override summary instead of the first-`## Why` paragraph.
+- Unrecognized `changelog:` value → emit a WARN log naming the value, fall through to default behavior.
+
+#### Scenario: Default invocation emits markdown grouped by capability
+- **WHEN** an operator runs `autocoder changelog` from a repo root with two prior tags AND three archives added since the most recent tag (`drift-audit-spec-contradictions`, `chatops-slack-event-dedup`, `executor-streams-output-incrementally`)
+- **THEN** stdout contains a markdown document headed `## <to-ref> — <YYYY-MM-DD>`
+- **AND** the changes group under `### chatops-manager` (one entry), `### executor` (one entry), AND `### orchestrator-cli` (one entry — whichever capability owns drift-audit's spec delta)
+- **AND** each entry's bullet form is `- **<summary-first-line>** (<slug>) — <rest-of-summary-if-any>`
+- **AND** stderr is empty
+
+#### Scenario: No prior tags falls back to "ever" with an INFO line
+- **WHEN** the operator runs `autocoder changelog` from a repo root with no tags AND `--since` unset
+- **THEN** the subcommand emits one stderr INFO line naming the fallback AND pointing at `--since ever` as the explicit form
+- **AND** stdout contains every archive in the repo's history, sorted by shipped-commit order
+- **AND** the subcommand exits 0
+
+#### Scenario: `--since ever` explicit form suppresses the INFO line
+- **WHEN** the operator runs `autocoder changelog --since ever` from a repo (with or without tags)
+- **THEN** stdout contains every archive in history
+- **AND** stderr is empty (the INFO line only fires under the implicit fallback path)
+
+#### Scenario: Frontmatter `changelog: skip` omits the change
+- **WHEN** an archive's `proposal.md` carries frontmatter `changelog: skip`
+- **AND** `autocoder changelog --format json` is run against a range that includes this archive
+- **THEN** the change does NOT appear in the JSON output's `entries` array
+- **AND** the change DOES appear in the `skipped` array with `{"slug": "...", "reason": "changelog: skip"}`
+
+#### Scenario: Frontmatter `changelog.summary` override replaces the default summary
+- **WHEN** an archive's `proposal.md` carries frontmatter `changelog: { summary: "Adds /healthz endpoint for liveness probes" }`
+- **AND** the changelog is generated for a range that includes this archive
+- **THEN** the entry's summary text is `Adds /healthz endpoint for liveness probes` exactly
+- **AND** the first paragraph of `## Why` is NOT used
+
+#### Scenario: JSON output is machine-readable
+- **WHEN** the operator runs `autocoder changelog --format json`
+- **THEN** stdout contains a single JSON object with `version`, `date`, `since`, `to`, `entries`, and `skipped` top-level fields
+- **AND** each entry object includes `slug`, `archive_dir`, `primary_capability`, `summary`, `shipped_commit`, `shipped_date`
+- **AND** the JSON parses without error via `serde_json::from_str`
+- **AND** the output is pretty-printed (2-space indent) for human readability
+
+#### Scenario: Cross-project usage via `--workspace`
+- **WHEN** an operator runs `autocoder changelog --workspace /path/to/another-openspec-repo`
+- **THEN** the subcommand reads the named workspace's archive AND git history
+- **AND** the operator's cwd is irrelevant
+- **AND** the subcommand works against any repo whose `openspec/changes/archive/` directory exists, not just autocoder's own repo
+
+#### Scenario: Archive discovery uses git addition commits, not directory date prefixes
+- **WHEN** an archive entry is added to `openspec/changes/archive/` in commit `<sha>`
+- **AND** the operator runs `autocoder changelog --since <tag>` where `<tag>` is reachable from before `<sha>`
+- **THEN** the entry appears in the output if and only if `<sha>` is reachable from `--to` BUT NOT from `--since`
+- **AND** the directory's `YYYY-MM-DD` prefix is used only for the entry's `shipped_date` field, never for range filtering (so a manually-renamed archive directory does not affect what changelogs include)
+
+#### Scenario: Subcommand is testable against synthetic fixtures
+- **WHEN** the changelog tests run under `cargo test`
+- **THEN** each test stands up a tempdir with a synthetic git repo (`git init`, a few commits adding archive entries, optional tags)
+- **AND** the test invokes `execute` with a `ChangelogArgs` pointing at the tempdir
+- **AND** assertions cover the markdown / JSON output text exactly
+- **AND** no test depends on autocoder's own archive history
+
+### Requirement: `changelog` chatops verb queues an LLM-styled CHANGELOG.md update via the standard triage path
+The daemon SHALL accept a `ChangelogAction` over its Unix-domain control socket (submitted by the Slack inbound listener on `@<bot> changelog <repo-substring> [<args>]`). The action SHALL stamp a `ChangelogRequest` state file under `<state_dir>/changelog-requests/<request_id>.json`. On the next polling iteration AFTER the request is queued, the daemon SHALL: (a) run the `a05` deterministic extractor against the workspace's archive AND get the JSON output, (b) invoke the wrapped agent CLI with the embedded `prompts/changelog-stylist.md` system prompt + the JSON data as input, (c) validate the resulting diff's path scope (`CHANGELOG.md` AND optionally `openspec/changes/archive/<slug>/proposal.md` files; reject all others), (d) commit the diff to a `changelog-<short-hash>` branch, push it, AND open a single PR. The PR SHALL participate in the existing PR-comment revision loop without additional plumbing.
+
+The stylist prompt SHALL instruct the agent to check for an existing `CHANGELOG.md` in the workspace root AND match its style if present, OR create a fresh file in the Keep a Changelog v1.1.0 format if absent. The agent SHALL also be permitted to propose `changelog:` frontmatter edits to source proposals when the changelog work surfaces a durable classification decision — but only when the operator's input (initial verb OR revision text) implies such a decision.
+
+`ChangelogRequest` state files SHALL be pruned after 7 days regardless of terminal status (`Acted`, `Failed`, `InFlight`), parallel to the audit-thread and proposal-request pruning schedules.
+
+#### Scenario: Verb queues a request and the next iteration produces a PR
+- **WHEN** an operator types `@<bot> changelog coterie` in a watched channel
+- **AND** the inbound listener parses the verb AND submits a `ChangelogAction`
+- **THEN** the daemon writes a `ChangelogRequest` state file with `status: Pending`
+- **AND** the bot posts `✓ Queued changelog request for <repo-url>. The next polling iteration will run it. Follow along in this thread.` as a top-level channel message
+- **AND** the ack message's `ts` is stored as the request's `lifecycle_thread_ts`
+- **WHEN** the next polling iteration runs
+- **THEN** the handler runs the deterministic extractor, invokes the stylist via the executor, captures the diff
+- **AND** validates that the diff touches only `CHANGELOG.md` AND/OR `openspec/changes/archive/<slug>/proposal.md` paths
+- **AND** commits the diff to a `changelog-<short-hash>` branch
+- **AND** opens a single PR
+- **AND** posts a threaded reply in the lifecycle thread: `✓ Changelog draft ready at <PR-URL>. Review on GitHub; revise via @<bot> revise <text>.`
+- **AND** the request's `status` advances to `Acted`
+
+#### Scenario: Out-of-scope diff is refused
+- **WHEN** the LLM's diff touches files outside `CHANGELOG.md` AND `openspec/changes/archive/<slug>/proposal.md`
+- **THEN** the handler does NOT commit
+- **AND** the handler posts `✗ changelog: LLM produced out-of-scope diff; refusing to commit. See <log-path>.` to the lifecycle thread
+- **AND** the request's `status` advances to `Failed`
+- **AND** the workspace is left clean (no partial branch, no orphan commit)
+
+#### Scenario: Revision loop iterates the changelog
+- **WHEN** an operator posts `@<bot> revise leave out the refactors from this changelog` on the changelog PR
+- **THEN** the existing PR-comment revision dispatcher (from `a01-pr-comment-revision-loop`) parses the comment
+- **AND** the next polling iteration re-invokes the stylist with the previous draft + the operator's instruction in context
+- **AND** the handler validates the new diff's path scope AND force-pushes the updated commit to the `changelog-<short-hash>` branch
+- **AND** the PR's diff updates in place; no PR close/re-open
+
+#### Scenario: Revision proposes frontmatter edits when implied
+- **WHEN** an operator's revision text implies a durable classification (e.g. `leave out the refactors` OR `internal changes shouldn't appear in the changelog`)
+- **THEN** the stylist MAY include `changelog: skip` frontmatter edits to the relevant source proposals in the same diff
+- **AND** the operator reviewing the PR sees both the CHANGELOG.md edit AND the proposal.md frontmatter edits in a single diff
+- **AND** future invocations of the deterministic extractor honor the frontmatter, so the classification persists across releases
+
+#### Scenario: Fresh-repo CHANGELOG.md creation
+- **WHEN** the operator runs `@<bot> changelog <repo>` against a workspace with NO existing `CHANGELOG.md`
+- **THEN** the stylist creates `CHANGELOG.md` in the Keep a Changelog v1.1.0 format
+- **AND** the file starts with the project name as a top-level heading
+- **AND** includes an `## [Unreleased]` placeholder
+- **AND** the current release's section appears as `## [<version>] - <YYYY-MM-DD>`
+- **AND** the operator reviewing the PR can validate the formatting choice before merging
+
+#### Scenario: Polite refusal — missing repo substring
+- **WHEN** an operator types `@<bot> changelog` with no first argument
+- **THEN** the listener posts `✗ changelog: missing repo-substring.` as a threaded reply
+- **AND** no state file is written
+- **AND** the request is idempotent — re-issuing the verb with arguments works as if the first attempt never happened
+
+#### Scenario: Polite refusal — repo substring matches nothing
+- **WHEN** the operator's substring does not match any configured repository
+- **THEN** the listener posts `✗ changelog: no repo matched '<sub>'; configured: <list>`
+- **AND** the candidate list contains every configured `repositories[].url` so the operator can copy-paste a correction
+
+#### Scenario: Polite refusal — chatops backend unconfigured
+- **WHEN** the daemon's `OperatorCommandDispatcher` is constructed without a chatops backend
+- **AND** an operator's `changelog` verb reaches the parser
+- **THEN** the listener responds `✗ changelog: chatops backend not configured.`
+- **AND** no state file is written
+
+#### Scenario: Polite refusal — ack post failure
+- **WHEN** the ack `post_notification` to the channel fails (HTTP error, scope revoked, channel renamed)
+- **THEN** the listener posts the error inline (`✗ changelog: could not post ack to chat: <reason>`) where it can
+- **AND** the state file is NOT written
+- **AND** the operator can retry the verb after fixing the upstream chatops issue
+
+#### Scenario: 7-day staleness pruning
+- **WHEN** a `ChangelogRequest` state file's `submitted_at` is older than 7 days
+- **THEN** the next polling iteration's pruning pass removes the file
+- **AND** an INFO log line records the pruned `request_id`
+- **AND** any PRs spawned from that request continue to work independently (their revision loop is keyed to the PR's branch, not the state file)
+

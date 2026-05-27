@@ -638,6 +638,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
         > = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_proposal_requests_for_task = pending_proposal_requests.clone();
+        let pending_changelog_requests: Arc<
+            std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
+        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending_changelog_requests_for_task = pending_changelog_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -663,6 +667,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_triages_for_task,
                 pending_audit_runs_for_task,
                 pending_proposal_requests_for_task,
+                pending_changelog_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -692,6 +697,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_triages,
                     pending_audit_runs,
                     pending_proposal_requests,
+                    pending_changelog_requests,
                     iteration_cancel,
                     iteration_drained,
                 },

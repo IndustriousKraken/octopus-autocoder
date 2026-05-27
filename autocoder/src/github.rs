@@ -722,6 +722,47 @@ pub async fn self_bot_username(api_base: &str, token: &str) -> Result<String> {
     Ok(parsed.login)
 }
 
+/// List every open PR in a repository (no `head` filter). Used by the
+/// changelog revision dispatcher: changelog PRs ship on branches whose
+/// names follow the deterministic `changelog-<short-hash>` shape, but
+/// the dispatcher does not know any individual short-hash up front — it
+/// pulls every open PR AND filters in-process by `head.ref` prefix.
+/// Pagination beyond 100 is out of scope for the same reason as the
+/// head-filtered variant.
+pub async fn list_open_prs_all(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<PrSummary>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[("state", "open"), ("per_page", "100")])
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github list-open-prs-all GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github list-open-prs-all GET {owner}/{repo} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<PrSummary> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github list-open-prs-all response decode failed: {e}"))?;
+    Ok(parsed)
+}
+
 /// List open PRs whose head is `<owner>:<head_branch>`. Used by the
 /// revision dispatcher to find the set of bot-opened PRs to poll for
 /// comment triggers. Pagination beyond 100 is out of scope — a repo with

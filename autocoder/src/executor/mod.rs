@@ -82,6 +82,27 @@ pub trait Executor: Send + Sync {
             reason: "chat-triage mode not supported by this executor backend".to_string(),
         })
     }
+
+    /// Chat-driven changelog stylist for the `changelog` chatops verb.
+    /// The deterministic extractor has already produced the JSON payload
+    /// in `ctx.changelog_json`; this method asks the wrapped CLI to read
+    /// any existing `CHANGELOG.md`, match its style (or create a new file
+    /// in Keep a Changelog format), and write the polished release notes.
+    ///
+    /// Default impl returns `Failed { reason: "changelog stylist not
+    /// supported" }` so a backend that hasn't been taught about the
+    /// changelog flow degrades to a polite refusal instead of a panic.
+    async fn run_changelog(
+        &self,
+        workspace: &Path,
+        ctx: &ChangelogContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "changelog stylist not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -102,6 +123,24 @@ pub struct TriageContext {
     /// `openspec/specs/`. The triage prompt instructs the LLM to read
     /// the relevant subset before classifying findings.
     pub canonical_specs_index: String,
+}
+
+/// Context handed to `Executor::run_changelog`. Plumbed in from the
+/// chat-driven `changelog` flow. Carried verbatim through the
+/// `prompts/changelog-stylist.md` template's `{{...}}` substitutions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogContext {
+    /// JSON payload produced by the deterministic `autocoder changelog`
+    /// extractor (the `--format json` shape). The stylist gets this as
+    /// its primary input.
+    pub changelog_json: String,
+    /// Repository URL the changelog targets (for the prompt's context
+    /// banner line).
+    pub repo_url: String,
+    /// The operator's revision text — populated only when this
+    /// invocation is a revision of a prior changelog PR; empty for the
+    /// first stylist run.
+    pub revision_text: String,
 }
 
 /// Context handed to `Executor::run_chat_triage`. Plumbed in from the

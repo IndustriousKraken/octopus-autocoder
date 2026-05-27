@@ -180,6 +180,54 @@ The ETA is `~Nm` where `N` is `poll_interval_sec` rounded to minutes, or `immine
 
 **CLI variant.** `autocoder audit run --workspace <path> --audit <name>` does the same job from the command line (no substring matching — the audit-type slug must match exactly). See [CLI.md → audit run](CLI.md#audit-run).
 
+### Generating a changelog: `changelog`
+
+The `changelog` verb queues an LLM-styled `CHANGELOG.md` update against a managed repo. Unlike the deterministic `autocoder changelog` CLI subcommand (which prints to stdout), the chatops verb opens a PR with a polished draft that operators iterate on via the existing revision loop.
+
+```
+@<bot> changelog <repo-substring> [<args>]
+```
+
+**Accepted flags** (mirror the [`autocoder changelog`](CLI.md#changelog) CLI surface):
+
+- `--since <tag>` — lower bound (exclusive). Default: the most recent tag on `HEAD`'s ancestry. `--since ever` explicitly opts into "from the beginning of archive history".
+- `--to <tag>` — upper bound (inclusive). Default: `HEAD`.
+
+The `--workspace <path>` flag is intentionally NOT accepted via chatops: letting any channel member point the stylist at an arbitrary directory is a security gap. The daemon refuses such requests with an inline error AND a WARN log line. Operators with daemon-host access can use `autocoder changelog --workspace <path>` directly instead.
+
+**Ack and lifecycle thread.** Same shape as `propose`:
+
+```
+✓ Queued changelog request for <repo-url>. The next polling iteration will run it. Follow along in this thread.
+```
+
+The ack's `ts` becomes the changelog-request's lifecycle thread. Status updates and the final PR-URL reply all post into that thread.
+
+**Polling-iteration flow.** On the next polling iteration after the verb is queued, the daemon:
+
+1. Runs the deterministic `a05` extractor against the workspace's archive (calls the data-producing helpers directly — no subprocess).
+2. Invokes the wrapped agent CLI with the embedded `prompts/changelog-stylist.md` system prompt + the JSON data as input. The stylist reads any existing `CHANGELOG.md` in the workspace root (matching its style if present, creating a fresh Keep a Changelog v1.1.0 file if absent).
+3. Validates the resulting diff's path scope. Only `CHANGELOG.md` AND `openspec/changes/archive/<slug>/proposal.md` (frontmatter edits) are accepted; anything else is refused with `✗ changelog: LLM produced out-of-scope diff; refusing to commit.`
+4. Commits the diff to a `changelog-<short-hash>` branch, pushes, AND opens a single PR.
+5. Posts a threaded reply in the lifecycle thread: `✓ Changelog draft ready at <PR-URL>. Review on GitHub; revise via @<bot> revise <text>.`
+
+**Single-PR shape.** Unlike `propose`'s two-PR mechanic, the changelog flow produces a single PR. The reason: `CHANGELOG.md` is the only output artifact. When the stylist proposes `changelog: skip` frontmatter edits to source proposals, those land in the same PR — they're part of "what this release's changelog work decided," not a separable concern.
+
+**Frontmatter propagation.** When an operator's revision implies a durable classification (`@<bot> revise leave out the refactors`), the stylist MAY include `changelog: skip` frontmatter edits to the relevant `openspec/changes/archive/<slug>/proposal.md` files in the same PR. Future invocations of the deterministic extractor honor the frontmatter — the classification persists across releases. Reviewers see both the `CHANGELOG.md` edit AND the proposal.md frontmatter edits in a single diff.
+
+**Revision loop.** The PR's `changelog-<short-hash>` branch participates in the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment). An `@<bot> revise <text>` comment on the PR re-runs the stylist with the operator's revision text injected, validates the new diff's path scope, AND force-pushes the updated commit to the same branch (no PR close/re-open).
+
+**7-day staleness rule.** Changelog-request state files are pruned after 7 days regardless of terminal status. Same shape as `propose` / audit-thread state.
+
+**Polite-refusal cases.**
+
+- `✗ changelog: missing repo-substring.` — no first arg.
+- `✗ no repo matched '<sub>'; configured: <list>` — substring doesn't resolve to any configured repo.
+- `✗ `<sub>` matched multiple repos: ...` — ambiguous substring; lists candidates.
+- `✗ changelog: chatops backend not configured.` — the verb needs the backend to ack.
+- `✗ changelog: could not post ack to chat: <reason>` — ack post failed; no state file is written (the verb is idempotent on retry).
+- `✗ changelog: bad arg: <text>` — `parse_changelog_args` rejected an unrecognized flag or missing value.
+
 ### Revising an open PR: `@<bot> revise <text>` (cross-link)
 
 When the bot opens a PR (from a normal queue iteration, from a `send it` triage, or from a `propose` directive), an operator comment of the form `@<bot> revise <free-form text>` on that PR triggers an in-place revision: the next polling iteration re-runs the executor with the original change material, the current PR diff, and the operator's text, then force-pushes the updated diff and posts a `✅ Revision applied:` or `✗ Revision attempt failed:` reply comment.

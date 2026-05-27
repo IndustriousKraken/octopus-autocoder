@@ -154,6 +154,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        # The release-notes step shells out to `autocoder changelog`, which
+        # reads the workspace's `openspec/changes/archive/` AND the git
+        # history. Without the checkout the publish job has neither.
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -163,12 +172,39 @@ jobs:
       - name: List downloaded assets
         run: ls -la dist
 
+      - name: Generate release notes from OpenSpec archive
+        id: notes
+        # A failing changelog generation does NOT block the binary release
+        # — the binary is the primary artifact, notes are a best-effort
+        # enhancement. On any error we log + write an empty notes file +
+        # continue. Operators see the failed step in the Actions tab and
+        # can investigate manually.
+        shell: bash
+        run: |
+          set +e
+          notes_file=/tmp/release-notes.md
+          : > "$notes_file"
+          binary="dist/autocoder-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          if [ ! -x "$binary" ]; then
+            chmod +x "$binary" 2>/dev/null || true
+          fi
+          previous_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || echo "ever")
+          echo "Generating release notes for ${GITHUB_REF_NAME} (since: ${previous_tag})"
+          "$binary" changelog --since "$previous_tag" --to "${GITHUB_REF_NAME}" > "$notes_file" 2> /tmp/release-notes.err
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "WARN: autocoder changelog failed (exit $rc); release will publish with empty notes"
+            cat /tmp/release-notes.err || true
+            : > "$notes_file"
+          fi
+          echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: |
             dist/autocoder-${{ github.ref_name }}-*
+          body_path: ${{ steps.notes.outputs.notes_file }}
           prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: true
           fail_on_unmatched_files: true

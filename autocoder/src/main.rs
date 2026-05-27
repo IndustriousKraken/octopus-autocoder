@@ -5,6 +5,8 @@ mod alert_state;
 mod alerts;
 mod audits;
 mod busy_marker;
+mod changelog_requests;
+mod changelog_triage;
 mod chatops;
 mod cli;
 mod code_reviewer;
