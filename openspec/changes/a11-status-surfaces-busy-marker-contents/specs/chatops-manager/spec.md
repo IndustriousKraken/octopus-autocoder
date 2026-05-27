@@ -1,9 +1,9 @@
 ## MODIFIED Requirements
 
 ### Requirement: Status reply always shows live workspace snapshot
-The `@<bot> status <repo>` reply SHALL contain five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state, AND the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, AND the queue snapshot. The `currently:` line SHALL surface the busy marker's actual contents (not just `idle` vs. `working on <change>`) so operators diagnosing a "stuck pending change" can distinguish between an audit in flight, a stale marker awaiting recovery, AND a truly-idle daemon.
+The `status` verb's reply SHALL always include five sections regardless of whether the repo has any markers, throttled alerts, or queued changes: (1) `branches: base=<base>, agent=<agent>`; (2) one `last commit on <branch>` line per branch (base and agent), each rendering as `<short_sha> "<subject>" (<age> ago)` when a commit exists or `(none)` when the branch does not exist or has no commits; (3) `latest PR: ...` with a URL on the following line when a PR exists from the agent branch, or `latest PR: (none)` otherwise; (4) the `currently:` line surfacing the live busy marker's actual contents (per the branching rules below); (5) the existing `next iteration: in <age> ...` line. These sections SHALL precede the existing marker / throttled-alert / queue sections.
 
-The `currently:` line's value SHALL be computed by branching on marker contents in this order:
+The `currently:` line's value SHALL be computed by branching on the busy marker's contents in this order:
 
 1. No marker present → `idle`.
 2. Marker present AND classification per `a08`'s busy-marker semantics says the marker is stale (dead pid OR live pid past threshold) → `stale marker from pid <pid> (age <age>, recovery <eligible-or-remaining-time>)`.
@@ -16,6 +16,35 @@ The `currently:` line's value SHALL be computed by branching on marker contents 
 The status code path SHALL read the busy marker from the daemon's resolved runtime-dir path (per `a09`'s state-path-resolution rule). The status reply MUST NOT report `idle` when the daemon's writer has stamped a marker at the runtime path.
 
 The age formatting matches the existing convention: `Xm ago` for ages under 1 hour, `XhYm ago` for older.
+
+#### Scenario: All sections present for a healthy repo
+- **WHEN** an operator issues `status <repo>` against a repo with commits on both branches, an open PR from the agent branch, an idle daemon, and an empty queue
+- **THEN** the reply contains all five always-present sections in the documented order
+- **AND** the `currently:` line reads `idle`
+- **AND** the queue section either reads `queue: 0 pending, 0 waiting, 0 excluded` (one-liner form) or is omitted entirely per the queue-one-liner requirement
+
+#### Scenario: Absent data renders `(none)`, not blank or missing
+- **WHEN** the agent branch does not exist yet (fresh clone)
+- **THEN** `last commit on <agent_branch>:` reads `(none)`
+- **AND** the line is still present (the section is always shown)
+
+#### Scenario: GitHub failure does not break the reply
+- **WHEN** the GitHub API call for `latest PR` returns an error (network failure, 4xx, 5xx, rate-limit)
+- **THEN** the daemon logs a WARN with the underlying error
+- **AND** the reply's `latest PR:` line reads `(none)`
+- **AND** every other section is rendered normally
+- **AND** the status reply succeeds — the operator gets the local-state half even when GitHub is unreachable
+
+#### Scenario: Local git failure does not break the reply
+- **WHEN** `git log -1` returns an error (workspace not yet cloned, .git directory corrupt)
+- **THEN** the daemon logs a WARN with the underlying error
+- **AND** the affected `last commit on <branch>:` line reads `(none)`
+- **AND** every other section is rendered normally
+
+#### Scenario: Currently-busy line reflects the live busy marker
+- **WHEN** the daemon is mid-iteration on change `a05-foo` started 2 minutes ago
+- **THEN** the `currently:` line reads `working on a05-foo (started 2m ago)`
+- **AND** the busy-marker file is read but NOT taken, held, or released by the status path
 
 #### Scenario: Daemon working on a named change
 - **WHEN** the busy marker has `change: a36-expense-tracking`, `stage: executor`, `started_at: now - 180 seconds`
@@ -47,11 +76,6 @@ The age formatting matches the existing convention: `Xm ago` for ages under 1 ho
 - **WHEN** the busy marker has `pid: <some live pid>`, `started_at: now - 8 minutes` AND threshold is 10 minutes
 - **THEN** the reply's `currently:` line reads `stale marker from pid <pid> (age 8m, recovery in 2m)`
 - **AND** the heuristic (surface upcoming-recovery when age > 80% of threshold) makes "stuck-feeling" markers visibly transitioning rather than permanent
-
-#### Scenario: Truly idle daemon
-- **WHEN** no busy marker exists at the resolved runtime-dir path
-- **THEN** the reply's `currently:` line reads `idle`
-- **AND** an operator seeing this combined with a non-empty `queue: <N> pending` line knows the daemon SHOULD be picking up the change on the next iteration
 
 #### Scenario: Status read path matches daemon write path
 - **WHEN** the daemon's busy-marker writer stamps a marker at `<runtime_dir>/busy/<workspace>.json`

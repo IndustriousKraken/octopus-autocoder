@@ -1,7 +1,9 @@
 ## MODIFIED Requirements
 
 ### Requirement: Architecture-brightline audit
-autocoder SHALL register an `architecture_brightline` audit that computes pure-code metrics (file line counts, duplicate function signatures across files) AND reports findings via `AuditOutcome::Reported(...)`. The audit SHALL declare `WritePolicy::None` AND `requires_head_change = true`. The audit SHALL load a per-workspace `.brightline-ignore` file (if present) AND apply match-suppression to duplicate-signature findings whose constituent sites are all listed in the ignore file. The audit SHALL also validate ignore entries against the current workspace state AND report stale entries via the chatops top-line (informational; the audit does NOT modify the ignore file itself given its `WritePolicy::None`).
+autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, AND `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds.
+
+The audit SHALL load a per-workspace `.brightline-ignore` file (if present) AND apply match-suppression to duplicate-signature findings whose constituent sites are all listed in the ignore file. The audit SHALL also validate ignore entries against the current workspace state AND report stale entries via the chatops top-line (informational; the audit does NOT modify the ignore file itself given its `WritePolicy::None`).
 
 The ignore file's YAML schema:
 
@@ -25,11 +27,23 @@ Stale-entry rule: each ignore entry is validated against the current workspace a
 
 The threaded body lists each stale entry's `file + function + reason` so the operator knows what to remove. The audit does NOT modify `.brightline-ignore` on disk (given `WritePolicy::None`); cleanup is operator-driven.
 
-#### Scenario: Audit runs against pure-code metrics and reports findings
-- **WHEN** the audit runs against a workspace where 2 files exceed the `file_lines_threshold` (default 800) AND 1 function signature appears in 3 files
-- **THEN** the audit returns `AuditOutcome::Reported` with findings naming the oversize files AND the duplicate signature
-- **AND** no `.brightline-ignore` exists OR the file's entries don't match the finding
-- **AND** the chatops top-line reads `📐 architecture_brightline on <repo>: 2 file(s) over line threshold; 1 duplicate signature(s)`
+#### Scenario: Reports files exceeding the size threshold
+- **WHEN** the audit runs AND a tracked file under the repository's source root has more lines than the threshold (default `800`)
+- **THEN** a finding of severity `medium` is included with `subject = "file <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:1")`
+
+#### Scenario: Reports identical function signatures across files
+- **WHEN** the audit detects two or more functions with identical name + parameter list signatures in different files (excluding `mod tests {}` blocks)
+- **AND** no ignore entry suppresses the finding (see the ignore scenarios below)
+- **THEN** a finding of severity `low` lists each occurrence
+
+#### Scenario: Reports dead public items
+- **WHEN** the audit (or a static-analysis subprocess it invokes) identifies public items with zero references in the repository
+- **THEN** a finding of severity `low` lists the items
+
+#### Scenario: No findings produces silent outcome
+- **WHEN** no metric exceeds its threshold AND no ignore entries are stale
+- **THEN** the audit returns `AuditOutcome::Reported(vec![])`
+- **AND** unless `notify_on_clean: true` is set, no chatops message is posted (per the framework-level scenario)
 
 #### Scenario: Ignore entry suppresses a fully-matching finding
 - **WHEN** a duplicate-signature finding involves 3 sites (file1.ts, file2.ts, file3.ts with function `foo` AND signature substring `async function foo(req`)

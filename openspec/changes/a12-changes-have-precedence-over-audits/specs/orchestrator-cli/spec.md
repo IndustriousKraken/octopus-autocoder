@@ -42,6 +42,11 @@ autocoder SHALL include a periodic audit framework that runs registered audit ta
 - **WHEN** an audit returns `AuditOutcome::Reported(findings)` AND chatops is configured
 - **THEN** autocoder posts a single chatops message with a header line `📋 <repo>: <audit_type> — <N> finding(s)` followed by a bullet list of finding subjects
 
+#### Scenario: AuditOutcome::Reported with no findings posts a brief OK
+- **WHEN** an audit returns `AuditOutcome::Reported(vec![])` AND chatops is configured AND the operator has set `audits.<audit_type>.notify_on_clean: true` (default `false`)
+- **THEN** autocoder posts `✅ <repo>: <audit_type> — no findings`
+- **AND** when `notify_on_clean` is unset or `false`, no chatops post is made for an empty-findings outcome (silence is success)
+
 #### Scenario: AuditOutcome::SpecsWritten records the change names; implementation waits one iteration
 - **WHEN** an audit returns `AuditOutcome::SpecsWritten(names)` with non-empty `names`
 - **THEN** the framework logs an info line naming each created change
