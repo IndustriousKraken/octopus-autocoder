@@ -1,8 +1,17 @@
 //! Per-workspace persistence for predictable-failure alert throttling.
 //!
-//! Lives at `<workspace>/.alert-state.json` (alongside `.in-progress`,
-//! `.question.json`, `.answer.json`). Cleared on the next successful pass so
-//! a transient outage does not silence follow-up alerts.
+//! Production layout: `<state_dir>/alert-state/<workspace-basename>.json`
+//! (resolved via `DaemonPaths::alert_state_path()`). The file lives
+//! OUTSIDE the managed repository's workspace — daemon bookkeeping
+//! never appears in `git status` or any `git checkout` clobber-protection
+//! check. The first-startup migration in `state/alert_state_migration.rs`
+//! moves any legacy `<workspace>/.alert-state.json` files to the new
+//! location.
+//!
+//! Test layout (when the daemon-paths global has not been installed):
+//! the module falls back to the legacy `<workspace>/.alert-state.json`
+//! layout. Tests that build workspaces in `TempDir`s thus stay
+//! self-contained without each one needing to install paths.
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -10,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const ALERT_STATE_FILE: &str = ".alert-state.json";
+/// File name of the legacy workspace-local alert-state file. Kept as a
+/// constant because the migration code, the workspace-init invariant
+/// check, and the test-mode fallback all need to refer to it.
+pub(crate) const LEGACY_ALERT_STATE_FILE: &str = ".alert-state.json";
 
 /// Categories of predictable infrastructure failure that autocoder alerts on.
 /// Other failure surfaces (executor-`Failed`, reviewer-failed, chatops-post-
@@ -83,8 +95,28 @@ pub struct AlertState {
     pub spec_revision_alerts: HashMap<String, AlertEntry>,
 }
 
+/// `true` when the production state-dir layout is active (i.e. the
+/// daemon has installed its `DaemonPaths` global). When `false`, the
+/// module falls back to a single-file-per-workspace layout — keeps
+/// tests that build workspaces in `TempDir`s working without each one
+/// needing to install paths.
+fn state_dir_layout_active() -> bool {
+    crate::paths::get_global().is_some()
+}
+
+/// Resolve the on-disk path of `<workspace>`'s alert-state file. Uses
+/// the state-dir layout in production and the legacy in-workspace path
+/// in tests that have not installed daemon-paths.
 fn alert_state_path(workspace: &Path) -> PathBuf {
-    workspace.join(ALERT_STATE_FILE)
+    if state_dir_layout_active() {
+        let basename = workspace
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::paths::current().alert_state_path(&basename)
+    } else {
+        workspace.join(LEGACY_ALERT_STATE_FILE)
+    }
 }
 
 impl AlertState {
@@ -111,9 +143,9 @@ impl AlertState {
         }
     }
 
-    /// Atomically persist this state under `<workspace>/.alert-state.json`
-    /// via tempfile-then-rename in the same directory so a torn write can
-    /// never be observed by a concurrent reader.
+    /// Atomically persist this state at the resolved alert-state path
+    /// via tempfile-then-rename in the same directory so a torn write
+    /// can never be observed by a concurrent reader.
     pub fn save(&self, workspace: &Path) -> Result<()> {
         let path = alert_state_path(workspace);
         let parent = path
@@ -192,9 +224,9 @@ mod tests {
             },
         );
         state.save(dir.path()).unwrap();
-        assert!(dir.path().join(".alert-state.json").exists());
+        assert!(alert_state_path(dir.path()).exists());
         AlertState::clear(dir.path()).expect("first clear ok");
-        assert!(!dir.path().join(".alert-state.json").exists());
+        assert!(!alert_state_path(dir.path()).exists());
         // Second clear must also succeed.
         AlertState::clear(dir.path()).expect("second clear ok");
     }
@@ -230,7 +262,7 @@ mod tests {
         assert!(diff < 5, "timestamps must roundtrip within 5ms; diff = {diff}");
 
         // Pin the on-disk JSON key.
-        let raw = std::fs::read_to_string(dir.path().join(".alert-state.json")).unwrap();
+        let raw = std::fs::read_to_string(alert_state_path(dir.path())).unwrap();
         assert!(
             raw.contains("archive_collision"),
             "archive collision must serialize as snake_case `archive_collision`; got: {raw}"
@@ -240,8 +272,8 @@ mod tests {
 
     #[test]
     fn json_keys_use_snake_case_for_categories() {
-        // The spec's `.alert-state.json` shape labels the categories in
-        // snake_case; guard against accidental rename downstream.
+        // The on-disk schema labels the categories in snake_case;
+        // guard against accidental rename downstream.
         let mut state = AlertState::default();
         state.alerts.insert(
             AlertCategory::WorkspaceInitFailure,
@@ -256,4 +288,5 @@ mod tests {
             "json must use snake_case category key; got: {s}"
         );
     }
+
 }

@@ -190,7 +190,44 @@ pub fn ensure_initialized(
             "could not register .needs-spec-revision.json in .git/info/exclude: {e:#}"
         );
     }
+    enforce_alert_state_workspace_invariant(workspace);
     Ok(())
+}
+
+/// Per `a16-consolidate-workspace-bookkeeping-to-state-dir`: post-
+/// migration, the managed workspace SHALL NOT contain a
+/// `.alert-state.json` file. When the migration marker is present and
+/// the file appears anyway (code drift OR a fresh re-clone of a repo
+/// whose history transiently included it), log WARN and remove the
+/// file. When the marker is absent, this check is a no-op — the
+/// first-startup migration in `alert_state_migration::migrate_*`
+/// handles pre-migration workspaces explicitly.
+pub(crate) fn enforce_alert_state_workspace_invariant(workspace: &Path) {
+    let paths = crate::paths::current();
+    let marker = paths
+        .alert_state_dir()
+        .join(crate::alert_state_migration::MIGRATION_MARKER);
+    if !marker.exists() {
+        return;
+    }
+    let in_workspace = workspace.join(crate::alert_state::LEGACY_ALERT_STATE_FILE);
+    if !in_workspace.exists() {
+        return;
+    }
+    tracing::warn!(
+        workspace = %workspace.display(),
+        path = %in_workspace.display(),
+        "alert-state invariant: unexpected `.alert-state.json` in the workspace post-migration \
+         (likely code drift OR a fresh clone of a repo whose history transiently committed it); \
+         removing"
+    );
+    if let Err(e) = std::fs::remove_file(&in_workspace) {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            path = %in_workspace.display(),
+            "alert-state invariant: removing unexpected workspace file failed: {e:#}"
+        );
+    }
 }
 
 /// Inspect a `<workspace>` directory that has no `.git/` and decide

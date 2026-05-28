@@ -1134,8 +1134,12 @@ pub async fn run_pass_through_commits(
     let _cleared = queue::clear_stale_locks(workspace)?;
 
     let dirty = git::status_porcelain(workspace)?;
-    // `.alert-state.json` is autocoder bookkeeping at the workspace root.
-    // It is intentionally untracked; it must not trip the dirty check.
+    // Post-`a16`, alert-state lives in `<state_dir>/alert-state/...`,
+    // outside the workspace, so this filter is a defensive no-op for
+    // normal operation. It still runs to catch transient `.alert-state.json`
+    // files that linger before the first-startup migration completes
+    // (e.g., a fresh re-clone of a repo whose history transiently
+    // included it).
     let dirty_filtered = filter_alert_state_lines(&dirty);
     if !dirty_filtered.is_empty() {
         let dirty_count = dirty_filtered.lines().count();
@@ -2020,8 +2024,9 @@ async fn handle_failure_counter(
 }
 
 /// Post the chatops perma-stuck alert (best-effort, 24h-throttled per
-/// change). The state for this throttle lives in
-/// `.alert-state.json`'s `perma_stuck_alerts` map.
+/// change). The state for this throttle lives in the daemon's
+/// alert-state file (`<state_dir>/alert-state/<basename>.json`) under
+/// its `perma_stuck_alerts` map.
 async fn post_perma_stuck_alert(
     chatops_ctx: Option<&ChatOpsContext>,
     repo: &RepositoryConfig,
@@ -2088,9 +2093,10 @@ async fn post_perma_stuck_alert(
 }
 
 /// Post the chatops spec-needs-revision alert (best-effort, 24h-throttled
-/// per change). State for this throttle lives in `.alert-state.json`'s
-/// `spec_revision_alerts` map. Mirrors `post_perma_stuck_alert` — both
-/// announce operator-action states with the same throttle window.
+/// per change). State for this throttle lives in the daemon's
+/// alert-state file (`<state_dir>/alert-state/<basename>.json`) under
+/// its `spec_revision_alerts` map. Mirrors `post_perma_stuck_alert` —
+/// both announce operator-action states with the same throttle window.
 async fn maybe_post_spec_revision_alert(
     chatops_ctx: Option<&ChatOpsContext>,
     repo: &RepositoryConfig,
@@ -2216,9 +2222,15 @@ fn attempt_dirty_workspace_recovery(workspace: &Path, base_branch: &str) -> Resu
     Ok(())
 }
 
-/// Remove `git status --porcelain` lines that reference the
-/// workspace-root `.alert-state.json` bookkeeping file. The file is
-/// autocoder-owned, intentionally untracked, and never executor output.
+/// Defensive no-op: remove `git status --porcelain` lines that
+/// reference a workspace-root `.alert-state.json` file. Post-`a16` the
+/// file lives in `<state_dir>/alert-state/<basename>.json`, so the
+/// workspace should never contain it AND the helper returns its input
+/// unchanged for normal operation. The helper stays in the polling-
+/// loop code path to absorb transient workspace-root `.alert-state.json`
+/// files (e.g., a fresh re-clone of a repo whose history transiently
+/// committed it before the migration completes). A future spec can
+/// remove the helper after a verification window.
 fn filter_alert_state_lines(porcelain: &str) -> String {
     porcelain
         .lines()

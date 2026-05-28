@@ -173,7 +173,7 @@ WARN workspace=/path/to/ws repo=<url> workspace exists without .git; partial clo
 
 When a tripwire fires, the daemon returns the original "exists but no `.git`" error extended with `(partial cleanup refused: <tripwire>; manual operator inspection required)` and the directory is NOT deleted. Operators inspect the directory and decide manually. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the manual recovery flow.
 
-**Not a tripwire:** `.alert-state.json` at the workspace root. It is daemon-written and will be re-created on the next failure if any, so destroying it is harmless.
+**Not a tripwire:** a stray `.alert-state.json` at the workspace root. As of `a16-consolidate-workspace-bookkeeping-to-state-dir`, alert-throttle state lives at `<state_dir>/alert-state/<workspace-basename>.json` and the workspace SHOULD NOT contain the file at all. If a transient copy appears (e.g. fresh re-clone of a repo whose history transiently committed it before the migration completed), the workspace-init invariant check removes it; destroying it manually is also harmless.
 
 **Re-clone failure classification.** When the re-clone itself fails (the actual transport call after the partial-cleanup decision), the surfaced error feeds into the same mid-iteration classifier described under [Dirty workspace auto-recovery](#dirty-workspace-auto-recovery): transient (network blip, GitHub `5xx`, auth token blip) retries on the next polling tick with a throttled alert, while permanent (config error, missing binary) skips the iteration and fires the operator-inspection alert. See [CHATOPS.md → Throttled failure alerts](CHATOPS.md#throttled-failure-alerts-) for the alert text variants.
 
@@ -647,5 +647,23 @@ See [Reviewer-initiated revisions on Block verdicts](CODE-REVIEW.md#reviewer-ini
 for the full reviewer-side flow, the per-concern decision the reviewer
 makes, and the operator-template migration steps for sites that have
 overridden the default reviewer prompt.
+
+## Migrations
+
+At startup, the daemon checks for one-shot migration markers and runs
+each missing migration before any polling task starts. Marker files are
+written only when a migration completes cleanly; a per-entry failure
+suppresses the marker so the next startup retries.
+
+| Marker | Migration | When it runs | Force re-scan |
+| --- | --- | --- | --- |
+| `<state>/.migration-from-tmp-done` | `state-paths-out-of-tmp` (`a07`) — moves legacy `/tmp/...` workspaces, state files, and run logs into the resolved standard layout (`<cache>/workspaces/`, `<state>/<shape>/`, `<logs>/runs/`). Cross-partition `EXDEV` falls back to copy + delete. | First startup after upgrading to the `a07` build, if any legacy `/tmp/` data is present. | `rm <state>/.migration-from-tmp-done` and restart. |
+| `<state>/alert-state/.migration-from-workspace-done` | `alert-state-from-workspace` (`a16`) — moves any pre-existing `<workspace>/.alert-state.json` into `<state>/alert-state/<workspace-basename>.json`. If both versions exist, the state-dir copy wins. If the workspace file is tracked by git, runs `git rm --cached` + commit + push to the base branch. | First startup after upgrading to the `a16` build. | `rm <state>/alert-state/.migration-from-workspace-done` and restart. |
+
+Both migrations are idempotent (already-migrated workspaces become
+no-ops on re-scan) and per-repo error-tolerant (one failing repo does
+not block the rest). Per-entry failures are logged at ERROR with the
+suggested operator action; `journalctl -u autocoder | grep migration`
+surfaces every line.
 
 ---

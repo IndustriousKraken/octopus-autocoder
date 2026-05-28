@@ -22,7 +22,7 @@ use crate::control_socket::{
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
-use crate::{git, migration, paths, polling_loop, workspace};
+use crate::{alert_state_migration, git, migration, paths, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -76,6 +76,21 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 "legacy /tmp migration: scan failed (daemon continues): {e:#}"
             );
         }
+    }
+
+    // Migrate any pre-existing workspace-rooted `.alert-state.json`
+    // files into the new `<state_dir>/alert-state/<basename>.json`
+    // layout (per `a16`). Errors are per-repo AND non-fatal; the
+    // marker is only written when every repo's outcome was clean. A
+    // failed repo retries on the next daemon start.
+    if let Err(e) = alert_state_migration::migrate_alert_state_from_workspace(
+        &daemon_paths,
+        &cfg.repositories,
+        &cfg.github,
+    ) {
+        tracing::error!(
+            "alert-state migration: scan errored (daemon continues): {e:#}"
+        );
     }
 
     // Reload audit cadence state from `<state_dir>/audit-state/` so

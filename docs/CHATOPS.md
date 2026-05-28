@@ -444,7 +444,7 @@ Emitted at most once every 24 hours per (repository, failure category) for three
 ⚠️ `<repo-url>`: <category-label>. Latest: <error excerpt>
 ```
 
-The 24h throttle state lives in a per-workspace `.alert-state.json` file. On the next successful iteration the file is removed, so a transient outage followed by recovery does not leave the next failure (whenever it occurs) silenced. Other failure surfaces — executor returning `Failed`, reviewer LLM call errors, the chatops post itself failing — are deliberately out of scope and never produce a categorized alert.
+The 24h throttle state lives at `<state_dir>/alert-state/<workspace-basename>.json` (resolved via the daemon's `DaemonPaths.alert_state_path()` helper). The file is outside the managed repository's workspace, so daemon writes never trip the workspace's git checkout / dirty-check / pull operations. On the next successful iteration the file is removed, so a transient outage followed by recovery does not leave the next failure (whenever it occurs) silenced. Other failure surfaces — executor returning `Failed`, reviewer LLM call errors, the chatops post itself failing — are deliberately out of scope and never produce a categorized alert.
 
 **Mid-iteration recovery suffix (a14).** When the failure originates from the mid-iteration recovery path (workspace re-init, `git fetch`, dirty cleanup — see [OPERATIONS.md → Dirty workspace auto-recovery](OPERATIONS.md#dirty-workspace-auto-recovery)), the alert label is followed by a parenthetical naming the classification:
 
@@ -546,11 +546,11 @@ This fires alongside the one-time `🛑 Revision cap reached` PR comment. Subseq
 | --- | --- | --- |
 | `.question.json` | `<workspace>/openspec/changes/<change>/` | AskUser thread + resume handle while a change is waiting on a human answer. |
 | `.answer.json` | `<workspace>/openspec/changes/<change>/` | The operator's reply text, captured on the iteration that resumed the executor. Removed after resume completes. |
-| `.alert-state.json` | `<workspace>/` | 24h-alert throttle window per (repo, failure category) for progress notifications. |
+| `<workspace-basename>.json` | `<state_dir>/alert-state/` | 24h-alert throttle window per (repo, failure category) for progress notifications. **Lives outside the workspace** — see [`STATE-LAYOUT.md`](STATE-LAYOUT.md). |
 
-All three are written atomically (temp-file-then-rename) so they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle — safe to inspect (plain JSON), unsafe to modify by hand. When a change is archived, the directory move takes the change-scoped marker files with it; `.alert-state.json` is cleared whenever the polling pass completes without hitting any of the three predictable-failure sites.
+All three are written atomically (temp-file-then-rename) so they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle — safe to inspect (plain JSON), unsafe to modify by hand. When a change is archived, the directory move takes the change-scoped marker files with it; the alert-state file is cleared whenever the polling pass completes without hitting any of the three predictable-failure sites.
 
-Deleting `.alert-state.json` by hand is harmless: it just resets the alert throttle window for that repository, so the next predictable failure will alert immediately rather than wait out the 24h window.
+Deleting the alert-state file by hand is harmless: it just resets the alert throttle window for that repository, so the next predictable failure will alert immediately rather than wait out the 24h window.
 
 ### Trust boundary
 
