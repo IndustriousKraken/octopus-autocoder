@@ -507,69 +507,48 @@ is configured.
 - **AND** the executor proceeds as normal
 
 ### Requirement: Throttled predictable-failure alerts
-autocoder SHALL emit a ChatOps notification at most once every 24
-hours per (repository, failure category) combination for three
-categories of predictable infrastructure failure:
-`workspace_init_failure`, `branch_push_failure`,
-`pr_creation_failure`. Throttle state SHALL be persisted in a
-per-workspace `.alert-state.json` file and cleared on the next
-successful iteration of the same repository.
+autocoder SHALL emit a ChatOps notification at most once every 24 hours per (repository, failure category) combination for three categories of predictable infrastructure failure: `workspace_init_failure`, `branch_push_failure`, `pr_creation_failure`. Throttle state SHALL be persisted at `<state_dir>/alert-state/<workspace-basename>.json` (resolved via the daemon's `DaemonPaths.alert_state_path()` helper) AND cleared on the next successful iteration of the same repository. The state file lives outside the managed repository's workspace — daemon bookkeeping never appears in the managed repo's working tree, nor in `git status`, nor in any `git checkout` operation's clobber-protection logic.
 
 #### Scenario: First failure in a category alerts immediately
-- **WHEN** any of the three categorized failures occurs in a
-  repository whose `.alert-state.json` has no entry for that category
-  AND `slack.notifications.failure_alerts` is unset OR `true`
-- **THEN** autocoder calls `chatops.post_notification(channel, text)`
-  with category-specific text containing the repo URL, a
-  category label, and a truncated error excerpt (max 200 chars)
-- **AND** on successful post, autocoder writes the category's
-  `last_alerted_at` (current UTC) and `last_error_excerpt` to
-  `.alert-state.json` atomically (tempfile-then-rename)
+- **WHEN** any of the three categorized failures occurs in a repository whose `<state_dir>/alert-state/<basename>.json` has no entry for that category AND `slack.notifications.failure_alerts` is unset OR `true`
+- **THEN** autocoder calls `chatops.post_notification(channel, text)` with category-specific text containing the repo URL, a category label, and a truncated error excerpt (max 200 chars)
+- **AND** on successful post, autocoder writes the category's `last_alerted_at` (current UTC) and `last_error_excerpt` to `<state_dir>/alert-state/<basename>.json` atomically (tempfile-then-rename)
 
 #### Scenario: Repeat failure within 24h is silent
-- **WHEN** a categorized failure occurs in a repository whose
-  `.alert-state.json` has an entry for that category with
-  `last_alerted_at` within the past 24 hours
+- **WHEN** a categorized failure occurs in a repository whose `<state_dir>/alert-state/<basename>.json` has an entry for that category with `last_alerted_at` within the past 24 hours
 - **THEN** no notification is posted for that iteration
-- **AND** `.alert-state.json` is NOT modified
+- **AND** the state file is NOT modified
 
 #### Scenario: Repeat failure beyond 24h re-alerts
-- **WHEN** a categorized failure occurs AND
-  `now - last_alerted_at >= 24h`
-- **THEN** a new notification is posted with the most recent error
-  excerpt
+- **WHEN** a categorized failure occurs AND `now - last_alerted_at >= 24h`
+- **THEN** a new notification is posted with the most recent error excerpt
 - **AND** `last_alerted_at` is updated to the current UTC time
 
 #### Scenario: Success clears alert state
-- **WHEN** an iteration of a repository completes its
-  `run_pass_through_commits` workflow without returning Err
-  (regardless of whether any changes were processed or whether the
-  queue was empty)
-- **THEN** autocoder removes `.alert-state.json` from that
-  repository's workspace (or writes an empty `{ "alerts": {} }` map,
-  equivalent semantics)
+- **WHEN** an iteration of a repository completes its `run_pass_through_commits` workflow without returning Err (regardless of whether any changes were processed or whether the queue was empty)
+- **THEN** autocoder removes `<state_dir>/alert-state/<basename>.json` from disk (or writes an empty `{ "alerts": {} }` map, equivalent semantics)
 - **AND** the next failure of any category re-alerts immediately
 
 #### Scenario: Alert post failure does NOT update state
-- **WHEN** a categorized failure occurs AND the 24h window is open
-  AND `post_notification` itself returns Err
-- **THEN** the failure is logged to stderr including the alert text
-  that would have been posted
-- **AND** `.alert-state.json` is NOT updated (so the next iteration
-  re-attempts the alert immediately)
+- **WHEN** a categorized failure occurs AND the 24h window is open AND `post_notification` itself returns Err
+- **THEN** the failure is logged to stderr including the alert text that would have been posted
+- **AND** the state file is NOT updated (so the next iteration re-attempts the alert immediately)
 
 #### Scenario: Failure-alerts disabled
 - **WHEN** `slack.notifications.failure_alerts` is `false`
-- **THEN** no failure alerts are posted regardless of category or
-  history
-- **AND** `.alert-state.json` is NEITHER read NOR written
+- **THEN** no failure alerts are posted regardless of category or history
+- **AND** the state file is NEITHER read NOR written
 - **AND** the failure still produces the existing stderr log line
 
 #### Scenario: Out-of-scope failures are not alerted
-- **WHEN** an executor returns `Failed` OR the reviewer LLM call
-  fails OR `post_notification` itself fails
-- **THEN** no failure alert is posted (these categories are out of
-  scope for this change)
+- **WHEN** an executor returns `Failed` OR the reviewer LLM call fails OR `post_notification` itself fails
+- **THEN** no failure alert is posted (these categories are out of scope for this change)
+
+#### Scenario: State file never appears in the managed workspace
+- **WHEN** the daemon writes alert-state for any repository
+- **THEN** no file named `.alert-state.json` exists at any path inside the repository's workspace directory
+- **AND** `git status` in the workspace shows no daemon-bookkeeping file (the workspace contains only the repo's tracked content, the daemon's own `.git/info/exclude`-listed in-workspace bookkeeping per other specs, AND any operator-edited uncommitted work)
+- **AND** the daemon's writes never interfere with the workspace's git checkout / dirty-check / pull operations
 
 ### Requirement: Notifications config schema
 autocoder SHALL accept an optional `notifications:` sub-block inside
@@ -1390,33 +1369,82 @@ autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (g
 - **AND** the daemon does NOT start
 
 ### Requirement: Architecture-brightline audit
-autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, and `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds.
+autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, AND `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds.
+
+The audit SHALL load a per-workspace `.brightline-ignore` file (if present) AND apply match-suppression to duplicate-signature findings whose constituent sites are all listed in the ignore file. The audit SHALL also validate ignore entries against the current workspace state AND report stale entries via the chatops top-line (informational; the audit does NOT modify the ignore file itself given its `WritePolicy::None`).
+
+The ignore file's YAML schema:
+
+```yaml
+ignore:
+  - file: <workspace-relative path>
+    function: <function or method name>
+    signature_match: <substring of the function's signature line>
+    reason: <one-line operator-readable explanation>
+```
+
+All four fields are required per entry. An entry with a missing field triggers a WARN log AND the entry is skipped.
+
+Match-suppression rule: a duplicate-signature finding is suppressed in full when EVERY constituent site matches an ignore entry. A partial match (some sites match, some don't) emits the finding with only the unmatched sites listed in the body. No match → the finding is emitted in full (today's behavior).
+
+Stale-entry rule: each ignore entry is validated against the current workspace at audit time. Validation fails when (a) the named file doesn't exist, (b) the file doesn't contain a function with the named name, OR (c) the function's signature no longer contains `signature_match`. The audit collects the stale entries AND adds a trailing clause to the chatops top-line:
+
+```
+📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s); <K> stale ignore entries to clean up
+```
+
+The threaded body lists each stale entry's `file + function + reason` so the operator knows what to remove. The audit does NOT modify `.brightline-ignore` on disk (given `WritePolicy::None`); cleanup is operator-driven.
 
 #### Scenario: Reports files exceeding the size threshold
-- **WHEN** the audit runs AND a tracked file under the
-  repository's source root has more lines than the threshold
-  (default `800`)
-- **THEN** a finding of severity `medium` is included with
-  `subject = "file <path> is <N> lines (threshold: <T>)"` AND
-  `anchor = Some("<path>:1")`
+- **WHEN** the audit runs AND a tracked file under the repository's source root has more lines than the threshold (default `800`)
+- **THEN** a finding of severity `medium` is included with `subject = "file <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:1")`
 
 #### Scenario: Reports identical function signatures across files
-- **WHEN** the audit detects two or more functions with
-  identical name + parameter list signatures in different files
-  (excluding `mod tests {}` blocks)
+- **WHEN** the audit detects two or more functions with identical name + parameter list signatures in different files (excluding `mod tests {}` blocks)
+- **AND** no ignore entry suppresses the finding (see the ignore scenarios below)
 - **THEN** a finding of severity `low` lists each occurrence
 
 #### Scenario: Reports dead public items
-- **WHEN** the audit (or a static-analysis subprocess it invokes)
-  identifies public items with zero references in the
-  repository
+- **WHEN** the audit (or a static-analysis subprocess it invokes) identifies public items with zero references in the repository
 - **THEN** a finding of severity `low` lists the items
 
 #### Scenario: No findings produces silent outcome
-- **WHEN** no metric exceeds its threshold
+- **WHEN** no metric exceeds its threshold AND no ignore entries are stale
 - **THEN** the audit returns `AuditOutcome::Reported(vec![])`
-- **AND** unless `notify_on_clean: true` is set, no chatops
-  message is posted (per the framework-level scenario above)
+- **AND** unless `notify_on_clean: true` is set, no chatops message is posted (per the framework-level scenario)
+
+#### Scenario: Ignore entry suppresses a fully-matching finding
+- **WHEN** a duplicate-signature finding involves 3 sites (file1.ts, file2.ts, file3.ts with function `foo` AND signature substring `async function foo(req`)
+- **AND** `.brightline-ignore` contains entries for all 3 sites with matching `file`, `function`, AND `signature_match`
+- **THEN** the audit does NOT emit the finding
+- **AND** the `<M> duplicate signature(s)` count in the chatops top-line does NOT include this finding
+
+#### Scenario: Partial ignore matches still emit with the unmatched sites
+- **WHEN** a duplicate-signature finding involves 3 sites
+- **AND** `.brightline-ignore` contains entries for 2 of the 3 sites
+- **THEN** the audit emits the finding listing only the 1 unmatched site
+- **AND** the chatops body for that finding names the unmatched site AND notes that 2 sites were suppressed by ignore entries
+
+#### Scenario: Stale ignore entries are reported but not removed
+- **WHEN** `.brightline-ignore` contains an entry for `examples/site-x/auth.ts:handleAuthCallback`
+- **AND** that file has been deleted from the workspace
+- **THEN** the audit marks the entry as stale
+- **AND** the chatops top-line gains the trailing `; <K> stale ignore entries to clean up` clause
+- **AND** the threaded body lists the stale entry with its `file + function + reason`
+- **AND** the audit does NOT modify `.brightline-ignore` on disk
+
+#### Scenario: Malformed entries WARN and are skipped
+- **WHEN** `.brightline-ignore` contains an entry missing the `reason` field
+- **THEN** the audit logs a WARN naming the offending entry AND skips it (treats it as if it didn't exist for the run)
+- **AND** other valid entries continue to apply
+- **AND** the on-disk file is unchanged
+
+#### Scenario: Missing `.brightline-ignore` behaves identically to today
+- **WHEN** the workspace has no `.brightline-ignore` file
+- **THEN** the audit loads an empty ignore list
+- **AND** no suppression occurs
+- **AND** no stale-cleanup clause appears in the chatops output
+- **AND** behavior is byte-identical to pre-spec runs
 
 ### Requirement: Dependency update triage audit
 autocoder SHALL register a `dependency_update_triage` audit in the periodic-audit framework. The audit SHALL list Dependabot pull requests on the bot's fork (or upstream when no fork is configured), classify each by a strict "safe shape" filter, approve the safe ones via the GitHub Reviews API, and report unsafe ones via chatops. The audit is `requires_head_change = false` and `WritePolicy::None`.
@@ -4391,4 +4419,49 @@ This requirement applies to MID-ITERATION recovery only. Startup-time recovery (
 - **WHEN** a workspace is dirty at daemon startup AND recovery fails
 - **THEN** the existing `Dirty workspace auto-recovers at startup` requirement's behavior applies (skip-for-lifetime regardless of classification)
 - **AND** this requirement applies only to mid-iteration recovery
+
+### Requirement: Alert-state migration from workspace to state-dir on first startup
+On the first daemon start after this spec ships, autocoder SHALL migrate any pre-existing `<workspace>/.alert-state.json` files to their corresponding `<state_dir>/alert-state/<basename>.json` paths. The migration SHALL be per-repository AND idempotent. A daemon-wide migration marker `<state_dir>/alert-state/.migration-from-workspace-done` records that the scan ran AND prevents subsequent startups from re-attempting work.
+
+The migration handles three cases per workspace:
+
+1. **Workspace file exists, state-dir file absent**: move the file via `fs::rename` (same-filesystem) or copy + delete (cross-filesystem).
+2. **Both files exist**: the state-dir version wins (more recently authoritative AND survived any prior workspace wipes). Delete the workspace file.
+3. **Workspace file is git-tracked** (rare; only for repos whose history transiently committed it): run `git rm --cached <workspace>/.alert-state.json`, commit with subject `chore: untrack .alert-state.json (now stored in daemon state dir per a16)`, push to the base branch.
+
+The migration runs at daemon startup BEFORE any polling task starts. Errors during migration are per-repository AND non-fatal: if one repository's migration fails (e.g., `git push` rejected due to branch protection), the daemon logs ERROR naming the repository AND the failure mode, continues processing other repositories, AND does NOT set the migration marker. Subsequent startups retry.
+
+#### Scenario: Workspace file moves to state-dir cleanly
+- **WHEN** the daemon starts up AND the migration marker is absent AND a configured repository has `<workspace>/.alert-state.json` (not git-tracked, no state-dir version present)
+- **THEN** the daemon moves the file to `<state_dir>/alert-state/<basename>.json`
+- **AND** logs INFO naming the repository AND the source + destination paths
+- **AND** after all repositories complete, writes the migration marker
+
+#### Scenario: Both-files-exist case prefers state-dir
+- **WHEN** a configured repository has BOTH `<workspace>/.alert-state.json` AND `<state_dir>/alert-state/<basename>.json`
+- **THEN** the daemon deletes the workspace file AND keeps the state-dir version unchanged
+- **AND** logs INFO noting that the state-dir version was preferred
+
+#### Scenario: Git-tracked workspace file is untracked + committed + pushed
+- **WHEN** a configured repository has `<workspace>/.alert-state.json` AND `git ls-files` shows the file tracked
+- **THEN** the migration runs `git rm --cached`, commits with the documented subject, AND pushes to the base branch
+- **AND** the migration treats success as "complete for this repository"
+- **AND** on push failure, the migration logs ERROR with the suggested operator action AND continues to other repositories
+
+#### Scenario: Migration is idempotent via the marker
+- **WHEN** the daemon starts up AND `<state_dir>/alert-state/.migration-from-workspace-done` exists
+- **THEN** the migration code returns immediately without scanning any workspace
+- **AND** the daemon proceeds to its normal startup flow
+
+#### Scenario: Per-repository failure does not set the marker
+- **WHEN** the migration attempts a repository whose `git push` fails
+- **THEN** the daemon logs ERROR with the failure detail AND the operator action
+- **AND** the migration marker is NOT set (so the next startup retries)
+- **AND** other repositories' migrations are unaffected — they continue to attempt AND succeed independently
+
+#### Scenario: No pre-existing workspace files means no-op migration
+- **WHEN** the daemon starts up AND NO configured repository has `<workspace>/.alert-state.json`
+- **THEN** the migration logs INFO noting that no files needed migration
+- **AND** writes the migration marker (recording that the scan ran AND found nothing)
+- **AND** subsequent startups skip the scan
 

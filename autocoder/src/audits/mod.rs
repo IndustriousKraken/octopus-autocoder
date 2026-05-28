@@ -1074,7 +1074,9 @@ pub fn format_audit_notification(
 }
 
 /// Build the per-audit-type top-line string. Documented shapes:
-/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)` —
+///   with an optional trailing `; <K> stale ignore entries to clean up`
+///   clause when the audit detected stale entries in `.brightline-ignore`.
 /// - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
 /// - other audits: generic `📋 <audit_type> on <repo>: <N> finding(s)`
 ///
@@ -1091,10 +1093,16 @@ fn format_audit_top_line(
     }
     match audit_type {
         "architecture_brightline" => {
-            let (files, dupes) = count_brightline_findings(findings);
-            format!(
+            let (files, dupes, stale) = count_brightline_findings(findings);
+            let mut line = format!(
                 "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {dupes} duplicate signature(s)"
-            )
+            );
+            if stale > 0 {
+                line.push_str(&format!(
+                    "; {stale} stale ignore entries to clean up"
+                ));
+            }
+            line
         }
         "drift_audit" => {
             format!(
@@ -1113,21 +1121,27 @@ fn format_audit_top_line(
 
 /// Partition brightline findings by subject shape. Files-over-threshold
 /// subjects start with `"file "` and contain `" lines (threshold:"`;
-/// duplicate-signature subjects start with `"duplicate signature "`.
-/// Any other finding shape falls into neither bucket and is not counted
-/// in either total (the per-finding body still appears in the thread).
-fn count_brightline_findings(findings: &[Finding]) -> (usize, usize) {
+/// duplicate-signature subjects start with `"duplicate signature "`;
+/// stale-ignore-entry subjects start with
+/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any
+/// other finding shape falls into none of the three buckets and is
+/// not counted in any total (the per-finding body still appears in
+/// the thread).
+fn count_brightline_findings(findings: &[Finding]) -> (usize, usize, usize) {
     let mut files = 0usize;
     let mut dupes = 0usize;
+    let mut stale = 0usize;
     for f in findings {
         let s = f.subject.as_str();
-        if s.starts_with("file ") && s.contains(" lines (threshold:") {
+        if s.starts_with(brightline::STALE_IGNORE_SUBJECT_PREFIX) {
+            stale += 1;
+        } else if s.starts_with("file ") && s.contains(" lines (threshold:") {
             files += 1;
         } else if s.starts_with("duplicate signature ") {
             dupes += 1;
         }
     }
-    (files, dupes)
+    (files, dupes, stale)
 }
 
 /// Render the per-finding body the thread reply carries. Same shape as
@@ -1911,6 +1925,20 @@ mod tests {
         }
     }
 
+    fn brightline_stale_finding(file: &str, function: &str, reason: &str) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!(
+                "{prefix}{file} :: {function} — {reason}",
+                prefix = brightline::STALE_IGNORE_SUBJECT_PREFIX,
+            ),
+            body: format!(
+                "file: {file}\nfunction: {function}\nreason: {reason}"
+            ),
+            anchor: None,
+        }
+    }
+
     fn drift_finding(divergence: &str) -> Finding {
         Finding {
             severity: Severity::Medium,
@@ -1961,6 +1989,77 @@ mod tests {
         assert!(
             n.should_thread,
             "10 findings exceed the threshold, must thread"
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_brightline_stale_clause_appears_when_nonzero() {
+        let findings = vec![
+            brightline_file_finding("src/big.rs", 1200),
+            brightline_dup_finding("fn foo"),
+            brightline_stale_finding(
+                "examples/site-x/auth.ts",
+                "handleAuthCallback",
+                "site removed in refactor",
+            ),
+            brightline_stale_finding(
+                "examples/site-y/auth.ts",
+                "handleAuthCallback",
+                "site removed in refactor",
+            ),
+            brightline_stale_finding(
+                "examples/site-z/auth.ts",
+                "handleAuthCallback",
+                "site removed in refactor",
+            ),
+        ];
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.contains("1 file(s) over line threshold"),
+            "top_line should report 1 file: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 duplicate signature(s)"),
+            "top_line should report 1 dupe: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("3 stale ignore entries to clean up"),
+            "top_line should include the stale clause: {}",
+            n.top_line
+        );
+        // Stale entries' subject + reason appear in the threaded body.
+        assert!(
+            n.thread_body.contains("examples/site-x/auth.ts"),
+            "thread_body should name the stale file: {}",
+            n.thread_body
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_brightline_no_stale_clause_when_zero() {
+        let findings = vec![
+            brightline_file_finding("src/big.rs", 1200),
+            brightline_dup_finding("fn foo"),
+        ];
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            !n.top_line.contains("stale ignore"),
+            "no stale entries → no clause: {}",
+            n.top_line
         );
     }
 

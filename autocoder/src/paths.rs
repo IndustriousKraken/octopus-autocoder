@@ -116,6 +116,20 @@ impl DaemonPaths {
         self.state.join("audit-state")
     }
 
+    /// `<state>/alert-state/` — per-workspace alert-throttle state. One
+    /// file per workspace, named `<workspace-basename>.json`. The
+    /// daemon-wide migration marker `.migration-from-workspace-done`
+    /// also lives directly under this directory.
+    pub fn alert_state_dir(&self) -> PathBuf {
+        self.state.join("alert-state")
+    }
+
+    /// `<state>/alert-state/<workspace_basename>.json` — alert-throttle
+    /// state file for the named workspace.
+    pub fn alert_state_path(&self, workspace_basename: &str) -> PathBuf {
+        self.alert_state_dir().join(format!("{workspace_basename}.json"))
+    }
+
     /// `<logs>/runs/<basename>/` — per-change run logs for the named
     /// workspace.
     pub fn run_logs_dir(&self, workspace_basename: &str) -> PathBuf {
@@ -645,6 +659,11 @@ mod tests {
         );
         assert_eq!(p.revisions_dir(), PathBuf::from("/srv/state/revisions"));
         assert_eq!(p.audit_state_dir(), PathBuf::from("/srv/state/audit-state"));
+        assert_eq!(p.alert_state_dir(), PathBuf::from("/srv/state/alert-state"));
+        assert_eq!(
+            p.alert_state_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/alert-state/github_com_owner_repo.json")
+        );
         assert_eq!(
             p.run_logs_dir("github_com_owner_repo"),
             PathBuf::from("/srv/logs/runs/github_com_owner_repo")

@@ -55,6 +55,18 @@ per-state-shape helpers — `audit_threads_dir()`, `busy_markers_dir()`,
 `workspaces_dir()`, `control_socket_path()` — that callers use instead
 of constructing paths inline.
 
+### State-dir subdirectories
+
+| Subdirectory                | Contents                                                                                           |
+|-----------------------------|----------------------------------------------------------------------------------------------------|
+| `<state>/audit-state/`      | Per-audit-type cadence + last-run state, one `<audit-type>.json` per registered audit.             |
+| `<state>/alert-state/`      | Per-workspace alert-throttle state, one `<workspace-basename>.json` per managed repository. Holds the daemon-wide `.migration-from-workspace-done` marker for the `a16` migration. |
+| `<state>/failure-state/`    | Per-(repo, change) failure counters that drive perma-stuck detection.                              |
+| `<state>/revisions/`        | Per-PR reviewer-revision state.                                                                    |
+| `<state>/audit-threads/`    | Per-`thread_ts` state files for the `audit-reply-acts` (send-it) flow.                             |
+| `<state>/proposal-requests/`| Per-`request_id` state files for the chat-request-triage (propose) flow.                           |
+| `<state>/changelog-requests/`| Per-`request_id` state files for the changelog-stylist flow.                                      |
+
 The rule exists to prevent a defect class where readers and writers
 drift to different paths after the legacy-to-standard migration.
 Operator-visible symptoms of the defect class (now fixed by `a09`):
@@ -115,6 +127,47 @@ manually with the same paths listed above.
 To force a re-scan after restoring legacy data from backup, remove
 `<state>/.migration-from-tmp-done` and restart the daemon.
 
+## Alert-state migration from workspace (a16)
+
+Pre-`a16`, alert-throttle state lived at `<workspace>/.alert-state.json`.
+That daemon-written file appearing inside the managed repo's working
+tree caused operator-visible failures: `git checkout` aborts on tracked-
+but-modified `.alert-state.json`, `WritePolicy::None` audits saw the
+daemon's own write as a violation, and the canonical spec was internally
+contradictory about the file's location. The principled fix moved the
+file to `<state>/alert-state/<workspace-basename>.json`.
+
+On the first daemon start after upgrade — detected by the absence of
+`<state>/alert-state/.migration-from-workspace-done` — the daemon walks
+every configured repository and:
+
+1. If the workspace has no `.alert-state.json`, no-op.
+2. If both the workspace and state-dir versions exist, the state-dir
+   version wins (more recently authoritative); the workspace copy is
+   removed.
+3. If only the workspace version exists, `fs::rename` moves it to
+   `<state>/alert-state/<workspace-basename>.json` (cross-partition
+   `EXDEV` falls back to copy + delete).
+4. If the workspace file is tracked by git (`git ls-files --error-unmatch`
+   succeeds), the daemon runs `git rm --cached`, commits with subject
+   `chore: untrack .alert-state.json (now stored in daemon state dir per a16)`,
+   and pushes to the base branch using the same token + auth path as
+   normal autocoder pushes.
+
+Per-repo failures (push rejected by branch protection, etc.) are logged
+at ERROR with the suggested operator action (manual `git rm --cached`
++ PR) and the daemon continues to other repositories. The marker is
+written only when every repo's outcome was clean; otherwise the next
+startup retries every repo (idempotent reads on already-migrated repos).
+
+The workspace-init step also enforces an invariant: if the migration
+marker is present AND a `.alert-state.json` appears in the workspace
+later (code drift, or a fresh re-clone of a repo whose history
+transiently included it), the daemon logs WARN and removes the file.
+
+To force a re-scan, remove `<state>/alert-state/.migration-from-workspace-done`
+and restart the daemon.
+
 ## Workspace-local markers (stay in the workspace)
 
 The workspace move to `<cache>/workspaces/` automatically preserves
@@ -124,8 +177,15 @@ every operator-meaningful in-tree file:
 - `.needs-spec-revision.json` — operator action: edit the spec, then
   delete to retry.
 - `.question.json` / `.answer.json` — askuser flow state.
-- `.alert-state.json` — throttle window for chatops alerts.
 - `.in-progress*` — per-iteration progress markers.
+
+`.alert-state.json` is **no longer** a workspace-local file. Per
+`a16-consolidate-workspace-bookkeeping-to-state-dir`, alert-throttle
+state lives at `<state>/alert-state/<workspace-basename>.json` so the
+daemon's writes never appear inside the managed repository's working
+tree (and never trip `git checkout` / dirty-check). The first-startup
+migration described below moves any pre-existing workspace-rooted
+files automatically.
 
 These continue to live inside the workspace directory because they
 are operator-visible artefacts inside the change's directory (or at

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod alert_state;
+mod alert_state_migration;
 mod alerts;
 mod audits;
 mod busy_marker;

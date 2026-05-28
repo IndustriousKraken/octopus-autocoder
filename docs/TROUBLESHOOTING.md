@@ -572,3 +572,41 @@ The next polling iteration acquires a fresh marker and proceeds normally.
 **Why this used to happen.** Before `a08-busy-marker-recovery-semantics`, the marker classification logic gated dead-PID recovery on the marker's age exceeding `executor.timeout_secs + 600`. An operator who had bumped `timeout_secs` to e.g. 5400 (90 minutes for a long-running change) saw repos with daemon-restart-leftover markers stay stuck for up to 100 minutes before recovery fired — even though `/proc/<pid>` confirmed the recorded process was long gone.
 
 **What the fix changes.** Dead-PID recovery now fires IMMEDIATELY in the classification logic, with no age check. The `recovery_eligible=true` in the log line above confirms the next iteration WILL recover the marker — under the new behavior, that next iteration happens within a few seconds (it's still gated on the polling cadence) and resolves the symptom on its own. Operators on the fixed build do not need to manually delete the marker for the daemon-restart case.
+
+## `git checkout` fails with "local changes to `.alert-state.json`"
+
+**Symptom.** A polling iteration logs an error containing one of:
+
+```
+error: Your local changes to the following files would be overwritten by checkout:
+        .alert-state.json
+```
+
+```
+error: The following untracked working tree files would be overwritten by checkout:
+        .alert-state.json
+```
+
+The iteration fails on `recreate_branch` (which runs `git checkout -B <agent_branch>`) and the repo never progresses.
+
+**Root cause.** Pre-`a16-consolidate-workspace-bookkeeping-to-state-dir`, the daemon wrote alert-throttle state at `<workspace>/.alert-state.json` — directly inside the managed repository's working tree. `git checkout` saw the daemon's writes as either uncommitted modifications (when the file was tracked) or as an untracked-clobber risk (when it wasn't), and aborted to protect them. The daemon then failed the iteration.
+
+**Automatic fix.** Upgrade to a build that ships `a16`. On the next daemon startup, the first-startup migration (`alert-state-from-workspace`, see [OPERATIONS.md → Migrations](OPERATIONS.md#migrations)) moves `<workspace>/.alert-state.json` to `<state_dir>/alert-state/<workspace-basename>.json` and removes the workspace copy. The workspace will not contain the file again — the daemon writes to the state-dir path going forward, so subsequent `git checkout` operations never see it. Tracked-in-git copies are handled by `git rm --cached` + commit + push to the base branch (per-repo failure: branch protection rejection → ERROR log + manual operator action; the marker stays unset so the next startup retries).
+
+**Immediate fix for operators stuck on a pre-`a16` build.** Until you can upgrade:
+
+```bash
+# Stop the daemon so it does not race the cleanup.
+sudo systemctl stop autocoder
+
+# In every affected workspace, remove the file. (If the file is tracked
+# in git, also run `git rm --cached .alert-state.json` and commit + push
+# the removal to the base branch.)
+for ws in /var/cache/autocoder/workspaces/*; do
+  rm -f "$ws/.alert-state.json"
+done
+
+sudo systemctl start autocoder
+```
+
+The next polling iteration recreates the alert-throttle state on demand the first time a categorized failure fires — there is no operator-meaningful data loss; the file holds only the 24h throttle window.
