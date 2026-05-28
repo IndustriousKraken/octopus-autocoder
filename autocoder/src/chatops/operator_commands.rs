@@ -211,6 +211,25 @@ pub enum OperatorCommand {
         repo_substring: String,
         change: String,
     },
+    /// `@<bot> ignore-and-continue <repo-substring> <change-slug>` — stamps
+    /// `.ignore-for-queue.json` alongside an existing blocking marker
+    /// (`.perma-stuck.json` OR `.needs-spec-revision.json`). The marker
+    /// downgrades the change's blocking effect on its siblings: the
+    /// change stays excluded from `list_pending`, but the queue resumes
+    /// processing subsequent pending changes.
+    IgnoreAndContinue {
+        repo_substring: String,
+        change: String,
+    },
+    /// `@<bot> clear-ignore <repo-substring> <change-slug>` — removes the
+    /// `.ignore-for-queue.json` marker (without touching the underlying
+    /// blocking marker). The queue resumes blocking on the original
+    /// marker until the operator resolves it (`clear-perma-stuck` /
+    /// `clear-revision`).
+    ClearIgnore {
+        repo_substring: String,
+        change: String,
+    },
     WipeWorkspace {
         repo_substring: String,
     },
@@ -388,6 +407,36 @@ fn parse_command_outcome_in_thread(
                 return ParseOutcome::Invalid(invalid_change_slug_reply());
             }
             ParseOutcome::Ok(OperatorCommand::ClearRevision {
+                repo_substring: rest[0].to_string(),
+                change: rest[1].to_string(),
+            })
+        }
+        "ignore-and-continue" => {
+            if rest.len() != 2 {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::IgnoreAndContinue {
+                repo_substring: rest[0].to_string(),
+                change: rest[1].to_string(),
+            })
+        }
+        "clear-ignore" => {
+            if rest.len() != 2 {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::ClearIgnore {
                 repo_substring: rest[0].to_string(),
                 change: rest[1].to_string(),
             })
@@ -848,6 +897,14 @@ pub struct MarkerEntry {
     /// Free-form detail for the marker (e.g. `consecutive_failures: 2`).
     /// Omitted from the reply when empty.
     pub detail: String,
+    /// True when an accompanying `.ignore-for-queue.json` marker is
+    /// present alongside this blocking marker. The status formatter
+    /// uses this flag to annotate the marker line with
+    /// `(ignore-for-queue: yes — queue not blocked)`. Defaults to false
+    /// so older daemons (pre-`a18`) serialize compatibly with newer
+    /// chatops formatters.
+    #[serde(default)]
+    pub has_ignore_for_queue: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -897,6 +954,18 @@ fn format_commit_summary(summary: Option<&CommitSummary>) -> String {
             )
         }
         None => "(none)".to_string(),
+    }
+}
+
+/// Return the trailing annotation for an active-markers line when
+/// `.ignore-for-queue.json` is paired with the underlying blocking
+/// marker. Returns an empty string when no annotation is needed so the
+/// caller can unconditionally append the result.
+fn ignore_annotation(has_ignore_for_queue: bool) -> &'static str {
+    if has_ignore_for_queue {
+        " (ignore-for-queue: yes — queue not blocked)"
+    } else {
+        ""
     }
 }
 
@@ -956,13 +1025,14 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         for m in &resp.perma_stuck_changes {
             let age = human_age_since(m.marked_at);
             let change = slack_escape(&m.change);
+            let annotation = ignore_annotation(m.has_ignore_for_queue);
             if m.detail.is_empty() {
                 out.push_str(&format!(
-                    "  • {change} (.perma-stuck.json — marked {age} ago)\n"
+                    "  • {change} (.perma-stuck.json — marked {age} ago){annotation}\n"
                 ));
             } else {
                 out.push_str(&format!(
-                    "  • {change} (.perma-stuck.json — {}, marked {age} ago)\n",
+                    "  • {change} (.perma-stuck.json — {}, marked {age} ago){annotation}\n",
                     m.detail
                 ));
             }
@@ -970,8 +1040,9 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         for m in &resp.revision_marked_changes {
             let age = human_age_since(m.marked_at);
             let change = slack_escape(&m.change);
+            let annotation = ignore_annotation(m.has_ignore_for_queue);
             out.push_str(&format!(
-                "  • {change} (.needs-spec-revision.json — marked {age} ago)\n"
+                "  • {change} (.needs-spec-revision.json — marked {age} ago){annotation}\n"
             ));
         }
     }
@@ -1307,6 +1378,8 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `status` (no repo) — list every watched repository with queue summary, busy state, and last-iteration time. Use `status <repo>` for the per-repo detail.\n");
     out.push_str("  • `clear-perma-stuck <repo> <change>` — clear `.perma-stuck.json` for a change\n");
     out.push_str("  • `clear-revision <repo> <change>` — clear `.needs-spec-revision.json` for a change\n");
+    out.push_str("  • `ignore-and-continue <repo> <change>` — skip a broken change AND let siblings proceed (stamps `.ignore-for-queue.json`)\n");
+    out.push_str("  • `clear-ignore <repo> <change>` — remove `.ignore-for-queue.json`; queue resumes blocking on the original marker\n");
     out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `confirm` (60s TTL)\n");
     out.push_str("  • `confirm` — second step for `wipe-workspace` (same channel, within 60s)\n");
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
@@ -1742,7 +1815,8 @@ impl OperatorCommandDispatcher {
                 .await,
             ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
-                self.dispatch(cmd, channel_id, repositories, submitter).await,
+                self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
+                    .await,
             )),
             ParseOutcome::None => None,
             ParseOutcome::Invalid(reply) => Some(reply),
@@ -1753,6 +1827,7 @@ impl OperatorCommandDispatcher {
         &self,
         cmd: OperatorCommand,
         channel_id: &str,
+        operator_user: Option<&str>,
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> String {
@@ -1804,10 +1879,24 @@ impl OperatorCommandDispatcher {
                     }))
                     .await;
                 if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    format!(
-                        "✓ cleared .perma-stuck.json for {change} on {}",
-                        short_repo_label(&repo.url)
-                    )
+                    // The control-socket response carries
+                    // `removed_ignore_for_queue: bool` so the chatops
+                    // reply can name both removals when a companion
+                    // `.ignore-for-queue.json` was also present.
+                    let removed_ignore = resp
+                        .get("removed_ignore_for_queue")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if removed_ignore {
+                        format!(
+                            "✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for {change}."
+                        )
+                    } else {
+                        format!(
+                            "✓ cleared .perma-stuck.json for {change} on {}",
+                            short_repo_label(&repo.url)
+                        )
+                    }
                 } else {
                     let err = resp
                         .get("error")
@@ -1838,6 +1927,77 @@ impl OperatorCommandDispatcher {
                     format!(
                         "✓ cleared .needs-spec-revision.json for {change} on {}",
                         short_repo_label(&repo.url)
+                    )
+                } else {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    format!("✗ {err}")
+                }
+            }
+            OperatorCommand::IgnoreAndContinue {
+                repo_substring,
+                change,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                // Resolve a marked_by identifier — the chatops envelope's
+                // operator user id, or a generic fallback for command
+                // sources (CLI / test) that don't carry one.
+                let marked_by = operator_user.unwrap_or("operator").to_string();
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "ignore_for_queue_marker",
+                        "url": repo.url,
+                        "change": change,
+                        "marked_by": marked_by,
+                    }))
+                    .await;
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    format!(
+                        "✓ Marked {change} as ignored for queue. \
+                         Subsequent changes will process; {change} stays excluded \
+                         until the underlying marker is cleared."
+                    )
+                } else {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    format!("✗ {err}")
+                }
+            }
+            OperatorCommand::ClearIgnore {
+                repo_substring,
+                change,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "clear_ignore_for_queue_marker",
+                        "url": repo.url,
+                        "change": change,
+                    }))
+                    .await;
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let underlying = resp
+                        .get("underlying_marker")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("the underlying marker");
+                    format!(
+                        "✓ Cleared ignore-for-queue on {change}. Queue resumes blocking on {underlying}."
                     )
                 } else {
                     let err = resp
@@ -2872,6 +3032,47 @@ mod tests {
                 change: "a07-bar".into(),
             }
         );
+    }
+
+    #[test]
+    fn parse_ignore_and_continue_happy_path() {
+        let cmd = parse_command(
+            &format!("{BOT} ignore-and-continue myrepo a07-foo"),
+            BOT,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::IgnoreAndContinue {
+                repo_substring: "myrepo".into(),
+                change: "a07-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_ignore_happy_path() {
+        let cmd =
+            parse_command(&format!("{BOT} clear-ignore myrepo a07-foo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearIgnore {
+                repo_substring: "myrepo".into(),
+                change: "a07-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_ignore_and_continue_missing_args_returns_none() {
+        assert!(parse_command(&format!("{BOT} ignore-and-continue myrepo"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} ignore-and-continue"), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_clear_ignore_missing_args_returns_none() {
+        assert!(parse_command(&format!("{BOT} clear-ignore myrepo"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} clear-ignore"), BOT).is_none());
     }
 
     #[test]
@@ -4085,6 +4286,7 @@ mod tests {
                 change: "a06-foo".into(),
                 marked_at: Utc::now() - chrono::Duration::hours(1),
                 detail: String::new(),
+                has_ignore_for_queue: false,
             }],
             ..RepoStatusResponse::default()
         };
@@ -4107,11 +4309,13 @@ mod tests {
                 change: "a06-foo".into(),
                 marked_at: Utc::now() - chrono::Duration::hours(4),
                 detail: "consecutive_failures: 2".into(),
+                has_ignore_for_queue: false,
             }],
             revision_marked_changes: vec![MarkerEntry {
                 change: "a07-bar".into(),
                 marked_at: Utc::now() - chrono::Duration::minutes(22),
                 detail: String::new(),
+                has_ignore_for_queue: false,
             }],
             ..RepoStatusResponse::default()
         };
@@ -4128,6 +4332,70 @@ mod tests {
         assert!(
             out.contains("queue: 0 pending, 0 waiting, 2 excluded"),
             "small queue + 2 excluded must use one-liner form: {out}"
+        );
+    }
+
+    /// a18: When a perma-stuck marker is paired with `.ignore-for-queue.json`,
+    /// the status reply's active-markers line gains the annotation
+    /// "(ignore-for-queue: yes — queue not blocked)".
+    #[test]
+    fn format_status_annotates_ignored_perma_stuck_marker() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            perma_stuck_changes: vec![MarkerEntry {
+                change: "a07-foo".into(),
+                marked_at: Utc::now() - chrono::Duration::hours(1),
+                detail: String::new(),
+                has_ignore_for_queue: true,
+            }],
+            revision_marked_changes: vec![MarkerEntry {
+                change: "a09-bar".into(),
+                marked_at: Utc::now() - chrono::Duration::minutes(10),
+                detail: String::new(),
+                has_ignore_for_queue: false,
+            }],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        // The annotated line names the ignored change AND the annotation.
+        let lines: Vec<&str> = out.lines().collect();
+        let annotated = lines
+            .iter()
+            .find(|l| l.contains("a07-foo"))
+            .expect("a07-foo line must be present");
+        assert!(
+            annotated.contains("(ignore-for-queue: yes — queue not blocked)"),
+            "annotated line must carry the ignore-for-queue annotation: {annotated}"
+        );
+        // The non-annotated line does NOT carry the annotation.
+        let bare = lines
+            .iter()
+            .find(|l| l.contains("a09-bar"))
+            .expect("a09-bar line must be present");
+        assert!(
+            !bare.contains("ignore-for-queue"),
+            "unaccompanied line must NOT carry the annotation: {bare}"
+        );
+    }
+
+    /// a18: When no `.ignore-for-queue.json` accompanies any marker, the
+    /// status reply omits the annotation from every line.
+    #[test]
+    fn format_status_no_annotation_when_ignore_marker_absent() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            perma_stuck_changes: vec![MarkerEntry {
+                change: "a07-foo".into(),
+                marked_at: Utc::now(),
+                detail: String::new(),
+                has_ignore_for_queue: false,
+            }],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            !out.contains("ignore-for-queue"),
+            "no marker present → no annotation: {out}"
         );
     }
 
@@ -4162,6 +4430,8 @@ mod tests {
             "status",
             "clear-perma-stuck",
             "clear-revision",
+            "ignore-and-continue",
+            "clear-ignore",
             "wipe-workspace",
             "rebuild-specs",
             "help",
@@ -4349,6 +4619,121 @@ mod tests {
             calls[0]["url"], "git@github.com:acme/myrepo.git"
         );
         assert_eq!(calls[0]["change"], "a06-foo");
+    }
+
+    #[tokio::test]
+    async fn dispatch_ignore_and_continue_submits_action_and_replies_success() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("ignore_for_queue_marker", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} ignore-and-continue myrepo a07-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"));
+        assert!(text.contains("a07-foo"));
+        assert!(text.contains("ignored for queue"));
+        assert!(text.contains("stays excluded"));
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "ignore_for_queue_marker");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["change"], "a07-foo");
+        assert!(calls[0].get("marked_by").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_ignore_and_continue_refuses_with_no_underlying_marker() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "ignore_for_queue_marker",
+            serde_json::json!({
+                "ok": false,
+                "error": "a07-foo has no operator-action marker (perma-stuck OR needs-spec-revision). Ignore is a no-op; rejecting to prevent confusion.",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} ignore-and-continue myrepo a07-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"));
+        assert!(text.contains("no operator-action marker"));
+        assert!(text.contains("a07-foo"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_ignore_submits_action_and_replies_success() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "clear_ignore_for_queue_marker",
+            serde_json::json!({
+                "ok": true,
+                "underlying_marker": ".perma-stuck.json",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-ignore myrepo a07-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"));
+        assert!(text.contains("a07-foo"));
+        assert!(text.contains("Cleared ignore-for-queue"));
+        assert!(text.contains(".perma-stuck.json"));
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "clear_ignore_for_queue_marker");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["change"], "a07-foo");
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_ignore_refuses_when_no_marker_exists() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "clear_ignore_for_queue_marker",
+            serde_json::json!({
+                "ok": false,
+                "error": "no ignore-for-queue marker for change `a07-foo`",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-ignore myrepo a07-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"));
+        assert!(text.contains("no ignore-for-queue marker"));
+        assert!(text.contains("a07-foo"));
     }
 
     #[tokio::test]
@@ -4922,6 +5307,7 @@ mod tests {
                 change: "audit-proposal-created-notification".into(),
                 marked_at: Utc::now(),
                 detail: String::new(),
+                has_ignore_for_queue: false,
             }],
             revision_marked_changes: vec![],
             ..RepoStatusResponse::default()
@@ -4959,6 +5345,7 @@ mod tests {
                 change: "needs-revising-thing".into(),
                 marked_at: Utc::now(),
                 detail: String::new(),
+                has_ignore_for_queue: false,
             }],
             ..RepoStatusResponse::default()
         };

@@ -290,13 +290,34 @@ The chatops alert names the repo, change, count, and a truncated `last_reason`, 
 
 To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
 
+**Queue-blocking behavior (a18).** A `.perma-stuck.json` marker does more than exclude the affected change: it ALSO halts the queue walk for subsequent pending changes in the same repository. This is the same blocking semantic that already applies to `.needs-spec-revision.json` and AskUser (`.question.json`) markers — the four marker categories that gate the queue are enumerated under [Queue-blocking policy](#queue-blocking-policy). The reason: stacked changes (the common autocoder pattern) frequently reference symbols a prior change introduces, so blasting through the queue after a perma-stuck would burn tokens against changes that cannot land.
+
+**Escape hatch: `ignore-and-continue`.** When the operator knows a particular perma-stuck (or needs-spec-revision) change is independent of its siblings — they happen to be on the same queue but don't depend on each other — they can run `@<bot> ignore-and-continue <repo> <change>` to stamp `.ignore-for-queue.json` alongside the underlying marker. The change stays excluded from `list_pending` (it's still broken), but siblings resume processing. Reverse with `@<bot> clear-ignore <repo> <change>`. Resolving the original problem with `@<bot> clear-perma-stuck <repo> <change>` removes BOTH files automatically. See [CHATOPS.md → operator recovery commands](CHATOPS.md#operator-recovery-commands) for verb syntax and example replies.
+
 See also [Spec marked as needing revision](#spec-marked-as-needing-revision) — its sibling pattern for the case where the operator (not the agent) is the one with work to do.
+
+## Queue-blocking policy
+
+autocoder treats the following per-change marker categories as queue-blocking — when any change in `openspec/changes/<slug>/` has one of these markers AND does NOT also have `.ignore-for-queue.json`, the polling loop halts the queue walk for the iteration:
+
+1. **`.question.json` (AskUser waiting).** The agent has posted a question to the operator and is awaiting a reply. Resumed via `@<bot> send it` or by replying in the chatops thread; cleared when the resume completes.
+2. **`.needs-spec-revision.json`.** Either the agent flagged unimplementable tasks OR the a17 pre-flight check rejected an unarchivable spec delta. Cleared via `@<bot> clear-revision <repo> <change>` (or by deleting the file directly).
+3. **`.perma-stuck.json`.** The change has hit `executor.perma_stuck_after_failures` consecutive failures. Cleared via `@<bot> clear-perma-stuck <repo> <change>` (which also removes any accompanying `.ignore-for-queue.json`).
+4. **Future extension markers.** Any new operator-action category future specs add SHOULD be added to this list AND honor the `.ignore-for-queue.json` downgrade contract.
+
+**Downgrade marker.** `.ignore-for-queue.json` accompanies any of the above and downgrades the change's blocking effect from "halt subsequent pending changes" to "still excluded from `list_pending` but siblings proceed." It is the operator's explicit "I know this one's broken; skip it AND keep going with the rest" signal — see [Perma-stuck change detection](#perma-stuck-change-detection) for the operator workflow and [CHATOPS.md](CHATOPS.md#operator-recovery-commands) for the verb syntax.
 
 ## Spec marked as needing revision
 
 Sibling pattern to [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). Where perma-stuck signals "the agent kept failing on this change," needs-spec-revision signals "the spec is asking the agent to do something it cannot do." Both are operator-action states; both are cleared by deleting the marker file.
 
-**What triggers it.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`, posts a chatops alert under `AlertCategory::SpecNeedsRevision` (same 24-hour throttle as perma-stuck), and halts the queue walk for the iteration.
+**What triggers it.** Two independent code paths can write this marker:
+
+1. **Agent-detected unimplementable tasks.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` with `unimplementable_tasks` populated and halts the queue walk.
+
+2. **Pre-flight spec-delta archivability check (a17).** Before invoking the executor, autocoder parses each `specs/<capability>/spec.md` in the change and verifies every `## ADDED Requirements` / `## MODIFIED Requirements` / `## REMOVED Requirements` / `## RENAMED Requirements` block's `### Requirement:` headers against the canonical `openspec/specs/<capability>/spec.md`. The four delta kinds enforce: ADDED title must NOT exist in canonical (catching duplicate-add); MODIFIED title MUST exist (catching the a07 class of bug where an invented title was used); REMOVED title MUST exist; RENAMED `from:` title MUST exist, `to:` title MUST NOT exist. On any precondition violation, autocoder writes the marker with `unarchivable_deltas` populated, posts the chatops alert, and halts the queue — the executor is never invoked. **Principal cost savings:** no LLM call against a change whose deltas would abort `openspec archive` later anyway. The marker's `revision_suggestion` is auto-generated and names exactly which deltas need to be fixed.
+
+Both code paths share the same `AlertCategory::SpecNeedsRevision` throttle (24-hour, same as perma-stuck) and the same operator-clears-the-marker recovery shape. The marker schema accommodates either (or both) populations: `unimplementable_tasks` for the agent-detected path, `unarchivable_deltas` for the pre-flight path.
 
 The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves the project invariant that no AI process edits its own marching orders without human review.
 
@@ -309,10 +330,15 @@ The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves th
   "unimplementable_tasks": [
     {"task_id": "5.2", "task_text": "...", "reason": "..."}
   ],
-  "revision_suggestion": "free-form text the agent wrote describing what to change",
-  "operator_action": "Edit openspec/changes/<change>/tasks.md to remove or revise the flagged tasks, commit + push, then delete this marker file."
+  "unarchivable_deltas": [
+    {"capability": "code-reviewer", "kind": "Modified", "header": "Reviewer prompt budget is operator-configurable", "reason": "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)"}
+  ],
+  "revision_suggestion": "free-form text describing what to change (auto-generated for the pre-flight path)",
+  "operator_action": "Edit openspec/changes/<change>/(tasks.md OR specs/<capability>/spec.md), commit + push, then clear this marker (via @<bot> clear-revision <repo> <change> or by deleting the file directly)."
 }
 ```
+
+`unimplementable_tasks` and `unarchivable_deltas` are both optional (each elided from the JSON when empty). Pre-spec markers with only `unimplementable_tasks` continue to deserialize unchanged.
 
 The marker is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check and survives `git clean -fd` during per-iteration recovery (same treatment as `.perma-stuck.json`).
 

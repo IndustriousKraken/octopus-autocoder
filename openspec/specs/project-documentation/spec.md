@@ -589,3 +589,38 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **THEN** the section enumerates every daemon-side migration marker, including the existing `state-paths-out-of-tmp` migration AND the new `alert-state-from-workspace` migration
 - **AND** each entry names the marker file's path, when the migration runs, what it migrates, AND how to force a re-scan (remove the marker)
 
+### Requirement: OPERATIONS.md and TROUBLESHOOTING.md document the spec-delta pre-flight and the unarchivable-deltas marker shape
+`docs/OPERATIONS.md`'s "Spec marked as needing revision" section SHALL be extended with a paragraph describing the new pre-flight failure mode (unarchivable spec deltas) AND the extended marker schema. `docs/TROUBLESHOOTING.md` SHALL include a new entry naming the specific archive-time error this pre-flight prevents.
+
+#### Scenario: OPERATIONS.md describes the new failure mode
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s "Spec marked as needing revision" section
+- **THEN** a paragraph names the pre-flight check, the four delta kinds it validates, AND the `unarchivable_deltas` field in the marker schema
+- **AND** the paragraph explains the recovery workflow: edit the spec on the operator's machine, push to the base branch, `@<bot> clear-revision <repo> <change>` from chat
+- **AND** the paragraph notes that the marker's `revision_suggestion` field is auto-generated AND names exactly which deltas need to be fixed
+
+#### Scenario: TROUBLESHOOTING.md replaces a known operator-pain-point entry
+- **WHEN** an operator reads `docs/TROUBLESHOOTING.md`
+- **THEN** an entry titled "openspec archive aborts with 'MODIFIED failed for header'" exists
+- **AND** the entry contrasts pre-a17 behavior (archive failed late; LLM cost wasted; change perma-stuck) with post-a17 behavior (pre-flight catches the issue early; no LLM cost; needs-spec-revision marker written immediately with actionable diagnostic)
+- **AND** the entry references the marker's `unarchivable_deltas` array as the canonical place to find what's wrong
+
+### Requirement: OPERATIONS.md and CHATOPS.md document the queue-blocking change and the ignore verbs
+`docs/OPERATIONS.md`'s "Perma-stuck change detection" section SHALL describe the new queue-blocking behavior. `docs/OPERATIONS.md` SHALL also include a Queue-blocking-policy section (or extend the existing one) enumerating every marker that blocks the queue AND noting that `.ignore-for-queue.json` downgrades any of them. `docs/CHATOPS.md`'s operator-recovery-commands section SHALL document the two new verbs (`ignore-and-continue` AND `clear-ignore`) with example reply shapes.
+
+#### Scenario: OPERATIONS.md perma-stuck section names the new queue-blocking behavior
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s perma-stuck section
+- **THEN** a paragraph describes the new behavior: a `.perma-stuck.json` marker blocks subsequent pending changes in the same repo
+- **AND** the paragraph names the escape hatch (`@<bot> ignore-and-continue`) AND when an operator might want it (sibling changes that don't depend on the perma-stuck one)
+- **AND** cross-links to `docs/CHATOPS.md` for the verb syntax
+
+#### Scenario: OPERATIONS.md enumerates the four blocking-marker categories
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s queue-blocking-policy discussion
+- **THEN** the section enumerates the four markers that block the queue: `.in-progress*` (AskUser waiting), `.needs-spec-revision.json` (agent-flagged or `a17`-flagged), `.perma-stuck.json`, AND any extension markers future specs may add
+- **AND** the section notes that `.ignore-for-queue.json` downgrades any of them
+
+#### Scenario: CHATOPS.md documents the two new verbs with examples
+- **WHEN** an operator reads `docs/CHATOPS.md`'s operator-recovery-commands section
+- **THEN** rows for `ignore-and-continue` AND `clear-ignore` appear in the verbs table
+- **AND** each verb has an example reply (happy path AND refusal path)
+- **AND** the section cross-links back to OPERATIONS.md for the underlying queue-blocking model
+
