@@ -633,21 +633,20 @@ If you're seeing operator-visible inconsistencies between writers and readers (`
 
 ## Per-change run log shape
 
-Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/<change>.log`. The default shape (with `executor.output_format: json`) splits the log into four sections so operators can quickly judge what the agent was doing without scrolling through the raw JSON event stream:
+Each iteration writes TWO sibling log files per change (per `a20a2`):
+
+- **Summary log** at `<logs_dir>/runs/<workspace-basename>/<change>.log` — operator-facing. Contains PROMPT, an ACTIONS pointer line, FINAL ANSWER, and STDERR sections. Short, signal-dense, no agent-controllable action stream.
+- **Stream log** at `<logs_dir>/runs/<workspace-basename>/<change>.stream.log` — verbose. The full action stream (`[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]`, `[unknown:<type>]` lines). Consulted when diagnosing what the agent actually did.
+
+The split exists to isolate the high-volume agent-controllable action stream from the daemon-readable summary. Daemon-internal consumers (sentinel scanner, PR-comment composer) read from the summary log; they cannot be tricked by sentinel-shaped substrings hiding in tool-result echoes.
+
+Summary log shape (with `executor.output_format: json`, the default):
 
 ```
 === PROMPT (<n> bytes) ===
 <the full prompt sent to the wrapped Claude CLI>
 
-=== ACTIONS ===
-[tool_use] Read autocoder/src/foo.rs
-[tool_result] (4128 bytes returned)
-[tool_use] Edit autocoder/src/foo.rs
-[tool_result] (200 bytes returned)
-[assistant] I've identified the issue in line 42 and applied the fix.
-[tool_use] Bash cargo test --lib
-[tool_result] (1024 bytes returned)
-...
+=== ACTIONS (see <change>.stream.log) ===
 
 === FINAL ANSWER (<n> bytes) ===
 <the agent's closing conversational summary — same content the PR comment shows>
@@ -656,14 +655,45 @@ Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/
 <anything the wrapped CLI emitted on stderr, typically empty>
 ```
 
-- **PROMPT** — exactly what autocoder sent on stdin (template + `openspec instructions apply` output + the per-change context). Use this when an agent ran on the wrong prompt.
-- **ACTIONS** — one line per JSON event the wrapped CLI emitted (Read/Edit/Bash tool calls, tool results with byte counts, intermediate assistant text). Each line is prefixed `[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]` (for lines that failed JSON parsing) or `[unknown:<type>]` (for forward-compat event types). Use this when triaging a timeout — the last action line names what the agent was doing when the kill fired. On a successful run, scanning the ACTIONS section gives you a fast read of the work.
-- **FINAL ANSWER** — the closing `result` event's text, captured separately so it is the ONE thing the PR's `## Agent implementation notes` comment shows. Empty when the run timed out before reaching `result`.
-- **STDERR** — bytes the wrapped CLI wrote on stderr. Usually empty; populated on framework errors.
+Stream log shape (no section headers, one continuous stream):
 
-The legacy log shape (`=== STDOUT === / === STDERR ===`) is preserved when `executor.output_format: text` is set; that mode skips JSON event parsing entirely and uses today's at-exit capture.
+```
+[tool_use] Read autocoder/src/foo.rs
+[tool_result] (4128 bytes returned)
+[tool_use] Edit autocoder/src/foo.rs
+[tool_result] (200 bytes returned)
+[assistant] I've identified the issue in line 42 and applied the fix.
+[tool_use] Bash cargo test --lib
+[tool_result] (1024 bytes returned)
+...
+```
 
-**Retention.** Per-change logs are pruned at daemon startup and once every 24 hours during operation. A log is eligible for deletion when its mtime is older than `executor.log_retention_days` (default 30) AND its corresponding change directory under `openspec/changes/<change>/` no longer exists. Active changes' logs are preserved regardless of age — operators triaging a long-running stuck change want its log even if it's months old.
+Section descriptions:
+
+- **PROMPT** (summary) — exactly what autocoder sent on stdin (template + `openspec instructions apply` output + the per-change context). Use this when an agent ran on the wrong prompt.
+- **ACTIONS pointer** (summary) — one line naming the sibling stream log file. The slot exists so the structural invariant ("all four section headers present") holds even when the stream is empty.
+- **FINAL ANSWER** (summary) — the closing `result` event's text, captured separately so it is the ONE thing the PR's `## Agent implementation notes` comment shows. Empty when the run timed out before reaching `result`.
+- **STDERR** (summary) — bytes the wrapped CLI wrote on stderr. Usually empty; populated on framework errors.
+- **Stream content** — one line per JSON event the wrapped CLI emitted. `[tool_use]`/`[tool_result]` for Read/Edit/Bash tool activity (results show byte counts), `[assistant]` for intermediate assistant text, `[raw]` for lines that failed JSON parsing, `[unknown:<type>]` for forward-compat event types. When triaging a timeout, the last line names what the agent was doing when the kill fired.
+
+Operator CLI snippets:
+
+```bash
+# Read the operator-facing summary (PROMPT + FINAL ANSWER + STDERR):
+tail -f /var/log/autocoder/runs/<basename>/<change>.log
+
+# Watch the live action stream during a run:
+tail -f /var/log/autocoder/runs/<basename>/<change>.stream.log
+
+# Grep for specific tool activity:
+grep '\[tool_use\] Edit' /var/log/autocoder/runs/<basename>/<change>.stream.log
+```
+
+**Migration note for operator tooling.** Tools that previously grepped `<change>.log` for `[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]`, OR `[unknown:<type>]` patterns SHALL be redirected to the `<change>.stream.log` file. The summary log no longer contains those patterns — only the pointer line. The change is a simple file-path swap in your scripts.
+
+The legacy log shape (`=== STDOUT === / === STDERR ===`) is preserved when `executor.output_format: text` is set; that mode skips JSON event parsing entirely and uses today's at-exit capture. Text mode does NOT produce a stream log file.
+
+**Retention.** Per-change logs are pruned at daemon startup and once every 24 hours during operation. A summary log is eligible for deletion when its mtime is older than `executor.log_retention_days` (default 30) AND its corresponding change directory under `openspec/changes/<change>/` no longer exists. Deletion is **pair-atomic**: when a summary log is deleted, its sibling stream log is deleted in the same pass. Active changes' logs are preserved as a pair regardless of age — operators triaging a long-running stuck change want both files even if old. Orphan stream logs (a `<change>.stream.log` without its summary sibling, from a pre-spec migration or manual operator action) are cleaned up with a WARN when their age exceeds the window and no change directory exists.
 
 **PR-comment stability.** The `## Agent implementation notes` comment on every PR continues to contain ONLY the agent's closing conversational summary — the same content operators have always seen since the section was introduced. With JSON streaming mode on, autocoder captures that text more precisely (from the closing `result` event) instead of slicing it out of the raw stdout buffer, but reviewers see the same shape. The intermediate tool-call stream stays in the log file and never ships to GitHub. Existing PR-review workflows do not change.
 

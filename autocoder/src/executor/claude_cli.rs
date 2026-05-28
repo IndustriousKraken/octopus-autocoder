@@ -2925,23 +2925,22 @@ exit 0
         }
         let log = run_log_path(&ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
+        // Per a20a2: summary log has PROMPT, ACTIONS-pointer line,
+        // FINAL ANSWER, STDERR. NOT raw action content.
         assert!(body.contains("=== PROMPT ("));
-        assert!(body.contains("=== ACTIONS ==="));
+        assert!(body.contains("=== ACTIONS (see x.stream.log) ==="));
         assert!(body.contains("=== FINAL ANSWER ("));
         assert!(body.contains("=== STDERR ("));
-        assert!(body.contains("[tool_use] Read src/a.rs"));
-        assert!(body.contains("[tool_result] (9 bytes returned)"));
         assert!(body.contains("Done — the change is implemented."));
-        // FINAL ANSWER must not leak the ACTIONS material.
-        let final_section = body
-            .split("=== FINAL ANSWER (")
-            .nth(1)
-            .unwrap()
-            .split("=== STDERR (")
-            .next()
-            .unwrap();
-        assert!(!final_section.contains("[tool_use]"));
-        assert!(!final_section.contains("[tool_result]"));
+        // FINAL ANSWER must not leak action stream content.
+        assert!(!body.contains("[tool_use]"));
+        assert!(!body.contains("[tool_result]"));
+
+        // Action stream lives in the sibling stream log.
+        let stream_log = log.with_extension("stream.log");
+        let stream = std::fs::read_to_string(&stream_log).unwrap();
+        assert!(stream.contains("[tool_use] Read src/a.rs"));
+        assert!(stream.contains("[tool_result] (9 bytes returned)"));
     }
 
     /// JSON streaming: a fixture child that gets killed mid-stream
@@ -2977,13 +2976,16 @@ sleep 30
             other => panic!("expected Failed timeout, got {other:?}"),
         }
         let log = run_log_path(&ws, "x");
-        let body = std::fs::read_to_string(&log).expect("log written");
-        assert!(body.contains("[tool_use] Read a"));
-        assert!(body.contains("[tool_use] Edit b"));
+        let body = std::fs::read_to_string(&log).expect("summary log written");
+        // Summary: empty FINAL ANSWER (timeout). Stream: action lines.
         assert!(
             body.contains("=== FINAL ANSWER (0 bytes) ==="),
             "FINAL ANSWER must be empty after timeout-kill:\n{body}"
         );
+        let stream_log = log.with_extension("stream.log");
+        let stream = std::fs::read_to_string(&stream_log).expect("stream log written");
+        assert!(stream.contains("[tool_use] Read a"));
+        assert!(stream.contains("[tool_use] Edit b"));
     }
 
     /// JSON streaming: malformed JSON line lands in ACTIONS as `[raw]`.
@@ -3003,14 +3005,21 @@ exit 0
         let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
         let outcome = executor.run(&ws, "x").await.unwrap();
         assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
-        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        // Raw action lines live in the stream log; the valid `result`
+        // event populates FINAL ANSWER in the summary log.
+        let summary = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        let stream = std::fs::read_to_string(
+            run_log_path(&ws, "x").with_extension("stream.log"),
+        )
+        .unwrap();
         assert!(
-            body.contains("[raw] this is not json"),
-            "malformed line missing in:\n{body}"
+            stream.contains("[raw] this is not json"),
+            "malformed line missing from stream log:\n{stream}"
         );
-        // The valid `result` event after the bad line must still be
-        // captured.
-        assert!(body.contains("ok"));
+        assert!(
+            summary.contains("ok"),
+            "result event's text must reach FINAL ANSWER in summary:\n{summary}"
+        );
     }
 
     /// JSON streaming: an unknown event type lands in ACTIONS as
@@ -3029,10 +3038,15 @@ exit 0
         );
         let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
         let _ = executor.run(&ws, "x").await.unwrap();
-        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        // Per a20a2: unknown-type lines land in the stream log, not
+        // the summary.
+        let stream = std::fs::read_to_string(
+            run_log_path(&ws, "x").with_extension("stream.log"),
+        )
+        .unwrap();
         assert!(
-            body.contains("[unknown:future_event_kind]"),
-            "unknown prefix missing in:\n{body}"
+            stream.contains("[unknown:future_event_kind]"),
+            "unknown prefix missing from stream log:\n{stream}"
         );
     }
 
