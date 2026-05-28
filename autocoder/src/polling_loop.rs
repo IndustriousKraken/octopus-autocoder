@@ -1293,6 +1293,48 @@ pub async fn run_pass_through_commits(
         return Ok((processed, includes_self_heal));
     }
 
+    // Same-repo block (a18): if any change carries an operator-action
+    // marker (`.perma-stuck.json`, `.needs-spec-revision.json`, or
+    // `.question.json` AskUser waiting) AND is NOT downgraded by a
+    // companion `.ignore-for-queue.json`, halt the pending walk. The
+    // operator opts a specific change out of blocking by stamping
+    // `.ignore-for-queue.json` alongside the underlying marker.
+    let blocking_markers = queue::find_queue_blocking_markers(workspace)?;
+    if !blocking_markers.is_empty() {
+        for bm in &blocking_markers {
+            let marker_path = workspace
+                .join("openspec/changes")
+                .join(&bm.change)
+                .join(&bm.marker);
+            tracing::info!(
+                url = repo.url.as_str(),
+                change = %bm.change,
+                marker = %bm.marker,
+                path = %marker_path.display(),
+                "queue blocked: change `{}` has `{}` (not downgraded by .ignore-for-queue.json)",
+                bm.change,
+                bm.marker
+            );
+        }
+        run_due_audits_after_queue(
+            workspace,
+            repo,
+            audit_registry,
+            audits_cfg,
+            audit_settings,
+            chatops_ctx,
+            queued_audit_types,
+        )
+        .await;
+        tracing::info!(
+            url = %repo.url,
+            committed = processed.len(),
+            blocked = blocking_markers.len(),
+            "polling pass complete (queue blocked by operator-action markers)"
+        );
+        return Ok((processed, includes_self_heal));
+    }
+
     let remaining = max_changes_per_pr.saturating_sub(processed.len() as u32);
     if remaining > 0 {
         let (pending_processed, pending_self_heal) = walk_queue(
@@ -8508,6 +8550,183 @@ mod tests {
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "executor must run after the operator clears the marker"
+        );
+    }
+
+    // ============================================================
+    // Queue-blocking markers (a18)
+    // ============================================================
+
+    /// a18: A perma-stuck change on the queue blocks subsequent pending
+    /// changes in the same repo. The pending sibling's executor is never
+    /// invoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perma_stuck_marker_blocks_subsequent_pending_change() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "01-broken", "fixture");
+        add_committed_change(&ws, "02-sibling", "fixture");
+        // Pre-place the perma-stuck marker on the first change.
+        std::fs::write(
+            ws.join("openspec/changes/01-broken/.perma-stuck.json"),
+            r#"{"change":"01-broken","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"Delete this file to retry the change."}"#,
+        )
+        .unwrap();
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "queue must halt on perma-stuck; pending sibling must not be processed"
+        );
+        // Sibling is still on disk waiting to run next time.
+        assert!(
+            ws.join("openspec/changes/02-sibling/proposal.md").exists(),
+            "sibling change must remain in the queue"
+        );
+    }
+
+    /// a18: When `.ignore-for-queue.json` accompanies the blocking
+    /// marker, the queue walk RESUMES — the pending sibling IS processed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignore_for_queue_marker_unblocks_subsequent_pending_change() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "01-broken", "fixture");
+        add_committed_change(&ws, "02-sibling", "fixture");
+        // Perma-stuck marker on the first change.
+        std::fs::write(
+            ws.join("openspec/changes/01-broken/.perma-stuck.json"),
+            r#"{"change":"01-broken","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        // AND the ignore-for-queue downgrade marker.
+        std::fs::write(
+            ws.join("openspec/changes/01-broken/.ignore-for-queue.json"),
+            r#"{"change":"01-broken","marked_at":"2026-01-01T00:00:00Z","marked_by":"U_OP","reason":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let invoked_with = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct Counter {
+            count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, change: &str) -> Result<ExecutorOutcome> {
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.seen.lock().unwrap().push(change.to_string());
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter {
+            count: invocations.clone(),
+            seen: invoked_with.clone(),
+        };
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let seen = invoked_with.lock().unwrap().clone();
+        assert!(
+            !seen.contains(&"01-broken".to_string()),
+            "perma-stuck change must still be excluded; got {seen:?}"
+        );
+        assert!(
+            seen.contains(&"02-sibling".to_string()),
+            "ignore-for-queue must let the sibling proceed; got {seen:?}"
+        );
+    }
+
+    /// a18: `.needs-spec-revision.json` continues to block the queue
+    /// (unchanged behavior — confirms the new pre-walk gate matches the
+    /// existing per-iteration behavior).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn needs_spec_revision_marker_blocks_subsequent_pending_change() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "01-revision", "fixture");
+        add_committed_change(&ws, "02-sibling", "fixture");
+        std::fs::write(
+            ws.join("openspec/changes/01-revision/.needs-spec-revision.json"),
+            r#"{"change":"01-revision","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "queue must halt on needs-spec-revision; pending sibling must not be processed"
+        );
+    }
+
+    /// a18: A workspace with no operator-action markers proceeds normally
+    /// — the new pre-walk gate is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_workspace_processes_pending_changes_normally() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "only-pending", "fixture");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "clean queue must process the pending change"
         );
     }
 

@@ -18,6 +18,7 @@ mod failure_state;
 mod git;
 mod github;
 mod github_credentials;
+mod ignore_for_queue;
 mod llm;
 mod log_retention;
 mod mcp_askuser_server;

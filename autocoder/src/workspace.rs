@@ -190,6 +190,17 @@ pub fn ensure_initialized(
             "could not register .needs-spec-revision.json in .git/info/exclude: {e:#}"
         );
     }
+    // Per-change ignore-for-queue markers (a18) live at
+    // `openspec/changes/<change>/.ignore-for-queue.json`. Same gitignore
+    // contract as the other per-change operator-action markers: they
+    // must not trip the pre-pass dirty check AND must survive
+    // `git clean -fd` during per-iteration recovery.
+    if let Err(e) = ensure_git_info_excluded(workspace, ".ignore-for-queue.json") {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register .ignore-for-queue.json in .git/info/exclude: {e:#}"
+        );
+    }
     enforce_alert_state_workspace_invariant(workspace);
     Ok(())
 }

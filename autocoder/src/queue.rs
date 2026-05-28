@@ -20,6 +20,7 @@ const PROPOSAL_FILE: &str = "proposal.md";
 const QUESTION_FILE: &str = ".question.json";
 const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
 const NEEDS_REVISION_FILE: &str = ".needs-spec-revision.json";
+const IGNORE_FOR_QUEUE_FILE: &str = ".ignore-for-queue.json";
 
 fn changes_dir(workspace: &Path) -> PathBuf {
     workspace.join(CHANGES_SUBDIR)
@@ -147,6 +148,36 @@ pub fn remove_perma_stuck_marker(workspace: &Path, change: &str) -> Result<()> {
     }
 }
 
+/// Remove `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`.
+/// Errors when the marker is absent with a clear "no ignore-for-queue
+/// marker for change `<change>`" message; non-NotFound IO errors propagate.
+pub fn remove_ignore_for_queue_marker(workspace: &Path, change: &str) -> Result<()> {
+    let path = change_dir(workspace, change).join(IGNORE_FOR_QUEUE_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "no ignore-for-queue marker for change `{change}`"
+        )),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Idempotent removal of `.ignore-for-queue.json`. Distinct from
+/// `remove_ignore_for_queue_marker` — this is used by
+/// `clear-perma-stuck` / similar full-resolution operations where the
+/// ignore-marker's absence is a no-op rather than an error.
+pub fn remove_ignore_for_queue_marker_idempotent(
+    workspace: &Path,
+    change: &str,
+) -> Result<bool> {
+    let path = change_dir(workspace, change).join(IGNORE_FOR_QUEUE_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// Remove `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`.
 /// Errors when the marker is absent with a clear "no needs-spec-revision
 /// marker for change `<change>`" message; non-NotFound IO errors propagate.
@@ -159,6 +190,89 @@ pub fn remove_revision_marker(workspace: &Path, change: &str) -> Result<()> {
         )),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
+}
+
+/// True when `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`
+/// exists. Pure filesystem check. The marker downgrades any sibling
+/// operator-action marker (`.perma-stuck.json`, `.needs-spec-revision.json`,
+/// or `.in-progress`/`.question.json` AskUser markers) from "blocks
+/// subsequent queue processing" to "still excludes this change, but
+/// doesn't block siblings."
+pub fn is_ignore_for_queue_marked(workspace: &Path, change: &str) -> bool {
+    change_dir(workspace, change).join(IGNORE_FOR_QUEUE_FILE).exists()
+}
+
+/// One change that has a queue-blocking marker. Returned by
+/// `find_queue_blocking_markers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockingMarker {
+    pub change: String,
+    /// Filename of the blocking marker file (e.g. `.perma-stuck.json`,
+    /// `.needs-spec-revision.json`, `.question.json`). The first such
+    /// file found in alphabetical order is reported; a change with
+    /// multiple blocking markers reports only the first.
+    pub marker: String,
+}
+
+/// Scan every direct subdirectory of `<workspace>/openspec/changes/`
+/// (excluding `archive` and dotfile-named entries) and return the changes
+/// that have at least one queue-blocking marker but NO accompanying
+/// `.ignore-for-queue.json` marker. The set of blocking markers is:
+/// `.question.json` (AskUser waiting), `.needs-spec-revision.json`,
+/// `.perma-stuck.json`. The presence of `.ignore-for-queue.json`
+/// downgrades the change's blocking effect on its siblings — it stays
+/// excluded from `list_pending`, but doesn't gate subsequent changes.
+///
+/// Returns sorted ascending by change name. An empty result means the
+/// queue walk is clear to proceed; a non-empty result means the polling
+/// loop should halt the pending walk for this iteration.
+pub fn find_queue_blocking_markers(workspace: &Path) -> Result<Vec<BlockingMarker>> {
+    let root = changes_dir(workspace);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<BlockingMarker> = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("reading {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ARCHIVE_DIR || name.starts_with('.') {
+            continue;
+        }
+        let dir = entry.path();
+        // Downgrade: if the ignore-marker is present, this change does
+        // NOT block the queue (it stays excluded from list_pending via
+        // its own marker, but siblings proceed).
+        if dir.join(IGNORE_FOR_QUEUE_FILE).exists() {
+            continue;
+        }
+        // Check blocking markers in priority order. The first one
+        // found is reported; chained markers (rare) report the
+        // highest-priority one.
+        let candidates = [
+            QUESTION_FILE,
+            NEEDS_REVISION_FILE,
+            PERMA_STUCK_FILE,
+        ];
+        for marker in candidates {
+            if dir.join(marker).exists() {
+                out.push(BlockingMarker {
+                    change: name.clone(),
+                    marker: marker.to_string(),
+                });
+                break;
+            }
+        }
+    }
+    out.sort_by(|a, b| a.change.cmp(&b.change));
+    Ok(out)
 }
 
 /// List changes excluded from `list_pending` by an operator-action marker.
@@ -803,6 +917,194 @@ mod tests {
             msg.contains("no needs-spec-revision marker for change `beta`"),
             "error must name change: {msg}"
         );
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_empty_workspace_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert!(blocking.is_empty());
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_finds_perma_stuck() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "broken");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("broken").join(PERMA_STUCK_FILE),
+            r#"{"change":"broken","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].change, "broken");
+        assert_eq!(blocking[0].marker, PERMA_STUCK_FILE);
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_finds_needs_spec_revision() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "broken");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("broken")
+                .join(NEEDS_REVISION_FILE),
+            r#"{"change":"broken","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].change, "broken");
+        assert_eq!(blocking[0].marker, NEEDS_REVISION_FILE);
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_finds_question_waiting() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "waiting");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("waiting").join(QUESTION_FILE),
+            r#"{"thread_ts":"x","channel":"C","resume_handle":null,"asked_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].change, "waiting");
+        assert_eq!(blocking[0].marker, QUESTION_FILE);
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_downgraded_by_ignore_for_queue() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "ready");
+        make_change(ws, "broken-ignored");
+        // Perma-stuck marker present.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("broken-ignored")
+                .join(PERMA_STUCK_FILE),
+            r#"{"change":"broken-ignored","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        // AND the ignore-for-queue downgrade marker.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("broken-ignored")
+                .join(IGNORE_FOR_QUEUE_FILE),
+            r#"{"change":"broken-ignored","marked_at":"2026-01-01T00:00:00Z","marked_by":"U_OP","reason":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert!(
+            blocking.is_empty(),
+            "ignore-for-queue must downgrade blocking effect; got: {blocking:?}"
+        );
+    }
+
+    #[test]
+    fn find_queue_blocking_markers_multiple_changes_sorted() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "zeta-broken");
+        make_change(ws, "alpha-waiting");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("zeta-broken")
+                .join(PERMA_STUCK_FILE),
+            r#"{"change":"zeta-broken","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("alpha-waiting")
+                .join(QUESTION_FILE),
+            r#"{"thread_ts":"x","channel":"C","resume_handle":null,"asked_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let blocking = find_queue_blocking_markers(ws).unwrap();
+        assert_eq!(blocking.len(), 2);
+        assert_eq!(blocking[0].change, "alpha-waiting");
+        assert_eq!(blocking[1].change, "zeta-broken");
+    }
+
+    #[test]
+    fn is_ignore_for_queue_marked_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "foo");
+        assert!(!is_ignore_for_queue_marked(ws, "foo"));
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("foo").join(IGNORE_FOR_QUEUE_FILE),
+            r#"{"change":"foo","marked_at":"2026-01-01T00:00:00Z","marked_by":"U","reason":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        assert!(is_ignore_for_queue_marked(ws, "foo"));
+    }
+
+    #[test]
+    fn remove_ignore_for_queue_marker_errors_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "foo");
+        let err = remove_ignore_for_queue_marker(ws, "foo")
+            .expect_err("must error when marker absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no ignore-for-queue marker for change `foo`"),
+            "error must name change: {msg}"
+        );
+    }
+
+    #[test]
+    fn remove_ignore_for_queue_marker_clears_file() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "foo");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("foo").join(IGNORE_FOR_QUEUE_FILE),
+            r#"{"change":"foo","marked_at":"2026-01-01T00:00:00Z","marked_by":"U","reason":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        assert!(is_ignore_for_queue_marked(ws, "foo"));
+        remove_ignore_for_queue_marker(ws, "foo").unwrap();
+        assert!(!is_ignore_for_queue_marked(ws, "foo"));
+    }
+
+    #[test]
+    fn remove_ignore_for_queue_marker_idempotent_returns_false_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "foo");
+        let removed = remove_ignore_for_queue_marker_idempotent(ws, "foo").unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_ignore_for_queue_marker_idempotent_returns_true_when_present() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "foo");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("foo").join(IGNORE_FOR_QUEUE_FILE),
+            r#"{"change":"foo","marked_at":"2026-01-01T00:00:00Z","marked_by":"U","reason":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        let removed = remove_ignore_for_queue_marker_idempotent(ws, "foo").unwrap();
+        assert!(removed);
+        assert!(!is_ignore_for_queue_marked(ws, "foo"));
     }
 
     #[test]

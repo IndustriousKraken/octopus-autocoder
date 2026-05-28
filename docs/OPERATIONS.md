@@ -290,7 +290,22 @@ The chatops alert names the repo, change, count, and a truncated `last_reason`, 
 
 To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
 
+**Queue-blocking behavior (a18).** A `.perma-stuck.json` marker does more than exclude the affected change: it ALSO halts the queue walk for subsequent pending changes in the same repository. This is the same blocking semantic that already applies to `.needs-spec-revision.json` and AskUser (`.question.json`) markers — the four marker categories that gate the queue are enumerated under [Queue-blocking policy](#queue-blocking-policy). The reason: stacked changes (the common autocoder pattern) frequently reference symbols a prior change introduces, so blasting through the queue after a perma-stuck would burn tokens against changes that cannot land.
+
+**Escape hatch: `ignore-and-continue`.** When the operator knows a particular perma-stuck (or needs-spec-revision) change is independent of its siblings — they happen to be on the same queue but don't depend on each other — they can run `@<bot> ignore-and-continue <repo> <change>` to stamp `.ignore-for-queue.json` alongside the underlying marker. The change stays excluded from `list_pending` (it's still broken), but siblings resume processing. Reverse with `@<bot> clear-ignore <repo> <change>`. Resolving the original problem with `@<bot> clear-perma-stuck <repo> <change>` removes BOTH files automatically. See [CHATOPS.md → operator recovery commands](CHATOPS.md#operator-recovery-commands) for verb syntax and example replies.
+
 See also [Spec marked as needing revision](#spec-marked-as-needing-revision) — its sibling pattern for the case where the operator (not the agent) is the one with work to do.
+
+## Queue-blocking policy
+
+autocoder treats the following per-change marker categories as queue-blocking — when any change in `openspec/changes/<slug>/` has one of these markers AND does NOT also have `.ignore-for-queue.json`, the polling loop halts the queue walk for the iteration:
+
+1. **`.question.json` (AskUser waiting).** The agent has posted a question to the operator and is awaiting a reply. Resumed via `@<bot> send it` or by replying in the chatops thread; cleared when the resume completes.
+2. **`.needs-spec-revision.json`.** Either the agent flagged unimplementable tasks OR the a17 pre-flight check rejected an unarchivable spec delta. Cleared via `@<bot> clear-revision <repo> <change>` (or by deleting the file directly).
+3. **`.perma-stuck.json`.** The change has hit `executor.perma_stuck_after_failures` consecutive failures. Cleared via `@<bot> clear-perma-stuck <repo> <change>` (which also removes any accompanying `.ignore-for-queue.json`).
+4. **Future extension markers.** Any new operator-action category future specs add SHOULD be added to this list AND honor the `.ignore-for-queue.json` downgrade contract.
+
+**Downgrade marker.** `.ignore-for-queue.json` accompanies any of the above and downgrades the change's blocking effect from "halt subsequent pending changes" to "still excluded from `list_pending` but siblings proceed." It is the operator's explicit "I know this one's broken; skip it AND keep going with the rest" signal — see [Perma-stuck change detection](#perma-stuck-change-detection) for the operator workflow and [CHATOPS.md](CHATOPS.md#operator-recovery-commands) for the verb syntax.
 
 ## Spec marked as needing revision
 

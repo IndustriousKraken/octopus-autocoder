@@ -245,8 +245,10 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 | Verb | Syntax | What it does |
 | --- | --- | --- |
 | `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (one of `idle`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `stale marker from pid <pid>`, or the unclassified-fallback `busy (stage=<stage>)` — see [`currently:` line variants](#currently-line-variants) below), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
-| `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
+| `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json` (and any accompanying `.ignore-for-queue.json` — a18 full resolution). The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
+| `ignore-and-continue` | `@<bot> ignore-and-continue <repo-substring> <change-slug>` | Stamps `openspec/changes/<change>/.ignore-for-queue.json` alongside an existing `.perma-stuck.json` OR `.needs-spec-revision.json`. The change stays excluded from `list_pending`; siblings resume processing on the next iteration. Refuses when the named change has no underlying blocking marker. Commits + pushes the marker on the daemon's agent branch. See [OPERATIONS.md → Queue-blocking policy](OPERATIONS.md#queue-blocking-policy) for the model. |
+| `clear-ignore` | `@<bot> clear-ignore <repo-substring> <change-slug>` | Removes `openspec/changes/<change>/.ignore-for-queue.json`. The queue resumes blocking on the underlying marker. Refuses when no ignore-marker exists. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `<cache_dir>/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
@@ -311,6 +313,36 @@ Success replies are one line beginning with `✓`. Error replies are one line be
 ✓ cleared .perma-stuck.json for a06-foo on myrepo
 ✗ no perma-stuck marker for change a99-nonexistent on myrepo
 ✗ no repo matched 'gibberish'; configured: myrepo, widgets
+```
+
+#### `ignore-and-continue` and `clear-ignore` example replies
+
+Happy path:
+
+```
+✓ Marked a07-foo as ignored for queue. Subsequent changes will process; a07-foo stays excluded until the underlying marker is cleared.
+✓ Cleared ignore-for-queue on a07-foo. Queue resumes blocking on .perma-stuck.json.
+✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for a07-foo.
+```
+
+Refusal paths:
+
+```
+✗ a07-foo has no operator-action marker (perma-stuck OR needs-spec-revision). Ignore is a no-op; rejecting to prevent confusion.
+✗ a07-foo already has .ignore-for-queue.json. No change.
+✗ no ignore-for-queue marker for change `a07-foo`
+```
+
+See [OPERATIONS.md → Queue-blocking policy](OPERATIONS.md#queue-blocking-policy) for the underlying queue-gating model and when an operator should reach for `ignore-and-continue` vs. fixing the underlying problem.
+
+#### `status` annotation when `.ignore-for-queue.json` is present
+
+When the operator has stamped `.ignore-for-queue.json` alongside a blocking marker, the `@<bot> status` reply's "active markers" section gains a trailing annotation on the matching line so operators see at a glance which broken changes are "skip-and-continue" vs. genuinely blocking:
+
+```
+active markers (excluded from list_pending):
+  • a07-foo (.perma-stuck.json — consecutive_failures: 2, marked 4h ago) (ignore-for-queue: yes — queue not blocked)
+  • a09-bar (.needs-spec-revision.json — marked 22m ago)
 ```
 
 The `status` reply for a healthy repo looks like:

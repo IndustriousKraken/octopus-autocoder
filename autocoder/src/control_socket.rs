@@ -351,6 +351,8 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "repo_status_all" => handle_repo_status_all(state).await,
         "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
+        "ignore_for_queue_marker" => handle_ignore_for_queue(&parsed, state),
+        "clear_ignore_for_queue_marker" => handle_clear_ignore_for_queue(&parsed, state),
         "wipe_workspace" => handle_wipe_workspace(&parsed, state).await,
         "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
         "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
@@ -572,7 +574,10 @@ async fn build_repo_status(
     resp.latest_pr = fetch_latest_pr(repo, github_cfg).await;
 
     // Marker-excluded changes — pull marked_at + detail from the marker
-    // JSON files where possible.
+    // JSON files where possible. Each marker entry also carries a
+    // `has_ignore_for_queue` flag (a18) so the formatter can annotate
+    // the line when the operator has stamped `.ignore-for-queue.json`
+    // alongside the blocking marker.
     let (perma_changes, revision_changes) = queue::list_marker_excluded(workspace_path)?;
     for change in perma_changes {
         let marker_path = workspace_path
@@ -580,10 +585,12 @@ async fn build_repo_status(
             .join(&change)
             .join(".perma-stuck.json");
         let (marked_at, detail) = read_perma_marker(&marker_path);
+        let has_ignore_for_queue = queue::is_ignore_for_queue_marked(workspace_path, &change);
         resp.perma_stuck_changes.push(MarkerEntry {
             change,
             marked_at,
             detail,
+            has_ignore_for_queue,
         });
     }
     for change in revision_changes {
@@ -592,10 +599,12 @@ async fn build_repo_status(
             .join(&change)
             .join(".needs-spec-revision.json");
         let marked_at = read_revision_marker(&marker_path);
+        let has_ignore_for_queue = queue::is_ignore_for_queue_marked(workspace_path, &change);
         resp.revision_marked_changes.push(MarkerEntry {
             change,
             marked_at,
             detail: String::new(),
+            has_ignore_for_queue,
         });
     }
 
@@ -748,10 +757,28 @@ fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
-    match queue::remove_perma_stuck_marker(&workspace_path, &change) {
-        Ok(()) => json!({"ok": true, "change": change, "url": url}),
-        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    if let Err(e) = queue::remove_perma_stuck_marker(&workspace_path, &change) {
+        return json!({"ok": false, "error": format!("{e:#}")});
     }
+    // Per a18: removing `.perma-stuck.json` also removes any companion
+    // `.ignore-for-queue.json` (full resolution — the operator is going
+    // to retry the change, so the downgrade marker becomes vestigial).
+    let removed_ignore =
+        match queue::remove_ignore_for_queue_marker_idempotent(&workspace_path, &change) {
+            Ok(removed) => removed,
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("removed perma-stuck but failed to remove .ignore-for-queue.json: {e:#}"),
+                });
+            }
+        };
+    json!({
+        "ok": true,
+        "change": change,
+        "url": url,
+        "removed_ignore_for_queue": removed_ignore,
+    })
 }
 
 fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
@@ -772,6 +799,159 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
         Ok(()) => json!({"ok": true, "change": change, "url": url}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
     }
+}
+
+/// Stamp `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`
+/// for the operator's "skip this broken change AND let siblings proceed"
+/// signal. Refuses with a polite error when the change has NEITHER
+/// `.perma-stuck.json` NOR `.needs-spec-revision.json` (ignoring a
+/// not-broken change is a confusing no-op). On success, stages + commits
+/// + pushes the new file on the daemon's agent branch.
+fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let marked_by = parsed
+        .get("marked_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("operator")
+        .to_string();
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+
+    // Refuse if the change has no underlying blocking marker — stamping
+    // ignore on a change with no problem is a confusing no-op.
+    let has_perma_stuck = queue::is_perma_stuck(&workspace_path, &change);
+    let has_needs_revision = queue::is_needs_spec_revision_marked(&workspace_path, &change);
+    if !has_perma_stuck && !has_needs_revision {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "{change} has no operator-action marker (perma-stuck OR needs-spec-revision). Ignore is a no-op; rejecting to prevent confusion."
+            ),
+        });
+    }
+    // Refuse if the marker is already present so the operator gets a
+    // clear "no change" signal rather than a stealth no-op commit.
+    if crate::ignore_for_queue::marker_exists(&workspace_path, &change) {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "{change} already has .ignore-for-queue.json. No change."
+            ),
+        });
+    }
+
+    // Write the marker file.
+    if let Err(e) = crate::ignore_for_queue::write_marker(&workspace_path, &change, &marked_by) {
+        return json!({"ok": false, "error": format!("writing marker: {e:#}")});
+    }
+
+    // Commit + push using the daemon's normal git path. Failure to
+    // commit/push is surfaced to the operator and leaves the marker on
+    // disk so the next iteration's queue gate honors the operator's
+    // intent even if the push didn't land.
+    let github_cfg = state.github.load_full();
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    let subject = format!("chore: ignore-for-queue on {change} (operator {marked_by})");
+    if let Err(e) = git::add_all(&workspace_path) {
+        return json!({
+            "ok": false,
+            "error": format!("git add failed after writing marker: {e:#}"),
+        });
+    }
+    if let Err(e) = git::commit(&workspace_path, &subject) {
+        return json!({
+            "ok": false,
+            "error": format!("git commit failed after writing marker: {e:#}"),
+        });
+    }
+    if let Err(e) = git::push_force_with_lease(&workspace_path, &repo.agent_branch, push_remote) {
+        return json!({
+            "ok": false,
+            "error": format!("git push failed after commit: {e:#}"),
+        });
+    }
+    json!({"ok": true, "change": change, "url": url})
+}
+
+/// Remove `.ignore-for-queue.json` for the named change AND commit +
+/// push the removal. Refuses with a polite error when the marker is
+/// absent (`@<bot> clear-ignore` against a clean change is a no-op the
+/// operator should know about).
+fn handle_clear_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&repo);
+
+    // Remove the marker — propagate the absent-marker error.
+    if let Err(e) = queue::remove_ignore_for_queue_marker(&workspace_path, &change) {
+        return json!({"ok": false, "error": format!("{e:#}")});
+    }
+
+    // Surface which underlying marker the queue resumes blocking on, so
+    // the chatops reply can name it.
+    let underlying_marker = if queue::is_perma_stuck(&workspace_path, &change) {
+        ".perma-stuck.json".to_string()
+    } else if queue::is_needs_spec_revision_marked(&workspace_path, &change) {
+        ".needs-spec-revision.json".to_string()
+    } else {
+        "the underlying marker".to_string()
+    };
+
+    let github_cfg = state.github.load_full();
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    let subject = format!("chore: clear ignore-for-queue on {change}");
+    if let Err(e) = git::add_all(&workspace_path) {
+        return json!({
+            "ok": false,
+            "error": format!("git add failed after removing marker: {e:#}"),
+        });
+    }
+    if let Err(e) = git::commit(&workspace_path, &subject) {
+        return json!({
+            "ok": false,
+            "error": format!("git commit failed after removing marker: {e:#}"),
+        });
+    }
+    if let Err(e) = git::push_force_with_lease(&workspace_path, &repo.agent_branch, push_remote) {
+        return json!({
+            "ok": false,
+            "error": format!("git push failed after commit: {e:#}"),
+        });
+    }
+    json!({
+        "ok": true,
+        "change": change,
+        "url": url,
+        "underlying_marker": underlying_marker,
+    })
 }
 
 /// Idempotent — a missing workspace directory is success (the user wanted
