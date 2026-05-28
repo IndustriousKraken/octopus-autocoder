@@ -25,6 +25,14 @@ use super::{
 };
 use crate::config::AuditSettings;
 
+pub mod ignore;
+
+/// Subject prefix used for stale `.brightline-ignore` entries. The
+/// chatops top-line formatter (`format_audit_top_line`) counts findings
+/// whose subject starts with this prefix to render the trailing
+/// `; <K> stale ignore entries to clean up` clause.
+pub const STALE_IGNORE_SUBJECT_PREFIX: &str = "stale ignore entry: ";
+
 const DEFAULT_FILE_LINES_THRESHOLD: u64 = 800;
 const SETTINGS_KEY_FILE_LINES: &str = "file_lines_threshold";
 
@@ -77,13 +85,25 @@ impl ArchitectureBrightlineAudit {
     /// across invocations.
     pub fn analyze(&self, workspace: &Path) -> Result<Vec<Finding>> {
         let scanned = collect_source_files(workspace)?;
+        let ignore_entries = ignore::load(workspace);
         let mut findings = Vec::new();
         for path in &scanned {
             if let Some(f) = check_file_size(path, workspace, self.file_lines_threshold) {
                 findings.push(f);
             }
         }
-        findings.extend(check_signature_duplicates(&scanned, workspace));
+        findings.extend(check_signature_duplicates(&scanned, workspace, &ignore_entries));
+        // Validate every loaded ignore entry against the current
+        // workspace state. Stale entries surface as findings with a
+        // dedicated subject prefix that the chatops top-line formatter
+        // counts separately to render the trailing
+        // `; <K> stale ignore entries to clean up` clause. The audit
+        // does NOT modify the on-disk file (WritePolicy::None is
+        // unchanged); cleanup is operator-driven.
+        let stale = ignore::collect_stale(workspace, &ignore_entries);
+        for entry in stale {
+            findings.push(stale_finding(&entry));
+        }
         // Deterministic ordering: severity (high first), then subject.
         findings.sort_by(|a, b| {
             severity_rank(b.severity)
@@ -91,6 +111,29 @@ impl ArchitectureBrightlineAudit {
                 .then(a.subject.cmp(&b.subject))
         });
         Ok(findings)
+    }
+}
+
+fn stale_finding(entry: &ignore::IgnoreEntry) -> Finding {
+    let file = entry.file.to_string_lossy();
+    let subject = format!(
+        "{prefix}{file} :: {function} — {reason}",
+        prefix = STALE_IGNORE_SUBJECT_PREFIX,
+        file = file,
+        function = entry.function,
+        reason = entry.reason,
+    );
+    let body = format!(
+        "file: {file}\nfunction: {function}\nreason: {reason}",
+        file = file,
+        function = entry.function,
+        reason = entry.reason,
+    );
+    Finding {
+        severity: Severity::Low,
+        subject,
+        body,
+        anchor: None,
     }
 }
 
@@ -210,12 +253,34 @@ fn check_file_size(path: &Path, root: &Path, threshold: u64) -> Option<Finding> 
     })
 }
 
+/// One occurrence of a function signature in a file. Used to apply
+/// `.brightline-ignore` match-suppression per-site (before grouping).
+#[derive(Debug, Clone)]
+struct SignatureSite {
+    rel_path: String,
+    line_number: usize,
+    function: String,
+    signature_line: String,
+}
+
 /// Detect identical function/method signatures across files. We use a
 /// simple regex per language and stay deliberately approximate — the
 /// audit's value is fast smoke-testing, not full parsing.
-fn check_signature_duplicates(files: &[PathBuf], root: &Path) -> Vec<Finding> {
-    // signature_key → list of (rel_path, line_number)
-    let mut occurrences: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+///
+/// `ignore_entries` carries the parsed `.brightline-ignore` content;
+/// every constituent site of a duplicate-signature finding is matched
+/// against the ignore list before the finding is emitted. A finding
+/// whose every site matches an ignore entry is dropped entirely. A
+/// finding where only some sites match is emitted with the unmatched
+/// sites only, plus a "(N suppressed by .brightline-ignore)" tail in
+/// the subject.
+fn check_signature_duplicates(
+    files: &[PathBuf],
+    root: &Path,
+    ignore_entries: &[ignore::IgnoreEntry],
+) -> Vec<Finding> {
+    // signature_key → list of SignatureSite
+    let mut occurrences: BTreeMap<String, Vec<SignatureSite>> = BTreeMap::new();
     for path in files {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e,
@@ -232,11 +297,16 @@ fn check_signature_duplicates(files: &[PathBuf], root: &Path) -> Vec<Finding> {
         } else {
             contents.clone()
         };
-        for (lineno, sig_key) in extract_signatures(&stripped, ext) {
+        for (lineno, sig_key, function, signature_line) in extract_signature_sites(&stripped, ext) {
             occurrences
                 .entry(sig_key)
                 .or_default()
-                .push((relative_path(path, root), lineno));
+                .push(SignatureSite {
+                    rel_path: relative_path(path, root),
+                    line_number: lineno,
+                    function,
+                    signature_line,
+                });
         }
     }
     let mut findings = Vec::new();
@@ -246,26 +316,59 @@ fn check_signature_duplicates(files: &[PathBuf], root: &Path) -> Vec<Finding> {
         }
         // Group by file: a signature appearing twice in the SAME file is
         // not a cross-file collision and isn't what this metric is for.
-        let mut files_seen: BTreeMap<&String, Vec<usize>> = BTreeMap::new();
-        for (p, l) in &places {
-            files_seen.entry(p).or_default().push(*l);
+        let mut files_seen: BTreeMap<String, Vec<&SignatureSite>> = BTreeMap::new();
+        for site in &places {
+            files_seen.entry(site.rel_path.clone()).or_default().push(site);
         }
         if files_seen.len() < 2 {
             continue;
         }
-        let mut subject_locations: Vec<String> = files_seen
+        // Partition the distinct files into "matches an ignore entry"
+        // and "doesn't". A file is considered matched when at least one
+        // of its occurrences matches an entry — sites in the same file
+        // are treated as one site per the audit's grouping rule above.
+        let mut unmatched_files: Vec<(String, &SignatureSite)> = Vec::new();
+        let mut suppressed_count: usize = 0;
+        for (file, sites) in &files_seen {
+            let any_matched = sites.iter().any(|s| {
+                ignore_entries.iter().any(|e| {
+                    ignore::entry_matches_site(e, &s.rel_path, &s.function, &s.signature_line)
+                })
+            });
+            if any_matched {
+                suppressed_count += 1;
+            } else {
+                let first = sites.first().copied().expect("non-empty per construction");
+                unmatched_files.push((file.clone(), first));
+            }
+        }
+        if unmatched_files.is_empty() {
+            // Every constituent site is intentional — drop the finding.
+            continue;
+        }
+        let mut subject_locations: Vec<String> = unmatched_files
             .iter()
-            .map(|(p, lines)| {
-                let first = lines.first().copied().unwrap_or(1);
-                format!("{p}:{first}")
-            })
+            .map(|(p, site)| format!("{p}:{ln}", ln = site.line_number))
             .collect();
         subject_locations.sort();
-        let body = subject_locations.join("\n");
-        let subject = format!(
-            "duplicate signature `{sig_key}` across {n} files",
-            n = files_seen.len()
-        );
+        let mut body = subject_locations.join("\n");
+        if suppressed_count > 0 {
+            body.push_str(&format!(
+                "\n({suppressed_count} site(s) suppressed by .brightline-ignore)"
+            ));
+        }
+        let unmatched_count = unmatched_files.len();
+        let subject = if suppressed_count > 0 {
+            format!(
+                "duplicate signature `{sig_key}` across {n} files ({suppressed_count} suppressed by .brightline-ignore)",
+                n = unmatched_count,
+            )
+        } else {
+            format!(
+                "duplicate signature `{sig_key}` across {n} files",
+                n = unmatched_count,
+            )
+        };
         findings.push(Finding {
             severity: Severity::Low,
             subject,
@@ -276,7 +379,18 @@ fn check_signature_duplicates(files: &[PathBuf], root: &Path) -> Vec<Finding> {
     findings
 }
 
+#[allow(dead_code)]
 fn extract_signatures(contents: &str, ext: &str) -> Vec<(usize, String)> {
+    extract_signature_sites(contents, ext)
+        .into_iter()
+        .map(|(line, key, _name, _line_text)| (line, key))
+        .collect()
+}
+
+/// Like [`extract_signatures`] but also returns the parsed function
+/// name and the raw signature line — both needed to apply
+/// `.brightline-ignore` match-suppression.
+fn extract_signature_sites(contents: &str, ext: &str) -> Vec<(usize, String, String, String)> {
     let re = match signature_regex(ext) {
         Some(r) => r,
         None => return Vec::new(),
@@ -290,13 +404,13 @@ fn extract_signatures(contents: &str, ext: &str) -> Vec<(usize, String)> {
             // formatting differences don't dodge the duplicate check.
             let normalized_params: String = params.split_whitespace().collect::<Vec<_>>().join(" ");
             let key = format!("{name}({normalized_params})");
-            out.push((idx + 1, key));
+            out.push((idx + 1, key, name.to_string(), line.to_string()));
         }
     }
     out
 }
 
-fn signature_regex(ext: &str) -> Option<Regex> {
+pub(super) fn signature_regex(ext: &str) -> Option<Regex> {
     let pattern = match ext {
         "rs" => Some(r"^\s*(?:pub\s+(?:\([^)]*\)\s+)?)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)"),
         "py" => Some(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)\s*(?:->[^:]+)?\s*:"),
@@ -319,7 +433,7 @@ fn signature_regex(ext: &str) -> Option<Regex> {
 /// `#[cfg(test)]` or any other attribute. Returns the source with the
 /// matched ranges replaced by empty lines (preserving line numbers for
 /// the duplicate-signature anchors).
-fn strip_rust_tests_modules(src: &str) -> String {
+pub(super) fn strip_rust_tests_modules(src: &str) -> String {
     let re = match Regex::new(r"(?m)^\s*(?:#\[[^\]]+\]\s*)?mod\s+tests\s*\{") {
         Ok(r) => r,
         Err(_) => return src.to_string(),
@@ -692,6 +806,217 @@ mod tests {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
+    }
+
+    #[test]
+    fn ignore_fully_matching_finding_is_suppressed() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x * y }\n",
+        );
+        write(
+            &ws.join(".brightline-ignore"),
+            r#"ignore:
+  - file: src/a.rs
+    function: helper
+    signature_match: "fn helper(x: u32"
+    reason: "intentional"
+  - file: src/b.rs
+    function: helper
+    signature_match: "fn helper(x: u32"
+    reason: "intentional"
+"#,
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        assert!(
+            !findings.iter().any(|f| f.subject.contains("duplicate signature")),
+            "all sites matched; finding should be suppressed: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ignore_partial_match_emits_unmatched_sites_only() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x * y }\n",
+        );
+        write(
+            &ws.join("src/c.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x - y }\n",
+        );
+        write(
+            &ws.join(".brightline-ignore"),
+            r#"ignore:
+  - file: src/a.rs
+    function: helper
+    signature_match: "fn helper(x: u32"
+    reason: "intentional"
+  - file: src/b.rs
+    function: helper
+    signature_match: "fn helper(x: u32"
+    reason: "intentional"
+"#,
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        let dupes: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with("duplicate signature"))
+            .collect();
+        assert_eq!(dupes.len(), 1, "expected one partial-suppression finding: {findings:?}");
+        let f = dupes[0];
+        assert!(
+            f.subject.contains("across 1 files"),
+            "subject should reflect unmatched site count: {}",
+            f.subject
+        );
+        assert!(
+            f.subject.contains("2 suppressed by .brightline-ignore"),
+            "subject should note the suppressed count: {}",
+            f.subject
+        );
+        assert!(
+            f.body.contains("src/c.rs"),
+            "body should name the unmatched site: {}",
+            f.body
+        );
+        assert!(
+            !f.body.contains("src/a.rs") && !f.body.contains("src/b.rs"),
+            "body should omit suppressed sites: {}",
+            f.body
+        );
+        assert!(
+            f.body.contains("2 site(s) suppressed by .brightline-ignore"),
+            "body should mention suppressed count: {}",
+            f.body
+        );
+    }
+
+    #[test]
+    fn ignore_no_matches_behaves_like_today() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x * y }\n",
+        );
+        write(
+            &ws.join("src/c.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x - y }\n",
+        );
+        // No .brightline-ignore.
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        let dupes: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with("duplicate signature"))
+            .collect();
+        assert_eq!(dupes.len(), 1, "expected one finding: {findings:?}");
+        let f = dupes[0];
+        assert!(
+            f.subject.contains("across 3 files"),
+            "subject should list all sites: {}",
+            f.subject
+        );
+        assert!(
+            f.body.contains("src/a.rs")
+                && f.body.contains("src/b.rs")
+                && f.body.contains("src/c.rs"),
+            "body should list every site: {}",
+            f.body
+        );
+        assert!(
+            !f.body.contains("suppressed"),
+            "body should NOT mention suppression when no entries match: {}",
+            f.body
+        );
+    }
+
+    #[test]
+    fn ignore_empty_list_no_suppression() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn helper(x: u32, y: u32) -> u32 { x * y }\n",
+        );
+        // Empty top-level `ignore` list.
+        write(
+            &ws.join(".brightline-ignore"),
+            "ignore: []\n",
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        let dupes: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with("duplicate signature"))
+            .collect();
+        assert_eq!(dupes.len(), 1, "expected one finding: {findings:?}");
+    }
+
+    #[test]
+    fn stale_entries_emit_findings_with_documented_prefix() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // src/present.rs has `kept`; src/gone.rs is missing.
+        write(&ws.join("src/present.rs"), "pub fn kept(x: u32) -> u32 { x }\n");
+        write(
+            &ws.join(".brightline-ignore"),
+            r#"ignore:
+  - file: src/gone.rs
+    function: vanished
+    signature_match: "fn vanished("
+    reason: "this file was deleted"
+  - file: src/present.rs
+    function: kept
+    signature_match: "fn kept(x: u32"
+    reason: "still here"
+"#,
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        let stale: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with(STALE_IGNORE_SUBJECT_PREFIX))
+            .collect();
+        assert_eq!(stale.len(), 1, "expected exactly one stale entry: {findings:?}");
+        let f = stale[0];
+        assert!(
+            f.subject.contains("src/gone.rs") && f.subject.contains("vanished"),
+            "stale subject should name file + function: {}",
+            f.subject
+        );
+        assert!(
+            f.subject.contains("this file was deleted"),
+            "stale subject should carry the reason: {}",
+            f.subject
+        );
+        assert!(
+            f.body.contains("file: src/gone.rs"),
+            "stale body should name file: {}",
+            f.body
+        );
     }
 
     /// Regression guard for `a02-audit-proposal-created-notification`.

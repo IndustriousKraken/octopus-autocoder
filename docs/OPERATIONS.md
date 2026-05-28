@@ -458,6 +458,40 @@ Both triage-spawned PRs are normal autocoder-opened PRs that participate in the 
 
 **Symmetry with `propose`.** The `send it` flow is "act on what the audit found." The companion `@<bot> propose <repo> <free-form text>` verb (see [CHATOPS.md → Chat-driven proposals: `propose`](CHATOPS.md#chat-driven-proposals-propose)) is "act on what I'm asking for." It reuses the same triage-mode plumbing — explore + classify + apply + maybe-spec — and the same two-PR diff split, but accepts the operator's free-form description as the input instead of an audit's findings. The chat-triage prompt adds one classification step ahead of explore: a request that reads as a QUESTION gets a thread reply (no PR), a DIRECTIVE gets the standard fixes-PR-and/or-spec-PR output, an AMBIGUOUS request escalates via `ask_user`. Resulting PRs go through the same revision loop as `send it` PRs.
 
+### `.brightline-ignore` — silencing intentional duplications {#brightline-ignore}
+
+The `architecture_brightline` audit's duplicate-signature check is structural: any function/method whose normalized signature appears in N+ files trips it. Some duplications are deliberate (example sites mirroring a production API, generated scaffolding, multi-platform protocol implementations). To silence those without suppressing the audit entirely, drop a `.brightline-ignore` file at the workspace root.
+
+**Location.** `<workspace_root>/.brightline-ignore`. Per-workspace, never global — different repos have different intentional-duplication patterns.
+
+**YAML schema.** All four fields per entry are required; malformed entries WARN and are skipped:
+
+```yaml
+ignore:
+  - file: examples/site-a/auth.ts            # workspace-relative path (exact match)
+    function: handleAuthCallback              # function/method name (exact match)
+    signature_match: "async function handleAuthCallback(req"   # substring of the signature line
+    reason: "All example sites implement the same auth contract; intentional"
+  - file: examples/site-b/auth.ts
+    function: handleAuthCallback
+    signature_match: "async function handleAuthCallback(req"
+    reason: "All example sites implement the same auth contract; intentional"
+```
+
+Anchors are `file + function + signature_match` — NEVER line numbers, which shift on every edit and would rot every entry within days.
+
+**Match-suppression rule.** A duplicate-signature finding is suppressed in full when EVERY constituent site matches an ignore entry. A partial match (some sites match, some don't) emits the finding with the unmatched sites only, plus a `(N suppressed by .brightline-ignore)` tail in the subject so operators see at a glance that the finding is partially silenced. No match → the finding emits unchanged.
+
+**Stale-entry handling.** Each brightline run validates every loaded entry against the current workspace state. An entry is stale when (a) the named file doesn't exist, (b) the file no longer contains a function with the named name, OR (c) the function's signature line no longer contains `signature_match`. Stale entries surface as additional findings; the brightline chatops top-line gains a trailing `; <K> stale ignore entries to clean up` clause when `K > 0`, and the threaded body lists each stale entry with its `file + function + reason`. The audit does NOT modify `.brightline-ignore` on disk — brightline declares `WritePolicy::None` and the cleanup is purely informational. The operator removes stale entries manually (or via `@<bot> send it` on a future audit run, since the triage handler permits `.brightline-ignore` writes).
+
+**`send it` integration.** When an operator runs `@<bot> send it` on a brightline-finding thread, the triage LLM classifies each duplicate-signature finding as one of:
+
+- **Fix** — refactor the duplication out via a quick fix.
+- **Spec-worthy** — write a proposal under `openspec/changes/<slug>/`.
+- **Mark as intentional** — add an entry to `.brightline-ignore` for each constituent site of the finding (the LLM populates `reason` from its judgment; operators revise via the standard PR-comment revision loop if the reason is off).
+
+A `Mark as intentional` triage produces a diff that touches ONLY `.brightline-ignore`. The triage handler enforces this scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (the offending paths are named in the rejection chatops reply and the thread's status flips to `triage-failed` so the operator can retry).
+
 ### On-demand audit triggers
 
 Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, which suits steady-state operation but not the production-readiness workflow ("run an architecture audit now, fix what it surfaces, run a security audit now, iterate"). On-demand triggers complement the cadence: a `@<bot> audit <substring> <repo>` chatops verb (see [CHATOPS.md → On-demand audit: `audit`](CHATOPS.md#on-demand-audit-audit)) and an `autocoder audit run --workspace <path> --audit <name>` CLI subcommand (see [CLI Reference → audit run](CLI.md#audit-run)) both append an audit-type to a per-repo `pending_audit_runs` queue. At the start of each polling iteration's audit phase, the scheduler drains the queue and runs each queued audit unconditionally — cadence and `requires_head_change` are bypassed for queued runs. After the queued runs, the cadence-driven sweep proceeds normally, skipping any audit that already ran via the queue this iteration so the same audit cannot run twice in one pass.

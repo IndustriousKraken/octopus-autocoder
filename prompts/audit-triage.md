@@ -51,6 +51,55 @@ sentences each). If a finding is ambiguous, default to spec-worthy —
 the operator can revise the spec via `@<bot> revise` on the resulting
 PR if your judgment was off.
 
+#### For `architecture_brightline` duplicate-signature findings
+
+The brightline audit's duplicate-signature check trips on any function
+or method whose normalized signature appears in N+ files. Some of those
+duplications are intentional (example sites mirroring an API,
+generated scaffolding, multi-platform protocol implementations). For
+each duplicate-signature finding, decide one of:
+
+- **Fix** — refactor the duplication out (extract a shared helper,
+  collapse the copies). Proceeds with the standard quick-fix output
+  path.
+- **Spec-worthy** — the duplication signals a missing abstraction that
+  needs design work. Proceeds with the standard spec-worthy output
+  path (write a proposal under `openspec/changes/<slug>/`).
+- **Mark as intentional** — the duplication reflects a design choice
+  that fixing would actively harm. Add an entry to `.brightline-ignore`
+  at the workspace root for EACH constituent site of the finding. Each
+  entry MUST carry `file`, `function`, `signature_match`, AND a
+  one-line `reason` explaining why the duplication is deliberate. Use
+  this option for example sites that intentionally mirror a production
+  API, generated scaffolding that produces identical shapes per
+  entity, or multi-platform protocol implementations where the
+  duplication is the whole point.
+
+YAML shape for `.brightline-ignore` entries:
+
+```yaml
+ignore:
+  - file: examples/site-a/auth.ts
+    function: handleAuthCallback
+    signature_match: "async function handleAuthCallback(req"
+    reason: "All example sites implement the same auth contract; intentional"
+  - file: examples/site-b/auth.ts
+    function: handleAuthCallback
+    signature_match: "async function handleAuthCallback(req"
+    reason: "All example sites implement the same auth contract; intentional"
+```
+
+Anchors are `file + function + signature_match` (substring) — NEVER
+line numbers. Line numbers shift on every edit and would rot the
+entry within days.
+
+When the chosen classification is "Mark as intentional", your diff
+MUST touch ONLY `.brightline-ignore`. Do NOT also write code fixes
+or new `openspec/changes/<slug>/` directories in the same triage run
+when "Mark as intentional" is the verdict for a brightline finding —
+the triage handler enforces this scope and will refuse to ship a
+diff that mixes `.brightline-ignore` writes with code edits.
+
 ### 3. Apply the quick fixes
 
 For every finding classified as quick fix:

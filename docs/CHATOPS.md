@@ -152,6 +152,8 @@ This is intentional: stale audit findings probably no longer reflect the current
 
 **Revising the produced PRs.** Both the fixes PR and the spec PR are normal autocoder-opened PRs that participate in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment). If the agent over-promoted findings to specs, ask it to inline the fix via a revision comment on the spec PR; if it under-fixed, point that out via a revision comment on the fixes PR.
 
+**Brightline findings can also produce `.brightline-ignore` updates.** When `send it` runs on an `architecture_brightline` thread, the triage LLM classifies each duplicate-signature finding as **Fix**, **Spec-worthy**, or **Mark as intentional**. The third path produces a diff that touches ONLY `.brightline-ignore` (one entry per constituent site of the finding, with the LLM's reasoning recorded in each entry's `reason` field). The triage handler enforces brightline-specific diff scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (only `.brightline-ignore` and `openspec/changes/<slug>/` are permitted in the brightline triage output). See [OPERATIONS.md → `.brightline-ignore`](OPERATIONS.md#brightline-ignore) for the full file format, match-suppression rules, and stale-entry handling.
+
 ### On-demand audit: `audit`
 
 Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, which suits steady-state operation but not the production-readiness workflow ("run an architecture audit now, fix what it surfaces, run a security audit now, iterate"). The `audit` verb queues an audit run for the next polling iteration:

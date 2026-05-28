@@ -3981,6 +3981,39 @@ async fn process_completed_triage(
     let new_slug = derive_unique_triage_slug(workspace, &state.audit_type, &state.findings_excerpt);
     let slug_prefix = format!("openspec/changes/{new_slug}/");
 
+    // Brightline-specific diff-scope validation: the `Mark as
+    // intentional` triage output writes ONLY `.brightline-ignore`. The
+    // overall brightline-triage diff must therefore be limited to
+    // `.brightline-ignore` plus `openspec/changes/<slug>/`. A diff
+    // touching arbitrary code AND `.brightline-ignore` indicates a
+    // confused LLM run; we refuse rather than ship a half-valid PR.
+    if let Err(violations) =
+        validate_brightline_triage_scope(&state.audit_type, &changed, &slug_prefix)
+    {
+        tracing::warn!(
+            thread_ts = %state.thread_ts,
+            "audit-triage: brightline diff scope violation; rejecting. Out-of-scope paths: {violations:?}"
+        );
+        if let Some(ctx) = chatops_ctx {
+            let body = format!(
+                "✗ Triage for `{audit_type}` on `{repo_url}` rejected: out-of-scope diff. \
+                Brightline triages may only write `.brightline-ignore` or `openspec/changes/{new_slug}/`. \
+                Offending paths:\n{violations}",
+                audit_type = state.audit_type,
+                repo_url = state.repo_url,
+                new_slug = new_slug,
+                violations = violations.join("\n"),
+            );
+            let _ = ctx
+                .chatops
+                .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+                .await;
+        }
+        state.status = AuditThreadStatus::TriageFailed;
+        let _ = threads::write_state(&state_root, state);
+        return Ok(());
+    }
+
     let (fixes_paths, spec_paths): (Vec<String>, Vec<String>) = changed
         .into_iter()
         .partition(|p| !p.starts_with(&slug_prefix));
@@ -4172,6 +4205,51 @@ fn short_findings_hash(findings: &str) -> String {
         h = h.wrapping_mul(0x100000001b3); // FNV prime
     }
     format!("{:08x}", h as u32)
+}
+
+/// Diff-scope check applied to `architecture_brightline` triage diffs.
+/// The brightline `send it` LLM emits one of three output shapes per
+/// finding:
+///
+/// 1. **Fix** — touches arbitrary source files.
+/// 2. **Spec-worthy** — touches files under `openspec/changes/<slug>/`.
+/// 3. **Mark as intentional** — touches ONLY `.brightline-ignore`.
+///
+/// Per the spec, a brightline triage diff is permitted to touch
+/// `.brightline-ignore` and/or `openspec/changes/<slug>/` — but if
+/// `.brightline-ignore` writes mix with arbitrary code edits, the run
+/// is confused and we refuse to ship it (the caller posts a chatops
+/// rejection and flips state to `TriageFailed`).
+///
+/// For non-brightline audits this function is a no-op: every other
+/// audit's triage diff is unconstrained beyond the spec/fixes
+/// partition that happens downstream.
+///
+/// Returns `Ok(())` when the diff passes. Returns `Err(violations)`
+/// listing the offending paths when it fails.
+fn validate_brightline_triage_scope(
+    audit_type: &str,
+    changed: &[String],
+    slug_prefix: &str,
+) -> Result<(), Vec<String>> {
+    if audit_type != "architecture_brightline" {
+        return Ok(());
+    }
+    if !changed.iter().any(|p| p == ".brightline-ignore") {
+        // No `.brightline-ignore` write in this diff → the brightline
+        // triage took the fix/spec path, which is unconstrained.
+        return Ok(());
+    }
+    let violations: Vec<String> = changed
+        .iter()
+        .filter(|p| p.as_str() != ".brightline-ignore" && !p.starts_with(slug_prefix))
+        .cloned()
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
 }
 
 /// Pull the path out of a `git status --porcelain` line. Lines look like
@@ -4770,6 +4848,74 @@ fn short_request_excerpt(request_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brightline_triage_scope_accepts_only_ignore_file() {
+        let changed = vec![".brightline-ignore".to_string()];
+        assert!(validate_brightline_triage_scope(
+            "architecture_brightline",
+            &changed,
+            "openspec/changes/architecture-brightline-abcd1234/",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn brightline_triage_scope_accepts_ignore_plus_spec_dir() {
+        let changed = vec![
+            ".brightline-ignore".to_string(),
+            "openspec/changes/architecture-brightline-abcd1234/proposal.md".to_string(),
+        ];
+        assert!(validate_brightline_triage_scope(
+            "architecture_brightline",
+            &changed,
+            "openspec/changes/architecture-brightline-abcd1234/",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn brightline_triage_scope_rejects_ignore_mixed_with_code() {
+        let changed = vec![
+            ".brightline-ignore".to_string(),
+            "src/foo.rs".to_string(),
+        ];
+        let err = validate_brightline_triage_scope(
+            "architecture_brightline",
+            &changed,
+            "openspec/changes/architecture-brightline-abcd1234/",
+        )
+        .expect_err("mixed-scope diff must be rejected");
+        assert_eq!(err, vec!["src/foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn brightline_triage_scope_accepts_pure_fixes_diff_without_ignore_file() {
+        // No `.brightline-ignore` write → the LLM took the fix path.
+        // That path is unconstrained.
+        let changed = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
+        assert!(validate_brightline_triage_scope(
+            "architecture_brightline",
+            &changed,
+            "openspec/changes/architecture-brightline-abcd1234/",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn brightline_triage_scope_noop_for_other_audits() {
+        // Non-brightline audits are unaffected: a mixed diff is fine.
+        let changed = vec![
+            ".brightline-ignore".to_string(),
+            "src/foo.rs".to_string(),
+        ];
+        assert!(validate_brightline_triage_scope(
+            "drift_audit",
+            &changed,
+            "openspec/changes/drift-audit-abcd1234/",
+        )
+        .is_ok());
+    }
 
     /// Routing test: when `owner_tokens` maps the parsed URL owner to an
     /// env var, the PR-creation HTTP call MUST carry that env var's value
