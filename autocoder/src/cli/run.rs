@@ -862,7 +862,7 @@ pub async fn dispatch_startup_notification(
     chatops: Option<&ChatOpsSlot>,
     repo_count: usize,
 ) {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("AUTOCODER_VERSION");
     let msg = startup_version_message(version, repo_count);
     match chatops {
         Some(slot) => {
@@ -1509,6 +1509,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn autocoder_version_env_is_non_empty() {
+        let v = env!("AUTOCODER_VERSION");
+        assert!(
+            !v.is_empty(),
+            "AUTOCODER_VERSION must be non-empty (build.rs fallback should always produce a value)"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_startup_notification_posts_one_message_when_chatops_configured() {
         let backend = Arc::new(crate::audits::test_support::RecordingBackend::new());
@@ -1524,8 +1533,8 @@ mod tests {
         assert_eq!(calls.len(), 1, "exactly one post_notification call expected");
         assert_eq!(calls[0].channel, "C_DEFAULT");
         assert!(
-            calls[0].text.contains(&format!("autocoder v{}", env!("CARGO_PKG_VERSION"))),
-            "message must name CARGO_PKG_VERSION: {}",
+            calls[0].text.contains(&format!("autocoder v{}", env!("AUTOCODER_VERSION"))),
+            "message must name AUTOCODER_VERSION: {}",
             calls[0].text
         );
         assert!(

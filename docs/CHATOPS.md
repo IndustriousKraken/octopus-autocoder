@@ -460,6 +460,19 @@ chatops:
 
 All three keys are optional. An absent `notifications:` block parses to "all true" — first-time deployments see useful chatops traffic without further configuration. Set a key to `false` to suppress that stream without affecting the others. If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 
+### Startup version notification (`🆙`)
+
+One line per daemon startup, posted after the bring-up pipeline completes (configs validated, chatops backend constructed, repositories enumerated) and BEFORE the first polling iteration begins:
+
+```
+🆙 autocoder v1.1.1 started — 8 repository(ies) configured
+🆙 autocoder v1.1.1-23-g4abc123 started — 8 repository(ies) configured
+```
+
+The first form fires when the binary was built at a clean `vX.Y.Z` tag commit (the case for `update.sh`-installed binaries — the release workflow builds at tagged commits). The second form fires when the binary was built N commits past the most-recent tag (the common case for source-built deployments running master); the trailing `-g<short-sha>` names the working commit, and a `-dirty` suffix appears when the build included uncommitted local changes. See [DEPLOYMENT.md → Version-string format](DEPLOYMENT.md#version-string-format) for the full version-resolution table.
+
+This notification is a **daemon-lifecycle signal**, not a per-change signal — it is NOT gated by `chatops.notifications.start_work`, `failure_alerts`, or `pr_opened`. Operators who silence per-change traffic still see the once-per-boot version line. When no chatops backend is configured, the daemon falls back to an INFO log line so the version is still recoverable via `journalctl -u autocoder`.
+
 ### Start-of-work (`🚀`)
 
 One line per change pickup, fired immediately after the change's `.in-progress` lock is created and BEFORE the executor is invoked:

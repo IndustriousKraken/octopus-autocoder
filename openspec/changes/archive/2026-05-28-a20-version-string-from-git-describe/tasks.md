@@ -1,6 +1,6 @@
 ## 1. `build.rs`
 
-- [ ] 1.1 Create `autocoder/build.rs` at the crate root:
+- [x] 1.1 Create `autocoder/build.rs` at the crate root:
   ```rust
   fn main() {
       let describe = std::process::Command::new("git")
@@ -23,26 +23,26 @@
       println!("cargo:rerun-if-changed=.git/refs/tags");
   }
   ```
-- [ ] 1.2 Cargo auto-detects `build.rs` at crate root; no `Cargo.toml` edit needed. Verify on this version of cargo by running `cargo build` once AND checking that `env!("AUTOCODER_VERSION")` resolves.
-- [ ] 1.3 The fallback chain: git command not found OR exits non-zero OR returns empty → use `env!("CARGO_PKG_VERSION")` verbatim. The fallback NEVER produces an empty string AND NEVER fails the build.
-- [ ] 1.4 Test the fallback manually: rename `.git/` to `.git.bak/` temporarily, run `cargo build --release`, confirm `--version` returns the Cargo.toml version verbatim. Restore `.git/`.
+- [x] 1.2 Cargo auto-detects `build.rs` at crate root; no `Cargo.toml` edit needed. Verify on this version of cargo by running `cargo build` once AND checking that `env!("AUTOCODER_VERSION")` resolves.
+- [x] 1.3 The fallback chain: git command not found OR exits non-zero OR returns empty → use `env!("CARGO_PKG_VERSION")` verbatim. The fallback NEVER produces an empty string AND NEVER fails the build.
+- [x] 1.4 Test the fallback manually: rename `.git/` to `.git.bak/` temporarily, run `cargo build --release`, confirm `--version` returns the Cargo.toml version verbatim. Restore `.git/`.
 
 ## 2. Replace `env!("CARGO_PKG_VERSION")` references
 
-- [ ] 2.1 Sweep the codebase:
+- [x] 2.1 Sweep the codebase:
   ```bash
   grep -rn 'CARGO_PKG_VERSION' autocoder/src/
   ```
-- [ ] 2.2 For each hit, replace with `env!("AUTOCODER_VERSION")`. Likely sites: the `🆙` startup notification in the daemon's run-loop bring-up; the clap derive macro for the top-level `Cli` struct; any log line that prints version at startup.
-- [ ] 2.3 Tests covering version output:
+- [x] 2.2 For each hit, replace with `env!("AUTOCODER_VERSION")`. Likely sites: the `🆙` startup notification in the daemon's run-loop bring-up; the clap derive macro for the top-level `Cli` struct; any log line that prints version at startup.
+- [x] 2.3 Tests covering version output:
   - `autocoder --version` returns a non-empty string.
   - The string matches `env!("AUTOCODER_VERSION")` exactly.
   - In a CI environment where `.git/` is present, the string includes a hash suffix OR matches a tag — never literally `0.1.0` (the dev fallback).
 
 ## 3. Clap `--version` override
 
-- [ ] 3.1 Locate the top-level `Cli` struct (likely `autocoder/src/cli/mod.rs`).
-- [ ] 3.2 Update the `#[command(...)]` attribute:
+- [x] 3.1 Locate the top-level `Cli` struct (likely `autocoder/src/cli/mod.rs`).
+- [x] 3.2 Update the `#[command(...)]` attribute:
   ```rust
   #[derive(Parser)]
   #[command(
@@ -52,11 +52,11 @@
   )]
   pub struct Cli { ... }
   ```
-- [ ] 3.3 Test: `cargo run -- --version` outputs the describe-derived string, not the Cargo.toml version.
+- [x] 3.3 Test: `cargo run -- --version` outputs the describe-derived string, not the Cargo.toml version.
 
 ## 4. Startup notification update
 
-- [ ] 4.1 In whatever module hosts the `🆙` post (per `a04`'s implementation), change:
+- [x] 4.1 In whatever module hosts the `🆙` post (per `a04`'s implementation), change:
   ```rust
   let version = env!("CARGO_PKG_VERSION");
   ```
@@ -64,19 +64,19 @@
   ```rust
   let version = env!("AUTOCODER_VERSION");
   ```
-- [ ] 4.2 The `format!("🆙 autocoder v{} started — {} repository(ies) configured", version, count)` line is unchanged. Only the source of `version` changes.
-- [ ] 4.3 Test (using `MockChatOpsBackend` per `a04`'s test pattern):
+- [x] 4.2 The `format!("🆙 autocoder v{} started — {} repository(ies) configured", version, count)` line is unchanged. Only the source of `version` changes.
+- [x] 4.3 Test (using `MockChatOpsBackend` per `a04`'s test pattern):
   - Boot the daemon's bring-up function.
   - Assert the `post_notification` message text contains the `env!("AUTOCODER_VERSION")` value.
   - Assert the message follows the format `🆙 autocoder v<version> started — <N> repository(ies) configured`.
 
 ## 5. Docs
 
-- [ ] 5.1 In `docs/DEPLOYMENT.md`, add a "Version-string format" section under the existing "Upgrading" discussion:
+- [x] 5.1 In `docs/DEPLOYMENT.md`, add a "Version-string format" section under the existing "Upgrading" discussion:
   - Binary-release operators (using `update.sh`) see clean `vX.Y.Z` strings because the release workflow builds at tagged commits.
   - Source-build operators see `vX.Y.Z-N-gSHA` strings where N is the count of commits past the last tag AND SHA is the abbreviated commit hash. A `-dirty` suffix appears when the build includes uncommitted local changes.
   - Cargo.toml's `version =` field is the "base version operators manually bump at semver-meaningful releases." It's not bumped per commit; `git describe` provides the delta info automatically.
-- [ ] 5.2 In `docs/CHATOPS.md`, update the `🆙` startup-notification example. Pre-spec:
+- [x] 5.2 In `docs/CHATOPS.md`, update the `🆙` startup-notification example. Pre-spec:
   ```
   🆙 autocoder v0.1.0 started — 8 repository(ies) configured
   ```
@@ -89,12 +89,12 @@
 
 ## 6. Spec deltas
 
-- [ ] 6.1 `openspec/changes/a20-version-string-from-git-describe/specs/orchestrator-cli/spec.md` MODIFIES `Daemon emits a startup version notification on every successful boot` (preserves all 4 existing scenarios) AND ADDs `Binary version string is derived from \`git describe\` at build time`.
-- [ ] 6.2 `openspec/changes/a20-version-string-from-git-describe/specs/project-documentation/spec.md` ADDs `DEPLOYMENT.md AND CHATOPS.md explain the version-string format AND the source-vs-binary distinction`.
+- [x] 6.1 `openspec/changes/a20-version-string-from-git-describe/specs/orchestrator-cli/spec.md` MODIFIES `Daemon emits a startup version notification on every successful boot` (preserves all 4 existing scenarios) AND ADDs `Binary version string is derived from \`git describe\` at build time`.
+- [x] 6.2 `openspec/changes/a20-version-string-from-git-describe/specs/project-documentation/spec.md` ADDs `DEPLOYMENT.md AND CHATOPS.md explain the version-string format AND the source-vs-binary distinction`.
 
 ## 7. Verification
 
-- [ ] 7.1 `cargo test` passes (new + existing).
-- [ ] 7.2 `openspec validate a20-version-string-from-git-describe --strict` passes.
-- [ ] 7.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings.
-- [ ] 7.4 Manual verification: build the daemon from the current repo; run `./target/release/autocoder --version`; assert the output is the `git describe` form, NOT `0.1.0`.
+- [x] 7.1 `cargo test` passes (new + existing).
+- [x] 7.2 `openspec validate a20-version-string-from-git-describe --strict` passes.
+- [x] 7.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings.
+- [x] 7.4 Manual verification: build the daemon from the current repo; run `./target/release/autocoder --version`; assert the output is the `git describe` form, NOT `0.1.0`.
