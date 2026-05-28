@@ -1012,6 +1012,13 @@ pub async fn ensure_forks_exist(
 /// `true` if the repository is healthy and a polling task should be spawned;
 /// `false` (with a logged error) if the workspace is dirty or cannot be
 /// initialized.
+///
+/// TODO(a14): a future spec could extend mid-iteration's
+/// `classify_recovery_failure` to startup too, so a transient
+/// `Could not resolve host` at boot waits for the next iteration instead
+/// of skipping the repo for the daemon's lifetime. For now startup keeps
+/// its conservative skip-for-lifetime contract: any failure here removes
+/// the repo from the polling set until the operator restarts the daemon.
 pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig) -> bool {
     let workspace_path = workspace::resolve_path(repo);
     let fork_url = match github.fork_owner.as_deref() {
