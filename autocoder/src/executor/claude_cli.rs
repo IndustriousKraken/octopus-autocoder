@@ -548,6 +548,24 @@ impl ClaudeCliExecutor {
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("task[{i}] missing string `reason`"))?;
+            // Per a20a1: detect un-substituted placeholders.
+            // The agent's worked example in prompts/implementer.md is
+            // expected to be ANCHORED behaviour; emitting it verbatim
+            // (with `<id-from-tasks-md>` etc. still in fields) is a
+            // template-following bug. Convert to a specific Err so the
+            // caller's WARN log and Failed-reason carry the diagnostic
+            // pointing the operator at the prompt section.
+            for (field_name, field_value) in [
+                ("task_id", task_id),
+                ("task_text", task_text),
+                ("reason", reason),
+            ] {
+                if Self::contains_unsubstituted_placeholder(field_value) {
+                    return Err(format!(
+                        "looks like un-substituted placeholders — the agent emitted the prompt's example verbatim instead of substituting concrete values; see prompts/implementer.md sentinel section (task[{i}].{field_name} contained `<...>` placeholder text: {field_value})"
+                    ));
+                }
+            }
             tasks.push(UnimplementableTask {
                 task_id: task_id.to_string(),
                 task_text: task_text.to_string(),
@@ -563,6 +581,58 @@ impl ClaudeCliExecutor {
             unimplementable_tasks: tasks,
             revision_suggestion,
         }))
+    }
+
+    /// Detect `<placeholder>` patterns that indicate the agent emitted
+    /// the prompt template's example verbatim instead of substituting
+    /// concrete values. The regex is intentionally narrow — lowercase
+    /// letters, digits, spaces, underscores, hyphens between angle
+    /// brackets, leading char must be a letter — to avoid matching
+    /// legitimate `<...>` content like `@<bot>` mentions or HTML-shaped
+    /// task descriptions. False positives ARE possible (a real task
+    /// whose text happens to match the pattern); per the spec, the
+    /// diagnostic phrase still helps the operator either way.
+    fn contains_unsubstituted_placeholder(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            if start >= bytes.len() {
+                return false;
+            }
+            let first = bytes[start];
+            if !first.is_ascii_lowercase() {
+                i += 1;
+                continue;
+            }
+            let mut j = start + 1;
+            let mut closed = false;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == b'>' {
+                    closed = true;
+                    break;
+                }
+                let ok = b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b' '
+                    || b == b'_'
+                    || b == b'-';
+                if !ok {
+                    break;
+                }
+                j += 1;
+            }
+            if closed {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Truncate `s` to at most `SENTINEL_EXCERPT_MAX` characters (codepoints)
@@ -964,6 +1034,21 @@ impl ClaudeCliExecutor {
             });
         }
 
+        // Timeout precedence (a20a1): a timed-out run by definition did
+        // not reach a deliberate end-of-run point. Any sentinel-shaped
+        // substring in the captured event stream is by-construction NOT
+        // the agent's deliberate emission. Classify as timeout BEFORE
+        // any sentinel extraction so a false-match on prompt-echo OR
+        // tool-result content cannot mask the real cause. Pre-a20a1,
+        // the order was reversed, which caused a21-canonical-spec-rag
+        // to perma-stuck under "unparseable sentinel" when the real
+        // cause was a one-hour timeout.
+        if outcome.timed_out {
+            return Ok(ExecutorOutcome::Failed {
+                reason: "timeout".to_string(),
+            });
+        }
+
         // Outcome sentinel: the agent's pre-flight check writes an
         // `=== AUTOCODER-OUTCOME ===` block when it identifies an
         // unimplementable task. We check this BEFORE looking at the exit
@@ -971,22 +1056,21 @@ impl ClaudeCliExecutor {
         // honored, and so the dispatcher's no-diff-Failed fallback never
         // sees the workspace ahead of the signal.
         //
-        // Scope-narrow the sentinel scan to the FINAL ANSWER (the
-        // `result`-event text in JSON streaming mode) when available,
-        // falling back to full stdout in text-mode opt-out. The
-        // sentinel is meant to be the agent's deliberate signal at
-        // end-of-run, NOT something autocoder false-positives on when
-        // the agent's tool_result content (e.g. a Read of
-        // `prompts/implementer.md`) happens to contain the documented
-        // marker text. The marker appears as documentation in this very
-        // file's prompt template, so any Read of it during streaming
-        // captures the documentation into stdout and used to confuse
-        // the parser.
-        let sentinel_source: &str = outcome
-            .final_answer
-            .as_deref()
-            .unwrap_or(&outcome.stdout);
-        if let Some(payload) = Self::extract_outcome_sentinel(sentinel_source) {
+        // Scope (a20a1): in JSON streaming mode the sentinel SHALL be
+        // sought ONLY in `final_answer` (the `result`-event text — the
+        // agent's deliberate end-of-run emission). Tool-result echoes,
+        // prompt-context echoes, and other event-stream content are
+        // NOT deliberate emissions; matching against them produces the
+        // false-positives that drove a21-canonical-spec-rag to perma-
+        // stuck. In text-mode opt-out the only signal IS stdout, so
+        // the legacy stdout scan is retained for that case.
+        let sentinel_source: Option<&str> = match self.output_format {
+            crate::config::ExecutorOutputFormat::Json => outcome.final_answer.as_deref(),
+            crate::config::ExecutorOutputFormat::Text => Some(outcome.stdout.as_str()),
+        };
+        if let Some(source) = sentinel_source
+            && let Some(payload) = Self::extract_outcome_sentinel(source)
+        {
             match Self::try_parse_spec_needs_revision(&payload) {
                 Ok(Some(spec_revision)) => return Ok(spec_revision),
                 Ok(None) => {
@@ -1002,17 +1086,11 @@ impl ClaudeCliExecutor {
                     );
                     return Ok(ExecutorOutcome::Failed {
                         reason: format!(
-                            "agent emitted unparseable SpecNeedsRevision sentinel: {excerpt}"
+                            "agent emitted unparseable SpecNeedsRevision sentinel: {parse_err}; excerpt: {excerpt}"
                         ),
                     });
                 }
             }
-        }
-
-        if outcome.timed_out {
-            return Ok(ExecutorOutcome::Failed {
-                reason: "timeout".to_string(),
-            });
         }
 
         let status = outcome.exit_status.expect("non-timeout path has status");
@@ -2203,6 +2281,234 @@ mod tests {
         assert!(body.contains("STDERR_SENTINEL"));
     }
 
+    // ---------- a20a1: timeout precedence + sentinel-scope ----------
+
+    fn fixture_workspace_for_classify() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("github_com_owner_repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        // Ensure the openspec/changes/<change>/ directory exists so the
+        // askuser-marker check in classify_outcome's preamble doesn't
+        // error on a missing path. classify_outcome only checks the
+        // marker file's existence, not the directory, so this is mostly
+        // hygiene.
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
+        (tmp, ws)
+    }
+
+    fn fixture_executor_json() -> ClaudeCliExecutor {
+        ClaudeCliExecutor::new("dummy-claude".into(), 30)
+    }
+
+    fn fixture_executor_text() -> ClaudeCliExecutor {
+        ClaudeCliExecutor::new("dummy-claude".into(), 30)
+            .with_output_format(crate::config::ExecutorOutputFormat::Text)
+    }
+
+    /// The regression test for the a21-perma-stuck incident: a timed-out
+    /// run with a well-formed sentinel-shaped block in stdout (e.g. from
+    /// a tool-result echo of prompts/implementer.md) must classify as
+    /// `timeout`, NOT `unparseable sentinel`. Pre-a20a1 this produced
+    /// the misleading sentinel-failure reason that masked the real cause.
+    #[tokio::test]
+    async fn timed_out_run_with_sentinel_in_stdout_returns_timeout() {
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            // Full well-formed sentinel-shaped content in stdout —
+            // would have triggered the false-match path pre-fix.
+            stdout: "\
+some tool output\n\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\
+\"revision_suggestion\":\"Replace with CI gate.\"}\n".to_string(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        match result {
+            ExecutorOutcome::Failed { reason } => {
+                assert_eq!(reason, "timeout",
+                    "timed-out runs must classify as timeout regardless of stdout content: got {reason}");
+                assert!(
+                    !reason.contains("unparseable"),
+                    "pre-fix would have surfaced 'unparseable sentinel' here"
+                );
+            }
+            other => panic!("expected Failed(timeout), got {other:?}"),
+        }
+    }
+
+    /// The exact a21 incident shape: timed_out, final_answer absent,
+    /// stdout contains the `\n31\t`-line-numbered Read echo of the
+    /// prompt template. Pre-fix returned `Failed { reason: "agent
+    /// emitted unparseable SpecNeedsRevision sentinel: ..." }`. Now
+    /// classifies as timeout.
+    #[tokio::test]
+    async fn timed_out_run_with_line_numbered_prompt_echo_returns_timeout() {
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        // The `\n31\t` is the cat-n style prefix that signaled the bug:
+        // a Read tool result for prompts/implementer.md renders the
+        // file with line numbers, breaking JSON parse if scanned.
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: "\
+[tool_use] Read prompts/implementer.md\n\
+[tool_result]\n\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\n31\t  {\"task_id\":\"<id-from-tasks-md>\",\"task_text\":\"<verbatim quote>\",\"reason\":\"<one-line why>\"}\n],\"revision_suggestion\":\"<free-form text>\"}\n".to_string(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(matches!(
+            result,
+            ExecutorOutcome::Failed { reason } if reason == "timeout"
+        ));
+    }
+
+    /// JSON streaming mode with sentinel in stdout (tool-result echo)
+    /// but final_answer empty — no timeout, no exit-status. The
+    /// sentinel scan must consider final_answer ONLY and find nothing.
+    /// Falls through to the normal exit-status path. Without an exit
+    /// status set, classify_outcome panics ("non-timeout path has
+    /// status"), so we set a fake successful status to drive the path.
+    #[tokio::test]
+    async fn json_mode_sentinel_only_scanned_in_final_answer() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            // stdout contains a sentinel-shaped block from a tool-result
+            // echo. final_answer is the agent's actual emission — no
+            // sentinel there. Pre-fix would have scanned stdout and
+            // false-matched; post-fix the scan is final_answer-scoped
+            // and returns None.
+            stdout: "\
+[tool_use] Read prompts/implementer.md\n\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
+            stderr: String::new(),
+            final_answer: Some("Implementation complete; all tests pass.".to_string()),
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        // Exit-status path: zero exit, empty diff → the
+        // no-modifications path; not our concern here. The point: NO
+        // SpecNeedsRevision was returned. The scan ignored stdout.
+        assert!(
+            !matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
+            "JSON-mode sentinel scan must NOT match against stdout content"
+        );
+    }
+
+    /// JSON streaming mode with a real sentinel in final_answer —
+    /// happy-path scoping. The scan SHOULD find it there.
+    #[tokio::test]
+    async fn json_mode_sentinel_in_final_answer_is_honored() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: "irrelevant tool noise".to_string(),
+            stderr: String::new(),
+            final_answer: Some(
+                "=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"Replace with CI gate.\"}".to_string(),
+            ),
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }));
+    }
+
+    /// JSON streaming mode with final_answer absent (no `result` event)
+    /// AND no timeout: the sentinel scan returns None (no fallback to
+    /// stdout). Falls through to normal exit-status handling.
+    #[tokio::test]
+    async fn json_mode_with_no_final_answer_skips_sentinel_scan() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            // stdout contains a sentinel block; the pre-a20a1 fallback
+            // path would have matched it. Now: ignored because mode is
+            // Json and final_answer is None.
+            stdout: "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
+            stderr: String::new(),
+            final_answer: None,
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(
+            !matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
+            "JSON-mode with no final_answer must not scan stdout"
+        );
+    }
+
+    /// Text mode preserves the stdout sentinel scan for non-timeout
+    /// runs. The legacy opt-out has no `result`-event channel; stdout
+    /// IS the agent's emission. Behavior unchanged.
+    #[tokio::test]
+    async fn text_mode_sentinel_in_stdout_is_honored() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_text();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: "\
+some leading narrative\n\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"Replace with CI gate.\"}\n".to_string(),
+            stderr: String::new(),
+            final_answer: None,
+            streamed_log: false,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }));
+    }
+
+    /// Text mode also yields to timeout precedence — a timed-out
+    /// text-mode run is classified as timeout BEFORE the stdout
+    /// scan runs.
+    #[tokio::test]
+    async fn text_mode_timeout_precedence_skips_sentinel_scan() {
+        let executor = fixture_executor_text();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: false,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(matches!(
+            result,
+            ExecutorOutcome::Failed { reason } if reason == "timeout"
+        ));
+    }
+
+    // ---------- end a20a1 ----------
+
     #[test]
     fn parse_spec_needs_revision_sentinel_round_trips() {
         let stdout = "\
@@ -2231,6 +2537,162 @@ some narrative output before the sentinel\n\
             }
             other => panic!("expected SpecNeedsRevision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bundled_implementer_prompt_worked_example_parses() {
+        // Per a20a1: the implementer prompt's worked example must
+        // deserialize cleanly into a SpecNeedsRevision outcome with no
+        // angle-bracket placeholders surviving in the parsed fields.
+        // Guards against regressions where the documented example
+        // accidentally reintroduces `<...>` placeholder text that the
+        // agent would then emit verbatim.
+        let prompt = DEFAULT_IMPLEMENTER_TEMPLATE;
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(prompt).expect(
+                "implementer prompt must contain an AUTOCODER-OUTCOME example",
+            );
+        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect("worked example must parse as a SpecNeedsRevision payload");
+        match outcome {
+            Some(ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                revision_suggestion,
+            }) => {
+                assert!(
+                    !unimplementable_tasks.is_empty(),
+                    "worked example must have at least one task"
+                );
+                for t in &unimplementable_tasks {
+                    assert!(
+                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.task_id),
+                        "task_id contains placeholder text: {}",
+                        t.task_id
+                    );
+                    assert!(
+                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.task_text),
+                        "task_text contains placeholder text: {}",
+                        t.task_text
+                    );
+                    assert!(
+                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.reason),
+                        "reason contains placeholder text: {}",
+                        t.reason
+                    );
+                }
+                assert!(
+                    !revision_suggestion.is_empty(),
+                    "worked example must have a concrete revision_suggestion"
+                );
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placeholder_detection_matches_template_markers() {
+        // Each of these is a literal substring from the pre-fix
+        // implementer-prompt template. After the fix, the prompt has
+        // none of them, but the detection must catch any that survive
+        // a misedit OR an operator override.
+        for s in &[
+            "<id-from-tasks-md>",
+            "<verbatim quote>",
+            "<one-line why>",
+            "<free-form text describing what to change>",
+        ] {
+            assert!(
+                ClaudeCliExecutor::contains_unsubstituted_placeholder(s),
+                "expected {s} to match placeholder regex"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_detection_ignores_uppercase_and_special_chars() {
+        // Narrow regex: leading char must be ASCII lowercase. Mixed-case
+        // OR symbol-leading angle-bracket content is NOT flagged. Keeps
+        // legitimate task descriptions (`<HTML>`, `<MyType>`, real code
+        // syntax) from triggering false-positive flags.
+        for s in &[
+            "<HTML>",          // uppercase
+            "<MyType>",        // CamelCase
+            "<!doctype>",      // leading symbol
+            "<3>",             // leading digit
+            "<>",              // empty
+            "no brackets at all",
+            "plain text",
+        ] {
+            assert!(
+                !ClaudeCliExecutor::contains_unsubstituted_placeholder(s),
+                "did not expect {s} to match placeholder regex"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_detection_catches_template_in_task_id() {
+        // The most-likely failure mode: the agent copies the prompt
+        // template's `task_id` value verbatim. Parser must reject.
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"<id-from-tasks-md>\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\
+\"revision_suggestion\":\"Replace with CI gate.\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect_err("placeholder must produce parse error");
+        assert!(
+            err.contains("un-substituted placeholders"),
+            "diagnostic phrase missing from: {err}"
+        );
+        assert!(
+            err.contains("prompts/implementer.md"),
+            "prompt reference missing from: {err}"
+        );
+        assert!(
+            err.contains("task_id"),
+            "specific field name missing from: {err}"
+        );
+    }
+
+    #[test]
+    fn placeholder_detection_catches_template_in_task_text_and_reason() {
+        // Both `task_text` and `reason` fields are scanned. Any field
+        // tripping the regex fails the whole payload.
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"5.2\",\"task_text\":\"<verbatim quote>\",\"reason\":\"<one-line why>\"}],\
+\"revision_suggestion\":\"Replace with CI gate.\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect_err("placeholder must produce parse error");
+        // Detection short-circuits at task_text (first failing field).
+        assert!(err.contains("un-substituted placeholders"), "err: {err}");
+        assert!(err.contains("task_text"), "err: {err}");
+    }
+
+    #[test]
+    fn placeholder_detection_tolerates_legitimate_angle_brackets() {
+        // A legitimate task whose text happens to include `<HTML>` or
+        // `<MyType>` is NOT flagged — the regex requires lowercase
+        // leading char to avoid this common false-positive shape.
+        let stdout = "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
+{\"task_id\":\"7.1\",\"task_text\":\"Render <HTML> tags in user input safely\",\"reason\":\"needs DOM sandbox\"}],\
+\"revision_suggestion\":\"Add an HTML sanitizer dependency.\"}\n";
+        let payload =
+            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
+        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
+            .expect("legitimate angle-bracket content must NOT trip placeholder detection");
+        assert!(matches!(
+            outcome,
+            Some(ExecutorOutcome::SpecNeedsRevision { .. })
+        ));
     }
 
     #[test]
@@ -2288,7 +2750,12 @@ some narrative output before the sentinel\n\
 
     /// End-to-end: a script that emits a well-formed spec-needs-revision
     /// sentinel on stdout and exits 0 causes the executor to return
-    /// `SpecNeedsRevision`, not `Completed`.
+    /// `SpecNeedsRevision`, not `Completed`. Uses text mode because the
+    /// fixture is a shell script — JSON mode requires the wrapped CLI
+    /// to emit a `result` event channel, which this fixture does not
+    /// simulate. The semantic the test guards (well-formed sentinel
+    /// in agent emission → SpecNeedsRevision) is identical in both
+    /// modes; only the source of "agent emission" differs (a20a1).
     #[tokio::test]
     async fn spec_needs_revision_sentinel_routes_through_run() {
         let (_dir, ws) = fixture_workspace_with_git();
@@ -2297,7 +2764,8 @@ some narrative output before the sentinel\n\
             "needs_revision.sh",
             "#!/bin/sh\ncat <<'EOF'\nbla bla\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"7.3\",\"task_text\":\"smoke test on macOS\",\"reason\":\"no macOS host in sandbox\"}],\"revision_suggestion\":\"drop the macOS smoke step\"}\nEOF\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+            .with_output_format(crate::config::ExecutorOutputFormat::Text);
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::SpecNeedsRevision {
@@ -2323,7 +2791,14 @@ some narrative output before the sentinel\n\
             "bad_sentinel.sh",
             "#!/bin/sh\ncat <<'EOF'\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[]}\nEOF\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        // Text mode: stdout IS the agent's emission stream (no JSON
+        // event channel), so the malformed sentinel emitted via the
+        // script SHALL trigger the canonical "unparseable sentinel"
+        // Failed outcome. Per a20a1, JSON mode scopes the scan to
+        // `final_answer` only; a shell-script fixture has no `result`
+        // event so a JSON-mode equivalent test isn't well-defined.
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+            .with_output_format(crate::config::ExecutorOutputFormat::Text);
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Failed { reason } => {

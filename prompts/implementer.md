@@ -22,15 +22,39 @@ unimplementable tasks:
 - Manual external observation ("confirm the deploy works in browser",
   "check the Grafana dashboard")
 
-If you find one or more such tasks, emit this sentinel at end-of-run and
-DO NOT modify any files:
+If you find one or more such tasks, emit the sentinel at end-of-run and
+DO NOT modify any files.
+
+**REPLACE every value below with concrete data from this change.** The
+example is a pattern; emitting it verbatim is a parse failure that the
+daemon now detects, reports as a specific failure mode, and increments
+against perma-stuck. The daemon scans `task_id`, `task_text`, and
+`reason` for `<...>`-shaped substrings; if any appear, the sentinel is
+rejected.
 
 ```
 === AUTOCODER-OUTCOME ===
 {"type":"spec_needs_revision","unimplementable_tasks":[
-  {"task_id":"<id-from-tasks-md>","task_text":"<verbatim quote>","reason":"<one-line why>"}
-],"revision_suggestion":"<free-form text describing what to change in tasks.md to make the spec verifiable>"}
+  {"task_id":"6.4","task_text":"Manual: SSH into the production host and verify systemctl status autocoder","reason":"executor sandbox has no real SSH credentials and no production host access"}
+],"revision_suggestion":"Replace task 6.4 with a unit test that mocks systemctl-status output, OR move the live-host check to docs/SMOKE.md as an operator step rather than an implementer task."}
 ```
+
+Field-by-field:
+
+- `task_id` — the exact id from tasks.md (e.g., `6.4`).
+- `task_text` — the verbatim text of the unimplementable task (the line
+  text, not the checkbox).
+- `reason` — one line naming why the task cannot run in your sandbox.
+- `revision_suggestion` — a concrete edit the operator can make to
+  tasks.md to make the spec verifiable. Be specific; this becomes the
+  operator's checklist.
+
+**Before emitting, scan your sentinel for `<...>` patterns inside string
+values.** If you see angle-bracket text inside any string value, you
+have not substituted — re-read this section and fix before emitting.
+The daemon's placeholder-detection diagnostic will surface in the
+operator's `journalctl` log and in the perma-stuck reason, so a
+regression here is loud rather than silent.
 
 The operator will review your assessment, edit tasks.md, and re-trigger the
 change. If you judge a task implementable when this section's examples
