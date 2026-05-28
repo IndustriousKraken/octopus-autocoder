@@ -1,0 +1,32 @@
+# Bundled Ollama compose for the canonical-spec RAG quick-start (a21).
+#
+# `autocoder install`'s wizard option (1) copies this file to the
+# operator's config dir (e.g. /etc/autocoder/ollama-docker-compose.yml
+# or ~/.config/autocoder/ollama-docker-compose.yml). The wizard does
+# NOT auto-run docker; the operator opts in explicitly:
+#
+#     docker compose -f <config_dir>/ollama-docker-compose.yml up -d
+#
+# After startup, `curl http://localhost:11434/api/tags` lists
+# nomic-embed-text. The autocoder daemon's workspace-init step connects
+# on the first iteration of each managed repo.
+#
+# To upgrade to a larger embedding model on hardware with a GPU, edit
+# the entrypoint to pull e.g. qwen3-embedding:4b instead of (or in
+# addition to) nomic-embed-text.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # On startup: launch the server in the background, wait for it to
+    # accept connections, pull nomic-embed-text (small enough for CPU;
+    # reasonable quality for the docker quick-start), then keep the
+    # server attached to PID 1 so `docker compose up` runs forever.
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"]
+
+volumes:
+  ollama_data:

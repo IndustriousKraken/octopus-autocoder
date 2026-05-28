@@ -96,9 +96,23 @@ pub struct ClaudeCliExecutor {
     sandbox: crate::config::ResolvedSandbox,
     template: String,
     /// Stylist prompt template for the chat-driven `changelog` flow.
-    /// Resolved from `executor.changelog_stylist_prompt_path` when set;
-    /// otherwise the embedded `prompts/changelog-stylist.md` template.
+    /// Resolved from `executor.changelog_stylist.prompt_path` (nested,
+    /// a24) OR `executor.changelog_stylist_prompt_path` (legacy flat)
+    /// at construction; otherwise the embedded
+    /// `prompts/changelog-stylist.md` template.
     changelog_stylist_template: String,
+    /// Revision-loop prompt template (a24). Resolved via the uniform
+    /// [`PromptLoader`] from `executor.implementer_revision.prompt_path`
+    /// or the embedded `prompts/implementer-revision.md` default.
+    revision_template: String,
+    /// Audit-triage prompt template (a24). Resolved via the loader
+    /// from `executor.audit_triage.prompt_path` or the embedded
+    /// `prompts/audit-triage.md` default.
+    triage_template: String,
+    /// Chat-request-triage prompt template (a24). Resolved via the
+    /// loader from `executor.chat_request_triage.prompt_path` or the
+    /// embedded `prompts/chat-request-triage.md` default.
+    chat_triage_template: String,
     /// Output format mode for the wrapped CLI. `Json` (default) → stream
     /// `--output-format stream-json` events through the parser and
     /// structured log writer; `Text` → preserve today's at-exit capture
@@ -144,6 +158,9 @@ impl ClaudeCliExecutor {
             sandbox,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
             changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
+            revision_template: DEFAULT_REVISION_TEMPLATE.to_string(),
+            triage_template: DEFAULT_TRIAGE_TEMPLATE.to_string(),
+            chat_triage_template: DEFAULT_CHAT_TRIAGE_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
@@ -157,47 +174,51 @@ impl ClaudeCliExecutor {
         self
     }
 
-    /// Construct an executor wired from an `ExecutorConfig`: resolves the
-    /// implementer prompt template (loading the override file when set,
-    /// otherwise using the embedded default) and the sandbox.
+    /// Construct an executor wired from an `ExecutorConfig`. Resolves
+    /// the implementer, revision, audit-triage, chat-request-triage,
+    /// AND changelog-stylist prompt templates via the uniform
+    /// [`crate::prompts::PromptLoader`] (a24). Each template walks the
+    /// loader's precedence chain (nested → flat-legacy → embedded);
+    /// missing/empty configured override paths log a one-shot WARN at
+    /// daemon-startup AND fall back to the embedded default.
     pub fn from_config(cfg: &crate::config::ExecutorConfig) -> Result<Self> {
-        let template = match &cfg.implementer_prompt_path {
-            Some(path) => {
-                let s = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "reading implementer prompt template at {}",
-                        path.display()
-                    )
-                })?;
-                if s.trim().is_empty() {
-                    return Err(anyhow!(
-                        "implementer prompt template at {} is empty",
-                        path.display()
-                    ));
-                }
-                s
-            }
-            None => DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
-        };
-        let changelog_stylist_template =
-            match &cfg.changelog_stylist_prompt_path {
-                Some(path) => {
-                    let s = std::fs::read_to_string(path).with_context(|| {
-                        format!(
-                            "reading changelog-stylist prompt template at {}",
-                            path.display()
-                        )
-                    })?;
-                    if s.trim().is_empty() {
-                        return Err(anyhow!(
-                            "changelog-stylist prompt template at {} is empty",
-                            path.display()
-                        ));
-                    }
-                    s
-                }
-                None => DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
-            };
+        use crate::prompts::{PromptId, PromptLoader};
+        let template = PromptLoader::load(
+            PromptId::Implementer,
+            cfg.implementer.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            cfg.implementer_prompt_path.as_deref(),
+            None,
+        );
+        let changelog_stylist_template = PromptLoader::load(
+            PromptId::ChangelogStylist,
+            cfg.changelog_stylist
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            cfg.changelog_stylist_prompt_path.as_deref(),
+            None,
+        );
+        let revision_template = PromptLoader::load(
+            PromptId::ImplementerRevision,
+            cfg.implementer_revision
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            None,
+            None,
+        );
+        let triage_template = PromptLoader::load(
+            PromptId::AuditTriage,
+            cfg.audit_triage.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            None,
+            None,
+        );
+        let chat_triage_template = PromptLoader::load(
+            PromptId::ChatRequestTriage,
+            cfg.chat_request_triage
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            None,
+            None,
+        );
         Ok(Self {
             command: cfg.command.clone(),
             args: Vec::new(),
@@ -205,6 +226,9 @@ impl ClaudeCliExecutor {
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
             template,
             changelog_stylist_template,
+            revision_template,
+            triage_template,
+            chat_triage_template,
             output_format: cfg.output_format,
             settings_dir: None,
         })
@@ -221,6 +245,9 @@ impl ClaudeCliExecutor {
             sandbox: crate::config::ResolvedSandbox::resolve(None),
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
             changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
+            revision_template: DEFAULT_REVISION_TEMPLATE.to_string(),
+            triage_template: DEFAULT_TRIAGE_TEMPLATE.to_string(),
+            chat_triage_template: DEFAULT_CHAT_TRIAGE_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
         }
@@ -329,8 +356,8 @@ impl ClaudeCliExecutor {
                 )
             }
         };
-        let template = DEFAULT_REVISION_TEMPLATE;
-        let rendered = template
+        let rendered = self
+            .revision_template
             .replace(PROMPT_BODY_PLACEHOLDER, &change_body)
             .replace(REVISION_DIFF_PLACEHOLDER, &revision_context.pr_diff)
             .replace(REVISION_REQUEST_PLACEHOLDER, &revision_context.revision_text);
@@ -344,8 +371,8 @@ impl ClaudeCliExecutor {
     /// out to `openspec instructions apply` because the LLM is asked
     /// to explore the codebase itself rather than acting on one
     /// pre-existing change.
-    fn build_triage_prompt(ctx: &TriageContext) -> String {
-        DEFAULT_TRIAGE_TEMPLATE
+    fn build_triage_prompt(&self, ctx: &TriageContext) -> String {
+        self.triage_template
             .replace(TRIAGE_FINDINGS_PLACEHOLDER, &ctx.findings)
             .replace(TRIAGE_AUDIT_TYPE_PLACEHOLDER, &ctx.audit_type)
             .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
@@ -357,8 +384,8 @@ impl ClaudeCliExecutor {
     /// `prompts/chat-request-triage.md` template. Like `build_triage_prompt`,
     /// this does NOT shell out to `openspec instructions apply` because the
     /// LLM is asked to classify and explore the codebase itself.
-    fn build_chat_triage_prompt(ctx: &ChatTriageContext) -> String {
-        DEFAULT_CHAT_TRIAGE_TEMPLATE
+    fn build_chat_triage_prompt(&self, ctx: &ChatTriageContext) -> String {
+        self.chat_triage_template
             .replace(CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER, &ctx.request_text)
             .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
             .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
@@ -376,24 +403,51 @@ impl ClaudeCliExecutor {
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
-    /// launch THIS autocoder binary as the `ask_user` MCP tool. The
-    /// caller MUST delete this file via `delete_mcp_config` after the child
-    /// exits to keep the working tree clean.
+    /// launch THIS autocoder binary as the per-execution stdio MCP child.
+    /// The caller MUST delete this file via `delete_mcp_config` after the
+    /// child exits to keep the working tree clean.
+    ///
+    /// When `ORCH_DAEMON_CONTROL_SOCKET` is set in the parent process's
+    /// environment (the daemon sets it when `canonical_rag` is configured),
+    /// the same env vars are propagated into the MCP child's spawn
+    /// environment so the `query_canonical_specs` tool can relay queries
+    /// to the daemon's `CanonicalRagStore`. Absent → the child sees no
+    /// such env vars AND the tool returns the documented
+    /// "rag not configured for this execution" hint.
     fn write_mcp_config(workspace: &Path, change: &str) -> Result<PathBuf> {
         // We may be running from a non-autocoder binary (e.g. cargo test).
         // `current_exe` returns the actual running binary; in production
         // this is the `autocoder` binary and the MCP subcommand exists.
         let exe = std::env::current_exe()
             .context("resolving current autocoder binary path for MCP config")?;
+        let mut env = serde_json::json!({
+            crate::mcp_askuser_server::ENV_WORKSPACE: workspace.to_string_lossy(),
+            crate::mcp_askuser_server::ENV_CHANGE: change,
+        });
+        // Plumb the daemon's control-socket path and workspace basename
+        // through to the MCP child only when the daemon has explicitly
+        // set them in the parent process env (i.e., `canonical_rag` is
+        // configured). Absent in non-RAG runs by design.
+        if let Ok(socket) = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET) {
+            env[crate::mcp_askuser_server::ENV_CONTROL_SOCKET] =
+                serde_json::Value::String(socket);
+            let basename = std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME)
+                .unwrap_or_else(|_| {
+                    workspace
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown_workspace")
+                        .to_string()
+                });
+            env[crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME] =
+                serde_json::Value::String(basename);
+        }
         let config = serde_json::json!({
             "mcpServers": {
                 "ask_user": {
                     "command": exe,
                     "args": ["mcp-ask-user-server"],
-                    "env": {
-                        crate::mcp_askuser_server::ENV_WORKSPACE: workspace.to_string_lossy(),
-                        crate::mcp_askuser_server::ENV_CHANGE: change,
-                    }
+                    "env": env,
                 }
             }
         });
@@ -1266,7 +1320,7 @@ impl Executor for ClaudeCliExecutor {
         workspace: &Path,
         ctx: &TriageContext,
     ) -> Result<ExecutorOutcome> {
-        let prompt = Self::build_triage_prompt(ctx);
+        let prompt = self.build_triage_prompt(ctx);
         // Triage mode does not target a specific change directory, so the
         // per-change MCP marker plumbing is keyed by a synthetic name.
         let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME)?;
@@ -1285,7 +1339,7 @@ impl Executor for ClaudeCliExecutor {
         workspace: &Path,
         ctx: &ChatTriageContext,
     ) -> Result<ExecutorOutcome> {
-        let prompt = Self::build_chat_triage_prompt(ctx);
+        let prompt = self.build_chat_triage_prompt(ctx);
         let _mcp_path = Self::write_mcp_config(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME)?;
         let outcome = self
             .run_subprocess(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt)
@@ -1960,6 +2014,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1991,14 +2050,21 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
     }
 
-    /// `from_config`: a missing override file errors.
+    /// `from_config`: a missing override file falls back to the embedded
+    /// default (a24). A one-shot WARN names the missing path; the
+    /// daemon does NOT abort start-up.
     #[test]
-    fn from_config_errors_when_override_file_missing() {
+    fn from_config_falls_back_when_override_file_missing() {
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
             command: "/bin/true".into(),
@@ -2019,13 +2085,15 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
-        let err = match ClaudeCliExecutor::from_config(&cfg) {
-            Ok(_) => panic!("missing file must error"),
-            Err(e) => e,
-        };
-        let s = format!("{err:#}");
-        assert!(s.contains("implementer prompt template"), "error: {s}");
+        let executor = ClaudeCliExecutor::from_config(&cfg)
+            .expect("missing override path must fall back to embedded");
+        assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
     }
 
     /// The embedded changelog-stylist template is non-empty AND contains
@@ -2066,6 +2134,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(
@@ -2101,6 +2174,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(
@@ -2110,9 +2188,11 @@ mod tests {
         );
     }
 
-    /// `from_config`: an empty changelog-stylist override file errors.
+    /// `from_config`: an empty changelog-stylist override file falls
+    /// back to the embedded default (a24). A one-shot WARN names the
+    /// path; start-up is NOT aborted.
     #[test]
-    fn from_config_errors_when_changelog_stylist_file_empty() {
+    fn from_config_falls_back_when_changelog_stylist_file_empty() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("empty.md");
         std::fs::write(&path, "   \n  \n").unwrap();
@@ -2136,20 +2216,24 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
-        let err = match ClaudeCliExecutor::from_config(&cfg) {
-            Ok(_) => panic!("empty changelog-stylist file must error"),
-            Err(e) => e,
-        };
-        let s = format!("{err:#}");
-        assert!(s.contains("changelog-stylist"), "{s}");
-        assert!(s.contains("empty"), "{s}");
+        let executor = ClaudeCliExecutor::from_config(&cfg)
+            .expect("empty stylist override falls back to embedded");
+        assert_eq!(
+            executor.changelog_stylist_template,
+            DEFAULT_CHANGELOG_STYLIST_TEMPLATE
+        );
     }
 
-    /// `from_config`: an empty override file errors (otherwise the
-    /// daemon would feed an empty wrapper to Claude on every run).
+    /// `from_config`: an empty implementer override file falls back to
+    /// the embedded default (a24). A one-shot WARN names the path.
     #[test]
-    fn from_config_errors_when_override_file_empty() {
+    fn from_config_falls_back_when_override_file_empty() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("empty.md");
         std::fs::write(&path, "   \n  \n").unwrap();
@@ -2173,12 +2257,121 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
-        let err = match ClaudeCliExecutor::from_config(&cfg) {
-            Ok(_) => panic!("empty file must error"),
-            Err(e) => e,
+        let executor = ClaudeCliExecutor::from_config(&cfg)
+            .expect("empty implementer override falls back to embedded");
+        assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
+    }
+
+    /// `from_config`: the new nested form
+    /// `executor.implementer.prompt_path` is preferred over the legacy
+    /// flat `implementer_prompt_path` (a24).
+    #[test]
+    fn from_config_nested_form_preempts_legacy_for_implementer() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("nested.md");
+        let legacy = tmp.path().join("legacy.md");
+        std::fs::write(&nested, "NESTED_IMPL {{change_body}}").unwrap();
+        std::fs::write(&legacy, "LEGACY_IMPL {{change_body}}").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: Some(legacy),
+            changelog_stylist_prompt_path: None,
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
+            implementer: Some(crate::config::PromptOverrideBlock {
+                prompt_path: Some(nested),
+            }),
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         };
-        assert!(format!("{err:#}").contains("empty"));
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert!(executor.template.contains("NESTED_IMPL"));
+        assert!(!executor.template.contains("LEGACY_IMPL"));
+    }
+
+    /// `from_config`: the new nested fields
+    /// `executor.audit_triage.prompt_path`,
+    /// `executor.chat_request_triage.prompt_path`, AND
+    /// `executor.implementer_revision.prompt_path` are honored (a24).
+    #[test]
+    fn from_config_resolves_new_nested_triage_and_revision_overrides() {
+        let tmp = TempDir::new().unwrap();
+        let triage = tmp.path().join("triage.md");
+        let chat_triage = tmp.path().join("chat-triage.md");
+        let revision = tmp.path().join("revision.md");
+        std::fs::write(&triage, "TRIAGE_SENTINEL").unwrap();
+        std::fs::write(&chat_triage, "CHAT_TRIAGE_SENTINEL").unwrap();
+        std::fs::write(&revision, "REVISION_SENTINEL").unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            kind: crate::config::ExecutorKind::ClaudeCli,
+            command: "/bin/true".into(),
+            timeout_secs: 30,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: None,
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
+            output_format: crate::config::default_output_format(),
+            log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: Some(crate::config::PromptOverrideBlock {
+                prompt_path: Some(revision),
+            }),
+            audit_triage: Some(crate::config::PromptOverrideBlock {
+                prompt_path: Some(triage),
+            }),
+            chat_request_triage: Some(crate::config::PromptOverrideBlock {
+                prompt_path: Some(chat_triage),
+            }),
+        };
+        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        assert!(
+            executor.triage_template.contains("TRIAGE_SENTINEL"),
+            "audit_triage override must load: {}",
+            executor.triage_template
+        );
+        assert!(
+            executor.chat_triage_template.contains("CHAT_TRIAGE_SENTINEL"),
+            "chat_request_triage override must load: {}",
+            executor.chat_triage_template
+        );
+        assert!(
+            executor.revision_template.contains("REVISION_SENTINEL"),
+            "implementer_revision override must load: {}",
+            executor.revision_template
+        );
     }
 
     /// Run-log persistence: after a subprocess invocation completes,

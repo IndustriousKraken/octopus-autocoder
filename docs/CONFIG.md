@@ -26,7 +26,7 @@ A list of one or more repositories to manage. Each entry:
 | `command`                   | no       | `claude`      | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
 | `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
 | `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox). |
-| `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. |
+| `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. Operators with override templates MAY mention `query_canonical_specs` (a21 — see `canonical_rag:`) in their prompt OR ignore the new tool entirely; the tool stays registered regardless. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
 | `max_changes_per_pr`        | no       | `3`           | Default cap on archived changes committed in one iteration's PR; per-repo `max_changes_per_pr` overrides. Operators with long queues see them ship across multiple iterations instead of one large PR. A value of `0` is clamped to `1` with a WARN log at startup. |
 | `startup_jitter_max_secs`   | no       | `30`          | Each polling task waits a uniformly random `[0, startup_jitter_max_secs]` seconds before its first iteration. Staggers a fleet of concurrent `git fetch` operations so an IDS does not see a synchronized burst. Set to `0` to disable. See [Polling cadence and your firewall](OPERATIONS.md#polling-cadence-and-your-firewall). |
@@ -111,6 +111,65 @@ Per-repo override: each entry under `repositories[]` accepts an `audits:` field 
 - **`page_max_lines_without_toc`** (`usize`, default `500`) — the total-line threshold at which a docs page is expected to carry a top-of-file TOC or summary table. The LLM applies this number when assessing `docs/*.md` files; raising it suppresses the finding for repos whose docs pages run long by design (operator manuals, reference pages). Lower it for tighter operator-self-service expectations.
 
 Both knobs are thresholds the LLM applies when emitting `category: organization` findings. Operators in larger projects raise them; operators in smaller projects keep defaults. The audit's prompt receives the knob values verbatim as part of its input and respects them when deciding whether to flag a page.
+
+---
+
+## Prompt overrides
+
+Every embedded prompt the daemon ships is loaded through a uniform
+`PromptLoader` that walks four precedence levels for each call:
+
+1. **Per-workspace nested override** — the modernized form, e.g.
+   `executor.implementer.prompt_path` OR
+   `audits.settings.drift_audit.prompt_path`. Paths are workspace-
+   relative when not absolute.
+2. **Per-workspace flat-legacy override** — the older suffix form,
+   e.g. `executor.implementer_prompt_path` OR
+   `reviewer.prompt_template_path`. Still accepted indefinitely for
+   backward compatibility.
+3. **Daemon-level flat-legacy override** — the same field treated as
+   the daemon-wide value when no per-workspace config layer overrides
+   it. In the current code there is one config file per daemon, so
+   levels 2 and 3 collapse to the same field; the loader still walks
+   both tiers so future per-workspace config layering can plug in
+   without changing call sites.
+4. **Embedded default** — the template compiled into the binary via
+   `include_str!("../../prompts/<name>.md")`.
+
+A configured override path that does NOT exist (OR points at an
+empty file) produces a **one-shot WARN** naming the
+`(PromptId, path)` pair on the first attempted load AND falls
+through to the next precedence level. Repeated loads of the same
+`(PromptId, path)` stay silent so reloads do NOT spam the log.
+
+**Prompt registry.** The table below lists every embedded prompt
+the daemon ships, its logical id, its embedded path, its per-
+workspace override field, AND the legacy daemon-level field where
+one exists. `—` (em-dash) marks prompts that had no operator
+override at all before the uniform loader landed.
+
+| Logical id                       | Embedded path                              | Per-workspace override field                                | Legacy daemon-level field                                  |
+|----------------------------------|--------------------------------------------|--------------------------------------------------------------|------------------------------------------------------------|
+| `Implementer`                    | `prompts/implementer.md`                   | `executor.implementer.prompt_path`                           | `executor.implementer_prompt_path`                         |
+| `ImplementerRevision`            | `prompts/implementer-revision.md`          | `executor.implementer_revision.prompt_path`                  | —                                                          |
+| `ChangelogStylist`               | `prompts/changelog-stylist.md`             | `executor.changelog_stylist.prompt_path`                     | `executor.changelog_stylist_prompt_path`                   |
+| `CodeReview`                     | `prompts/code-review-default.md`           | `reviewer.code_review.prompt_path`                           | `reviewer.prompt_template_path`                            |
+| `AuditTriage`                    | `prompts/audit-triage.md`                  | `executor.audit_triage.prompt_path`                          | —                                                          |
+| `ChatRequestTriage`              | `prompts/chat-request-triage.md`           | `executor.chat_request_triage.prompt_path`                   | —                                                          |
+| `AuditArchitectureConsultative`  | `prompts/architecture-consultative.md`     | `audits.settings.architecture_consultative.prompt_path`      | —                                                          |
+| `AuditDrift`                     | `prompts/drift-audit.md`                   | `audits.settings.drift_audit.prompt_path`                    | —                                                          |
+| `AuditMissingTests`              | `prompts/missing-tests-audit.md`           | `audits.settings.missing_tests_audit.prompt_path`            | —                                                          |
+| `AuditSecurityBug`               | `prompts/security-bug-audit.md`            | `audits.settings.security_bug_audit.prompt_path`             | —                                                          |
+| `AuditDocumentation`             | `prompts/documentation-audit.md`           | `audits.settings.documentation_audit.prompt_path`            | —                                                          |
+| `BrownfieldDraft`                | `prompts/brownfield-draft.md`              | `features.brownfield.prompt_path`                            | —                                                          |
+| `ChangeContradictionCheck`       | `prompts/change-contradiction-check.md`    | `executor.change_internal_contradiction_check_prompt_path`   | —                                                          |
+
+**Naming convention going forward.** Any new embedded prompt added
+in a future change SHALL declare its override field using the
+nested `<area>.<thing>.prompt_path` form (matching the rows above).
+Flat-suffix forms (`<area>.<thing>_prompt_path`) remain accepted
+only for the legacy fields documented in this registry; new
+prompts MUST NOT introduce additional flat-suffix overrides.
 
 ---
 
@@ -285,3 +344,48 @@ features:
 
 **Forward-compatibility note.** The per-workspace prompt override knob's location is provisional. When the broader per-workspace-prompt schema lands (covering implementer, audit-triage, changelog-stylist, brownfield-draft, etc. under a unified shape), brownfield's override SHALL conform to it; the current `features.brownfield.prompt_path` MAY be relocated at that time. Operators using the override should expect a migration step in the corresponding release notes.
 
+
+## `canonical_rag:` (optional)
+
+Retrieval-augmented context for the implementer (a21). When the block
+is absent OR present with `enabled: false`, no embedding pipeline runs
+and the implementer's `query_canonical_specs` MCP tool returns an empty
+array with `error_hint: "rag disabled in config"`. When enabled, the
+daemon embeds every `openspec/specs/<capability>/spec.md` at workspace
+init AND re-embeds affected capabilities after archives that touch
+canonical specs.
+
+| Field                | Type                  | Default              | Description                                                                                                                          |
+|----------------------|-----------------------|----------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`            | `bool`                | `false`              | Master switch. `false` (the implicit default) makes the daemon behave as if the block were absent — useful for documenting a parked config without enabling. |
+| `provider`           | `ollama \| openai_compatible` | required             | Embedding provider. `ollama` posts to `<base>/api/embed`; `openai_compatible` posts to `<base>/embeddings` with `Authorization: Bearer <api_key>`. |
+| `model`              | `string`              | required             | Provider-specific embedding model identifier (e.g. `nomic-embed-text`, `qwen3-embedding:4b`, `voyage-2`).                            |
+| `api_base_url`       | `string`              | required             | For `ollama`: `http://host:11434` (the `/api` prefix is implicit). For `openai_compatible`: include the `/v1` prefix.                |
+| `api_key_env`        | `string?`             | `None`               | Env-var name carrying the API key. Required for `openai_compatible`. Ignored for `ollama` unless the endpoint requires auth.         |
+| `api_key`            | `{ value: string }?`  | `None`               | Inline alternative to `api_key_env`. Mutually exclusive with `api_key_env`; inline wins with a WARN if both set (same as `reviewer:`). |
+| `top_k`              | `usize`               | `10`                 | Default chunk count when the tool caller omits `top_k`. Clamped to `[1, 100]` with WARN at startup.                                  |
+| `chunk_strategy`     | `per_requirement \| per_scenario \| per_capability` | `per_requirement` | Chunk granularity. `per_requirement` (default) is one chunk per `### Requirement:`. The other two are reserved for future variants. |
+| `reembed_on_archive` | `bool`                | `true`               | When `true`, post-archive iterations whose archive touched a canonical spec re-embed the affected capability. When `false`, the store goes stale until daemon restart. |
+
+```yaml
+canonical_rag:
+  enabled: true
+  provider: ollama
+  model: nomic-embed-text
+  api_base_url: http://localhost:11434
+  top_k: 10
+  chunk_strategy: per_requirement
+  reembed_on_archive: true
+```
+
+See [OPERATIONS.md → Canonical-spec RAG](OPERATIONS.md#canonical-spec-rag)
+for the operational discussion (re-embed cadence, in-memory persistence,
+failure modes, cost expectations) AND
+[DEPLOYMENT.md → Self-hosted Ollama for RAG](DEPLOYMENT.md#self-hosted-ollama-for-rag)
+for the docker-compose quick-start AND the remote-Ollama options.
+
+**Override prompt note.** Operators using
+`executor.implementer_prompt_path` to ship a custom template can either
+mention `query_canonical_specs` in their override OR ignore the new
+tool entirely. The tool stays registered in the MCP child regardless;
+omitting the mention just means the agent won't be guided to call it.

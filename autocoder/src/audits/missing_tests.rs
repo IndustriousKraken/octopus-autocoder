@@ -15,17 +15,14 @@
 //! — the agent may write under `openspec/changes/` but nowhere else;
 //! a write outside that prefix triggers the framework's revert.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
-
-/// Built-in default prompt, embedded at compile time so the binary
-/// runs without requiring `prompts/` on disk.
-const DEFAULT_PROMPT: &str = include_str!("../../../prompts/missing-tests-audit.md");
+use crate::prompts::{PromptId, PromptLoader};
 
 /// Placeholder substituted into the prompt with the per-run cap.
 const MAX_PROPOSALS_PLACEHOLDER: &str = "{{MAX_PROPOSALS}}";
@@ -100,28 +97,16 @@ impl MissingTestsAudit {
         self
     }
 
-    /// Resolve the prompt (override or embedded default) and substitute
-    /// `{{MAX_PROPOSALS}}` with the configured cap so the agent knows
-    /// its budget for this run.
-    pub(crate) fn resolve_prompt(&self) -> Result<String> {
-        let raw = match &self.settings.prompt_path {
-            Some(path) => {
-                let body = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "reading missing-tests-audit prompt override at {}",
-                        path.display()
-                    )
-                })?;
-                if body.trim().is_empty() {
-                    return Err(anyhow!(
-                        "missing-tests-audit prompt override at {} is empty",
-                        path.display()
-                    ));
-                }
-                body
-            }
-            None => DEFAULT_PROMPT.to_string(),
-        };
+    /// Resolve the prompt via the uniform [`PromptLoader`] (a24) AND
+    /// substitute `{{MAX_PROPOSALS}}` with the configured cap so the
+    /// agent knows its budget for this run.
+    pub(crate) fn resolve_prompt(&self, workspace: Option<&Path>) -> Result<String> {
+        let raw = PromptLoader::load(
+            PromptId::AuditMissingTests,
+            self.settings.prompt_path.as_deref(),
+            None,
+            workspace,
+        );
         Ok(raw.replace(
             MAX_PROPOSALS_PLACEHOLDER,
             &self.max_proposals_per_run.to_string(),
@@ -148,7 +133,7 @@ impl Audit for MissingTestsAudit {
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
-        let prompt = self.resolve_prompt()?;
+        let prompt = self.resolve_prompt(Some(ctx.workspace))?;
         let prompt_source = self
             .settings
             .prompt_path
@@ -207,6 +192,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         }
     }
 
@@ -312,7 +302,7 @@ mod tests {
         let cfg = executor_cfg("/bin/true");
         let audit =
             MissingTestsAudit::new(&HashMap::new(), &cfg).with_max_proposals(7);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         assert!(
             !prompt.contains(MAX_PROPOSALS_PLACEHOLDER),
             "placeholder must be substituted: still found `{}`",
@@ -340,13 +330,17 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = MissingTestsAudit::new(&map, &cfg).with_max_proposals(3);
-        let prompt = audit.resolve_prompt().expect("override resolves");
+        let prompt = audit.resolve_prompt(None).expect("override resolves");
         assert!(prompt.contains("CUSTOM PROMPT"));
         assert!(prompt.contains("cap=3"));
     }
 
+    /// Empty override files now fall back to the embedded default via
+    /// the uniform `PromptLoader` rather than producing a hard error
+    /// (a24). The `{{MAX_PROPOSALS}}` substitution still runs against
+    /// the embedded default.
     #[test]
-    fn resolve_prompt_errors_on_empty_override() {
+    fn resolve_prompt_falls_back_when_override_empty() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("empty.md");
         std::fs::write(&p, "  \n").unwrap();
@@ -360,9 +354,18 @@ mod tests {
             },
         );
         let cfg = executor_cfg("/bin/true");
-        let audit = MissingTestsAudit::new(&map, &cfg);
-        let err = audit.resolve_prompt().expect_err("empty override errors");
-        assert!(format!("{err:#}").contains("empty"));
+        let audit = MissingTestsAudit::new(&map, &cfg).with_max_proposals(4);
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("empty override falls back");
+        assert!(
+            !prompt.contains(MAX_PROPOSALS_PLACEHOLDER),
+            "placeholder must still be substituted on fallback"
+        );
+        assert!(
+            prompt.contains("MAX_PROPOSALS: 4"),
+            "substitution must apply to embedded fallback: {prompt}"
+        );
     }
 
     #[test]

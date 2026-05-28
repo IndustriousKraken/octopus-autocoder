@@ -368,3 +368,71 @@ The script reports the resolved current + target versions, downloads + verifies 
 **Operator-visibility loop.** When chatops is configured, the daemon posts a `🆙 autocoder vX.Y.Z started — N repository(ies) configured` notification on every successful startup — so after a cron-driven update lands, the chat channel records the version transition automatically. See [CLI.md `run`](CLI.md#run) for the notification's format.
 
 ---
+
+## Self-hosted Ollama for RAG
+
+When `canonical_rag.provider: ollama` is configured (see
+[CONFIG.md → `canonical_rag:`](CONFIG.md#canonical_rag-optional)), the
+daemon connects to the operator's Ollama instance for every embed
+call. Three common topologies:
+
+### 1. Docker quick-start (recommended for trial deployments)
+
+`autocoder install`'s wizard option (1) copies
+`install/ollama-docker-compose.yml` to the operator's config
+directory. The wizard does NOT auto-run docker; the operator opts in
+explicitly:
+
+```bash
+docker compose -f <config_dir>/ollama-docker-compose.yml up -d
+```
+
+The compose file ships pulling `nomic-embed-text` as the default
+startup model — small enough for CPU-only hosts AND reasonable
+quality for the corpus size of typical OpenSpec projects. Once the
+container is running, the daemon's workspace-init step connects on
+the first iteration AND embeds the canonical corpus.
+
+To upgrade to a larger embedding model (e.g. on hardware with a GPU
+attached), edit the entrypoint in the copied compose file to pull
+`qwen3-embedding:4b` or another larger model AND `docker compose up
+-d` to recreate the container with the new pull.
+
+### 2. Remote Ollama on a GPU machine
+
+For shared-team deployments where the daemon runs on a small VM AND a
+dedicated GPU host serves embeddings, point the daemon at the remote
+instance:
+
+```yaml
+canonical_rag:
+  enabled: true
+  provider: ollama
+  model: qwen3-embedding:4b
+  api_base_url: http://gpu-host:11434
+```
+
+The Ollama process on `gpu-host` SHOULD bind on `0.0.0.0:11434` (or
+behind a private network proxy). No autocoder-side TLS is required at
+this layer — operators wanting TLS terminate it at the proxy. The
+daemon does not authenticate against vanilla Ollama; expose only on
+trusted networks.
+
+### 3. OpenAI-compatible providers
+
+For operators preferring a managed embedding provider (Voyage,
+OpenRouter, OpenAI, llama.cpp's server, etc.), use the
+`openai_compatible` provider — see
+[CONFIG.md → `canonical_rag:`](CONFIG.md#canonical_rag-optional) for
+the `api_base_url` AND `api_key_env`/`api_key` fields.
+
+### Hardware suggestions
+
+- CPU works for the corpus size of typical OpenSpec projects (~50
+  capabilities, ~500 chunks). Expect ~30s for the cold-start embed.
+- GPU is faster (sub-second cold start) but NOT required. Operators
+  adding a GPU later edit the compose file's entrypoint OR
+  `api_base_url` AND restart the daemon.
+- Memory: the in-memory store is bounded by the canonical corpus
+  size. For typical projects this is a few MB; the embedding model
+  itself dominates RAM use (~1.5 GB for `nomic-embed-text`).

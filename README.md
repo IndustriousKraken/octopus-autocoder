@@ -100,7 +100,7 @@ The default executor backend wraps `claude` as a subprocess. The daemon writes a
 
 Everything beyond the quick install lives under [`docs/`](docs/README.md) — grouped by getting started, feature surfaces, operating the daemon, reference, and internals. Highlights:
 
-- [Configuration reference](docs/CONFIG.md) — full `config.yaml` schema, multi-token routing, `paths:` block.
+- [Configuration reference](docs/CONFIG.md) — full `config.yaml` schema, multi-token routing, `paths:` block. The [Prompt overrides table](docs/CONFIG.md#prompt-overrides) is the canonical reference for customizing the daemon's embedded LLM prompts.
 - [ChatOps](docs/CHATOPS.md) — chat-driven workflows (`propose`, `send it`, `audit`, `revise`), operator recovery verbs, Slack Socket Mode setup, experimental backends.
 - [Operating notes](docs/OPERATIONS.md) — periodic audits, on-demand triggers, perma-stuck/needs-revision recovery, PR-comment revisions, live config reload, canonical spec rebuild.
 - [Deployment](docs/DEPLOYMENT.md) — systemd unit, SSH keys, upgrades.

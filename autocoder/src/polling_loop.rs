@@ -1263,6 +1263,12 @@ pub async fn run_pass_through_commits(
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
+    // Canonical-spec RAG workspace-init hook (a21). Idempotent: only
+    // builds + registers the store on the first iteration of a given
+    // workspace (a previously-registered store is left alone). Fail-open
+    // — any error logs WARN and the store is omitted from the registry.
+    crate::rag::workspace_init_hook(workspace).await;
+
     let pending_at_start = queue::list_pending(workspace)?;
     let waiting_at_start = queue::list_waiting(workspace)?;
     tracing::info!(
@@ -1829,6 +1835,15 @@ async fn walk_queue(
                         change = %change,
                         "failed to clear failure-state entry after archive: {e:#}"
                     );
+                }
+                // Canonical-spec RAG post-archive hook (a21). Inspect
+                // the just-landed commit (HEAD vs HEAD~1) for canonical
+                // spec changes; re-embed affected capabilities. Fail-
+                // open via the hook itself.
+                let touched_caps =
+                    crate::rag::capabilities_touched_between(workspace, "HEAD~1..HEAD");
+                if !touched_caps.is_empty() {
+                    crate::rag::post_archive_hook(workspace, &touched_caps).await;
                 }
                 archived.push(change);
                 if archived.len() as u32 >= max_changes {

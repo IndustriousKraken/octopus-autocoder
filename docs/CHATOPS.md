@@ -462,6 +462,8 @@ If mobile mentions stop working after a token rotation, check the daemon log for
 
 The original chatops mechanic: when an executor returns `AskUser { question, resume_handle }`, the daemon posts the question to the resolved channel, the change moves from "in flight" to "waiting on human," and the next iteration polls the Slack thread for the first non-bot reply. When the reply arrives, the executor resumes against the operator's answer.
 
+> **Implementer flow note (a21).** When `canonical_rag:` is configured (see [CONFIG.md → `canonical_rag:`](CONFIG.md#canonical_rag-optional)), the implementer agent may call the `query_canonical_specs` MCP tool to retrieve ranked canonical-spec chunks for its query. Calls and returned chunks are recorded in the per-change run log alongside the existing prompt + actions + final-answer sections, so reviewers and operators can audit what canonical context the agent consulted. See [OPERATIONS.md → Canonical-spec RAG](OPERATIONS.md#canonical-spec-rag) for the full operational discussion.
+
 ### What gets posted
 
 ```

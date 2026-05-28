@@ -117,6 +117,26 @@ pub struct InstallArgs {
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     #[arg(long, value_enum)]
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+
+    // ---------- canonical-spec RAG (a21) ----------
+    /// Canonical-spec RAG provider in non-interactive mode. `none`
+    /// (default when omitted) writes no `canonical_rag:` block.
+    #[arg(long, value_enum)]
+    pub rag_provider: Option<RagProviderArg>,
+    /// Embedding provider base URL. Required when `--rag-provider` is
+    /// `ollama` or `openai_compatible`.
+    #[arg(long)]
+    pub rag_base_url: Option<String>,
+    /// Embedding model identifier. Optional; defaults to
+    /// `nomic-embed-text` for ollama AND has no default for
+    /// openai_compatible (required).
+    #[arg(long)]
+    pub rag_model: Option<String>,
+    /// Env-var name carrying the API key for `openai_compatible`. Required
+    /// for that provider in non-interactive mode unless `--rag-api-key`
+    /// is set inline.
+    #[arg(long)]
+    pub rag_api_key_env: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -154,6 +174,20 @@ pub enum ChatOpsBackendArg {
     Teams,
     Mattermost,
     Matrix,
+}
+
+/// Canonical-spec RAG provider in non-interactive mode (a21).
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
+pub enum RagProviderArg {
+    /// No `canonical_rag:` block; default behaviour (RAG disabled).
+    #[default]
+    None,
+    /// Ollama (local or remote). Requires `--rag-base-url`.
+    Ollama,
+    /// OpenAI-compatible endpoint (Voyage, OpenRouter, llama.cpp, etc.).
+    /// Requires `--rag-base-url` AND `--rag-api-key-env`.
+    #[clap(name = "openai_compatible")]
+    OpenaiCompatible,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -264,6 +298,10 @@ pub struct WizardPrefill {
     pub audit_missing_tests_audit: Option<AuditCadenceArg>,
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+    pub rag_provider: Option<RagProviderArg>,
+    pub rag_base_url: Option<String>,
+    pub rag_model: Option<String>,
+    pub rag_api_key_env: Option<String>,
 }
 
 /// Final wizard output: everything the operator confirmed or accepted as
@@ -286,6 +324,18 @@ pub struct WizardAnswers {
     /// either absent from the map or stored as `Cadence::Disabled`. The
     /// config-assembly step drops `Disabled` entries before emitting YAML.
     pub audits: HashMap<String, Cadence>,
+    /// Canonical-spec RAG block (a21). `None` → no block written.
+    pub canonical_rag: Option<RagAnswers>,
+}
+
+/// Wizard-resolved canonical-spec RAG settings. `None` from the wizard
+/// means the operator declined RAG OR the wizard fell through to disable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RagAnswers {
+    pub provider: RagProviderArg,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: Option<String>,
 }
 
 // Write `contents` to `path` such that the file never exists on disk with a
@@ -954,6 +1004,7 @@ pub async fn run_wizard(
     }
 
     let audits = run_audit_prompts(io).await?;
+    let canonical_rag = run_rag_prompts(io, prefill).await?;
 
     Ok(WizardAnswers {
         repo_url,
@@ -969,7 +1020,106 @@ pub async fn run_wizard(
         reviewer_model,
         reviewer_api_key,
         audits,
+        canonical_rag,
     })
+}
+
+/// Canonical-spec RAG graduated-path prompt (a21). Probes localhost
+/// Ollama; on hit, offers it. On miss, presents the four-option menu:
+/// docker quick-start / remote Ollama / OpenAI-compatible / disable.
+async fn run_rag_prompts(
+    io: &mut dyn WizardIo,
+    _prefill: &WizardPrefill,
+) -> Result<Option<RagAnswers>> {
+    io.print(
+        "\nCanonical-spec RAG (a21): retrieval-augmented context for the implementer.\n",
+    );
+    io.print(
+        "When enabled, the daemon embeds your canonical specs and the agent can query them.\n",
+    );
+    if !io.confirm("Configure canonical-specs RAG?", true).await? {
+        io.print("Skipping RAG configuration. Re-enable later via `canonical_rag:` block in config.yaml.\n");
+        return Ok(None);
+    }
+    let localhost_url = "http://localhost:11434";
+    let detected = probe_ollama(localhost_url).await;
+    if detected {
+        io.print("Detected Ollama on http://localhost:11434.\n");
+        let model = ask_default(io, "Embedding model", "nomic-embed-text").await?;
+        return Ok(Some(RagAnswers {
+            provider: RagProviderArg::Ollama,
+            base_url: localhost_url.to_string(),
+            model,
+            api_key_env: None,
+        }));
+    }
+    io.print("Ollama not detected on http://localhost:11434.\n");
+    let options = [
+        "Install local Ollama via docker (we ship a compose file)",
+        "Point at a remote Ollama instance",
+        "Point at an OpenAI-compatible embeddings endpoint",
+        "Disable RAG (you can enable later in config.yaml)",
+    ];
+    let choice = io.choose("Choose RAG option", &options, 3).await?;
+    match choice {
+        0 => {
+            io.print(
+                "Docker compose file will be copied to your config directory at install time.\n",
+            );
+            io.print(
+                "After install, run: docker compose -f <config_dir>/ollama-docker-compose.yml up -d\n",
+            );
+            Ok(Some(RagAnswers {
+                provider: RagProviderArg::Ollama,
+                base_url: localhost_url.to_string(),
+                model: "nomic-embed-text".to_string(),
+                api_key_env: None,
+            }))
+        }
+        1 => {
+            let base_url = ask_required(io, "Ollama base URL (e.g. http://gpu-host:11434)", None).await?;
+            let model = ask_default(io, "Embedding model", "nomic-embed-text").await?;
+            Ok(Some(RagAnswers {
+                provider: RagProviderArg::Ollama,
+                base_url,
+                model,
+                api_key_env: None,
+            }))
+        }
+        2 => {
+            let base_url = ask_required(io, "OpenAI-compatible base URL (e.g. https://api.voyageai.com/v1)", None).await?;
+            let model = ask_required(io, "Embedding model name", None).await?;
+            let api_key_env = ask_default(io, "Env var holding the API key", "RAG_API_KEY").await?;
+            Ok(Some(RagAnswers {
+                provider: RagProviderArg::OpenaiCompatible,
+                base_url,
+                model,
+                api_key_env: Some(api_key_env),
+            }))
+        }
+        _ => {
+            io.print("Disabling RAG. Enable later via the `canonical_rag:` block in config.yaml.\n");
+            Ok(None)
+        }
+    }
+}
+
+/// HTTP probe: GET `<base>/api/tags` with a 2-second timeout. Returns
+/// `true` on 200 OK. Any other status, network failure, or timeout is
+/// `false`. Used by the install wizard's detection step.
+async fn probe_ollama(base_url: &str) -> bool {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(&url).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 /// Walk the operator through the periodic-audit prompts. See the
@@ -1272,6 +1422,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 api_key: None,
                 api_base_url: None,
                 prompt_template_path: None,
+                code_review: None,
                 auto_revise_on_block: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
@@ -1297,6 +1448,27 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
             ..AuditsConfig::default()
         })
     };
+
+    // Canonical-spec RAG (a21).
+    cfg.canonical_rag = answers.canonical_rag.as_ref().map(|r| {
+        crate::config::CanonicalRagConfig {
+            enabled: true,
+            provider: match r.provider {
+                RagProviderArg::Ollama => crate::config::RagProvider::Ollama,
+                RagProviderArg::OpenaiCompatible => {
+                    crate::config::RagProvider::OpenaiCompatible
+                }
+                RagProviderArg::None => crate::config::RagProvider::Ollama, // unreachable
+            },
+            model: r.model.clone(),
+            api_base_url: r.base_url.clone(),
+            api_key_env: r.api_key_env.clone(),
+            api_key: None,
+            top_k: crate::config::default_rag_top_k(),
+            chunk_strategy: crate::config::ChunkStrategy::default(),
+            reembed_on_archive: crate::config::default_reembed_on_archive(),
+        }
+    });
 
     // Suppress the unused-import warning if `SecretSource` ends up only
     // being referenced behind a feature in future edits.
@@ -1444,6 +1616,10 @@ pub(crate) async fn execute_inner(
         audit_drift_audit: args.audit_drift_audit,
         audit_missing_tests_audit: args.audit_missing_tests_audit,
         audit_security_bug_audit: args.audit_security_bug_audit,
+        rag_provider: args.rag_provider,
+        rag_base_url: args.rag_base_url.clone(),
+        rag_model: args.rag_model.clone(),
+        rag_api_key_env: args.rag_api_key_env.clone(),
     };
     if args.non_interactive {
         validate_non_interactive(&prefill)?;
@@ -1516,6 +1692,37 @@ pub(crate) async fn execute_inner(
     if mode == InstallMode::Server {
         actions.chown(&config_path, "autocoder", "autocoder").await?;
         actions.chown(&secrets_path, "autocoder", "autocoder").await?;
+    }
+
+    // Canonical-spec RAG (a21): if the operator chose the docker
+    // quick-start path AND a wired ollama compose file ships with the
+    // binary, copy it to the config dir AND print the operator's next
+    // step. We detect "docker quick-start path" by the wizard's choice
+    // of localhost ollama with the default model.
+    if let Some(rag) = answers.canonical_rag.as_ref()
+        && rag.provider == RagProviderArg::Ollama
+        && rag.base_url == "http://localhost:11434"
+    {
+        let dst = config_dir.join("ollama-docker-compose.yml");
+        if !dst.exists() {
+            const BUNDLED_OLLAMA_COMPOSE: &str =
+                include_str!("../../../install/ollama-docker-compose.yml");
+            if let Err(e) = fs::write(&dst, BUNDLED_OLLAMA_COMPOSE).await {
+                eprintln!(
+                    "WARN: could not copy ollama-docker-compose.yml to {}: {e}",
+                    dst.display()
+                );
+            } else {
+                println!(
+                    "Copied bundled ollama-docker-compose.yml to {}",
+                    dst.display()
+                );
+                println!(
+                    "Start it with: docker compose -f {} up -d",
+                    dst.display()
+                );
+            }
+        }
     }
 
     // 6. Systemd unit (server mode).
@@ -1628,10 +1835,53 @@ fn validate_non_interactive(p: &WizardPrefill) -> Result<()> {
     if p.reviewer_provider.is_none() {
         bail!("missing --reviewer-provider; {required_msg}");
     }
+    // Canonical-spec RAG (a21): when `--rag-provider` is set to a
+    // non-`none` provider, the corresponding base-url (and api-key-env
+    // for openai_compatible) MUST be present.
+    match p.rag_provider.unwrap_or(RagProviderArg::None) {
+        RagProviderArg::None => {}
+        RagProviderArg::Ollama => {
+            if p.rag_base_url.is_none() {
+                bail!(
+                    "missing --rag-base-url; required when --rag-provider=ollama"
+                );
+            }
+        }
+        RagProviderArg::OpenaiCompatible => {
+            if p.rag_base_url.is_none() {
+                bail!(
+                    "missing --rag-base-url; required when --rag-provider=openai_compatible"
+                );
+            }
+            if p.rag_api_key_env.is_none() {
+                bail!(
+                    "missing --rag-api-key-env; required when --rag-provider=openai_compatible"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
 fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
+    let canonical_rag = match p.rag_provider.unwrap_or(RagProviderArg::None) {
+        RagProviderArg::None => None,
+        provider => Some(RagAnswers {
+            provider,
+            base_url: p
+                .rag_base_url
+                .clone()
+                .ok_or_else(|| anyhow!("--rag-base-url required when --rag-provider is set"))?,
+            model: p
+                .rag_model
+                .clone()
+                .unwrap_or_else(|| match provider {
+                    RagProviderArg::Ollama => "nomic-embed-text".to_string(),
+                    _ => String::new(),
+                }),
+            api_key_env: p.rag_api_key_env.clone(),
+        }),
+    };
     Ok(WizardAnswers {
         repo_url: p.repo_url.clone().ok_or_else(|| anyhow!("--repo-url required"))?,
         base_branch: p.base_branch.clone().unwrap_or_else(|| "main".to_string()),
@@ -1646,6 +1896,7 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
         reviewer_model: p.reviewer_model.clone(),
         reviewer_api_key: None,
         audits: resolve_non_interactive_audits(p),
+        canonical_rag,
     })
 }
 
@@ -1931,6 +2182,7 @@ pub(crate) async fn reconfigure_reviewer(
                 api_key: None,
                 api_base_url: None,
                 prompt_template_path: None,
+                code_review: None,
                 auto_revise_on_block: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
@@ -2156,6 +2408,7 @@ mod tests {
             reviewer_model: None,
             reviewer_api_key: None,
             audits: HashMap::new(),
+            canonical_rag: None,
         }
     }
 
@@ -2182,7 +2435,7 @@ mod tests {
         // answers in order: repo, base, agent, poll, token env, PAT,
         // chatops choice "1" (none), reviewer choice "1" (none),
         // then the default-path audit answer (bare-Enter on the LLM gate
-        // → no).
+        // → no), then bare-Enter on the canonical-RAG gate (a21) → no.
         let mut io = ScriptedIo::new(vec![
             "git@github.com:acme/widgets.git",
             "main",
@@ -2193,6 +2446,7 @@ mod tests {
             "1",
             "1",
             "",
+            "n",
         ]);
         let prefill = WizardPrefill::default();
         let ans = run_wizard(&mut io, InstallMode::Dev, &prefill).await.unwrap();
@@ -2494,6 +2748,8 @@ mod tests {
         let mut answers = baseline_wizard_answers();
         // Bare-Enter on LLM gate → no.
         answers.push("");
+        // RAG gate (a21) bare-Enter → no.
+        answers.push("n");
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
@@ -2521,6 +2777,8 @@ mod tests {
         // LLM gate yes, fast-path default Y.
         answers.push("y"); // LLM gate
         answers.push(""); // fast-path (default Y)
+        // RAG gate (a21) → no.
+        answers.push("n");
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
@@ -2560,6 +2818,8 @@ mod tests {
         answers.push("n"); // security_bug_audit (never)
         answers.push("d"); // architecture_consultative
         answers.push("m"); // documentation_audit
+        // RAG gate (a21) → no.
+        answers.push("n");
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
@@ -3595,6 +3855,105 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         assert!(
             msg.contains("non-interactive") || msg.contains("non_interactive"),
             "clap error should name --non-interactive: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wizard_rag_decline_writes_no_block() {
+        let mut answers = baseline_wizard_answers();
+        answers.push(""); // audits gate bare-Enter → no
+        answers.push("n"); // RAG gate
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert!(ans.canonical_rag.is_none());
+        let cfg = assemble_config(&ans).unwrap();
+        assert!(cfg.canonical_rag.is_none());
+    }
+
+    #[tokio::test]
+    async fn wizard_rag_disable_option_writes_no_block() {
+        let mut answers = baseline_wizard_answers();
+        answers.push(""); // audits gate bare-Enter → no
+        answers.push("y"); // RAG gate: yes, configure
+        // localhost ollama probe will fail in test env so the four-option
+        // menu fires; choose option 4 (disable).
+        answers.push("4");
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert!(ans.canonical_rag.is_none());
+    }
+
+    #[tokio::test]
+    async fn wizard_rag_docker_option_writes_localhost_ollama() {
+        let mut answers = baseline_wizard_answers();
+        answers.push(""); // audits gate bare-Enter → no
+        answers.push("y"); // RAG gate
+        answers.push("1"); // docker option
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        let rag = ans.canonical_rag.expect("docker option writes block");
+        assert_eq!(rag.provider, RagProviderArg::Ollama);
+        assert_eq!(rag.base_url, "http://localhost:11434");
+        assert_eq!(rag.model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn non_interactive_rag_provider_without_base_url_fails() {
+        let p = WizardPrefill {
+            repo_url: Some("git@github.com:acme/x.git".into()),
+            token_env_var: Some("GITHUB_TOKEN".into()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            rag_provider: Some(RagProviderArg::Ollama),
+            ..WizardPrefill::default()
+        };
+        let err = validate_non_interactive(&p).expect_err("missing base url fails");
+        let msg = format!("{err}");
+        assert!(msg.contains("rag-base-url"), "msg should name flag: {msg}");
+    }
+
+    #[test]
+    fn non_interactive_rag_ollama_full_flags_pass() {
+        let p = WizardPrefill {
+            repo_url: Some("git@github.com:acme/x.git".into()),
+            token_env_var: Some("GITHUB_TOKEN".into()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            rag_provider: Some(RagProviderArg::Ollama),
+            rag_base_url: Some("http://gpu-host:11434".into()),
+            ..WizardPrefill::default()
+        };
+        validate_non_interactive(&p).expect("full flags should pass");
+        let ans = prefill_to_answers(&p).unwrap();
+        let rag = ans.canonical_rag.unwrap();
+        assert_eq!(rag.provider, RagProviderArg::Ollama);
+        assert_eq!(rag.base_url, "http://gpu-host:11434");
+        assert_eq!(rag.model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn non_interactive_rag_openai_requires_api_key_env() {
+        let p = WizardPrefill {
+            repo_url: Some("git@github.com:acme/x.git".into()),
+            token_env_var: Some("GITHUB_TOKEN".into()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            rag_provider: Some(RagProviderArg::OpenaiCompatible),
+            rag_base_url: Some("https://api.voyageai.com/v1".into()),
+            ..WizardPrefill::default()
+        };
+        let err = validate_non_interactive(&p)
+            .expect_err("missing api-key-env should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rag-api-key-env"),
+            "msg should name flag: {msg}"
         );
     }
 

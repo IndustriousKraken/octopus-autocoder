@@ -74,6 +74,33 @@ executor:
   # empty prompt to the wrapped CLI.
   # changelog_stylist_prompt_path: /etc/autocoder/changelog-stylist.md
 
+  # --- Per-workspace nested prompt overrides (a24) ---
+  #
+  # Modernized form of the flat-suffix override fields above. Each
+  # `prompt_path` is workspace-relative when not absolute; the uniform
+  # PromptLoader walks per-workspace nested → per-workspace flat-
+  # legacy → daemon-level flat-legacy → embedded fallback, and on a
+  # configured-but-missing path it logs a one-shot WARN and falls
+  # through. See docs/CONFIG.md `## Prompt overrides` for the full
+  # registry table.
+  #
+  # implementer:
+  #   prompt_path: ./prompts/implementer-custom.md
+  # changelog_stylist:
+  #   prompt_path: ./prompts/changelog-stylist-custom.md
+  #
+  # Three prompts whose only operator override is the nested form
+  # (they had no daemon-level field before a24). Each is workspace-
+  # relative; absent / unreadable / empty files fall back to the
+  # embedded default with a one-shot WARN.
+  #
+  # implementer_revision:
+  #   prompt_path: ./prompts/implementer-revision-custom.md
+  # audit_triage:
+  #   prompt_path: ./prompts/audit-triage-custom.md
+  # chat_request_triage:
+  #   prompt_path: ./prompts/chat-request-triage-custom.md
+
   # Consecutive Failed iterations after which a change is marked
   # perma-stuck (writes `.perma-stuck.json`, posts a chatops alert, and
   # is excluded from `list_pending` until the marker is removed). A
@@ -280,6 +307,13 @@ github:
 #   # you specifically want per-change attention.
 #   # See `docs/CODE-REVIEW.md` § "Per-change reviewer mode".
 #   # mode: bundled
+#   #
+#   # Nested override for the reviewer's prompt template (a24).
+#   # Workspace-relative when not absolute. Preferred over the legacy
+#   # flat `reviewer.prompt_template_path` field. Missing/empty files
+#   # emit a one-shot WARN and fall back to the embedded default.
+#   # code_review:
+#   #   prompt_path: ./prompts/code-review-custom.md
 
 # ChatOps escalation — when the agent can't proceed without human
 # input, post the question to a chat provider and resume on reply.
@@ -487,3 +521,24 @@ github:
 #     # handler logs a WARN naming the path AND falls back to the
 #     # embedded default. Default: null (use embedded).
 #     # prompt_path: ./prompts/brownfield-custom.md
+
+
+# Canonical-spec RAG (a21). Optional top-level block. When absent OR
+# present with `enabled: false`, no embedding pipeline runs and the
+# implementer's `query_canonical_specs` MCP tool returns an empty Vec
+# with `error_hint: rag disabled in config`. When enabled, the daemon
+# embeds every `openspec/specs/<capability>/spec.md` at workspace init
+# and re-embeds affected capabilities after archives that touch
+# canonical specs. The store is in-memory only (daemon restart
+# re-embeds).
+#
+# canonical_rag:
+#   enabled: true
+#   provider: ollama                    # | openai_compatible
+#   model: nomic-embed-text             # provider-specific identifier
+#   api_base_url: http://localhost:11434
+#   # api_key_env: VOYAGE_API_KEY       # required for openai_compatible
+#   # api_key: { value: "..." }         # inline alternative (wins with WARN if both set)
+#   top_k: 10                           # default for tool queries; clamped [1, 100]
+#   chunk_strategy: per_requirement     # per_requirement | per_scenario | per_capability
+#   reembed_on_archive: true            # re-embed affected capabilities post-archive

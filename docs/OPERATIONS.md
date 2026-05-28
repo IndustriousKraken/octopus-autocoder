@@ -779,3 +779,75 @@ autocoder's spec-driven workflow assumes `openspec/specs/<capability>/spec.md` a
 **OSS-fork mode.** When `openspec/` lives in a sibling repo separate from the upstream project (the "specs-only fork" pattern), brownfield is the bootstrap step that produces the initial canonical-spec set the rest of autocoder's machinery reads from. After every capability's canonical spec is in place, `propose` handles the ongoing work the same way it would for a green-field project.
 
 ---
+
+## Canonical-spec RAG
+
+When the operator configures `canonical_rag:` in `config.yaml` (see
+[CONFIG.md → `canonical_rag:`](CONFIG.md#canonical_rag-optional)), the
+daemon maintains a per-workspace in-memory vector store over each
+`openspec/specs/<capability>/spec.md` file. The implementer's MCP child
+exposes a `query_canonical_specs(query, top_k?)` tool that relays
+through the daemon's control socket so the agent can retrieve
+canonical-spec chunks ranked by semantic similarity.
+
+### Re-embed cadence
+
+The pipeline re-embeds at exactly two events:
+
+1. **Workspace init.** The first iteration of a workspace after daemon
+   start (OR after a workspace wipe) embeds the entire canonical
+   corpus synchronously before invoking the executor. Subsequent
+   iterations skip if embeds already exist.
+2. **Post-archive.** After an iteration's archive lands a commit that
+   touched at least one `openspec/specs/<cap>/spec.md` file, ONLY the
+   affected capabilities are rebuilt — not the whole corpus. Detection
+   is `git diff --name-only HEAD~1 HEAD -- openspec/specs/`. When
+   `reembed_on_archive: false`, this step is skipped and the store
+   goes stale until restart.
+
+### In-memory persistence
+
+Embeds are kept in RAM only. There is NO on-disk cache. Daemon restart
+re-embeds from scratch for every configured workspace — typically
+sub-second on GPU AND ~30 seconds on CPU for a typical corpus. The
+cost is paid once at startup AND once per archive that touches
+canonical specs; queries themselves take tens of milliseconds (one
+embed + cosine sim across O(1000) chunks).
+
+### Failure modes
+
+- **Embedding-provider error at init** (network, auth, rate-limit) →
+  WARN log naming the error AND the workspace's store is omitted from
+  the daemon's registry. Subsequent `query_canonical_specs` calls
+  return `{"hits": [], "error_hint": "rag init failed; see daemon log"}`.
+  The polling iteration proceeds normally — RAG availability never
+  gates iteration progress. Subsequent iterations retry the init.
+- **Per-query provider error** → WARN log AND empty array returned to
+  the caller with `error_hint: "query failed: <reason>"`.
+- **Control-socket unreachable from the MCP child** → the tool returns
+  `{"hits": [], "error_hint": "control socket unreachable: <error>"}`
+  after a 10-second timeout. The agent falls back to its non-RAG
+  behaviour.
+- **MCP child env vars absent** (RAG not configured for this execution)
+  → tool returns `{"hits": [], "error_hint": "rag not configured for this execution"}`
+  without attempting a socket connection.
+
+### Cost expectations
+
+- Embedding: sub-second on GPU; ~30s on CPU for a typical corpus
+  (~50 capabilities, ~500 chunks).
+- Re-embed-on-archive: typically a fraction of cold-start cost (1
+  capability, not the whole corpus).
+- Per-query: tens of milliseconds (one embed call + cosine sim across
+  ≤O(1000) chunks; no external calls beyond the embed).
+
+### Operator log lines
+
+- `canonical RAG embedded N chunks for workspace <basename>` —
+  successful workspace-init embed.
+- `canonical RAG re-embedded N capabilities after archive: [...]` —
+  successful post-archive re-embed.
+- `canonical RAG workspace-init failed: <error>; query_canonical_specs
+  will return empty Vec` — WARN at init.
+- `canonical RAG post-archive re-embed failed: <error>; prior embeds
+  retained` — WARN at archive.

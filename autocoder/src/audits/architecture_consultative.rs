@@ -16,7 +16,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,16 +27,12 @@ use super::{
     workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
+use crate::prompts::{PromptId, PromptLoader};
 
 /// Tools the consultative agent may call. Excludes `Write` and `Edit`
 /// so the sandbox blocks workspace modifications outright; the audit-
 /// run log captures the agent's stdout for forensic review.
 const ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash"];
-
-/// Built-in default consultative prompt, embedded at compile time so
-/// the binary runs without requiring `prompts/` on disk.
-const DEFAULT_PROMPT: &str =
-    include_str!("../../../prompts/architecture-consultative.md");
 
 /// Maximum number of findings the audit will accept. More than this
 /// indicates the agent ignored its cap; the audit fails rather than
@@ -85,29 +81,17 @@ impl ArchitectureConsultativeAudit {
         self
     }
 
-    /// Resolve the consultative prompt. When `settings.prompt_path` is
-    /// set, read the file (empty content errors so the daemon does not
-    /// feed an empty prompt to the wrapped CLI). Otherwise use the
-    /// embedded default.
-    fn resolve_prompt(&self) -> Result<String> {
-        match &self.settings.prompt_path {
-            Some(path) => {
-                let body = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "reading architecture-consultative prompt override at {}",
-                        path.display()
-                    )
-                })?;
-                if body.trim().is_empty() {
-                    return Err(anyhow!(
-                        "architecture-consultative prompt override at {} is empty",
-                        path.display()
-                    ));
-                }
-                Ok(body)
-            }
-            None => Ok(DEFAULT_PROMPT.to_string()),
-        }
+    /// Resolve the consultative prompt via the uniform [`PromptLoader`].
+    /// `settings.prompt_path` is the audit's nested override
+    /// (`audits.settings.architecture_consultative.prompt_path`);
+    /// missing/empty values fall through to the embedded default.
+    fn resolve_prompt(&self, workspace: Option<&Path>) -> Result<String> {
+        Ok(PromptLoader::load(
+            PromptId::AuditArchitectureConsultative,
+            self.settings.prompt_path.as_deref(),
+            None,
+            workspace,
+        ))
     }
 }
 
@@ -138,7 +122,7 @@ impl Audit for ArchitectureConsultativeAudit {
             return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
         }
 
-        let prompt = self.resolve_prompt()?;
+        let prompt = self.resolve_prompt(Some(ctx.workspace))?;
 
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
@@ -476,6 +460,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         }
     }
 
@@ -579,7 +568,7 @@ mod tests {
     fn prompt_contains_anti_microservices_clause() {
         let cfg = executor_cfg("/bin/true");
         let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         assert!(
             prompt.contains("microservices"),
             "prompt must mention microservices in its anti-pattern list: {prompt}"
@@ -597,7 +586,7 @@ mod tests {
     fn prompt_contains_language_agnostic_clause() {
         let cfg = executor_cfg("/bin/true");
         let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         let lower = prompt.to_lowercase();
         assert!(
             lower.contains("language-agnostic")
@@ -674,7 +663,7 @@ mod tests {
         let cfg = executor_cfg("/bin/true");
         let audit =
             ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         assert!(prompt.contains("findings"), "expected default prompt body");
         assert!(
             prompt.contains("consultative") || prompt.contains("question"),
@@ -682,8 +671,11 @@ mod tests {
         );
     }
 
+    /// Empty override files now fall back to the embedded default via
+    /// the uniform `PromptLoader` rather than producing a hard error
+    /// (a24). A one-shot WARN names the offending path.
     #[test]
-    fn resolve_prompt_errors_on_empty_override_file() {
+    fn resolve_prompt_falls_back_when_override_file_empty() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("empty.md");
         std::fs::write(&p, "   \n").unwrap();
@@ -698,8 +690,13 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = ArchitectureConsultativeAudit::new(&map, &cfg);
-        let err = audit.resolve_prompt().expect_err("empty override errors");
-        assert!(format!("{err:#}").contains("empty"));
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("empty override falls back to embedded");
+        assert!(
+            prompt.contains("findings"),
+            "fallback must use embedded default"
+        );
     }
 
     #[test]
