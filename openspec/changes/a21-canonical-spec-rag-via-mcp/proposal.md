@@ -42,7 +42,7 @@ canonical_rag:
 
 The cadence is deliberately conservative — re-embedding on every iteration would waste cycles when canonical is unchanged. Re-embedding only on archive matches the only operation that updates canonical.
 
-**MCP tool: `query_canonical_specs`.** Hosted by the daemon's existing MCP server (same as `ask_user`). Surface:
+**MCP tool: `query_canonical_specs` — control-socket relay.** autocoder's MCP architecture is per-execution stdio child processes, NOT a long-running daemon MCP server. Each polling iteration launches a fresh `autocoder mcp-server` child whose lifetime is bounded by the wrapped agent's execution; the child has no access to the daemon's in-memory state. To make `query_canonical_specs` work in this architecture, the stdio MCP child SHALL relay queries to the daemon via the existing Unix-domain control socket (`<system-temp>/autocoder/control/control.sock`, per canonical `orchestrator-cli` "Control socket for runtime daemon interaction"). The daemon's control-socket handler answers via the in-memory `CanonicalRagStore`. Tool surface (as seen by the agent):
 
 ```
 query_canonical_specs(query: string, top_k?: number) -> Array<{
@@ -54,7 +54,16 @@ query_canonical_specs(query: string, top_k?: number) -> Array<{
 }>
 ```
 
-Default `top_k` from config (default 10). The tool returns chunks ranked by cosine similarity. The agent reads results AND uses them to inform its work — same MCP plumbing as `ask_user`, no new transport.
+Default `top_k` from config (default 10). The tool returns chunks ranked by cosine similarity. The MCP child blocks on the control-socket round trip for one tool call's duration (typically tens of milliseconds — embedding the query + cosine similarity across ≤O(1000) chunks).
+
+**Per-execution MCP child plumbing.** The existing `ClaudeCliExecutor::write_mcp_config` adds two more env vars to the child's spawn environment alongside `ORCH_MCP_WORKSPACE` AND `ORCH_MCP_CHANGE`:
+
+- `ORCH_DAEMON_CONTROL_SOCKET` — absolute path to the daemon's control socket (resolved from `DaemonPaths.control_socket_path()`).
+- `ORCH_MCP_WORKSPACE_BASENAME` — the sanitized basename the daemon uses as the `CanonicalRagStore` registry key.
+
+The MCP child reads these on startup; when the agent invokes `query_canonical_specs`, the child opens a connection to the socket, sends `{"action":"query_canonical_specs","workspace_basename":"...","query":"...","top_k":...}`, reads the single-line JSON response, AND returns the `hits` array to the agent as the tool-call result. The child does NOT cache results across calls; each invocation roundtrips through the socket.
+
+The same MCP child still hosts the existing `ask_user` tool via the marker-file mechanism (unchanged). `query_canonical_specs` adds a parallel tool surface that relays via control socket instead of via marker file because `query_canonical_specs` needs a SYNCHRONOUS response within the same execution (the agent acts on the hits immediately), whereas `ask_user` is fire-and-forget from the child's perspective (the daemon picks up the marker after the agent has paused).
 
 **Implementer prompt update.** The embedded `prompts/implementer.md` gets a new paragraph:
 
@@ -132,7 +141,9 @@ The wizard's option 1 copies this file to `<config_dir>/ollama-docker-compose.ym
   - `autocoder/src/rag/chunking.rs` (new) — markdown-aware chunker that splits canonical specs into per-requirement chunks (heading + body + scenarios).
   - `autocoder/src/config.rs` — add `CanonicalRagConfig` struct AND the top-level `canonical_rag:` block.
   - `autocoder/src/polling_loop.rs` — workspace-init hook calls `CanonicalRagStore::rebuild_for_workspace`; post-archive hook checks for canonical changes AND calls `rebuild_capabilities` for affected caps.
-  - `autocoder/src/mcp/server.rs` (or wherever the daemon's MCP server lives) — register the `query_canonical_specs` tool; route calls to the store's `query` method.
+  - `autocoder/src/mcp_askuser_server.rs` (rename to `autocoder/src/mcp_server.rs` OR add a sibling) — extend the per-execution stdio MCP child's tool list with `query_canonical_specs`; on tool invocation, open a Unix-domain connection to the daemon's control socket (path from `ORCH_DAEMON_CONTROL_SOCKET` env var), send the `query_canonical_specs` action, return the `hits` array to the agent.
+  - `autocoder/src/control_socket.rs` — add a new `query_canonical_specs` action handler. On request, look up `workspace_basename` in the per-workspace `CanonicalRagStore` registry; call `store.query(query, top_k)`; return `{"ok": true, "hits": [...]}` OR `{"ok": false, "error": "..."}`.
+  - `autocoder/src/executor/claude_cli.rs::write_mcp_config` — add `ORCH_DAEMON_CONTROL_SOCKET` AND `ORCH_MCP_WORKSPACE_BASENAME` to the spawn env.
   - `autocoder/src/cli/install.rs` — the wizard's graduated-path flow.
   - `prompts/implementer.md` — new paragraph mentioning the tool.
   - `install/ollama-docker-compose.yml` (new) — the bundled quick-start compose file.

@@ -159,3 +159,62 @@ The wizard's RAG step is testable via the existing `ScriptedIo` test harness wit
 - **WHEN** `autocoder install --non-interactive --rag-provider ollama` is invoked WITHOUT `--rag-base-url`
 - **THEN** the install fails fast with an error naming the missing flag
 - **AND** no config is written
+
+### Requirement: Control socket exposes `query_canonical_specs` action
+The daemon's control socket (per the canonical "Control socket for runtime daemon interaction" requirement) SHALL accept a `query_canonical_specs` action that lets per-execution MCP children retrieve ranked canonical-spec chunks for any query string. Request shape:
+
+```json
+{"action":"query_canonical_specs","workspace_basename":"<sanitized-basename>","query":"<text>","top_k":<optional-number>}
+```
+
+Required fields: `action`, `workspace_basename`, `query`. Optional: `top_k`. When `top_k` is omitted, the handler SHALL apply `canonical_rag.top_k` from the daemon's config (default 10) per the existing clamp rules.
+
+Response shape:
+
+```json
+{"ok":true,"hits":[<RagHit JSON>...],"error_hint":"<optional message>"}
+```
+
+Each `RagHit` SHALL contain the fields documented in the executor spec delta (`capability`, `requirement_title`, `requirement_body`, `scenario_titles`, `relevance_score`). The handler SHALL be fail-open: any error condition (missing workspace registry entry, query-time provider error, RAG disabled, etc.) returns `ok: true` with an empty `hits` array AND a structured `error_hint` naming the cause. A `ok: false` response is reserved for protocol-level failures (malformed request, missing required field) per the canonical socket-protocol requirement.
+
+The handler SHALL look up the workspace's `CanonicalRagStore` in the daemon's per-workspace registry by `workspace_basename`. The handler SHALL NOT trust client-supplied input for any purpose other than registry lookup — the basename is matched verbatim against the registry's keys; if no match, the handler returns `{"ok":true,"hits":[],"error_hint":"no workspace registered for that basename"}`.
+
+#### Scenario: Happy-path query
+- **WHEN** a client (typically the per-execution MCP child) sends `{"action":"query_canonical_specs","workspace_basename":"github_com_foo_bar","query":"audit cadence","top_k":5}`
+- **AND** the daemon's registry has a `CanonicalRagStore` for `github_com_foo_bar`
+- **THEN** the handler calls `store.query("audit cadence", Some(5))`
+- **AND** returns `{"ok":true,"hits":[<up to 5 RagHits sorted by relevance>]}`
+- **AND** the connection is closed after the single response
+
+#### Scenario: Default top_k from config when omitted
+- **WHEN** a request omits `top_k` AND `canonical_rag.top_k: 15` is configured
+- **THEN** the handler calls `store.query(query, Some(15))` (OR equivalently passes the config default through)
+- **AND** the response contains up to 15 hits
+
+#### Scenario: Missing workspace in registry
+- **WHEN** a request's `workspace_basename` does not match any registry entry (RAG disabled for that workspace, OR no such workspace is configured)
+- **THEN** the handler returns `{"ok":true,"hits":[],"error_hint":"no workspace registered for that basename"}`
+- **AND** no exception OR `ok: false` response is emitted
+
+#### Scenario: RAG init failed earlier — registry has no entry
+- **WHEN** RAG is configured for the workspace BUT the workspace-init embed pipeline failed (provider unreachable) AND the daemon did NOT register a store
+- **AND** a request arrives for that workspace's basename
+- **THEN** the handler returns `{"ok":true,"hits":[],"error_hint":"rag init failed; see daemon log"}`
+- **AND** the daemon log contains the original init-failure WARN line
+
+#### Scenario: Query-time provider error
+- **WHEN** the request reaches the handler AND `store.query(...)` returns an error (e.g., provider unreachable mid-query)
+- **THEN** the handler returns `{"ok":true,"hits":[],"error_hint":"query failed: <reason>"}`
+- **AND** the daemon logs the underlying error at WARN
+
+#### Scenario: Malformed request fails per canonical socket protocol
+- **WHEN** a request is missing the required `workspace_basename` field OR `query` field
+- **THEN** the handler returns `{"ok":false,"error":"missing required field: <name>"}` per the canonical "Request protocol" scenario
+- **AND** the connection is closed
+
+#### Scenario: Unknown workspace_basename does not leak across workspaces
+- **WHEN** workspace A's MCP child accidentally sends a query with workspace B's basename (env var misconfiguration OR a hypothetical compromised child)
+- **THEN** the daemon's handler queries workspace B's store (the daemon trusts the basename for registry lookup)
+- **AND** the response contains workspace B's hits
+- **AND** the routing is "as configured" — workspace isolation depends on the env var the daemon itself sets via `ClaudeCliExecutor::write_mcp_config`; a child that controls its own env can in principle query any registered workspace
+- **AND** this is acceptable because MCP children run as the daemon user with full local access; isolation across managed workspaces is a property of the env var the daemon writes, not a security boundary enforced by the control socket

@@ -1,57 +1,74 @@
 ## ADDED Requirements
 
-### Requirement: MCP server exposes `query_canonical_specs` tool to the implementer
-The daemon's MCP server SHALL register a `query_canonical_specs` tool alongside the existing `ask_user` tool. The tool is available to the wrapped agent (Claude CLI by default) AND lets the implementer retrieve the most-relevant canonical-spec chunks for any query string. The tool's surface:
+### Requirement: Per-execution MCP child exposes `query_canonical_specs` tool via control-socket relay
+The per-execution stdio MCP server (the child process autocoder launches per polling iteration via `.mcp.json`, currently `autocoder/src/mcp_askuser_server.rs`) SHALL advertise a `query_canonical_specs` tool alongside the existing `ask_user` tool. The tool's surface as seen by the wrapped agent:
 
 - Name: `query_canonical_specs`.
-- Input schema: `{ query: string, top_k?: number }`. `query` is required. `top_k` defaults to `canonical_rag.top_k` from config (default 10), clamped per the orchestrator spec.
-- Output: a JSON array of objects shaped `{ capability: string, requirement_title: string, requirement_body: string, scenario_titles: string[], relevance_score: number }`, sorted by descending `relevance_score`.
-- Cost: free to the agent; the daemon owns the embedding pipeline AND amortizes its cost across iterations.
+- Input schema: `{ query: string, top_k?: number }`. `query` is required. `top_k` defaults to `canonical_rag.top_k` from the daemon's config (default 10), clamped per the orchestrator spec.
+- Output: a JSON object `{ hits: Array<RagHit>, error_hint?: string }` where each `RagHit` is shaped `{ capability: string, requirement_title: string, requirement_body: string, scenario_titles: string[], relevance_score: number }`, sorted by descending `relevance_score`.
 
-When RAG is disabled OR the workspace's store is absent (init failed; provider unreachable), the tool SHALL return an empty array PLUS a structured `error_hint` field naming the cause (`"rag disabled in config"` OR `"rag init failed; see daemon log"`). The agent's prompt is updated (in the implementer prompt template) to mention the tool's existence AND to encourage its use when working on a capability with a canonical spec.
+The tool's handler SHALL NOT compute results locally. Instead it SHALL relay the request to the daemon via the existing control socket (per the canonical `orchestrator-cli` "Control socket for runtime daemon interaction" requirement) using a new `query_canonical_specs` action defined in the orchestrator-cli spec deltas. The daemon owns the `CanonicalRagStore` AND answers via its in-memory state; the MCP child is a thin synchronous relay.
 
-The tool routes via the existing MCP transport; no new transport surface is introduced. The MCP server's per-workspace context resolution (the same logic that routes `ask_user` calls to the correct workspace's marker file) routes `query_canonical_specs` calls to the correct workspace's `CanonicalRagStore`.
+The relay is configured via two env vars set by `ClaudeCliExecutor::write_mcp_config` when launching the MCP child:
 
-#### Scenario: Tool registered alongside `ask_user`
-- **WHEN** the daemon's MCP server starts up
-- **THEN** the server's tool registry contains BOTH `ask_user` (existing) AND `query_canonical_specs` (new)
-- **AND** the per-workspace `.mcp.json` file the daemon writes for the wrapped agent lists both tools
-- **AND** the agent's discovery of available tools returns the documented input/output schemas
+- `ORCH_DAEMON_CONTROL_SOCKET` — absolute path to the daemon's Unix-domain control socket. When absent (i.e., RAG is not configured for this workspace), the tool returns `{ hits: [], error_hint: "rag not configured for this execution" }` AND does NOT attempt a socket connection.
+- `ORCH_MCP_WORKSPACE_BASENAME` — the sanitized basename the daemon uses as the `CanonicalRagStore` registry key. Routed verbatim into the control-socket request.
 
-#### Scenario: Tool returns ranked chunks for a workspace with embeds
+Connection timeout: 10 seconds. On timeout OR socket error, the tool returns `{ hits: [], error_hint: "control socket unreachable: <error>" }` AND surfaces the error so the agent can fall back to non-RAG behavior. The control-socket relay is fail-open in every error path; the agent never blocks indefinitely AND never sees a tool-call failure.
+
+The implementer prompt template (`prompts/implementer.md`) SHALL contain a paragraph naming the tool AND describing when to use it (working on a capability with a canonical spec). Operators with custom implementer prompt overrides MAY remove the mention to suppress agent use; the tool stays registered regardless, just unused.
+
+#### Scenario: Tool advertised in the MCP child's `tools/list`
+- **WHEN** an agent connects to the MCP child AND sends a `tools/list` request
+- **THEN** the response lists BOTH `ask_user` (existing) AND `query_canonical_specs` (new)
+- **AND** `query_canonical_specs`'s `inputSchema` matches the documented `{ query: string, top_k?: number }` shape
+
+#### Scenario: Tool returns ranked hits via control-socket relay
 - **WHEN** an agent invokes `query_canonical_specs({ query: "audit framework cadence", top_k: 5 })`
-- **AND** the workspace's `CanonicalRagStore` exists AND contains audit-framework-related embeds
-- **THEN** the tool returns up to 5 results sorted by descending `relevance_score`
-- **AND** each result has the documented fields (capability, requirement_title, requirement_body, scenario_titles, relevance_score)
-- **AND** the requirement_body contains enough text for the agent to act on (not just the title)
+- **AND** `ORCH_DAEMON_CONTROL_SOCKET` AND `ORCH_MCP_WORKSPACE_BASENAME` are set in the child's env
+- **AND** the daemon has a `CanonicalRagStore` registered for that workspace_basename
+- **THEN** the MCP child opens a connection to the socket AND sends `{"action":"query_canonical_specs","workspace_basename":"<basename>","query":"audit framework cadence","top_k":5}`
+- **AND** the daemon's handler returns `{"ok":true,"hits":[...]}` with up to 5 results
+- **AND** the MCP child returns the `hits` array to the agent as the tool-call result
 
-#### Scenario: Tool returns empty array when RAG is disabled
+#### Scenario: RAG not configured — tool returns empty with hint
 - **WHEN** the workspace's config has no `canonical_rag:` block (RAG disabled)
+- **AND** `ClaudeCliExecutor::write_mcp_config` omits `ORCH_DAEMON_CONTROL_SOCKET` from the spawn env
 - **AND** an agent invokes `query_canonical_specs({ query: "..." })`
-- **THEN** the tool returns an empty array AND a structured `error_hint: "rag disabled in config"` field at the response root
-- **AND** the agent's MCP client surfaces the hint so the implementer's prompt can fall back to its non-RAG behavior
+- **THEN** the tool returns `{ hits: [], error_hint: "rag not configured for this execution" }`
+- **AND** no socket connection is attempted
 
-#### Scenario: Tool returns empty array when init failed
-- **WHEN** RAG is configured but workspace-init's embed call failed earlier (provider unreachable)
+#### Scenario: Control socket unreachable — tool returns empty with hint
+- **WHEN** `ORCH_DAEMON_CONTROL_SOCKET` is set BUT the socket is unreachable (file missing, permission denied, daemon down)
 - **AND** an agent invokes `query_canonical_specs({ query: "..." })`
-- **THEN** the tool returns an empty array AND `error_hint: "rag init failed; see daemon log"`
+- **THEN** the tool returns `{ hits: [], error_hint: "control socket unreachable: <error>" }`
+- **AND** the connect attempt times out after 10 seconds at most
+
+#### Scenario: Store missing for workspace — daemon surfaces hint
+- **WHEN** RAG is configured BUT workspace-init's embed call failed earlier (provider unreachable)
+- **AND** the daemon's `CanonicalRagStore` registry has no entry for the workspace_basename
+- **AND** an agent invokes `query_canonical_specs({ query: "..." })`
+- **THEN** the daemon's control-socket handler returns `{"ok":true,"hits":[],"error_hint":"rag init failed; see daemon log"}`
+- **AND** the MCP child surfaces the hint to the agent
 - **AND** the daemon log contains the original failure's WARN line for operator diagnosis
 
-#### Scenario: Tool respects per-workspace store isolation
+#### Scenario: Per-workspace isolation enforced by daemon
 - **WHEN** two workspaces are managed by the same daemon AND both have `CanonicalRagStore` registered
-- **AND** agent A (for workspace 1) invokes `query_canonical_specs(...)`
-- **THEN** the tool's results come ONLY from workspace 1's store
-- **AND** workspace 2's store entries do NOT appear in the response
-- **AND** the routing uses the same per-workspace context resolution the existing `ask_user` tool uses
+- **AND** an MCP child spawned for workspace 1 (with its `ORCH_MCP_WORKSPACE_BASENAME` env var set to workspace 1's basename) invokes `query_canonical_specs(...)`
+- **THEN** the control-socket request carries workspace 1's basename
+- **AND** the daemon's handler queries ONLY workspace 1's store
+- **AND** workspace 2's entries do NOT appear in the response
+- **AND** the routing is enforced by the daemon, not the child (the child cannot accidentally query another workspace's store even if its env var is spoofed — the daemon's handler is the source of truth)
 
 #### Scenario: Default `top_k` from config when omitted
 - **WHEN** an agent invokes `query_canonical_specs({ query: "..." })` with NO `top_k` argument
 - **AND** `canonical_rag.top_k` is set to `15`
-- **THEN** the tool returns up to 15 results
+- **THEN** the control-socket request omits `top_k`; the daemon's handler applies the config default
+- **AND** the tool returns up to 15 results
 - **AND** the agent's explicit `top_k` (when present) overrides the config default
 
 #### Scenario: Implementer prompt mentions the tool
 - **WHEN** the daemon assembles the implementer prompt for an executor invocation
 - **AND** the embedded `prompts/implementer.md` (OR an operator override) is loaded
 - **THEN** the prompt contains a paragraph naming `query_canonical_specs` AND its purpose (retrieve canonical-spec chunks for the change's capability context)
-- **AND** the operator MAY override the prompt template to remove the mention if they prefer the agent not call the tool — the tool stays registered regardless, just unused
+- **AND** the operator MAY override the prompt template to remove the mention if they prefer the agent not call the tool — the tool stays registered in the MCP child regardless, just unused

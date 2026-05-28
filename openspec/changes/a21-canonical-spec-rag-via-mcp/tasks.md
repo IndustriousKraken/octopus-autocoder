@@ -131,17 +131,31 @@
   - Iteration C: archive with no canonical changes → no re-embed.
   - Iteration D: re-embed fails → existing embeds retained; WARN logged.
 
-## 6. MCP tool surface
+## 6. Control-socket action + per-execution MCP child relay
 
-- [ ] 6.1 In `autocoder/src/mcp/server.rs` (or wherever the daemon's MCP server registers tools), register a new tool:
+- [ ] 6.1 In `autocoder/src/control_socket.rs`, add a `query_canonical_specs` action handler. Request shape:
+  ```json
+  {"action":"query_canonical_specs","workspace_basename":"<sanitized-basename>","query":"<text>","top_k":10}
   ```
-  name: "query_canonical_specs"
-  description: "Query the workspace's canonical OpenSpec specs for the most-relevant existing requirements. Returns top-K chunks ranked by semantic similarity."
-  inputSchema: { query: string, top_k?: number }
-  ```
-- [ ] 6.2 The tool's handler reads the workspace basename from the MCP request context (the daemon's MCP server is per-workspace already AND knows which workspace called), looks up the corresponding `CanonicalRagStore` in the registry, calls `query`, returns JSON conforming to the proposal's documented response shape.
-- [ ] 6.3 If the store is absent for the workspace (RAG disabled OR init failed), the tool returns `[]` with a structured `error_hint` field naming the cause (`"rag disabled in config"` OR `"rag init failed; see daemon log"`).
-- [ ] 6.4 Tests: register the tool; call it via the MCP protocol against a fixture store; assert the JSON shape; assert behavior when the store is absent.
+  Handler behavior:
+  - Look up `workspace_basename` in the daemon's `HashMap<String, Arc<CanonicalRagStore>>` registry.
+  - If absent (RAG disabled, init failed, OR no workspace by that basename): return `{"ok":true,"hits":[],"error_hint":"rag disabled in config" | "rag init failed; see daemon log" | "no workspace registered for that basename"}`.
+  - If present: call `store.query(query, top_k)`; return `{"ok":true,"hits":[<RagHit JSON>...]}`.
+  - On query error (provider unreachable mid-query, etc.): return `{"ok":true,"hits":[],"error_hint":"query failed: <reason>"}` (fail-open, matching the canonical RAG failure posture).
+- [ ] 6.2 In `autocoder/src/executor/claude_cli.rs::write_mcp_config`, add two env vars to the MCP child's spawn environment:
+  - `ORCH_DAEMON_CONTROL_SOCKET` — value from `DaemonPaths.control_socket_path()`. Required when `canonical_rag` is enabled in the per-repo config; absent (env var not set at all) otherwise.
+  - `ORCH_MCP_WORKSPACE_BASENAME` — the sanitized basename the daemon uses for `CanonicalRagStore` registry keys.
+- [ ] 6.3 In the existing stdio MCP child (`autocoder/src/mcp_askuser_server.rs`, OR a renamed sibling `autocoder/src/mcp_server.rs` if the rename is preferable for clarity):
+  - Extend the `tools/list` response to advertise `query_canonical_specs` alongside `ask_user`, with the documented input schema (`{ query: string, top_k?: number }`).
+  - When `tools/call` receives `query_canonical_specs`:
+    - If `ORCH_DAEMON_CONTROL_SOCKET` env var is not set, return a tool result `{"hits":[],"error_hint":"rag not configured for this execution"}`.
+    - Otherwise, connect to the control socket; send a single line of JSON per the request shape above; read the single-line JSON response; return the response's `hits` array (plus `error_hint` if present) to the agent as the tool-call result.
+  - Connection timeout: 10 seconds. On timeout OR socket error: return `{"hits":[],"error_hint":"control socket unreachable: <error>"}`.
+- [ ] 6.4 Tests:
+  - Control-socket action: a daemon with a fixture `CanonicalRagStore` returns the expected JSON for a known query; missing-store case returns the expected `error_hint`.
+  - MCP child relay: a stdio session against a mocked control socket returns the expected tool result.
+  - Env-var absent case: tool returns `error_hint: "rag not configured for this execution"`.
+  - Round-trip integration: a daemon + a real stdio MCP child + a mocked embed-provider — invoking `query_canonical_specs` returns ranked chunks.
 
 ## 7. Implementer prompt update
 
