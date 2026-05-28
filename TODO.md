@@ -2,9 +2,9 @@
 
 Design questions and future-work items that aren't yet ready for an OpenSpec change proposal. Each section is a candidate spec; when the design solidifies enough to draft, lift the section into `openspec/changes/<slug>/proposal.md`.
 
-## a23 — Change-vs-canon contradiction pre-flight using a21's RAG
+## Change-vs-canon contradiction pre-flight using RAG (future change)
 
-`a19` ships the change-INTERNAL contradiction check. `a21` ships the RAG infrastructure. `a23` would combine them to check changes against EXISTING canonical material — catching cases where a change's new ADDED requirements contradict canonical without explicitly modifying it.
+`a19` ships the change-INTERNAL contradiction check. `a21` ships the RAG infrastructure. A future change would combine them to check changes against EXISTING canonical material — catching cases where a change's new ADDED requirements contradict canonical without explicitly modifying it.
 
 The natural shape: for each ADDED requirement in the change, RAG-query the canonical corpus for top-K similar canonical requirements (excluding any the change explicitly MODIFIES or REMOVES). Hand the small bundle to an LLM with a "does this change's new requirement contradict any of these existing ones?" prompt. Findings flow through the existing `.needs-spec-revision.json` mechanism.
 
@@ -32,9 +32,9 @@ The `a21` install wizard offers "install Ollama via docker" as option 1 but stop
 
 ## Brightline-ignore extension to RAG-aware contradiction check
 
-`a15` adds `.brightline-ignore` for intentional code duplication. The same concept could apply to `a23`'s contradiction check: a `.contradiction-ignore.yaml` lists requirement pairs the operator has reviewed AND confirmed are not actually contradictory. The check honors entries and stops flagging known-good pairs. Same architecture (file at workspace root, LLM-populated via `send it`, audit-time stale-pruning).
+`a15` adds `.brightline-ignore` for intentional code duplication. The same concept could apply to the contradiction-pre-flight check above: a `.contradiction-ignore.yaml` lists requirement pairs the operator has reviewed AND confirmed are not actually contradictory. The check honors entries and stops flagging known-good pairs. Same architecture (file at workspace root, LLM-populated via `send it`, audit-time stale-pruning).
 
-Defer until `a23` ships and we see false-positive rates.
+Defer until the contradiction-pre-flight ships and we see false-positive rates.
 
 ## On-demand audit re-run after operator merges a fix
 
