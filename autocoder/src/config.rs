@@ -73,6 +73,57 @@ pub struct Config {
     /// absent block is equivalent to all fields being `None`.
     #[serde(default, skip_serializing_if = "DaemonPathsConfig::is_empty")]
     pub paths: DaemonPathsConfig,
+    /// Optional per-workspace feature flags. Each sub-block is opt-in;
+    /// absent fields take their type-default. Today this block carries
+    /// only the `brownfield` toggle (a23); future per-workspace
+    /// feature flags land here so the schema scales without sprinkling
+    /// one-off top-level keys.
+    #[serde(default, skip_serializing_if = "FeaturesConfig::is_default")]
+    pub features: FeaturesConfig,
+}
+
+/// Top-level feature-flag block. Each sub-block is opt-in; absent
+/// sub-blocks take their type-default behaviour. Today only
+/// `brownfield` is defined.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FeaturesConfig {
+    #[serde(default)]
+    pub brownfield: BrownfieldFeatureConfig,
+}
+
+impl FeaturesConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Config for the `brownfield` chatops verb (a23). The verb is enabled
+/// per-workspace by default; operators opt out by setting
+/// `enabled: false`. The optional `prompt_path` points the brownfield-
+/// draft polling handler at a custom prompt template; when unset OR
+/// the file does not exist at run time, the handler falls back to the
+/// embedded default `prompts/brownfield-draft.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrownfieldFeatureConfig {
+    #[serde(default = "default_brownfield_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+}
+
+impl Default for BrownfieldFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_brownfield_enabled(),
+            prompt_path: None,
+        }
+    }
+}
+
+fn default_brownfield_enabled() -> bool {
+    true
 }
 
 /// Operator-visible override for the four daemon data paths. Each
@@ -5061,6 +5112,104 @@ github:
                     && f.message.contains(env_var)),
             "expected a secret-source WARN naming the unset env var; got: {:?}",
             report.warnings
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // features.brownfield (a23)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_brownfield_block_omitted_uses_defaults() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        assert!(
+            cfg.features.brownfield.enabled,
+            "default enabled must be true"
+        );
+        assert!(
+            cfg.features.brownfield.prompt_path.is_none(),
+            "default prompt_path must be None"
+        );
+    }
+
+    #[test]
+    fn features_brownfield_disable_parses() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  brownfield:
+    enabled: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit disable parses");
+        assert!(!cfg.features.brownfield.enabled);
+        assert!(cfg.features.brownfield.prompt_path.is_none());
+    }
+
+    #[test]
+    fn features_brownfield_explicit_prompt_path_parses() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  brownfield:
+    prompt_path: "./prompts/brownfield-custom.md"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("prompt_path override parses");
+        assert!(cfg.features.brownfield.enabled);
+        assert_eq!(
+            cfg.features.brownfield.prompt_path.as_deref(),
+            Some(Path::new("./prompts/brownfield-custom.md"))
+        );
+    }
+
+    #[test]
+    fn features_brownfield_non_bool_enabled_fails_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  brownfield:
+    enabled: "yes"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("non-bool enabled must fail config-load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("enabled") || msg.contains("bool"),
+            "error must name the offending field / expected type; got: {msg}"
         );
     }
 

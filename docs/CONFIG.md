@@ -253,3 +253,35 @@ See [`STATE-LAYOUT.md`](STATE-LAYOUT.md) for the full directory
 layout, the resolution precedence, and the migration behaviour on
 first startup after upgrade.
 
+## `features:` (optional)
+
+Per-workspace feature flags. Each sub-block is opt-in; absent sub-blocks
+take their type-default behaviour. Invalid value types (non-bool where
+a bool is expected, non-string where a string is expected) cause
+config-load to fail-fast with an error naming the offending field.
+
+### `features.brownfield` {#featuresbrownfield}
+
+Config for the `brownfield` chatops verb (a23). The verb drafts an
+initial canonical spec for one named capability that already exists in
+the repository. See [`CHATOPS.md → brownfield`](CHATOPS.md#drafting-a-spec-for-existing-behavior-brownfield)
+for the verb syntax, refusal cases, AND lifecycle-thread behavior, AND
+[`OPERATIONS.md → onboarding existing projects`](OPERATIONS.md#onboarding-existing-projects)
+for the recommended cadence.
+
+```yaml
+features:
+  brownfield:
+    enabled: true             # default true; set false to refuse the verb at parse time
+    prompt_path: null         # default null; relative path to a custom brownfield-draft prompt
+```
+
+| Field          | Type             | Default | Description                                                                                                                                                                                                                                                                                                                       |
+|----------------|------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`      | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> brownfield ...` at parse time with `✗ brownfield: disabled in this workspace's config (features.brownfield.enabled=false).`. No state file is written.                                                                                                       |
+| `prompt_path`  | `Option<String>` | `None`  | Workspace-relative path to a custom brownfield-draft prompt template. When set AND the file exists at run time, the polling handler uses it instead of the embedded `prompts/brownfield-draft.md` template. When set BUT the file is missing OR unreadable, the handler logs a WARN naming the path AND falls back to the embedded default. |
+
+**Default behaviour.** Omitting the `features.brownfield` block (or omitting the entire `features:` parent block) is equivalent to `enabled: true` AND `prompt_path: null`. The verb works out of the box on a fresh install.
+
+**Forward-compatibility note.** The per-workspace prompt override knob's location is provisional. When the broader per-workspace-prompt schema lands (covering implementer, audit-triage, changelog-stylist, brownfield-draft, etc. under a unified shape), brownfield's override SHALL conform to it; the current `features.brownfield.prompt_path` MAY be relocated at that time. Operators using the override should expect a migration step in the corresponding release notes.
+

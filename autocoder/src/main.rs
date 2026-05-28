@@ -26,6 +26,7 @@ mod migration;
 mod openspec_archive;
 mod paths;
 mod perma_stuck;
+mod polling;
 mod polling_loop;
 mod preflight;
 mod proposal_requests;
@@ -33,6 +34,7 @@ mod queue;
 mod recovery_classification;
 mod revisions;
 mod spec_revision;
+mod state;
 #[cfg(test)]
 mod testing;
 mod workspace;

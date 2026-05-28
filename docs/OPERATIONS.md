@@ -723,3 +723,24 @@ suggested operator action; `journalctl -u autocoder | grep migration`
 surfaces every line.
 
 ---
+
+## Onboarding existing projects {#onboarding-existing-projects}
+
+autocoder's spec-driven workflow assumes `openspec/specs/<capability>/spec.md` already exists for every capability the operator wants to evolve. When you onboard a repository that predates spec-driven development — or you're working in an OSS-contribution workspace where specs live in a sibling repo separate from the upstream project — you start with no canonical specs at all. The `brownfield` chatops verb is the first step.
+
+**Brownfield-drafting as the entry point.** `@<bot> brownfield <repo> <capability-name> [optional guidance]` queues a brownfield-draft run for the named capability. The polling iteration reads the codebase, drafts a `openspec/changes/brownfield-<capability-name>/` change that captures **existing** behavior (no code modifications), AND opens a spec-only PR. Operators review the PR like any other autocoder-opened PR, iterate via `@<bot> revise <text>` until the spec matches reality, AND merge. After merge, `openspec/specs/<capability-name>/spec.md` is canonical AND `brownfield` will refuse to overwrite it on subsequent invocations. See [CHATOPS.md → `brownfield`](CHATOPS.md#drafting-a-spec-for-existing-behavior-brownfield) for the verb syntax, refusal cases, AND lifecycle-thread behavior.
+
+**`brownfield` vs `propose`.** The two verbs cover the full lifecycle of bringing an existing project under spec-driven development:
+
+- `brownfield` — **one-shot per capability**. Documents existing behavior. Produces a spec-only PR. Use it when the capability has no canonical spec yet.
+- `propose` — **per-change**. Implements new behavior or modifies existing behavior. Produces a fixes PR (and optionally a spec PR for the corresponding spec delta). Use it for every change after the capability's canonical spec exists.
+
+`brownfield` refuses with a pointer to `propose` when the canonical spec already exists in the workspace, so the boundary is enforced at the verb level.
+
+**Recommended cadence.** Run one brownfield per capability. Review the resulting PR, merge (or iterate via `revise` first), THEN move on to the next capability. Running multiple brownfields concurrently against the same repo works (the polling iteration drains them one per pass), but it tends to flood reviewers with overlapping context — the human review step is what makes the spec accurate, AND parallel reviews scale poorly. The polling iteration deliberately drains AT MOST one brownfield per pass to keep the iteration cost predictable.
+
+**Capability granularity.** The capability name is the operator's call. Reasonable slices include: `scheduler`, `auth`, `chatops-manager`, `executor`, `audits-framework`. Avoid slices that are too broad ("the whole CLI" — most projects can't slot that into one cohesive set of requirements) OR too narrow (one helper function — the spec layer is the wrong granularity for a single utility). When the LLM can't reconcile your slug with one cohesive slice of the codebase, the resulting proposal's "Why" section surfaces the ambiguity AND draft a best-effort spec — `revise` from there until the boundary makes sense.
+
+**OSS-fork mode.** When `openspec/` lives in a sibling repo separate from the upstream project (the "specs-only fork" pattern), brownfield is the bootstrap step that produces the initial canonical-spec set the rest of autocoder's machinery reads from. After every capability's canonical spec is in place, `propose` handles the ongoing work the same way it would for a green-field project.
+
+---

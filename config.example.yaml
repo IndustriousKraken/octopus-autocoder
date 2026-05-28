@@ -466,3 +466,22 @@ github:
 #   cache_dir: /var/cache/autocoder
 #   logs_dir: /var/log/autocoder
 #   runtime_dir: /run/autocoder
+
+# Per-workspace feature flags (a23 + future). Each sub-block is opt-in;
+# absent sub-blocks take their type-default behaviour. Omit the entire
+# `features:` block to take every default.
+#
+# features:
+#   brownfield:
+#     # When `false`, the chatops dispatcher refuses `@<bot> brownfield ...`
+#     # at parse time with the documented "disabled in this workspace's
+#     # config" message. Default: true.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom brownfield-draft prompt
+#     # template. When set AND the file exists at run time, the polling
+#     # handler uses it instead of the embedded `prompts/brownfield-draft.md`
+#     # template. When set BUT the file is missing OR unreadable, the
+#     # handler logs a WARN naming the path AND falls back to the
+#     # embedded default. Default: null (use embedded).
+#     # prompt_path: ./prompts/brownfield-custom.md

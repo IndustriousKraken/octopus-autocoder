@@ -474,6 +474,7 @@ mod tests {
             chatops: None,
             audits: None,
             paths,
+            features: crate::config::FeaturesConfig::default(),
         }
     }
 

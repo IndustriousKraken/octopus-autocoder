@@ -94,6 +94,28 @@ pub struct ChangelogRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight chat-driven brownfield-request awaiting the
+/// brownfield-draft executor pass. The chatops dispatcher's
+/// `brownfield` verb appends to
+/// `RepoTaskHandle::pending_brownfield_requests`; the polling loop
+/// drains it (one request per iteration) after the proposal and
+/// changelog drains AND before the standard change-processing pass.
+/// The full `BrownfieldRequestState` lives on disk at
+/// `<workspace>/.state/brownfield_requests/<request_id>.json`; this
+/// in-memory shape carries only what the polling loop needs.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BrownfieldRequest {
+    pub request_id: String,
+    pub repo_url: String,
+    pub capability_name: String,
+    pub guidance: Option<String>,
+    pub channel: String,
+    /// Bot's ack-message ts; the request's lifecycle thread.
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -141,6 +163,16 @@ pub struct RepoTaskHandle {
     /// pending-change walk. Each entry keys into the on-disk
     /// `ChangelogRequestState` file via `request_id`.
     pub pending_changelog_requests: Arc<Mutex<Vec<ChangelogRequest>>>,
+    /// Queue of chat-driven brownfield requests awaiting the
+    /// brownfield-draft executor pass (`@<bot> brownfield`). The
+    /// chatops dispatcher's `brownfield` verb pushes here via the
+    /// `queue_brownfield_request` control-socket action; the polling
+    /// loop drains at most ONE entry per iteration AFTER the
+    /// proposal/changelog drains AND BEFORE the standard change-
+    /// processing pass. Each entry keys into the on-disk
+    /// `BrownfieldRequestState` file via `request_id`.
+    pub pending_brownfield_requests:
+        Arc<Mutex<std::collections::VecDeque<BrownfieldRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -359,6 +391,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_audit" => handle_queue_audit(&parsed, state),
         "queue_proposal_request" => handle_queue_proposal_request(&parsed, state),
         "queue_changelog_request" => handle_queue_changelog_request(&parsed, state),
+        "queue_brownfield_request" => handle_queue_brownfield_request(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -1438,6 +1471,85 @@ fn handle_queue_changelog_request(parsed: &Value, state: &ControlState) -> Value
     })
 }
 
+/// Queue a chat-driven brownfield request for the repo's next polling
+/// iteration. The request was already persisted by the chatops
+/// dispatcher to `<workspace>/.state/brownfield_requests/<request_id>.json`
+/// AND the spec-existence preflight is the dispatcher's job — this
+/// handler just loads the per-workspace state file and pushes a
+/// `BrownfieldRequest` onto the handle's `pending_brownfield_requests`
+/// queue.
+fn handle_queue_brownfield_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = crate::workspace::resolve_path(&repo);
+    let brownfield_state = match crate::state::brownfield_request::read_state(
+        &workspace,
+        &request_id,
+    ) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no brownfield-request state file found for request_id `{request_id}` under workspace `{}`",
+                    workspace.display()
+                ),
+            });
+        }
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("reading brownfield-request state: {e:#}"),
+            });
+        }
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_brownfield_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push_back(BrownfieldRequest {
+                request_id: brownfield_state.request_id.clone(),
+                repo_url: brownfield_state.repo_url.clone(),
+                capability_name: brownfield_state.capability_name.clone(),
+                guidance: brownfield_state.guidance.clone(),
+                channel: brownfield_state.channel.clone(),
+                thread_ts: brownfield_state.thread_ts.clone(),
+                submitted_at: brownfield_state.submitted_at,
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1785,6 +1897,8 @@ mod tests {
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
+                    pending_brownfield_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -3005,6 +3119,8 @@ github:
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
+                    pending_brownfield_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
