@@ -1,6 +1,8 @@
-//! Periodic-audit scheduler. Invoked per polling iteration AFTER
-//! `recreate_branch` AND BEFORE `list_pending`, so an audit that writes
-//! new OpenSpec changes feeds the same iteration's queue walk.
+//! Periodic-audit scheduler. Invoked per polling iteration AFTER the
+//! pending queue walk completes AND BEFORE the push+PR step. An audit
+//! that writes new OpenSpec changes does NOT feed this iteration's
+//! queue walk (it already completed); the new pending changes are
+//! picked up by the NEXT iteration's `list_pending`.
 //!
 //! Algorithm per audit:
 //!   1. Resolve effective cadence. `Disabled` → skip.
@@ -498,7 +500,7 @@ async fn drive_one_audit(
                 audit_type,
                 count = names.len(),
                 retries_used = *retries_used,
-                "audit wrote {} new spec(s){}; they will be picked up by this iteration's list_pending: {}",
+                "audit wrote {} new spec(s){}; they will be picked up by the NEXT iteration's list_pending: {}",
                 names.len(),
                 retry_clause,
                 names.join(", "),
