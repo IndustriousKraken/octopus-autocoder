@@ -130,7 +130,7 @@ The ack message's `ts` becomes the proposal-request's lifecycle thread. Subseque
 
 ### Acting on audit findings: `send it`
 
-When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
+When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭`/`📚` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
 
 ```
 @<bot> send it       (posted as a reply inside the audit thread)
@@ -527,12 +527,13 @@ The pure-data `architecture_brightline` audit does NOT fire this notification (i
 
 If the chatops backend is unconfigured OR `post_notification` errors when this notification is posted, the failure is logged at WARN and the audit's success outcome (proposal commit, queue insertion) is unaffected.
 
-### Audit-finding threaded notifications (`📐` / `🧭` / `📋` / `✅`)
+### Audit-finding threaded notifications (`📐` / `🧭` / `📚` / `📋` / `✅`)
 
-Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
+Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
 
 - `📐 architecture_brightline on <repo-url>: <N> file(s) over line threshold; <M> duplicate signature(s)`
 - `🧭 drift_audit on <repo-url>: <N> spec/code divergence(s) detected`
+- `📚 documentation_audit on <repo-url>: <N> finding(s)` — documentation coverage / stale-reference / organization findings. The thread body groups findings by category (`Coverage` / `Stale references` / `Organization`); each finding renders as `- <severity> at <anchor>: <body>`.
 - `📋 <audit-type> on <repo-url>: <N> finding(s)` — generic fallback for any other `Reported`-outcome audit.
 - `✅ <audit-type> on <repo-url>: no findings` — uniform shape for clean runs under `notify_on_clean=true`.
 

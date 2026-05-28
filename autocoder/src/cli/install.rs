@@ -70,6 +70,7 @@ pub struct InstallArgs {
             "audit_drift_audit",
             "audit_missing_tests_audit",
             "audit_security_bug_audit",
+            "audit_documentation_audit",
         ]
     )]
     pub reconfigure: Option<ReconfigureSection>,
@@ -97,7 +98,7 @@ pub struct InstallArgs {
     // ---------- audits ----------
     /// Master switch for the LLM-driven audits (architecture_brightline,
     /// architecture_consultative, drift_audit, missing_tests_audit,
-    /// security_bug_audit). Default `none`.
+    /// security_bug_audit, documentation_audit). Default `none`.
     #[arg(long, value_enum)]
     pub audits_llm_driven: Option<LlmDrivenAuditsArg>,
 
@@ -114,6 +115,8 @@ pub struct InstallArgs {
     pub audit_missing_tests_audit: Option<AuditCadenceArg>,
     #[arg(long, value_enum)]
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
+    #[arg(long, value_enum)]
+    pub audit_documentation_audit: Option<AuditCadenceArg>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -207,6 +210,7 @@ pub const LLM_DRIVEN_SLUGS: &[(&str, Cadence)] = &[
     ("missing_tests_audit", Cadence::Monthly),
     ("security_bug_audit", Cadence::Weekly),
     ("architecture_consultative", Cadence::Monthly),
+    ("documentation_audit", Cadence::Monthly),
 ];
 
 /// One-line operator-facing description per known audit slug. Mirrors each
@@ -221,6 +225,9 @@ fn audit_description(slug: &str) -> &'static str {
         "drift_audit" => "spec ↔ code drift detection (warns when reality outgrows the spec)",
         "missing_tests_audit" => "proposes test coverage for untested branches",
         "security_bug_audit" => "proposes fixes for likely security bugs",
+        "documentation_audit" => {
+            "documentation coverage / stale-reference / organization audit (LLM-driven)"
+        }
         _ => "",
     }
 }
@@ -256,6 +263,7 @@ pub struct WizardPrefill {
     pub audit_drift_audit: Option<AuditCadenceArg>,
     pub audit_missing_tests_audit: Option<AuditCadenceArg>,
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
+    pub audit_documentation_audit: Option<AuditCadenceArg>,
 }
 
 /// Final wizard output: everything the operator confirmed or accepted as
@@ -1430,6 +1438,7 @@ pub(crate) async fn execute_inner(
         reviewer_provider: args.reviewer_provider,
         reviewer_model: args.reviewer_model.clone(),
         audits_llm_driven: args.audits_llm_driven,
+        audit_documentation_audit: args.audit_documentation_audit,
         audit_architecture_brightline: args.audit_architecture_brightline,
         audit_architecture_consultative: args.audit_architecture_consultative,
         audit_drift_audit: args.audit_drift_audit,
@@ -1682,6 +1691,7 @@ fn lookup_per_audit_override(p: &WizardPrefill, slug: &str) -> Option<AuditCaden
         "drift_audit" => p.audit_drift_audit,
         "missing_tests_audit" => p.audit_missing_tests_audit,
         "security_bug_audit" => p.audit_security_bug_audit,
+        "documentation_audit" => p.audit_documentation_audit,
         _ => None,
     }
 }
@@ -2506,7 +2516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wizard_audits_fast_path_enables_all_five() {
+    async fn wizard_audits_fast_path_enables_all_llm_driven() {
         let mut answers = baseline_wizard_answers();
         // LLM gate yes, fast-path default Y.
         answers.push("y"); // LLM gate
@@ -2525,7 +2535,11 @@ mod tests {
         }
         let cfg = assemble_config(&ans).unwrap();
         let audits = cfg.audits.as_ref().expect("audits block present");
-        assert_eq!(audits.defaults.len(), 5, "all five audits must be present");
+        assert_eq!(
+            audits.defaults.len(),
+            LLM_DRIVEN_SLUGS.len(),
+            "every LLM-driven audit slug must be present"
+        );
     }
 
     #[tokio::test]
@@ -2537,6 +2551,7 @@ mod tests {
         //   missing_tests_audit: weekly
         //   security_bug_audit: never
         //   architecture_consultative: daily
+        //   documentation_audit: monthly
         answers.push("y");
         answers.push("n");
         answers.push("d"); // architecture_brightline
@@ -2544,6 +2559,7 @@ mod tests {
         answers.push("w"); // missing_tests_audit
         answers.push("n"); // security_bug_audit (never)
         answers.push("d"); // architecture_consultative
+        answers.push("m"); // documentation_audit
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
@@ -2557,6 +2573,7 @@ mod tests {
             ans.audits.get("architecture_consultative"),
             Some(&Cadence::Daily)
         );
+        assert_eq!(ans.audits.get("documentation_audit"), Some(&Cadence::Monthly));
     }
 
     fn ni_args_audits(tmp: &TempDir) -> InstallArgs {
@@ -3203,14 +3220,15 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         let raw = fixture_install_yaml();
         let existing: Config = serde_yml::from_str(&raw).unwrap();
         // LLM_DRIVEN_SLUGS order is: architecture_brightline, drift_audit,
-        // missing_tests_audit, security_bug_audit, architecture_consultative.
-        // The wizard re-prompts each one in turn — answers in that order.
+        // missing_tests_audit, security_bug_audit, architecture_consultative,
+        // documentation_audit. The wizard re-prompts each in order.
         let mut io = ScriptedIo::new(vec![
             "w", // architecture_brightline -> weekly
             "m", // drift_audit -> monthly (was weekly)
             "n", // missing_tests_audit -> never (drop)
             "d", // security_bug_audit -> daily
             "",  // architecture_consultative -> default (existing = disabled)
+            "m", // documentation_audit -> monthly
         ]);
         let new_cfg = reconfigure_audits(&existing, &mut io).await.unwrap();
         let defaults = new_cfg
@@ -3224,13 +3242,14 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         assert!(!defaults.contains_key("missing_tests_audit"));
         assert_eq!(defaults.get("security_bug_audit"), Some(&Cadence::Daily));
         assert!(!defaults.contains_key("architecture_consultative"));
+        assert_eq!(defaults.get("documentation_audit"), Some(&Cadence::Monthly));
     }
 
     #[tokio::test]
     async fn reconfigure_audits_all_never_drops_block() {
         let raw = fixture_install_yaml();
         let existing: Config = serde_yml::from_str(&raw).unwrap();
-        let mut io = ScriptedIo::new(vec!["n", "n", "n", "n", "n"]);
+        let mut io = ScriptedIo::new(vec!["n", "n", "n", "n", "n", "n"]);
         let new_cfg = reconfigure_audits(&existing, &mut io).await.unwrap();
         assert!(new_cfg.audits.is_none(), "no audits enabled → block omitted");
     }
@@ -3423,6 +3442,7 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
             "n", // missing_tests_audit
             "d", // security_bug_audit
             "",  // architecture_consultative
+            "m", // documentation_audit
         ]);
         let actions = RecordingActions::new();
         let args = dev_reconfigure_args(&tmp, ReconfigureSection::Audits);
@@ -3517,6 +3537,7 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
             "n", // missing_tests_audit
             "d", // security_bug_audit
             "",  // architecture_consultative
+            "m", // documentation_audit
         ]);
         let args = InstallArgs {
             mode: Some(InstallMode::Server),

@@ -9,6 +9,7 @@ use crate::audits::{
     AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    documentation_audit::DocumentationAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
@@ -146,6 +147,10 @@ async fn run_standalone(workspace: &Path, audit_name: &str) -> Result<()> {
         &executor_cfg,
     )));
     registry.register(std::sync::Arc::new(ArchitectureConsultativeAudit::new(
+        &audit_settings,
+        &executor_cfg,
+    )));
+    registry.register(std::sync::Arc::new(DocumentationAudit::new(
         &audit_settings,
         &executor_cfg,
     )));

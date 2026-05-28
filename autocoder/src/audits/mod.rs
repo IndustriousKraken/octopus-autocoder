@@ -19,6 +19,7 @@
 
 pub mod architecture_consultative;
 pub mod brightline;
+pub mod documentation_audit;
 pub mod drift;
 pub mod missing_tests;
 pub mod scheduler;
@@ -1046,6 +1047,8 @@ pub fn format_audit_notification(
         format_audit_top_line(audit_type, repo_url, findings, notify_on_clean);
     let mut thread_body = if findings.is_empty() {
         String::new()
+    } else if audit_type == documentation_audit::DocumentationAudit::TYPE {
+        format_documentation_audit_thread_body(findings)
     } else {
         format_audit_thread_body(findings)
     };
@@ -1110,6 +1113,12 @@ fn format_audit_top_line(
                 n = findings.len()
             )
         }
+        "documentation_audit" => {
+            format!(
+                "📚 documentation_audit on {repo_url}: {n} finding(s)",
+                n = findings.len()
+            )
+        }
         _ => {
             format!(
                 "📋 {audit_type} on {repo_url}: {n} finding(s)",
@@ -1166,6 +1175,67 @@ fn format_audit_thread_body(findings: &[Finding]) -> String {
         }
     }
     out
+}
+
+/// Render the `documentation_audit` thread body. Groups findings by
+/// category (Coverage / Stale references / Organization). Each finding
+/// renders as `- <severity> at <anchor>: <body>`. Categories with no
+/// findings are omitted. The grouping consults the finding's `subject`,
+/// which the audit's parser sets to the category slug.
+fn format_documentation_audit_thread_body(findings: &[Finding]) -> String {
+    let coverage: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.subject == documentation_audit::COVERAGE_SUBJECT)
+        .collect();
+    let stale: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.subject == documentation_audit::STALE_REFERENCE_SUBJECT)
+        .collect();
+    let organization: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.subject == documentation_audit::ORGANIZATION_SUBJECT)
+        .collect();
+
+    let mut out = String::new();
+    let mut first_group = true;
+    for (label, group) in [
+        ("Coverage", &coverage),
+        ("Stale references", &stale),
+        ("Organization", &organization),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        if !first_group {
+            out.push('\n');
+        }
+        out.push_str(label);
+        out.push('\n');
+        for f in group.iter() {
+            out.push_str("- ");
+            out.push_str(severity_label(f.severity));
+            out.push_str(" at ");
+            out.push_str(f.anchor.as_deref().unwrap_or("<no-anchor>"));
+            out.push_str(": ");
+            out.push_str(&f.body);
+            out.push('\n');
+        }
+        first_group = false;
+    }
+    // Trim trailing newline so the threading-threshold check counts
+    // lines the way operators see them.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn severity_label(s: Severity) -> &'static str {
+    match s {
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+    }
 }
 
 /// Deterministic id used in the truncation pointer. Shape:
@@ -2234,6 +2304,176 @@ mod tests {
             id,
             "git_github.com_o_r.git:drift_audit:2026-05-26T15:30:45Z"
         );
+    }
+
+    // ====================================================================
+    // documentation_audit notification tests (📚)
+    // ====================================================================
+
+    fn doc_finding(category_subject: &str, severity: Severity, anchor: &str, body: &str) -> Finding {
+        Finding {
+            severity,
+            subject: category_subject.to_string(),
+            body: body.to_string(),
+            anchor: Some(anchor.to_string()),
+        }
+    }
+
+    #[test]
+    fn format_audit_notification_documentation_top_line_uses_books_emoji() {
+        let findings = vec![doc_finding(
+            documentation_audit::COVERAGE_SUBJECT,
+            Severity::Medium,
+            "docs/CHATOPS.md",
+            "verb `propose` documented in spec but not in CHATOPS.md",
+        )];
+        let n = format_audit_notification(
+            "documentation_audit",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.starts_with("📚 documentation_audit on git@github.com:o/r.git"),
+            "top_line must start with the 📚 emoji + repo: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 finding(s)"),
+            "top_line must include the finding count: {}",
+            n.top_line
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_documentation_thread_groups_by_category() {
+        let findings = vec![
+            doc_finding(
+                documentation_audit::COVERAGE_SUBJECT,
+                Severity::Medium,
+                "docs/CHATOPS.md",
+                "verb propose missing",
+            ),
+            doc_finding(
+                documentation_audit::STALE_REFERENCE_SUBJECT,
+                Severity::Low,
+                "docs/CONFIG.md:42",
+                "dead config field foo_bar_quux",
+            ),
+            doc_finding(
+                documentation_audit::ORGANIZATION_SUBJECT,
+                Severity::Medium,
+                "README.md",
+                "README exceeds 200 lines without TOC",
+            ),
+            doc_finding(
+                documentation_audit::COVERAGE_SUBJECT,
+                Severity::Low,
+                "docs/CONFIG.md",
+                "config key audits.settings.foo.extra.bar not documented",
+            ),
+        ];
+        let n = format_audit_notification(
+            "documentation_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        // Coverage section appears before Stale references before Organization.
+        let cov_pos = n
+            .thread_body
+            .find("Coverage")
+            .expect("Coverage header present");
+        let stale_pos = n
+            .thread_body
+            .find("Stale references")
+            .expect("Stale references header present");
+        let org_pos = n
+            .thread_body
+            .find("Organization")
+            .expect("Organization header present");
+        assert!(cov_pos < stale_pos, "Coverage must precede Stale references");
+        assert!(
+            stale_pos < org_pos,
+            "Stale references must precede Organization"
+        );
+        // Per-finding format: `- <severity> at <anchor>: <body>`.
+        assert!(
+            n.thread_body.contains("- medium at docs/CHATOPS.md: verb propose missing"),
+            "thread body must use the `- <sev> at <anchor>: <body>` format: {}",
+            n.thread_body
+        );
+        assert!(
+            n.thread_body.contains("- low at docs/CONFIG.md:42: dead config field foo_bar_quux"),
+            "stale-reference finding: {}",
+            n.thread_body
+        );
+        assert!(
+            n.thread_body.contains("- medium at README.md: README exceeds 200 lines without TOC"),
+            "organization finding: {}",
+            n.thread_body
+        );
+        // Two coverage findings group together under one header.
+        let after_cov = &n.thread_body[cov_pos..stale_pos];
+        let cov_lines = after_cov
+            .lines()
+            .filter(|l| l.starts_with("- "))
+            .count();
+        assert_eq!(
+            cov_lines, 2,
+            "both coverage findings must appear under one Coverage group: {}",
+            after_cov
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_documentation_omits_empty_groups() {
+        // Only organization findings — Coverage and Stale references
+        // headers must NOT appear.
+        let findings = vec![doc_finding(
+            documentation_audit::ORGANIZATION_SUBJECT,
+            Severity::Low,
+            "docs/X.md",
+            "page too long",
+        )];
+        let n = format_audit_notification(
+            "documentation_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            !n.thread_body.contains("Coverage"),
+            "empty Coverage group must be omitted: {}",
+            n.thread_body
+        );
+        assert!(
+            !n.thread_body.contains("Stale references"),
+            "empty Stale references group must be omitted: {}",
+            n.thread_body
+        );
+        assert!(
+            n.thread_body.contains("Organization"),
+            "non-empty Organization group must appear: {}",
+            n.thread_body
+        );
+    }
+
+    #[test]
+    fn format_audit_notification_documentation_clean_run_uses_check_form() {
+        let n = format_audit_notification(
+            "documentation_audit",
+            "u",
+            &[],
+            true,
+            ts(),
+        );
+        assert_eq!(n.top_line, "✅ documentation_audit on u: no findings");
+        assert!(n.thread_body.is_empty());
+        assert!(!n.should_thread);
     }
 
     // ====================================================================

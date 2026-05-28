@@ -1487,6 +1487,7 @@ pub const KNOWN_AUDIT_TYPES: &[&str] = &[
     "missing_tests_audit",
     "security_bug_audit",
     "architecture_consultative",
+    "documentation_audit",
 ];
 
 /// Run every config validation check and return a structured report.
