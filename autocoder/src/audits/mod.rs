@@ -1,7 +1,8 @@
 //! Periodic-audit framework. Audits run on per-audit cadences AFTER the
-//! polling loop's `recreate_branch` step AND BEFORE `list_pending`, so an
-//! audit that writes new OpenSpec changes feeds the same iteration's
-//! queue walk.
+//! polling loop's pending queue walk completes AND BEFORE the push+PR
+//! step. An audit that writes new OpenSpec changes does NOT feed THIS
+//! iteration's queue walk (it already completed); the new pending
+//! changes are picked up by the NEXT iteration's `list_pending`.
 //!
 //! Structure:
 //! - [`Audit`] trait: each concrete audit implements `audit_type`,

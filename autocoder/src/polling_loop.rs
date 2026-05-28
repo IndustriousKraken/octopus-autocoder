@@ -1194,38 +1194,6 @@ pub async fn run_pass_through_commits(
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
-    // Periodic audits run AFTER recreate_branch (so the working tree is
-    // on a clean agent-q) AND BEFORE list_pending (so any specs a
-    // spec-writing audit creates are picked up by this same iteration's
-    // queue walk). Per design: audit failures inside the scheduler are
-    // logged and never abort the iteration.
-    //
-    // Iteration-level workspace-validity gate (see
-    // `audits-require-valid-workspace`): the audit scheduler is only
-    // reached when `ensure_initialized` returned Ok for this iteration.
-    // The early `return Err(e)` on init failure above is the gate: if
-    // the workspace can't be brought to a valid state at the start of
-    // the iteration, this site is unreachable and `run_due_audits` is
-    // never called, so audits cannot create broken-state side effects.
-    // (Per-audit gates in each `Audit::run` catch the rarer case where
-    // the workspace becomes invalid mid-iteration.)
-    if let Err(e) = run_due_audits(
-        audit_registry,
-        workspace,
-        repo,
-        audits_cfg,
-        audit_settings,
-        chatops_ctx,
-        queued_audit_types,
-    )
-    .await
-    {
-        tracing::error!(
-            url = %repo.url,
-            "audit scheduler errored (iteration continues): {e:#}"
-        );
-    }
-
     let pending_at_start = queue::list_pending(workspace)?;
     let waiting_at_start = queue::list_waiting(workspace)?;
     tracing::info!(
@@ -1263,7 +1231,10 @@ pub async fn run_pass_through_commits(
     }
 
     // Same-repo block: if any change is STILL waiting after the resume
-    // pass, skip the pending pass entirely for this iteration.
+    // pass, skip the pending pass entirely for this iteration. Audits
+    // still run after this gate — they are independent of queue state
+    // and the operator-visible block is on the queue walk, not on
+    // periodic maintenance.
     let still_waiting = queue::list_waiting(workspace)?;
     if !still_waiting.is_empty() {
         tracing::info!(
@@ -1273,6 +1244,16 @@ pub async fn run_pass_through_commits(
             still_waiting.len(),
             still_waiting.join(", ")
         );
+        run_due_audits_after_queue(
+            workspace,
+            repo,
+            audit_registry,
+            audits_cfg,
+            audit_settings,
+            chatops_ctx,
+            queued_audit_types,
+        )
+        .await;
         tracing::info!(
             url = %repo.url,
             committed = processed.len(),
@@ -1307,6 +1288,36 @@ pub async fn run_pass_through_commits(
         );
     }
 
+    // Periodic audits run AFTER the pending queue walk completes (was:
+    // before list_pending). The reorder prevents an "audit storm" — many
+    // audits becoming eligible at once after a HEAD change — from
+    // monopolizing the daemon and starving pending changes. The
+    // trade-off is that an audit's spec-writing outcome
+    // (`AuditOutcome::SpecsWritten`) lands its new pending change
+    // directories AFTER this iteration's queue walk has already finished;
+    // those changes wait for the NEXT iteration's `list_pending`. The
+    // audit's creation commit still ships in this iteration's PR.
+    //
+    // Iteration-level workspace-validity gate (see
+    // `audits-require-valid-workspace`): the audit scheduler is only
+    // reached when `ensure_initialized` returned Ok for this iteration.
+    // The early `return Err(e)` on init failure above is the gate: if
+    // the workspace can't be brought to a valid state at the start of
+    // the iteration, this site is unreachable and `run_due_audits` is
+    // never called, so audits cannot create broken-state side effects.
+    // (Per-audit gates in each `Audit::run` catch the rarer case where
+    // the workspace becomes invalid mid-iteration.)
+    run_due_audits_after_queue(
+        workspace,
+        repo,
+        audit_registry,
+        audits_cfg,
+        audit_settings,
+        chatops_ctx,
+        queued_audit_types,
+    )
+    .await;
+
     let waiting_after = queue::list_waiting(workspace)?.len();
     tracing::info!(
         url = %repo.url,
@@ -1315,6 +1326,36 @@ pub async fn run_pass_through_commits(
         "polling pass complete"
     );
     Ok((processed, includes_self_heal))
+}
+
+/// Invoke the periodic-audit scheduler at the post-queue-walk position.
+/// Audit failures inside the scheduler are logged and never abort the
+/// iteration — the caller continues to the push+PR step regardless.
+async fn run_due_audits_after_queue(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    audit_registry: &AuditRegistry,
+    audits_cfg: Option<&AuditsConfig>,
+    audit_settings: &HashMap<String, AuditSettings>,
+    chatops_ctx: Option<&ChatOpsContext>,
+    queued_audit_types: &std::collections::HashSet<String>,
+) {
+    if let Err(e) = run_due_audits(
+        audit_registry,
+        workspace,
+        repo,
+        audits_cfg,
+        audit_settings,
+        chatops_ctx,
+        queued_audit_types,
+    )
+    .await
+    {
+        tracing::error!(
+            url = %repo.url,
+            "audit scheduler errored (iteration continues): {e:#}"
+        );
+    }
 }
 
 /// Iterate over the workspace's `list_waiting` changes. For each:
@@ -11441,5 +11482,332 @@ mod tests {
             "test-token",
         )
         .await;
+    }
+
+    // ================================================================
+    // a12-changes-have-precedence-over-audits: iteration sequence puts
+    // pending queue walk BEFORE the audit phase. Tests in this section
+    // exercise the new ordering and the one-iteration delay for
+    // audit-generated changes' implementation.
+    // ================================================================
+
+    /// Executor that records the order of `run` invocations into a shared
+    /// log and writes a unique artifact per change so each invocation
+    /// produces a real commit. Lets ordering tests assert the order of
+    /// `executor:<change>` and `audit:<type>` entries.
+    struct OrderRecordingExecutor {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Executor for OrderRecordingExecutor {
+        async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("executor:{change}"));
+            // Produce a deterministic, change-scoped artifact so the
+            // commit step has a non-empty diff and the change archives.
+            let artifact_dir = workspace.join("openspec/changes").join(change);
+            std::fs::create_dir_all(&artifact_dir)?;
+            std::fs::write(
+                artifact_dir.join("IMPL_NOTES.md"),
+                format!("implementation for {change}\n"),
+            )?;
+            Ok(ExecutorOutcome::Completed { final_answer: None })
+        }
+        async fn resume(
+            &self,
+            _h: crate::executor::ResumeHandle,
+            _a: &str,
+        ) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    /// Test audit fixture used to assert iteration-ordering. Records each
+    /// invocation in a shared log under the slug `audit:<audit_type>` and
+    /// returns the configured outcome. When the outcome includes new
+    /// `openspec/changes/<name>/` directories, the audit commits them on
+    /// the agent branch so the post-hoc `OpenSpecOnly` enforcement passes.
+    struct OrderRecordingAudit {
+        audit_type: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        creates_changes: Vec<String>,
+        write_policy: crate::audits::WritePolicy,
+    }
+    #[async_trait::async_trait]
+    impl crate::audits::Audit for OrderRecordingAudit {
+        fn audit_type(&self) -> &'static str {
+            self.audit_type
+        }
+        fn description(&self) -> &'static str {
+            "ordering-test audit fixture"
+        }
+        fn requires_head_change(&self) -> bool {
+            false
+        }
+        fn write_policy(&self) -> crate::audits::WritePolicy {
+            self.write_policy
+        }
+        async fn run(
+            &self,
+            ctx: &mut crate::audits::AuditContext<'_>,
+        ) -> Result<crate::audits::AuditOutcome> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("audit:{}", self.audit_type));
+            if self.creates_changes.is_empty() {
+                return Ok(crate::audits::AuditOutcome::NoFindings);
+            }
+            // Create + commit each new openspec/changes/<name>/ directory
+            // so the post-hoc `OpenSpecOnly` enforcement sees a clean
+            // tree. This mirrors what real spec-writing audits do via
+            // the `specs_writing` helper.
+            for name in &self.creates_changes {
+                let dir = ctx.workspace.join("openspec/changes").join(name);
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(
+                    dir.join("proposal.md"),
+                    format!("## Why\nfixture proposal {name}\n"),
+                )?;
+                std::fs::write(dir.join("tasks.md"), "- [ ] do thing\n")?;
+            }
+            let st = std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(ctx.workspace)
+                .status()?;
+            anyhow::ensure!(st.success(), "git add failed in fixture audit");
+            let subject = format!(
+                "audit: {} proposals ({} change(s))",
+                self.audit_type,
+                self.creates_changes.len()
+            );
+            let st = std::process::Command::new("git")
+                .args(["commit", "-q", "-m", &subject])
+                .current_dir(ctx.workspace)
+                .status()?;
+            anyhow::ensure!(st.success(), "git commit failed in fixture audit");
+            Ok(crate::audits::AuditOutcome::specs_written(
+                self.creates_changes.clone(),
+            ))
+        }
+    }
+
+    /// 2.4 (a12): with 2 pending changes AND 1 eligible audit, pending
+    /// changes are processed FIRST, then the audit runs. Both phases
+    /// commit on agent-q so a single iteration's PR carries both.
+    ///
+    /// The audit is made eligible via the `queued_audit_types` set
+    /// (bypasses cadence) — equivalent for ordering purposes to a
+    /// cadence-driven eligible audit, and avoids constructing a full
+    /// `AuditsConfig` just to set a cadence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_changes_process_before_audits() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "change-one", "first pending");
+        add_committed_change(&ws, "change-two", "second pending");
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let executor = OrderRecordingExecutor { log: log.clone() };
+        let probe = OrderRecordingAudit {
+            audit_type: "ordering_probe_a",
+            log: log.clone(),
+            creates_changes: Vec::new(),
+            write_policy: crate::audits::WritePolicy::None,
+        };
+        let registry = crate::audits::AuditRegistry::with_audits(vec![
+            Arc::new(probe) as Arc<dyn crate::audits::Audit>,
+        ]);
+        let mut queued = std::collections::HashSet::new();
+        queued.insert("ordering_probe_a".to_string());
+
+        let test_github = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+            &registry,
+            None,
+            &std::collections::HashMap::new(),
+            &queued,
+        )
+        .await
+        .expect("pass succeeds");
+
+        assert_eq!(
+            processed.len(),
+            2,
+            "both pending changes must be processed"
+        );
+
+        let entries = log.lock().unwrap().clone();
+        // Both executor entries must precede the audit entry.
+        let audit_idx = entries
+            .iter()
+            .position(|e| e == "audit:ordering_probe_a")
+            .expect("audit must have run");
+        let exec_indices: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.starts_with("executor:").then_some(i))
+            .collect();
+        assert_eq!(exec_indices.len(), 2, "executor ran for both changes");
+        for i in &exec_indices {
+            assert!(
+                *i < audit_idx,
+                "executor invocations must precede the audit invocation; log was: {entries:?}"
+            );
+        }
+
+        // Both kinds of commits must be present on agent-q (change-one,
+        // change-two artifacts + their archive moves; archive landing
+        // means the queue is empty).
+        assert_eq!(
+            queue::list_pending(&ws).unwrap(),
+            Vec::<String>::new(),
+            "both pending changes must be archived this iteration"
+        );
+    }
+
+    /// 2.4 (a12): with 0 pending changes AND 1 eligible audit that
+    /// creates 2 new proposals, the audit's creation commit ships in
+    /// THIS iteration's PR but the 2 generated changes wait for the
+    /// NEXT iteration's `list_pending` (they appear as pending on disk
+    /// after the iteration but the executor was never invoked on them).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_generated_changes_wait_one_iteration_for_implementer() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // No pending changes at iteration start. The audit will create
+        // two openspec/changes/<name>/ directories below.
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let executor = OrderRecordingExecutor { log: log.clone() };
+        let probe = OrderRecordingAudit {
+            audit_type: "ordering_probe_b",
+            log: log.clone(),
+            creates_changes: vec![
+                "tests-generated-one".to_string(),
+                "tests-generated-two".to_string(),
+            ],
+            write_policy: crate::audits::WritePolicy::OpenSpecOnly,
+        };
+        let registry = crate::audits::AuditRegistry::with_audits(vec![
+            Arc::new(probe) as Arc<dyn crate::audits::Audit>,
+        ]);
+        let mut queued = std::collections::HashSet::new();
+        queued.insert("ordering_probe_b".to_string());
+
+        let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+        let test_github = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+            &registry,
+            None,
+            &std::collections::HashMap::new(),
+            &queued,
+        )
+        .await
+        .expect("pass succeeds");
+
+        assert!(
+            processed.is_empty(),
+            "no pending changes existed at iteration start; the implementer must not have run"
+        );
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(
+            entries,
+            vec!["audit:ordering_probe_b".to_string()],
+            "executor must not have been invoked on the audit's generated changes this iteration"
+        );
+
+        // Audit's creation commit must be on agent-q (the head moved
+        // past pre_main on the agent branch).
+        let agent_sha = crate::git::rev_parse(&ws, "agent-q").unwrap();
+        assert_ne!(
+            agent_sha, pre_main,
+            "audit's commit must land on agent-q so it ships in this iteration's PR"
+        );
+
+        // The two new proposals are on disk and now show up in
+        // list_pending — so the NEXT iteration's queue walk picks them
+        // up.
+        let mut pending = queue::list_pending(&ws).unwrap();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec![
+                "tests-generated-one".to_string(),
+                "tests-generated-two".to_string()
+            ],
+            "audit-generated proposals must be pending for the next iteration"
+        );
+    }
+
+    /// 2.4 (a12): with 1 pending change AND 0 eligible audits, only the
+    /// change processes; no audit work happens. (Sanity check that the
+    /// reorder did not accidentally couple the two phases.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_only_iteration_runs_no_audit_work() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "only-change", "solo pending");
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let executor = OrderRecordingExecutor { log: log.clone() };
+        // Empty registry: no audits to run, so the scheduler is a no-op.
+        let registry = crate::audits::AuditRegistry::default();
+
+        let test_github = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+            &registry,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("pass succeeds");
+
+        assert_eq!(processed, vec!["only-change".to_string()]);
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries, vec!["executor:only-change".to_string()]);
     }
 }

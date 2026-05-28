@@ -493,3 +493,30 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** the disposition table contains an entry for the swept-and-fixed pattern
 - **AND** a one-liner notes that operators with pre-spec dev machines can `rm -rf /tmp/autocoder/` to clean up stale test fixtures (the daemon never reads from there post-`a09`)
 
+### Requirement: CHATOPS.md status reply documentation enumerates the new `currently:` line variants
+`docs/CHATOPS.md`'s operator-recovery-commands section (where the `status` verb's reply shape is documented) SHALL include examples of every `currently:` line variant introduced by this spec AND explain the diagnostic value of each.
+
+#### Scenario: Reply-shape examples include every variant
+- **WHEN** an operator reads `docs/CHATOPS.md`'s `status` reply-shape examples
+- **THEN** at least one example each appears for: `idle`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `recovery in progress`, `stale marker from pid <pid> (... recovery eligible now)`, `stale marker from pid <pid> (... recovery in <duration>)`
+
+#### Scenario: Section explains the diagnostic value
+- **WHEN** an operator reads the section
+- **THEN** a paragraph explains that the `currently:` line distinguishes "audit in flight, just wait" from "stale marker, need recovery to fire (or manual `rm`)" from "truly idle"
+- **AND** the paragraph cross-links to `OPERATIONS.md`'s busy-marker section for the underlying classification logic
+- **AND** the paragraph cross-links to `TROUBLESHOOTING.md`'s stale-marker section for the immediate-fix-by-hand path
+
+### Requirement: OPERATIONS.md describes the new iteration ordering and the audit-to-implementation one-iteration delay
+`docs/OPERATIONS.md`'s `## Periodic audits` section SHALL be updated to reflect that audits run AFTER the pending change queue walk (not before, as the pre-spec text stated). The same section SHALL include a paragraph explaining the one-iteration delay for audit-generated changes' implementation AND why the trade-off is favorable.
+
+#### Scenario: OPERATIONS.md correctly names the new ordering
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s `## Periodic audits` section
+- **THEN** the "When audits fire" paragraph reads "audits run AFTER `list_pending`" (or equivalent), not "BEFORE `list_pending`"
+- **AND** the paragraph notes the motivation (preventing audit-storm monopolization when many audits become eligible at once)
+
+#### Scenario: OPERATIONS.md explains the audit-to-implementation delay
+- **WHEN** an operator reads the same section
+- **THEN** a paragraph describes the one-iteration delay: an audit running in iteration N creates proposals that the implementer picks up in iteration N+1
+- **AND** the paragraph explains the operator-visible effect: audit creation commits ship in one PR, audit-generated change implementations ship in a follow-up PR
+- **AND** the paragraph names the benefit: reviewers see proposal contents before implementation, and can `@<bot> revise <text>` the proposals before implementer runs in the next iteration
+
