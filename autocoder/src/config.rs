@@ -246,6 +246,57 @@ pub struct ExecutorConfig {
     /// (`timeout_secs + 600`) would have produced a longer value.
     #[serde(default)]
     pub busy_marker_stale_threshold_secs: Option<u64>,
+    /// Opt-in gate for the change-internal contradiction pre-flight (a19).
+    /// `Disabled` (the default) skips the LLM call entirely. `Enabled`
+    /// runs the check AFTER `a17`'s archivability check AND BEFORE the
+    /// executor; non-empty findings write `.needs-spec-revision.json`
+    /// and halt the queue walk. Enabling without configuring
+    /// `change_internal_contradiction_check_llm` is a fail-fast startup
+    /// error.
+    #[serde(default)]
+    pub change_internal_contradiction_check: ContradictionCheckMode,
+    /// Optional path to a custom contradiction-check prompt template.
+    /// When unset, the binary uses the template embedded at compile time
+    /// from `prompts/change-contradiction-check.md`. An empty override
+    /// file is rejected at use time so the daemon does not feed an
+    /// empty prompt to the LLM.
+    #[serde(default)]
+    pub change_internal_contradiction_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the contradiction check. Required when
+    /// `change_internal_contradiction_check` is `Enabled`. Held as a
+    /// distinct block from `reviewer:` so operators can pick a cheaper
+    /// model for the contradiction check (the prompt is small AND the
+    /// failure mode is fail-open).
+    #[serde(default)]
+    pub change_internal_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+}
+
+/// Opt-in gate for the change-internal contradiction pre-flight (a19).
+/// Default `Disabled` preserves pre-spec behaviour for operators who do
+/// not opt in.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContradictionCheckMode {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+/// LLM configuration block for the contradiction-check pre-flight.
+/// Parallel to `ReviewerConfig`'s API-key / provider / model surface but
+/// kept as its own type so the contradiction check can evolve
+/// independently (cheaper model, different failure mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContradictionCheckLlmConfig {
+    pub provider: ReviewerProvider,
+    pub model: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<SecretSource>,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1509,6 +1560,24 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some("executor/timeout_secs".into()),
         );
     }
+    // a19: opting into the contradiction check requires configuring the
+    // LLM block. Fail fast at startup so operators get the misconfig
+    // before the first polling iteration spends time on a pre-flight
+    // that would have errored at use time anyway.
+    if matches!(
+        config.executor.change_internal_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) && config
+        .executor
+        .change_internal_contradiction_check_llm
+        .is_none()
+    {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured",
+            Some("executor/change_internal_contradiction_check_llm".into()),
+        );
+    }
 }
 
 /// Token-route check: for each repo URL, derive owner and verify SOME
@@ -1743,6 +1812,40 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(cc_llm) = config
+        .executor
+        .change_internal_contradiction_check_llm
+        .as_ref()
+    {
+        let has_inline = cc_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = cc_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_internal_contradiction_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/change_internal_contradiction_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = cc_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_internal_contradiction_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/change_internal_contradiction_check_llm/api_key".into()),
+            );
+        }
+    }
     if let Some(chatops) = config.chatops.as_ref() {
         if let Some(slack) = chatops.slack.as_ref() {
             let bot_inline = slack
@@ -1945,6 +2048,9 @@ github:
             "output_format",
             "log_retention_days",
             "busy_marker_stale_threshold_secs",
+            "change_internal_contradiction_check",
+            "change_internal_contradiction_check_prompt_path",
+            "change_internal_contradiction_check_llm",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -2258,6 +2364,105 @@ github: {}
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.reviewer.is_none());
+    }
+
+    #[test]
+    fn contradiction_check_default_is_disabled() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("default config parses");
+        assert_eq!(
+            cfg.executor.change_internal_contradiction_check,
+            ContradictionCheckMode::Disabled
+        );
+        assert!(cfg
+            .executor
+            .change_internal_contradiction_check_prompt_path
+            .is_none());
+        assert!(cfg
+            .executor
+            .change_internal_contradiction_check_llm
+            .is_none());
+    }
+
+    #[test]
+    fn contradiction_check_enabled_without_llm_config_fails_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  change_internal_contradiction_check: enabled
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses even when llm is missing");
+        let report = validate_config(&cfg);
+        let msg = report
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains(
+                "executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured"
+            ),
+            "expected fail-fast error message; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn contradiction_check_enabled_with_llm_config_passes_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  change_internal_contradiction_check: enabled
+  change_internal_contradiction_check_llm:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    api_key:
+      value: sk-ant-inline
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let report = validate_config(&cfg);
+        assert!(
+            !report.errors.iter().any(|e| e
+                .message
+                .contains("change_internal_contradiction_check")),
+            "expected no contradiction-check validation error; got: {:#?}",
+            report.errors
+        );
+        let llm = cfg
+            .executor
+            .change_internal_contradiction_check_llm
+            .as_ref()
+            .expect("llm block present");
+        assert_eq!(llm.provider, ReviewerProvider::Anthropic);
+        assert_eq!(llm.model, "claude-haiku-4-5-20251001");
     }
 
     #[test]

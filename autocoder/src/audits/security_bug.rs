@@ -205,6 +205,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         }
     }
 

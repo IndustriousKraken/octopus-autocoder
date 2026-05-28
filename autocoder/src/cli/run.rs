@@ -12,8 +12,9 @@ use crate::audits::{
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{
-    AuditSettings, AuditsConfig, Config, ExecutorKind, GithubConfig, NotificationsConfig,
-    RepositoryConfig, clamp_max_audits_per_iteration, validate_audit_type_names,
+    AuditSettings, AuditsConfig, Config, ContradictionCheckMode, ExecutorKind, GithubConfig,
+    NotificationsConfig, RepositoryConfig, clamp_max_audits_per_iteration,
+    validate_audit_type_names,
 };
 use crate::control_socket::{
     self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
@@ -191,6 +192,51 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             ClaudeCliExecutor::from_config(&cfg.executor)
                 .context("initializing ClaudeCliExecutor from config")?,
         ),
+    };
+
+    // Build the change-internal contradiction pre-flight context
+    // (a19). Disabled by default → no LLM client built, no context
+    // produced; the polling loop short-circuits at the
+    // `change_contradiction::current()` read. Enabled-without-LLM-config
+    // already failed validation above, so an Enabled config here is
+    // guaranteed to carry an LLM block.
+    let contradiction_ctx: Option<
+        Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>,
+    > = if matches!(
+        cfg.executor.change_internal_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        let llm_cfg = cfg
+            .executor
+            .change_internal_contradiction_check_llm
+            .as_ref()
+            .expect("validate_config guarantees the llm block is set when enabled");
+        let llm: Arc<dyn crate::llm::LlmClient> = Arc::from(
+            crate::llm::build_from_contradiction_check_config(llm_cfg)
+                .context("building contradiction-check LLM client from config")?,
+        );
+        let prompt_template = crate::preflight::change_contradiction::load_prompt_template(
+            cfg.executor
+                .change_internal_contradiction_check_prompt_path
+                .as_deref(),
+        )
+        .context("loading change-contradiction-check prompt template")?;
+        tracing::info!(
+            provider = ?llm_cfg.provider,
+            model = llm_cfg.model.as_str(),
+            "change-internal contradiction pre-flight enabled (a19)"
+        );
+        Some(Arc::new(
+            crate::preflight::change_contradiction::ContradictionCheckCtx {
+                llm,
+                prompt_template,
+            },
+        ))
+    } else {
+        tracing::info!(
+            "change-internal contradiction pre-flight disabled (a19; opt-in via executor.change_internal_contradiction_check)"
+        );
+        None
     };
 
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
@@ -441,6 +487,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audit_registry: audit_registry.clone(),
         audits_cfg: audits_cfg_arc.clone(),
         audit_settings: audit_settings_arc.clone(),
+        contradiction_ctx: contradiction_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -655,6 +702,8 @@ struct SpawnDeps {
     audit_registry: Arc<AuditRegistry>,
     audits_cfg: Option<Arc<AuditsConfig>>,
     audit_settings: Arc<HashMap<String, AuditSettings>>,
+    contradiction_ctx:
+        Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -725,8 +774,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_cancel_for_task = iteration_cancel.clone();
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
+        let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
-            polling_loop::run(
+            let fut = polling_loop::run(
                 config_for_task,
                 executor_for_task,
                 github_for_task,
@@ -749,8 +799,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
-            )
-            .await;
+            );
+            crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut)
+                .await;
             {
                 let mut guard = map_for_task.lock().unwrap();
                 guard.remove(&url_for_task);
