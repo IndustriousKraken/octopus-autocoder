@@ -53,19 +53,21 @@ This is a stopgap until the reviewer is upgraded to an MCP-tool-using model that
 
 ## Prompt budget
 
-The reviewer's prompt-body cap is controlled by `reviewer.prompt_budget_chars` (default `2_000_000`). When the rendered prompt — change context + changed files + diff — would exceed this number of characters, files are skipped whole (in priority order) and the `## Skipped (budget exhausted): ...` footer is emitted.
+The reviewer's prompt-body cap is controlled by `reviewer.prompt_budget_chars` (default `2000000`). When the rendered prompt — change context + changed files + diff — would exceed this number of characters, files are skipped whole (in priority order) and the `## Skipped (budget exhausted): ...` footer is emitted.
 
 There is **no hard upper bound** enforced by the daemon. Operators are responsible for matching this value to their LLM provider's actual context window:
 
-- High-context providers (Grok-4, Claude Sonnet 4.6, etc., with 1M+ token windows) tolerate `4_000_000` chars or more — stop hitting truncation on bundled multi-change PRs touching large files.
-- Smaller-window providers (some self-hosted Ollama deployments, older Claude models) need a tighter cap to fit the provider's real limit. Setting `1_000_000` (or whatever maps to your provider's actual window at the model's chars-per-token rate) avoids API-side rejects.
+- High-context providers (Grok-4, Claude Sonnet 4.6, etc., with 1M+ token windows) tolerate `4000000` chars or more — stop hitting truncation on bundled multi-change PRs touching large files.
+- Smaller-window providers (some self-hosted Ollama deployments, older Claude models) need a tighter cap to fit the provider's real limit. Setting `1000000` (or whatever maps to your provider's actual window at the model's chars-per-token rate) avoids API-side rejects.
 - Setting too high a value relative to the model's window will cause the LLM to return an error at request time; autocoder does not pre-validate this. Match it to your provider.
+
+YAML integers do NOT accept underscore separators. Write the value as a plain decimal (`4000000`, not `4_000_000`); the latter parses as a string and autocoder rejects the config at load time.
 
 The field is hot-applicable via `autocoder reload` (it lives in the `reviewer:` block, which the existing reload path picks up). Restart-free.
 
 ```yaml
 reviewer:
-  prompt_budget_chars: 4_000_000   # default 2_000_000
+  prompt_budget_chars: 4000000   # default 2000000
 ```
 
 ## Per-change reviewer mode

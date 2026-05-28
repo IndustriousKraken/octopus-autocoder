@@ -262,13 +262,15 @@ github:
 #   # auto_revise_on_block: false
 #   #
 #   # Maximum size (in chars) of the rendered reviewer prompt body —
-#   # change context + changed files + diff combined. Default 2_000_000
+#   # change context + changed files + diff combined. Default 2000000
 #   # preserves historical behavior. No hard ceiling; the operator is
 #   # responsible for matching this to their LLM provider's context
-#   # window (Grok-4 / Claude Sonnet 4.6 fit 4_000_000+; tighter caps
+#   # window (Grok-4 / Claude Sonnet 4.6 fit 4000000+; tighter caps
 #   # suit smaller-window providers like older Ollama deployments).
+#   # YAML integers do NOT accept underscore separators — write plain
+#   # decimals (`4000000`, not `4_000_000`).
 #   # See `docs/CODE-REVIEW.md` § "Prompt budget".
-#   # prompt_budget_chars: 2_000_000
+#   # prompt_budget_chars: 2000000
 #   #
 #   # Reviewer dispatch mode. `bundled` (default) keeps today's single
 #   # reviewer call per PR. `per_change` dispatches one reviewer call

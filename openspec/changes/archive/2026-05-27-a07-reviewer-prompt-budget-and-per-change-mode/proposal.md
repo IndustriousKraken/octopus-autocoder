@@ -8,7 +8,7 @@ The escape hatch is per-change reviewer runs: one reviewer call per change in th
 
 ## What Changes
 
-**New config field `reviewer.prompt_budget_chars`** (`usize`, default `2_000_000`, max `unbounded` — there is no hard ceiling the daemon can enforce; the operator is responsible for matching it to the provider's actual context window). The existing prompt-truncation logic reads this value instead of the hard-coded constant. The default preserves today's behavior verbatim. The field is hot-applicable via `autocoder reload` (it's a `reviewer:` block field; the existing reviewer hot-reload path picks it up).
+**New config field `reviewer.prompt_budget_chars`** (`usize`, default `2000000`, max `unbounded` — there is no hard ceiling the daemon can enforce; the operator is responsible for matching it to the provider's actual context window). The existing prompt-truncation logic reads this value instead of the hard-coded constant. The default preserves today's behavior verbatim. The field is hot-applicable via `autocoder reload` (it's a `reviewer:` block field; the existing reviewer hot-reload path picks it up).
 
 **New config field `reviewer.mode`** (`enum { bundled, per_change }`, default `bundled`). The default `bundled` is today's behavior: one reviewer call per PR, prompt budget split across every touched file from every change in the PR. The `per_change` opt-in changes the reviewer's dispatch: one call per change in the PR, each prompt scoped to that change's diff + the files that change touched. Each per-change review posts as its own `## Code Review: <change-slug>` section in the PR body (instead of one combined `## Code Review` block).
 
@@ -54,7 +54,7 @@ The escape hatch is per-change reviewer runs: one reviewer call per change in th
   - `docs/CODE-REVIEW.md` — document both new fields with the use-case framing (bundled = default; per_change for operators who want one review per change; prompt_budget_chars for operators on high-context providers).
   - `docs/CONFIG.md` — add the two fields to the `reviewer:` table.
 - **Operator-visible behavior:**
-  - Operators on Grok / Sonnet 4.6 / etc. with large context windows set `reviewer.prompt_budget_chars: 4_000_000` (or whatever fits) and stop hitting truncation on bundled multi-change PRs.
+  - Operators on Grok / Sonnet 4.6 / etc. with large context windows set `reviewer.prompt_budget_chars: 4000000` (or whatever fits) and stop hitting truncation on bundled multi-change PRs.
   - Operators who want per-change review attention set `reviewer.mode: per_change`. Their PRs gain N `## Code Review: <change>` sections instead of one combined block. LLM cost rises ~N× (one call per change instead of one per PR).
   - Operators who change neither field see identical behavior to today.
 - **Breaking:** no. Both fields default to today's behavior. Existing configs deserialize unchanged.

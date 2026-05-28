@@ -4,7 +4,7 @@
 TBD - created by archiving change reviewer-integration. Update Purpose after archive.
 ## Requirements
 ### Requirement: AI-driven code-quality review
-The code-reviewer SHALL accept a structured `ReviewContext` containing the archived-change briefs, full contents of every file modified by the pass, and the unified diff, then send a rendered prompt to a configured LLM API and return a `ReviewReport { verdict, markdown }`. The review SHALL focus on code quality (security, error handling, naming, style, language idioms, obvious bugs) and SHALL NOT assess whether the diff correctly implements any spec — that is a separate verification concern handled in its own change. The reviewer's prompt-budget cap (the threshold past which touched-file context is truncated with a `## Skipped (budget exhausted): ...` footer) SHALL read from `reviewer.prompt_budget_chars` in `config.yaml`. The default value SHALL be `2_000_000` characters, preserving today's behavior verbatim for operators who do not set the field. There is no hard upper bound — the operator is responsible for matching the value to their LLM provider's actual context window.
+The code-reviewer SHALL accept a structured `ReviewContext` containing the archived-change briefs, full contents of every file modified by the pass, and the unified diff, then send a rendered prompt to a configured LLM API and return a `ReviewReport { verdict, markdown }`. The review SHALL focus on code quality (security, error handling, naming, style, language idioms, obvious bugs) and SHALL NOT assess whether the diff correctly implements any spec — that is a separate verification concern handled in its own change. The reviewer's prompt-budget cap (the threshold past which touched-file context is truncated with a `## Skipped (budget exhausted): ...` footer) SHALL read from `reviewer.prompt_budget_chars` in `config.yaml`. The default value SHALL be `2000000` characters, preserving today's behavior verbatim for operators who do not set the field. There is no hard upper bound — the operator is responsible for matching the value to their LLM provider's actual context window.
 
 #### Scenario: Successful review with parseable verdict (env-var key)
 - **WHEN** `code_reviewer.review(context)` is called AND the
@@ -82,7 +82,7 @@ The code-reviewer SHALL accept a structured `ReviewContext` containing the archi
 - **AND** the `## Skipped (budget exhausted): ...` footer fires for the skipped files
 
 #### Scenario: Higher cap permits more touched-file context
-- **WHEN** the operator sets `reviewer.prompt_budget_chars: 4_000_000`
+- **WHEN** the operator sets `reviewer.prompt_budget_chars: 4000000`
 - **AND** the reviewer is invoked against a pass whose touched-file content is 3,000,000 characters total
 - **THEN** the reviewer's prompt fits the full context (no truncation)
 - **AND** no `## Skipped (budget exhausted): ...` footer fires
