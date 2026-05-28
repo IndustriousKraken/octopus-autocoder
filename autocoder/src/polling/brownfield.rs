@@ -25,8 +25,10 @@ use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 
 /// Built-in default brownfield-draft prompt template, embedded at
-/// compile time. Operators override via `features.brownfield.prompt_path`
-/// (resolved by `resolve_brownfield_template` below).
+/// compile time. The uniform [`crate::prompts::PromptLoader`] holds
+/// the canonical reference now; this alias remains for the existing
+/// tests that compare against the embedded bytes directly.
+#[cfg(test)]
 pub(crate) const DEFAULT_BROWNFIELD_TEMPLATE: &str =
     include_str!("../../../prompts/brownfield-draft.md");
 
@@ -377,70 +379,39 @@ pub(crate) fn format_failed_message(reason: &str, request_id: &str) -> String {
     )
 }
 
-/// Resolve the brownfield-draft prompt template. When
-/// `features.brownfield.prompt_path` is configured AND the file exists
-/// at run time, that file's contents are used; otherwise the embedded
-/// default is returned. A configured path that does NOT exist produces
-/// a WARN log and falls back to embedded.
+/// Resolve the brownfield-draft prompt template via the uniform
+/// [`crate::prompts::PromptLoader`] (a24). The polling layer doesn't
+/// have direct access to the live `Config` holder on this codepath, so
+/// this helper passes `None` for the nested override AND relies on
+/// `resolve_brownfield_template_from_path` for explicit override
+/// plumbing. The embedded default is the only template returned here
+/// when production wiring has not threaded a config-driven path.
 fn resolve_brownfield_template(workspace: &Path) -> String {
-    // The polling layer doesn't have direct access to the Config holder
-    // in this codepath. To keep the per-workspace override semantics
-    // documented in the spec, we read the operator's config file via
-    // the same path the daemon does — but that requires plumbing the
-    // Config in. For now, look for a conventional file at
-    // `<workspace>/prompts/brownfield-custom.md` AS A FALLBACK; the
-    // primary override path (config-driven) is plumbed through
-    // [`resolve_brownfield_template_from_path`].
-    //
-    // Production wiring constructs the override path from the live
-    // config and threads it to this module via the polling-loop
-    // snapshot. Until that plumbing lands, the embedded default is the
-    // only template — operators wanting a custom prompt edit the
-    // embedded file in a fork.
-    let _ = workspace;
-    DEFAULT_BROWNFIELD_TEMPLATE.to_string()
+    use crate::prompts::{PromptId, PromptLoader};
+    PromptLoader::load(PromptId::BrownfieldDraft, None, None, Some(workspace))
 }
 
 /// Resolve the brownfield-draft template from an explicit override
-/// path. When `override_path` is `Some(path)`:
-///   - if the file exists AND is readable, its contents are returned;
-///   - if the file is missing OR unreadable, a WARN log fires AND the
-///     embedded default is returned.
+/// path via the uniform [`crate::prompts::PromptLoader`] (a24).
 ///
-/// When `override_path` is `None`, the embedded default is returned
-/// directly without any log.
+///   - `Some(path)` AND the file exists AND is non-empty → the file's
+///     contents are returned.
+///   - `Some(path)` AND the file is missing OR empty → a one-shot
+///     WARN names the offending path AND the embedded default is
+///     returned.
+///   - `None` → the embedded default is returned silently.
 #[allow(dead_code)]
 pub fn resolve_brownfield_template_from_path(
     workspace: &Path,
     override_path: Option<&Path>,
 ) -> String {
-    match override_path {
-        None => DEFAULT_BROWNFIELD_TEMPLATE.to_string(),
-        Some(rel) => {
-            let abs = if rel.is_absolute() {
-                rel.to_path_buf()
-            } else {
-                workspace.join(rel)
-            };
-            match std::fs::read_to_string(&abs) {
-                Ok(s) if !s.trim().is_empty() => s,
-                Ok(_) => {
-                    tracing::warn!(
-                        path = %abs.display(),
-                        "brownfield: configured prompt_path is empty; falling back to embedded default"
-                    );
-                    DEFAULT_BROWNFIELD_TEMPLATE.to_string()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %abs.display(),
-                        "brownfield: configured prompt_path could not be read ({e}); falling back to embedded default"
-                    );
-                    DEFAULT_BROWNFIELD_TEMPLATE.to_string()
-                }
-            }
-        }
-    }
+    use crate::prompts::{PromptId, PromptLoader};
+    PromptLoader::load(
+        PromptId::BrownfieldDraft,
+        override_path,
+        None,
+        Some(workspace),
+    )
 }
 
 /// Substitute the brownfield-draft context fields into the template's

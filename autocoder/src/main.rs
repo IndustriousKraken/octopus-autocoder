@@ -29,6 +29,7 @@ mod perma_stuck;
 mod polling;
 mod polling_loop;
 mod preflight;
+mod prompts;
 mod proposal_requests;
 mod queue;
 mod rag;

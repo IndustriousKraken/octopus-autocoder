@@ -12,7 +12,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,15 +23,12 @@ use super::{
     workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
+use crate::prompts::{PromptId, PromptLoader};
 
 /// Tools the drift agent may call. Excludes `Write` and `Edit` so the
 /// sandbox blocks workspace modifications outright; the audit-run log
 /// captures the agent's stdout for forensic review.
 const ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash"];
-
-/// Built-in default drift prompt, embedded at compile time so the
-/// binary runs without requiring `prompts/` on disk.
-const DEFAULT_DRIFT_PROMPT: &str = include_str!("../../../prompts/drift-audit.md");
 
 /// Maximum number of characters of stdout to embed in a parse-failure
 /// error message. The full stdout always lands in the audit-run log.
@@ -90,26 +87,19 @@ impl DriftAudit {
         self
     }
 
-    /// Resolve the drift prompt. When `settings.prompt_path` is set,
-    /// read the file (empty content errors so the daemon does not feed
-    /// an empty prompt to the wrapped CLI). Otherwise use the embedded
-    /// default.
-    fn resolve_prompt(&self) -> Result<String> {
-        match &self.settings.prompt_path {
-            Some(path) => {
-                let body = std::fs::read_to_string(path).with_context(|| {
-                    format!("reading drift-audit prompt override at {}", path.display())
-                })?;
-                if body.trim().is_empty() {
-                    return Err(anyhow!(
-                        "drift-audit prompt override at {} is empty",
-                        path.display()
-                    ));
-                }
-                Ok(body)
-            }
-            None => Ok(DEFAULT_DRIFT_PROMPT.to_string()),
-        }
+    /// Resolve the drift prompt via the uniform [`PromptLoader`]. The
+    /// `settings.prompt_path` field is the audit's per-workspace nested
+    /// override (`audits.settings.drift_audit.prompt_path`). When set
+    /// AND the file exists, that content wins; otherwise the embedded
+    /// default applies. A missing/empty override path produces a
+    /// one-shot WARN AND falls through to the embedded default.
+    fn resolve_prompt(&self, workspace: Option<&Path>) -> Result<String> {
+        Ok(PromptLoader::load(
+            PromptId::AuditDrift,
+            self.settings.prompt_path.as_deref(),
+            None,
+            workspace,
+        ))
     }
 }
 
@@ -139,7 +129,7 @@ impl Audit for DriftAudit {
             return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
         }
 
-        let prompt = self.resolve_prompt()?;
+        let prompt = self.resolve_prompt(Some(ctx.workspace))?;
 
         // Force the allowed_tools list per the spec; everything else
         // (deny patterns) comes from the executor's resolved sandbox so
@@ -471,6 +461,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         }
     }
 
@@ -633,13 +628,18 @@ mod tests {
     fn resolve_prompt_uses_embedded_default_when_unset() {
         let cfg = executor_cfg("/bin/true");
         let audit = DriftAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("default prompt resolves");
         assert!(prompt.contains("findings"), "expected default prompt body");
         assert!(prompt.contains("openspec/specs"), "expected default prompt body");
     }
 
+    /// Empty override files now fall back to the embedded default via
+    /// the uniform `PromptLoader` rather than producing a hard error
+    /// (a24). A one-shot WARN names the offending path.
     #[test]
-    fn resolve_prompt_errors_on_empty_override_file() {
+    fn resolve_prompt_falls_back_when_override_file_empty() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("empty.md");
         std::fs::write(&p, "   \n").unwrap();
@@ -654,8 +654,13 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = DriftAudit::new(&map, &cfg);
-        let err = audit.resolve_prompt().expect_err("empty override errors");
-        assert!(format!("{err:#}").contains("empty"));
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("empty override falls back");
+        assert!(
+            prompt.contains("findings"),
+            "fallback must use embedded default"
+        );
     }
 
     #[test]
@@ -674,7 +679,9 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = DriftAudit::new(&map, &cfg);
-        let prompt = audit.resolve_prompt().expect("override resolves");
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("override resolves");
         assert!(prompt.contains("CUSTOM DRIFT PROMPT SENTINEL"));
     }
 

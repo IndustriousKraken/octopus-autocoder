@@ -14,7 +14,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,14 +25,17 @@ use super::{
     workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
+use crate::prompts::{PromptId, PromptLoader};
 
 /// Tools the documentation agent may call. Excludes `Write` and `Edit`
 /// so the sandbox blocks workspace modifications outright; the audit-
 /// run log captures the agent's stdout for forensic review.
 const ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash"];
 
-/// Built-in default documentation prompt, embedded at compile time so
-/// the binary runs without requiring `prompts/` on disk.
+/// Embedded default prompt. The [`crate::prompts::PromptLoader`] also
+/// holds an identical reference; this local alias remains so the
+/// existing anti-prompt-drift tests can compare against the bytes.
+#[cfg(test)]
 const DEFAULT_PROMPT: &str =
     include_str!("../../../prompts/documentation-audit.md");
 
@@ -120,36 +123,24 @@ impl DocumentationAudit {
             .unwrap_or(DEFAULT_PAGE_MAX_LINES_WITHOUT_TOC)
     }
 
-    /// Resolve the documentation prompt. When `settings.prompt_path` is
-    /// set, read the file (empty content errors so the daemon does not
-    /// feed an empty prompt to the wrapped CLI). Otherwise use the
-    /// embedded default.
-    fn resolve_prompt(&self) -> Result<String> {
-        match &self.settings.prompt_path {
-            Some(path) => {
-                let body = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "reading documentation-audit prompt override at {}",
-                        path.display()
-                    )
-                })?;
-                if body.trim().is_empty() {
-                    return Err(anyhow!(
-                        "documentation-audit prompt override at {} is empty",
-                        path.display()
-                    ));
-                }
-                Ok(body)
-            }
-            None => Ok(DEFAULT_PROMPT.to_string()),
-        }
+    /// Resolve the documentation prompt via the uniform [`PromptLoader`].
+    /// `settings.prompt_path` is the audit's nested override
+    /// (`audits.settings.documentation_audit.prompt_path`); missing or
+    /// empty values fall through to the embedded default.
+    fn resolve_prompt(&self, workspace: Option<&Path>) -> Result<String> {
+        Ok(PromptLoader::load(
+            PromptId::AuditDocumentation,
+            self.settings.prompt_path.as_deref(),
+            None,
+            workspace,
+        ))
     }
 
     /// Build the full prompt: embedded template + an `extra` YAML block
     /// naming the operator's configured thresholds + a concatenation of
     /// every gathered input file headed by `## File: <path>`.
     fn build_prompt(&self, workspace: &std::path::Path) -> Result<String> {
-        let template = self.resolve_prompt()?;
+        let template = self.resolve_prompt(Some(workspace))?;
         let mut out = template;
         if !out.ends_with('\n') {
             out.push('\n');
@@ -626,6 +617,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         }
     }
 
@@ -834,7 +830,9 @@ mod tests {
     fn resolve_prompt_uses_embedded_default_when_unset() {
         let cfg = executor_cfg("/bin/true");
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("default prompt resolves");
         assert!(
             prompt.contains("documentation_audit_extra"),
             "default prompt must reference the extras YAML block"
@@ -844,8 +842,11 @@ mod tests {
         assert!(prompt.contains("organization"));
     }
 
+    /// Empty override files now fall back to the embedded default via
+    /// the uniform `PromptLoader` rather than producing a hard error
+    /// (a24). A one-shot WARN names the offending path.
     #[test]
-    fn resolve_prompt_errors_on_empty_override_file() {
+    fn resolve_prompt_falls_back_when_override_file_empty() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("empty.md");
         std::fs::write(&p, "   \n").unwrap();
@@ -860,8 +861,13 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = DocumentationAudit::new(&map, &cfg);
-        let err = audit.resolve_prompt().expect_err("empty override errors");
-        assert!(format!("{err:#}").contains("empty"));
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("empty override falls back");
+        assert!(
+            prompt.contains("documentation_audit_extra"),
+            "fallback must use embedded default"
+        );
     }
 
     #[test]
@@ -880,7 +886,9 @@ mod tests {
         );
         let cfg = executor_cfg("/bin/true");
         let audit = DocumentationAudit::new(&map, &cfg);
-        let prompt = audit.resolve_prompt().expect("override resolves");
+        let prompt = audit
+            .resolve_prompt(None)
+            .expect("override resolves");
         assert!(prompt.contains("CUSTOM DOC PROMPT SENTINEL"));
     }
 

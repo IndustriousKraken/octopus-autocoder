@@ -18,17 +18,14 @@
 //! `fix-` for bug fixes and `secure-` for security hardening so
 //! operators can recognize audit-produced changes at a glance.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
-
-/// Built-in default prompt, embedded at compile time so the binary
-/// runs without requiring `prompts/` on disk.
-const DEFAULT_PROMPT: &str = include_str!("../../../prompts/security-bug-audit.md");
+use crate::prompts::{PromptId, PromptLoader};
 
 /// Placeholder substituted into the prompt with the per-run cap.
 const MAX_PROPOSALS_PLACEHOLDER: &str = "{{MAX_PROPOSALS}}";
@@ -103,28 +100,16 @@ impl SecurityBugAudit {
         self
     }
 
-    /// Resolve the prompt (override or embedded default) and substitute
-    /// `{{MAX_PROPOSALS}}` with the configured cap so the agent knows
-    /// its budget for this run.
-    pub(crate) fn resolve_prompt(&self) -> Result<String> {
-        let raw = match &self.settings.prompt_path {
-            Some(path) => {
-                let body = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "reading security-bug-audit prompt override at {}",
-                        path.display()
-                    )
-                })?;
-                if body.trim().is_empty() {
-                    return Err(anyhow!(
-                        "security-bug-audit prompt override at {} is empty",
-                        path.display()
-                    ));
-                }
-                body
-            }
-            None => DEFAULT_PROMPT.to_string(),
-        };
+    /// Resolve the prompt via the uniform [`PromptLoader`] (a24) AND
+    /// substitute `{{MAX_PROPOSALS}}` with the configured cap so the
+    /// agent knows its budget for this run.
+    pub(crate) fn resolve_prompt(&self, workspace: Option<&Path>) -> Result<String> {
+        let raw = PromptLoader::load(
+            PromptId::AuditSecurityBug,
+            self.settings.prompt_path.as_deref(),
+            None,
+            workspace,
+        );
         Ok(raw.replace(
             MAX_PROPOSALS_PLACEHOLDER,
             &self.max_proposals_per_run.to_string(),
@@ -151,7 +136,7 @@ impl Audit for SecurityBugAudit {
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
-        let prompt = self.resolve_prompt()?;
+        let prompt = self.resolve_prompt(Some(ctx.workspace))?;
         let prompt_source = self
             .settings
             .prompt_path
@@ -209,6 +194,11 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
         }
     }
 
@@ -296,7 +286,7 @@ mod tests {
         let cfg = executor_cfg("/bin/true");
         let audit =
             SecurityBugAudit::new(&HashMap::new(), &cfg).with_max_proposals(4);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         assert!(
             !prompt.contains(MAX_PROPOSALS_PLACEHOLDER),
             "placeholder must be substituted: still found `{}`",
@@ -340,7 +330,7 @@ mod tests {
     fn low_confidence_finding_filtering_explicit_in_prompt() {
         let cfg = executor_cfg("/bin/true");
         let audit = SecurityBugAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt().expect("default prompt resolves");
+        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
         assert!(
             prompt.contains("Only emit a change for findings you are highly confident about"),
             "prompt must instruct high-confidence filter: {prompt}"

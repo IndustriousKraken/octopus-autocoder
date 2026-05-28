@@ -114,6 +114,65 @@ Both knobs are thresholds the LLM applies when emitting `category: organization`
 
 ---
 
+## Prompt overrides
+
+Every embedded prompt the daemon ships is loaded through a uniform
+`PromptLoader` that walks four precedence levels for each call:
+
+1. **Per-workspace nested override** — the modernized form, e.g.
+   `executor.implementer.prompt_path` OR
+   `audits.settings.drift_audit.prompt_path`. Paths are workspace-
+   relative when not absolute.
+2. **Per-workspace flat-legacy override** — the older suffix form,
+   e.g. `executor.implementer_prompt_path` OR
+   `reviewer.prompt_template_path`. Still accepted indefinitely for
+   backward compatibility.
+3. **Daemon-level flat-legacy override** — the same field treated as
+   the daemon-wide value when no per-workspace config layer overrides
+   it. In the current code there is one config file per daemon, so
+   levels 2 and 3 collapse to the same field; the loader still walks
+   both tiers so future per-workspace config layering can plug in
+   without changing call sites.
+4. **Embedded default** — the template compiled into the binary via
+   `include_str!("../../prompts/<name>.md")`.
+
+A configured override path that does NOT exist (OR points at an
+empty file) produces a **one-shot WARN** naming the
+`(PromptId, path)` pair on the first attempted load AND falls
+through to the next precedence level. Repeated loads of the same
+`(PromptId, path)` stay silent so reloads do NOT spam the log.
+
+**Prompt registry.** The table below lists every embedded prompt
+the daemon ships, its logical id, its embedded path, its per-
+workspace override field, AND the legacy daemon-level field where
+one exists. `—` (em-dash) marks prompts that had no operator
+override at all before the uniform loader landed.
+
+| Logical id                       | Embedded path                              | Per-workspace override field                                | Legacy daemon-level field                                  |
+|----------------------------------|--------------------------------------------|--------------------------------------------------------------|------------------------------------------------------------|
+| `Implementer`                    | `prompts/implementer.md`                   | `executor.implementer.prompt_path`                           | `executor.implementer_prompt_path`                         |
+| `ImplementerRevision`            | `prompts/implementer-revision.md`          | `executor.implementer_revision.prompt_path`                  | —                                                          |
+| `ChangelogStylist`               | `prompts/changelog-stylist.md`             | `executor.changelog_stylist.prompt_path`                     | `executor.changelog_stylist_prompt_path`                   |
+| `CodeReview`                     | `prompts/code-review-default.md`           | `reviewer.code_review.prompt_path`                           | `reviewer.prompt_template_path`                            |
+| `AuditTriage`                    | `prompts/audit-triage.md`                  | `executor.audit_triage.prompt_path`                          | —                                                          |
+| `ChatRequestTriage`              | `prompts/chat-request-triage.md`           | `executor.chat_request_triage.prompt_path`                   | —                                                          |
+| `AuditArchitectureConsultative`  | `prompts/architecture-consultative.md`     | `audits.settings.architecture_consultative.prompt_path`      | —                                                          |
+| `AuditDrift`                     | `prompts/drift-audit.md`                   | `audits.settings.drift_audit.prompt_path`                    | —                                                          |
+| `AuditMissingTests`              | `prompts/missing-tests-audit.md`           | `audits.settings.missing_tests_audit.prompt_path`            | —                                                          |
+| `AuditSecurityBug`               | `prompts/security-bug-audit.md`            | `audits.settings.security_bug_audit.prompt_path`             | —                                                          |
+| `AuditDocumentation`             | `prompts/documentation-audit.md`           | `audits.settings.documentation_audit.prompt_path`            | —                                                          |
+| `BrownfieldDraft`                | `prompts/brownfield-draft.md`              | `features.brownfield.prompt_path`                            | —                                                          |
+| `ChangeContradictionCheck`       | `prompts/change-contradiction-check.md`    | `executor.change_internal_contradiction_check_prompt_path`   | —                                                          |
+
+**Naming convention going forward.** Any new embedded prompt added
+in a future change SHALL declare its override field using the
+nested `<area>.<thing>.prompt_path` form (matching the rows above).
+Flat-suffix forms (`<area>.<thing>_prompt_path`) remain accepted
+only for the legacy fields documented in this registry; new
+prompts MUST NOT introduce additional flat-suffix overrides.
+
+---
+
 ## Multiple GitHub Tokens
 
 GitHub fine-grained PATs are scoped to a single account or organization — only the owner of a resource can mint one for it. A contributor who runs autocoder against, say, a personal repo plus repos in two work orgs cannot cover all three with a single fine-grained PAT.

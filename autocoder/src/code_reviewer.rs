@@ -5,13 +5,19 @@
 
 use crate::config::ReviewerConfig;
 use crate::llm::{self, LlmClient};
+use crate::prompts::{PromptId, PromptLoader};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// Built-in default prompt template, embedded at compile time so the binary
-/// runs without requiring `prompts/` on the filesystem.
+/// Built-in default prompt template, embedded at compile time so the
+/// binary runs without requiring `prompts/` on the filesystem. The
+/// [`PromptLoader`] also references the same file via `include_str!`;
+/// this alias remains here so existing anti-drift tests can compare
+/// the reviewer's resolved template against the embedded source of
+/// truth.
+#[cfg(test)]
 const DEFAULT_TEMPLATE: &str = include_str!("../../prompts/code-review-default.md");
 
 /// Backwards-compatible default for the reviewer's prompt-body cap. The
@@ -198,19 +204,20 @@ impl CodeReviewer {
         self.auto_revise_on_block
     }
 
-    /// Wire a reviewer from config: build the LLM client, load the prompt
-    /// template (overridden or default).
+    /// Wire a reviewer from config: build the LLM client, load the
+    /// prompt template via the uniform [`PromptLoader`] (a24). The
+    /// loader walks `reviewer.code_review.prompt_path` (nested form)
+    /// → `reviewer.prompt_template_path` (legacy flat) → embedded
+    /// default; missing/empty configured paths emit a one-shot WARN
+    /// AND fall back to the next level.
     pub fn from_config(cfg: &ReviewerConfig) -> Result<Self> {
         let client = llm::build_from_config(cfg)?;
-        let template = match &cfg.prompt_template_path {
-            Some(path) => std::fs::read_to_string(path).with_context(|| {
-                format!(
-                    "reading reviewer prompt template at {}",
-                    path.display()
-                )
-            })?,
-            None => DEFAULT_TEMPLATE.to_string(),
-        };
+        let template = PromptLoader::load(
+            PromptId::CodeReview,
+            cfg.code_review.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            cfg.prompt_template_path.as_deref(),
+            None,
+        );
         Ok(Self::new(client, template)
             .with_auto_revise_on_block(cfg.auto_revise_on_block)
             .with_prompt_budget(cfg.prompt_budget_chars)
@@ -923,6 +930,7 @@ this is not yaml: at all: ::: {{{ broken
             api_key: None,
             api_base_url: None,
             prompt_template_path: Some(template_path),
+            code_review: None,
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
@@ -941,8 +949,12 @@ this is not yaml: at all: ::: {{{ broken
         );
     }
 
+    /// A missing prompt-template override path now falls back to the
+    /// embedded default via the uniform `PromptLoader` (a24). The
+    /// daemon does NOT abort start-up; instead a one-shot WARN names
+    /// the offending path.
     #[test]
-    fn from_config_errors_when_template_path_missing() {
+    fn from_config_falls_back_when_template_path_missing() {
         use crate::config::{ReviewerConfig, ReviewerProvider};
         unsafe { std::env::set_var("REVIEWER_TEST_KEY_MISSING_TMPL", "k") };
         let bogus = std::path::PathBuf::from("/nonexistent/orchestrator-test-template.md");
@@ -954,21 +966,57 @@ this is not yaml: at all: ::: {{{ broken
             api_key: None,
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
+            code_review: None,
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
         };
-        let result = CodeReviewer::from_config(&cfg);
-        let err = match result {
-            Ok(_) => panic!("missing template must error"),
-            Err(e) => e,
-        };
+        let reviewer = CodeReviewer::from_config(&cfg)
+            .expect("missing template must fall back to embedded default");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_MISSING_TMPL") };
-        let msg = format!("{err:#}");
         assert!(
-            msg.contains("/nonexistent/orchestrator-test-template.md"),
-            "error must name the offending path; got: {msg}"
+            reviewer
+                .template
+                .contains("You are reviewing code quality only"),
+            "fallback must use embedded default"
         );
+    }
+
+    /// The new `reviewer.code_review.prompt_path` nested form takes
+    /// precedence over the legacy flat `reviewer.prompt_template_path`
+    /// when both are set AND the nested file exists (a24).
+    #[test]
+    fn from_config_nested_form_preempts_legacy_for_reviewer() {
+        use crate::config::{
+            PromptOverrideBlock, ReviewerConfig, ReviewerProvider,
+        };
+        use tempfile::TempDir;
+        unsafe { std::env::set_var("REVIEWER_TEST_KEY_NESTED", "k") };
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("nested-review.md");
+        let legacy = tmp.path().join("legacy-review.md");
+        std::fs::write(&nested, "NESTED REVIEW TEMPLATE").unwrap();
+        std::fs::write(&legacy, "LEGACY REVIEW TEMPLATE").unwrap();
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "x".into(),
+            api_key_env: Some("REVIEWER_TEST_KEY_NESTED".into()),
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: Some(legacy),
+            code_review: Some(PromptOverrideBlock {
+                prompt_path: Some(nested),
+            }),
+            auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+        };
+        let reviewer = CodeReviewer::from_config(&cfg)
+            .expect("nested override resolves");
+        unsafe { std::env::remove_var("REVIEWER_TEST_KEY_NESTED") };
+        assert!(reviewer.template.contains("NESTED REVIEW TEMPLATE"));
+        assert!(!reviewer.template.contains("LEGACY REVIEW TEMPLATE"));
     }
 
     #[test]
@@ -983,6 +1031,7 @@ this is not yaml: at all: ::: {{{ broken
             api_key: None,
             api_base_url: None,
             prompt_template_path: None,
+            code_review: None,
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,

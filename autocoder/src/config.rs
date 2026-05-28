@@ -255,6 +255,18 @@ fn default_brownfield_enabled() -> bool {
     true
 }
 
+/// Modernized nested prompt-override block (a24). Used as the value
+/// type for every `<area>.<thing>` field that overrides an embedded
+/// prompt template. The single `prompt_path` field is workspace-
+/// relative when not absolute; the [`crate::prompts::PromptLoader`]
+/// resolves it AND emits a one-shot WARN when the file is missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PromptOverrideBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+}
+
 /// Operator-visible override for the four daemon data paths. Each
 /// field is optional; the absent-field path means "use the default
 /// resolution chain" (see [`crate::paths::resolve_daemon_paths`]).
@@ -325,6 +337,11 @@ pub struct ExecutorConfig {
     /// `prompts/implementer.md`. The file must contain the literal
     /// `{{change_body}}` placeholder which is replaced with the output of
     /// `openspec instructions apply` for each change.
+    ///
+    /// **Legacy flat-suffix field.** The modernized nested form is
+    /// `executor.implementer.prompt_path` (see [`PromptOverrideBlock`]).
+    /// Both forms remain accepted; the loader prefers the nested one
+    /// when both are set.
     #[serde(default)]
     pub implementer_prompt_path: Option<PathBuf>,
     /// Optional path to a custom changelog-stylist prompt template. When
@@ -332,8 +349,36 @@ pub struct ExecutorConfig {
     /// `prompts/changelog-stylist.md`. An empty file at the override path
     /// is rejected at executor-construction time so the daemon does not
     /// feed an empty prompt to the wrapped CLI.
+    ///
+    /// **Legacy flat-suffix field.** Modernized form is
+    /// `executor.changelog_stylist.prompt_path`.
     #[serde(default)]
     pub changelog_stylist_prompt_path: Option<PathBuf>,
+    /// Nested override block for the implementer prompt (a24). When set
+    /// AND its `prompt_path` file exists, takes precedence over the
+    /// legacy flat field `implementer_prompt_path`. Workspace-relative
+    /// paths resolve under the repository's local workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<PromptOverrideBlock>,
+    /// Nested override block for the changelog-stylist prompt (a24).
+    /// Modernized form of `changelog_stylist_prompt_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changelog_stylist: Option<PromptOverrideBlock>,
+    /// Nested override block for the implementer-revision prompt (a24).
+    /// Previously had no operator override at all; now uniformly
+    /// configurable via the loader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer_revision: Option<PromptOverrideBlock>,
+    /// Nested override block for the audit-triage prompt (a24, used by
+    /// the polling-iteration `send it` flow). Previously had no
+    /// operator override at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_triage: Option<PromptOverrideBlock>,
+    /// Nested override block for the chat-request-triage prompt (a24,
+    /// used by the polling-iteration `propose` flow). Previously had
+    /// no operator override at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_request_triage: Option<PromptOverrideBlock>,
     /// Number of consecutive Failed outcomes for a single change before
     /// autocoder marks it perma-stuck (writes `.perma-stuck.json` in the
     /// change directory, posts a chatops alert, and excludes the change
@@ -858,8 +903,16 @@ pub struct ReviewerConfig {
     pub api_key: Option<SecretSource>,
     #[serde(default)]
     pub api_base_url: Option<String>,
+    /// Legacy flat-suffix override for the reviewer's prompt template
+    /// (`prompts/code-review-default.md`). Modernized form is
+    /// `reviewer.code_review.prompt_path` (see [`PromptOverrideBlock`]).
+    /// Both forms remain accepted; the loader prefers the nested one.
     #[serde(default)]
     pub prompt_template_path: Option<PathBuf>,
+    /// Nested override block for the code-review prompt (a24).
+    /// Modernized form of `prompt_template_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review: Option<PromptOverrideBlock>,
     /// Opt-in flag: when `true`, a reviewer `Block` verdict triggers
     /// reviewer-authored revision-request PR comments for each concern
     /// the reviewer marked `should_request_revision: true`. The dispatcher
@@ -2253,6 +2306,14 @@ github:
             "sandbox",
             "implementer_prompt_path",
             "changelog_stylist_prompt_path",
+            // a24 nested override blocks under `executor.<area>`.
+            "implementer",
+            "changelog_stylist",
+            "implementer_revision",
+            "audit_triage",
+            "chat_request_triage",
+            // a24 nested override block under `reviewer.code_review`.
+            "code_review",
             "perma_stuck_after_failures",
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",
@@ -5352,6 +5413,120 @@ features:
         assert_eq!(
             cfg.features.brownfield.prompt_path.as_deref(),
             Some(Path::new("./prompts/brownfield-custom.md"))
+        );
+    }
+
+    #[test]
+    fn executor_nested_prompt_overrides_round_trip(
+    ) {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  implementer:
+    prompt_path: "./prompts/impl-custom.md"
+  changelog_stylist:
+    prompt_path: "./prompts/stylist-custom.md"
+  implementer_revision:
+    prompt_path: "./prompts/revision-custom.md"
+  audit_triage:
+    prompt_path: "./prompts/triage-custom.md"
+  chat_request_triage:
+    prompt_path: "./prompts/chat-triage-custom.md"
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("nested overrides parse");
+        assert_eq!(
+            cfg.executor.implementer.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/impl-custom.md"))
+        );
+        assert_eq!(
+            cfg.executor
+                .changelog_stylist
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/stylist-custom.md"))
+        );
+        assert_eq!(
+            cfg.executor
+                .implementer_revision
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/revision-custom.md"))
+        );
+        assert_eq!(
+            cfg.executor
+                .audit_triage
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/triage-custom.md"))
+        );
+        assert_eq!(
+            cfg.executor
+                .chat_request_triage
+                .as_ref()
+                .and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/chat-triage-custom.md"))
+        );
+    }
+
+    #[test]
+    fn executor_legacy_and_nested_can_coexist() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  implementer_prompt_path: "/etc/autocoder/impl-legacy.md"
+  implementer:
+    prompt_path: "./prompts/impl-nested.md"
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("both forms coexist");
+        assert_eq!(
+            cfg.executor.implementer_prompt_path.as_deref(),
+            Some(Path::new("/etc/autocoder/impl-legacy.md"))
+        );
+        assert_eq!(
+            cfg.executor.implementer.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/impl-nested.md"))
+        );
+    }
+
+    #[test]
+    fn reviewer_nested_code_review_block_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-opus-4-7
+  api_key_env: ANTHROPIC_API_KEY
+  code_review:
+    prompt_path: "./prompts/review-custom.md"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("reviewer nested form parses");
+        let rv = cfg.reviewer.expect("reviewer parsed");
+        assert_eq!(
+            rv.code_review.as_ref().and_then(|b| b.prompt_path.as_deref()),
+            Some(Path::new("./prompts/review-custom.md"))
         );
     }
 

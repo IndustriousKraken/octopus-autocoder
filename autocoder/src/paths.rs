@@ -462,6 +462,11 @@ mod tests {
                     crate::config::ContradictionCheckMode::Disabled,
                 change_internal_contradiction_check_prompt_path: None,
                 change_internal_contradiction_check_llm: None,
+                implementer: None,
+                changelog_stylist: None,
+                implementer_revision: None,
+                audit_triage: None,
+                chat_request_triage: None,
             },
             github: GithubConfig {
                 token_env: "GITHUB_TOKEN".into(),
