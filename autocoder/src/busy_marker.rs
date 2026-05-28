@@ -60,8 +60,29 @@ pub struct BusyMarker {
 /// should investigate).
 pub enum AcquireOutcome {
     Acquired(BusyGuard),
-    SkipFreshInProgress(BusyMarker),
+    SkipFreshInProgress(SkipFreshDetails),
     SkipAmbiguous(BusyMarker),
+}
+
+/// Diagnostic context attached to `AcquireOutcome::SkipFreshInProgress`
+/// so the polling-loop's INFO log line can include the marker's age,
+/// the resolved stale-threshold, the PID-alive state, and a
+/// `recovery_eligible` boolean — without forcing callers to re-stat
+/// `/proc/<pid>` or re-read the marker file.
+pub struct SkipFreshDetails {
+    pub marker: BusyMarker,
+    pub age_secs: u64,
+    pub threshold_secs: u64,
+    pub pid_alive: bool,
+}
+
+impl SkipFreshDetails {
+    /// A marker is recovery-eligible when the dead-pid branch OR the
+    /// live-pid-but-stale branch would fire on the next iteration.
+    /// Computed inline here so the log line is single-source-of-truth.
+    pub fn recovery_eligible(&self) -> bool {
+        !self.pid_alive || self.age_secs >= self.threshold_secs
+    }
 }
 
 /// RAII handle. On Drop, the marker file is deleted. The guard is the only
@@ -253,10 +274,16 @@ pub fn remove_subprocess_marker(workspace: &Path) {
 
 /// Try to acquire the busy marker for the given workspace.
 ///
-/// `stuck_threshold_secs` is the age above which an existing marker is
-/// treated as potentially stuck (process died mid-pass or is hanging).
-/// In production this is `executor.timeout_secs + 600` (10-minute buffer
-/// for review/push/PR steps).
+/// `stuck_threshold_secs` is the age above which a busy marker whose
+/// recorded PID is STILL ALIVE is treated as a stuck pass (SIGTERM the
+/// process group, wait 5s, SIGKILL if still alive, then proceed). In
+/// production this is `executor.busy_marker_stale_threshold_secs`
+/// (default 600s, decoupled from `executor.timeout_secs`).
+///
+/// Markers whose recorded PID is no longer in `/proc` are recovered
+/// IMMEDIATELY regardless of `stuck_threshold_secs` — a PID that
+/// doesn't exist cannot be doing legitimate work, so the marker is
+/// unambiguously stale.
 pub fn try_acquire(
     workspace: &Path,
     repo_url: &str,
@@ -335,18 +362,33 @@ pub fn try_acquire_with(
                 };
 
                 let age_secs = age_secs(&existing.started_at);
-                if age_secs < stuck_threshold_secs {
-                    return Ok(AcquireOutcome::SkipFreshInProgress(existing));
-                }
+                let pid_alive = ops.pid_alive(existing.pid);
 
-                // Stale: classify.
-                if !ops.pid_alive(existing.pid) {
+                // Classification order (per `a08-busy-marker-recovery-semantics`):
+                //   1. file absent → handled above (Ok branch).
+                //   2. malformed JSON → handled above (parse-err branch).
+                //   3. PID dead → IMMEDIATE recovery, no age check. A PID
+                //      not in /proc can't be doing legitimate work; the
+                //      marker is unambiguously stale the moment that's
+                //      true. The pre-spec `age > timeout_secs + 600` gate
+                //      on this branch was the production-incident root
+                //      cause (51 minutes of skipped iterations on a
+                //      dead-pid marker after a daemon restart).
+                //   4. age < threshold AND PID alive → skip iteration,
+                //      another pass is presumed to be doing real work.
+                //   5. age >= threshold AND PID alive AND comm matches →
+                //      stuck; kill the process group and recover.
+                //   6. age >= threshold AND PID alive AND comm differs →
+                //      ambiguous (PID reuse suspected); skip and leave
+                //      the file for human investigation.
+                if !pid_alive {
                     tracing::warn!(
                         path = %path.display(),
                         pid = existing.pid,
                         age_secs,
                         stage = %existing.stage.as_str(),
-                        "busy_marker: stale (PID dead); clearing and acquiring"
+                        repo_url = %existing.repo_url,
+                        "busy_marker: PID dead; clearing marker and acquiring (no age gate)"
                     );
                     let _ = std::fs::remove_file(&path);
                     remove_subprocess_marker(workspace);
@@ -354,12 +396,21 @@ pub fn try_acquire_with(
                         continue;
                     }
                     return Err(anyhow!(
-                        "busy_marker: could not acquire after clearing stale-dead file at {}",
+                        "busy_marker: could not acquire after clearing dead-pid marker at {}",
                         path.display()
                     ));
                 }
 
-                // PID alive. Check comm to defeat PID reuse.
+                if age_secs < stuck_threshold_secs {
+                    return Ok(AcquireOutcome::SkipFreshInProgress(SkipFreshDetails {
+                        marker: existing,
+                        age_secs,
+                        threshold_secs: stuck_threshold_secs,
+                        pid_alive,
+                    }));
+                }
+
+                // PID alive AND age past threshold. Check comm to defeat PID reuse.
                 let live_comm = ops.read_comm(existing.pid);
                 let comm_check_skipped = existing.comm.is_empty() || live_comm.is_none();
                 let comm_matches = if let Some(live) = live_comm.as_deref() {
@@ -468,6 +519,30 @@ fn age_secs(started_at: &chrono::DateTime<chrono::Utc>) -> u64 {
     }
 }
 
+/// Render `secs` as a short human-readable duration matching the chatops
+/// `status` convention: cap the unit at hours (don't promote to days),
+/// and omit seconds for any duration > 1 minute. Produces strings like
+/// `45s`, `10m`, `53m`, `2h17m`.
+///
+/// Used by the polling-loop's "busy marker present; skipping iteration"
+/// INFO log line so an operator reading `journalctl` sees the marker's
+/// age and the configured threshold at a glance.
+pub fn format_age_human(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes}m")
+        }
+    }
+}
+
 fn read_comm(pid: u32) -> String {
     if cfg!(target_os = "linux") {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -493,14 +568,27 @@ pub struct RealProcessOps;
 
 impl ProcessOps for RealProcessOps {
     fn pid_alive(&self, pid: u32) -> bool {
-        // `kill(pid, 0)` returns 0 if the process exists OR if we have
-        // permission to signal it. ESRCH means the PID does not exist.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return true;
+        // Spec: stat `/proc/<pid>` — `false` on ENOENT, `true`
+        // otherwise. Any other error (permission, transient) is
+        // treated as "unknown alive" so we fall through to the
+        // age-based branches rather than clear a possibly-live
+        // marker. On non-Linux platforms `/proc` does not exist; we
+        // fall back to `kill(pid, 0)` so the daemon stays functional
+        // in CI on macOS/etc.
+        if cfg!(target_os = "linux") {
+            match std::fs::metadata(format!("/proc/{pid}")) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            }
+        } else {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if rc == 0 {
+                return true;
+            }
+            let err = std::io::Error::last_os_error();
+            err.raw_os_error() != Some(libc::ESRCH)
         }
-        let err = std::io::Error::last_os_error();
-        err.raw_os_error() != Some(libc::ESRCH)
     }
 
     fn read_comm(&self, pid: u32) -> Option<String> {
@@ -639,9 +727,22 @@ mod tests {
     fn acquire_when_fresh_returns_skip_fresh() {
         let (_dir, ws) = fixture_workspace();
         pre_populate_marker(&ws, 99999, "claude", 10);
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &MockOps::new()) {
-            Ok(AcquireOutcome::SkipFreshInProgress(m)) => {
-                assert_eq!(m.pid, 99999);
+        // The fresh-skip path is age < threshold AND pid_alive. The
+        // pre-spec test relied on `MockOps::new()` returning false for
+        // pid_alive AND letting the age check fire first; under the
+        // new ordering (pid-alive check FIRST), an absent-alive PID
+        // hits the dead-pid recovery branch. Mark the PID alive so
+        // the test exercises the fresh-skip branch it documents.
+        let ops = MockOps::new().with_alive(99999);
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+            Ok(AcquireOutcome::SkipFreshInProgress(details)) => {
+                assert_eq!(details.marker.pid, 99999);
+                assert_eq!(details.threshold_secs, 1800);
+                assert!(details.pid_alive);
+                assert!(
+                    !details.recovery_eligible(),
+                    "live + fresh marker is not recovery-eligible"
+                );
                 // Marker MUST remain untouched.
                 assert!(marker_path(&ws).exists());
             }
@@ -944,6 +1045,251 @@ mod tests {
         );
         // Guard still holds the marker; dropping it cleans up normally.
         drop(guard);
+    }
+
+    // -----------------------------------------------------------------
+    // a08-busy-marker-recovery-semantics: classification ordering
+    // tests covering the new dead-pid-immediate AND decoupled-threshold
+    // behavior.
+    // -----------------------------------------------------------------
+
+    /// Dead-PID + very young marker (1s old) → recover and proceed.
+    /// The new ordering checks PID liveness BEFORE the age gate.
+    #[test]
+    fn dead_pid_recovers_immediately_when_age_below_threshold() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 1);
+        // MockOps::new() → pid_alive(99999) returns false → dead-pid
+        // branch fires regardless of the marker's age.
+        let ops = MockOps::new();
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                assert!(guard.path().exists());
+                assert_eq!(guard.contents.pid, std::process::id());
+                drop(guard);
+            }
+            _ => panic!(
+                "dead-pid marker must recover immediately regardless of age (was 1s, threshold 1800s)"
+            ),
+        }
+    }
+
+    /// Dead-PID + very old marker → also recover and proceed. The
+    /// behavior is identical to the young-marker case; both confirm
+    /// that the age gate does not apply to the dead-pid branch.
+    #[test]
+    fn dead_pid_recovers_immediately_when_age_above_threshold() {
+        let (_dir, ws) = fixture_workspace();
+        // 90 days ≈ 7_776_000s — far above any plausible threshold.
+        pre_populate_marker(&ws, 99999, "claude", 90 * 86_400);
+        let ops = MockOps::new();
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                assert_eq!(guard.contents.pid, std::process::id());
+                drop(guard);
+            }
+            _ => panic!("very-old dead-pid marker must also recover"),
+        }
+    }
+
+    /// Live PID + age 1s → skip iteration (fresh-in-progress). This
+    /// is the only "skip without action" path under the new ordering.
+    #[test]
+    fn live_pid_fresh_skips_iteration() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 1);
+        let ops = MockOps::new().with_alive(99999);
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+            Ok(AcquireOutcome::SkipFreshInProgress(details)) => {
+                assert_eq!(details.marker.pid, 99999);
+                assert_eq!(details.threshold_secs, 600);
+                assert!(details.age_secs < 60);
+                assert!(details.pid_alive);
+                assert!(!details.recovery_eligible());
+                assert!(marker_path(&ws).exists(), "fresh marker must NOT be deleted");
+            }
+            _ => panic!("live + fresh marker must produce SkipFreshInProgress"),
+        }
+        let _ = std::fs::remove_file(marker_path(&ws));
+    }
+
+    /// Live PID + age past threshold + comm matches → SIGTERM the
+    /// process group, clear the marker, recover. The kill targets the
+    /// marker's `pgid` field (no sidecar present in this fixture).
+    #[test]
+    fn live_pid_past_threshold_comm_matches_kills_and_recovers() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 3600);
+        let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                let term = ops.killpg_terminate_called.lock().unwrap().clone();
+                assert_eq!(
+                    term,
+                    vec![1234],
+                    "SIGTERM must fire on stuck-recovery (marker.pgid = 1234)"
+                );
+                drop(guard);
+            }
+            _ => panic!("live + stale + comm-match must SIGTERM and recover"),
+        }
+    }
+
+    /// Live PID + age past threshold + comm differs → ambiguous;
+    /// SKIP iteration AND leave the marker for human investigation.
+    /// PID-reuse defense — the live PID is provably not the
+    /// autocoder-spawned process the marker was recorded for.
+    #[test]
+    fn live_pid_past_threshold_comm_differs_skips_ambiguous() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 3600);
+        let ops = MockOps::new().with_alive(99999).with_comm(99999, "sshd");
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+            Ok(AcquireOutcome::SkipAmbiguous(m)) => {
+                assert_eq!(m.comm, "claude");
+                // No kill signals should have fired in the ambiguous branch.
+                assert!(ops.killpg_terminate_called.lock().unwrap().is_empty());
+                assert!(ops.killpg_kill_called.lock().unwrap().is_empty());
+                assert!(
+                    marker_path(&ws).exists(),
+                    "ambiguous marker MUST remain for human inspection"
+                );
+            }
+            _ => panic!("live + stale + comm-differs must produce SkipAmbiguous"),
+        }
+        let _ = std::fs::remove_file(marker_path(&ws));
+    }
+
+    // -----------------------------------------------------------------
+    // SkipFreshDetails::recovery_eligible logic AND
+    // format_age_human formatter.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recovery_eligible_live_pid_fresh_is_false() {
+        let details = SkipFreshDetails {
+            marker: BusyMarker {
+                repo_url: "x".into(),
+                pid: 1,
+                pgid: 1,
+                comm: String::new(),
+                started_at: chrono::Utc::now(),
+                stage: Stage::Executor,
+                change: String::new(),
+            },
+            age_secs: 30,
+            threshold_secs: 600,
+            pid_alive: true,
+        };
+        assert!(!details.recovery_eligible());
+    }
+
+    #[test]
+    fn recovery_eligible_live_pid_past_threshold_is_true() {
+        let details = SkipFreshDetails {
+            marker: BusyMarker {
+                repo_url: "x".into(),
+                pid: 1,
+                pgid: 1,
+                comm: String::new(),
+                started_at: chrono::Utc::now(),
+                stage: Stage::Executor,
+                change: String::new(),
+            },
+            age_secs: 700,
+            threshold_secs: 600,
+            pid_alive: true,
+        };
+        assert!(details.recovery_eligible());
+    }
+
+    #[test]
+    fn recovery_eligible_dead_pid_always_true() {
+        let details = SkipFreshDetails {
+            marker: BusyMarker {
+                repo_url: "x".into(),
+                pid: 1,
+                pgid: 1,
+                comm: String::new(),
+                started_at: chrono::Utc::now(),
+                stage: Stage::Executor,
+                change: String::new(),
+            },
+            age_secs: 1,
+            threshold_secs: 600,
+            pid_alive: false,
+        };
+        assert!(details.recovery_eligible());
+    }
+
+    #[test]
+    fn format_age_human_seconds_below_minute() {
+        assert_eq!(format_age_human(0), "0s");
+        assert_eq!(format_age_human(45), "45s");
+        assert_eq!(format_age_human(59), "59s");
+    }
+
+    #[test]
+    fn format_age_human_minutes_below_hour() {
+        assert_eq!(format_age_human(60), "1m");
+        assert_eq!(format_age_human(600), "10m");
+        assert_eq!(format_age_human(3_180), "53m");
+        assert_eq!(format_age_human(3_599), "59m");
+    }
+
+    #[test]
+    fn format_age_human_hours_with_optional_minutes() {
+        assert_eq!(format_age_human(3_600), "1h");
+        assert_eq!(format_age_human(8_220), "2h17m");
+        assert_eq!(format_age_human(7_200), "2h");
+        // Cap-at-hours: even very long ages stay in hours (do not
+        // promote to days) so an operator can spot the "much longer
+        // than threshold" case at a glance.
+        assert_eq!(format_age_human(90_000), "25h");
+    }
+
+    /// Log-line shape: ensure the SkipFreshDetails struct exposes every
+    /// field that the polling-loop INFO line populates (age, threshold,
+    /// pid_alive, recovery_eligible). Regression guard for accidental
+    /// removal of any field on the diagnostic surface.
+    #[test]
+    fn skip_fresh_details_renders_expected_log_fields() {
+        let details = SkipFreshDetails {
+            marker: BusyMarker {
+                repo_url: "git@github.com:test/repo.git".into(),
+                pid: 12345,
+                pgid: 12345,
+                comm: "claude".into(),
+                started_at: chrono::Utc::now() - chrono::Duration::seconds(3_180),
+                stage: Stage::Executor,
+                change: String::new(),
+            },
+            age_secs: 3_180,
+            threshold_secs: 600,
+            pid_alive: true,
+        };
+        let age_str = format_age_human(details.age_secs);
+        let threshold_str = format_age_human(details.threshold_secs);
+        // Format-string approximation of the tracing log line so we can
+        // assert on the substrings an operator would grep for.
+        let rendered = format!(
+            "busy marker present; skipping iteration url={url} pid={pid} stage={stage} \
+             age={age} threshold={threshold} pid_alive={alive} recovery_eligible={recov}",
+            url = details.marker.repo_url,
+            pid = details.marker.pid,
+            stage = details.marker.stage.as_str(),
+            age = age_str,
+            threshold = threshold_str,
+            alive = details.pid_alive,
+            recov = details.recovery_eligible(),
+        );
+        assert!(rendered.contains("age=53m"), "rendered: {rendered}");
+        assert!(rendered.contains("threshold=10m"), "rendered: {rendered}");
+        assert!(rendered.contains("pid_alive=true"), "rendered: {rendered}");
+        assert!(
+            rendered.contains("recovery_eligible=true"),
+            "rendered: {rendered}"
+        );
     }
 
     #[test]

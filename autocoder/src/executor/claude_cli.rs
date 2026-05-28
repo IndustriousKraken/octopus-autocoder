@@ -1850,6 +1850,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1876,6 +1877,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1899,6 +1901,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1941,6 +1944,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(
@@ -1971,6 +1975,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(
@@ -2001,6 +2006,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty changelog-stylist file must error"),
@@ -2033,6 +2039,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),

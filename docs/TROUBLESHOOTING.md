@@ -536,3 +536,39 @@ your daemon actually picked up the new paths:
 
 To force a re-scan after restoring legacy data from backup, remove
 `<state_dir>/.migration-from-tmp-done` and restart the daemon.
+
+## Repo stuck on stale busy marker after daemon restart
+
+**Symptom.** `@<bot> status <repo>` shows `currently: idle`, the queue has pending changes, but every polling iteration logs:
+
+```
+INFO busy marker present; skipping iteration url=git@github.com:owner/repo.git pid=490170 \
+     stage=executor age=53m threshold=10m pid_alive=false recovery_eligible=true
+```
+
+The repo never progresses. New daemons started after the original daemon was killed (SIGTERM, restart, host reboot mid-iteration) inherit the old marker file and refuse to acquire because the recorded PID is from a process that no longer exists.
+
+**Diagnostic commands.** Replace `<basename>` with the workspace directory name (e.g. `github_com_owner_repo`):
+
+```bash
+sudo -u autocoder ls -l /tmp/autocoder/busy/                          # marker present?
+sudo -u autocoder cat /tmp/autocoder/busy/<basename>.json             # inspect contents
+ps -p $(jq -r .pid /tmp/autocoder/busy/<basename>.json)               # is the PID alive?
+```
+
+If `ps` reports `no such process` AND the marker is still on disk, the daemon is running a pre-`a08-busy-marker-recovery-semantics` build (which gated dead-pid recovery on `age > timeout_secs + 600`). Upgrade to a build that ships the fix — the underlying cause is removed for the daemon-restart scenario.
+
+**Immediate fix.** Stop the daemon, delete the marker file, and start the daemon again:
+
+```bash
+sudo systemctl stop autocoder
+sudo -u autocoder rm /tmp/autocoder/busy/<basename>.json
+sudo -u autocoder rm -f /tmp/autocoder/busy/<basename>.subprocess     # if present
+sudo systemctl start autocoder
+```
+
+The next polling iteration acquires a fresh marker and proceeds normally.
+
+**Why this used to happen.** Before `a08-busy-marker-recovery-semantics`, the marker classification logic gated dead-PID recovery on the marker's age exceeding `executor.timeout_secs + 600`. An operator who had bumped `timeout_secs` to e.g. 5400 (90 minutes for a long-running change) saw repos with daemon-restart-leftover markers stay stuck for up to 100 minutes before recovery fired — even though `/proc/<pid>` confirmed the recorded process was long gone.
+
+**What the fix changes.** Dead-PID recovery now fires IMMEDIATELY in the classification logic, with no age check. The `recovery_eligible=true` in the log line above confirms the next iteration WILL recover the marker — under the new behavior, that next iteration happens within a few seconds (it's still gated on the polling cadence) and resolves the symptom on its own. Operators on the fixed build do not need to manually delete the marker for the daemon-restart case.

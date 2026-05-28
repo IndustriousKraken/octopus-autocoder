@@ -61,16 +61,43 @@ At the start of each polling iteration, autocoder writes a per-repo JSON marker 
 
 Marker contents: `repo_url`, `pid`, `pgid` (Linux process group for `killpg` recovery), `comm` (process name from `/proc/<pid>/comm` at acquire time), `started_at`, and `stage` (one of `executor`, `commit`, `review`, `push`, `pr`).
 
-On the next iteration's startup, autocoder classifies any pre-existing marker:
+On the next iteration's startup, autocoder classifies any pre-existing marker in this order — the first matching row wins:
 
 | Marker state | Action |
 |---|---|
 | File absent | Acquire, run iteration |
-| Age < `executor.timeout_secs` + 10 min | Skip iteration with INFO log — another pass is working |
-| Age over threshold, PID dead | Auto-recover: clear marker, WARN log, proceed |
-| Age over threshold, PID alive + `comm` matches | Stuck: `SIGTERM` the process group, wait 5s, `SIGKILL` if still alive, clear marker, post chatops alert, proceed |
-| Age over threshold, PID alive + `comm` differs | Ambiguous (PID reuse suspected) — ERROR log, post chatops alert, SKIP iteration, leave marker for human inspection |
 | Malformed JSON | Treat as stale: WARN log, clear marker, proceed |
+| **PID dead** (recorded `pid` not in `/proc`) | **Auto-recover IMMEDIATELY: clear marker, WARN log, proceed. NO age check** — a pid that no longer exists cannot be doing legitimate work |
+| Age < `executor.busy_marker_stale_threshold_secs`, PID alive | Skip iteration with INFO log (`age=… threshold=… pid_alive=true recovery_eligible=false`) — another pass is working |
+| Age ≥ threshold, PID alive + `comm` matches | Stuck: `SIGTERM` the process group, wait 5s, `SIGKILL` if still alive, clear marker, post chatops alert, proceed |
+| Age ≥ threshold, PID alive + `comm` differs | Ambiguous (PID reuse suspected) — ERROR log, post chatops alert, SKIP iteration, leave marker for human inspection |
+
+The stale-threshold is a dedicated `executor.busy_marker_stale_threshold_secs` config field (default `600` seconds = 10 minutes, max `7200` clamped with a WARN). It is **decoupled** from `executor.timeout_secs` — raising the executor timeout for one legitimately long-running change does NOT proportionally delay stale-marker recovery on unrelated iterations.
+
+Pre-`a08-busy-marker-recovery-semantics` builds derived the threshold as `executor.timeout_secs + 600`, which had two problems: (1) a daemon killed mid-iteration left a dead-pid marker that the next pass refused to recover until the derived threshold elapsed (51+ minute production incidents); (2) bumping `timeout_secs` for one stubborn change silently delayed stale-marker recovery on all other iterations. Both are fixed: dead-pid markers recover immediately, and the live-pid stale threshold is now a separate operator-controlled field.
+
+When a daemon upgrades to a build that ships this fix AND the operator has NOT set `busy_marker_stale_threshold_secs` explicitly AND the pre-spec implicit threshold (`timeout_secs + 600`) would have been longer than the new default, the daemon emits one INFO line at startup naming both values:
+
+```
+busy marker stale threshold is now 600s (was implicit 6000s via timeout_secs+10min). \
+Pre-spec operators raising timeout_secs no longer see proportional recovery delays. \
+Set executor.busy_marker_stale_threshold_secs explicitly to override.
+```
+
+Operators who genuinely need the longer threshold (executor expected to legitimately not check in for >10 min) set the field in `config.yaml`:
+
+```yaml
+executor:
+  timeout_secs: 5400
+  busy_marker_stale_threshold_secs: 5500
+```
+
+The INFO line emitted when an existing marker is skipped now carries the marker's age, the resolved threshold, the PID-alive state, and a `recovery_eligible` boolean — operators reading `journalctl` see the diagnostic state inline:
+
+```
+INFO busy marker present; skipping iteration url=git@github.com:owner/repo.git pid=490170 \
+     stage=executor age=53m threshold=10m pid_alive=false recovery_eligible=true
+```
 
 Operators inspecting the file:
 ```bash

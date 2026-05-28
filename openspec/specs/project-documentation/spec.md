@@ -404,3 +404,48 @@ The stylist prompt template `prompts/changelog-stylist.md` SHALL ship in the rep
 - **AND** describes both branches: matching the existing style when present, OR creating a fresh Keep a Changelog v1.1.0 file when absent
 - **AND** the fresh-file branch specifies the file's expected structure (top-level project heading, `## [Unreleased]` placeholder, current release's `## [<version>] - <YYYY-MM-DD>` section)
 
+### Requirement: CODE-REVIEW.md and CONFIG.md document the prompt-budget and per-change-mode fields
+`docs/CODE-REVIEW.md` SHALL include a `## Prompt budget` subsection AND a `## Per-change reviewer mode` subsection documenting the new `reviewer.prompt_budget_chars` AND `reviewer.mode` config fields respectively. `docs/CONFIG.md`'s existing `reviewer:` table SHALL gain rows for both fields.
+
+#### Scenario: CODE-REVIEW.md documents the prompt budget field
+- **WHEN** an operator reads `docs/CODE-REVIEW.md`
+- **THEN** a section titled `## Prompt budget` appears between the existing `## Review context` section AND `## Reviewer-initiated revisions on \`Block\` verdicts`
+- **AND** the section names `reviewer.prompt_budget_chars` AND its default value (2_000_000)
+- **AND** the section explains the no-hard-ceiling property — operators match the value to their provider's actual context window
+- **AND** the section gives at least one example: Grok-4 / Claude Sonnet 4.6 → 4M (or whatever the current window is)
+
+#### Scenario: CODE-REVIEW.md documents per-change mode
+- **WHEN** an operator reads `docs/CODE-REVIEW.md`
+- **THEN** a section titled `## Per-change reviewer mode` documents `reviewer.mode` with values `bundled` (default) AND `per_change`
+- **AND** the section explains the LLM-cost trade-off (per_change = N× cost on N-change PRs)
+- **AND** the section describes the PR-body shape change (one `## Code Review: <slug>` section per change instead of one combined block)
+- **AND** the section explains the cross-change preamble (each per-change prompt includes a fixed-size list of the other changes in the same PR for cross-reference context)
+
+#### Scenario: CONFIG.md table includes both fields
+- **WHEN** an operator reads `docs/CONFIG.md`'s `reviewer:` table
+- **THEN** the table contains a row for `prompt_budget_chars` (type `usize`, default `2_000_000`, no max)
+- **AND** the table contains a row for `mode` (type enum, default `bundled`, values `bundled` / `per_change`)
+- **AND** both rows link to the relevant `docs/CODE-REVIEW.md` section for the full discussion
+
+### Requirement: OPERATIONS.md, CONFIG.md, and TROUBLESHOOTING.md document the busy-marker-stale-threshold field and the decoupled recovery semantics
+`docs/OPERATIONS.md`'s `## Busy marker` section SHALL be updated to reflect the new classification ordering (dead-pid immediate, decoupled threshold). `docs/CONFIG.md`'s `executor:` table SHALL gain a row for `busy_marker_stale_threshold_secs`. `docs/TROUBLESHOOTING.md` SHALL include a "Repo stuck on stale busy marker after daemon restart" diagnostic section.
+
+#### Scenario: OPERATIONS.md classification table reflects the new ordering
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s `## Busy marker` section
+- **THEN** the classification table lists the branches in the spec's order
+- **AND** the "PID dead" row notes that recovery fires immediately with no age check
+- **AND** a paragraph explains that the threshold is the new `executor.busy_marker_stale_threshold_secs` field (default 600s) rather than the pre-spec `timeout_secs + 10 min` formula
+- **AND** the paragraph names the migration log line operators will see if their pre-spec config had a longer implicit threshold
+
+#### Scenario: CONFIG.md documents the new field
+- **WHEN** an operator reads `docs/CONFIG.md`'s `executor:` table
+- **THEN** the table contains a row for `busy_marker_stale_threshold_secs` (type `u64`, default `600`, max `7200`)
+- **AND** the row describes the field's purpose (stale-threshold for the live-pid recovery branch) AND cross-links to the OPERATIONS.md section
+
+#### Scenario: TROUBLESHOOTING.md helps operators diagnose stale-marker symptoms
+- **WHEN** an operator reads `docs/TROUBLESHOOTING.md`
+- **THEN** a section titled `Repo stuck on stale busy marker after daemon restart` describes the symptom (status shows `currently: idle`, queue shows pending changes, but every polling iteration logs `busy marker present; skipping`)
+- **AND** the section gives the diagnostic commands (`ls`, `cat`, `ps -p <pid>`)
+- **AND** the section gives the immediate fix (`rm` the marker file)
+- **AND** the section notes that the underlying cause for dead-pid markers is fixed in this spec — operators upgrading to this version no longer hit the symptom for daemon-restart scenarios
+

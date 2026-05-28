@@ -357,6 +357,7 @@ mod tests {
                 wipe_drain_timeout_secs: 30,
                 output_format: crate::config::default_output_format(),
                 log_retention_days: crate::config::default_log_retention_days(),
+                busy_marker_stale_threshold_secs: None,
             },
             github: GithubConfig {
                 token_env: "GITHUB_TOKEN".into(),
