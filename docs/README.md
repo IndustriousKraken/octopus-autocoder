@@ -6,7 +6,7 @@ This directory holds the long-form documentation for autocoder. The main [README
 
 - [INSTALL.md](INSTALL.md) — Manual install from source. The `autocoder install` wizard handles most cases; use this for contributor setups, air-gapped builds, or installs that need to inspect the build itself.
 - [CONFIG.md](CONFIG.md) — Full `config.yaml` schema. Every field, every default. Includes the multi-token routing for operators running across more than one GitHub owner.
-- [DEPLOYMENT.md](DEPLOYMENT.md) — Recommended binary deploy with systemd: user setup, SSH keys, the unit file, env-var layout, upgrade workflow, applying config changes without a restart.
+- [DEPLOYMENT.md](DEPLOYMENT.md) — Recommended binary deploy with systemd: user setup, SSH keys, the unit file, env-var layout, manual upgrades, unattended `update.sh` via cron with atomic rollback, applying config changes without a restart, the `--reconfigure <section>` flag for editing one config section post-install.
 
 ## Feature surfaces
 

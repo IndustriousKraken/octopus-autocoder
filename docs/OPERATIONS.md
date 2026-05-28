@@ -1,400 +1,11 @@
 # Operating Notes
 
-## Workspace path derivation
-
-If a repository entry omits `local_path`, the workspace path is derived deterministically from the URL:
-
-1. Strip the protocol prefix (`git@`, `ssh://`, `https://`, `http://`).
-2. Strip a trailing `.git`.
-3. Replace any character that is not ASCII alphanumeric, `_`, or `-` with `_`.
-4. Prepend `/tmp/workspaces/`.
-
-`git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both map to `/tmp/workspaces/github_com_owner_repo`. At startup, autocoder runs a collision check: if two configured repositories resolve to the same workspace path (whether by derivation or by explicit `local_path`), the process exits non-zero before spawning any polling tasks. Set `local_path` explicitly to disambiguate.
-
-## Multi-repo setup
-
-`repositories:` accepts any number of entries. autocoder spawns one polling task per entry, each on its own `poll_interval_sec`. Per-repo state is fully independent: an iteration failure on repo A does not affect repo B; a ChatOps escalation on repo A blocks A's pending queue but does not touch B.
-
-```yaml
-repositories:
-  - url: "git@github.com:my-org/auth-service.git"
-    base_branch: main
-    agent_branch: agent-q
-    poll_interval_sec: 300
-
-  - url: "git@github.com:my-org/web-dashboard.git"
-    base_branch: dev
-    agent_branch: agent-q
-    poll_interval_sec: 3600
-```
-
-## Polling cadence and your firewall
-
-When autocoder spawns ≥5 polling tasks at process start, the simultaneous `git fetch` operations from a single source IP can look like a port scan or scraper to network IDS — one operator reported their IDS killing SSH connections the moment the daemon tried to poll 8–9 repos at once. Even without an IDS, tasks that all share the same `poll_interval_sec` (e.g. the default `300`) drift only marginally across iterations because `git fetch` dominates each iteration's wall-clock, so they tend to re-cluster over time.
-
-Two defaults defuse this:
-
-- `executor.startup_jitter_max_secs` (default `30`) — each task waits a uniformly-random `[0, 30]` seconds before its first iteration, smearing the first round of fetches across a 30 s window.
-- `executor.inter_iteration_jitter_pct` (default `10`) — each inter-iteration sleep is `poll_interval_sec ± 10%`, so tasks that briefly synchronize drift apart again on the next cycle.
-
-Both jitters cost almost nothing in wall-clock and respect SIGTERM/SIGINT (cancellation is observed within 200 ms during either sleep). Operators on isolated networks who prefer deterministic timing can set both to `0`. Operators who want a wider window — say, after seeing IDS alerts even with the defaults — can raise `startup_jitter_max_secs` to something like `120` or `300`.
-
-## Queue order
-
-Pending changes are processed in ascending entry-name order (UTF-8 byte order, which is alphabetical for ASCII names). Operators with stacked dependencies — i.e. change N+1 depends on change N — encode order explicitly by prefixing change names with a letter+number tag: `a01-rename-foo`, `a02-extract-bar`, `a03-wire-baz`. The prefix is the operator's contract for "this change depends on the previous in sequence." For a second unrelated stack, use a different letter group (`b01-`, `b02-`). For unrelated single changes, no prefix is needed; alphabetical order is arbitrary but deterministic.
-
-Note: OpenSpec rejects change names that start with a digit. Plain `01-`/`02-` prefixes will fail at the prompt-building step (`openspec instructions apply --change <name>` returns "Invalid change name"). Always start with a letter.
-
-Each iteration commits at most `max_changes_per_pr` archived changes (default `3`); any remaining pending changes wait for the next iteration. The cap is configurable per repository, or globally via `executor.max_changes_per_pr`. A long queue therefore ships as several reviewable PRs over time rather than one large PR.
-
-A change that fails (or escalates to chatops) halts the queue walk for that iteration; remaining pending changes wait for the next iteration. This preserves the stacked-dependency assumption behind authoring-order processing: change N+1 may depend on change N having succeeded, so the bot does not attempt N+1 while N is unfixed. A persistently-failing change accumulates failure-counter increments and hits perma-stuck (default after 2 consecutive failures), at which point it drops out of `list_pending` and the queue resumes at N+1.
-
-## Startup preflight
-
-At startup, `autocoder run` invokes `openspec --version` once. If the binary is not on the daemon's PATH or exits non-zero, the daemon exits non-zero before any polling task is spawned. The stderr message names the failure (binary not found, non-zero exit code, etc.). This means a misconfigured deployment surfaces at startup rather than producing empty iterations.
-
-If you see `openspec preflight failed: binary not found on PATH`, add the install directory to the systemd unit's `Environment="PATH=..."` line (see [Deployment](DEPLOYMENT.md)).
-
-## Busy marker
-
-At the start of each polling iteration, autocoder writes a per-repo JSON marker at `/tmp/autocoder/busy/<workspace-basename>.json` and holds it through every stage of the pass (executor → review → push → PR). The marker is removed when the pass returns normally. A daemon crash that bypasses normal cleanup (SIGKILL, segfault, host power loss) intentionally leaves the marker for the next pass to discover.
-
-Marker contents: `repo_url`, `pid`, `pgid` (Linux process group for `killpg` recovery), `comm` (process name from `/proc/<pid>/comm` at acquire time), `started_at`, and `stage` (one of `executor`, `commit`, `review`, `push`, `pr`).
-
-On the next iteration's startup, autocoder classifies any pre-existing marker in this order — the first matching row wins:
-
-| Marker state | Action |
-|---|---|
-| File absent | Acquire, run iteration |
-| Malformed JSON | Treat as stale: WARN log, clear marker, proceed |
-| **PID dead** (recorded `pid` not in `/proc`) | **Auto-recover IMMEDIATELY: clear marker, WARN log, proceed. NO age check** — a pid that no longer exists cannot be doing legitimate work |
-| Age < `executor.busy_marker_stale_threshold_secs`, PID alive | Skip iteration with INFO log (`age=… threshold=… pid_alive=true recovery_eligible=false`) — another pass is working |
-| Age ≥ threshold, PID alive + `comm` matches | Stuck: `SIGTERM` the process group, wait 5s, `SIGKILL` if still alive, clear marker, post chatops alert, proceed |
-| Age ≥ threshold, PID alive + `comm` differs | Ambiguous (PID reuse suspected) — ERROR log, post chatops alert, SKIP iteration, leave marker for human inspection |
-
-The stale-threshold is a dedicated `executor.busy_marker_stale_threshold_secs` config field (default `600` seconds = 10 minutes, max `7200` clamped with a WARN). It is **decoupled** from `executor.timeout_secs` — raising the executor timeout for one legitimately long-running change does NOT proportionally delay stale-marker recovery on unrelated iterations.
-
-Pre-`a08-busy-marker-recovery-semantics` builds derived the threshold as `executor.timeout_secs + 600`, which had two problems: (1) a daemon killed mid-iteration left a dead-pid marker that the next pass refused to recover until the derived threshold elapsed (51+ minute production incidents); (2) bumping `timeout_secs` for one stubborn change silently delayed stale-marker recovery on all other iterations. Both are fixed: dead-pid markers recover immediately, and the live-pid stale threshold is now a separate operator-controlled field.
-
-When a daemon upgrades to a build that ships this fix AND the operator has NOT set `busy_marker_stale_threshold_secs` explicitly AND the pre-spec implicit threshold (`timeout_secs + 600`) would have been longer than the new default, the daemon emits one INFO line at startup naming both values:
-
-```
-busy marker stale threshold is now 600s (was implicit 6000s via timeout_secs+10min). \
-Pre-spec operators raising timeout_secs no longer see proportional recovery delays. \
-Set executor.busy_marker_stale_threshold_secs explicitly to override.
-```
-
-Operators who genuinely need the longer threshold (executor expected to legitimately not check in for >10 min) set the field in `config.yaml`:
-
-```yaml
-executor:
-  timeout_secs: 5400
-  busy_marker_stale_threshold_secs: 5500
-```
-
-The INFO line emitted when an existing marker is skipped now carries the marker's age, the resolved threshold, the PID-alive state, and a `recovery_eligible` boolean — operators reading `journalctl` see the diagnostic state inline:
-
-```
-INFO busy marker present; skipping iteration url=git@github.com:owner/repo.git pid=490170 \
-     stage=executor age=53m threshold=10m pid_alive=false recovery_eligible=true
-```
-
-Operators inspecting the file:
-```bash
-sudo -u autocoder cat /tmp/autocoder/busy/<basename>.json
-```
-
-To force a recovery from a stuck state, stop the systemd unit, delete the marker file, and start the unit again:
-```bash
-sudo systemctl stop autocoder
-sudo -u autocoder rm /tmp/autocoder/busy/<basename>.json
-sudo systemctl start autocoder
-```
-
-The per-change run logs (`<logs_dir>/runs/<basename>/<change>.log`) and the busy markers share the same daemon-paths root.
-
-If you're seeing operator-visible inconsistencies between writers and readers (`status` says idle while the busy marker exists; `send it` returns `?` on a real audit thread), check `journalctl` AND the resolved paths the daemon is using — this class of bug is prevented going forward by the `path_literals_audit` CI test introduced in `a09`, which fails the build on any new hard-coded `/tmp/autocoder/` literal in `autocoder/src/`. See [`docs/STATE-LAYOUT.md`](STATE-LAYOUT.md#path-resolution-rule) for the resolver-only rule.
-
-## Per-change run log shape
-
-Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/<change>.log`. The default shape (with `executor.output_format: json`) splits the log into four sections so operators can quickly judge what the agent was doing without scrolling through the raw JSON event stream:
-
-```
-=== PROMPT (<n> bytes) ===
-<the full prompt sent to the wrapped Claude CLI>
-
-=== ACTIONS ===
-[tool_use] Read autocoder/src/foo.rs
-[tool_result] (4128 bytes returned)
-[tool_use] Edit autocoder/src/foo.rs
-[tool_result] (200 bytes returned)
-[assistant] I've identified the issue in line 42 and applied the fix.
-[tool_use] Bash cargo test --lib
-[tool_result] (1024 bytes returned)
-...
-
-=== FINAL ANSWER (<n> bytes) ===
-<the agent's closing conversational summary — same content the PR comment shows>
-
-=== STDERR (<n> bytes) ===
-<anything the wrapped CLI emitted on stderr, typically empty>
-```
-
-- **PROMPT** — exactly what autocoder sent on stdin (template + `openspec instructions apply` output + the per-change context). Use this when an agent ran on the wrong prompt.
-- **ACTIONS** — one line per JSON event the wrapped CLI emitted (Read/Edit/Bash tool calls, tool results with byte counts, intermediate assistant text). Each line is prefixed `[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]` (for lines that failed JSON parsing) or `[unknown:<type>]` (for forward-compat event types). Use this when triaging a timeout — the last action line names what the agent was doing when the kill fired. On a successful run, scanning the ACTIONS section gives you a fast read of the work.
-- **FINAL ANSWER** — the closing `result` event's text, captured separately so it is the ONE thing the PR's `## Agent implementation notes` comment shows. Empty when the run timed out before reaching `result`.
-- **STDERR** — bytes the wrapped CLI wrote on stderr. Usually empty; populated on framework errors.
-
-The legacy log shape (`=== STDOUT === / === STDERR ===`) is preserved when `executor.output_format: text` is set; that mode skips JSON event parsing entirely and uses today's at-exit capture.
-
-**Retention.** Per-change logs are pruned at daemon startup and once every 24 hours during operation. A log is eligible for deletion when its mtime is older than `executor.log_retention_days` (default 30) AND its corresponding change directory under `openspec/changes/<change>/` no longer exists. Active changes' logs are preserved regardless of age — operators triaging a long-running stuck change want its log even if it's months old.
-
-**PR-comment stability.** The `## Agent implementation notes` comment on every PR continues to contain ONLY the agent's closing conversational summary — the same content operators have always seen since the section was introduced. With JSON streaming mode on, autocoder captures that text more precisely (from the closing `result` event) instead of slicing it out of the raw stdout buffer, but reviewers see the same shape. The intermediate tool-call stream stays in the log file and never ships to GitHub. Existing PR-review workflows do not change.
-
-**PR commit ordering (a12).** When an iteration produces both pending change implementation commits AND audit creation commits, the implementation commits land FIRST on the agent branch and the audit creation commits land AFTER. This follows directly from the iteration-sequence change in `a12-changes-have-precedence-over-audits` — the pending queue walk runs before the audit phase, so its commits are older on the agent branch. Reviewers scanning the PR's commit list see the change work at the top. (Prior to `a12`, audit creation commits came first because audits ran before `list_pending`.)
-
-## Partial-clone self-heal
-
-When a `git clone` is interrupted mid-flight (network drop, signal, transient auth blip), git leaves the destination directory created but without a `.git/` subdirectory. Previously this state hard-stuck the daemon — every subsequent iteration logged `workspace path exists but is not a git repository (no .git directory): <path>` and never attempted recovery; the only way out was an operator-side `rm -rf`.
-
-The daemon now auto-recovers. When `workspace::ensure_initialized` detects that the workspace path exists AND has no `.git/`, it runs a safety check, deletes the partial directory, and re-attempts the clone as if the workspace had never existed. If the re-clone succeeds, the iteration proceeds normally; if it fails, the returned error carries the real clone failure (auth, network, etc.) — operators see the actual cause in journalctl and in any chatops `WorkspaceInitFailure` alert, rather than the misleading secondary detection.
-
-**WARN log line.** Each auto-cleanup emits exactly one WARN naming the workspace path, the repo URL, and the action:
-
-```
-WARN workspace=/path/to/ws repo=<url> workspace exists without .git; partial clone artifact detected. Deleting and re-cloning.
-```
-
-**Safety-check tripwires.** Before deleting, the daemon refuses auto-cleanup if the partial directory contains any of:
-
-- `.in-progress*` lock files at any depth (would suggest an active iteration somehow racing this path).
-- `openspec/changes/<slug>/.perma-stuck.json` or `openspec/changes/<slug>/.needs-spec-revision.json` at any depth (operator-managed markers that survived a previous successful clone).
-- `openspec/changes/<slug>/.question.json` or `openspec/changes/<slug>/.answer.json` (AskUser markers).
-
-When a tripwire fires, the daemon returns the original "exists but no `.git`" error extended with `(partial cleanup refused: <tripwire>; manual operator inspection required)` and the directory is NOT deleted. Operators inspect the directory and decide manually. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the manual recovery flow.
-
-**Not a tripwire:** a stray `.alert-state.json` at the workspace root. As of `a16-consolidate-workspace-bookkeeping-to-state-dir`, alert-throttle state lives at `<state_dir>/alert-state/<workspace-basename>.json` and the workspace SHOULD NOT contain the file at all. If a transient copy appears (e.g. fresh re-clone of a repo whose history transiently committed it before the migration completed), the workspace-init invariant check removes it; destroying it manually is also harmless.
-
-**Re-clone failure classification.** When the re-clone itself fails (the actual transport call after the partial-cleanup decision), the surfaced error feeds into the same mid-iteration classifier described under [Dirty workspace auto-recovery](#dirty-workspace-auto-recovery): transient (network blip, GitHub `5xx`, auth token blip) retries on the next polling tick with a throttled alert, while permanent (config error, missing binary) skips the iteration and fires the operator-inspection alert. See [CHATOPS.md → Throttled failure alerts](CHATOPS.md#throttled-failure-alerts-) for the alert text variants.
-
-## Workspace directory deleted
-
-If a workspace directory under `/tmp/workspaces/` is removed while autocoder is running (or while stopped), the daemon's next iteration treats this as a fresh-clone case: it clones upstream into the path again. In fork-PR mode it also fetches ONLY the configured agent branch from the `fork` remote at that time (via `git fetch fork +refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>`) so the local `refs/remotes/fork/<agent_branch>` tracking ref reflects the fork's actual state. Without that fetch the next `git push --force-with-lease fork <agent_branch>` would compare an empty local tracking value against the fork's existing commits and reject with `! [rejected] <agent_branch> -> <agent_branch> (stale info)`, leaving the daemon stuck. The fetch deliberately restricts itself to one branch: a wholesale `git fetch fork` would populate `refs/remotes/fork/<every-branch>`, and if any fork branch shadows an upstream name (e.g. both `origin/dev` and `fork/dev` exist), the next `git checkout <base_branch>` would fail with `fatal: 'dev' matched multiple (2) remote tracking branches`. The post-clone fork fetch is best-effort: if it fails (network blip, fork doesn't yet exist, agent branch doesn't yet exist on the fork), the daemon proceeds and the next push will surface any real divergence via the existing branch-push-failure alert.
-
-## Fork recreation on workspace reinitialization
-
-The default workspace-deleted recovery above preserves whatever state lives on the fork. That is the right behavior when you have open PRs from that fork — losing their head refs would close the PRs. But the same preservation is a liability when the fork has accumulated stale branches no one cares about, or when the fork's state is genuinely worthless and you'd rather start from a pristine mirror of upstream.
-
-Set `github.recreate_fork_on_reinit: true` to opt in to the destructive recovery path. When that flag is enabled AND fork-PR mode is active AND the workspace directory is absent at iteration start, autocoder:
-
-1. Calls `DELETE /repos/<fork_owner>/<repo>` against the GitHub API to delete the fork.
-2. Waits 2 seconds for the deletion to propagate.
-3. Calls `POST /repos/<upstream_owner>/<repo>/forks` to re-fork from upstream.
-4. Polls the new fork's URL via `git ls-remote` for up to 30 seconds until reachable.
-5. Proceeds with the normal clone + fork-remote registration.
-
-After a successful re-fork, autocoder posts a one-line chatops notification:
-
-> :warning: \`<repo>\`: re-forked at workspace reinitialization (previous fork deleted; any open PRs from this fork are now closed)
-
-The notification is gated by the same `chatops.notifications.failure_alerts` toggle as the other operator-visible failure alerts.
-
-Requirements:
-
-- The operator's PAT must include the `delete_repo` scope. Without it, the DELETE returns 403, autocoder logs an ERROR naming the missing scope, and falls back to the conservative non-recreating init path (clone + fetch fork). The iteration still makes progress; the fork is unchanged.
-- The flag is global on the `github:` block, not per-repository — all configured repos in a single autocoder process share the same fork owner, and the fork-recreation policy is uniform across them.
-
-Defaults to `false`. With the default, the workspace-deleted recovery preserves fork state (see [Workspace directory deleted](#workspace-directory-deleted) above).
-
-## Rebuilding canonical specs from archive history
-
-`openspec/specs/<capability>/spec.md` is rebuilt by the host's openspec install whenever an archived change has the `openspec sync` workflow enabled at archive time. When a repository was archived from a host without that workflow (or before that workflow existed), the canonical specs drift from what the archive history actually says. Symptoms: the archive contains 30 `## ADDED Requirements` blocks, but the canonical spec is missing 25 of them.
-
-autocoder ships a full rebuild path for that case. Incremental backfill is intentionally unsupported — when drift is mid-history (an earlier change was never synced but later changes were), re-applying the skipped change onto the current canonical produces an incorrect end state. Full rebuild from scratch is the only safe answer.
-
-**When to use rebuild.** When you onboard a repo that was archive-driven from a host without `openspec sync`, when `git diff openspec/specs/` after a successful archive shows nothing despite the change adding requirements, or when `openspec list` and the on-disk canonical specs disagree on capability content.
-
-**CLI invocation** (against a local clone — no daemon required):
-
-```bash
-autocoder sync-specs --rebuild --workspace /path/to/repo
-```
-
-This iterates every archived change in chronological order, replays it via `openspec archive`, and preserves each archive's original date prefix via in-place rename. The CLI prints a summary listing successful and failed changes plus a modified-vs-unchanged tally for every canonical spec file. Exit code is non-zero if any archive failed to re-archive.
-
-**Chatops invocation** (for daemon-managed repos):
-
-```
-@<bot> rebuild-specs <repo-substring>
-```
-
-This submits a `RebuildSpecs` action to the control socket, which sets a `pending_rebuild` flag on the named repo's polling task. The next iteration runs the rebuild instead of the normal queue walk. The rebuild's commits land on the agent branch via the existing push + PR flow; the PR title is `spec rebuild: <N> capability(ies) rebuilt from archive history` so operators can recognize it at a glance.
-
-When the rebuild iteration finishes, the bot posts one of three chatops messages:
-
-- `✓ rebuild complete for <repo>: PR <url> opened — <N> capability(ies) updated from <M> archived change(s)` (success with drift)
-- `✓ rebuild complete for <repo>: no drift detected, canonical specs already in sync` (success no drift)
-- `⚠️ rebuild for <repo> completed with <N> failure(s); ...` (partial failure)
-
-The completion notification fires regardless of `chatops.notifications.pr_opened` or `failure_alerts` — it is the operator's direct response to a command they issued, so they always get the completion signal.
-
-**The `--immediate` flag** (CLI only — never exposed via chatops):
-
-```bash
-autocoder sync-specs --rebuild --immediate --workspace /path/to/repo
-```
-
-Without `--immediate`, the CLI waits politely for the current iteration to release the busy marker before starting. With `--immediate`, the CLI sends `SIGTERM` to the executor subprocess (via the busy marker's recorded PID), waits up to 30 seconds for cleanup, and runs the rebuild even if the iteration was mid-flight. The cancelled iteration's partial workspace state is cleaned up by the rebuild's first dirty-workspace recovery pass.
-
-Chatops deliberately does NOT support `--immediate`: killing a running executor mid-iteration is a foot-loaded gun that should require SSH access. Operators wanting `--immediate` SSH to the daemon host and run the CLI.
-
-**What rebuild discards** — a caveat. The rebuild is "what would canonical look like if every archive had synced correctly the first time." It does NOT preserve:
-
-- `## Purpose` paragraphs hand-edited into canonical specs without an archived change introducing them. New capability spec files openspec creates from scratch get a placeholder Purpose (`TBD - created by archiving change <X>. Update Purpose after archive.`); operators replace those manually after the rebuild PR merges.
-- `### Requirement:` entries hand-added to canonical without an archive source. Anything not in the archive history is gone after rebuild.
-
-Review the rebuild PR's diff before merging; treat it like any other autocoder PR.
-
-## Perma-stuck change detection
-
-When an agent fails the same change two iterations in a row, autocoder marks it perma-stuck: writes a `.perma-stuck.json` marker inside the change directory, posts a chatops alert, and excludes the change from `list_pending` on every subsequent pass until the marker is removed manually. The threshold is `executor.perma_stuck_after_failures` (default `2`, minimum `1`).
-
-What counts as a failure:
-
-- The executor returns `Failed`.
-- The executor returns `Completed` but did not modify the workspace (no-op completion).
-- The executor returns `Completed` but only renamed the change directory into `archive/` (lazy archive).
-
-What does NOT count (transient infrastructure problems):
-
-- Workspace init / clone / fetch failure.
-- `openspec` preflight failure.
-- GitHub API transport errors.
-- A busy-marker stuck-state that skipped the iteration entirely.
-
-Per-repo counter state lives at `<workspace>/.failure-state.json` (registered in `.git/info/exclude` at workspace init so it never trips the pre-pass dirty check). Successfully archiving a change clears its counter entry; the next failure starts fresh from `1`.
-
-The marker file at `<workspace>/openspec/changes/<change>/.perma-stuck.json` has the schema:
-
-```json
-{
-  "change": "<change-name>",
-  "consecutive_failures": 2,
-  "last_reason": "...",
-  "marked_stuck_at": "RFC 3339 UTC timestamp",
-  "operator_action": "Delete this file to retry the change."
-}
-```
-
-The chatops alert names the repo, change, count, and a truncated `last_reason`, plus the marker file path. It is subject to the same 24-hour throttle as the predictable-failure alerts: repeat fix-test-fail cycles do not spam the channel. When no chatops backend is configured, the marker is still written and the change is still excluded — an ERROR log is the operator's only signal.
-
-To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
-
-**Queue-blocking behavior (a18).** A `.perma-stuck.json` marker does more than exclude the affected change: it ALSO halts the queue walk for subsequent pending changes in the same repository. This is the same blocking semantic that already applies to `.needs-spec-revision.json` and AskUser (`.question.json`) markers — the four marker categories that gate the queue are enumerated under [Queue-blocking policy](#queue-blocking-policy). The reason: stacked changes (the common autocoder pattern) frequently reference symbols a prior change introduces, so blasting through the queue after a perma-stuck would burn tokens against changes that cannot land.
-
-**Escape hatch: `ignore-and-continue`.** When the operator knows a particular perma-stuck (or needs-spec-revision) change is independent of its siblings — they happen to be on the same queue but don't depend on each other — they can run `@<bot> ignore-and-continue <repo> <change>` to stamp `.ignore-for-queue.json` alongside the underlying marker. The change stays excluded from `list_pending` (it's still broken), but siblings resume processing. Reverse with `@<bot> clear-ignore <repo> <change>`. Resolving the original problem with `@<bot> clear-perma-stuck <repo> <change>` removes BOTH files automatically. See [CHATOPS.md → operator recovery commands](CHATOPS.md#operator-recovery-commands) for verb syntax and example replies.
-
-See also [Spec marked as needing revision](#spec-marked-as-needing-revision) — its sibling pattern for the case where the operator (not the agent) is the one with work to do.
-
-## Queue-blocking policy
-
-autocoder treats the following per-change marker categories as queue-blocking — when any change in `openspec/changes/<slug>/` has one of these markers AND does NOT also have `.ignore-for-queue.json`, the polling loop halts the queue walk for the iteration:
-
-1. **`.question.json` (AskUser waiting).** The agent has posted a question to the operator and is awaiting a reply. Resumed via `@<bot> send it` or by replying in the chatops thread; cleared when the resume completes.
-2. **`.needs-spec-revision.json`.** Either the agent flagged unimplementable tasks OR the a17 pre-flight check rejected an unarchivable spec delta. Cleared via `@<bot> clear-revision <repo> <change>` (or by deleting the file directly).
-3. **`.perma-stuck.json`.** The change has hit `executor.perma_stuck_after_failures` consecutive failures. Cleared via `@<bot> clear-perma-stuck <repo> <change>` (which also removes any accompanying `.ignore-for-queue.json`).
-4. **Future extension markers.** Any new operator-action category future specs add SHOULD be added to this list AND honor the `.ignore-for-queue.json` downgrade contract.
-
-**Downgrade marker.** `.ignore-for-queue.json` accompanies any of the above and downgrades the change's blocking effect from "halt subsequent pending changes" to "still excluded from `list_pending` but siblings proceed." It is the operator's explicit "I know this one's broken; skip it AND keep going with the rest" signal — see [Perma-stuck change detection](#perma-stuck-change-detection) for the operator workflow and [CHATOPS.md](CHATOPS.md#operator-recovery-commands) for the verb syntax.
-
-## Spec marked as needing revision
-
-Sibling pattern to [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). Where perma-stuck signals "the agent kept failing on this change," needs-spec-revision signals "the spec is asking the agent to do something it cannot do." Both are operator-action states; both are cleared by deleting the marker file.
-
-**What triggers it.** Three independent code paths can write this marker:
-
-1. **Agent-detected unimplementable tasks.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` with `unimplementable_tasks` populated and halts the queue walk.
-
-2. **Pre-flight spec-delta archivability check (a17).** Before invoking the executor, autocoder parses each `specs/<capability>/spec.md` in the change and verifies every `## ADDED Requirements` / `## MODIFIED Requirements` / `## REMOVED Requirements` / `## RENAMED Requirements` block's `### Requirement:` headers against the canonical `openspec/specs/<capability>/spec.md`. The four delta kinds enforce: ADDED title must NOT exist in canonical (catching duplicate-add); MODIFIED title MUST exist (catching the a07 class of bug where an invented title was used); REMOVED title MUST exist; RENAMED `from:` title MUST exist, `to:` title MUST NOT exist. On any precondition violation, autocoder writes the marker with `unarchivable_deltas` populated, posts the chatops alert, and halts the queue — the executor is never invoked. **Principal cost savings:** no LLM call against a change whose deltas would abort `openspec archive` later anyway. The marker's `revision_suggestion` is auto-generated and names exactly which deltas need to be fixed.
-
-3. **Pre-flight change-internal contradiction check (a19; opt-in).** Where `a17` catches structural defects, the contradiction check catches semantic ones: a change whose requirements are individually well-formed AND archivable but contradict each other (e.g. ADDED A "all secrets in env vars" + ADDED B "API key in `config.yaml`"). The check runs a configurable LLM against the change's concatenated spec-delta files (small input → small cost, ~$0.01 per check at current pricing). Non-empty findings write the marker with `revision_suggestion` populated from the contradictions narrative — `unarchivable_deltas` AND `unimplementable_tasks` are left empty for this case because the issue is semantic, not mechanical. The check is **disabled by default**; operators trading the small per-change LLM cost for the catch enable it via `executor.change_internal_contradiction_check: enabled` AND `executor.change_internal_contradiction_check_llm`. Failures (network, parse, malformed response) fail OPEN — log a WARN AND proceed to the executor; the daemon does NOT gate work on a failed check. See [Pre-flight checks](#pre-flight-checks) for the full layered design.
-
-All three code paths share the same `AlertCategory::SpecNeedsRevision` throttle (24-hour, same as perma-stuck) and the same operator-clears-the-marker recovery shape. The marker schema accommodates any (or several) populations: `unimplementable_tasks` for the agent-detected path, `unarchivable_deltas` for the a17 pre-flight path, AND a free-form `revision_suggestion` carrying the contradictions narrative for the a19 path.
-
-The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves the project invariant that no AI process edits its own marching orders without human review.
-
-**The marker file** at `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` has the schema:
-
-```json
-{
-  "change": "<change-name>",
-  "marked_at": "RFC 3339 UTC timestamp",
-  "unimplementable_tasks": [
-    {"task_id": "5.2", "task_text": "...", "reason": "..."}
-  ],
-  "unarchivable_deltas": [
-    {"capability": "code-reviewer", "kind": "Modified", "header": "Reviewer prompt budget is operator-configurable", "reason": "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)"}
-  ],
-  "revision_suggestion": "free-form text describing what to change (auto-generated for the pre-flight path)",
-  "operator_action": "Edit openspec/changes/<change>/(tasks.md OR specs/<capability>/spec.md), commit + push, then clear this marker (via @<bot> clear-revision <repo> <change> or by deleting the file directly)."
-}
-```
-
-`unimplementable_tasks` and `unarchivable_deltas` are both optional (each elided from the JSON when empty). Pre-spec markers with only `unimplementable_tasks` continue to deserialize unchanged.
-
-The marker is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check and survives `git clean -fd` during per-iteration recovery (same treatment as `.perma-stuck.json`).
-
-**The chatops alert** lists each flagged task's id + text, the agent's revision suggestion, an operator-action checklist, and the marker file path + the per-change run log path. It is gated on `failure_alerts_enabled` and subject to the standard 24-hour per-category throttle.
-
-**Operator workflow.**
-
-1. Read the chatops alert. The flagged tasks and the agent's revision suggestion are in the body; the run log is named for deeper diagnosis if needed.
-2. Edit `openspec/changes/<change>/tasks.md` to remove or revise the flagged tasks. Commit + push to the base branch.
-3. Delete the marker file: `rm openspec/changes/<change>/.needs-spec-revision.json`. The next iteration picks the change back up.
-
-**False-positive escape hatch.** If you review the flagged tasks and decide the agent was overly conservative, delete the marker WITHOUT editing `tasks.md`. The change re-enters `list_pending` on the next iteration. If the agent flags the same task again, you can add a comment in `tasks.md` near it explaining why it's implementable (e.g. naming a tool path or workflow that resolves the concern), or update the implementer prompt template via a follow-up change to relax the relevant pattern.
-
-The marker is operator-cleared, not auto-cleared. autocoder does not remove it on the next iteration even when the spec has been revised — same rationale as the perma-stuck marker: the operator's audit trail is clearer when "did the issue actually get fixed?" requires an explicit human action.
-
-## Pre-flight checks
-
-Before invoking the executor on a pending change, autocoder runs a layered set of pre-flight checks. Each catches a different failure mode AND has a different cost; together they prevent the expensive-then-fail cycle of running the executor on a change that would have failed at archive time anyway.
-
-The checks run in order. A failure in any layer halts the queue walk for the iteration (writes `.needs-spec-revision.json` AND posts a chatops alert under `AlertCategory::SpecNeedsRevision`); the executor is never invoked.
-
-| Layer | Purpose | Cost | Opt-in | Failure mode |
-|---|---|---|---|---|
-| **1. `openspec validate --strict`** | Well-formedness — frontmatter present, sections named correctly, scenarios use proper `WHEN`/`THEN` structure, normative keywords (`SHALL` / `MUST` / `SHOULD`) appear. The change couldn't be loaded by `openspec` at all without passing this. | Free (mechanical, sub-millisecond) | Always on | The change is excluded from `list_pending` until the operator fixes the structural problem AND re-runs `openspec validate`. |
-| **2. Archivability check (a17)** | Mechanical structural check: each `## ADDED` / `## MODIFIED` / `## REMOVED` / `## RENAMED Requirements` block's `### Requirement:` header must satisfy its kind's precondition against the canonical `openspec/specs/<capability>/spec.md` (e.g. MODIFIED's title MUST exist; ADDED's title MUST NOT exist). Catches the a07 class of bug where an invented title was used. | Free (mechanical, sub-millisecond) | Always on | `.needs-spec-revision.json` written with `unarchivable_deltas` populated. Operator action: edit the spec deltas to match canonical AND clear the marker. See [Spec marked as needing revision](#spec-marked-as-needing-revision). |
-| **3. Change-internal contradiction check (a19)** | LLM-based semantic check: detects requirements within the same change that cannot all hold simultaneously (e.g. ADDED A "all secrets in env vars" + ADDED B "API key in `config.yaml`"). The LLM input is small (concatenated spec-delta files only); cost is **~$0.01 per checked change** at current pricing. | LLM call (~$0.01 per checked change) | Opt-in: `executor.change_internal_contradiction_check: enabled` + `executor.change_internal_contradiction_check_llm:` block | `.needs-spec-revision.json` written with `revision_suggestion` populated from the contradictions narrative (`unarchivable_deltas` AND `unimplementable_tasks` left empty for this semantic case). **Fail-OPEN posture:** LLM transport / parse / malformed-response failures log a WARN AND proceed to the executor; the daemon does NOT gate work on a failed check. Operators see the WARN cadence in journalctl AND decide whether to investigate. |
-
-**Opt-in posture for the contradiction check.** Initially shipped disabled because (a) the small per-change LLM cost is non-zero AND charged regardless of whether the check finds anything; (b) early operator experience may produce false positives — the gated rollout lets operators opt in when ready; (c) the prompt template needs iteration AND operators may want to override it for their domain.
-
-Operators trading a small per-change LLM cost for the catch of semantic self-contradictions enable it. Default-off operators see no behavior change.
-
-**Why fail-open for the contradiction check?** A flaky pre-flight should not block work. The same conservative bias applies as `a14`'s transient-failure handling: better to incur a redundant executor run than to halt the queue on a transient LLM outage. The WARN log lets operators investigate via journalctl AND decide whether to investigate further.
-
-## Self-heal for already-implemented changes
-
-When a rebase or merge lands the work for a change on the base branch without moving the change directory into `archive/`, the agent sees the implementation already done and returns `Completed` without modifying the workspace. Normally that's classified as Failed (no-op completion) and retried on every poll, burning tokens to re-confirm the same answer. autocoder self-heals this case instead:
-
-When the executor returns `Completed`, `git status --porcelain` is empty, `openspec validate <change> --strict` exits 0, AND every checkbox in `openspec/changes/<change>/tasks.md` is `[x]`, autocoder runs the archive move itself, commits it with subject `archive: <change>: implementation already in base`, and ships a PR through the normal push + PR flow.
-
-If any of the four preconditions fails — including `openspec validate` erroring or any task still `[ ]` — autocoder falls through to the existing Failed path, so non-self-heal cases retain their prior behavior.
-
-The PR body for a pass that self-healed one or more changes is prefixed with:
-
-> _This PR archives one or more changes whose implementation was already present on the base branch. No code diff is included; only the openspec archive move._
-
-The disclaimer identifies these passes for reviewers regardless of whether the pass also includes normally-implemented changes.
-
-## Skipping iterations while a PR is open
-
-Before each polling iteration begins its work, autocoder queries GitHub for open PRs whose `head` matches the configured agent branch (`<fork_owner>:<agent_branch>` in fork-PR mode, `<repo_owner>:<agent_branch>` in direct mode, base = the configured base branch). If an open PR is found, the iteration is skipped: no executor invocation, no commits, no push, no PR creation attempt. The skip persists until the open PR is closed or merged. This prevents the daemon from re-implementing the same changes on every poll while a PR sits awaiting review, which would otherwise force-push new commits over the PR's branch and burn agent tokens redundantly.
-
-To re-implement after rejecting a PR: close it (don't merge). The next poll proceeds. To accept the implementation: merge it; the archive moves land on the base branch and the changes drop out of `list_pending`.
-
-If the GitHub query itself fails (transport error, non-2xx), the iteration proceeds as if no PR existed — better to incur a redundant Claude run than to halt the repo on a flaky API. The failure is logged at WARN.
+This document is organized so day-to-day workflow content comes first, recovery flows next, configuration reference in the middle, and automatic-mechanism internals at the end. Use your markdown viewer's outline pane to jump to a section.
+
+- **Day-to-day operations** — periodic audits, on-demand audit triggers, PR-comment revisions.
+- **Recovery workflows** — perma-stuck changes, spec-needs-revision, queue-blocking policy, `rewind`.
+- **Operating the daemon** — runtime config reload, rebuilding canonical specs, workspace paths, multi-repo setup, polling cadence, queue order, startup preflight, fork-recreation policy.
+- **Internals & automatic recovery** — workspace-deleted recovery, partial-clone self-heal, dirty-workspace auto-recovery, busy marker, per-change run log shape, pre-flight checks, self-heal for already-implemented changes, skipping iterations while a PR is open, migrations.
 
 ## Periodic audits
 
@@ -552,91 +163,6 @@ Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, w
 
 **Standalone CLI mode.** When no daemon is running, `autocoder audit run` invokes the audit module directly against the named workspace and prints findings to stdout. This bypasses the daemon's scheduler entirely (no `pending_audit_runs` queue is involved) and is intended for prompt-template iteration during audit-prompt development — edit `prompts/<audit>.md`, run the CLI, observe, iterate.
 
-## Recovering from a bad run
-
-The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](CLI.md#rewind) below.
-
-## Dirty workspace auto-recovery
-
-If a workspace under `/tmp/workspaces/` is left dirty between polls (uncommitted edits, untracked files, or a checked-out branch other than the base), autocoder recovers automatically at the next startup or poll cycle: it checks out the configured `base_branch`, runs `git reset --hard origin/<base_branch>`, and runs `git clean -fd`. The repo then re-enters its normal polling loop. If recovery itself fails (e.g. the remote is unreachable), the repo is skipped for the daemon's lifetime and an error is logged — restart the daemon once the underlying problem is fixed.
-
-Recovery runs at two points in the lifecycle:
-
-1. **Startup** (`autocoder run` boot): every configured repo passes through `repo_passes_startup_check`. A dirty workspace at this point usually means a daemon restart after a previous run was killed mid-iteration. Recovery resets the workspace and the repo proceeds to normal polling; if recovery itself fails the repo is excluded for the process lifetime.
-2. **Per iteration** (`run_pass_through_commits` pre-pass check): a failed executor invocation that returned `Failed` or timed out without committing leaves tracked-file modifications behind. The next iteration's pre-pass dirty check runs the same recovery before the iteration's normal flow begins. On success the iteration proceeds and no operator notification fires. Only when recovery itself errors (or the workspace is somehow still dirty after the recovery commands complete) does autocoder post the `WorkspaceDirtyMidIteration` chatops alert and return the iteration as failed.
-
-Wholesale wiping of the workspace is safe at both points because the agent branch is rebuilt from base each iteration via `recreate_branch` — any local state the recovery destroys would have been overwritten anyway. The recovery does NOT touch the fork remote; it operates purely on the local working tree.
-
-**Mid-iteration recovery failures are classified transient vs. permanent.** Starting with `a14`, a recovery operation that fails during a poll (workspace re-init, `git fetch`, dirty cleanup) runs the returned `anyhow::Error` through `classify_recovery_failure`:
-
-- **Transient** — DNS resolution failures, `Connection timed out / refused / reset`, TLS handshake failures, "the remote end hung up", GitHub HTTP `5xx` (502, 503, 504, 522, 524), HTTP 401 / 403 (auth blip — recoverable by rotating the env-var-backed token and calling `autocoder reload` without restarting), HTTP 429 (rate limit), and `std::io::ErrorKind` values matching transport hiccups (`TimedOut`, `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`, `WouldBlock`). The iteration logs a WARN line tagged `class=transient`, fires the existing 24h-throttled chatops alert (see [CHATOPS.md → Throttled failure alerts](CHATOPS.md#throttled-failure-alerts-) for the suffix variants), and returns from the iteration. The next polling tick attempts the recovery again — no special backoff state is kept.
-- **Permanent** — configuration errors (missing required field, malformed YAML, no matching token route), missing required binaries (`openspec`, `git`, `claude` not on PATH), and the "remains dirty after recovery" branch (recovery commands all succeed but `git status --porcelain` is still non-empty). The iteration logs an ERROR line tagged `class=permanent`, fires the throttled alert with the operator-inspection suffix, and returns. Recovery on the next iteration will fail the same way, so the alert is the operator's signal to SSH in and investigate.
-
-Unclassified errors default to **transient** — the conservative choice is to retry, since operators have the chatops `🛑 perma-stuck` plus manual-skip escape hatches when a genuinely-permanent failure mis-classifies. The classification logic applies to **mid-iteration recovery only**; startup-time recovery (the initial `repo_passes_startup_check` pass) keeps its skip-for-lifetime contract for any failure — a future spec may extend classification there too.
-
-Operators who want to inspect a dirty workspace before any daemon action should stop the systemd unit first:
-
-```bash
-sudo systemctl stop autocoder
-# inspect /tmp/workspaces/<repo>/ at your leisure
-sudo systemctl start autocoder
-```
-
-## Runtime control: live config reload
-
-A running daemon exposes a Unix-domain control socket at `<system-temp>/autocoder/control/control.sock` (typically `/tmp/autocoder/control/control.sock` on Linux). The file is created on startup with mode `0600` and owned by the user running the daemon — only that user can connect. The socket file is removed at shutdown.
-
-The `autocoder reload` subcommand connects to the socket, sends `{"action":"reload"}`, and prints the daemon's response. The daemon re-reads the YAML config from the same path it was launched with, validates it (parse + workspace-collision + token-route checks), and either rejects the request or hot-applies the safe subset of changes.
-
-What gets hot-applied:
-
-- `github` — per-owner tokens, default `token_env`, `fork_owner`. Applied at the next iteration boundary for each repository.
-- `reviewer` — provider, model, API key, prompt template. In-flight reviews finish with the previous reviewer; subsequent reviews use the new one.
-- `chatops` — backend selection, default channel, notification flags. In-flight notifications finish with the previous backend; subsequent ones use the new one.
-- `repositories` — adding, removing, or modifying repositories in the list. New entries are spawned as fresh polling tasks (workspace setup, dirty-check, busy-marker — same as daemon startup). Removed entries get their per-repo cancellation token fired; the running task finishes its in-flight iteration normally (including push + PR) and exits at the next inter-poll sleep boundary. Modified entries hot-swap an `Arc<ArcSwap<RepositoryConfig>>` holder so the next iteration of that task reads the new `base_branch`, `agent_branch`, `poll_interval_sec`, `chatops_channel_id`, `local_path`, or `max_changes_per_pr`. The reload handler diffs the new list against the current task set by `url` — that field is the identity key. Changing the `url` of an existing entry is treated as `remove old_url + add new_url`. Reordering the list has no effect.
-
-What requires a full restart:
-
-- `executor` — only one executor instance exists, shared across tasks. Changes to `executor:` fields are reported under `requires_restart`.
-
-Response shape on success:
-
-```json
-{
-  "ok": true,
-  "applied": ["github", "reviewer", "repositories"],
-  "requires_restart": ["executor"],
-  "unchanged": ["chatops"],
-  "repositories_delta": {
-    "added": ["git@github.com:owner/repo-c.git"],
-    "removed": ["git@github.com:owner/repo-a.git"],
-    "changed": ["git@github.com:owner/repo-b.git"]
-  }
-}
-```
-
-`repositories_delta` is always present (the three arrays can each be empty) so client tooling has a consistent shape to parse. An entry only appears under one of `added` / `removed` / `changed` per reload.
-
-Validation rejection is non-disruptive: if the new YAML fails to parse or fails semantic validation, the daemon continues running with the previous in-memory config. The response is `{"ok": false, "error": "<message>"}` naming the failure, and the CLI exits non-zero. If the daemon is not running (or is running under a different user), the CLI prints an error naming the expected socket path and hinting at the cause.
-
-### Adding a repository at runtime
-
-To add a repository without restarting the daemon:
-
-1. Edit `config.yaml` (the path the daemon was launched with) and append the new entry under `repositories:`. Set its `url`, `base_branch`, `agent_branch`, and `poll_interval_sec` as usual.
-2. Run `sudo -u autocoder autocoder reload` from the same host. The CLI prints the daemon's response.
-3. Verify the response includes the new URL under `repositories_delta.added` and `"repositories"` appears in `applied`. The polling task is now running; it does workspace initialization on its first pass.
-
-The reverse (remove a repository) works the same way: delete the entry, reload, and the new URL appears under `repositories_delta.removed`. The cancelled task finishes its current iteration before exiting, so a removal during an active push or PR step completes cleanly.
-
-### In-flight iteration safety
-
-A repo cancelled mid-iteration finishes its in-flight pass normally. The cancellation check sits in the inter-poll `tokio::select!`, so the next poll never starts after the cancel — but the current one runs to completion. A modify-in-place is observed at the *next* iteration; the current iteration uses the old snapshot. Both rules eliminate mid-iteration tearing of `RepositoryConfig` fields.
-
-If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
-
----
-
 ## Revising an open PR via comment
 
 autocoder treats a PR comment of the form `@<bot> revise <free-text>` as a
@@ -693,6 +219,485 @@ See [Reviewer-initiated revisions on Block verdicts](CODE-REVIEW.md#reviewer-ini
 for the full reviewer-side flow, the per-concern decision the reviewer
 makes, and the operator-template migration steps for sites that have
 overridden the default reviewer prompt.
+
+## Perma-stuck change detection
+
+When an agent fails the same change two iterations in a row, autocoder marks it perma-stuck: writes a `.perma-stuck.json` marker inside the change directory, posts a chatops alert, and excludes the change from `list_pending` on every subsequent pass until the marker is removed manually. The threshold is `executor.perma_stuck_after_failures` (default `2`, minimum `1`).
+
+What counts as a failure:
+
+- The executor returns `Failed`.
+- The executor returns `Completed` but did not modify the workspace (no-op completion).
+- The executor returns `Completed` but only renamed the change directory into `archive/` (lazy archive).
+
+What does NOT count (transient infrastructure problems):
+
+- Workspace init / clone / fetch failure.
+- `openspec` preflight failure.
+- GitHub API transport errors.
+- A busy-marker stuck-state that skipped the iteration entirely.
+
+Per-repo counter state lives at `<workspace>/.failure-state.json` (registered in `.git/info/exclude` at workspace init so it never trips the pre-pass dirty check). Successfully archiving a change clears its counter entry; the next failure starts fresh from `1`.
+
+The marker file at `<workspace>/openspec/changes/<change>/.perma-stuck.json` has the schema:
+
+```json
+{
+  "change": "<change-name>",
+  "consecutive_failures": 2,
+  "last_reason": "...",
+  "marked_stuck_at": "RFC 3339 UTC timestamp",
+  "operator_action": "Delete this file to retry the change."
+}
+```
+
+The chatops alert names the repo, change, count, and a truncated `last_reason`, plus the marker file path. It is subject to the same 24-hour throttle as the predictable-failure alerts: repeat fix-test-fail cycles do not spam the channel. When no chatops backend is configured, the marker is still written and the change is still excluded — an ERROR log is the operator's only signal.
+
+To clear the marker: delete the file. The change re-enters `list_pending` on the next poll. If the underlying problem is not fixed, the change will fail twice more and be marked perma-stuck again (with the 24-hour alert throttle suppressing duplicate notifications inside the window).
+
+**Queue-blocking behavior (a18).** A `.perma-stuck.json` marker does more than exclude the affected change: it ALSO halts the queue walk for subsequent pending changes in the same repository. This is the same blocking semantic that already applies to `.needs-spec-revision.json` and AskUser (`.question.json`) markers — the four marker categories that gate the queue are enumerated under [Queue-blocking policy](#queue-blocking-policy). The reason: stacked changes (the common autocoder pattern) frequently reference symbols a prior change introduces, so blasting through the queue after a perma-stuck would burn tokens against changes that cannot land.
+
+**Escape hatch: `ignore-and-continue`.** When the operator knows a particular perma-stuck (or needs-spec-revision) change is independent of its siblings — they happen to be on the same queue but don't depend on each other — they can run `@<bot> ignore-and-continue <repo> <change>` to stamp `.ignore-for-queue.json` alongside the underlying marker. The change stays excluded from `list_pending` (it's still broken), but siblings resume processing. Reverse with `@<bot> clear-ignore <repo> <change>`. Resolving the original problem with `@<bot> clear-perma-stuck <repo> <change>` removes BOTH files automatically. See [CHATOPS.md → operator recovery commands](CHATOPS.md#operator-recovery-commands) for verb syntax and example replies.
+
+See also [Spec marked as needing revision](#spec-marked-as-needing-revision) — its sibling pattern for the case where the operator (not the agent) is the one with work to do.
+
+## Spec marked as needing revision
+
+Sibling pattern to [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). Where perma-stuck signals "the agent kept failing on this change," needs-spec-revision signals "the spec is asking the agent to do something it cannot do." Both are operator-action states; both are cleared by deleting the marker file.
+
+**What triggers it.** Three independent code paths can write this marker:
+
+1. **Agent-detected unimplementable tasks.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` with `unimplementable_tasks` populated and halts the queue walk.
+
+2. **Pre-flight spec-delta archivability check (a17).** Before invoking the executor, autocoder parses each `specs/<capability>/spec.md` in the change and verifies every `## ADDED Requirements` / `## MODIFIED Requirements` / `## REMOVED Requirements` / `## RENAMED Requirements` block's `### Requirement:` headers against the canonical `openspec/specs/<capability>/spec.md`. The four delta kinds enforce: ADDED title must NOT exist in canonical (catching duplicate-add); MODIFIED title MUST exist (catching the a07 class of bug where an invented title was used); REMOVED title MUST exist; RENAMED `from:` title MUST exist, `to:` title MUST NOT exist. On any precondition violation, autocoder writes the marker with `unarchivable_deltas` populated, posts the chatops alert, and halts the queue — the executor is never invoked. **Principal cost savings:** no LLM call against a change whose deltas would abort `openspec archive` later anyway. The marker's `revision_suggestion` is auto-generated and names exactly which deltas need to be fixed.
+
+3. **Pre-flight change-internal contradiction check (a19; opt-in).** Where `a17` catches structural defects, the contradiction check catches semantic ones: a change whose requirements are individually well-formed AND archivable but contradict each other (e.g. ADDED A "all secrets in env vars" + ADDED B "API key in `config.yaml`"). The check runs a configurable LLM against the change's concatenated spec-delta files (small input → small cost, ~$0.01 per check at current pricing). Non-empty findings write the marker with `revision_suggestion` populated from the contradictions narrative — `unarchivable_deltas` AND `unimplementable_tasks` are left empty for this case because the issue is semantic, not mechanical. The check is **disabled by default**; operators trading the small per-change LLM cost for the catch enable it via `executor.change_internal_contradiction_check: enabled` AND `executor.change_internal_contradiction_check_llm`. Failures (network, parse, malformed response) fail OPEN — log a WARN AND proceed to the executor; the daemon does NOT gate work on a failed check. See [Pre-flight checks](#pre-flight-checks) for the full layered design.
+
+All three code paths share the same `AlertCategory::SpecNeedsRevision` throttle (24-hour, same as perma-stuck) and the same operator-clears-the-marker recovery shape. The marker schema accommodates any (or several) populations: `unimplementable_tasks` for the agent-detected path, `unarchivable_deltas` for the a17 pre-flight path, AND a free-form `revision_suggestion` carrying the contradictions narrative for the a19 path.
+
+The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves the project invariant that no AI process edits its own marching orders without human review.
+
+**The marker file** at `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` has the schema:
+
+```json
+{
+  "change": "<change-name>",
+  "marked_at": "RFC 3339 UTC timestamp",
+  "unimplementable_tasks": [
+    {"task_id": "5.2", "task_text": "...", "reason": "..."}
+  ],
+  "unarchivable_deltas": [
+    {"capability": "code-reviewer", "kind": "Modified", "header": "Reviewer prompt budget is operator-configurable", "reason": "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)"}
+  ],
+  "revision_suggestion": "free-form text describing what to change (auto-generated for the pre-flight path)",
+  "operator_action": "Edit openspec/changes/<change>/(tasks.md OR specs/<capability>/spec.md), commit + push, then clear this marker (via @<bot> clear-revision <repo> <change> or by deleting the file directly)."
+}
+```
+
+`unimplementable_tasks` and `unarchivable_deltas` are both optional (each elided from the JSON when empty). Pre-spec markers with only `unimplementable_tasks` continue to deserialize unchanged.
+
+The marker is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check and survives `git clean -fd` during per-iteration recovery (same treatment as `.perma-stuck.json`).
+
+**The chatops alert** lists each flagged task's id + text, the agent's revision suggestion, an operator-action checklist, and the marker file path + the per-change run log path. It is gated on `failure_alerts_enabled` and subject to the standard 24-hour per-category throttle.
+
+**Operator workflow.**
+
+1. Read the chatops alert. The flagged tasks and the agent's revision suggestion are in the body; the run log is named for deeper diagnosis if needed.
+2. Edit `openspec/changes/<change>/tasks.md` to remove or revise the flagged tasks. Commit + push to the base branch.
+3. Delete the marker file: `rm openspec/changes/<change>/.needs-spec-revision.json`. The next iteration picks the change back up.
+
+**False-positive escape hatch.** If you review the flagged tasks and decide the agent was overly conservative, delete the marker WITHOUT editing `tasks.md`. The change re-enters `list_pending` on the next iteration. If the agent flags the same task again, you can add a comment in `tasks.md` near it explaining why it's implementable (e.g. naming a tool path or workflow that resolves the concern), or update the implementer prompt template via a follow-up change to relax the relevant pattern.
+
+The marker is operator-cleared, not auto-cleared. autocoder does not remove it on the next iteration even when the spec has been revised — same rationale as the perma-stuck marker: the operator's audit trail is clearer when "did the issue actually get fixed?" requires an explicit human action.
+
+## Queue-blocking policy
+
+autocoder treats the following per-change marker categories as queue-blocking — when any change in `openspec/changes/<slug>/` has one of these markers AND does NOT also have `.ignore-for-queue.json`, the polling loop halts the queue walk for the iteration:
+
+1. **`.question.json` (AskUser waiting).** The agent has posted a question to the operator and is awaiting a reply. Resumed via `@<bot> send it` or by replying in the chatops thread; cleared when the resume completes.
+2. **`.needs-spec-revision.json`.** Either the agent flagged unimplementable tasks OR the a17 pre-flight check rejected an unarchivable spec delta. Cleared via `@<bot> clear-revision <repo> <change>` (or by deleting the file directly).
+3. **`.perma-stuck.json`.** The change has hit `executor.perma_stuck_after_failures` consecutive failures. Cleared via `@<bot> clear-perma-stuck <repo> <change>` (which also removes any accompanying `.ignore-for-queue.json`).
+4. **Future extension markers.** Any new operator-action category future specs add SHOULD be added to this list AND honor the `.ignore-for-queue.json` downgrade contract.
+
+**Downgrade marker.** `.ignore-for-queue.json` accompanies any of the above and downgrades the change's blocking effect from "halt subsequent pending changes" to "still excluded from `list_pending` but siblings proceed." It is the operator's explicit "I know this one's broken; skip it AND keep going with the rest" signal — see [Perma-stuck change detection](#perma-stuck-change-detection) for the operator workflow and [CHATOPS.md](CHATOPS.md#operator-recovery-commands) for the verb syntax.
+
+## Recovering from a bad run
+
+The `rewind` subcommand discards the in-flight agent branch and re-queues one or more archived changes. See [CLI Reference → rewind](CLI.md#rewind) below.
+
+## Runtime control: live config reload
+
+A running daemon exposes a Unix-domain control socket at `<system-temp>/autocoder/control/control.sock` (typically `/tmp/autocoder/control/control.sock` on Linux). The file is created on startup with mode `0600` and owned by the user running the daemon — only that user can connect. The socket file is removed at shutdown.
+
+The `autocoder reload` subcommand connects to the socket, sends `{"action":"reload"}`, and prints the daemon's response. The daemon re-reads the YAML config from the same path it was launched with, validates it (parse + workspace-collision + token-route checks), and either rejects the request or hot-applies the safe subset of changes.
+
+What gets hot-applied:
+
+- `github` — per-owner tokens, default `token_env`, `fork_owner`. Applied at the next iteration boundary for each repository.
+- `reviewer` — provider, model, API key, prompt template. In-flight reviews finish with the previous reviewer; subsequent reviews use the new one.
+- `chatops` — backend selection, default channel, notification flags. In-flight notifications finish with the previous backend; subsequent ones use the new one.
+- `repositories` — adding, removing, or modifying repositories in the list. New entries are spawned as fresh polling tasks (workspace setup, dirty-check, busy-marker — same as daemon startup). Removed entries get their per-repo cancellation token fired; the running task finishes its in-flight iteration normally (including push + PR) and exits at the next inter-poll sleep boundary. Modified entries hot-swap an `Arc<ArcSwap<RepositoryConfig>>` holder so the next iteration of that task reads the new `base_branch`, `agent_branch`, `poll_interval_sec`, `chatops_channel_id`, `local_path`, or `max_changes_per_pr`. The reload handler diffs the new list against the current task set by `url` — that field is the identity key. Changing the `url` of an existing entry is treated as `remove old_url + add new_url`. Reordering the list has no effect.
+
+What requires a full restart:
+
+- `executor` — only one executor instance exists, shared across tasks. Changes to `executor:` fields are reported under `requires_restart`.
+
+Response shape on success:
+
+```json
+{
+  "ok": true,
+  "applied": ["github", "reviewer", "repositories"],
+  "requires_restart": ["executor"],
+  "unchanged": ["chatops"],
+  "repositories_delta": {
+    "added": ["git@github.com:owner/repo-c.git"],
+    "removed": ["git@github.com:owner/repo-a.git"],
+    "changed": ["git@github.com:owner/repo-b.git"]
+  }
+}
+```
+
+`repositories_delta` is always present (the three arrays can each be empty) so client tooling has a consistent shape to parse. An entry only appears under one of `added` / `removed` / `changed` per reload.
+
+Validation rejection is non-disruptive: if the new YAML fails to parse or fails semantic validation, the daemon continues running with the previous in-memory config. The response is `{"ok": false, "error": "<message>"}` naming the failure, and the CLI exits non-zero. If the daemon is not running (or is running under a different user), the CLI prints an error naming the expected socket path and hinting at the cause.
+
+### Adding a repository at runtime
+
+To add a repository without restarting the daemon:
+
+1. Edit `config.yaml` (the path the daemon was launched with) and append the new entry under `repositories:`. Set its `url`, `base_branch`, `agent_branch`, and `poll_interval_sec` as usual.
+2. Run `sudo -u autocoder autocoder reload` from the same host. The CLI prints the daemon's response.
+3. Verify the response includes the new URL under `repositories_delta.added` and `"repositories"` appears in `applied`. The polling task is now running; it does workspace initialization on its first pass.
+
+The reverse (remove a repository) works the same way: delete the entry, reload, and the new URL appears under `repositories_delta.removed`. The cancelled task finishes its current iteration before exiting, so a removal during an active push or PR step completes cleanly.
+
+### In-flight iteration safety
+
+A repo cancelled mid-iteration finishes its in-flight pass normally. The cancellation check sits in the inter-poll `tokio::select!`, so the next poll never starts after the cancel — but the current one runs to completion. A modify-in-place is observed at the *next* iteration; the current iteration uses the old snapshot. Both rules eliminate mid-iteration tearing of `RepositoryConfig` fields.
+
+If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
+
+## Rebuilding canonical specs from archive history
+
+`openspec/specs/<capability>/spec.md` is rebuilt by the host's openspec install whenever an archived change has the `openspec sync` workflow enabled at archive time. When a repository was archived from a host without that workflow (or before that workflow existed), the canonical specs drift from what the archive history actually says. Symptoms: the archive contains 30 `## ADDED Requirements` blocks, but the canonical spec is missing 25 of them.
+
+autocoder ships a full rebuild path for that case. Incremental backfill is intentionally unsupported — when drift is mid-history (an earlier change was never synced but later changes were), re-applying the skipped change onto the current canonical produces an incorrect end state. Full rebuild from scratch is the only safe answer.
+
+**When to use rebuild.** When you onboard a repo that was archive-driven from a host without `openspec sync`, when `git diff openspec/specs/` after a successful archive shows nothing despite the change adding requirements, or when `openspec list` and the on-disk canonical specs disagree on capability content.
+
+**CLI invocation** (against a local clone — no daemon required):
+
+```bash
+autocoder sync-specs --rebuild --workspace /path/to/repo
+```
+
+This iterates every archived change in chronological order, replays it via `openspec archive`, and preserves each archive's original date prefix via in-place rename. The CLI prints a summary listing successful and failed changes plus a modified-vs-unchanged tally for every canonical spec file. Exit code is non-zero if any archive failed to re-archive.
+
+**Chatops invocation** (for daemon-managed repos):
+
+```
+@<bot> rebuild-specs <repo-substring>
+```
+
+This submits a `RebuildSpecs` action to the control socket, which sets a `pending_rebuild` flag on the named repo's polling task. The next iteration runs the rebuild instead of the normal queue walk. The rebuild's commits land on the agent branch via the existing push + PR flow; the PR title is `spec rebuild: <N> capability(ies) rebuilt from archive history` so operators can recognize it at a glance.
+
+When the rebuild iteration finishes, the bot posts one of three chatops messages:
+
+- `✓ rebuild complete for <repo>: PR <url> opened — <N> capability(ies) updated from <M> archived change(s)` (success with drift)
+- `✓ rebuild complete for <repo>: no drift detected, canonical specs already in sync` (success no drift)
+- `⚠️ rebuild for <repo> completed with <N> failure(s); ...` (partial failure)
+
+The completion notification fires regardless of `chatops.notifications.pr_opened` or `failure_alerts` — it is the operator's direct response to a command they issued, so they always get the completion signal.
+
+**The `--immediate` flag** (CLI only — never exposed via chatops):
+
+```bash
+autocoder sync-specs --rebuild --immediate --workspace /path/to/repo
+```
+
+Without `--immediate`, the CLI waits politely for the current iteration to release the busy marker before starting. With `--immediate`, the CLI sends `SIGTERM` to the executor subprocess (via the busy marker's recorded PID), waits up to 30 seconds for cleanup, and runs the rebuild even if the iteration was mid-flight. The cancelled iteration's partial workspace state is cleaned up by the rebuild's first dirty-workspace recovery pass.
+
+Chatops deliberately does NOT support `--immediate`: killing a running executor mid-iteration is a foot-loaded gun that should require SSH access. Operators wanting `--immediate` SSH to the daemon host and run the CLI.
+
+**What rebuild discards** — a caveat. The rebuild is "what would canonical look like if every archive had synced correctly the first time." It does NOT preserve:
+
+- `## Purpose` paragraphs hand-edited into canonical specs without an archived change introducing them. New capability spec files openspec creates from scratch get a placeholder Purpose (`TBD - created by archiving change <X>. Update Purpose after archive.`); operators replace those manually after the rebuild PR merges.
+- `### Requirement:` entries hand-added to canonical without an archive source. Anything not in the archive history is gone after rebuild.
+
+Review the rebuild PR's diff before merging; treat it like any other autocoder PR.
+
+## Workspace path derivation
+
+If a repository entry omits `local_path`, the workspace path is derived deterministically from the URL:
+
+1. Strip the protocol prefix (`git@`, `ssh://`, `https://`, `http://`).
+2. Strip a trailing `.git`.
+3. Replace any character that is not ASCII alphanumeric, `_`, or `-` with `_`.
+4. Prepend `/tmp/workspaces/`.
+
+`git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both map to `/tmp/workspaces/github_com_owner_repo`. At startup, autocoder runs a collision check: if two configured repositories resolve to the same workspace path (whether by derivation or by explicit `local_path`), the process exits non-zero before spawning any polling tasks. Set `local_path` explicitly to disambiguate.
+
+## Multi-repo setup
+
+`repositories:` accepts any number of entries. autocoder spawns one polling task per entry, each on its own `poll_interval_sec`. Per-repo state is fully independent: an iteration failure on repo A does not affect repo B; a ChatOps escalation on repo A blocks A's pending queue but does not touch B.
+
+```yaml
+repositories:
+  - url: "git@github.com:my-org/auth-service.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+
+  - url: "git@github.com:my-org/web-dashboard.git"
+    base_branch: dev
+    agent_branch: agent-q
+    poll_interval_sec: 3600
+```
+
+## Polling cadence and your firewall
+
+When autocoder spawns ≥5 polling tasks at process start, the simultaneous `git fetch` operations from a single source IP can look like a port scan or scraper to network IDS — one operator reported their IDS killing SSH connections the moment the daemon tried to poll 8–9 repos at once. Even without an IDS, tasks that all share the same `poll_interval_sec` (e.g. the default `300`) drift only marginally across iterations because `git fetch` dominates each iteration's wall-clock, so they tend to re-cluster over time.
+
+Two defaults defuse this:
+
+- `executor.startup_jitter_max_secs` (default `30`) — each task waits a uniformly-random `[0, 30]` seconds before its first iteration, smearing the first round of fetches across a 30 s window.
+- `executor.inter_iteration_jitter_pct` (default `10`) — each inter-iteration sleep is `poll_interval_sec ± 10%`, so tasks that briefly synchronize drift apart again on the next cycle.
+
+Both jitters cost almost nothing in wall-clock and respect SIGTERM/SIGINT (cancellation is observed within 200 ms during either sleep). Operators on isolated networks who prefer deterministic timing can set both to `0`. Operators who want a wider window — say, after seeing IDS alerts even with the defaults — can raise `startup_jitter_max_secs` to something like `120` or `300`.
+
+## Queue order
+
+Pending changes are processed in ascending entry-name order (UTF-8 byte order, which is alphabetical for ASCII names). Operators with stacked dependencies — i.e. change N+1 depends on change N — encode order explicitly by prefixing change names with a letter+number tag: `a01-rename-foo`, `a02-extract-bar`, `a03-wire-baz`. The prefix is the operator's contract for "this change depends on the previous in sequence." For a second unrelated stack, use a different letter group (`b01-`, `b02-`). For unrelated single changes, no prefix is needed; alphabetical order is arbitrary but deterministic.
+
+Note: OpenSpec rejects change names that start with a digit. Plain `01-`/`02-` prefixes will fail at the prompt-building step (`openspec instructions apply --change <name>` returns "Invalid change name"). Always start with a letter.
+
+Each iteration commits at most `max_changes_per_pr` archived changes (default `3`); any remaining pending changes wait for the next iteration. The cap is configurable per repository, or globally via `executor.max_changes_per_pr`. A long queue therefore ships as several reviewable PRs over time rather than one large PR.
+
+A change that fails (or escalates to chatops) halts the queue walk for that iteration; remaining pending changes wait for the next iteration. This preserves the stacked-dependency assumption behind authoring-order processing: change N+1 may depend on change N having succeeded, so the bot does not attempt N+1 while N is unfixed. A persistently-failing change accumulates failure-counter increments and hits perma-stuck (default after 2 consecutive failures), at which point it drops out of `list_pending` and the queue resumes at N+1.
+
+## Startup preflight
+
+At startup, `autocoder run` invokes `openspec --version` once. If the binary is not on the daemon's PATH or exits non-zero, the daemon exits non-zero before any polling task is spawned. The stderr message names the failure (binary not found, non-zero exit code, etc.). This means a misconfigured deployment surfaces at startup rather than producing empty iterations.
+
+If you see `openspec preflight failed: binary not found on PATH`, add the install directory to the systemd unit's `Environment="PATH=..."` line (see [Deployment](DEPLOYMENT.md)).
+
+## Fork recreation on workspace reinitialization
+
+The default workspace-deleted recovery (see [Workspace directory deleted](#workspace-directory-deleted)) preserves whatever state lives on the fork. That is the right behavior when you have open PRs from that fork — losing their head refs would close the PRs. But the same preservation is a liability when the fork has accumulated stale branches no one cares about, or when the fork's state is genuinely worthless and you'd rather start from a pristine mirror of upstream.
+
+Set `github.recreate_fork_on_reinit: true` to opt in to the destructive recovery path. When that flag is enabled AND fork-PR mode is active AND the workspace directory is absent at iteration start, autocoder:
+
+1. Calls `DELETE /repos/<fork_owner>/<repo>` against the GitHub API to delete the fork.
+2. Waits 2 seconds for the deletion to propagate.
+3. Calls `POST /repos/<upstream_owner>/<repo>/forks` to re-fork from upstream.
+4. Polls the new fork's URL via `git ls-remote` for up to 30 seconds until reachable.
+5. Proceeds with the normal clone + fork-remote registration.
+
+After a successful re-fork, autocoder posts a one-line chatops notification:
+
+> :warning: \`<repo>\`: re-forked at workspace reinitialization (previous fork deleted; any open PRs from this fork are now closed)
+
+The notification is gated by the same `chatops.notifications.failure_alerts` toggle as the other operator-visible failure alerts.
+
+Requirements:
+
+- The operator's PAT must include the `delete_repo` scope. Without it, the DELETE returns 403, autocoder logs an ERROR naming the missing scope, and falls back to the conservative non-recreating init path (clone + fetch fork). The iteration still makes progress; the fork is unchanged.
+- The flag is global on the `github:` block, not per-repository — all configured repos in a single autocoder process share the same fork owner, and the fork-recreation policy is uniform across them.
+
+Defaults to `false`. With the default, the workspace-deleted recovery preserves fork state (see [Workspace directory deleted](#workspace-directory-deleted)).
+
+## Workspace directory deleted
+
+If a workspace directory under `/tmp/workspaces/` is removed while autocoder is running (or while stopped), the daemon's next iteration treats this as a fresh-clone case: it clones upstream into the path again. In fork-PR mode it also fetches ONLY the configured agent branch from the `fork` remote at that time (via `git fetch fork +refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>`) so the local `refs/remotes/fork/<agent_branch>` tracking ref reflects the fork's actual state. Without that fetch the next `git push --force-with-lease fork <agent_branch>` would compare an empty local tracking value against the fork's existing commits and reject with `! [rejected] <agent_branch> -> <agent_branch> (stale info)`, leaving the daemon stuck. The fetch deliberately restricts itself to one branch: a wholesale `git fetch fork` would populate `refs/remotes/fork/<every-branch>`, and if any fork branch shadows an upstream name (e.g. both `origin/dev` and `fork/dev` exist), the next `git checkout <base_branch>` would fail with `fatal: 'dev' matched multiple (2) remote tracking branches`. The post-clone fork fetch is best-effort: if it fails (network blip, fork doesn't yet exist, agent branch doesn't yet exist on the fork), the daemon proceeds and the next push will surface any real divergence via the existing branch-push-failure alert.
+
+## Partial-clone self-heal
+
+When a `git clone` is interrupted mid-flight (network drop, signal, transient auth blip), git leaves the destination directory created but without a `.git/` subdirectory. Previously this state hard-stuck the daemon — every subsequent iteration logged `workspace path exists but is not a git repository (no .git directory): <path>` and never attempted recovery; the only way out was an operator-side `rm -rf`.
+
+The daemon now auto-recovers. When `workspace::ensure_initialized` detects that the workspace path exists AND has no `.git/`, it runs a safety check, deletes the partial directory, and re-attempts the clone as if the workspace had never existed. If the re-clone succeeds, the iteration proceeds normally; if it fails, the returned error carries the real clone failure (auth, network, etc.) — operators see the actual cause in journalctl and in any chatops `WorkspaceInitFailure` alert, rather than the misleading secondary detection.
+
+**WARN log line.** Each auto-cleanup emits exactly one WARN naming the workspace path, the repo URL, and the action:
+
+```
+WARN workspace=/path/to/ws repo=<url> workspace exists without .git; partial clone artifact detected. Deleting and re-cloning.
+```
+
+**Safety-check tripwires.** Before deleting, the daemon refuses auto-cleanup if the partial directory contains any of:
+
+- `.in-progress*` lock files at any depth (would suggest an active iteration somehow racing this path).
+- `openspec/changes/<slug>/.perma-stuck.json` or `openspec/changes/<slug>/.needs-spec-revision.json` at any depth (operator-managed markers that survived a previous successful clone).
+- `openspec/changes/<slug>/.question.json` or `openspec/changes/<slug>/.answer.json` (AskUser markers).
+
+When a tripwire fires, the daemon returns the original "exists but no `.git`" error extended with `(partial cleanup refused: <tripwire>; manual operator inspection required)` and the directory is NOT deleted. Operators inspect the directory and decide manually. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the manual recovery flow.
+
+**Not a tripwire:** a stray `.alert-state.json` at the workspace root. As of `a16-consolidate-workspace-bookkeeping-to-state-dir`, alert-throttle state lives at `<state_dir>/alert-state/<workspace-basename>.json` and the workspace SHOULD NOT contain the file at all. If a transient copy appears (e.g. fresh re-clone of a repo whose history transiently committed it before the migration completed), the workspace-init invariant check removes it; destroying it manually is also harmless.
+
+**Re-clone failure classification.** When the re-clone itself fails (the actual transport call after the partial-cleanup decision), the surfaced error feeds into the same mid-iteration classifier described under [Dirty workspace auto-recovery](#dirty-workspace-auto-recovery): transient (network blip, GitHub `5xx`, auth token blip) retries on the next polling tick with a throttled alert, while permanent (config error, missing binary) skips the iteration and fires the operator-inspection alert. See [CHATOPS.md → Throttled failure alerts](CHATOPS.md#throttled-failure-alerts-) for the alert text variants.
+
+## Dirty workspace auto-recovery
+
+If a workspace under `/tmp/workspaces/` is left dirty between polls (uncommitted edits, untracked files, or a checked-out branch other than the base), autocoder recovers automatically at the next startup or poll cycle: it checks out the configured `base_branch`, runs `git reset --hard origin/<base_branch>`, and runs `git clean -fd`. The repo then re-enters its normal polling loop. If recovery itself fails (e.g. the remote is unreachable), the repo is skipped for the daemon's lifetime and an error is logged — restart the daemon once the underlying problem is fixed.
+
+Recovery runs at two points in the lifecycle:
+
+1. **Startup** (`autocoder run` boot): every configured repo passes through `repo_passes_startup_check`. A dirty workspace at this point usually means a daemon restart after a previous run was killed mid-iteration. Recovery resets the workspace and the repo proceeds to normal polling; if recovery itself fails the repo is excluded for the process lifetime.
+2. **Per iteration** (`run_pass_through_commits` pre-pass check): a failed executor invocation that returned `Failed` or timed out without committing leaves tracked-file modifications behind. The next iteration's pre-pass dirty check runs the same recovery before the iteration's normal flow begins. On success the iteration proceeds and no operator notification fires. Only when recovery itself errors (or the workspace is somehow still dirty after the recovery commands complete) does autocoder post the `WorkspaceDirtyMidIteration` chatops alert and return the iteration as failed.
+
+Wholesale wiping of the workspace is safe at both points because the agent branch is rebuilt from base each iteration via `recreate_branch` — any local state the recovery destroys would have been overwritten anyway. The recovery does NOT touch the fork remote; it operates purely on the local working tree.
+
+**Mid-iteration recovery failures are classified transient vs. permanent.** Starting with `a14`, a recovery operation that fails during a poll (workspace re-init, `git fetch`, dirty cleanup) runs the returned `anyhow::Error` through `classify_recovery_failure`:
+
+- **Transient** — DNS resolution failures, `Connection timed out / refused / reset`, TLS handshake failures, "the remote end hung up", GitHub HTTP `5xx` (502, 503, 504, 522, 524), HTTP 401 / 403 (auth blip — recoverable by rotating the env-var-backed token and calling `autocoder reload` without restarting), HTTP 429 (rate limit), and `std::io::ErrorKind` values matching transport hiccups (`TimedOut`, `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`, `WouldBlock`). The iteration logs a WARN line tagged `class=transient`, fires the existing 24h-throttled chatops alert (see [CHATOPS.md → Throttled failure alerts](CHATOPS.md#throttled-failure-alerts-) for the suffix variants), and returns from the iteration. The next polling tick attempts the recovery again — no special backoff state is kept.
+- **Permanent** — configuration errors (missing required field, malformed YAML, no matching token route), missing required binaries (`openspec`, `git`, `claude` not on PATH), and the "remains dirty after recovery" branch (recovery commands all succeed but `git status --porcelain` is still non-empty). The iteration logs an ERROR line tagged `class=permanent`, fires the throttled alert with the operator-inspection suffix, and returns. Recovery on the next iteration will fail the same way, so the alert is the operator's signal to SSH in and investigate.
+
+Unclassified errors default to **transient** — the conservative choice is to retry, since operators have the chatops `🛑 perma-stuck` plus manual-skip escape hatches when a genuinely-permanent failure mis-classifies. The classification logic applies to **mid-iteration recovery only**; startup-time recovery (the initial `repo_passes_startup_check` pass) keeps its skip-for-lifetime contract for any failure — a future spec may extend classification there too.
+
+Operators who want to inspect a dirty workspace before any daemon action should stop the systemd unit first:
+
+```bash
+sudo systemctl stop autocoder
+# inspect /tmp/workspaces/<repo>/ at your leisure
+sudo systemctl start autocoder
+```
+
+## Busy marker
+
+At the start of each polling iteration, autocoder writes a per-repo JSON marker at `/tmp/autocoder/busy/<workspace-basename>.json` and holds it through every stage of the pass (executor → review → push → PR). The marker is removed when the pass returns normally. A daemon crash that bypasses normal cleanup (SIGKILL, segfault, host power loss) intentionally leaves the marker for the next pass to discover.
+
+Marker contents: `repo_url`, `pid`, `pgid` (Linux process group for `killpg` recovery), `comm` (process name from `/proc/<pid>/comm` at acquire time), `started_at`, and `stage` (one of `executor`, `commit`, `review`, `push`, `pr`).
+
+On the next iteration's startup, autocoder classifies any pre-existing marker in this order — the first matching row wins:
+
+| Marker state | Action |
+|---|---|
+| File absent | Acquire, run iteration |
+| Malformed JSON | Treat as stale: WARN log, clear marker, proceed |
+| **PID dead** (recorded `pid` not in `/proc`) | **Auto-recover IMMEDIATELY: clear marker, WARN log, proceed. NO age check** — a pid that no longer exists cannot be doing legitimate work |
+| Age < `executor.busy_marker_stale_threshold_secs`, PID alive | Skip iteration with INFO log (`age=… threshold=… pid_alive=true recovery_eligible=false`) — another pass is working |
+| Age ≥ threshold, PID alive + `comm` matches | Stuck: `SIGTERM` the process group, wait 5s, `SIGKILL` if still alive, clear marker, post chatops alert, proceed |
+| Age ≥ threshold, PID alive + `comm` differs | Ambiguous (PID reuse suspected) — ERROR log, post chatops alert, SKIP iteration, leave marker for human inspection |
+
+The stale-threshold is a dedicated `executor.busy_marker_stale_threshold_secs` config field (default `600` seconds = 10 minutes, max `7200` clamped with a WARN). It is **decoupled** from `executor.timeout_secs` — raising the executor timeout for one legitimately long-running change does NOT proportionally delay stale-marker recovery on unrelated iterations.
+
+Pre-`a08-busy-marker-recovery-semantics` builds derived the threshold as `executor.timeout_secs + 600`, which had two problems: (1) a daemon killed mid-iteration left a dead-pid marker that the next pass refused to recover until the derived threshold elapsed (51+ minute production incidents); (2) bumping `timeout_secs` for one stubborn change silently delayed stale-marker recovery on all other iterations. Both are fixed: dead-pid markers recover immediately, and the live-pid stale threshold is now a separate operator-controlled field.
+
+When a daemon upgrades to a build that ships this fix AND the operator has NOT set `busy_marker_stale_threshold_secs` explicitly AND the pre-spec implicit threshold (`timeout_secs + 600`) would have been longer than the new default, the daemon emits one INFO line at startup naming both values:
+
+```
+busy marker stale threshold is now 600s (was implicit 6000s via timeout_secs+10min). \
+Pre-spec operators raising timeout_secs no longer see proportional recovery delays. \
+Set executor.busy_marker_stale_threshold_secs explicitly to override.
+```
+
+Operators who genuinely need the longer threshold (executor expected to legitimately not check in for >10 min) set the field in `config.yaml`:
+
+```yaml
+executor:
+  timeout_secs: 5400
+  busy_marker_stale_threshold_secs: 5500
+```
+
+The INFO line emitted when an existing marker is skipped now carries the marker's age, the resolved threshold, the PID-alive state, and a `recovery_eligible` boolean — operators reading `journalctl` see the diagnostic state inline:
+
+```
+INFO busy marker present; skipping iteration url=git@github.com:owner/repo.git pid=490170 \
+     stage=executor age=53m threshold=10m pid_alive=false recovery_eligible=true
+```
+
+Operators inspecting the file:
+```bash
+sudo -u autocoder cat /tmp/autocoder/busy/<basename>.json
+```
+
+To force a recovery from a stuck state, stop the systemd unit, delete the marker file, and start the unit again:
+```bash
+sudo systemctl stop autocoder
+sudo -u autocoder rm /tmp/autocoder/busy/<basename>.json
+sudo systemctl start autocoder
+```
+
+The per-change run logs (`<logs_dir>/runs/<basename>/<change>.log`) and the busy markers share the same daemon-paths root.
+
+If you're seeing operator-visible inconsistencies between writers and readers (`status` says idle while the busy marker exists; `send it` returns `?` on a real audit thread), check `journalctl` AND the resolved paths the daemon is using — this class of bug is prevented going forward by the `path_literals_audit` CI test introduced in `a09`, which fails the build on any new hard-coded `/tmp/autocoder/` literal in `autocoder/src/`. See [`docs/STATE-LAYOUT.md`](STATE-LAYOUT.md#path-resolution-rule) for the resolver-only rule.
+
+## Per-change run log shape
+
+Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/<change>.log`. The default shape (with `executor.output_format: json`) splits the log into four sections so operators can quickly judge what the agent was doing without scrolling through the raw JSON event stream:
+
+```
+=== PROMPT (<n> bytes) ===
+<the full prompt sent to the wrapped Claude CLI>
+
+=== ACTIONS ===
+[tool_use] Read autocoder/src/foo.rs
+[tool_result] (4128 bytes returned)
+[tool_use] Edit autocoder/src/foo.rs
+[tool_result] (200 bytes returned)
+[assistant] I've identified the issue in line 42 and applied the fix.
+[tool_use] Bash cargo test --lib
+[tool_result] (1024 bytes returned)
+...
+
+=== FINAL ANSWER (<n> bytes) ===
+<the agent's closing conversational summary — same content the PR comment shows>
+
+=== STDERR (<n> bytes) ===
+<anything the wrapped CLI emitted on stderr, typically empty>
+```
+
+- **PROMPT** — exactly what autocoder sent on stdin (template + `openspec instructions apply` output + the per-change context). Use this when an agent ran on the wrong prompt.
+- **ACTIONS** — one line per JSON event the wrapped CLI emitted (Read/Edit/Bash tool calls, tool results with byte counts, intermediate assistant text). Each line is prefixed `[tool_use]`, `[tool_result]`, `[assistant]`, `[raw]` (for lines that failed JSON parsing) or `[unknown:<type>]` (for forward-compat event types). Use this when triaging a timeout — the last action line names what the agent was doing when the kill fired. On a successful run, scanning the ACTIONS section gives you a fast read of the work.
+- **FINAL ANSWER** — the closing `result` event's text, captured separately so it is the ONE thing the PR's `## Agent implementation notes` comment shows. Empty when the run timed out before reaching `result`.
+- **STDERR** — bytes the wrapped CLI wrote on stderr. Usually empty; populated on framework errors.
+
+The legacy log shape (`=== STDOUT === / === STDERR ===`) is preserved when `executor.output_format: text` is set; that mode skips JSON event parsing entirely and uses today's at-exit capture.
+
+**Retention.** Per-change logs are pruned at daemon startup and once every 24 hours during operation. A log is eligible for deletion when its mtime is older than `executor.log_retention_days` (default 30) AND its corresponding change directory under `openspec/changes/<change>/` no longer exists. Active changes' logs are preserved regardless of age — operators triaging a long-running stuck change want its log even if it's months old.
+
+**PR-comment stability.** The `## Agent implementation notes` comment on every PR continues to contain ONLY the agent's closing conversational summary — the same content operators have always seen since the section was introduced. With JSON streaming mode on, autocoder captures that text more precisely (from the closing `result` event) instead of slicing it out of the raw stdout buffer, but reviewers see the same shape. The intermediate tool-call stream stays in the log file and never ships to GitHub. Existing PR-review workflows do not change.
+
+**PR commit ordering (a12).** When an iteration produces both pending change implementation commits AND audit creation commits, the implementation commits land FIRST on the agent branch and the audit creation commits land AFTER. This follows directly from the iteration-sequence change in `a12-changes-have-precedence-over-audits` — the pending queue walk runs before the audit phase, so its commits are older on the agent branch. Reviewers scanning the PR's commit list see the change work at the top. (Prior to `a12`, audit creation commits came first because audits ran before `list_pending`.)
+
+## Pre-flight checks
+
+Before invoking the executor on a pending change, autocoder runs a layered set of pre-flight checks. Each catches a different failure mode AND has a different cost; together they prevent the expensive-then-fail cycle of running the executor on a change that would have failed at archive time anyway.
+
+The checks run in order. A failure in any layer halts the queue walk for the iteration (writes `.needs-spec-revision.json` AND posts a chatops alert under `AlertCategory::SpecNeedsRevision`); the executor is never invoked.
+
+| Layer | Purpose | Cost | Opt-in | Failure mode |
+|---|---|---|---|---|
+| **1. `openspec validate --strict`** | Well-formedness — frontmatter present, sections named correctly, scenarios use proper `WHEN`/`THEN` structure, normative keywords (`SHALL` / `MUST` / `SHOULD`) appear. The change couldn't be loaded by `openspec` at all without passing this. | Free (mechanical, sub-millisecond) | Always on | The change is excluded from `list_pending` until the operator fixes the structural problem AND re-runs `openspec validate`. |
+| **2. Archivability check (a17)** | Mechanical structural check: each `## ADDED` / `## MODIFIED` / `## REMOVED` / `## RENAMED Requirements` block's `### Requirement:` header must satisfy its kind's precondition against the canonical `openspec/specs/<capability>/spec.md` (e.g. MODIFIED's title MUST exist; ADDED's title MUST NOT exist). Catches the a07 class of bug where an invented title was used. | Free (mechanical, sub-millisecond) | Always on | `.needs-spec-revision.json` written with `unarchivable_deltas` populated. Operator action: edit the spec deltas to match canonical AND clear the marker. See [Spec marked as needing revision](#spec-marked-as-needing-revision). |
+| **3. Change-internal contradiction check (a19)** | LLM-based semantic check: detects requirements within the same change that cannot all hold simultaneously (e.g. ADDED A "all secrets in env vars" + ADDED B "API key in `config.yaml`"). The LLM input is small (concatenated spec-delta files only); cost is **~$0.01 per checked change** at current pricing. | LLM call (~$0.01 per checked change) | Opt-in: `executor.change_internal_contradiction_check: enabled` + `executor.change_internal_contradiction_check_llm:` block | `.needs-spec-revision.json` written with `revision_suggestion` populated from the contradictions narrative (`unarchivable_deltas` AND `unimplementable_tasks` left empty for this semantic case). **Fail-OPEN posture:** LLM transport / parse / malformed-response failures log a WARN AND proceed to the executor; the daemon does NOT gate work on a failed check. Operators see the WARN cadence in journalctl AND decide whether to investigate. |
+
+**Opt-in posture for the contradiction check.** Initially shipped disabled because (a) the small per-change LLM cost is non-zero AND charged regardless of whether the check finds anything; (b) early operator experience may produce false positives — the gated rollout lets operators opt in when ready; (c) the prompt template needs iteration AND operators may want to override it for their domain.
+
+Operators trading a small per-change LLM cost for the catch of semantic self-contradictions enable it. Default-off operators see no behavior change.
+
+**Why fail-open for the contradiction check?** A flaky pre-flight should not block work. The same conservative bias applies as `a14`'s transient-failure handling: better to incur a redundant executor run than to halt the queue on a transient LLM outage. The WARN log lets operators investigate via journalctl AND decide whether to investigate further.
+
+## Self-heal for already-implemented changes
+
+When a rebase or merge lands the work for a change on the base branch without moving the change directory into `archive/`, the agent sees the implementation already done and returns `Completed` without modifying the workspace. Normally that's classified as Failed (no-op completion) and retried on every poll, burning tokens to re-confirm the same answer. autocoder self-heals this case instead:
+
+When the executor returns `Completed`, `git status --porcelain` is empty, `openspec validate <change> --strict` exits 0, AND every checkbox in `openspec/changes/<change>/tasks.md` is `[x]`, autocoder runs the archive move itself, commits it with subject `archive: <change>: implementation already in base`, and ships a PR through the normal push + PR flow.
+
+If any of the four preconditions fails — including `openspec validate` erroring or any task still `[ ]` — autocoder falls through to the existing Failed path, so non-self-heal cases retain their prior behavior.
+
+The PR body for a pass that self-healed one or more changes is prefixed with:
+
+> _This PR archives one or more changes whose implementation was already present on the base branch. No code diff is included; only the openspec archive move._
+
+The disclaimer identifies these passes for reviewers regardless of whether the pass also includes normally-implemented changes.
+
+## Skipping iterations while a PR is open
+
+Before each polling iteration begins its work, autocoder queries GitHub for open PRs whose `head` matches the configured agent branch (`<fork_owner>:<agent_branch>` in fork-PR mode, `<repo_owner>:<agent_branch>` in direct mode, base = the configured base branch). If an open PR is found, the iteration is skipped: no executor invocation, no commits, no push, no PR creation attempt. The skip persists until the open PR is closed or merged. This prevents the daemon from re-implementing the same changes on every poll while a PR sits awaiting review, which would otherwise force-push new commits over the PR's branch and burn agent tokens redundantly.
+
+To re-implement after rejecting a PR: close it (don't merge). The next poll proceeds. To accept the implementation: merge it; the archive moves land on the base branch and the changes drop out of `list_pending`.
+
+If the GitHub query itself fails (transport error, non-2xx), the iteration proceeds as if no PR existed — better to incur a redundant Claude run than to halt the repo on a flaky API. The failure is logged at WARN.
 
 ## Migrations
 
