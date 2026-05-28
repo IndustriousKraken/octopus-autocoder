@@ -224,6 +224,28 @@ pub struct ExecutorConfig {
     /// (365) are clamped down with a WARN log at startup.
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u32,
+    /// Stale-threshold (in seconds) for the live-PID busy-marker
+    /// recovery branch. The marker classification logic treats any
+    /// marker whose recorded PID is alive but older than this value as
+    /// a stuck pass and SIGTERMs the process group. A value of `0` is
+    /// permitted — every live-PID marker is then considered stale on
+    /// inspection (useful for diagnostics). Dead-PID markers are
+    /// recovered IMMEDIATELY regardless of this value; this field only
+    /// gates the live-PID branch.
+    ///
+    /// Defaults to `600` (10 minutes). Decoupled from
+    /// `executor.timeout_secs` so raising the executor timeout for one
+    /// legitimately long-running change does not delay stale-marker
+    /// recovery on unrelated iterations. Values above
+    /// `BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS` (7200, i.e. 2 hours)
+    /// are clamped down with a WARN log at startup.
+    ///
+    /// `None` means "operator did not set this field" — the daemon's
+    /// startup-log code uses that signal to emit a migration-aware
+    /// INFO line when the pre-spec implicit threshold
+    /// (`timeout_secs + 600`) would have produced a longer value.
+    #[serde(default)]
+    pub busy_marker_stale_threshold_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +273,98 @@ pub fn default_log_retention_days() -> u32 {
 /// Upper bound on `executor.log_retention_days`. Anything above is
 /// clamped down at startup with a WARN log so the operator notices.
 pub const LOG_RETENTION_DAYS_CEILING: u32 = 365;
+
+/// Default stale-threshold (seconds) for the live-PID busy-marker
+/// recovery branch. 10 minutes is short enough that a live-but-truly-
+/// stuck executor doesn't pin a repo for long, but long enough that
+/// briefly slow normal work doesn't trip the kill path.
+pub fn default_busy_marker_stale_threshold_secs() -> u64 {
+    600
+}
+
+/// Upper bound on `executor.busy_marker_stale_threshold_secs`. Values
+/// above are clamped down at startup with a WARN log so an operator
+/// raising the threshold to "forever" notices the cap.
+pub const BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS: u64 = 7200;
+
+/// Clamp the configured busy-marker stale threshold. Values above
+/// `BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS` are clamped down to the
+/// ceiling AND a `tracing::warn!` is emitted naming both the
+/// requested and clamped values. Returns `(clamped_value,
+/// Option<warn_message>)` so callers (in particular
+/// `Config::load_from` and the unit tests) can observe whether a
+/// WARN was issued without scraping the tracing log. A value of `0`
+/// is permitted and passes through unchanged — useful for diagnostics
+/// where the operator wants every live-PID marker treated as stale on
+/// inspection.
+pub fn clamp_busy_marker_stale_threshold_secs(requested: u64) -> (u64, Option<String>) {
+    if requested > BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS {
+        let msg = format!(
+            "executor.busy_marker_stale_threshold_secs ({requested}) is above the ceiling of \
+             {BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS}; clamping to \
+             {BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS}"
+        );
+        tracing::warn!("{msg}");
+        (BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS, Some(msg))
+    } else {
+        (requested, None)
+    }
+}
+
+/// Shape of the busy-marker stale-threshold startup INFO line.
+/// Returned by [`busy_marker_threshold_startup_log`] so the daemon's
+/// boot path can emit ONE log line per startup that names both the
+/// resolved values AND, when applicable, the gap from the pre-spec
+/// implicit threshold (`timeout_secs + 600`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusyMarkerThresholdStartupLog {
+    /// Operator did NOT set `executor.busy_marker_stale_threshold_secs`
+    /// AND the pre-spec implicit formula would have produced a longer
+    /// threshold. Surfaces the gap so operators upgrading from the
+    /// pre-spec build see the change without reading release notes.
+    Migration {
+        new_threshold_secs: u64,
+        pre_spec_implicit_threshold_secs: u64,
+        timeout_secs: u64,
+    },
+    /// Operator set the field explicitly OR the implicit threshold did
+    /// not exceed the new resolved value (e.g. `timeout_secs = 0`).
+    /// One INFO line naming both resolved values.
+    Regular {
+        timeout_secs: u64,
+        busy_marker_stale_threshold_secs: u64,
+    },
+}
+
+/// Decide which startup INFO line to emit for the busy-marker stale
+/// threshold. Pure function — no side effects, no logging — so the
+/// shape is unit-testable. Callers emit the actual `tracing::info!`
+/// call.
+///
+/// `explicit_configured` is `Some(_)` iff the operator set
+/// `executor.busy_marker_stale_threshold_secs` in YAML (even to the
+/// default value). `resolved_threshold_secs` is what the daemon will
+/// actually use (post-clamp); `timeout_secs` is the resolved
+/// `executor.timeout_secs`.
+pub fn busy_marker_threshold_startup_log(
+    explicit_configured: Option<u64>,
+    resolved_threshold_secs: u64,
+    timeout_secs: u64,
+) -> BusyMarkerThresholdStartupLog {
+    let pre_spec_implicit = timeout_secs.saturating_add(600);
+    if explicit_configured.is_none() && resolved_threshold_secs < pre_spec_implicit {
+        BusyMarkerThresholdStartupLog::Migration {
+            new_threshold_secs: resolved_threshold_secs,
+            pre_spec_implicit_threshold_secs: pre_spec_implicit,
+            timeout_secs,
+        }
+    } else {
+        BusyMarkerThresholdStartupLog::Regular {
+            timeout_secs,
+            busy_marker_stale_threshold_secs: resolved_threshold_secs,
+        }
+    }
+}
 
 /// Clamp the configured log-retention window. Values above
 /// `LOG_RETENTION_DAYS_CEILING` are clamped down to the ceiling AND
@@ -327,6 +441,19 @@ impl ExecutorConfig {
     pub fn wipe_drain_timeout_secs_clamped(&self) -> u64 {
         self.wipe_drain_timeout_secs
             .min(WIPE_DRAIN_TIMEOUT_CEILING_SECS)
+    }
+
+    /// Effective busy-marker stale threshold (seconds). `None` →
+    /// `default_busy_marker_stale_threshold_secs()` (600). Configured
+    /// values above `BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS` are
+    /// clamped down so a runaway operator config doesn't disable
+    /// stuck-pass recovery entirely. The raw stored field is preserved
+    /// (so the startup-log code can detect "operator did not set this
+    /// field" via `Option::is_none`).
+    pub fn busy_marker_stale_threshold_secs(&self) -> u64 {
+        self.busy_marker_stale_threshold_secs
+            .unwrap_or_else(default_busy_marker_stale_threshold_secs)
+            .min(BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS)
     }
 }
 
@@ -1112,6 +1239,15 @@ impl Config {
         let (retention_clamped, _) =
             clamp_log_retention_days(cfg.executor.log_retention_days);
         cfg.executor.log_retention_days = retention_clamped;
+        // Clamp the busy-marker stale threshold IN PLACE if the
+        // operator set it explicitly. We preserve the `None` case so
+        // the startup-log code can detect "operator did not set this"
+        // — clamping `None` to `Some(default)` would erase that
+        // signal.
+        if let Some(raw) = cfg.executor.busy_marker_stale_threshold_secs {
+            let (clamped, _) = clamp_busy_marker_stale_threshold_secs(raw);
+            cfg.executor.busy_marker_stale_threshold_secs = Some(clamped);
+        }
         if let Some(slack) = cfg
             .chatops
             .as_mut()
@@ -1763,6 +1899,7 @@ github:
             "wipe_drain_timeout_secs",
             "output_format",
             "log_retention_days",
+            "busy_marker_stale_threshold_secs",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -3568,6 +3705,175 @@ github: {}
         let (clamped, warn) = clamp_log_retention_days(LOG_RETENTION_DAYS_CEILING);
         assert_eq!(clamped, LOG_RETENTION_DAYS_CEILING);
         assert!(warn.is_none(), "ceiling value is not clamped");
+    }
+
+    // -----------------------------------------------------------------
+    // executor.busy_marker_stale_threshold_secs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn busy_marker_stale_threshold_defaults_when_unset() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.executor.busy_marker_stale_threshold_secs.is_none());
+        assert_eq!(cfg.executor.busy_marker_stale_threshold_secs(), 600);
+    }
+
+    #[test]
+    fn busy_marker_stale_threshold_explicit_within_bounds_passes_through() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  busy_marker_stale_threshold_secs: 1800
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            cfg.executor.busy_marker_stale_threshold_secs,
+            Some(1800)
+        );
+        assert_eq!(cfg.executor.busy_marker_stale_threshold_secs(), 1800);
+    }
+
+    #[test]
+    fn busy_marker_stale_threshold_zero_is_permitted() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  busy_marker_stale_threshold_secs: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.busy_marker_stale_threshold_secs, Some(0));
+        assert_eq!(cfg.executor.busy_marker_stale_threshold_secs(), 0);
+    }
+
+    #[test]
+    fn busy_marker_stale_threshold_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  busy_marker_stale_threshold_secs: 10000
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            cfg.executor.busy_marker_stale_threshold_secs,
+            Some(BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS)
+        );
+        assert_eq!(
+            cfg.executor.busy_marker_stale_threshold_secs(),
+            BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS
+        );
+        let (clamped, warn) = clamp_busy_marker_stale_threshold_secs(10000);
+        assert_eq!(clamped, BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS);
+        let msg = warn.expect("warn must be emitted when above ceiling");
+        assert!(msg.contains("10000"), "warn names requested value: {msg}");
+        assert!(
+            msg.contains(&BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS.to_string()),
+            "warn names clamped value: {msg}"
+        );
+    }
+
+    #[test]
+    fn busy_marker_stale_threshold_at_ceiling_no_warn() {
+        let (clamped, warn) =
+            clamp_busy_marker_stale_threshold_secs(BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS);
+        assert_eq!(clamped, BUSY_MARKER_STALE_THRESHOLD_CEILING_SECS);
+        assert!(warn.is_none(), "ceiling value is not clamped");
+    }
+
+    /// Operator bumped `timeout_secs` to 5400 (90 min) for one long
+    /// change AND did NOT set the new field → pre-spec implicit was
+    /// 6000s; new resolved is 600s. The Migration variant fires with
+    /// both values so the operator sees the gap in the log.
+    #[test]
+    fn startup_log_migration_when_field_unset_and_implicit_was_longer() {
+        let log = busy_marker_threshold_startup_log(None, 600, 5400);
+        assert_eq!(
+            log,
+            BusyMarkerThresholdStartupLog::Migration {
+                new_threshold_secs: 600,
+                pre_spec_implicit_threshold_secs: 6000,
+                timeout_secs: 5400,
+            }
+        );
+    }
+
+    /// Operator set the field explicitly → the regular line fires,
+    /// even if the explicit value happens to equal the default. The
+    /// "explicit" signal is what disables the migration branch.
+    #[test]
+    fn startup_log_regular_when_field_set_explicitly() {
+        let log = busy_marker_threshold_startup_log(Some(600), 600, 5400);
+        assert_eq!(
+            log,
+            BusyMarkerThresholdStartupLog::Regular {
+                timeout_secs: 5400,
+                busy_marker_stale_threshold_secs: 600,
+            }
+        );
+    }
+
+    /// Operator did NOT set the field AND the pre-spec implicit
+    /// threshold (`timeout_secs + 600`) is NOT longer than the new
+    /// default (i.e. `timeout_secs == 0`, or some pathological config
+    /// where the operator left `timeout_secs` smaller than the
+    /// 10-minute buffer would imply). The regular line fires — no
+    /// "migration gap" exists to surface.
+    #[test]
+    fn startup_log_regular_when_implicit_not_longer() {
+        let log = busy_marker_threshold_startup_log(None, 600, 0);
+        assert_eq!(
+            log,
+            BusyMarkerThresholdStartupLog::Regular {
+                timeout_secs: 0,
+                busy_marker_stale_threshold_secs: 600,
+            }
+        );
+    }
+
+    /// Operator set the field higher than the default → the regular
+    /// line still fires (their explicit value is what they want
+    /// surfaced).
+    #[test]
+    fn startup_log_regular_when_field_set_to_high_value() {
+        let log = busy_marker_threshold_startup_log(Some(7200), 7200, 1800);
+        assert_eq!(
+            log,
+            BusyMarkerThresholdStartupLog::Regular {
+                timeout_secs: 1800,
+                busy_marker_stale_threshold_secs: 7200,
+            }
+        );
     }
 
     // -----------------------------------------------------------------

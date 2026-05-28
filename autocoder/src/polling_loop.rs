@@ -566,12 +566,16 @@ pub async fn execute_one_pass(
     // detect and (depending on age + PID liveness) auto-recover from.
     let mut guard = match busy_marker::try_acquire(workspace, &repo.url, stuck_threshold_secs) {
         Ok(busy_marker::AcquireOutcome::Acquired(g)) => g,
-        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(m)) => {
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) => {
             tracing::info!(
                 url = %repo.url,
-                pid = m.pid,
-                stage = %m.stage.as_str(),
-                "busy marker present; another pass is in progress — skipping iteration"
+                pid = details.marker.pid,
+                stage = %details.marker.stage.as_str(),
+                age = %busy_marker::format_age_human(details.age_secs),
+                threshold = %busy_marker::format_age_human(details.threshold_secs),
+                pid_alive = details.pid_alive,
+                recovery_eligible = details.recovery_eligible(),
+                "busy marker present; skipping iteration"
             );
             return Ok(());
         }
@@ -2201,10 +2205,15 @@ async fn execute_rebuild_iteration(
 ) -> Result<()> {
     let mut guard = match busy_marker::try_acquire(workspace, &repo.url, stuck_threshold_secs) {
         Ok(busy_marker::AcquireOutcome::Acquired(g)) => g,
-        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(m)) => {
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) => {
             tracing::info!(
                 url = %repo.url,
-                pid = m.pid,
+                pid = details.marker.pid,
+                stage = %details.marker.stage.as_str(),
+                age = %busy_marker::format_age_human(details.age_secs),
+                threshold = %busy_marker::format_age_human(details.threshold_secs),
+                pid_alive = details.pid_alive,
+                recovery_eligible = details.recovery_eligible(),
                 "rebuild iteration: busy marker held by another pass; will retry next iteration"
             );
             return Ok(());

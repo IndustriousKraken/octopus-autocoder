@@ -204,6 +204,7 @@ mod tests {
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
         }
     }
 

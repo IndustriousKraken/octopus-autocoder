@@ -263,11 +263,54 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         cancel.clone(),
     );
 
-    // Busy-marker stuck threshold: how long an in-flight iteration is
-    // allowed to hold the marker before the next pass treats it as
-    // potentially crashed. Sized as the executor's wall-clock budget
-    // plus a 10-minute buffer for review/push/PR steps.
-    let stuck_threshold_secs: u64 = cfg.executor.timeout_secs.saturating_add(600);
+    // Busy-marker stuck threshold for the LIVE-PID branch: how long a
+    // live in-flight iteration is allowed to hold the marker before
+    // the next pass treats it as stuck and SIGTERMs the process
+    // group. Sourced from `executor.busy_marker_stale_threshold_secs`
+    // (default 600s, max 7200s clamped) per
+    // `a08-busy-marker-recovery-semantics`. Decoupled from
+    // `executor.timeout_secs` — raising the executor timeout for one
+    // legitimately long-running change does NOT delay stale-marker
+    // recovery on unrelated iterations.
+    //
+    // Dead-PID markers are recovered IMMEDIATELY regardless of this
+    // value; the dead-pid branch in `busy_marker::try_acquire_with`
+    // does not consult an age gate.
+    let stuck_threshold_secs: u64 = cfg.executor.busy_marker_stale_threshold_secs();
+    let timeout_secs = cfg.executor.timeout_secs;
+    match crate::config::busy_marker_threshold_startup_log(
+        cfg.executor.busy_marker_stale_threshold_secs,
+        stuck_threshold_secs,
+        timeout_secs,
+    ) {
+        crate::config::BusyMarkerThresholdStartupLog::Migration {
+            new_threshold_secs,
+            pre_spec_implicit_threshold_secs,
+            timeout_secs,
+        } => {
+            tracing::info!(
+                new_threshold_secs,
+                pre_spec_implicit_threshold_secs,
+                timeout_secs,
+                "busy marker stale threshold is now {new_threshold_secs}s (was implicit \
+                 {pre_spec_implicit_threshold_secs}s via timeout_secs+10min). Pre-spec \
+                 operators raising timeout_secs no longer see proportional recovery \
+                 delays. Set executor.busy_marker_stale_threshold_secs explicitly to \
+                 override."
+            );
+        }
+        crate::config::BusyMarkerThresholdStartupLog::Regular {
+            timeout_secs,
+            busy_marker_stale_threshold_secs,
+        } => {
+            tracing::info!(
+                timeout_secs,
+                busy_marker_stale_threshold_secs,
+                "executor timeout: {timeout_secs}s; busy_marker_stale_threshold: \
+                 {busy_marker_stale_threshold_secs}s"
+            );
+        }
+    }
 
     // Perma-stuck consecutive-failure threshold. `perma_stuck_threshold`
     // clamps a misconfigured 0 to 1 internally; we WARN once here so the
