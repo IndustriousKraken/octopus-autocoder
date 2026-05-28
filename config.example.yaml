@@ -487,3 +487,24 @@ github:
 #     # handler logs a WARN naming the path AND falls back to the
 #     # embedded default. Default: null (use embedded).
 #     # prompt_path: ./prompts/brownfield-custom.md
+
+
+# Canonical-spec RAG (a21). Optional top-level block. When absent OR
+# present with `enabled: false`, no embedding pipeline runs and the
+# implementer's `query_canonical_specs` MCP tool returns an empty Vec
+# with `error_hint: rag disabled in config`. When enabled, the daemon
+# embeds every `openspec/specs/<capability>/spec.md` at workspace init
+# and re-embeds affected capabilities after archives that touch
+# canonical specs. The store is in-memory only (daemon restart
+# re-embeds).
+#
+# canonical_rag:
+#   enabled: true
+#   provider: ollama                    # | openai_compatible
+#   model: nomic-embed-text             # provider-specific identifier
+#   api_base_url: http://localhost:11434
+#   # api_key_env: VOYAGE_API_KEY       # required for openai_compatible
+#   # api_key: { value: "..." }         # inline alternative (wins with WARN if both set)
+#   top_k: 10                           # default for tool queries; clamped [1, 100]
+#   chunk_strategy: per_requirement     # per_requirement | per_scenario | per_capability
+#   reembed_on_archive: true            # re-embed affected capabilities post-archive

@@ -1,13 +1,13 @@
-//! Minimal stdio MCP server exposing one tool: `ask_user(question)`.
+//! Minimal stdio MCP server exposing two tools (a21):
+//! - `ask_user(question)` — writes a marker file the parent autocoder
+//!   process picks up after the wrapped agent exits.
+//! - `query_canonical_specs(query, top_k?)` — relays the request to the
+//!   daemon via a Unix-domain control socket and returns ranked
+//!   canonical-spec chunks for the wrapped agent's query.
 //!
 //! Launched by `claude-cli` (or any MCP-compatible CLI agent) as a child
 //! process via the workspace's `.mcp.json` configuration written by
-//! `ClaudeCliExecutor` at run time. When the wrapped agent invokes
-//! `ask_user`, this server writes
-//! `<workspace>/openspec/changes/<change>/.askuser-pending.json` containing
-//! the question, then returns a successful tool-call result so the agent
-//! sees its tool succeeded. autocoder picks up the marker file
-//! after the child process exits.
+//! `ClaudeCliExecutor` at run time.
 //!
 //! Protocol: JSON-RPC 2.0 over stdio with newline-delimited messages.
 //! Only the subset needed by Claude Code's MCP client is implemented:
@@ -15,13 +15,24 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Env vars autocoder sets in the MCP server child's environment so
-/// the server knows where to write the marker file.
+/// Env vars autocoder sets in the MCP server child's environment.
 pub const ENV_WORKSPACE: &str = "ORCH_MCP_WORKSPACE";
 pub const ENV_CHANGE: &str = "ORCH_MCP_CHANGE";
+/// Path to the daemon's control socket. Set when canonical_rag is
+/// configured; absent → the `query_canonical_specs` tool returns
+/// `{ hits: [], error_hint: "rag not configured for this execution" }`.
+pub const ENV_CONTROL_SOCKET: &str = "ORCH_DAEMON_CONTROL_SOCKET";
+/// Sanitized workspace basename routed into the control-socket request
+/// so the daemon's handler can look up the right `CanonicalRagStore`.
+pub const ENV_WORKSPACE_BASENAME: &str = "ORCH_MCP_WORKSPACE_BASENAME";
+
+/// 10-second timeout for the control-socket round trip (read + write).
+const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the stdio MCP server until stdin closes. Returns Ok on a clean
 /// shutdown (EOF on stdin) or Err on a protocol/IO failure.
@@ -46,7 +57,6 @@ pub fn run() -> Result<()> {
             .read_line(&mut line)
             .context("reading from stdin")?;
         if n == 0 {
-            // EOF: peer closed stdin.
             break;
         }
         let trimmed = line.trim();
@@ -56,7 +66,6 @@ pub fn run() -> Result<()> {
         let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                // Malformed JSON — emit a parse error and continue listening.
                 emit_error(&mut writer, None, -32700, &format!("parse error: {e}"))?;
                 continue;
             }
@@ -71,8 +80,6 @@ fn handle_request<W: Write>(
     marker_path: &std::path::Path,
     req: JsonRpcRequest,
 ) -> Result<()> {
-    // JSON-RPC 2.0: requests with `id` expect a response; notifications
-    // (no `id`) do not. We emit a response for every request that has an id.
     let id = req.id.clone();
     match req.method.as_str() {
         "initialize" => {
@@ -82,7 +89,7 @@ fn handle_request<W: Write>(
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "autocoder-ask-user",
+                    "name": "autocoder-mcp",
                     "version": env!("AUTOCODER_VERSION"),
                 }
             });
@@ -107,6 +114,24 @@ fn handle_request<W: Write>(
                             },
                             "required": ["question"]
                         }
+                    },
+                    {
+                        "name": "query_canonical_specs",
+                        "description": "Retrieve canonical-spec chunks for a query string via semantic similarity. Use this when you're working on a capability whose canonical contract matters. Returns ranked excerpts, not whole files; cheap to call as often as useful.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "A search string describing what canonical-spec context you want (a requirement title, a problem you're solving, a keyword)."
+                                },
+                                "top_k": {
+                                    "type": "integer",
+                                    "description": "Optional maximum number of chunks to return. Defaults to the daemon's configured top_k (typically 10)."
+                                }
+                            },
+                            "required": ["query"]
+                        }
                     }
                 ]
             });
@@ -118,38 +143,145 @@ fn handle_request<W: Write>(
                 .ok_or_else(|| anyhow!("tools/call missing params"))?;
             let call: ToolCallParams = serde_json::from_value(params)
                 .map_err(|e| anyhow!("tools/call params decode: {e}"))?;
-            if call.name != "ask_user" {
-                emit_error(
-                    writer,
-                    id,
-                    -32601,
-                    &format!("unknown tool `{}`", call.name),
-                )?;
-                return Ok(());
-            }
-            let question = call
-                .arguments
-                .get("question")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| anyhow!("ask_user: missing string `question` argument"))?;
-            write_marker(marker_path, &question)?;
-            let result = serde_json::json!({
-                "content": [
+            match call.name.as_str() {
+                "ask_user" => {
+                    let question = call
+                        .arguments
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            anyhow!("ask_user: missing string `question` argument")
+                        })?;
+                    write_marker(marker_path, &question)?;
+                    let result = serde_json::json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Your question has been delivered to the human operator. autocoder will resume you with their answer in a subsequent invocation. Stop further changes now."
+                            }
+                        ],
+                        "isError": false
+                    });
+                    emit_result(writer, id, result)?;
+                }
+                "query_canonical_specs" => {
+                    let query_str = match call
+                        .arguments
+                        .get("query")
+                        .and_then(|v| v.as_str())
                     {
-                        "type": "text",
-                        "text": "Your question has been delivered to the human operator. autocoder will resume you with their answer in a subsequent invocation. Stop further changes now."
-                    }
-                ],
-                "isError": false
-            });
-            emit_result(writer, id, result)?;
+                        Some(s) => s.to_string(),
+                        None => {
+                            emit_error(
+                                writer,
+                                id,
+                                -32602,
+                                "query_canonical_specs: missing string `query` argument",
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let top_k = call.arguments.get("top_k").and_then(|v| v.as_u64());
+                    let payload = handle_query_canonical_specs(&query_str, top_k);
+                    let result = serde_json::json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": serde_json::to_string(&payload)
+                                    .unwrap_or_else(|_| "{}".into()),
+                            }
+                        ],
+                        "isError": false,
+                        "structuredContent": payload,
+                    });
+                    emit_result(writer, id, result)?;
+                }
+                other => {
+                    emit_error(
+                        writer,
+                        id,
+                        -32601,
+                        &format!("unknown tool `{other}`"),
+                    )?;
+                }
+            }
         }
         other => {
             emit_error(writer, id, -32601, &format!("method not found: {other}"))?;
         }
     }
     Ok(())
+}
+
+/// Build the `query_canonical_specs` tool result payload. Fail-open:
+/// every error path returns `{ hits: [], error_hint: "..." }` so the
+/// agent can fall back to its non-RAG behaviour gracefully.
+fn handle_query_canonical_specs(
+    query: &str,
+    top_k: Option<u64>,
+) -> serde_json::Value {
+    let socket_path = match std::env::var(ENV_CONTROL_SOCKET) {
+        Ok(s) => s,
+        Err(_) => {
+            return serde_json::json!({
+                "hits": [],
+                "error_hint": "rag not configured for this execution",
+            });
+        }
+    };
+    let workspace_basename = std::env::var(ENV_WORKSPACE_BASENAME).unwrap_or_default();
+    let mut request = serde_json::json!({
+        "action": "query_canonical_specs",
+        "workspace_basename": workspace_basename,
+        "query": query,
+    });
+    if let Some(k) = top_k {
+        request["top_k"] = serde_json::json!(k);
+    }
+    match relay_to_control_socket(Path::new(&socket_path), &request) {
+        Ok(value) => {
+            // Pass through `hits` and `error_hint` from the daemon's
+            // response verbatim — the daemon's fail-open contract is
+            // already the right shape for the tool result.
+            let hits = value
+                .get("hits")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let mut out = serde_json::json!({ "hits": hits });
+            if let Some(hint) = value.get("error_hint").and_then(|h| h.as_str()) {
+                out["error_hint"] = serde_json::json!(hint);
+            }
+            out
+        }
+        Err(e) => serde_json::json!({
+            "hits": [],
+            "error_hint": format!("control socket unreachable: {e}"),
+        }),
+    }
+}
+
+/// Open a connection to the daemon's control socket, send `request`
+/// followed by a newline, and read the single-line JSON response. Both
+/// halves are bounded by `CONTROL_SOCKET_TIMEOUT`.
+fn relay_to_control_socket(
+    socket: &Path,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let stream = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to control socket at {}", socket.display()))?;
+    stream.set_read_timeout(Some(CONTROL_SOCKET_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONTROL_SOCKET_TIMEOUT))?;
+    let mut stream = stream;
+    let raw = serde_json::to_string(request)?;
+    stream.write_all(raw.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf)?;
+    let value: serde_json::Value = serde_json::from_str(buf.trim())
+        .with_context(|| format!("decoding control-socket response: {buf:?}"))?;
+    Ok(value)
 }
 
 fn write_marker(marker_path: &std::path::Path, question: &str) -> Result<()> {
@@ -230,11 +362,17 @@ struct ToolCallParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Env-var mutation is global; serialize the env-var-touching tests
+    /// so concurrent runs do not race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Drive the server's `handle_request` with a sequence of synthetic
     /// JSON-RPC messages and return everything written to the response
-    /// buffer. Bypasses stdin/stdout for hermetic testing.
+    /// buffer.
     fn run_with(
         marker_path: &std::path::Path,
         messages: &[&str],
@@ -244,7 +382,6 @@ mod tests {
             let req: JsonRpcRequest = serde_json::from_str(line).unwrap();
             handle_request(&mut output, marker_path, req).unwrap();
         }
-        // Parse newline-delimited JSON responses.
         std::str::from_utf8(&output)
             .unwrap()
             .lines()
@@ -263,12 +400,12 @@ mod tests {
         );
         assert_eq!(resps.len(), 1);
         assert_eq!(resps[0]["id"], 1);
-        assert_eq!(resps[0]["result"]["serverInfo"]["name"], "autocoder-ask-user");
+        assert_eq!(resps[0]["result"]["serverInfo"]["name"], "autocoder-mcp");
         assert!(resps[0]["result"]["capabilities"]["tools"].is_object());
     }
 
     #[test]
-    fn tools_list_returns_ask_user_tool() {
+    fn tools_list_advertises_both_tools() {
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
         let resps = run_with(
@@ -276,16 +413,21 @@ mod tests {
             &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#],
         );
         let tools = resps[0]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "ask_user");
-        assert!(tools[0]["inputSchema"]["properties"]["question"].is_object());
-        let required: Vec<&str> = tools[0]["inputSchema"]["required"]
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"ask_user"));
+        assert!(names.contains(&"query_canonical_specs"));
+        let rag_tool = tools
+            .iter()
+            .find(|t| t["name"] == "query_canonical_specs")
+            .unwrap();
+        assert!(rag_tool["inputSchema"]["properties"]["query"].is_object());
+        let required: Vec<&str> = rag_tool["inputSchema"]["required"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(required, vec!["question"]);
+        assert_eq!(required, vec!["query"]);
     }
 
     #[test]
@@ -339,5 +481,98 @@ mod tests {
             &[r#"{"jsonrpc":"2.0","id":5,"method":"resources/list"}"#],
         );
         assert_eq!(resps[0]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn query_canonical_specs_env_absent_returns_not_configured_hint() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query_canonical_specs","arguments":{"query":"audit cadence"}}}"#],
+        );
+        let structured = &resps[0]["result"]["structuredContent"];
+        assert!(structured["hits"].as_array().unwrap().is_empty());
+        assert_eq!(
+            structured["error_hint"].as_str().unwrap(),
+            "rag not configured for this execution"
+        );
+    }
+
+    #[test]
+    fn query_canonical_specs_relays_via_socket() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        // Spawn a thread that answers ONE request with a canned response
+        // and exits.
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            // Echo what we got plus a fixed hits array.
+            let response = serde_json::json!({
+                "ok": true,
+                "hits": [
+                    {"capability": "audits", "requirement_title": "Audit cadence",
+                     "requirement_body": "...", "scenario_titles": [], "relevance_score": 0.9}
+                ],
+            });
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, socket_path.to_string_lossy().to_string());
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"query_canonical_specs","arguments":{"query":"audit cadence","top_k":3}}}"#],
+        );
+        handle.join().unwrap();
+        let structured = &resps[0]["result"]["structuredContent"];
+        let hits = structured["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["capability"], "audits");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+        }
+    }
+
+    #[test]
+    fn query_canonical_specs_socket_unreachable_returns_hint() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, "/nonexistent/control.sock");
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"query_canonical_specs","arguments":{"query":"x"}}}"#],
+        );
+        let structured = &resps[0]["result"]["structuredContent"];
+        assert!(structured["hits"].as_array().unwrap().is_empty());
+        let hint = structured["error_hint"].as_str().unwrap();
+        assert!(
+            hint.contains("control socket unreachable"),
+            "hint should name socket-unreachable; got: {hint}"
+        );
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+        }
     }
 }

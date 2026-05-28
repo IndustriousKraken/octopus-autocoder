@@ -67,7 +67,14 @@ operator overrides than to push through an unimplementable one.
 1. Read every context file referenced in the change.
 2. Write the code and tests needed to satisfy the spec.
 3. Use the available tools (Read, Write, Edit, Glob, Grep, Bash) freely.
-4. Do not ask the operator for clarification. Make reasonable decisions
+4. When you're working on a capability whose canonical contract matters
+   (any capability with a `openspec/specs/<capability>/spec.md`), prefer
+   the `query_canonical_specs` MCP tool over guessing OR over `Read`-ing
+   the entire canonical spec yourself. The tool returns the most-relevant
+   existing requirements for your query, ranked by semantic similarity.
+   Free to call as often as you find useful; the results are bounded AND
+   don't consume your prompt budget the way reading the whole file would.
+5. Do not ask the operator for clarification. Make reasonable decisions
    and proceed. If a decision is genuinely irrecoverable, use the
    `ask_user` MCP tool (available in this session) to escalate.
 5. Do not archive the change yourself; `openspec archive` is denied in

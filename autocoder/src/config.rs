@@ -80,6 +80,135 @@ pub struct Config {
     /// one-off top-level keys.
     #[serde(default, skip_serializing_if = "FeaturesConfig::is_default")]
     pub features: FeaturesConfig,
+    /// Optional canonical-spec RAG (retrieval-augmented context) block.
+    /// Absent → feature disabled (no embed calls, MCP tool returns empty
+    /// Vec with `rag disabled in config` hint). Present with
+    /// `enabled: false` → also disabled, but the block is preserved for
+    /// documentation purposes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_rag: Option<CanonicalRagConfig>,
+}
+
+/// Canonical-spec RAG configuration (a21).
+///
+/// When `Some` with `enabled: true`, the daemon embeds every
+/// `openspec/specs/<capability>/spec.md` at workspace init and re-embeds
+/// affected capabilities after archives that touch canonical specs. The
+/// per-execution MCP child exposes `query_canonical_specs` to the
+/// implementer, which relays to the daemon via the control socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalRagConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub provider: RagProvider,
+    pub model: String,
+    pub api_base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretSource>,
+    #[serde(default = "default_rag_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub chunk_strategy: ChunkStrategy,
+    #[serde(default = "default_reembed_on_archive")]
+    pub reembed_on_archive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RagProvider {
+    Ollama,
+    OpenaiCompatible,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkStrategy {
+    #[default]
+    PerRequirement,
+    PerScenario,
+    PerCapability,
+}
+
+pub fn default_rag_top_k() -> usize {
+    10
+}
+
+pub fn default_reembed_on_archive() -> bool {
+    true
+}
+
+/// Lower bound on `canonical_rag.top_k`. Values below clamp up.
+pub const RAG_TOP_K_FLOOR: usize = 1;
+/// Upper bound on `canonical_rag.top_k`. Values above clamp down with a WARN.
+pub const RAG_TOP_K_CEILING: usize = 100;
+
+/// Clamp `top_k` to `[1, 100]`. Returns `(clamped, Option<warn_message>)`.
+pub fn clamp_rag_top_k(requested: usize) -> (usize, Option<String>) {
+    if requested < RAG_TOP_K_FLOOR {
+        let msg = format!(
+            "canonical_rag.top_k ({requested}) is below the floor of {RAG_TOP_K_FLOOR}; \
+             clamping to {RAG_TOP_K_FLOOR}"
+        );
+        tracing::warn!("{msg}");
+        (RAG_TOP_K_FLOOR, Some(msg))
+    } else if requested > RAG_TOP_K_CEILING {
+        let msg = format!(
+            "canonical_rag.top_k ({requested}) is above the ceiling of {RAG_TOP_K_CEILING}; \
+             clamping to {RAG_TOP_K_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (RAG_TOP_K_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
+}
+
+impl CanonicalRagConfig {
+    /// Resolve the API key for the OpenAI-compatible provider. Inline
+    /// `api_key` wins over `api_key_env` with a WARN if both are set
+    /// (same pattern as `reviewer:`). Returns `None` if neither is set —
+    /// the Ollama provider permits an unset key; the OpenAI-compatible
+    /// provider's adapter rejects `None` at build time.
+    pub fn resolve_api_key(&self) -> Result<Option<String>> {
+        let inline = self
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if inline {
+            if self.api_key_env.is_some() {
+                tracing::warn!(
+                    "canonical_rag.api_key (inline) AND canonical_rag.api_key_env both set; \
+                     inline value wins, env var ignored"
+                );
+            }
+            return Ok(Some(
+                self.api_key
+                    .as_ref()
+                    .expect("inline path")
+                    .resolve("canonical_rag.api_key")?,
+            ));
+        }
+        if let Some(env_name) = self.api_key_env.as_deref() {
+            return std::env::var(env_name)
+                .map(Some)
+                .map_err(|_| anyhow!("canonical_rag.api_key_env `{env_name}` is not set"));
+        }
+        if let Some(src) = self.api_key.as_ref() {
+            return Ok(Some(src.resolve("canonical_rag.api_key")?));
+        }
+        Ok(None)
+    }
+
+    /// `true` when the block is present AND `enabled: true`. The single
+    /// gate used by callers to decide whether to invoke the RAG pipeline.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
 }
 
 /// Top-level feature-flag block. Each sub-block is opt-in; absent
@@ -1405,6 +1534,10 @@ impl Config {
             let (ttl, _) = clamp_dedup_cache_ttl_secs(slack.dedup_cache_ttl_secs);
             slack.dedup_cache_ttl_secs = ttl;
         }
+        if let Some(rag) = cfg.canonical_rag.as_mut() {
+            let (top_k, _) = clamp_rag_top_k(rag.top_k);
+            rag.top_k = top_k;
+        }
         Ok(cfg)
     }
 }
@@ -1864,6 +1997,34 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(rag) = config.canonical_rag.as_ref() {
+        let has_inline = rag
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = rag.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "canonical_rag.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("canonical_rag/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = rag.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!("canonical_rag.api_key references env var `{name}` which is not set"),
+                Some("canonical_rag/api_key".into()),
+            );
+        }
+    }
     if let Some(cc_llm) = config
         .executor
         .change_internal_contradiction_check_llm
@@ -2143,6 +2304,12 @@ github:
             "extra",
             "max_validation_retries",
             "max_audits_per_iteration",
+            // `CanonicalRagConfig` (a21).
+            "canonical_rag",
+            "api_base_url",
+            "chunk_strategy",
+            "reembed_on_archive",
+            "top_k",
         ];
 
         let path = example_yaml_path();
@@ -5211,6 +5378,139 @@ features:
             msg.contains("enabled") || msg.contains("bool"),
             "error must name the offending field / expected type; got: {msg}"
         );
+    }
+
+    #[test]
+    fn canonical_rag_absent_block_parses_as_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.canonical_rag.is_none());
+    }
+
+    #[test]
+    fn canonical_rag_full_block_parses() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+canonical_rag:
+  enabled: true
+  provider: ollama
+  model: qwen3-embedding:4b
+  api_base_url: http://gpu-host:11434
+  top_k: 15
+  chunk_strategy: per_requirement
+  reembed_on_archive: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let rag = cfg.canonical_rag.expect("block should parse");
+        assert!(rag.enabled);
+        assert_eq!(rag.provider, RagProvider::Ollama);
+        assert_eq!(rag.model, "qwen3-embedding:4b");
+        assert_eq!(rag.api_base_url, "http://gpu-host:11434");
+        assert_eq!(rag.top_k, 15);
+        assert_eq!(rag.chunk_strategy, ChunkStrategy::PerRequirement);
+        assert!(rag.reembed_on_archive);
+    }
+
+    #[test]
+    fn canonical_rag_missing_required_provider_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+canonical_rag:
+  enabled: true
+  model: foo
+  api_base_url: http://localhost:11434
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("missing provider must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("provider"),
+            "error should mention `provider`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn canonical_rag_top_k_clamps_above_ceiling() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+canonical_rag:
+  enabled: true
+  provider: ollama
+  model: nomic-embed-text
+  api_base_url: http://localhost:11434
+  top_k: 500
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.canonical_rag.unwrap().top_k, RAG_TOP_K_CEILING);
+    }
+
+    #[test]
+    fn canonical_rag_inline_api_key_wins_over_env_with_warn() {
+        let env_var = "AUTOCODER_TEST_CANONICAL_RAG_ENV";
+        unsafe { std::env::remove_var(env_var) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+canonical_rag:
+  enabled: true
+  provider: openai_compatible
+  model: voyage-2
+  api_base_url: https://api.voyageai.com/v1
+  api_key_env: {env_var}
+  api_key:
+    value: "inline-secret"
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let rag = cfg.canonical_rag.unwrap();
+        let resolved = rag.resolve_api_key().unwrap();
+        assert_eq!(resolved.as_deref(), Some("inline-secret"));
     }
 
     #[test]

@@ -515,6 +515,24 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
 
     // Spawn the control-socket listener as a sibling task. It shares the
     // same cancellation token as the polling tasks.
+    let canonical_rag_registry = crate::rag::CanonicalRagRegistry::new();
+    // Publish the registry + config to the process-global so the polling
+    // loop's RAG hooks AND the per-execution MCP child can both reach
+    // them without threading every-call-site plumbing. Set BEFORE the
+    // control socket binds so the daemon's `query_canonical_specs`
+    // handler observes a consistent view.
+    if let Some(rag_cfg) = cfg.canonical_rag.as_ref().filter(|c| c.is_active()) {
+        crate::rag::set_shared(canonical_rag_registry.clone(), rag_cfg.clone());
+        // Set the control-socket env var so `ClaudeCliExecutor::write_mcp_config`
+        // picks it up when writing the per-execution `.mcp.json`.
+        let socket = crate::control_socket::socket_path();
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+        }
+    }
     let control_state = ControlState {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
@@ -524,6 +542,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         repo_tasks: task_map.clone(),
         repo_tasks_changed: task_map_changed.clone(),
         spawn_repo: spawn_repo.clone(),
+        canonical_rag_registry: canonical_rag_registry.clone(),
     };
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {

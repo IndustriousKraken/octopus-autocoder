@@ -376,24 +376,51 @@ impl ClaudeCliExecutor {
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
-    /// launch THIS autocoder binary as the `ask_user` MCP tool. The
-    /// caller MUST delete this file via `delete_mcp_config` after the child
-    /// exits to keep the working tree clean.
+    /// launch THIS autocoder binary as the per-execution stdio MCP child.
+    /// The caller MUST delete this file via `delete_mcp_config` after the
+    /// child exits to keep the working tree clean.
+    ///
+    /// When `ORCH_DAEMON_CONTROL_SOCKET` is set in the parent process's
+    /// environment (the daemon sets it when `canonical_rag` is configured),
+    /// the same env vars are propagated into the MCP child's spawn
+    /// environment so the `query_canonical_specs` tool can relay queries
+    /// to the daemon's `CanonicalRagStore`. Absent → the child sees no
+    /// such env vars AND the tool returns the documented
+    /// "rag not configured for this execution" hint.
     fn write_mcp_config(workspace: &Path, change: &str) -> Result<PathBuf> {
         // We may be running from a non-autocoder binary (e.g. cargo test).
         // `current_exe` returns the actual running binary; in production
         // this is the `autocoder` binary and the MCP subcommand exists.
         let exe = std::env::current_exe()
             .context("resolving current autocoder binary path for MCP config")?;
+        let mut env = serde_json::json!({
+            crate::mcp_askuser_server::ENV_WORKSPACE: workspace.to_string_lossy(),
+            crate::mcp_askuser_server::ENV_CHANGE: change,
+        });
+        // Plumb the daemon's control-socket path and workspace basename
+        // through to the MCP child only when the daemon has explicitly
+        // set them in the parent process env (i.e., `canonical_rag` is
+        // configured). Absent in non-RAG runs by design.
+        if let Ok(socket) = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET) {
+            env[crate::mcp_askuser_server::ENV_CONTROL_SOCKET] =
+                serde_json::Value::String(socket);
+            let basename = std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME)
+                .unwrap_or_else(|_| {
+                    workspace
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown_workspace")
+                        .to_string()
+                });
+            env[crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME] =
+                serde_json::Value::String(basename);
+        }
         let config = serde_json::json!({
             "mcpServers": {
                 "ask_user": {
                     "command": exe,
                     "args": ["mcp-ask-user-server"],
-                    "env": {
-                        crate::mcp_askuser_server::ENV_WORKSPACE: workspace.to_string_lossy(),
-                        crate::mcp_askuser_server::ENV_CHANGE: change,
-                    }
+                    "env": env,
                 }
             }
         });

@@ -31,6 +31,7 @@ mod polling_loop;
 mod preflight;
 mod proposal_requests;
 mod queue;
+mod rag;
 mod recovery_classification;
 mod revisions;
 mod spec_revision;

@@ -238,6 +238,12 @@ pub struct ControlState {
     /// newly-added repository. Captured at daemon startup so the reload
     /// handler doesn't need direct access to executor/holders.
     pub spawn_repo: SpawnRepoFn,
+    /// Per-workspace canonical-spec RAG registry (a21). Populated by
+    /// the polling loop's workspace-init step when `canonical_rag` is
+    /// enabled. The `query_canonical_specs` action looks up the
+    /// workspace by sanitized basename and dispatches against the
+    /// store; an absent basename is fail-open (empty hits + hint).
+    pub canonical_rag_registry: crate::rag::CanonicalRagRegistry,
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -392,6 +398,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_proposal_request" => handle_queue_proposal_request(&parsed, state),
         "queue_changelog_request" => handle_queue_changelog_request(&parsed, state),
         "queue_brownfield_request" => handle_queue_brownfield_request(&parsed, state),
+        "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -1550,6 +1557,92 @@ fn handle_queue_brownfield_request(parsed: &Value, state: &ControlState) -> Valu
     })
 }
 
+/// Handle the `query_canonical_specs` action (a21). Looks up the
+/// workspace's `CanonicalRagStore` in the daemon's registry; on hit,
+/// runs the query and returns ranked chunks. Every error path is
+/// fail-open: an `ok: true` response with an empty `hits` array and a
+/// structured `error_hint`. Protocol-level violations (missing
+/// `workspace_basename` or `query`) return `ok: false` per the canonical
+/// request-protocol scenario.
+async fn handle_query_canonical_specs(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("missing required field: workspace_basename ({e})")});
+        }
+    };
+    let query = match require_str(parsed, "query") {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("missing required field: query ({e})")});
+        }
+    };
+    let top_k = parsed
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let cfg = state.last_config.load_full();
+    if cfg
+        .canonical_rag
+        .as_ref()
+        .map(|r| !r.is_active())
+        .unwrap_or(true)
+    {
+        return json!({
+            "ok": true,
+            "hits": [],
+            "error_hint": "rag disabled in config",
+        });
+    }
+
+    let store = match state
+        .canonical_rag_registry
+        .get(&workspace_basename)
+        .await
+    {
+        Some(s) => s,
+        None => {
+            // Distinguish the two empty-registry cases: a known
+            // workspace whose init failed (config has the block) vs.
+            // a basename the daemon doesn't manage.
+            let cfg_active = cfg
+                .canonical_rag
+                .as_ref()
+                .map(|r| r.is_active())
+                .unwrap_or(false);
+            let hint = if cfg_active {
+                "rag init failed; see daemon log"
+            } else {
+                "no workspace registered for that basename"
+            };
+            return json!({
+                "ok": true,
+                "hits": [],
+                "error_hint": hint,
+            });
+        }
+    };
+
+    match store.query(&query, top_k).await {
+        Ok(hits) => json!({
+            "ok": true,
+            "hits": hits,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                workspace_basename = %workspace_basename,
+                "canonical RAG query failed: {e:#}"
+            );
+            json!({
+                "ok": true,
+                "hits": [],
+                "error_hint": format!("query failed: {e}"),
+            })
+        }
+    }
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -1933,6 +2026,7 @@ mod tests {
             repo_tasks: task_map,
             repo_tasks_changed: task_map_changed,
             spawn_repo: spawn,
+            canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
         }
     }
 

@@ -475,6 +475,7 @@ mod tests {
             audits: None,
             paths,
             features: crate::config::FeaturesConfig::default(),
+            canonical_rag: None,
         }
     }
 
