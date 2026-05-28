@@ -3,7 +3,9 @@
 //! providers behind one trait so users can pick Claude, GPT, Grok, Ollama,
 //! or any OpenAI-compatible endpoint.
 
-use crate::config::{ReviewerConfig, ReviewerProvider};
+use crate::config::{
+    ContradictionCheckLlmConfig, ReviewerConfig, ReviewerProvider,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -185,6 +187,53 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
     let model = cfg.model.clone();
     let base = cfg.api_base_url.clone();
 
+    Ok(match provider {
+        ReviewerProvider::Anthropic => Box::new(AnthropicClient::new(
+            base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+            api_key,
+            model,
+        )),
+        ReviewerProvider::OpenAiCompatible => Box::new(OpenAiCompatibleClient::new(
+            base.unwrap_or_else(|| DEFAULT_OPENAI_BASE.to_string()),
+            api_key,
+            model,
+        )),
+    })
+}
+
+/// Construct an `LlmClient` for the change-internal contradiction
+/// pre-flight (a19). Parallel surface to [`build_from_config`] but reads
+/// from `ContradictionCheckLlmConfig` so the contradiction check can be
+/// configured with a cheaper model than the reviewer.
+pub fn build_from_contradiction_check_config(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<Box<dyn LlmClient>> {
+    let api_key = match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("executor.change_internal_contradiction_check_llm.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "executor.change_internal_contradiction_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
+                );
+            }
+            key
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!(
+                "executor.change_internal_contradiction_check_llm.api_key_env={env_name}"
+            ))?,
+        (None, None) => {
+            return Err(anyhow!(
+                "executor.change_internal_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
+            ));
+        }
+    };
+    let provider = cfg.provider;
+    let model = cfg.model.clone();
+    let base = cfg.api_base_url.clone();
     Ok(match provider {
         ReviewerProvider::Anthropic => Box::new(AnthropicClient::new(
             base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),

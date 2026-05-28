@@ -304,6 +304,21 @@ sudo rm -f /etc/systemd/system/openspec-orchestrator.service /usr/local/bin/open
 sudo systemctl daemon-reload
 ```
 
+## Version-string format
+
+The version string surfaced by `autocoder --version` and the `🆙` startup notification is resolved **at build time** by `build.rs` running `git describe --tags --always --dirty` against the source checkout. Operators see different forms depending on how the binary was built:
+
+| Build context | Example output | When you see it |
+| --- | --- | --- |
+| Clean tag commit | `v1.1.1` | The build sits exactly on a `vX.Y.Z` tag. Binary-release installs (via `update.sh`) always land here, because the GitHub Actions release workflow builds at the tagged commit. |
+| Dev commits past tag | `v1.1.1-23-g4abc123` | The build is N commits past the most-recent tag. The trailing `-g<short-sha>` names the working commit. Typical of source-built deployments running master. |
+| Dirty working tree | `v1.1.1-23-g4abc123-dirty` | The build includes uncommitted modifications to tracked files. The `-dirty` suffix surfaces that the running binary was built from an in-progress local state. |
+| Source tarball without `.git/` | Cargo.toml's `version =` field verbatim | `cargo install autocoder` from crates.io, an unpacked source tarball, or any host without the `git` binary on PATH. `build.rs` falls back to `env!("CARGO_PKG_VERSION")` and the build still succeeds. |
+
+`Cargo.toml`'s `version =` field is the **base version operators manually bump at semver-meaningful releases** (major / minor / patch). It is NOT bumped per commit — `git describe` provides the delta-past-tag info automatically, so per-commit version bumps would just be churn. The Cargo.toml version only surfaces directly in the tarball-fallback case above; in every other case it is the prefix that `git describe` extends with `-N-gSHA[-dirty]`.
+
+Binary-release operators (using `update.sh`) always see clean `vX.Y.Z` strings in their `🆙` notifications and `--version` output because the release workflow builds at tagged commits. Source-build operators see the `-N-gSHA` form whenever their checkout sits past a tag — which is the common case on master.
+
 ## Unattended updates via cron
 
 For single-host SBC, indie VPS, and homelab deployments where set-and-forget is the explicit goal, `update.sh` ships at the repo root as a cron-friendly companion to `install.sh`. The script resolves the installed version, fetches the latest non-prerelease tag, downloads + checksum-verifies the binary, runs `autocoder check-config` against the downloaded binary as a preflight, atomically swaps the binary aside to `/usr/local/bin/autocoder.previous`, restarts the systemd unit, and rolls back automatically if the daemon does not reach `active` within 30 seconds.

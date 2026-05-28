@@ -146,6 +146,47 @@ executor:
   # (2 hours) are clamped to `7200` with a WARN log at startup.
   # busy_marker_stale_threshold_secs: 600
 
+  # ─────────────────────────────────────────────────────────────────
+  # Change-internal contradiction pre-flight (a19; opt-in).
+  #
+  # A second pre-executor pre-flight, layered AFTER the mechanical
+  # archivability check. Where archivability catches structural defects
+  # (a MODIFIED title not present in canonical), the contradiction
+  # check catches semantic ones: a change whose requirements are
+  # individually well-formed but contradict each other (e.g. ADDED A
+  # "all secrets in env vars" + ADDED B "API key in config.yaml").
+  #
+  # The check runs an LLM against the change's concatenated spec-delta
+  # files. Costs ~$0.01 per checked change at current pricing. Failures
+  # (network, parse, malformed response) fail OPEN — log a WARN AND
+  # proceed to the executor; the daemon does NOT gate work on a failed
+  # check.
+  #
+  # Disabled by default. To enable, set the mode below AND configure the
+  # LLM block. Enabling without configuring the LLM block is a fail-fast
+  # startup error.
+  #
+  # See docs/OPERATIONS.md § "Pre-flight checks" for the full design.
+  # change_internal_contradiction_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the
+  # prompt compiled into the binary from
+  # `prompts/change-contradiction-check.md` is used. An empty override
+  # file is rejected at use time.
+  # change_internal_contradiction_check_prompt_path: /etc/autocoder/prompts/contradiction-check.md
+  #
+  # Required when the check is enabled. Parallel to the `reviewer:` LLM
+  # surface (provider | model | api_key_env | api_key | api_base_url)
+  # but kept as its own block so operators can pick a cheaper model.
+  # change_internal_contradiction_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   # Inline alternative: when `api_key` is set, `api_key_env` is ignored.
+  #   # api_key:
+  #   #   value: "sk-ant-yourkeyhere"
+  #   # api_base_url: https://api.anthropic.com
+
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.

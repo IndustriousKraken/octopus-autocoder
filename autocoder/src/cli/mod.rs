@@ -18,6 +18,7 @@ pub mod sync_specs_deps;
 
 #[derive(Parser, Debug)]
 #[command(name = "autocoder")]
+#[command(version = env!("AUTOCODER_VERSION"))]
 #[command(about = "Autonomous AI code-writer driven by OpenSpec changes", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]

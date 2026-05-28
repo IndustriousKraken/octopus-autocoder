@@ -83,7 +83,7 @@ fn handle_request<W: Write>(
                 },
                 "serverInfo": {
                     "name": "autocoder-ask-user",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": env!("AUTOCODER_VERSION"),
                 }
             });
             emit_result(writer, id, result)?;

@@ -1924,6 +1924,28 @@ async fn process_one_pending_change(
         }
     }
 
+    // Change-internal contradiction pre-flight (a19). Opt-in via
+    // `executor.change_internal_contradiction_check: enabled`. The
+    // global is `None` until daemon startup installs a context, so
+    // tests AND default-off operators short-circuit here without
+    // touching the LLM. Failures inside the check fail-open (no
+    // contradictions reported, executor proceeds).
+    if let Some(cc_ctx) = crate::preflight::change_contradiction::current() {
+        match handle_contradiction_preflight(workspace, repo, chatops_ctx, change, &cc_ctx)
+            .await
+        {
+            Ok(Some(step)) => return Ok(step),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "change-contradiction pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
+                );
+            }
+        }
+    }
+
     queue::lock(workspace, change)
         .with_context(|| format!("locking change `{change}`"))?;
 
@@ -2025,6 +2047,166 @@ fn build_unarchivable_revision_suggestion(
          this marker via @<bot> clear-revision <repo> <change>.\n"
     ));
     out
+}
+
+/// Run the change-internal contradiction pre-flight (a19) against
+/// `change`. On clean result (LLM returned an empty array OR failed
+/// open): returns `Ok(None)` and the caller proceeds to the executor.
+/// On non-empty findings: writes the `.needs-spec-revision.json`
+/// marker with `revision_suggestion` populated from the contradictions
+/// narrative, posts the existing `AlertCategory::SpecNeedsRevision`
+/// chatops alert (subject to 24h throttle), AND returns
+/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the
+/// queue walk without invoking the executor.
+async fn handle_contradiction_preflight(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
+) -> Result<Option<QueueStep>> {
+    let findings =
+        crate::preflight::change_contradiction::check_change_internal_contradictions(
+            workspace,
+            change,
+            cc_ctx.llm.as_ref(),
+            &cc_ctx.prompt_template,
+        )
+        .await
+        .with_context(|| format!("contradiction-check pre-flight for `{change}`"))?;
+    if findings.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_contradiction_revision_suggestion(&findings);
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        findings = findings.len(),
+        "change-contradiction pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
+        );
+    }
+    maybe_post_contradiction_findings_alert(chatops_ctx, repo, change, &findings, &suggestion)
+        .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into
+/// the marker file when the contradiction pre-flight catches one or
+/// more findings. Numbers each finding 1..N, includes the LLM's
+/// `requirement_a`, `requirement_b`, AND `summary`, AND closes with
+/// operator-action guidance.
+fn build_contradiction_revision_suggestion(
+    findings: &[crate::preflight::change_contradiction::ContradictionFinding],
+) -> String {
+    let n = findings.len();
+    let mut out = format!(
+        "Pre-flight contradiction check found {n} issue(s) where this change's\n\
+         requirements appear to contradict each other:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!(
+            "{idx}. Requirement A: {a}\n   Requirement B: {b}\n   {summary}\n\n",
+            idx = i + 1,
+            a = f.requirement_a,
+            b = f.requirement_b,
+            summary = f.summary,
+        ));
+    }
+    out.push_str(
+        "Edit the conflicting requirements so they can hold simultaneously,\n\
+         OR REMOVE one of them. Push the spec change AND clear this marker\n\
+         via @<bot> clear-revision <repo> <change>.\n",
+    );
+    out
+}
+
+/// Sibling of `maybe_post_unarchivable_deltas_alert` for the a19
+/// contradiction pre-flight path. Same throttle state, channel, and
+/// gating flag as the existing alert so a single stream of
+/// `AlertCategory::SpecNeedsRevision` notifications covers both code
+/// paths. Body framing names "contradictions" instead of unarchivable
+/// deltas.
+async fn maybe_post_contradiction_findings_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    findings: &[crate::preflight::change_contradiction::ContradictionFinding],
+    revision_suggestion: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    let now = Utc::now();
+    let should_alert = state
+        .spec_revision_alerts
+        .get(change)
+        .map(|entry| {
+            now - entry.last_alerted_at
+                >= ChronoDuration::hours(PERMA_STUCK_ALERT_THROTTLE_HOURS)
+        })
+        .unwrap_or(true);
+    if !should_alert {
+        return;
+    }
+    let marker_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join(".needs-spec-revision.json");
+    let mut findings_block = String::new();
+    for (i, f) in findings.iter().enumerate() {
+        findings_block.push_str(&format!(
+            "  {n}. A: \"{a}\" vs B: \"{b}\" — {s}\n",
+            n = i + 1,
+            a = f.requirement_a,
+            b = f.requirement_b,
+            s = f.summary,
+        ));
+    }
+    let text = format!(
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+        repo_url = repo.url,
+        change = change,
+        findings_block = findings_block,
+        suggestion = revision_suggestion,
+        base = repo.base_branch,
+        marker = marker_path.display(),
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "contradiction-findings chatops alert post failed: {e:#}"
+        );
+        return;
+    }
+    state.spec_revision_alerts.insert(
+        change.to_string(),
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: truncate_reason(revision_suggestion),
+        },
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to persist contradiction-findings alert state: {e:#}"
+        );
+    }
 }
 
 /// Sibling of [`maybe_post_spec_revision_alert`] for the a17 pre-flight
@@ -8991,6 +9173,289 @@ mod tests {
         .await;
 
         alert_mock.assert_async().await;
+    }
+
+    // ============================================================
+    // Change-internal contradiction pre-flight (a19)
+    // ============================================================
+
+    /// A test LlmClient that returns a fixed body OR a fixed error.
+    struct CcFixedLlm {
+        body: std::sync::Mutex<Option<String>>,
+        error: std::sync::Mutex<Option<String>>,
+    }
+    impl CcFixedLlm {
+        fn ok(body: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
+            std::sync::Arc::new(Self {
+                body: std::sync::Mutex::new(Some(body.into())),
+                error: std::sync::Mutex::new(None),
+            })
+        }
+        fn err(msg: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
+            std::sync::Arc::new(Self {
+                body: std::sync::Mutex::new(None),
+                error: std::sync::Mutex::new(Some(msg.into())),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for CcFixedLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            if let Some(msg) = self.error.lock().unwrap().clone() {
+                return Err(anyhow!(msg));
+            }
+            Ok(self.body.lock().unwrap().clone().unwrap_or_default())
+        }
+    }
+
+    /// Disabled mode: no scoped context (or explicit `None`) → no LLM
+    /// call, executor reached normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contradiction_preflight_disabled_proceeds_to_executor() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "plain", "fixture");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let _ = crate::preflight::change_contradiction::scope(None, fut).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "executor must be invoked when contradiction check is disabled"
+        );
+    }
+
+    /// Enabled mode + LLM returns empty contradictions → executor still
+    /// reached (the check is a no-op outcome-wise).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contradiction_preflight_empty_findings_proceeds_to_executor() {
+        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
+            llm: CcFixedLlm::ok(r#"{"contradictions": []}"#),
+            prompt_template: "TEST_PROMPT".into(),
+        };
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Change has a spec delta so build_spec_input has something to send,
+        // but archivability check passes (no canonical to fight with).
+        add_committed_change_with_spec(
+            &ws,
+            "clean",
+            "newcap",
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let _ = crate::preflight::change_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "executor must be invoked when contradiction check returns empty findings"
+        );
+    }
+
+    /// Enabled mode + LLM returns contradictions → marker is written,
+    /// `unimplementable_tasks` AND `unarchivable_deltas` are empty, AND
+    /// the executor is NOT invoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contradiction_preflight_findings_write_marker_and_skip_executor() {
+        let body = r#"{
+          "contradictions": [
+            { "requirement_a": "All secrets in env vars",
+              "requirement_b": "API key in config.yaml",
+              "summary": "A forbids what B requires" },
+            { "requirement_a": "Cap operations at 60s",
+              "requirement_b": "Run the 5-minute workflow",
+              "summary": "B exceeds A's cap" }
+          ]
+        }"#;
+        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
+            llm: CcFixedLlm::ok(body),
+            prompt_template: "TEST_PROMPT".into(),
+        };
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change_with_spec(
+            &ws,
+            "conflicting",
+            "newcap",
+            "## ADDED Requirements\n\n### Requirement: All secrets in env vars\nThe system SHALL store secrets only in env vars.\n\n### Requirement: API key in config.yaml\nThe API key SHALL live in config.yaml.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let _ = crate::preflight::change_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "executor must NOT be invoked when contradictions are found"
+        );
+
+        let marker_path = ws.join("openspec/changes/conflicting/.needs-spec-revision.json");
+        assert!(marker_path.exists(), "marker must be written");
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(
+            raw.contains("Pre-flight contradiction check found 2 issue(s)"),
+            "revision_suggestion should announce 2 findings; got: {raw}"
+        );
+        assert!(raw.contains("Requirement A: All secrets in env vars"));
+        assert!(raw.contains("Requirement B: API key in config.yaml"));
+        assert!(raw.contains("A forbids what B requires"));
+        assert!(raw.contains("Requirement A: Cap operations at 60s"));
+        assert!(raw.contains("Requirement B: Run the 5-minute workflow"));
+        assert!(raw.contains("B exceeds A's cap"));
+        assert!(
+            raw.contains("clear-revision"),
+            "revision_suggestion should name the clear-revision verb; got: {raw}"
+        );
+
+        let parsed: crate::spec_revision::SpecNeedsRevisionMarker =
+            serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.unimplementable_tasks.is_empty(),
+            "unimplementable_tasks must be empty (semantic-not-mechanical case)"
+        );
+        assert!(
+            parsed.unarchivable_deltas.is_empty(),
+            "unarchivable_deltas must be empty (semantic-not-mechanical case)"
+        );
+        assert!(
+            !parsed.revision_suggestion.is_empty(),
+            "revision_suggestion must carry the narrative"
+        );
+    }
+
+    /// Enabled mode + LLM transport error → fail open, executor IS
+    /// invoked, no marker written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contradiction_preflight_llm_error_fails_open() {
+        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
+            llm: CcFixedLlm::err("simulated transport error"),
+            prompt_template: "TEST_PROMPT".into(),
+        };
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change_with_spec(
+            &ws,
+            "transport-err",
+            "newcap",
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let _ = crate::preflight::change_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fail-open: executor must be invoked despite the transport error"
+        );
+        assert!(
+            !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")
+                .exists(),
+            "no marker on fail-open"
+        );
+    }
+
+    /// Sanity test for the marker's `revision_suggestion` text shape —
+    /// uses the public `build_contradiction_revision_suggestion` helper
+    /// directly.
+    #[test]
+    fn revision_suggestion_text_enumerates_findings() {
+        let findings = vec![
+            crate::preflight::change_contradiction::ContradictionFinding {
+                requirement_a: "A1".into(),
+                requirement_b: "B1".into(),
+                summary: "S1".into(),
+            },
+            crate::preflight::change_contradiction::ContradictionFinding {
+                requirement_a: "A2".into(),
+                requirement_b: "B2".into(),
+                summary: "S2".into(),
+            },
+        ];
+        let text = build_contradiction_revision_suggestion(&findings);
+        assert!(text.contains("Pre-flight contradiction check found 2 issue(s)"));
+        assert!(text.contains("1. Requirement A: A1"));
+        assert!(text.contains("   Requirement B: B1"));
+        assert!(text.contains("   S1"));
+        assert!(text.contains("2. Requirement A: A2"));
+        assert!(text.contains("   Requirement B: B2"));
+        assert!(text.contains("   S2"));
+        assert!(text.contains("clear-revision"));
     }
 
     // ============================================================

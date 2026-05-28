@@ -624,3 +624,38 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** each verb has an example reply (happy path AND refusal path)
 - **AND** the section cross-links back to OPERATIONS.md for the underlying queue-blocking model
 
+### Requirement: CONFIG.md and OPERATIONS.md document the contradiction-check fields and cost model
+`docs/CONFIG.md`'s `executor:` table SHALL include rows for the three new fields (`change_internal_contradiction_check`, `change_internal_contradiction_check_prompt_path`, `change_internal_contradiction_check_llm`). `docs/OPERATIONS.md` SHALL include a "Pre-flight checks" section enumerating the layered pre-executor checks (validate → archivability → contradiction) AND noting the contradiction check's opt-in posture, LLM cost, AND fail-open behavior.
+
+#### Scenario: CONFIG.md documents all three new fields
+- **WHEN** an operator reads `docs/CONFIG.md`'s `executor:` table
+- **THEN** rows for `change_internal_contradiction_check` (default `disabled`), `change_internal_contradiction_check_prompt_path` (default `null`, embedded template), AND `change_internal_contradiction_check_llm` (required when the check is enabled) appear with brief descriptions
+- **AND** each row cross-links to OPERATIONS.md's pre-flight-checks section for the full operational discussion
+
+#### Scenario: OPERATIONS.md enumerates the pre-flight layers
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s pre-flight-checks section
+- **THEN** the section enumerates the three layered checks: `openspec validate --strict` (well-formedness, free), `a17`'s archivability check (mechanical, free), AND `a19`'s contradiction check (LLM, opt-in, small per-change cost)
+- **AND** each layer's purpose is named AND the failure mode (marker + chatops alert + executor-skip) is described
+- **AND** the contradiction check's opt-in posture is explained: operators trading a small per-change LLM cost for the catch of semantic self-contradictions enable it; default-off operators see no behavior change
+
+#### Scenario: OPERATIONS.md describes the fail-open posture
+- **WHEN** an operator reads the contradiction-check description in OPERATIONS.md
+- **THEN** the section notes that LLM failures (transport, parse, etc.) fail OPEN — the executor proceeds, the operator sees a WARN in journalctl
+- **AND** the section explains why: a failed check should not block work; operators decide whether to investigate based on the WARN cadence
+
+### Requirement: DEPLOYMENT.md and CHATOPS.md explain the version-string format and the source-vs-binary distinction
+`docs/DEPLOYMENT.md` SHALL include a "Version-string format" section explaining how the daemon resolves its version string at build time, what operators see in different build contexts (clean tag, dev commit past tag, dirty working tree, source tarball without `.git/`), AND the Cargo.toml-bump convention. `docs/CHATOPS.md` SHALL update the `🆙` startup-notification example to show both the clean-tag form AND the development-build form.
+
+#### Scenario: DEPLOYMENT.md describes every build context
+- **WHEN** an operator reads `docs/DEPLOYMENT.md`'s "Version-string format" section
+- **THEN** the section names the four build contexts (clean tag, dev commits past tag, dirty working tree, tarball without `.git/`) AND the corresponding version-string output for each
+- **AND** the section explains that Cargo.toml's `version =` field is the "base version operators manually bump at semver-meaningful releases" — NOT bumped per-commit
+- **AND** the section notes that binary-release installs (via `update.sh`) always see clean `vX.Y.Z` strings because the release workflow builds at tagged commits
+
+#### Scenario: CHATOPS.md shows both notification forms
+- **WHEN** an operator reads `docs/CHATOPS.md`'s `🆙` startup-notification documentation
+- **THEN** the example shows both forms:
+  - `🆙 autocoder v1.1.1 started — 8 repository(ies) configured` (clean tag)
+  - `🆙 autocoder v1.1.1-23-g4abc123 started — 8 repository(ies) configured` (dev commits past tag)
+- **AND** a one-liner explains when each form appears
+

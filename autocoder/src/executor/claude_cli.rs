@@ -1849,6 +1849,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1876,6 +1880,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1900,6 +1908,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1943,6 +1955,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(
@@ -1974,6 +1990,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(
@@ -2005,6 +2025,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty changelog-stylist file must error"),
@@ -2038,6 +2062,10 @@ mod tests {
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),
             busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),
