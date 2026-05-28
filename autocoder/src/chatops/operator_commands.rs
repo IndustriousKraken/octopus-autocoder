@@ -190,6 +190,44 @@ fn oversize_request_text_reply() -> Reply {
     ))
 }
 
+/// Cap on the operator-supplied guidance accepted by the `brownfield`
+/// verb (a23). Mirrors the `propose` request-text cap.
+pub const MAX_BROWNFIELD_GUIDANCE_LEN: usize = 10_000;
+
+/// Capability-name slug regex for the `brownfield` verb. The slug is
+/// the canonical-spec directory name; it MUST be lowercase, start with
+/// a letter, AND contain only letters, digits, AND hyphens.
+fn capability_slug_regex() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    R.get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]*$").unwrap())
+}
+
+fn brownfield_missing_capability_reply() -> Reply {
+    Reply::Sync(
+        "✗ brownfield: missing capability name. Usage: @<bot> brownfield <repo> <capability-name> [optional guidance]"
+            .to_string(),
+    )
+}
+
+fn brownfield_missing_repo_reply() -> Reply {
+    Reply::Sync(
+        "✗ brownfield: missing repo-substring. Usage: @<bot> brownfield <repo> <capability-name> [optional guidance]"
+            .to_string(),
+    )
+}
+
+fn brownfield_invalid_slug_reply(got: &str) -> Reply {
+    Reply::Sync(format!(
+        "✗ brownfield: capability name must match ^[a-z][a-z0-9-]*$ (got: {got})"
+    ))
+}
+
+fn brownfield_oversize_guidance_reply() -> Reply {
+    Reply::Sync(format!(
+        "✗ brownfield: guidance text exceeds {MAX_BROWNFIELD_GUIDANCE_LEN} characters."
+    ))
+}
+
 // ====================================================================
 // Parsed-command shape (post-parse, pre-dispatch)
 // ====================================================================
@@ -296,6 +334,21 @@ pub enum OperatorCommand {
     ChangelogRequest {
         repo_substring: String,
         raw_args: String,
+    },
+    /// `@<bot> brownfield <repo-substring> <capability-name> [optional
+    /// guidance]` — draft a canonical OpenSpec capability spec for a
+    /// capability that already exists in the repo (a23). The dispatcher
+    /// posts a top-level ack message in the channel (whose `ts` becomes
+    /// the request's lifecycle thread), writes a
+    /// `BrownfieldRequestState` file under the workspace, AND submits a
+    /// `queue_brownfield_request` control-socket action so the next
+    /// polling iteration runs the brownfield-draft executor. See
+    /// `crate::state::brownfield_request` for the state-file shape AND
+    /// lifecycle.
+    BrownfieldRequest {
+        repo_substring: String,
+        capability_name: String,
+        guidance: Option<String>,
     },
     Help,
 }
@@ -574,6 +627,55 @@ fn parse_command_outcome_in_thread(
             ParseOutcome::Ok(OperatorCommand::ChangelogRequest {
                 repo_substring: repo_substring.to_string(),
                 raw_args: rest_after_sub.to_string(),
+            })
+        }
+        "brownfield" => {
+            // `@<bot> brownfield <repo-substring> <capability-name>
+            // [optional guidance]` (a23). The repo substring is the
+            // first whitespace-separated token after `brownfield`; the
+            // capability name is the next token; the guidance remainder
+            // is everything after the capability name, trimmed AND
+            // capped at MAX_BROWNFIELD_GUIDANCE_LEN.
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..];
+            let after_verb = after_verb.trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(brownfield_missing_repo_reply());
+            }
+            // First token = repo substring.
+            let sub_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let repo_substring = &after_verb[..sub_end];
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let after_repo = after_verb[sub_end..].trim_start();
+            if after_repo.is_empty() {
+                return ParseOutcome::Invalid(brownfield_missing_capability_reply());
+            }
+            // Second token = capability name.
+            let cap_end = after_repo
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_repo.len());
+            let capability_name = &after_repo[..cap_end];
+            if !capability_slug_regex().is_match(capability_name) {
+                return ParseOutcome::Invalid(brownfield_invalid_slug_reply(capability_name));
+            }
+            // Remainder = guidance (may be empty).
+            let guidance_raw = after_repo[cap_end..].trim();
+            if guidance_raw.chars().count() > MAX_BROWNFIELD_GUIDANCE_LEN {
+                return ParseOutcome::Invalid(brownfield_oversize_guidance_reply());
+            }
+            let guidance = if guidance_raw.is_empty() {
+                None
+            } else {
+                Some(guidance_raw.to_string())
+            };
+            ParseOutcome::Ok(OperatorCommand::BrownfieldRequest {
+                repo_substring: repo_substring.to_string(),
+                capability_name: capability_name.to_string(),
+                guidance,
             })
         }
         "send" => {
@@ -1385,6 +1487,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
     out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
+    out.push_str("  • `brownfield <repo> <capability-name> [optional guidance]` — draft a canonical spec for a capability that already exists\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
@@ -1645,6 +1748,11 @@ pub struct OperatorCommandDispatcher {
     /// When `None` (some test paths), the `propose` branch returns a
     /// `Reply::Sync(...)` failure noting chatops is not configured.
     chatops: Option<std::sync::Arc<dyn crate::chatops::ChatOpsBackend>>,
+    /// Daemon-wide enable flag for the `brownfield` verb (a23).
+    /// When `false`, the dispatcher refuses `@<bot> brownfield ...`
+    /// at parse time with the documented `disabled in this workspace's
+    /// config` message. Defaults to `true`.
+    brownfield_enabled: bool,
 }
 
 impl Default for OperatorCommandDispatcher {
@@ -1664,7 +1772,17 @@ impl OperatorCommandDispatcher {
                 crate::changelog_requests::default_state_root(),
             audit_types: Vec::new(),
             chatops: None,
+            brownfield_enabled: true,
         }
+    }
+
+    /// Override the daemon-wide brownfield-feature enable flag.
+    /// Production wiring derives this from `features.brownfield.enabled`
+    /// at startup; tests pass `false` to exercise the disabled-verb
+    /// refusal path.
+    pub fn with_brownfield_enabled(mut self, enabled: bool) -> Self {
+        self.brownfield_enabled = enabled;
+        self
     }
 
     /// Override the audit-thread state directory. Used by tests to
@@ -1808,6 +1926,21 @@ impl OperatorCommandDispatcher {
                 self.dispatch_changelog_request(
                     &repo_substring,
                     &raw_args,
+                    channel_id,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::BrownfieldRequest {
+                repo_substring,
+                capability_name,
+                guidance,
+            }) => Some(
+                self.dispatch_brownfield_request(
+                    &repo_substring,
+                    &capability_name,
+                    guidance.as_deref(),
                     channel_id,
                     repositories,
                     submitter,
@@ -2167,6 +2300,12 @@ impl OperatorCommandDispatcher {
                  Please file a bug."
                     .to_string()
             }
+            OperatorCommand::BrownfieldRequest { .. } => {
+                "✗ brownfield: internal routing error (the dispatcher saw \
+                 BrownfieldRequest in the String-returning dispatch fn). \
+                 Please file a bug."
+                    .to_string()
+            }
         }
     }
 
@@ -2435,6 +2574,159 @@ impl OperatorCommandDispatcher {
             {
                 tracing::warn!(
                     "changelog: subsequent thread reply for queue failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        Reply::Silent
+    }
+
+    /// Handle the `brownfield` verb (a23). Resolves the repo, peeks the
+    /// workspace HEAD for an existing canonical spec at
+    /// `openspec/specs/<capability>/spec.md` (refusing if present),
+    /// posts a top-level ack via the configured chatops backend
+    /// (capturing the ack's `ts` as the request's lifecycle thread),
+    /// writes a per-workspace `BrownfieldRequestState` file with
+    /// `status: Pending`, AND submits a `queue_brownfield_request`
+    /// control-socket action so the next polling iteration runs the
+    /// brownfield-draft executor.
+    async fn dispatch_brownfield_request(
+        &self,
+        repo_substring: &str,
+        capability_name: &str,
+        guidance: Option<&str>,
+        channel_id: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        // 0. Daemon-wide enable gate.
+        if !self.brownfield_enabled {
+            return Reply::Sync(
+                "✗ brownfield: disabled in this workspace's config (features.brownfield.enabled=false)."
+                    .to_string(),
+            );
+        }
+
+        // 1. Repo substring resolution.
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+
+        // 2. Pre-existing spec check — peek the resolved repo's
+        //    workspace HEAD. If `openspec/specs/<capability>/spec.md`
+        //    already exists, refuse without writing state.
+        let spec_path = repo
+            .workspace_path
+            .join("openspec/specs")
+            .join(capability_name)
+            .join("spec.md");
+        if spec_path.is_file() {
+            return Reply::Sync(format!(
+                "✗ brownfield: openspec/specs/{capability_name}/spec.md already exists. \
+                 Use @<bot> propose ... for changes to an existing capability."
+            ));
+        }
+
+        // 3. Generate a fresh request_id.
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // 4. Build the ack text. Guidance is NOT echoed in the ack to
+        //    keep it short (per the chatops-manager scenario).
+        let ack_text = format!(
+            "✓ Queued brownfield draft for {repo_url}: capability={capability_name}. \
+             The next polling iteration will run it (~Nm). Follow along in this thread.",
+            repo_url = repo.url,
+        );
+
+        // 5. Post the ack via the chatops backend and capture the `ts`.
+        let backend = match self.chatops.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                return Reply::Sync(
+                    "✗ brownfield: chatops backend not configured; cannot post the brownfield ack"
+                        .to_string(),
+                );
+            }
+        };
+        let ack_ts = match backend
+            .post_message_capturing_ts(channel_id, &ack_text)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!(
+                    "brownfield: backend post_message_capturing_ts failed: {e:#}"
+                );
+                return Reply::Sync(format!(
+                    "✗ brownfield: could not post ack to chat: {e}"
+                ));
+            }
+        };
+
+        // 6. Write the per-workspace state file.
+        let guidance_owned = guidance.map(|g| g.to_string());
+        let state = crate::state::brownfield_request::BrownfieldRequestState {
+            request_id: request_id.clone(),
+            repo_url: repo.url.clone(),
+            capability_name: capability_name.to_string(),
+            guidance: guidance_owned,
+            channel: channel_id.to_string(),
+            thread_ts: ack_ts.clone(),
+            submitted_at: chrono::Utc::now(),
+            status: crate::state::brownfield_request::BrownfieldRequestStatus::Pending,
+            reason: None,
+            pr_url: None,
+        };
+        if let Err(e) = crate::state::brownfield_request::write_state(
+            &repo.workspace_path,
+            &state,
+        ) {
+            tracing::warn!(
+                request_id = %request_id,
+                "brownfield: write_state failed: {e:#}"
+            );
+            if let Err(reply_err) = backend
+                .post_threaded_reply(
+                    channel_id,
+                    &ack_ts,
+                    &format!("✗ brownfield: could not persist state file: {e}"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "brownfield: subsequent thread reply for state-write failure also failed: {reply_err:#}"
+                );
+            }
+            return Reply::Silent;
+        }
+
+        // 7. Submit the queue_brownfield_request control-socket action.
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "queue_brownfield_request",
+                "url": repo.url,
+                "request_id": request_id,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            let body = format!("✗ brownfield: could not enqueue request: {err}");
+            if let Err(reply_err) = backend
+                .post_threaded_reply(channel_id, &ack_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    "brownfield: subsequent thread reply for queue failure also failed: {reply_err:#}"
                 );
             }
             return Reply::Silent;
@@ -6741,5 +7033,348 @@ mod tests {
         assert!(text.contains("--bogus"), "{text}");
         assert!(backend.posts.lock().unwrap().is_empty());
         assert!(submitter.calls().is_empty());
+    }
+
+    // ---------- brownfield verb (a23) ----------
+
+    fn brownfield_repos_at(workspace: &std::path::Path) -> Vec<RepoIdentity> {
+        vec![
+            RepoIdentity {
+                url: "git@github.com:acme/myrepo.git".to_string(),
+                workspace_path: workspace.to_path_buf(),
+            },
+            RepoIdentity {
+                url: "git@github.com:acme/widgets.git".to_string(),
+                workspace_path: workspace.join("widgets"),
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_brownfield_happy_path_without_guidance() {
+        let cmd = parse_command(&format!("{BOT} brownfield myrepo scheduler"), BOT)
+            .expect("brownfield without guidance must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::BrownfieldRequest {
+                repo_substring: "myrepo".into(),
+                capability_name: "scheduler".into(),
+                guidance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_happy_path_with_guidance() {
+        let cmd = parse_command(
+            &format!(
+                "{BOT} brownfield myrepo scheduler focus on the cron-trigger lifecycle; skip telemetry hooks"
+            ),
+            BOT,
+        )
+        .expect("brownfield with guidance must parse");
+        match cmd {
+            OperatorCommand::BrownfieldRequest {
+                repo_substring,
+                capability_name,
+                guidance,
+            } => {
+                assert_eq!(repo_substring, "myrepo");
+                assert_eq!(capability_name, "scheduler");
+                assert_eq!(
+                    guidance.as_deref(),
+                    Some("focus on the cron-trigger lifecycle; skip telemetry hooks")
+                );
+            }
+            other => panic!("expected BrownfieldRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_brownfield_preserves_multiline_guidance() {
+        let msg = format!("{BOT} brownfield myrepo scheduler line1\nline2\n\nthird para");
+        let cmd = parse_command(&msg, BOT).expect("multi-line guidance must parse");
+        match cmd {
+            OperatorCommand::BrownfieldRequest { guidance, .. } => {
+                assert_eq!(
+                    guidance.as_deref(),
+                    Some("line1\nline2\n\nthird para")
+                );
+            }
+            other => panic!("expected BrownfieldRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_brownfield_verb_case_insensitive() {
+        for verb in ["brownfield", "Brownfield", "BROWNFIELD", "BroWnFiELd"] {
+            let cmd = parse_command(&format!("{BOT} {verb} myrepo scheduler"), BOT)
+                .unwrap_or_else(|| panic!("`{verb}` must parse"));
+            match cmd {
+                OperatorCommand::BrownfieldRequest { capability_name, .. } => {
+                    assert_eq!(capability_name, "scheduler");
+                }
+                other => panic!("expected BrownfieldRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_missing_capability_returns_usage_hint_no_post() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} brownfield myrepo"), "C_OPS", BOT, &repos, &submitter)
+            .await
+            .expect("missing capability must surface as a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗ brownfield: missing capability name."), "{text}");
+        assert!(text.contains("Usage:"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_invalid_slug_returns_constraint_message_no_state() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield myrepo BadName_Slug"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗ brownfield: capability name must match"), "{text}");
+        assert!(text.contains("BadName_Slug"), "{text}");
+        assert!(text.contains("^[a-z][a-z0-9-]*$"), "{text}");
+        // No state file written, no chatops post, no control-socket action.
+        let state_dir =
+            crate::state::brownfield_request::state_dir(workspace.path());
+        if state_dir.is_dir() {
+            assert!(
+                std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+                "no state files must be written on invalid-slug"
+            );
+        }
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_ambiguous_repo_returns_be_more_specific() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let repos = brownfield_repos_at(workspace.path());
+        // Both fixture repos contain "acme" → ambiguous.
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield acme scheduler"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("be more specific"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_disabled_returns_disabled_message() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_brownfield_enabled(false);
+        let submitter = FakeSubmitter::new();
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield myrepo scheduler"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(
+            text.contains("disabled in this workspace's config"),
+            "{text}"
+        );
+        assert!(text.contains("features.brownfield.enabled=false"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_existing_spec_refused_with_propose_pointer() {
+        // Set up a workspace with `openspec/specs/scheduler/spec.md`
+        // already present. The dispatcher must refuse AND point at
+        // `propose` for changes to an existing capability.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let spec = workspace
+            .path()
+            .join("openspec/specs/scheduler/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "## existing").unwrap();
+
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield myrepo scheduler"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("already exists"), "{text}");
+        assert!(text.contains("openspec/specs/scheduler/spec.md"), "{text}");
+        assert!(text.contains("propose"), "{text}");
+        // No state file written.
+        let sd = crate::state::brownfield_request::state_dir(workspace.path());
+        if sd.is_dir() {
+            assert!(
+                std::fs::read_dir(&sd).unwrap().next().is_none(),
+                "no state files must be written on pre-existing-spec refusal"
+            );
+        }
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_happy_path_posts_ack_writes_state_submits_action() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748399999.001234"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_brownfield_request",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield myrepo scheduler focus on cron-trigger"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .expect("brownfield must produce a reply");
+        unwrap_silent(reply);
+
+        // Ack posted with the documented shape.
+        let posts = backend.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "exactly one ack: {posts:?}");
+        let (channel, ack_text) = &posts[0];
+        assert_eq!(channel, "C_OPS");
+        assert!(
+            ack_text.starts_with("✓ Queued brownfield draft for "),
+            "{ack_text}"
+        );
+        assert!(
+            ack_text.contains("capability=scheduler"),
+            "{ack_text}"
+        );
+        assert!(ack_text.contains("git@github.com:acme/myrepo.git"), "{ack_text}");
+        // Guidance is NOT echoed in the ack per spec scenario.
+        assert!(!ack_text.contains("focus on cron-trigger"), "{ack_text}");
+
+        // Exactly one control-socket action submitted.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_brownfield_request");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        let request_id = calls[0]["request_id"]
+            .as_str()
+            .expect("action carries request_id")
+            .to_string();
+
+        // State file exists with the expected fields (including guidance).
+        let st = crate::state::brownfield_request::read_state(
+            workspace.path(),
+            &request_id,
+        )
+        .unwrap()
+        .expect("state file present");
+        assert_eq!(st.capability_name, "scheduler");
+        assert_eq!(st.guidance.as_deref(), Some("focus on cron-trigger"));
+        assert_eq!(st.channel, "C_OPS");
+        assert_eq!(st.thread_ts, "1748399999.001234");
+        assert_eq!(
+            st.status,
+            crate::state::brownfield_request::BrownfieldRequestStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_happy_path_without_guidance_writes_none_guidance() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("ts-1"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_brownfield_request",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        let repos = brownfield_repos_at(workspace.path());
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield myrepo scheduler"),
+                "C_OPS",
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .expect("brownfield must produce a reply");
+        unwrap_silent(reply);
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        let request_id = calls[0]["request_id"].as_str().unwrap().to_string();
+        let st = crate::state::brownfield_request::read_state(
+            workspace.path(),
+            &request_id,
+        )
+        .unwrap()
+        .expect("state file present");
+        assert!(st.guidance.is_none(), "no guidance must round-trip as None");
+    }
+
+    #[test]
+    fn help_output_lists_brownfield_verb() {
+        let text = format_help_reply();
+        assert!(text.contains("brownfield"), "help must list brownfield: {text}");
+        assert!(
+            text.contains("capability-name"),
+            "help must explain the brownfield args: {text}"
+        );
     }
 }

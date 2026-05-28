@@ -16,8 +16,8 @@
 use super::event_log::{self, ActionKind, StructuredLogWriter};
 use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
 use super::{
-    ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome, ResumeHandle,
-    TriageContext, UnimplementableTask,
+    BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
+    ResumeHandle, TriageContext, UnimplementableTask,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -83,6 +83,11 @@ const CHAT_TRIAGE_LOG_CHANGE_NAME: &str = "chat-request-triage";
 
 /// Synthetic "change" name used for the changelog-stylist run-log path.
 const CHANGELOG_STYLIST_LOG_CHANGE_NAME: &str = "changelog-stylist";
+
+/// Synthetic "change" name used for the brownfield-draft run-log path
+/// (a23). Like the triage modes, brownfield-draft does not target a
+/// pre-existing change directory at invocation time.
+const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -1211,6 +1216,30 @@ impl Executor for ClaudeCliExecutor {
         let outcome = outcome?;
         persist_run_log(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, outcome)
+            .await
+    }
+
+    async fn run_brownfield_draft(
+        &self,
+        workspace: &Path,
+        ctx: &BrownfieldDraftContext,
+    ) -> Result<ExecutorOutcome> {
+        // The polling layer has already substituted the template; the
+        // executor passes `rendered_prompt` verbatim to the wrapped CLI.
+        let prompt = ctx.rendered_prompt.clone();
+        let _mcp_path = Self::write_mcp_config(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME)?;
+        let outcome = self
+            .run_subprocess(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, &prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(
+            workspace,
+            BROWNFIELD_DRAFT_LOG_CHANGE_NAME,
+            &prompt,
+            &outcome,
+        );
+        self.classify_outcome(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, outcome)
             .await
     }
 

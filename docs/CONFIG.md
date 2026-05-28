@@ -101,9 +101,16 @@ Per-repo override: each entry under `repositories[]` accepts an `audits:` field 
 
 | Field | Type | Description |
 |---|---|---|
-| `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. Used by `drift_audit` (embedded default: `prompts/drift-audit.md`), `missing_tests_audit` (embedded default: `prompts/missing-tests-audit.md`), `security_bug_audit` (embedded default: `prompts/security-bug-audit.md`), and `architecture_consultative` (embedded default: `prompts/architecture-consultative.md`). An empty file is rejected at audit invocation so the daemon does not feed an empty prompt to the wrapped CLI. |
+| `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. Used by `drift_audit` (embedded default: `prompts/drift-audit.md`), `missing_tests_audit` (embedded default: `prompts/missing-tests-audit.md`), `security_bug_audit` (embedded default: `prompts/security-bug-audit.md`), `architecture_consultative` (embedded default: `prompts/architecture-consultative.md`), and `documentation_audit` (embedded default: `prompts/documentation-audit.md`). An empty file is rejected at audit invocation so the daemon does not feed an empty prompt to the wrapped CLI. |
 | `notify_on_clean` | `bool` (default `false`) | When `true`, an empty-findings `Reported` outcome posts `✅ <repo>: <audit_type> — no findings` to chatops. When `false`, silence is success. |
-| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. `missing_tests_audit` and `security_bug_audit` each read `max_proposals_per_run` (`u32`, default `2`) from here. `drift_audit` and `architecture_consultative` do not currently read any `extra` knobs; configure them via the top-level `prompt_path` and `notify_on_clean` fields under `audits.settings.<slug>`. |
+| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. `missing_tests_audit` and `security_bug_audit` each read `max_proposals_per_run` (`u32`, default `2`) from here. `documentation_audit` reads two knobs: `readme_max_lines` (`usize`, default `200`) and `page_max_lines_without_toc` (`usize`, default `500`). `drift_audit` and `architecture_consultative` do not currently read any `extra` knobs; configure them via the top-level `prompt_path` and `notify_on_clean` fields under `audits.settings.<slug>`. |
+
+**`documentation_audit` `extra` knobs.** The `documentation_audit` exposes two organizational thresholds via `audits.settings.documentation_audit.extra`:
+
+- **`readme_max_lines`** (`usize`, default `200`) — the body-line threshold at which the audit emits a "README too long" organization finding. The LLM applies this number when assessing `README.md`'s structure; raising it suppresses the finding for repos whose README has organic length (an explicit TOC, a clearly sectioned layout that does not need TOC navigation, etc.). Larger projects with extensive front-page docs typically raise this to `300`–`500`; smaller projects keep the default.
+- **`page_max_lines_without_toc`** (`usize`, default `500`) — the total-line threshold at which a docs page is expected to carry a top-of-file TOC or summary table. The LLM applies this number when assessing `docs/*.md` files; raising it suppresses the finding for repos whose docs pages run long by design (operator manuals, reference pages). Lower it for tighter operator-self-service expectations.
+
+Both knobs are thresholds the LLM applies when emitting `category: organization` findings. Operators in larger projects raise them; operators in smaller projects keep defaults. The audit's prompt receives the knob values verbatim as part of its input and respects them when deciding whether to flag a page.
 
 ---
 
@@ -245,4 +252,36 @@ paths:
 See [`STATE-LAYOUT.md`](STATE-LAYOUT.md) for the full directory
 layout, the resolution precedence, and the migration behaviour on
 first startup after upgrade.
+
+## `features:` (optional)
+
+Per-workspace feature flags. Each sub-block is opt-in; absent sub-blocks
+take their type-default behaviour. Invalid value types (non-bool where
+a bool is expected, non-string where a string is expected) cause
+config-load to fail-fast with an error naming the offending field.
+
+### `features.brownfield` {#featuresbrownfield}
+
+Config for the `brownfield` chatops verb (a23). The verb drafts an
+initial canonical spec for one named capability that already exists in
+the repository. See [`CHATOPS.md → brownfield`](CHATOPS.md#drafting-a-spec-for-existing-behavior-brownfield)
+for the verb syntax, refusal cases, AND lifecycle-thread behavior, AND
+[`OPERATIONS.md → onboarding existing projects`](OPERATIONS.md#onboarding-existing-projects)
+for the recommended cadence.
+
+```yaml
+features:
+  brownfield:
+    enabled: true             # default true; set false to refuse the verb at parse time
+    prompt_path: null         # default null; relative path to a custom brownfield-draft prompt
+```
+
+| Field          | Type             | Default | Description                                                                                                                                                                                                                                                                                                                       |
+|----------------|------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`      | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> brownfield ...` at parse time with `✗ brownfield: disabled in this workspace's config (features.brownfield.enabled=false).`. No state file is written.                                                                                                       |
+| `prompt_path`  | `Option<String>` | `None`  | Workspace-relative path to a custom brownfield-draft prompt template. When set AND the file exists at run time, the polling handler uses it instead of the embedded `prompts/brownfield-draft.md` template. When set BUT the file is missing OR unreadable, the handler logs a WARN naming the path AND falls back to the embedded default. |
+
+**Default behaviour.** Omitting the `features.brownfield` block (or omitting the entire `features:` parent block) is equivalent to `enabled: true` AND `prompt_path: null`. The verb works out of the box on a fresh install.
+
+**Forward-compatibility note.** The per-workspace prompt override knob's location is provisional. When the broader per-workspace-prompt schema lands (covering implementer, audit-triage, changelog-stylist, brownfield-draft, etc. under a unified shape), brownfield's override SHALL conform to it; the current `features.brownfield.prompt_path` MAY be relocated at that time. Operators using the override should expect a migration step in the corresponding release notes.
 

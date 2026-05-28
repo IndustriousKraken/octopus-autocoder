@@ -4663,3 +4663,177 @@ The Cargo.toml `version =` field SHALL be operator-bumped only at semver-meaning
 - **THEN** the embedded version string is `vX.Y.Z` (no `-N-gSHA` suffix; no `-dirty` suffix)
 - **AND** operators installing via `update.sh` see clean semver versions in their `🆙` notifications AND `--version` output
 
+### Requirement: Documentation audit reports coverage, stale-reference, and organization findings
+autocoder SHALL register a `documentation_audit` audit type in the periodic-audit framework. The audit is LLM-driven, declares `WritePolicy::None`, `requires_head_change = true`, AND a sandbox profile allowing `Read`, `Glob`, `Grep`, AND `Bash` (read-only). It produces `AuditOutcome::Reported(findings)` covering three categories of documentation defect:
+
+1. **Coverage** — code or canonical-spec features that user-facing docs (`README.md`, `docs/*.md`) don't mention. Heuristic: any canonical-spec requirement whose body mentions operator-visible artifacts (`@<bot>` verbs, config keys, CLI flags, file paths the operator interacts with) is in scope. Pure-internal capabilities are NOT flagged.
+2. **Stale references** — docs references to code symbols (function names in code blocks, CLI verbs, config fields, file paths under `src/`) that don't exist in the current code or canonical specs. Catches dead references from removed features.
+3. **Organization** — qualitative structural findings: README exceeding `extra.readme_max_lines` lines (default `200`), docs pages exceeding `extra.page_max_lines_without_toc` (default `500`) without a TOC, important user-visible features buried below setup/admin material on their page, two docs pages covering the same topic without cross-linking, capabilities surfaced only in CHANGELOG but never in operator docs.
+
+The audit's findings SHALL be tagged with `severity` of `low` OR `medium` ONLY — the audit deliberately does NOT emit `high` (documentation drift is rarely emergency-grade; promotion would crowd out genuinely-urgent audit signals from other types). An `anchor` field names `<file>:<line>` for stale-reference findings AND `<file>` (no line) for coverage AND organization findings.
+
+The audit's prompt template `prompts/documentation-audit.md` ships embedded via `include_str!` AND is overridable via `audits.settings.documentation_audit.prompt_path`. Two `extra` knobs apply: `readme_max_lines` (default `200`) AND `page_max_lines_without_toc` (default `500`). The prompt receives these knobs as part of its input AND respects them when emitting organization findings.
+
+The audit does NOT produce LLM-generated documentation proposals (unlike `missing_tests_audit` / `security_bug_audit`). Findings ship as `Reported` outcomes; operators run `@<bot> send it` in the audit's threaded notification to trigger a triage executor run that produces a docs-fix PR (NOT a spec PR). The PR participates in the standard `@<bot> revise <text>` revision loop.
+
+When `a21`'s canonical-spec RAG is enabled in the same workspace, the audit's prompt MAY use the `query_canonical_specs` MCP tool to fetch focused canonical context. The audit functions correctly without RAG too; the RAG integration is an opportunistic enhancement, not a requirement.
+
+#### Scenario: Audit detects implementation-without-documentation
+- **WHEN** the canonical spec contains a requirement whose body mentions an operator-visible feature (e.g. `@<bot> propose` verb)
+- **AND** none of `README.md` or `docs/*.md` mentions `propose`
+- **THEN** the audit emits a finding with `category: coverage`, `severity: medium`, `anchor: <docs-or-spec-file-where-the-feature-is-defined>`, AND a body explaining the missing documentation
+
+#### Scenario: Audit detects documentation-without-implementation
+- **WHEN** `docs/CONFIG.md` references a config field `executor.foo_bar_quux` in a code block
+- **AND** no Rust source file under `<workspace>/<source-tree>/` defines a field named `foo_bar_quux` in any struct
+- **THEN** the audit emits a finding with `category: stale_reference`, `severity: medium`, `anchor: docs/CONFIG.md:<line>`, AND a body naming the missing referent
+
+#### Scenario: Audit detects organization issues
+- **WHEN** `docs/CHATOPS.md` is 600 lines long AND has no top-of-file TOC
+- **AND** the page documents user-driving workflows (`propose`, `send it`) AND administrative recovery verbs (`clear-perma-stuck`)
+- **AND** the user-driving content appears below the admin material
+- **THEN** the audit MAY emit findings with `category: organization`, `severity: low` or `medium`, naming each separately (missing TOC; burial of user-driving content)
+
+#### Scenario: Audit deliberately does not emit `high` severity
+- **WHEN** the LLM's response contains a finding marked `"severity": "high"`
+- **THEN** the audit demotes it to `"medium"` AND logs a WARN naming the demotion
+- **AND** the operator-visible finding lists severity `medium`
+
+#### Scenario: Audit honors `requires_head_change = true`
+- **WHEN** the audit's `last_run_sha` equals the current base-branch HEAD AND the cadence has elapsed
+- **THEN** the framework skips the audit (per the existing framework requirement)
+- **AND** the next iteration after a HEAD change re-evaluates
+
+#### Scenario: Pure-internal capability is NOT flagged for coverage
+- **WHEN** a capability's canonical spec exists BUT every requirement body covers pure-internal mechanics (no operator-visible artifacts)
+- **THEN** the audit does NOT emit a coverage finding for that capability
+- **AND** the heuristic recognizes "internal" via the absence of `@<bot>` verbs, config keys, CLI flags, AND operator-facing file paths in the requirement bodies
+
+#### Scenario: `extra` knobs apply to organization thresholds
+- **WHEN** `audits.settings.documentation_audit.extra.readme_max_lines: 400`
+- **AND** `README.md` is 300 lines
+- **THEN** the audit does NOT emit a "README too long" finding (the threshold is operator-raised)
+- **WHEN** the same config AND `README.md` grows to 500 lines
+- **THEN** the audit emits the organization finding
+
+#### Scenario: Audit works without `a21`'s RAG
+- **WHEN** `canonical_rag` is disabled (no block OR `enabled: false`)
+- **AND** `documentation_audit` runs
+- **THEN** the audit completes successfully without invoking `query_canonical_specs`
+- **AND** findings are emitted based on the prompt's direct access to canonical specs (read via the sandbox's `Read` tool)
+
+#### Scenario: Audit uses RAG when available
+- **WHEN** `canonical_rag` is enabled AND a documentation_audit run starts
+- **THEN** the audit's executor invocation has access to `query_canonical_specs` via MCP
+- **AND** the prompt MAY direct the LLM to use the tool for canonical-context retrieval
+- **AND** the implementation detail (whether the LLM uses the tool) is left to the prompt's design — both with-RAG AND without-RAG produce valid output
+
+#### Scenario: Findings can be acted on via `send it`
+- **WHEN** the audit posts a threaded notification with findings AND the operator replies `@<bot> send it` in that thread
+- **THEN** the existing `audit-reply-acts` mechanism triggers a triage executor run
+- **AND** the triage produces a doc-fix PR (changes to `README.md` / `docs/*.md` files)
+- **AND** the triage does NOT produce a spec PR (documentation is not OpenSpec material)
+- **AND** the doc-fix PR participates in the standard `@<bot> revise <text>` revision loop
+
+### Requirement: `brownfield` chatops verb queues a brownfield-draft executor request
+The chatops listener SHALL submit a `BrownfieldAction` (per the chatops-manager requirement) which the daemon's control-socket handler converts into an entry on the resolved repo's `pending_brownfield_requests: VecDeque<RequestId>` queue. The daemon SHALL persist a per-request state file `<workspace>/.state/brownfield_requests/<request_id>.json` containing the request's `repo_url`, `capability_name`, `guidance: Option<String>`, `channel`, `thread_ts`, AND `status` (`Pending` | `InProgress` | `Acted` | `Failed` | `Aborted`).
+
+Each polling iteration SHALL, after processing pending proposal requests AND before the standard change-processing pass, drain at most one brownfield request from the queue.
+
+#### Scenario: Queue stores requests in submission order
+- **WHEN** the operator posts two brownfield requests in sequence (`brownfield repo a`, `brownfield repo b`)
+- **THEN** `pending_brownfield_requests` contains both request_ids in submission order
+- **AND** the polling iteration drains them one per iteration
+
+#### Scenario: State file persists across daemon restart
+- **WHEN** a `BrownfieldRequestState` file exists with `status: Pending` AND the daemon restarts
+- **THEN** the daemon's startup reads the file AND re-queues the request
+- **AND** processing resumes on the next iteration
+
+#### Scenario: Late conflict aborts the request
+- **WHEN** a brownfield request reaches the polling iteration AND `openspec/specs/<capability-name>/spec.md` exists at the current workspace HEAD (created by a merge between dispatch AND processing)
+- **THEN** the iteration posts a thread reply `✗ brownfield: openspec/specs/<capability-name>/spec.md now exists (created since the request was queued). Aborting.`
+- **AND** the state's `status` becomes `Aborted`
+- **AND** no executor invocation occurs
+
+### Requirement: Brownfield-draft executor mode produces a spec-only change PR
+When the polling iteration processes a brownfield request, it SHALL invoke the executor with `WritePolicy::OpenSpecOnly` AND a sandbox profile permitting `Read`, `Glob`, `Grep`, AND `Bash` (read-only). The executor's prompt SHALL be assembled from:
+
+1. The embedded default template at `prompts/brownfield-draft.md` (via `include_str!`), OR the template at `features.brownfield.prompt_path` when configured AND the file exists.
+2. The operator's guidance (when non-empty), interpolated into a `## Operator guidance` section of the prompt.
+3. The capability name, the workspace's `README.md` contents, the list of `docs/*.md` filenames, AND a code-symbol overview built via `cargo metadata` (for Rust workspaces) OR a ripgrep pass for top-level public items (other languages).
+
+On executor `Completed`, the iteration SHALL verify the change directory `openspec/changes/brownfield-<capability-name>/` contains `proposal.md`, `tasks.md`, AND `specs/<capability-name>/spec.md`. The iteration SHALL ALSO verify `git status --porcelain` shows no modifications outside `openspec/`; any such modification triggers `git reset --hard HEAD; git clean -fd`, a WARN log naming the leaked paths, AND a state transition to `Failed`.
+
+On verification success, the iteration SHALL create a spec branch (NOT a fixes branch — brownfield never modifies source code), push, AND open a PR. The PR body SHALL include the proposal's "Why" section. The iteration SHALL post `✅ Brownfield draft PR opened: <pr_url>` to the request's thread AND set the state's `status` to `Acted` with the PR URL recorded.
+
+On executor `Err` OR missing artifacts, the iteration SHALL post `✗ Brownfield draft failed: <reason>` to the request's thread, log the full error to the daemon log, revert the workspace, AND set the state's `status` to `Failed`.
+
+#### Scenario: Successful run produces a spec-only PR
+- **WHEN** the executor returns `Completed` AND `openspec/changes/brownfield-<cap>/` contains all required artifacts AND no source-file modifications leaked
+- **THEN** the daemon creates a spec branch `<configured-prefix>brownfield/<cap>`, pushes, AND opens a PR
+- **AND** the PR body contains the proposal's "Why" section
+- **AND** the state's `status` is `Acted` with the PR URL
+- **AND** the thread receives `✅ Brownfield draft PR opened: <pr_url>`
+- **AND** NO fixes branch OR fixes PR is created
+
+#### Scenario: Sandbox leak triggers cleanup
+- **WHEN** the executor returns `Completed` AND `git status --porcelain` shows modifications under `src/` (in addition to `openspec/`)
+- **THEN** the iteration reverts the workspace via `git reset --hard HEAD; git clean -fd`
+- **AND** a WARN log fires naming the leaked paths
+- **AND** the state's `status` is `Failed`
+- **AND** the thread reply names the sandbox violation
+
+#### Scenario: Missing change-directory artifacts produce a clear failure
+- **WHEN** the executor returns `Completed` BUT `openspec/changes/brownfield-<cap>/specs/<cap>/spec.md` is absent
+- **THEN** the state's `status` is `Failed`
+- **AND** the thread reply names the missing artifact
+- **AND** the workspace is reverted
+
+#### Scenario: Operator guidance reaches the prompt
+- **WHEN** the operator's request includes guidance `focus on the cron-trigger lifecycle; skip telemetry hooks`
+- **THEN** the executor invocation's prompt contains a `## Operator guidance` section with the verbatim guidance text
+- **AND** the LLM's draft scopes its requirements accordingly
+
+#### Scenario: Per-workspace prompt override applies
+- **WHEN** `features.brownfield.prompt_path: ./prompts/brownfield-custom.md` AND the file exists in the workspace
+- **THEN** the iteration loads the custom template AND uses it instead of the embedded default
+- **AND** the loaded template combines with the operator's guidance + the gathered inputs into the executor's prompt
+
+#### Scenario: Missing override file falls back to embedded
+- **WHEN** `features.brownfield.prompt_path: ./prompts/brownfield-custom.md` is configured BUT the file does not exist
+- **THEN** the iteration logs a WARN naming the missing path
+- **AND** the iteration falls back to the embedded default template
+- **AND** the request proceeds successfully
+
+#### Scenario: PR participates in standard revision loop
+- **WHEN** the brownfield PR is open AND an operator comments `@<bot> revise add a requirement covering retry semantics` on it
+- **THEN** the existing PR-comment revision-loop mechanism handles the comment
+- **AND** the next polling iteration revises the spec PR per the operator's text
+
+### Requirement: `features.brownfield` config schema
+The daemon's per-repo config schema SHALL accept an optional top-level `features` block containing a `brownfield` sub-block with:
+
+- `enabled: bool` (default `true`) — when `false`, the dispatcher refuses the verb at parse time.
+- `prompt_path: Option<String>` (default `None`) — operator-supplied path (relative to workspace root) to a custom brownfield-draft prompt template.
+
+Both fields are optional; absent fields take their defaults. Invalid values (non-boolean `enabled`, non-string `prompt_path`) cause config-load to fail-fast with a clear error naming the offending field.
+
+#### Scenario: Default config enables brownfield
+- **WHEN** a workspace's config omits the `features.brownfield` block
+- **THEN** `features.brownfield.enabled` resolves to `true`
+- **AND** `features.brownfield.prompt_path` resolves to `None`
+
+#### Scenario: Explicit disable refuses the verb
+- **WHEN** a workspace's config sets `features.brownfield.enabled: false`
+- **THEN** the dispatcher refuses `@<bot> brownfield ...` requests for that workspace per the chatops-manager requirement
+
+#### Scenario: Explicit override path resolves
+- **WHEN** a workspace's config sets `features.brownfield.prompt_path: "./prompts/brownfield-custom.md"`
+- **THEN** the polling iteration loads the file at that workspace-relative path
+- **AND** uses its contents as the brownfield-draft prompt template
+
+#### Scenario: Invalid field type fails config load
+- **WHEN** a workspace's config sets `features.brownfield.enabled: "yes"` (string instead of bool)
+- **THEN** config-load fails with an error naming `features.brownfield.enabled` AND the expected type
+

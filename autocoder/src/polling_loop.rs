@@ -91,6 +91,11 @@ pub async fn run(
     pending_changelog_requests: Arc<
         std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
     >,
+    pending_brownfield_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
+        >,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -115,6 +120,7 @@ pub async fn run(
         pending_audit_runs,
         pending_proposal_requests,
         pending_changelog_requests,
+        pending_brownfield_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -178,6 +184,11 @@ pub async fn run_with_hooks(
     >,
     pending_changelog_requests: Arc<
         std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
+    >,
+    pending_brownfield_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
+        >,
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
@@ -413,6 +424,34 @@ pub async fn run_with_hooks(
             tracing::error!(
                 url = snapshot_ref.url.as_str(),
                 "changelog-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain at most ONE brownfield request per iteration (per the
+        // a23 spec). The handler reverts the workspace on failure so a
+        // sandboxed leak doesn't bleed into the standard change-
+        // processing pass that follows. Failures are logged but never
+        // abort the surrounding iteration.
+        let brownfield_request: Option<crate::control_socket::BrownfieldRequest> = {
+            let mut g = pending_brownfield_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = brownfield_request
+            && let Err(error) = crate::polling::brownfield::process_pending_brownfield(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+                &req,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                request_id = req.request_id.as_str(),
+                "brownfield-request processing errored for {}: {error:#}",
                 snapshot_ref.url
             );
         }
@@ -6958,6 +6997,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -7162,6 +7204,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -11503,6 +11548,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 task_cancel,

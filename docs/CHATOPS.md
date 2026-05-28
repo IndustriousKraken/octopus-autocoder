@@ -128,9 +128,59 @@ The ack message's `ts` becomes the proposal-request's lifecycle thread. Subseque
 
 **Polite-refusal cases.** A request whose repo substring resolves to multiple repos gets the standard "be more specific" reply with the candidate URLs. A request with no text after the substring gets `✗ propose: missing request text.`. A request whose text exceeds the 10,000-character cap gets `✗ propose: request text exceeds 10000 characters.` — put longer descriptions in an issue or doc and reference it in a shorter request.
 
+### Drafting a spec for existing behavior: `brownfield`
+
+The `brownfield` verb is the chat entry point for "this capability already exists in the repo — write me an initial canonical spec that describes it." Brownfield is the inverse of `propose`: `propose` says "implement something new"; `brownfield` says "document something that already exists."
+
+```
+@<bot> brownfield <repo-substring> <capability-name> [optional guidance]
+```
+
+- `<capability-name>` — the slug the new spec will live under at `openspec/specs/<capability-name>/spec.md`. SHALL match `^[a-z][a-z0-9-]*$` (lowercase letters, digits, hyphens; starting with a letter).
+- `[optional guidance]` — free-form text the operator can use to scope the draft (focus areas, naming preferences, behaviors to skip). Trimmed, capped at 10,000 characters. Passed verbatim to the brownfield-draft prompt.
+
+Examples:
+
+- `@<bot> brownfield myrepo scheduler` — draft a spec for the `scheduler` capability with no extra guidance.
+- `@<bot> brownfield myrepo scheduler focus on the cron-trigger lifecycle; skip telemetry hooks` — same capability, scoped via guidance.
+
+**Ack and lifecycle thread.** The bot's response is a top-level message in the channel:
+
+```
+✓ Queued brownfield draft for <repo-url>: capability=<capability-name>. The next polling iteration will run it (~Nm). Follow along in this thread.
+```
+
+The ack's `ts` becomes the request's **lifecycle thread**. Subsequent status updates, the `✅ Brownfield draft PR opened: <pr_url>` message, AND any `@<bot> revise ...` discussion all thread under that ack. Operators wanting follow-along context reply inside the thread; channel-level mentions on the same request still get the response in the original thread.
+
+**Spec-only PR.** Brownfield runs produce a single **spec PR** — no fixes PR, since brownfield NEVER modifies source code. The polling iteration that handles the request:
+
+1. Reads `README.md` AND `docs/*.md` for any existing user-facing description of the capability.
+2. Builds a code-symbol overview from `cargo metadata` (for Rust workspaces) OR a ripgrep pass for likely public items (other languages).
+3. Invokes the wrapped agent CLI with the embedded `prompts/brownfield-draft.md` system prompt under `WritePolicy::OpenSpecOnly` (read tools + bash read-only). The prompt directs the agent to map the named capability's surface area, then draft `openspec/changes/brownfield-<capability-name>/{proposal.md, tasks.md, specs/<capability-name>/spec.md}`.
+4. Verifies the change-directory artifacts exist AND that `git status --porcelain` shows no modifications outside `openspec/`. A sandbox leak (anything outside `openspec/` was written) triggers `git reset --hard HEAD; git clean -fd`, a WARN log naming the leaked paths, AND a state transition to `Failed`.
+5. On verification success, creates a `<agent-branch>-brownfield-<capability-name>` branch off `base_branch`, pushes, AND opens a PR. The PR body includes the proposal's "Why" section.
+6. Posts `✅ Brownfield draft PR opened: <pr_url>` to the request's lifecycle thread.
+
+On any failure (executor returned `Failed`, missing artifacts, sandbox leak, push/PR creation error), the daemon posts `✗ Brownfield draft failed: <reason>` to the thread AND links to the daemon log.
+
+**Refusal cases at parse / dispatch time.**
+
+- `✗ brownfield: missing capability name. Usage: @<bot> brownfield <repo> <capability-name> [optional guidance]` — no capability arg.
+- `✗ brownfield: capability name must match ^[a-z][a-z0-9-]*$ (got: <name>)` — invalid slug.
+- The standard "be more specific" reply when the repo substring matches multiple configured repos.
+- The standard "no repo matched" reply when the substring doesn't resolve.
+- `✗ brownfield: openspec/specs/<capability-name>/spec.md already exists. Use @<bot> propose ... for changes to an existing capability.` — the canonical spec already lives in the workspace. Use `propose` instead.
+- `✗ brownfield: disabled in this workspace's config (features.brownfield.enabled=false).` — the operator opted the verb out at the workspace level. See [CONFIG.md → `features.brownfield`](CONFIG.md#featuresbrownfield).
+
+**Per-workspace prompt override.** Operators MAY point the brownfield-draft handler at a custom prompt template via `features.brownfield.prompt_path` (workspace-relative). When the path is unset OR the file does not exist at run time, the handler falls back to the embedded `prompts/brownfield-draft.md`. See [CONFIG.md → `features.brownfield`](CONFIG.md#featuresbrownfield).
+
+**Revision loop.** The resulting PR participates in the standard [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment). `@<bot> revise <text>` on the PR re-runs the brownfield draft with the operator's revision text injected so misstatements get corrected through the same channel as any other autocoder-opened PR.
+
+**Relationship to `propose`.** Use `brownfield` to introduce a capability's canonical spec to the workspace for the first time. After the brownfield PR merges, the standard `propose` flow handles any subsequent change to that capability (the `openspec/specs/<capability-name>/spec.md` file then exists, AND brownfield refuses to overwrite it). See [OPERATIONS.md → onboarding existing projects](OPERATIONS.md#onboarding-existing-projects) for the recommended cadence.
+
 ### Acting on audit findings: `send it`
 
-When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
+When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭`/`📚` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
 
 ```
 @<bot> send it       (posted as a reply inside the audit thread)
@@ -527,12 +577,13 @@ The pure-data `architecture_brightline` audit does NOT fire this notification (i
 
 If the chatops backend is unconfigured OR `post_notification` errors when this notification is posted, the failure is logged at WARN and the audit's success outcome (proposal commit, queue insertion) is unaffected.
 
-### Audit-finding threaded notifications (`📐` / `🧭` / `📋` / `✅`)
+### Audit-finding threaded notifications (`📐` / `🧭` / `📚` / `📋` / `✅`)
 
-Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
+Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
 
 - `📐 architecture_brightline on <repo-url>: <N> file(s) over line threshold; <M> duplicate signature(s)`
 - `🧭 drift_audit on <repo-url>: <N> spec/code divergence(s) detected`
+- `📚 documentation_audit on <repo-url>: <N> finding(s)` — documentation coverage / stale-reference / organization findings. The thread body groups findings by category (`Coverage` / `Stale references` / `Organization`); each finding renders as `- <severity> at <anchor>: <body>`.
 - `📋 <audit-type> on <repo-url>: <N> finding(s)` — generic fallback for any other `Reported`-outcome audit.
 - `✅ <audit-type> on <repo-url>: no findings` — uniform shape for clean runs under `notify_on_clean=true`.
 

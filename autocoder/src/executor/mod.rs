@@ -83,6 +83,31 @@ pub trait Executor: Send + Sync {
         })
     }
 
+    /// Brownfield-draft mode for the `brownfield` chatops verb (a23).
+    /// The polling iteration's brownfield handler resolves the prompt
+    /// template (embedded default OR a workspace-relative override
+    /// from `features.brownfield.prompt_path`), substitutes the
+    /// `BrownfieldDraftContext` fields into the template, AND passes
+    /// the rendered prompt here. The backend's job is to invoke the
+    /// wrapped CLI with the rendered prompt under a read-only
+    /// sandbox (the polling layer verifies the resulting diff stays
+    /// under `openspec/`).
+    ///
+    /// Default impl returns `Failed { reason: "brownfield-draft mode
+    /// not supported" }`.
+    async fn run_brownfield_draft(
+        &self,
+        workspace: &Path,
+        ctx: &BrownfieldDraftContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "brownfield-draft mode not supported by this executor backend"
+                .to_string(),
+        })
+    }
+
     /// Chat-driven changelog stylist for the `changelog` chatops verb.
     /// The deterministic extractor has already produced the JSON payload
     /// in `ctx.changelog_json`; this method asks the wrapped CLI to read
@@ -141,6 +166,23 @@ pub struct ChangelogContext {
     /// invocation is a revision of a prior changelog PR; empty for the
     /// first stylist run.
     pub revision_text: String,
+}
+
+/// Context handed to `Executor::run_brownfield_draft`. Built by the
+/// polling iteration's brownfield handler from the operator's request
+/// AND the workspace's surface (README, docs filenames, code-symbol
+/// overview). The `rendered_prompt` field holds the final prompt after
+/// the polling layer has substituted these inputs into the resolved
+/// template (embedded default OR `features.brownfield.prompt_path`
+/// override).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrownfieldDraftContext {
+    /// Canonical capability slug (matches `^[a-z][a-z0-9-]*$`). Used
+    /// to derive the change directory name AND the spec path.
+    pub capability_name: String,
+    /// Fully rendered prompt: template + interpolated context. The
+    /// executor passes this verbatim to the wrapped CLI.
+    pub rendered_prompt: String,
 }
 
 /// Context handed to `Executor::run_chat_triage`. Plumbed in from the

@@ -6,6 +6,7 @@ use crate::audits::{
     AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    documentation_audit::DocumentationAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
@@ -438,6 +439,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         &audit_settings,
         &cfg.executor,
     )));
+    registry.register(Arc::new(DocumentationAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so
     // we fail fast at startup with the list of known names.
@@ -660,7 +665,8 @@ async fn spawn_inbound_listener(
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>(),
             )
-            .with_chatops(slot.backend.clone()),
+            .with_chatops(slot.backend.clone())
+            .with_brownfield_enabled(cfg.features.brownfield.enabled),
     );
     let task_map_for_provider = task_map.clone();
     let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
@@ -769,6 +775,12 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>,
         > = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_changelog_requests_for_task = pending_changelog_requests.clone();
+        let pending_brownfield_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_brownfield_requests_for_task = pending_brownfield_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -796,6 +808,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_audit_runs_for_task,
                 pending_proposal_requests_for_task,
                 pending_changelog_requests_for_task,
+                pending_brownfield_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -827,6 +840,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_audit_runs,
                     pending_proposal_requests,
                     pending_changelog_requests,
+                    pending_brownfield_requests,
                     iteration_cancel,
                     iteration_drained,
                 },
