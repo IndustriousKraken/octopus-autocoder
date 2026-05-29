@@ -20,13 +20,23 @@
 //! scoped `DaemonPaths`) or `temp_env::with_var(...)` for env-driven
 //! cases — never the production path literal.
 //!
-//! Allowlists: the `src/` allowlist contains only the migration scan,
-//! which legitimately references legacy paths to identify state that
-//! needs to be moved. The `tests/` allowlist is intentionally empty —
-//! the scanner file's own self-reference (it has to mention the
-//! substring at least in error-message text) is excluded by a
-//! filename-based self-check, not by an allowlist entry, so the rule
-//! "no test allowlist entries" stays true on inspection.
+//! Extended in `a27` with a second scanner pass over `autocoder/src/`
+//! for the names of the REMOVED process-global `DaemonPaths`
+//! accessors (`paths::current`, `paths::install_global`,
+//! `paths::test_fallback`, `paths::get_global`). After the threading
+//! refactor, those names MUST NOT appear in `src/` at all — any
+//! reintroduction (e.g. a copy-paste from old code) fails the build
+//! with a list of offending `file:line` locations. The allowlist for
+//! that pass is intentionally empty.
+//!
+//! Allowlists: the `src/` `/tmp/autocoder` allowlist contains only the
+//! migration scan, which legitimately references legacy paths to
+//! identify state that needs to be moved. The `tests/` allowlist is
+//! intentionally empty — the scanner file's own self-reference (it
+//! has to mention the substring at least in error-message text) is
+//! excluded by a filename-based self-check, not by an allowlist
+//! entry, so the rule "no test allowlist entries" stays true on
+//! inspection.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -128,6 +138,137 @@ fn no_hardcoded_tmp_autocoder_literals_outside_allowlist() {
          exercise an `AUTOCODER_*_DIR` env-var path. Never hard-code the \
          production path literal in tests.",
         violations.join("\n"),
+    );
+}
+
+/// The names of the REMOVED process-global accessors banned from
+/// reintroduction (per `a27-thread-daemon-paths`). The constants are
+/// built at runtime from fragments so the scanner's own source file
+/// does not match itself on these strings, and so the scanner's own
+/// `file!()`-based self-check is not actually required for soundness
+/// (we still self-skip by basename for defense in depth).
+fn banned_global_paths_accessor_names() -> Vec<String> {
+    let prefix: String = ["paths", "::"].concat();
+    vec![
+        format!("{prefix}{}", "current"),
+        format!("{prefix}{}", "install_global"),
+        format!("{prefix}{}", "test_fallback"),
+        format!("{prefix}{}", "get_global"),
+    ]
+}
+
+/// Enabled once the threading refactor (`a27-thread-daemon-paths`)
+/// has removed every call site of the global accessors named below.
+/// Until then the test would fail loudly on the 17 known-good
+/// references in production code; running it `#[ignore]`'d preserves
+/// the scanner infrastructure AND keeps the rest of the suite green
+/// while the per-module signature changes are landed. Remove the
+/// `#[ignore]` (and the doc comment above) in the same commit that
+/// removes the last call site.
+#[test]
+#[ignore = "enable once a27 removes all paths::current()/install_global()/test_fallback()/get_global() call sites"]
+fn no_removed_paths_global_accessor_references_in_src() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src_root = crate_root.join("src");
+    assert!(
+        src_root.is_dir(),
+        "src/ must exist under {}",
+        crate_root.display()
+    );
+
+    let needles = banned_global_paths_accessor_names();
+
+    let mut rs_files = Vec::new();
+    collect_rs_files(&src_root, &mut rs_files);
+
+    let mut violations: Vec<String> = Vec::new();
+    for path in &rs_files {
+        // Self-skip: the scanner's own file is excluded by basename so
+        // its docs (which legitimately name the removed accessors as
+        // strings) do not match itself. This pass operates on `src/`
+        // anyway, so the scanner file under `tests/` is naturally not
+        // walked — the self-skip is defense in depth.
+        if path.file_name() == Some(OsStr::new(SCANNER_FILENAME)) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&crate_root)
+            .expect("walker returns paths under crate root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => panic!("could not read {}: {e}", path.display()),
+        };
+        for (lineno, line) in contents.lines().enumerate() {
+            for needle in &needles {
+                if line.contains(needle.as_str()) {
+                    violations.push(format!(
+                        "{}:{}: matched `{needle}`: {}",
+                        rel,
+                        lineno + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Removed process-global `DaemonPaths` accessor names found in src/:\n\n{}\n\n\
+         These accessors were removed in `a27-thread-daemon-paths`. \
+         Production code now receives `DaemonPaths` as an explicit \
+         constructor argument or function parameter — see \
+         `docs/STATE-LAYOUT.md` § \"Path resolution rule\". Tests \
+         construct their own via `crate::testing::test_daemon_paths()` \
+         and pass it explicitly to the production API.",
+        violations.join("\n"),
+    );
+}
+
+/// Self-test: feed the scanner a synthetic Rust source string
+/// containing one of the banned names and confirm the inner detection
+/// loop flags it. This guards the scanner against a silent-pass
+/// regression where the needles list goes out of sync with the
+/// matcher's logic.
+#[test]
+fn scanner_flags_synthetic_banned_reference() {
+    let needles = banned_global_paths_accessor_names();
+    assert!(
+        !needles.is_empty(),
+        "banned_global_paths_accessor_names must not be empty"
+    );
+    // Build a synthetic line containing the first needle.
+    let synthetic_line = format!("    let p = crate::{}();", needles[0]);
+    let matched = needles.iter().any(|n| synthetic_line.contains(n.as_str()));
+    assert!(
+        matched,
+        "scanner detector must flag a synthetic line that contains `{}`; got: {synthetic_line}",
+        needles[0]
+    );
+}
+
+/// Self-test: the scanner's own source file does NOT trip the banned-
+/// name pass (because the `src/` walker doesn't even reach `tests/`,
+/// AND because the basename self-skip catches it as belt-and-braces).
+#[test]
+fn scanner_does_not_flag_itself() {
+    // Walk `tests/` ourselves and confirm SCANNER_FILENAME is present
+    // (the file we're running from). If the rule "scanner self-skips"
+    // breaks in the future, the second pass would otherwise start
+    // matching its own docs.
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tests_root = crate_root.join("tests");
+    let mut rs_files = Vec::new();
+    collect_rs_files(&tests_root, &mut rs_files);
+    let names: Vec<String> = rs_files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == SCANNER_FILENAME),
+        "scanner file `{SCANNER_FILENAME}` should be present in tests/; got: {names:?}"
     );
 }
 

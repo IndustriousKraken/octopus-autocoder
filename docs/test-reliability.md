@@ -275,17 +275,21 @@ legitimately use. Concretely:
   `tests/` and fails the build if any file outside its narrow allowlist
   contains the substring; the `tests/` allowlist is empty.
 
-Operator note: existing dev machines that ran `cargo test` before
-this discipline was enforced may have left stale fixtures under
-`/tmp/autocoder/audit-threads/*.json` (and a few sibling dirs).
-`rm -rf /tmp/autocoder/` is safe to run — the daemon never reads from
-that prefix post-`a09`, and the test suite no longer writes there.
+Per-test isolation property (`a27`): each test owns its own
+`DaemonPaths` via `test_daemon_paths()`, and the production APIs the
+test exercises receive that value as an explicit parameter rather
+than reading from a process-global. Two concurrent tests therefore
+land their fixtures under DISJOINT tempdir roots; no fixture write OR
+read crosses between tests, regardless of how similar the basenames
+happen to be. See `docs/STATE-LAYOUT.md`'s "Path resolution rule"
+section for the architectural detail.
 
 ## Disposition summary
 
 | Test | Module | Category | Disposition | Notes |
 |---|---|---|---|---|
 | Tests writing to `/tmp/autocoder` | (sweep wide) | filesystem | `fixed-in-a10` | Test helper `crate::testing::test_daemon_paths()` introduced; `path_literals_audit` extended to scan `tests/` (empty allowlist) so regressions fail the build. |
+| Test-mode `paths::current()` fallback to shared `<system-temp>/autocoder/...` | `src/paths.rs` (and every test exercising production code that read it) | filesystem (shared global) | `fixed-in-a27` | The process-global `paths::current()`/`install_global()`/`test_fallback()`/`get_global()` accessors are removed; production modules receive `DaemonPaths` via constructor or function parameter, and tests construct their own per-test instance via `test_daemon_paths()`. See `docs/STATE-LAYOUT.md` § "Path resolution rule". |
 | `weekly_creates_about_52_occurrences` | — | (unlocatable) | `not-flaky-on-inspection` | Test does not exist in current tree or git history (see "Test name lookup"). Per-spec, documented as a ghost so future operators don't reopen the search. |
 | `audits::missing_tests::tests::post_run_detects_only_new_change_dirs` | `audits/missing_tests.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |
 | `audits::drift::tests::sandbox_settings_file_cleaned_up_after_run` | `audits/drift.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |

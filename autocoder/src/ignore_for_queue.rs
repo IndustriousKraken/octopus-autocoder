@@ -10,7 +10,9 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use crate::spec_root::SpecRoot;
 
 const MARKER_FILE: &str = ".ignore-for-queue.json";
 const DEFAULT_REASON: &str = "operator-driven skip; original marker(s) preserved";
@@ -36,23 +38,20 @@ fn default_operator_action() -> String {
     DEFAULT_OPERATOR_ACTION.to_string()
 }
 
-fn marker_path(workspace: &Path, change: &str) -> PathBuf {
-    workspace
-        .join("openspec/changes")
-        .join(change)
-        .join(MARKER_FILE)
+fn marker_path(spec_root: &SpecRoot, change: &str) -> PathBuf {
+    spec_root.changes_dir().join(change).join(MARKER_FILE)
 }
 
-/// True when `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`
+/// True when `<spec_root>/changes/<change>/.ignore-for-queue.json`
 /// exists. Pure filesystem check — no JSON parsing.
-pub fn marker_exists(workspace: &Path, change: &str) -> bool {
-    marker_path(workspace, change).exists()
+pub fn marker_exists(spec_root: &SpecRoot, change: &str) -> bool {
+    marker_path(spec_root, change).exists()
 }
 
 /// Write the marker file atomically (tempfile + rename in the change
 /// directory). The change directory must already exist.
-pub fn write_marker(workspace: &Path, change: &str, marked_by: &str) -> Result<()> {
-    let path = marker_path(workspace, change);
+pub fn write_marker(spec_root: &SpecRoot, change: &str, marked_by: &str) -> Result<()> {
+    let path = marker_path(spec_root, change);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
@@ -81,7 +80,16 @@ pub fn write_marker(workspace: &Path, change: &str, marked_by: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    fn ws_spec_root(workspace: &Path) -> SpecRoot {
+        SpecRoot::from_parts(
+            workspace.to_path_buf(),
+            workspace.join("openspec"),
+            false,
+        )
+    }
 
     fn make_change_dir(workspace: &Path, name: &str) {
         std::fs::create_dir_all(workspace.join("openspec/changes").join(name)).unwrap();
@@ -91,10 +99,11 @@ mod tests {
     fn write_then_exists_returns_true() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let sr = ws_spec_root(ws);
         make_change_dir(ws, "foo");
-        assert!(!marker_exists(ws, "foo"));
-        write_marker(ws, "foo", "U_OP").unwrap();
-        assert!(marker_exists(ws, "foo"));
+        assert!(!marker_exists(&sr, "foo"));
+        write_marker(&sr, "foo", "U_OP").unwrap();
+        assert!(marker_exists(&sr, "foo"));
         let raw = std::fs::read_to_string(
             ws.join("openspec/changes/foo/.ignore-for-queue.json"),
         )
@@ -113,7 +122,8 @@ mod tests {
     fn write_marker_errors_when_change_directory_absent() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
-        let err = write_marker(ws, "missing", "U")
+        let sr = ws_spec_root(ws);
+        let err = write_marker(&sr, "missing", "U")
             .expect_err("write_marker should fail when change dir is absent");
         let msg = format!("{err:#}");
         assert!(
@@ -126,8 +136,9 @@ mod tests {
     fn round_trip_marker_struct() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let sr = ws_spec_root(ws);
         make_change_dir(ws, "foo");
-        write_marker(ws, "foo", "U_OP_42").unwrap();
+        write_marker(&sr, "foo", "U_OP_42").unwrap();
         let raw = std::fs::read_to_string(
             ws.join("openspec/changes/foo/.ignore-for-queue.json"),
         )

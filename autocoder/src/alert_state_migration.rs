@@ -356,6 +356,9 @@ mod tests {
             local_path: Some(workspace),
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 

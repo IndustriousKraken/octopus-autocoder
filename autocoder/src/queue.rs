@@ -401,6 +401,55 @@ pub fn archive(workspace: &Path, change: &str) -> Result<()> {
     archive_with_runner(&RealArchiveRunner, workspace, change)
 }
 
+/// SpecRoot-aware archive entry point. Use this when the caller has a
+/// `&RepositoryConfig` in scope so per-repo `spec_storage` is honored.
+pub fn archive_at(spec_root: &crate::spec_root::SpecRoot, change: &str) -> Result<()> {
+    archive_at_with_runner(&RealArchiveRunner, spec_root, change)
+}
+
+/// SpecRoot + injectable-runner variant of [`archive_at`]. Production
+/// uses [`archive_at`] (which delegates here with a `RealArchiveRunner`);
+/// tests substitute mock runners to drive the four `ArchiveFailure`
+/// branches without spawning real subprocesses.
+pub fn archive_at_with_runner(
+    runner: &dyn ArchiveRunner,
+    spec_root: &crate::spec_root::SpecRoot,
+    change: &str,
+) -> Result<()> {
+    let src = spec_root.changes_dir().join(change);
+    if !src.is_dir() {
+        return Err(anyhow!(
+            "cannot archive change `{change}`: source directory {} not found",
+            src.display()
+        ));
+    }
+    match openspec_archive_with_postcondition(runner, spec_root, change) {
+        Ok(_archive_path) => Ok(()),
+        Err(ArchiveFailure::NonZeroExit { code, stderr, stdout }) => {
+            let body = if !stderr.trim().is_empty() {
+                truncate_for_report(stderr.trim())
+            } else if !stdout.trim().is_empty() {
+                truncate_for_report(stdout.trim())
+            } else {
+                "(no output)".to_string()
+            };
+            Err(anyhow!(
+                "openspec archive `{change}` exited {code:?}: {body}"
+            ))
+        }
+        Err(ArchiveFailure::AbortedMarker { reason, full_output }) => Err(anyhow!(
+            "openspec archive `{change}` aborted by openspec: {reason}; full output: {full_output}"
+        )),
+        Err(ArchiveFailure::ActivePathStillPresent { path, full_output: _ }) => Err(anyhow!(
+            "openspec archive `{change}` reported success but the change directory at {} still exists",
+            path.display()
+        )),
+        Err(ArchiveFailure::NoArchiveEntryFound { full_output }) => Err(anyhow!(
+            "openspec archive `{change}` reported success but neither the active path nor any archive entry exists; full output: {full_output}"
+        )),
+    }
+}
+
 /// Test-injectable variant of `archive`. The production entry point
 /// delegates with a `RealArchiveRunner`; tests substitute mock
 /// runners to drive the four `ArchiveFailure` branches without
@@ -417,7 +466,17 @@ pub fn archive_with_runner(
             src.display()
         ));
     }
-    match openspec_archive_with_postcondition(runner, workspace, change) {
+    // `workspace` here is the dir containing openspec/ (which for non-
+    // spec_storage repos is the code workspace; for spec_storage repos
+    // is the spec_storage path). Wrap it in a `SpecRoot::from_parts`
+    // shim so `openspec_archive_with_postcondition` operates on the
+    // right tree.
+    let spec_root = crate::spec_root::SpecRoot::from_parts(
+        workspace.to_path_buf(),
+        workspace.join("openspec"),
+        false,
+    );
+    match openspec_archive_with_postcondition(runner, &spec_root, change) {
         Ok(_archive_path) => Ok(()),
         Err(ArchiveFailure::NonZeroExit { code, stderr, stdout }) => {
             let body = if !stderr.trim().is_empty() {

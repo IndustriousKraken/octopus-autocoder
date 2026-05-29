@@ -17,6 +17,78 @@ A list of one or more repositories to manage. Each entry:
 | `local_path`         | no       | derived | See [Workspace path derivation](OPERATIONS.md#workspace-path-derivation). |
 | `chatops_channel_id` | no       | falls back to `chatops.default_channel_id` | See [ChatOps Escalation](CHATOPS.md). |
 | `max_changes_per_pr` | no       | falls back to `executor.max_changes_per_pr`, then `3` | Upper bound on archived changes committed in one iteration's PR. Remaining pending changes wait for the next iteration. A value of `0` is clamped to `1` with a WARN log at startup. |
+| `spec_storage`       | no       | unset (workspace-internal specs) | OSS-fork support (a26): see [`spec_storage`](#repositoriesspec_storage). |
+| `upstream`           | no       | unset (no upstream remote management) | OSS-fork support (a26): see [`upstream`](#repositoriesupstream). |
+| `auto_submit_pr`     | no       | `true`  | OSS-fork support (a26): see [`auto_submit_pr`](#repositoriesauto_submit_pr). |
+
+### `repositories[].spec_storage` {#repositoriesspec_storage}
+
+OSS-fork support (a26). When set, autocoder treats `<path>/openspec/`
+as the canonical-spec source AND destination INSTEAD OF
+`<workspace>/openspec/`. Used when canonical specs cannot live inside
+the code repo (typically an upstream OSS project that does not use
+spec-driven development).
+
+| Field  | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `path` | yes      | —       | Workspace-relative OR absolute path to a directory. SHALL be a git working tree containing an `openspec/` subdirectory. |
+
+Validation (config-load fail-fast):
+
+- The resolved `path` MUST exist AND MUST be a directory.
+- The directory MUST be a git working tree (verified via
+  `git -C <path> rev-parse --is-inside-work-tree`).
+- The subdirectory `<path>/openspec/` MUST exist.
+
+Cross-link: see the OSS contribution workflow in
+[`docs/OPERATIONS.md`](OPERATIONS.md#oss-contribution-workflow) for
+the recommended setup.
+
+### `repositories[].upstream` {#repositoriesupstream}
+
+OSS-fork support (a26). When set, autocoder ensures the workspace has
+a git remote named `<remote>` pointing at `<url>` AND opportunistically
+runs `git fetch <remote>` at the start of every polling iteration. The
+fetch is best-effort: failures log a WARN but do not block the
+iteration. Enables — but does NOT trigger — automatic upstream
+syncing; syncing is operator-initiated via the `@<bot> sync-upstream`
+chatops verb (see [`docs/CHATOPS.md`](CHATOPS.md)).
+
+| Field    | Required | Default      | Description |
+|----------|----------|--------------|-------------|
+| `remote` | no       | `"upstream"` | Git remote name to manage. |
+| `branch` | no       | `"main"`     | The upstream repo's primary branch. |
+| `url`    | yes      | —            | The upstream repo's git URL (SSH OR HTTPS). |
+
+Validation: `url` MUST be non-empty. Reachability is NOT checked at
+config-load — that's the polling iteration's concern.
+
+Cross-link:
+[`docs/OPERATIONS.md`'s OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow).
+
+### `repositories[].auto_submit_pr` {#repositoriesauto_submit_pr}
+
+OSS-fork support (a26). Gates whether autocoder auto-opens the
+end-of-iteration PR.
+
+| Value           | Behavior |
+|-----------------|----------|
+| `true` (default)| Existing behavior: the agent branch is pushed AND a PR is opened via the GitHub REST API. The chatops thread reply is `✅ PR opened: <url>`. |
+| `false`         | The agent branch is pushed BUT the PR-creation API call is skipped. The chatops thread reply is `📦 Branch pushed: <branch-url>` followed by `Run: gh pr create --base <upstream.branch \| base-branch> --head <agent-branch>` so the operator can submit the upstream PR manually after local review. |
+
+`auto_submit_pr: false` is the recommended setting for OSS-fork
+deployments where a bad PR damages your reputation with upstream
+maintainers in a way an internal PR does not. All other end-of-pass
+behaviors (implementer-summary capture, reviewer run, etc.) execute
+unchanged.
+
+`auto_submit_pr` applies UNIFORMLY to both code-workspace PR creation
+AND `spec_storage` PR creation (when set). Operators wanting
+different behavior for the two cases SHALL split the workspace into
+separate per-repo configurations.
+
+Cross-link:
+[`docs/OPERATIONS.md`'s OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow).
 
 ## `executor:` (required)
 

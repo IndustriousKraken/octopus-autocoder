@@ -37,6 +37,39 @@ repositories:
     # audits:
     #   architecture_brightline: weekly
 
+    # ----------------------------------------------------------------
+    # OSS-fork support (a26). See `docs/OPERATIONS.md`'s
+    # "OSS contribution workflow" section for the full operator setup
+    # — these three blocks combine to enable autocoder on a fork of
+    # an upstream project the operator does NOT own.
+    # ----------------------------------------------------------------
+    #
+    # `spec_storage.path` — when set, canonical specs live at
+    # `<path>/openspec/` instead of `<workspace>/openspec/`. The path
+    # is workspace-relative OR absolute; SHALL be a git working tree
+    # containing an `openspec/` subdirectory (verified at config-load).
+    # Default: unset (specs live alongside code).
+    # spec_storage:
+    #   path: "../my-specs"
+    #
+    # `upstream` — when set, autocoder ensures a git remote named
+    # `<remote>` (default `upstream`) points at `<url>` AND
+    # opportunistically `git fetch <remote>` at iteration start.
+    # Enables the `@<bot> sync-upstream <repo>` chatops verb that
+    # rebases the workspace's base branch onto upstream's primary
+    # branch on operator demand.
+    # upstream:
+    #   remote: upstream      # default
+    #   branch: main          # default
+    #   url: "https://github.com/upstream-org/upstream-project.git"
+    #
+    # `auto_submit_pr` — when `false`, autocoder pushes the agent
+    # branch BUT skips the PR-creation API call, surfacing a
+    # `gh pr create` command suggestion to chatops so the operator
+    # can review locally before opening the upstream PR.
+    # Default: `true` (existing auto-submit behavior).
+    # auto_submit_pr: false
+
 executor:
   # The default executor wraps the `claude` CLI (Claude Code) installed and
   # authenticated on this host. No API key in this file — authentication

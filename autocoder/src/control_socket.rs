@@ -152,6 +152,22 @@ pub struct SpecItRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight sync-upstream request awaiting the polling
+/// iteration's handler (a26). The chatops dispatcher's `sync-upstream`
+/// verb appends to `RepoTaskHandle::pending_sync_upstream_requests`;
+/// the polling loop drains the queue at the start of each iteration.
+/// Carries the chatops thread context so the rebase result OR
+/// conflict notice can be posted as a follow-up reply.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SyncUpstreamRequest {
+    pub request_id: String,
+    pub repo_url: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -224,6 +240,14 @@ pub struct RepoTaskHandle {
     /// handler internally enqueues a fresh `ProposalRequest`).
     pub pending_spec_it_requests:
         Arc<Mutex<std::collections::VecDeque<SpecItRequest>>>,
+    /// Queue of chat-driven sync-upstream requests (a26). The chatops
+    /// dispatcher's `sync-upstream` verb pushes here via the
+    /// `queue_sync_upstream_request` control-socket action; the
+    /// polling loop drains the queue at the start of each iteration
+    /// (FIFO). Each entry carries its own request_id so duplicate
+    /// queueing within a single window is deduplicated on insert.
+    pub pending_sync_upstream_requests:
+        Arc<Mutex<std::collections::VecDeque<SyncUpstreamRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -452,6 +476,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_scout_request" => handle_queue_scout_request(&parsed, state),
         "queue_spec_it_request" => handle_queue_spec_it_request(&parsed, state),
         "queue_clear_scout" => handle_queue_clear_scout(&parsed, state),
+        "queue_sync_upstream_request" => handle_queue_sync_upstream_request(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
@@ -954,7 +979,8 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
     // Refuse if the marker is already present so the operator gets a
     // clear "no change" signal rather than a stealth no-op commit.
-    if crate::ignore_for_queue::marker_exists(&workspace_path, &change) {
+    let spec_root = crate::spec_root::SpecRoot::for_repo(&repo, &workspace_path);
+    if crate::ignore_for_queue::marker_exists(&spec_root, &change) {
         return json!({
             "ok": false,
             "error": format!(
@@ -964,7 +990,7 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
 
     // Write the marker file.
-    if let Err(e) = crate::ignore_for_queue::write_marker(&workspace_path, &change, &marked_by) {
+    if let Err(e) = crate::ignore_for_queue::write_marker(&spec_root, &change, &marked_by) {
         return json!({"ok": false, "error": format!("writing marker: {e:#}")});
     }
 
@@ -1765,6 +1791,68 @@ fn handle_queue_spec_it_request(parsed: &Value, state: &ControlState) -> Value {
     })
 }
 
+/// Handle the `queue_sync_upstream_request` action (a26). Enqueues
+/// a `SyncUpstreamRequest` onto the matched repo's handle; the
+/// polling iteration's handler drains it at iteration start.
+fn handle_queue_sync_upstream_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = parsed
+        .get("thread_ts")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_sync_upstream_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push_back(SyncUpstreamRequest {
+                request_id: request_id.clone(),
+                repo_url: url.clone(),
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Handle the `queue_clear_scout` action (a25). Synchronously deletes
 /// every `ScoutRunState` file in the matched repo's workspace AND
 /// returns the count cleared. The chatops dispatcher posts the reply
@@ -2233,6 +2321,8 @@ mod tests {
                     pending_scout_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_spec_it_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_sync_upstream_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
@@ -3428,6 +3518,9 @@ github:
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         {
             let mut guard = state.repo_tasks.lock().unwrap();
@@ -3460,6 +3553,8 @@ github:
                     pending_scout_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_spec_it_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_sync_upstream_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
@@ -3677,6 +3772,9 @@ github:
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let gh = GithubConfig {
             token_env: env_var.to_string(),

@@ -75,6 +75,113 @@ pub fn fetch_remote(workspace: &Path, remote: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git fetch <remote>` with a hard timeout (in seconds). The child
+/// process is killed if it does not finish in time AND a timeout
+/// error is returned. Used by the OSS-fork-support opportunistic
+/// upstream fetch (a26): the polling iteration's startup runs this
+/// best-effort AND must not block the iteration for more than the
+/// configured timeout window when the network is slow.
+pub fn fetch_remote_with_timeout(
+    workspace: &Path,
+    remote: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let mut child = Command::new("git")
+        .args(["fetch", remote])
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning `git fetch {remote}` in {}", workspace.display()))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut stdout);
+                }
+                if let Some(mut s) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut stderr);
+                }
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr_s = String::from_utf8_lossy(&stderr).trim().to_string();
+                return Err(anyhow!("git fetch {remote} failed: {stderr_s}"));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(
+                        "git fetch {remote} timed out after {timeout_secs}s"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(anyhow!("waiting on `git fetch {remote}`: {e}"));
+            }
+        }
+    }
+}
+
+/// `git rebase <upstream>` — rebase the current branch onto a remote
+/// tracking ref. Returns Ok on clean rebase. On conflict, returns the
+/// captured stderr; callers MAY then call `rebase_abort` to restore
+/// the workspace.
+pub fn rebase(workspace: &Path, upstream_ref: &str) -> Result<()> {
+    run_git(workspace, "rebase", &["rebase", upstream_ref])?;
+    Ok(())
+}
+
+/// `git rebase --abort` — abort an in-progress rebase, restoring the
+/// pre-rebase HEAD. Idempotent: when no rebase is in progress, git
+/// emits a non-zero exit; this helper logs at WARN and returns Ok so
+/// the caller's "abort on conflict" flow doesn't compound a failure.
+pub fn rebase_abort(workspace: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git rebase --abort` in {}", workspace.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "git rebase --abort returned non-zero (likely no rebase in progress): {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// Return the workspace-relative paths of conflicted (UU/AA/etc.)
+/// files reported by `git status --porcelain`. Used by the OSS-fork
+/// `sync-upstream` handler to surface conflicting files in the
+/// chatops reply before aborting the rebase.
+pub fn conflicted_files(workspace: &Path) -> Result<Vec<String>> {
+    let output = run_git(workspace, "status --porcelain", &["status", "--porcelain"])?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        // Porcelain status format: XY <path>. Conflict statuses are
+        // any line whose XY pair contains a `U` OR `AA` / `DD`.
+        if line.len() < 3 {
+            continue;
+        }
+        let (xy, rest) = line.split_at(2);
+        let path = rest.trim();
+        if xy.contains('U') || xy == "AA" || xy == "DD" {
+            out.push(path.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// `git fetch <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>`
 /// — fetch ONLY the named branch from the remote, populating the
 /// corresponding local tracking ref. The leading `+` enables forced

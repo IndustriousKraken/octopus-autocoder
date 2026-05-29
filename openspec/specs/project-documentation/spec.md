@@ -811,3 +811,89 @@ The `a24` Prompt overrides table SHALL be extended with the `Scout` entry (logic
 - **WHEN** an operator reads the `## Prompt overrides` table in `docs/CONFIG.md`
 - **THEN** a `Scout` row appears with embedded path `prompts/scout.md`, per-workspace override `features.scout.prompt_path`, legacy field `—`
 
+### Requirement: `docs/CHATOPS.md`, `docs/OPERATIONS.md`, AND `docs/CONFIG.md` document the OSS-fork workflow knobs AND the `sync-upstream` verb
+`docs/CHATOPS.md` SHALL contain a `### sync-upstream` subsection under operator-driven verbs documenting the syntax, the rebase behavior, the conflict-abort behavior, AND the explicit no-push guarantee (the verb fetches + rebases the workspace's base branch but does NOT push to any remote).
+
+`docs/OPERATIONS.md` SHALL contain an "OSS contribution workflow" section describing the recommended setup AS a discrete operator workflow:
+
+1. Fork the upstream project on GitHub.
+2. Clone the fork as the autocoder workspace.
+3. Configure the `upstream` block pointing at the upstream repo.
+4. Set `auto_submit_pr: false`.
+5. Configure `spec_storage.path` pointing at a sibling specs repo.
+6. (Optional) Configure a tighter `executor.implementer.prompt_path` emphasizing minimal-diff + follow-existing-conventions style. The section SHALL include a sample prompt snippet operators can adapt.
+
+The section SHALL document the typical operator loop: `scout` → `spec-it` → review the auto-generated fork PR → merge into fork — then manually `gh pr create` to upstream.
+
+`docs/CONFIG.md` SHALL document each new field with default, validation rules, AND a cross-link to the OPERATIONS.md OSS-workflow section:
+
+- `spec_storage.path: Option<String>` — workspace-relative OR absolute path; SHALL be a git working tree containing `openspec/`; validation rules listed.
+- `upstream.{remote, branch, url}` — defaults named; validation rules listed.
+- `auto_submit_pr: bool` — default `true`; behavior described per polling-iteration outcome.
+
+`config.example.yaml` SHALL include all three blocks commented out with each field's default in a comment.
+
+#### Scenario: CHATOPS.md documents sync-upstream
+- **WHEN** an operator reads `docs/CHATOPS.md`'s operator-driven-verbs section
+- **THEN** a `### sync-upstream` subsection appears with:
+  - Syntax: `@<bot> sync-upstream <repo-substring>`
+  - Behavior: fetches the upstream remote, rebases the configured base branch, posts the result
+  - Conflict behavior: rebase aborted, files named, operator advised to resolve manually
+  - No-push guarantee: the verb never pushes to origin OR the fork
+
+#### Scenario: OPERATIONS.md OSS-workflow section is complete
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s "OSS contribution workflow" section
+- **THEN** the section lists the six-step setup in order
+- **AND** includes a sample tighter implementer-prompt snippet operators can adapt
+- **AND** documents the scout → spec-it → review → merge-fork → manual-upstream-PR loop
+
+#### Scenario: CONFIG.md documents each new field
+- **WHEN** an operator reads `docs/CONFIG.md`'s per-repo-config section
+- **THEN** subsections appear for `spec_storage`, `upstream`, AND `auto_submit_pr`
+- **AND** each subsection names the field's default, validation rules, AND cross-links to OPERATIONS.md for the workflow context
+- **AND** the `auto_submit_pr` subsection explicitly notes the chatops notification difference (`📦 Branch pushed` vs `✅ PR opened`) on the two settings
+
+#### Scenario: config.example.yaml includes the three blocks
+- **WHEN** an operator opens `config.example.yaml`
+- **THEN** commented-out blocks for `spec_storage`, `upstream`, AND `auto_submit_pr` appear under the per-repo configuration section
+- **AND** each field's default value is named in a comment
+- **AND** a header comment links to `docs/OPERATIONS.md`'s OSS-workflow section for usage guidance
+
+### Requirement: `docs/STATE-LAYOUT.md` "Path resolution rule" describes DaemonPaths threading AND `docs/test-reliability.md` records the resolved test-fallback caveat
+`docs/STATE-LAYOUT.md`'s "Path resolution rule" section SHALL be updated to describe the threading model that replaces the prior `paths::current()` global. The section SHALL state:
+
+1. The daemon constructs exactly one `DaemonPaths` value at startup (in the entrypoint module).
+2. Every consumer of path information receives that value via constructor OR function parameter.
+3. There is no process-global accessor; the formerly-existing `paths::current()` AND its helpers have been removed.
+4. Tests construct their own `DaemonPaths` via `test_daemon_paths()` for per-test isolation; concurrent tests cannot collide on disk because each test's fixtures live under its own tempdir.
+5. A CI scanner (extending the `a10` path-literals audit) blocks reintroduction of the removed global accessors anywhere under `autocoder/src/`.
+
+`docs/test-reliability.md`'s disposition-table row for the `a10` caveat (the residual test-fallback issue) SHALL be updated:
+
+- Status changes from "left for follow-up" to `fixed-in-a27`.
+- The resolution paragraph names the threading refactor AND points the reader at the updated `docs/STATE-LAYOUT.md` "Path resolution rule" section for the architectural detail.
+
+The `rm -rf /tmp/autocoder/` cleanup hint added by `a10` SHALL be removed (the shared location no longer accumulates fixtures, so the hint is obsolete).
+
+#### Scenario: STATE-LAYOUT.md describes the threading model
+- **WHEN** a maintainer reads `docs/STATE-LAYOUT.md`'s "Path resolution rule" section
+- **THEN** the section names the single-construction-site rule (daemon entrypoint)
+- **AND** the section names the parameter/constructor-threading rule for consumers
+- **AND** the section explicitly states there is no `paths::current()` global
+- **AND** the section names the CI scanner that prevents reintroduction
+
+#### Scenario: STATE-LAYOUT.md describes per-test isolation
+- **WHEN** the same maintainer reads further in the section
+- **THEN** the section describes `test_daemon_paths()` as the canonical per-test construction helper
+- **AND** the section names the isolation property (concurrent tests use disjoint tempdirs)
+
+#### Scenario: test-reliability.md marks the caveat resolved
+- **WHEN** the maintainer reads `docs/test-reliability.md`'s disposition table
+- **THEN** the row covering the test-fallback issue is tagged `fixed-in-a27`
+- **AND** the resolution paragraph names the threading refactor AND links to STATE-LAYOUT.md
+
+#### Scenario: Obsolete cleanup hint removed
+- **WHEN** the maintainer reads `docs/test-reliability.md`
+- **THEN** the `rm -rf /tmp/autocoder/` cleanup hint is no longer present
+- **AND** any prose that referenced it has been adjusted OR removed
+

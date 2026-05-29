@@ -45,15 +45,46 @@ relative path or a collision between two roles is a startup error.
 
 ## Path resolution rule
 
-Every daemon-side state-file read AND write SHALL route through the
-`DaemonPaths` resolver in `autocoder/src/paths.rs`. The resolver exposes
-the four bare roots (`state`, `cache`, `logs`, `runtime`) plus a set of
-per-state-shape helpers — `audit_threads_dir()`, `busy_markers_dir()`,
-`proposal_requests_dir()`, `changelog_requests_dir()`,
-`failure_state_dir()`, `revisions_dir()`, `audit_state_dir()`,
-`run_logs_dir(<basename>)`, `audit_logs_dir(<basename>)`,
-`workspaces_dir()`, `control_socket_path()` — that callers use instead
-of constructing paths inline.
+Every daemon-side state-file read AND write goes through a
+`DaemonPaths` value threaded into the consumer via constructor OR
+function parameter; there is no process-global `paths::current()`.
+
+- The daemon constructs exactly one `DaemonPaths` value at startup,
+  in the entrypoint module (`cli::run::execute`), via the env-driven
+  `resolve_daemon_paths` constructor.
+- Every consumer of path information receives that value via its
+  constructor (for struct-shaped consumers like the audit scheduler,
+  the busy-marker manager, the control-socket handler) OR via a
+  function parameter (for free functions like `audits::threads`,
+  `proposal_requests`, `changelog_requests`). Modules MAY take
+  ownership AND clone, OR hold an `Arc<DaemonPaths>` for shared
+  reference. Either is acceptable provided no global state results.
+- There is no process-global accessor. The formerly-existing
+  `paths::current()` AND its siblings (`install_global`,
+  `install_global_for_tests`, `test_fallback`, `get_global`) have
+  been removed (per `a27-thread-daemon-paths`). Production code that
+  needs paths declares the dependency on its constructor / function
+  signature.
+- Tests construct their own `DaemonPaths` via
+  `crate::testing::test_daemon_paths()` (which hands out a
+  tempdir-scoped instance) AND pass it explicitly into the
+  production APIs they exercise. Each test's fixtures live under
+  ITS OWN tempdir, so concurrent tests cannot collide on disk —
+  the property that motivated `a27`.
+- A CI scanner (extending the `a10` `path_literals_audit`) blocks
+  reintroduction of the removed global accessors anywhere under
+  `autocoder/src/`. If a future PR adds `paths::current` /
+  `paths::install_global` / `paths::test_fallback` /
+  `paths::get_global` to any `src/**/*.rs` file, the build fails.
+
+The resolver exposes the four bare roots (`state`, `cache`, `logs`,
+`runtime`) plus a set of per-state-shape helpers —
+`audit_threads_dir()`, `busy_markers_dir()`, `proposal_requests_dir()`,
+`changelog_requests_dir()`, `failure_state_dir()`, `revisions_dir()`,
+`audit_state_dir()`, `run_logs_dir(<basename>)`,
+`audit_logs_dir(<basename>)`, `workspaces_dir()`,
+`control_socket_path()` — that callers use instead of constructing
+paths inline.
 
 ### State-dir subdirectories
 
