@@ -282,6 +282,25 @@ pub fn rev_list_count(workspace: &Path, range: &str) -> Result<usize> {
         .with_context(|| format!("parsing rev-list count output: {s:?}"))
 }
 
+/// Return each commit subject in `range` (e.g. `"main..agent-q"`) in
+/// chronological order (`--reverse`). Empty subjects are filtered out.
+/// Used by the audit-only PR-body builder to enumerate the agent-branch
+/// commits the iteration is shipping.
+pub fn log_subjects(workspace: &Path, range: &str) -> Result<Vec<String>> {
+    let output = run_git(
+        workspace,
+        "log --format=%s",
+        &["log", "--reverse", "--format=%s", range],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 /// Return the three-dot diff between `base` and `head` — i.e. the changes
 /// present on `head` since it diverged from `base`. Equivalent to
 /// `git diff <base>...<head>`.
