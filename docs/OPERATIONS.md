@@ -780,6 +780,27 @@ autocoder's spec-driven workflow assumes `openspec/specs/<capability>/spec.md` a
 
 ---
 
+## Finding things to work on {#finding-things-to-work-on}
+
+`propose`, `brownfield`, AND `send it` all assume the operator has already decided what to work on. The upstream question — "I have a few minutes and an unfamiliar (or long-running) codebase; what's worth looking at?" — is what the `scout` → pick → `spec-it` loop is for.
+
+The recommended discovery cadence is three steps:
+
+1. **Scout.** `@<bot> scout <repo> [optional focus]` queues a scout-mode executor pass. The polling iteration runs the agent CLI under a read-only sandbox (Read, Glob, Grep, Bash including `gh` for the open-issues fetch), AND posts a curated triage list of opportunities to the lifecycle thread. The list is grouped by category (`security`, `bug`, `error_handling`, `type_tightening`, `code_smell`, `perf`, `documentation`, `test_coverage`, `issue`, `todo_fixme`, `research`) with one line per item including a source pointer (`<file>:<line>`, an issue URL, or a commit range) AND a tractability tag (`small`, `medium`, `large`).
+2. **Pick.** Read the list. The scout's tone is "things you might consider," not ranked recommendations — the operator decides which item is worth pursuing.
+3. **Spec-it.** Reply inside the same scout thread with `@<bot> spec-it <N> [optional guidance]`. The polling iteration translates the picked item into a `ProposeRequest` (the item's title + body + source/category/tractability lines + your guidance) AND hands it to the standard propose lifecycle. The resulting fixes PR and/or spec PR matches a normal `@<bot> propose` run.
+
+When to use the loop:
+
+- **OSS-contribution workspaces.** You've forked an unfamiliar upstream project AND want to land small targeted PRs (swallowed errors, type tightening, security gaps). Scout's category list maps directly to the kinds of contributions reviewers welcome; `spec-it` produces the same spec-and-PR shape the rest of the autocoder workflow expects.
+- **Long-running owned projects.** You periodically want a "what would a fresh pair of eyes notice" pass without committing to any specific fix. Run `@<bot> scout <repo>` with a focus area (e.g., `focus on error handling` or `focus on the auth surface`) AND let the curated list tell you whether anything's worth scoping.
+
+**Staleness.** If you wait more than `features.scout.staleness_warn_days` days (default 7) OR the workspace HEAD has moved since the scout ran, `spec-it` posts a warning naming the gap before submitting the propose-request. The warning does NOT block; if the picked item is no longer relevant, re-run `@<bot> scout <repo>` for a fresh list. Operators who want to force a fresh state can wipe prior runs via `@<bot> clear-scout <repo>` (see [CHATOPS.md → `clear-scout`](CHATOPS.md#clear-scout)).
+
+**Configuration.** Scout is enabled by default. Toggles AND limits live under `features.scout` — see [CONFIG.md → `features.scout`](CONFIG.md#featuresscout) for the schema.
+
+---
+
 ## Canonical-spec RAG
 
 When the operator configures `canonical_rag:` in `config.yaml` (see

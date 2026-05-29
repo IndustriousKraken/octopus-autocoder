@@ -35,6 +35,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -194,6 +195,10 @@ fn oversize_request_text_reply() -> Reply {
 /// verb (a23). Mirrors the `propose` request-text cap.
 pub const MAX_BROWNFIELD_GUIDANCE_LEN: usize = 10_000;
 
+/// Cap on the operator-supplied guidance accepted by the `scout`
+/// AND `spec-it` verbs (a25). Mirrors `propose`'s cap.
+pub const MAX_SCOUT_GUIDANCE_LEN: usize = 10_000;
+
 /// Capability-name slug regex for the `brownfield` verb. The slug is
 /// the canonical-spec directory name; it MUST be lowercase, start with
 /// a letter, AND contain only letters, digits, AND hyphens.
@@ -349,6 +354,30 @@ pub enum OperatorCommand {
         repo_substring: String,
         capability_name: String,
         guidance: Option<String>,
+    },
+    /// `@<bot> scout <repo-substring> [optional guidance]` (a25).
+    /// Queues a scout-mode executor pass; the polling iteration's
+    /// scout handler returns a curated triage list posted on the
+    /// lifecycle thread.
+    ScoutRequest {
+        repo_substring: String,
+        guidance: Option<String>,
+    },
+    /// `@<bot> spec-it <N> [optional guidance]` (a25). ONLY valid as
+    /// a reply inside a scout lifecycle thread (recognition happens
+    /// via thread-ts → ScoutRunState lookup in the dispatcher).
+    SpecItRequest {
+        item_id: usize,
+        guidance: Option<String>,
+        /// The scout-thread ts the verb was posted under. Mandatory
+        /// (parser only emits this variant inside a recognized scout
+        /// thread).
+        thread_ts: String,
+    },
+    /// `@<bot> clear-scout <repo-substring>` (a25). Wipes every
+    /// `ScoutRunState` file for the matched repo's workspace.
+    ClearScout {
+        repo_substring: String,
     },
     Help,
 }
@@ -676,6 +705,110 @@ fn parse_command_outcome_in_thread(
                 repo_substring: repo_substring.to_string(),
                 capability_name: capability_name.to_string(),
                 guidance,
+            })
+        }
+        "scout" => {
+            // `@<bot> scout <repo-substring> [optional guidance]`
+            // (a25). The repo substring is the first whitespace token
+            // after `scout`; guidance is everything after, preserving
+            // internal whitespace AND line breaks, capped at
+            // MAX_SCOUT_GUIDANCE_LEN.
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..];
+            let after_verb = after_verb.trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ scout: missing repo-substring. Usage: @<bot> scout <repo> [optional guidance]"
+                        .to_string(),
+                ));
+            }
+            let sub_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let repo_substring = &after_verb[..sub_end];
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let guidance_raw = after_verb[sub_end..].trim();
+            if guidance_raw.chars().count() > MAX_SCOUT_GUIDANCE_LEN {
+                return ParseOutcome::Invalid(Reply::Sync(format!(
+                    "✗ scout: guidance text exceeds {MAX_SCOUT_GUIDANCE_LEN} characters."
+                )));
+            }
+            let guidance = if guidance_raw.is_empty() {
+                None
+            } else {
+                Some(guidance_raw.to_string())
+            };
+            ParseOutcome::Ok(OperatorCommand::ScoutRequest {
+                repo_substring: repo_substring.to_string(),
+                guidance,
+            })
+        }
+        "spec-it" => {
+            // `@<bot> spec-it <item-number> [optional guidance]`
+            // (a25). ONLY recognized when the inbound message arrived
+            // inside a thread (any thread; the dispatcher does the
+            // scout-thread cross-check against on-disk
+            // `ScoutRunState.thread_ts` values).
+            let ts = match thread_ts {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ spec-it: only valid as a reply in a scout thread. Run @<bot> scout <repo> first."
+                            .to_string(),
+                    ));
+                }
+            };
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..].trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ spec-it: missing item number. Usage: @<bot> spec-it <N> [guidance]"
+                        .to_string(),
+                ));
+            }
+            let token_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let token = &after_verb[..token_end];
+            let item_id = match token.parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    return ParseOutcome::Invalid(Reply::Sync(format!(
+                        "✗ spec-it: `{token}` is not a valid item number. Usage: @<bot> spec-it <N> [guidance]"
+                    )));
+                }
+            };
+            let guidance_raw = after_verb[token_end..].trim();
+            if guidance_raw.chars().count() > MAX_SCOUT_GUIDANCE_LEN {
+                return ParseOutcome::Invalid(Reply::Sync(format!(
+                    "✗ spec-it: guidance text exceeds {MAX_SCOUT_GUIDANCE_LEN} characters."
+                )));
+            }
+            let guidance = if guidance_raw.is_empty() {
+                None
+            } else {
+                Some(guidance_raw.to_string())
+            };
+            ParseOutcome::Ok(OperatorCommand::SpecItRequest {
+                item_id,
+                guidance,
+                thread_ts: ts,
+            })
+        }
+        "clear-scout" => {
+            if rest.len() != 1 {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ clear-scout: missing repo-substring. Usage: @<bot> clear-scout <repo>"
+                        .to_string(),
+                ));
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::ClearScout {
+                repo_substring: rest[0].to_string(),
             })
         }
         "send" => {
@@ -1488,6 +1621,9 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
     out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
     out.push_str("  • `brownfield <repo> <capability-name> [optional guidance]` — draft a canonical spec for a capability that already exists\n");
+    out.push_str("  • `scout <repo> [optional guidance]` — chat-driven workflow: survey the repo AND return a triage list of opportunities\n");
+    out.push_str("  • `spec-it <N> [optional guidance]` — scout-thread-only: scope a scouted item into a propose-equivalent flow\n");
+    out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout-run state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
@@ -1753,6 +1889,19 @@ pub struct OperatorCommandDispatcher {
     /// at parse time with the documented `disabled in this workspace's
     /// config` message. Defaults to `true`.
     brownfield_enabled: bool,
+    /// Daemon-wide enable flag for the `scout`, `spec-it`, AND
+    /// `clear-scout` verbs (a25). When `false`, the dispatcher
+    /// refuses all three with the documented disabled-message.
+    scout_enabled: bool,
+    /// Resolver for the per-repo workspace path. Used by the
+    /// `spec-it` dispatcher to find the on-disk scout-state file for
+    /// the thread the operator replied in. Production wiring (in
+    /// `cli/run.rs`) installs a closure that consults the live repo
+    /// list AND `workspace::resolve_path`; tests inject a fixture.
+    #[allow(clippy::type_complexity)]
+    workspace_resolver: Option<
+        Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
+    >,
 }
 
 impl Default for OperatorCommandDispatcher {
@@ -1773,7 +1922,28 @@ impl OperatorCommandDispatcher {
             audit_types: Vec::new(),
             chatops: None,
             brownfield_enabled: true,
+            scout_enabled: true,
+            workspace_resolver: None,
         }
+    }
+
+    /// Override the daemon-wide scout-feature enable flag (a25).
+    #[allow(dead_code)] // wired by production callers in a follow-up; tests already use it
+    pub fn with_scout_enabled(mut self, enabled: bool) -> Self {
+        self.scout_enabled = enabled;
+        self
+    }
+
+    /// Provide a workspace-resolver closure used by the `spec-it`
+    /// dispatcher to find on-disk scout state for the thread the
+    /// operator replied in.
+    #[allow(dead_code)] // wired by production callers in a follow-up; tests already use it
+    pub fn with_workspace_resolver<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Option<std::path::PathBuf> + Send + Sync + 'static,
+    {
+        self.workspace_resolver = Some(Arc::new(f));
+        self
     }
 
     /// Override the daemon-wide brownfield-feature enable flag.
@@ -1955,6 +2125,40 @@ impl OperatorCommandDispatcher {
                     submitter,
                 )
                 .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::ScoutRequest {
+                repo_substring,
+                guidance,
+            }) => Some(
+                self.dispatch_scout_request(
+                    &repo_substring,
+                    guidance.as_deref(),
+                    channel_id,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::SpecItRequest {
+                item_id,
+                guidance,
+                thread_ts: ts,
+            }) => Some(
+                self.dispatch_spec_it_request(
+                    item_id,
+                    guidance.as_deref(),
+                    channel_id,
+                    &ts,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::ClearScout { repo_substring }) => Some(
+                Reply::Sync(
+                    self.dispatch_clear_scout(&repo_substring, repositories, submitter)
+                        .await,
+                ),
             ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
@@ -2313,6 +2517,12 @@ impl OperatorCommandDispatcher {
                 "✗ brownfield: internal routing error (the dispatcher saw \
                  BrownfieldRequest in the String-returning dispatch fn). \
                  Please file a bug."
+                    .to_string()
+            }
+            OperatorCommand::ScoutRequest { .. }
+            | OperatorCommand::SpecItRequest { .. }
+            | OperatorCommand::ClearScout { .. } => {
+                "✗ scout/spec-it/clear-scout: internal routing error. Please file a bug."
                     .to_string()
             }
         }
@@ -2742,6 +2952,207 @@ impl OperatorCommandDispatcher {
         }
 
         Reply::Silent
+    }
+
+    /// Handle the `scout` verb (a25). Resolves the repo substring,
+    /// posts a top-level ack capturing the lifecycle thread ts, AND
+    /// submits a `queue_scout_request` control-socket action.
+    async fn dispatch_scout_request(
+        &self,
+        repo_substring: &str,
+        guidance: Option<&str>,
+        channel_id: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        if !self.scout_enabled {
+            return Reply::Sync(
+                "✗ scout: disabled in this workspace's config (features.scout.enabled=false)."
+                    .to_string(),
+            );
+        }
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+
+        let backend = match self.chatops.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                return Reply::Sync(
+                    "✗ scout: chatops backend not configured; cannot post the scout ack"
+                        .to_string(),
+                );
+            }
+        };
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let ack_text = format!(
+            "✓ Queued scout for {url}. The next polling iteration will run it (~Nm). Follow along in this thread.",
+            url = repo.url
+        );
+        let ack_ts = match backend
+            .post_message_capturing_ts(channel_id, &ack_text)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!("scout: post_message_capturing_ts failed: {e:#}");
+                return Reply::Sync(format!("✗ scout: could not post ack to chat: {e}"));
+            }
+        };
+
+        let mut payload = serde_json::json!({
+            "action": "queue_scout_request",
+            "url": repo.url,
+            "request_id": request_id,
+            "channel": channel_id,
+            "thread_ts": ack_ts,
+        });
+        if let Some(g) = guidance {
+            payload["guidance"] = serde_json::Value::String(g.to_string());
+        }
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            let body = format!("✗ scout: could not enqueue request: {err}");
+            if let Err(reply_err) = backend
+                .post_threaded_reply(channel_id, &ack_ts, &body)
+                .await
+            {
+                tracing::warn!("scout: failure-thread-reply also failed: {reply_err:#}");
+            }
+        }
+        Reply::Silent
+    }
+
+    /// Handle the `spec-it` verb (a25). Looks up the scout-thread by
+    /// resolving the operator's thread_ts against on-disk scout
+    /// states; on a match, submits a `queue_spec_it_request` action.
+    async fn dispatch_spec_it_request(
+        &self,
+        item_id: usize,
+        guidance: Option<&str>,
+        channel_id: &str,
+        thread_ts: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        if !self.scout_enabled {
+            return Reply::Sync(
+                "✗ spec-it: scout/spec-it disabled in this workspace's config (features.scout.enabled=false)."
+                    .to_string(),
+            );
+        }
+        // Search every configured repo's `.state/scout_runs/` for a
+        // state whose `thread_ts` matches. The match also tells us
+        // the repo URL AND the scout's request_id.
+        let resolver = self.workspace_resolver.as_ref();
+        let mut matched: Option<(String, crate::state::scout_run::ScoutRunState)> = None;
+        'outer: for repo in repositories {
+            let ws = match resolver {
+                Some(f) => match f(&repo.url) {
+                    Some(p) => p,
+                    None => continue,
+                },
+                None => repo.workspace_path.clone(),
+            };
+            let runs = match crate::state::scout_run::list_runs_by_mtime(&ws) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for (request_id, _) in runs {
+                if let Ok(Some(state)) =
+                    crate::state::scout_run::read_state(&ws, &request_id)
+                    && state.thread_ts == thread_ts
+                {
+                    matched = Some((repo.url.clone(), state));
+                    break 'outer;
+                }
+            }
+        }
+        let (repo_url, scout_state) = match matched {
+            Some(p) => p,
+            None => {
+                return Reply::Sync(
+                    "✗ spec-it: only valid as a reply in a scout thread. Run @<bot> scout <repo> first."
+                        .to_string(),
+                );
+            }
+        };
+        // Range-check the item id against the scout's list.
+        let max = scout_state.items.len();
+        if !scout_state.items.iter().any(|i| i.id == item_id) {
+            return Reply::Sync(format!(
+                "✗ spec-it: item #{item_id} not in this scout's list (range: 1..{max})."
+            ));
+        }
+        let mut payload = serde_json::json!({
+            "action": "queue_spec_it_request",
+            "url": repo_url,
+            "scout_request_id": scout_state.request_id,
+            "item_id": item_id,
+            "channel": channel_id,
+            "thread_ts": thread_ts,
+        });
+        if let Some(g) = guidance {
+            payload["guidance"] = serde_json::Value::String(g.to_string());
+        }
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Reply::Sync(format!("✗ spec-it: could not enqueue: {err}"));
+        }
+        Reply::Sync(format!(
+            "✓ spec-it #{item_id}: queued for triage on the next polling iteration."
+        ))
+    }
+
+    /// Handle the `clear-scout` verb (a25). Submits a `queue_clear_scout`
+    /// control-socket action; the response carries the count cleared.
+    async fn dispatch_clear_scout(
+        &self,
+        repo_substring: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> String {
+        if !self.scout_enabled {
+            return "✗ clear-scout: scout disabled in this workspace's config (features.scout.enabled=false)."
+                .to_string();
+        }
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return format_multiple_matches(repo_substring, &ms);
+            }
+            RepoMatch::None => return format_no_match(repo_substring, repositories),
+        };
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "queue_clear_scout",
+                "url": repo.url,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return format!("✗ clear-scout: {err}");
+        }
+        let cleared = resp.get("cleared").and_then(|v| v.as_u64()).unwrap_or(0);
+        format!("✓ Cleared {cleared} scout run(s) for {url}.", url = repo.url)
     }
 
     /// Handle the `audit` verb. Resolves the audit substring against the
@@ -7385,5 +7796,473 @@ mod tests {
             text.contains("capability-name"),
             "help must explain the brownfield args: {text}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // a25: scout / spec-it / clear-scout parsing tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_scout_without_guidance() {
+        let cmd = parse_command(&format!("{BOT} scout myrepo"), BOT)
+            .expect("scout without guidance must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ScoutRequest {
+                repo_substring: "myrepo".into(),
+                guidance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scout_with_guidance() {
+        let cmd = parse_command(
+            &format!("{BOT} scout myrepo focus on security fixes and helpful error messages"),
+            BOT,
+        )
+        .expect("scout with guidance must parse");
+        match cmd {
+            OperatorCommand::ScoutRequest {
+                repo_substring,
+                guidance,
+            } => {
+                assert_eq!(repo_substring, "myrepo");
+                assert_eq!(
+                    guidance.as_deref(),
+                    Some("focus on security fixes and helpful error messages")
+                );
+            }
+            other => panic!("expected ScoutRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scout_preserves_multiline_guidance() {
+        let cmd = parse_command(
+            &format!("{BOT} scout myrepo line1\nline2\n\npara3"),
+            BOT,
+        )
+        .expect("multi-line scout guidance must parse");
+        match cmd {
+            OperatorCommand::ScoutRequest { guidance, .. } => {
+                assert_eq!(guidance.as_deref(), Some("line1\nline2\n\npara3"));
+            }
+            other => panic!("expected ScoutRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scout_missing_repo_returns_invalid() {
+        // Direct parse_command returns None on Invalid; the full path
+        // through handle_message_with_context surfaces the user-facing
+        // refusal message. This test asserts the parse-outcome shape.
+        let outcome = parse_command_outcome(&format!("{BOT} scout"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(
+                    text.starts_with("✗ scout: missing repo-substring"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_it_inside_thread_happy_path() {
+        let outcome = parse_command_outcome_in_thread(
+            &format!("{BOT} spec-it 3"),
+            BOT,
+            Some("1748399999.000200"),
+        );
+        match outcome {
+            ParseOutcome::Ok(OperatorCommand::SpecItRequest {
+                item_id,
+                guidance,
+                thread_ts: ts,
+            }) => {
+                assert_eq!(item_id, 3);
+                assert!(guidance.is_none());
+                assert_eq!(ts, "1748399999.000200");
+            }
+            other => panic!("expected SpecItRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_it_inside_thread_with_guidance() {
+        let outcome = parse_command_outcome_in_thread(
+            &format!(
+                "{BOT} spec-it 5 stick to the OAuth scope, ignore the rate-limit angle"
+            ),
+            BOT,
+            Some("1748399999.000200"),
+        );
+        match outcome {
+            ParseOutcome::Ok(OperatorCommand::SpecItRequest { item_id, guidance, .. }) => {
+                assert_eq!(item_id, 5);
+                assert_eq!(
+                    guidance.as_deref(),
+                    Some("stick to the OAuth scope, ignore the rate-limit angle")
+                );
+            }
+            other => panic!("expected SpecItRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_it_outside_thread_returns_invalid_refusal() {
+        let outcome = parse_command_outcome_in_thread(
+            &format!("{BOT} spec-it 3"),
+            BOT,
+            None,
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(
+                    text.starts_with("✗ spec-it: only valid as a reply in a scout thread"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_it_non_integer_returns_invalid() {
+        let outcome = parse_command_outcome_in_thread(
+            &format!("{BOT} spec-it foo"),
+            BOT,
+            Some("1748.001"),
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("`foo` is not a valid item number"), "{text}");
+                assert!(text.contains("Usage:"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_it_zero_returns_invalid() {
+        // 0 is not a positive integer; the parser rejects it.
+        let outcome = parse_command_outcome_in_thread(
+            &format!("{BOT} spec-it 0"),
+            BOT,
+            Some("1748.001"),
+        );
+        assert!(
+            matches!(outcome, ParseOutcome::Invalid(Reply::Sync(_))),
+            "0 must be rejected as a non-positive integer"
+        );
+    }
+
+    #[test]
+    fn parse_clear_scout_happy_path() {
+        let cmd = parse_command(&format!("{BOT} clear-scout myrepo"), BOT)
+            .expect("clear-scout must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearScout {
+                repo_substring: "myrepo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_scout_missing_repo_returns_invalid() {
+        let outcome = parse_command_outcome(&format!("{BOT} clear-scout"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("clear-scout"), "{text}");
+                assert!(text.contains("missing repo-substring"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_output_lists_scout_verbs() {
+        let text = format_help_reply();
+        assert!(text.contains("scout"), "{text}");
+        assert!(text.contains("spec-it"), "{text}");
+        assert!(text.contains("clear-scout"), "{text}");
+        assert!(
+            text.contains("scout-thread-only"),
+            "spec-it line must call out the scope: {text}"
+        );
+        assert!(
+            text.contains("operator-recovery"),
+            "clear-scout description must call it out as operator-recovery: {text}"
+        );
+        assert!(
+            text.contains("chat-driven workflow"),
+            "scout description must call out chat-driven workflow placement: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_scout_disabled_returns_refusal_no_post() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_scout_enabled(false);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} scout myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("disabled scout must surface a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.contains("disabled in this workspace's config"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_scout_ambiguous_repo_returns_be_more_specific() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        // Both fixture repos contain "acme" → ambiguous.
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} scout acme"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("be more specific"), "{text}");
+        assert!(backend.posts.lock().unwrap().is_empty());
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_scout_happy_path_posts_ack_and_queues_action() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748.99"));
+        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_scout_request",
+            serde_json::json!({"ok": true}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} scout myrepo focus on errors"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("scout happy path must produce a reply");
+        unwrap_silent(reply);
+        // Ack posted on chat AND captures the ts.
+        let posts = backend.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, "C_OPS");
+        assert!(posts[0].1.contains("Queued scout for"), "{}", posts[0].1);
+        assert!(
+            posts[0].1.contains("Follow along in this thread."),
+            "{}",
+            posts[0].1
+        );
+        // Exactly one control-socket call.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_scout_request");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["thread_ts"], "1748.99");
+        assert_eq!(calls[0]["channel"], "C_OPS");
+        assert_eq!(calls[0]["guidance"], "focus on errors");
+        // request_id present.
+        assert!(calls[0].get("request_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_scout_reports_count_from_daemon() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_clear_scout",
+            serde_json::json!({"ok": true, "cleared": 3}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-scout myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓ Cleared 3 scout run(s) for "), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_clear_scout");
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_scout_zero_runs_uses_zero_count() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_clear_scout",
+            serde_json::json!({"ok": true, "cleared": 0}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-scout myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓ Cleared 0 scout run(s)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_spec_it_outside_recognized_thread_returns_refusal() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} spec-it 3"),
+                "C_OPS",
+                Some("1234.5"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("spec-it parses, then dispatcher rejects unrecognized thread");
+        let text = unwrap_sync(reply);
+        assert!(
+            text.contains("only valid as a reply in a scout thread"),
+            "{text}"
+        );
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_spec_it_recognized_thread_queues_action() {
+        // Seed a scout-run state file matching the inbound thread.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let state = crate::state::scout_run::ScoutRunState {
+            request_id: "scout-req-1".into(),
+            repo_url: "git@github.com:acme/myrepo.git".into(),
+            guidance: None,
+            head_sha_at_run: "abc123".into(),
+            completed_at: chrono::Utc::now(),
+            thread_ts: "1748.42".into(),
+            channel: "C_OPS".into(),
+            items: vec![
+                crate::state::scout_run::ScoutItem {
+                    id: 1,
+                    category: "bug".into(),
+                    title: "T1".into(),
+                    body: "B1".into(),
+                    source: "src/a.rs:1".into(),
+                    tractability: "small".into(),
+                },
+                crate::state::scout_run::ScoutItem {
+                    id: 2,
+                    category: "security".into(),
+                    title: "T2".into(),
+                    body: "B2".into(),
+                    source: "src/b.rs:2".into(),
+                    tractability: "medium".into(),
+                },
+            ],
+        };
+        crate::state::scout_run::write_state(workspace.path(), &state).unwrap();
+        // workspace-resolver maps the only repo URL onto our temp dir.
+        let ws_path = workspace.path().to_path_buf();
+        let dispatcher = OperatorCommandDispatcher::new().with_workspace_resolver(
+            move |_url| Some(ws_path.clone()),
+        );
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_spec_it_request",
+            serde_json::json!({"ok": true}),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} spec-it 2"),
+                "C_OPS",
+                Some("1748.42"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓ spec-it #2"), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_spec_it_request");
+        assert_eq!(calls[0]["scout_request_id"], "scout-req-1");
+        assert_eq!(calls[0]["item_id"], 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_spec_it_out_of_range_item_returns_refusal() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let state = crate::state::scout_run::ScoutRunState {
+            request_id: "scout-req-2".into(),
+            repo_url: "git@github.com:acme/myrepo.git".into(),
+            guidance: None,
+            head_sha_at_run: "abc123".into(),
+            completed_at: chrono::Utc::now(),
+            thread_ts: "1748.42".into(),
+            channel: "C_OPS".into(),
+            items: vec![crate::state::scout_run::ScoutItem {
+                id: 1,
+                category: "bug".into(),
+                title: "T".into(),
+                body: "B".into(),
+                source: "s:1".into(),
+                tractability: "small".into(),
+            }],
+        };
+        crate::state::scout_run::write_state(workspace.path(), &state).unwrap();
+        let ws_path = workspace.path().to_path_buf();
+        let dispatcher = OperatorCommandDispatcher::new().with_workspace_resolver(
+            move |_url| Some(ws_path.clone()),
+        );
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} spec-it 999"),
+                "C_OPS",
+                Some("1748.42"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("not in this scout's list"), "{text}");
+        assert!(text.contains("range: 1..1"), "{text}");
+        assert!(submitter.calls().is_empty());
     }
 }

@@ -96,6 +96,16 @@ pub async fn run(
             std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
         >,
     >,
+    pending_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ScoutRequest>,
+        >,
+    >,
+    pending_spec_it_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SpecItRequest>,
+        >,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -121,6 +131,8 @@ pub async fn run(
         pending_proposal_requests,
         pending_changelog_requests,
         pending_brownfield_requests,
+        pending_scout_requests,
+        pending_spec_it_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -188,6 +200,16 @@ pub async fn run_with_hooks(
     pending_brownfield_requests: Arc<
         std::sync::Mutex<
             std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
+        >,
+    >,
+    pending_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ScoutRequest>,
+        >,
+    >,
+    pending_spec_it_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SpecItRequest>,
         >,
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
@@ -456,6 +478,59 @@ pub async fn run_with_hooks(
             );
         }
 
+        // Drain at most ONE scout request per iteration (a25). The
+        // handler invokes the executor in scout mode (read-only
+        // sandbox) AND persists the result to disk. Failures are
+        // logged but never abort the surrounding iteration.
+        let scout_request: Option<crate::control_socket::ScoutRequest> = {
+            let mut g = pending_scout_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = scout_request
+            && let Err(error) = crate::polling::scout::process_pending_scout(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                chatops_ctx.as_ref(),
+                &req,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                request_id = req.request_id.as_str(),
+                "scout-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain at most ONE spec-it request per iteration (a25). The
+        // handler translates the scouted item into a `ProposalRequest`
+        // AND pushes it onto the proposal-request queue for the
+        // standard propose lifecycle to consume on the next iteration.
+        let spec_it_request: Option<crate::control_socket::SpecItRequest> = {
+            let mut g = pending_spec_it_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = spec_it_request
+            && let Err(error) = crate::polling::spec_it::process_pending_spec_it(
+                &workspace,
+                snapshot_ref,
+                chatops_ctx.as_ref(),
+                pending_proposal_requests.clone(),
+                &req,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                scout_request_id = req.scout_request_id.as_str(),
+                item_id = req.item_id,
+                "spec-it-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
         if want_rebuild {
             if let Err(error) = execute_rebuild_iteration(
                 &workspace,
@@ -699,14 +774,12 @@ pub async fn execute_one_pass(
         queued_audit_types,
     )
     .await?;
-    if processed.is_empty() {
-        // Workspace init succeeded and the queue walk produced no work.
-        // Per design.md task 6.4, an Ok-returning iteration with no
-        // failures clears every category's throttle.
-        let _ = AlertState::clear(workspace);
-        return Ok(());
-    }
 
+    // Termination is gated EXCLUSIVELY on the agent branch's commit count
+    // relative to base — see `polling-iteration-termination-is-commit-count
+    // -gated`. Using `processed.is_empty()` would miss commits produced by
+    // the audit phase that runs AFTER the queue walk, silently dropping
+    // them on the next iteration's recreate_branch step.
     let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
     let commit_count = git::rev_list_count(workspace, &range)?;
     if commit_count == 0 {
@@ -729,42 +802,51 @@ pub async fn execute_one_pass(
     // posted as `<!-- reviewer-revision -->` PR comments after the PR is
     // created, and the dropped set is annotated into the `## Code Review`
     // PR-body section so the human sees what was skipped.
-    let (review_report, draft, reviewer_revision_concerns) = match reviewer {
-        None => (None, false, Vec::new()),
-        Some(r) => {
-            let _ = guard.set_stage(busy_marker::Stage::Review);
-            let outcome = match r.mode() {
-                crate::config::ReviewerMode::Bundled => {
-                    let ctx = build_review_context(workspace, repo, &processed)?;
-                    r.review(&ctx).await
-                }
-                crate::config::ReviewerMode::PerChange => {
-                    let contexts =
-                        build_per_change_contexts(workspace, repo, &processed)?;
-                    r.review_per_change(&contexts).await.map(|per_change| {
-                        synthesize_per_change_report(per_change)
-                    })
-                }
-            };
-            match outcome {
-                Ok(mut report) => {
-                    let draft = matches!(report.verdict, ReviewVerdict::Block);
-                    let taken = if r.auto_revise_on_block() {
-                        partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
-                    } else {
-                        Vec::new()
-                    };
-                    (Some(report), draft, taken)
-                }
-                Err(e) => {
-                    tracing::error!("reviewer failed: {e:#}");
-                    let synthetic = ReviewReport {
-                        verdict: ReviewVerdict::Concerns,
-                        markdown: format!("(reviewer failed: {e})"),
-                        concerns: Vec::new(),
-                        per_change_sections: Vec::new(),
-                    };
-                    (Some(synthetic), false, Vec::new())
+    let (review_report, draft, reviewer_revision_concerns) = if processed.is_empty() {
+        // Audit-only iteration: no implementer-touched files to evaluate.
+        // The audit's own validation pass already gated each proposal, so
+        // the reviewer would either error against an empty `processed`
+        // list or produce a meaningless review of mechanical
+        // proposal-writing. Skip the reviewer entirely.
+        (None, false, Vec::new())
+    } else {
+        match reviewer {
+            None => (None, false, Vec::new()),
+            Some(r) => {
+                let _ = guard.set_stage(busy_marker::Stage::Review);
+                let outcome = match r.mode() {
+                    crate::config::ReviewerMode::Bundled => {
+                        let ctx = build_review_context(workspace, repo, &processed)?;
+                        r.review(&ctx).await
+                    }
+                    crate::config::ReviewerMode::PerChange => {
+                        let contexts =
+                            build_per_change_contexts(workspace, repo, &processed)?;
+                        r.review_per_change(&contexts).await.map(|per_change| {
+                            synthesize_per_change_report(per_change)
+                        })
+                    }
+                };
+                match outcome {
+                    Ok(mut report) => {
+                        let draft = matches!(report.verdict, ReviewVerdict::Block);
+                        let taken = if r.auto_revise_on_block() {
+                            partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
+                        } else {
+                            Vec::new()
+                        };
+                        (Some(report), draft, taken)
+                    }
+                    Err(e) => {
+                        tracing::error!("reviewer failed: {e:#}");
+                        let synthetic = ReviewReport {
+                            verdict: ReviewVerdict::Concerns,
+                            markdown: format!("(reviewer failed: {e})"),
+                            concerns: Vec::new(),
+                            per_change_sections: Vec::new(),
+                        };
+                        (Some(synthetic), false, Vec::new())
+                    }
                 }
             }
         }
@@ -3507,6 +3589,91 @@ fn first_line_of_section(text: &str, header: &str) -> Option<String> {
     None
 }
 
+/// Test-only routing hook for the PR-creation HTTP call. When set, the
+/// helper below targets the override URL (a mockito server) instead of
+/// `github::DEFAULT_API_BASE`. Tests acquire `test_hooks::lock()` before
+/// installing the override so two tests cannot race on the process-wide
+/// static. Never linked outside `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static GITHUB_API_BASE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn cell() -> &'static Mutex<Option<String>> {
+        GITHUB_API_BASE.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Snapshot the currently-installed override URL (or `None`).
+    pub fn github_api_base() -> Option<String> {
+        cell().lock().unwrap().clone()
+    }
+
+    /// Install a PR-creation API-base override for the duration of a
+    /// test. The test holds the returned guard until it has finished
+    /// reading mockito's recorded calls; on drop the override is cleared.
+    pub fn set_github_api_base(value: Option<String>) {
+        *cell().lock().unwrap() = value;
+    }
+
+    /// Process-wide mutex held by any test that installs the PR-creation
+    /// override. Serializes tests that share the static so two concurrent
+    /// tests do not clobber each other's override URL.
+    pub fn lock<'a>() -> MutexGuard<'a, ()> {
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+}
+
+/// PR-creation routing wrapper. In production this is a thin shim around
+/// `github::create_pull_request` (targets the live GitHub API). Under
+/// `cfg(test)`, when an override is installed via `test_hooks`, the call
+/// is rerouted to `github::create_pull_request_at_for_test` against a
+/// mockito server URL so the test can assert head/base/title/body.
+#[allow(clippy::too_many_arguments)]
+async fn create_pull_request_via_hook(
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+    review_report: Option<&ReviewReport>,
+    draft: bool,
+) -> Result<github::CreatedPr> {
+    #[cfg(test)]
+    {
+        if let Some(api_base) = test_hooks::github_api_base() {
+            return github::create_pull_request_at_for_test(
+                &api_base,
+                owner,
+                repo,
+                head,
+                base,
+                title,
+                body,
+                token,
+                review_report,
+                draft,
+            )
+            .await;
+        }
+    }
+    github::create_pull_request(
+        owner,
+        repo,
+        head,
+        base,
+        title,
+        body,
+        token,
+        review_report,
+        draft,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_pull_request(
     repo: &RepositoryConfig,
@@ -3524,8 +3691,23 @@ async fn open_pull_request(
     // posted to upstream's /pulls endpoint regardless of fork-PR mode, so
     // the credential authorizing that call must have access to upstream.
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
-    let title = build_pr_title(changes);
-    let body = build_pr_body(workspace, changes, includes_self_heal);
+    // Audit-only iterations have no implementer-processed changes; the
+    // agent branch carries only the audit's `audit: <type> proposals
+    // (N change(s))` commits. Build the PR title + body from those
+    // commit subjects so reviewers see which audits fired.
+    let (title, body) = if changes.is_empty() {
+        let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
+        let subjects = git::log_subjects(workspace, &range).unwrap_or_default();
+        (
+            build_audit_only_pr_title(&subjects),
+            build_audit_only_pr_body(&subjects),
+        )
+    } else {
+        (
+            build_pr_title(changes),
+            build_pr_body(workspace, changes, includes_self_heal),
+        )
+    };
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -3535,7 +3717,7 @@ async fn open_pull_request(
         None => repo.agent_branch.clone(),
     };
 
-    let pr = match github::create_pull_request(
+    let pr = match create_pull_request_via_hook(
         &owner,
         &repo_name,
         &head,
@@ -4029,6 +4211,85 @@ fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool)
     s
 }
 
+/// Parse audit-produced commit subjects of shape
+/// `audit: <type> proposals (<N> change(s))` and return `(total, types)`:
+/// the sum of `N` across all matching subjects AND the deduplicated list
+/// of audit types preserving first-seen order. Subjects not matching the
+/// canonical shape contribute nothing to the totals (they are listed
+/// verbatim in the PR body, but the title summary skips them).
+fn summarize_audit_commit_subjects(subjects: &[String]) -> (u32, Vec<String>) {
+    let re = match regex::Regex::new(
+        r"^audit: (?P<type>\S+) proposals \((?P<n>\d+) change\(s\)\)$",
+    ) {
+        Ok(r) => r,
+        Err(_) => return (0, Vec::new()),
+    };
+    let mut total: u32 = 0;
+    let mut types: Vec<String> = Vec::new();
+    for s in subjects {
+        if let Some(caps) = re.captures(s) {
+            if let Ok(n) = caps["n"].parse::<u32>() {
+                total = total.saturating_add(n);
+            }
+            let t = caps["type"].to_string();
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+    }
+    (total, types)
+}
+
+/// PR title for an audit-only iteration: `audit-only: <N> proposal(s)
+/// from <comma-separated-audit-types>`. Falls back to a generic shape
+/// when no commit subject matches the canonical audit pattern.
+fn build_audit_only_pr_title(commit_subjects: &[String]) -> String {
+    const MAX_LEN: usize = 80;
+    const ELLIPSIS: char = '…';
+    let (total, types) = summarize_audit_commit_subjects(commit_subjects);
+    let title = if types.is_empty() {
+        "audit-only: agent-branch commits without implementer changes".to_string()
+    } else {
+        format!(
+            "audit-only: {} proposal(s) from {}",
+            total,
+            types.join(", "),
+        )
+    };
+    if title.chars().count() <= MAX_LEN {
+        return title;
+    }
+    let take = MAX_LEN.saturating_sub(1);
+    let truncated: String = title.chars().take(take).collect();
+    let mut out = truncated;
+    out.push(ELLIPSIS);
+    out
+}
+
+/// PR body for an audit-only iteration. Lists the agent-branch commit
+/// subjects so reviewers see which audits fired and how many proposals
+/// each produced, and notes that the produced openspec/changes/<prefix>-*
+/// directories will be picked up by the next iteration's `list_pending`.
+fn build_audit_only_pr_body(commit_subjects: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "This PR ships audit-produced proposals only — no implementer changes this iteration.\n\n",
+    );
+    s.push_str("Commits on the agent branch:\n\n");
+    if commit_subjects.is_empty() {
+        s.push_str("- _(no commit subjects could be read)_\n");
+    } else {
+        for subject in commit_subjects {
+            s.push_str(&format!("- {subject}\n"));
+        }
+    }
+    s.push('\n');
+    s.push_str(
+        "Each `audit: <type>` commit creates new `openspec/changes/<prefix>-*` directories that the next polling iteration will pick up via `list_pending` and route to the implementer.\n",
+    );
+    s
+}
+
 /// Read a change's proposal `## Why` section, preferring the archive
 /// location and falling back to the active path. Step 1 looks up
 /// `<workspace>/openspec/changes/archive/*-<change>/proposal.md` (picking
@@ -4245,6 +4506,12 @@ async fn open_pr_exists_for_agent_branch(
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
 ) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(api_base) = test_hooks::github_api_base() {
+            return open_pr_exists_for_agent_branch_at(&api_base, repo, github_cfg).await;
+        }
+    }
     open_pr_exists_for_agent_branch_at(github::DEFAULT_API_BASE, repo, github_cfg).await
 }
 
@@ -7015,6 +7282,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -7219,6 +7492,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
@@ -11566,6 +11845,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 task_cancel,
@@ -13305,5 +13590,215 @@ mod tests {
         assert_eq!(processed, vec!["only-change".to_string()]);
         let entries = log.lock().unwrap().clone();
         assert_eq!(entries, vec!["executor:only-change".to_string()]);
+    }
+
+    // ================================================================
+    // a20a3-audit-only-iterations-push-and-pr: when the queue walk
+    // produces zero implementer commits BUT an audit produces proposal
+    // commits on the agent branch, the iteration MUST push and open
+    // a PR. The pre-fix code's `if processed.is_empty() { return Ok(()) }`
+    // guard caused the audit's commits to be silently destroyed by the
+    // next iteration's `recreate_branch` step. This test asserts the
+    // commit-count gate fires instead so the audit's commits ship.
+    // ================================================================
+
+    /// Pure-function test: title shape for an audit-only iteration.
+    #[test]
+    fn build_audit_only_pr_title_single_audit() {
+        let subjects = vec!["audit: security_bug proposals (1 change(s))".to_string()];
+        let title = build_audit_only_pr_title(&subjects);
+        assert_eq!(title, "audit-only: 1 proposal(s) from security_bug");
+    }
+
+    /// Multiple audit commits aggregate counts AND list types in
+    /// first-seen order.
+    #[test]
+    fn build_audit_only_pr_title_aggregates_multiple_audits() {
+        let subjects = vec![
+            "audit: security_bug proposals (2 change(s))".to_string(),
+            "audit: missing_tests proposals (3 change(s))".to_string(),
+        ];
+        let title = build_audit_only_pr_title(&subjects);
+        assert_eq!(
+            title,
+            "audit-only: 5 proposal(s) from security_bug, missing_tests"
+        );
+    }
+
+    /// Body explicitly states this is an audit-only PR, lists every
+    /// agent-branch commit subject, AND notes that the produced
+    /// directories will be picked up by the next iteration.
+    #[test]
+    fn build_audit_only_pr_body_lists_subjects_and_next_iter_note() {
+        let subjects = vec![
+            "audit: security_bug proposals (1 change(s))".to_string(),
+            "audit: missing_tests proposals (2 change(s))".to_string(),
+        ];
+        let body = build_audit_only_pr_body(&subjects);
+        assert!(
+            body.contains("audit-produced proposals only"),
+            "body must mark itself as audit-only: {body}"
+        );
+        assert!(
+            body.contains("- audit: security_bug proposals (1 change(s))"),
+            "body must list first subject: {body}"
+        );
+        assert!(
+            body.contains("- audit: missing_tests proposals (2 change(s))"),
+            "body must list second subject: {body}"
+        );
+        assert!(
+            body.contains("next polling iteration will pick"),
+            "body must explain next-iteration pickup: {body}"
+        );
+    }
+
+    /// Regression-prevention end-to-end test for the audit-only PR
+    /// flow. Fixture: workspace with no pending changes + a mock audit
+    /// that writes a proposal directory AND commits it on the agent
+    /// branch. Expected behaviour: the iteration's push reaches the
+    /// fixture remote AND the PR-creation HTTP call is invoked with the
+    /// audit-only title + body. Against the pre-fix code (early-return
+    /// on `processed.is_empty()`), the push step is unreachable and
+    /// the mockito mock's `.expect(1)` assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_only_iteration_pushes_and_opens_pr() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Rename workspace so its basename is unique vs other tests that
+        // share `fixture_workspace_with_remote`'s default name. The
+        // busy-marker keys off workspace basename only.
+        let ws = {
+            let renamed = ws.parent().unwrap().join("workspace-audit-only-pr-test");
+            std::fs::rename(&ws, &renamed).unwrap();
+            renamed
+        };
+        // No pending changes at iteration start. The fixture audit
+        // creates one openspec/changes/secure-test-1 directory and
+        // commits it on the agent branch.
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let probe = OrderRecordingAudit {
+            audit_type: "security_bug",
+            log: log.clone(),
+            creates_changes: vec!["secure-test-1".to_string()],
+            write_policy: crate::audits::WritePolicy::OpenSpecOnly,
+        };
+        let registry = crate::audits::AuditRegistry::with_audits(vec![
+            Arc::new(probe) as Arc<dyn crate::audits::Audit>,
+        ]);
+        let mut queued = std::collections::HashSet::new();
+        queued.insert("security_bug".to_string());
+
+        // Serialize: tests sharing the github-api-base test hook must not
+        // race on the process-wide static.
+        let _hook_guard = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        // The PR-existence pre-check queries `/pulls` and must return
+        // an empty list so the iteration proceeds past the open-PR
+        // short-circuit.
+        let _list_mock = server
+            .mock("GET", mockito::Matcher::Regex("^/repos/owner/fixture/pulls".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        // PR-creation: assert head + base + title + body shape.
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(
+                    r#"{"head":"agent-q","base":"main"}"#.to_string(),
+                ),
+                mockito::Matcher::Regex("audit-only:".to_string()),
+                mockito::Matcher::Regex(
+                    "audit-only: 1 proposal\\(s\\) from security_bug".to_string(),
+                ),
+                mockito::Matcher::Regex(
+                    "audit: security_bug proposals \\(1 change\\(s\\)\\)".to_string(),
+                ),
+            ]))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"html_url":"https://github.com/owner/fixture/pull/42","number":42}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        // Inline token so credential resolution succeeds.
+        let github_cfg = GithubConfig {
+            token_env: "X".into(),
+            token: Some(crate::config::SecretSource::Inline {
+                value: "inline-test-token".into(),
+            }),
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        let executor = AlwaysFailingExecutor; // unused: no pending changes
+
+        let stuck_secs = 2400u64;
+        let result = execute_one_pass(
+            &ws,
+            &fixture_repo(&ws),
+            &executor,
+            &github_cfg,
+            None,
+            None,
+            stuck_secs,
+            u32::MAX,
+            u32::MAX,
+            0, // revision_cap: disabled in tests
+            &registry,
+            None,
+            &std::collections::HashMap::new(),
+            &queued,
+        )
+        .await;
+
+        // Clear the test hook BEFORE asserting so a panic in an assertion
+        // does not leave the override installed for the next test that
+        // happens to acquire the lock.
+        test_hooks::set_github_api_base(None);
+
+        result.expect("audit-only iteration must succeed end-to-end");
+
+        // The audit must have run.
+        let entries = log.lock().unwrap().clone();
+        assert!(
+            entries.iter().any(|e| e == "audit:security_bug"),
+            "audit must have run; log was: {entries:?}"
+        );
+
+        // The PR-creation HTTP call MUST have been invoked: this is the
+        // regression assertion. Against the pre-fix code (early-return
+        // on `processed.is_empty()`), the iteration returns before the
+        // push step AND before this PR call. The mockito `.expect(1)`
+        // assertion then fails.
+        pr_mock.assert_async().await;
+
+        // Push reached the fixture remote: the audit's commit must be on
+        // `origin/agent-q` AND the agent-branch ref on the remote must
+        // contain the new proposal directory.
+        let remote = _dir.path().join("remote");
+        let remote_log = std::process::Command::new("git")
+            .args(["log", "agent-q", "--format=%s"])
+            .current_dir(&remote)
+            .output()
+            .expect("git log on remote agent-q");
+        assert!(
+            remote_log.status.success(),
+            "agent-q must exist on the fixture remote after push"
+        );
+        let subjects = String::from_utf8_lossy(&remote_log.stdout).to_string();
+        assert!(
+            subjects.contains("audit: security_bug proposals (1 change(s))"),
+            "audit's commit subject must be present on remote agent-q; got: {subjects}"
+        );
     }
 }

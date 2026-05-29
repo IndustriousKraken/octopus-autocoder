@@ -108,6 +108,27 @@ pub trait Executor: Send + Sync {
         })
     }
 
+    /// Scout-mode invocation for the `scout` chatops verb (a25). The
+    /// polling layer has substituted the scout prompt template; this
+    /// method passes the rendered prompt verbatim to the wrapped CLI
+    /// under a read-only sandbox AND returns the executor's final
+    /// answer (expected to be a JSON array of opportunity items). The
+    /// scout polling handler parses the JSON itself.
+    ///
+    /// Default impl returns `Failed { reason: "scout mode not
+    /// supported" }`.
+    async fn run_scout(
+        &self,
+        workspace: &Path,
+        ctx: &ScoutContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "scout mode not supported by this executor backend".to_string(),
+        })
+    }
+
     /// Chat-driven changelog stylist for the `changelog` chatops verb.
     /// The deterministic extractor has already produced the JSON payload
     /// in `ctx.changelog_json`; this method asks the wrapped CLI to read
@@ -182,6 +203,17 @@ pub struct BrownfieldDraftContext {
     pub capability_name: String,
     /// Fully rendered prompt: template + interpolated context. The
     /// executor passes this verbatim to the wrapped CLI.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_scout` (a25). The polling layer
+/// renders the scout prompt template AND passes the result here. The
+/// executor backend should run the wrapped CLI under a read-only
+/// sandbox (Read, Glob, Grep, Bash including `gh`) AND return the
+/// model's final answer as `ExecutorOutcome::Completed { final_answer }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoutContext {
+    /// Fully rendered prompt: template + interpolated context.
     pub rendered_prompt: String,
 }
 
