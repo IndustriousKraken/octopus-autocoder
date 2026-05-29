@@ -28,6 +28,18 @@ comments, the reviewer feedback is in the body).
    agent implementation notes`) to understand what the previous
    implementer claimed to do. The gap between those notes AND the
    reviewer's complaint is what the revision needs to close.
+   - The prior agent's scope assessments AND deferral reasons are
+     hypotheses to evaluate, NOT settled facts. If the notes claim a
+     task was "deferred because it cascades across N files" OR "too
+     large for one iteration" OR similar scope objections, treat that
+     as a calibration signal AND re-evaluate the work yourself. The
+     operator's revision request is often exactly the signal that the
+     prior agent's pessimism was wrong AND you should push past it.
+   - Mechanical refactors (find/replace across files, threading a
+     parameter through call sites, updating fixture initializations
+     in tests) are NOT multi-day work even when they touch many
+     files. The prior agent may have miscalibrated scope; do not
+     inherit that miscalibration.
 4. **Use the PR body** (under `## PR body`) to see the code-review
    section (if the reviewer was enabled) AND any other rendered context
    the human reviewer saw.
@@ -63,6 +75,30 @@ agent branch on success.
 {{agent_implementation_notes}}
 
 --- END ORIGINAL AGENT IMPLEMENTATION NOTES ---
+
+Read the notes above as context, NOT as constraints. Specifically:
+
+- If the prior notes say a task was deferred for scope OR complexity
+  reasons, that judgment was made under uncertainty AND may have been
+  wrong. Re-evaluate the actual work in front of you.
+- If the prior notes recommend "chunking into N separate PRs" OR
+  similar workflow restructuring, that is a suggestion you are NOT
+  bound by. The operator's revision request — appearing AFTER the
+  prior notes were written — represents an explicit decision to
+  continue in the CURRENT PR. Honor that decision by attempting the
+  work, not by re-litigating the chunking proposal.
+- The prior notes' tone (apologetic, defensive, "too large to
+  attempt") is NOT informative about the work's actual difficulty.
+  Trust your own assessment of the diff AND the revision request,
+  not the prior agent's pessimism.
+
+If you genuinely cannot start the work because of a concrete blocker
+(a tool you need is missing, a file you need to read does not exist,
+a specification is ambiguous in a way you cannot resolve), use the
+`ask_user` MCP tool to escalate. Do NOT produce a narrative response
+explaining why the work is too large; that path produces no progress
+AND the operator has already overridden it by issuing the revision
+request.
 
 --- BEGIN PR DIFF ---
 
