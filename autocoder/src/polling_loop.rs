@@ -1495,7 +1495,7 @@ pub async fn run_pass_through_commits(
     // builds + registers the store on the first iteration of a given
     // workspace (a previously-registered store is left alone). Fail-open
     // — any error logs WARN and the store is omitted from the registry.
-    crate::rag::workspace_init_hook(workspace).await;
+    crate::rag::workspace_init_hook(workspace, repo).await;
 
     let pending_at_start = queue::list_pending(workspace)?;
     let waiting_at_start = queue::list_waiting(workspace)?;
@@ -2071,7 +2071,7 @@ async fn walk_queue(
                 let touched_caps =
                     crate::rag::capabilities_touched_between(workspace, "HEAD~1..HEAD");
                 if !touched_caps.is_empty() {
-                    crate::rag::post_archive_hook(workspace, &touched_caps).await;
+                    crate::rag::post_archive_hook(workspace, repo, &touched_caps).await;
                 }
                 archived.push(change);
                 if archived.len() as u32 >= max_changes {
@@ -2271,7 +2271,7 @@ async fn handle_archivability_preflight(
     change: &str,
 ) -> Result<Option<QueueStep>> {
     let violations = crate::preflight::spec_archivability::check_spec_deltas_archivable(
-        workspace, change,
+        workspace, repo, change,
     )
     .with_context(|| format!("spec-delta archivability check for `{change}`"))?;
     if violations.is_empty() {
@@ -2350,6 +2350,7 @@ async fn handle_contradiction_preflight(
     let findings =
         crate::preflight::change_contradiction::check_change_internal_contradictions(
             workspace,
+            repo,
             change,
             cc_ctx.llm.as_ref(),
             &cc_ctx.prompt_template,
@@ -4585,7 +4586,7 @@ pub async fn process_audit_triages(
         };
 
         // Build the canonical-specs index from openspec/specs/<name>/.
-        let canonical_specs_index = build_canonical_specs_index(workspace);
+        let canonical_specs_index = build_canonical_specs_index(workspace, repo);
         let ctx = crate::executor::TriageContext {
             findings: state.findings_excerpt.clone(),
             audit_type: state.audit_type.clone(),
@@ -5006,8 +5007,9 @@ fn extract_porcelain_path(line: &str) -> Option<&str> {
 /// Read the workspace's `openspec/specs/` directory and produce a brief
 /// listing of the canonical spec names available. Used by the triage
 /// prompt's `{{canonical_specs_index}}` substitution.
-fn build_canonical_specs_index(workspace: &Path) -> String {
-    let specs_dir = workspace.join("openspec/specs");
+fn build_canonical_specs_index(workspace: &Path, repo: &RepositoryConfig) -> String {
+    // a26: route via SpecRoot so external spec_storage is consulted.
+    let specs_dir = crate::workspace::spec_root::specs_dir(repo, workspace);
     if !specs_dir.is_dir() {
         return "(no openspec/specs/ directory found)".to_string();
     }
@@ -5176,7 +5178,7 @@ pub async fn process_proposal_requests(
         state.status = crate::proposal_requests::ProposalRequestStatus::TriagePending;
         let _ = crate::proposal_requests::write_state(&state_root, &state);
 
-        let canonical_specs_index = build_canonical_specs_index(workspace);
+        let canonical_specs_index = build_canonical_specs_index(workspace, repo);
         let ctx = crate::executor::ChatTriageContext {
             request_text: state.request_text.clone(),
             repo_url: state.repo_url.clone(),

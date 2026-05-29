@@ -78,10 +78,12 @@ pub struct UnarchivableDelta {
 /// one unreadable capability spec must not mask the rest.
 pub fn check_spec_deltas_archivable(
     workspace_root: &Path,
+    repo: &crate::config::RepositoryConfig,
     change_slug: &str,
 ) -> Result<Vec<UnarchivableDelta>> {
-    let specs_dir = workspace_root
-        .join("openspec/changes")
+    // a26: route the change-dir lookup via the SpecRoot resolver so an
+    // external `spec_storage.path` is consulted when configured.
+    let specs_dir = crate::workspace::spec_root::changes_dir(repo, workspace_root)
         .join(change_slug)
         .join("specs");
     if !specs_dir.is_dir() {
@@ -136,7 +138,7 @@ pub fn check_spec_deltas_archivable(
         // (it's introducing a new capability); MODIFIED / REMOVED /
         // RENAMED-from blocks against a non-existent canonical produce
         // a dedicated reason.
-        let canonical_headers = load_canonical_headers(workspace_root, &cap_name);
+        let canonical_headers = load_canonical_headers(workspace_root, repo, &cap_name);
 
         for delta in deltas {
             match delta {
@@ -251,14 +253,20 @@ pub fn check_spec_deltas_archivable(
     Ok(violations)
 }
 
-/// Read `<workspace>/openspec/specs/<cap>/spec.md` and extract the set of
+/// Read `<spec_root>/openspec/specs/<cap>/spec.md` and extract the set of
 /// `### Requirement: <title>` titles. Returns `None` if the canonical
 /// spec is absent (a new-capability change), `Some(set)` otherwise.
 /// Read failures are treated as "no canonical headers visible" — same
 /// effect as an absent file — and emit a WARN log.
-fn load_canonical_headers(workspace_root: &Path, capability: &str) -> Option<HashSet<String>> {
-    let path = workspace_root
-        .join("openspec/specs")
+///
+/// a26: routes via the SpecRoot resolver so an external
+/// `spec_storage.path` is consulted when configured.
+fn load_canonical_headers(
+    workspace_root: &Path,
+    repo: &crate::config::RepositoryConfig,
+    capability: &str,
+) -> Option<HashSet<String>> {
+    let path = crate::workspace::spec_root::specs_dir(repo, workspace_root)
         .join(capability)
         .join("spec.md");
     if !path.is_file() {
@@ -307,6 +315,22 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn fixture_repo() -> crate::config::RepositoryConfig {
+        crate::config::RepositoryConfig {
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".to_string(),
+            agent_branch: "agent-q".to_string(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+        }
+    }
+
     fn write(p: &Path, body: &str) {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -353,7 +377,7 @@ mod tests {
             "cap",
             "## ADDED Requirements\n\n### Requirement: New thing\nThe system SHALL new.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "expected pass, got {v:#?}");
     }
 
@@ -372,7 +396,7 @@ mod tests {
             "cap",
             "## ADDED Requirements\n\n### Requirement: Existing\nThe system SHALL existing.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Added);
         assert_eq!(v[0].capability, "cap");
@@ -397,7 +421,7 @@ mod tests {
             "code-reviewer",
             "## MODIFIED Requirements\n\n### Requirement: AI-driven code-quality review\nReplacement body SHALL.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "expected pass, got {v:#?}");
     }
 
@@ -417,7 +441,7 @@ mod tests {
             "code-reviewer",
             "## MODIFIED Requirements\n\n### Requirement: Reviewer prompt budget is operator-configurable\nBody SHALL.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Modified);
         assert_eq!(v[0].capability, "code-reviewer");
@@ -442,7 +466,7 @@ mod tests {
             "cap",
             "## MODIFIED Requirements\n\n### Requirement: Existing requirement.\nNew body SHALL.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1, "got {v:#?}");
         assert_eq!(v[0].kind, DeltaKind::Modified);
     }
@@ -464,7 +488,7 @@ mod tests {
             "cap",
             "## REMOVED Requirements\n\n### Requirement: Going away\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "expected pass, got {v:#?}");
     }
 
@@ -483,7 +507,7 @@ mod tests {
             "cap",
             "## REMOVED Requirements\n\n### Requirement: Not here\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Removed);
         assert!(v[0].reason.contains("cannot remove non-existent"));
@@ -506,7 +530,7 @@ mod tests {
             "cap",
             "## RENAMED Requirements\n\n- FROM: `Old`\n  TO: `New`\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "expected pass, got {v:#?}");
     }
 
@@ -525,7 +549,7 @@ mod tests {
             "cap",
             "## RENAMED Requirements\n\n- FROM: `Old`\n  TO: `New`\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Renamed);
         assert_eq!(v[0].header, "from Old to New");
@@ -547,7 +571,7 @@ mod tests {
             "cap",
             "## RENAMED Requirements\n\n- FROM: `Old`\n  TO: `New`\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Renamed);
         assert!(v[0].reason.contains("rename would create a duplicate"));
@@ -566,7 +590,7 @@ mod tests {
             "brand-new-cap",
             "## ADDED Requirements\n\n### Requirement: First\nThe system SHALL first.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "ADDs on new capability must pass, got {v:#?}");
     }
 
@@ -580,7 +604,7 @@ mod tests {
             "brand-new-cap",
             "## MODIFIED Requirements\n\n### Requirement: First\nThe system SHALL first.\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, DeltaKind::Modified);
         assert!(v[0].reason.contains("has no canonical spec"));
@@ -614,7 +638,7 @@ mod tests {
             "beta",
             "## REMOVED Requirements\n\n### Requirement: Wrong-beta\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert_eq!(v.len(), 2, "expected one per capability, got {v:#?}");
         // Deterministic capability ordering — alpha sorts before beta.
         assert_eq!(v[0].capability, "alpha");
@@ -628,7 +652,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/c1")).unwrap();
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty());
     }
 
@@ -648,7 +672,7 @@ mod tests {
             "cap",
             "## ADDED Requirements\n\n(no requirements yet)\n",
         );
-        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        let v = check_spec_deltas_archivable(ws, &fixture_repo(), "c1").unwrap();
         assert!(v.is_empty(), "empty delta block must be a no-op, got {v:#?}");
     }
 }

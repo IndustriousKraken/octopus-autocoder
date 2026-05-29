@@ -3,7 +3,6 @@
 
 pub mod spec_root;
 
-#[allow(unused_imports)]
 pub use spec_root::SpecRoot;
 
 use crate::config::GithubConfig;

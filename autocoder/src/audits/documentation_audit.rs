@@ -139,7 +139,11 @@ impl DocumentationAudit {
     /// Build the full prompt: embedded template + an `extra` YAML block
     /// naming the operator's configured thresholds + a concatenation of
     /// every gathered input file headed by `## File: <path>`.
-    fn build_prompt(&self, workspace: &std::path::Path) -> Result<String> {
+    fn build_prompt(
+        &self,
+        workspace: &std::path::Path,
+        repo: &crate::config::RepositoryConfig,
+    ) -> Result<String> {
         let template = self.resolve_prompt(Some(workspace))?;
         let mut out = template;
         if !out.ends_with('\n') {
@@ -154,7 +158,7 @@ impl DocumentationAudit {
         ));
         out.push_str("```\n\n");
 
-        let inputs = gather_inputs(workspace);
+        let inputs = gather_inputs(workspace, repo);
         let mut total = 0usize;
         for input in inputs {
             let header = format!("## File: {}\n\n", input.display_path);
@@ -198,7 +202,7 @@ impl Audit for DocumentationAudit {
             return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
         }
 
-        let prompt = self.build_prompt(ctx.workspace)?;
+        let prompt = self.build_prompt(ctx.workspace, ctx.repo)?;
 
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
@@ -315,10 +319,15 @@ struct GatheredInput {
 /// skipped (the audit can still report on what it has). The returned
 /// list is in a stable order: specs first (sorted by capability
 /// slug), then README, then docs (sorted by filename).
-fn gather_inputs(workspace: &std::path::Path) -> Vec<GatheredInput> {
+fn gather_inputs(
+    workspace: &std::path::Path,
+    repo: &crate::config::RepositoryConfig,
+) -> Vec<GatheredInput> {
     let mut out: Vec<GatheredInput> = Vec::new();
 
-    let specs_root = workspace.join("openspec/specs");
+    // a26: route canonical-spec reads through the SpecRoot resolver so
+    // an external `spec_storage.path` redirects discovery.
+    let specs_root = crate::workspace::spec_root::specs_dir(repo, workspace);
     if let Ok(entries) = std::fs::read_dir(&specs_root) {
         let mut cap_paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
@@ -911,7 +920,9 @@ mod tests {
 
         let cfg = executor_cfg("/bin/true");
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.build_prompt(workspace).expect("prompt builds");
+        let prompt = audit
+            .build_prompt(workspace, &fixture_repo())
+            .expect("prompt builds");
         assert!(prompt.contains("documentation_audit_extra"));
         assert!(prompt.contains(&format!("readme_max_lines: {DEFAULT_README_MAX_LINES}")));
         assert!(prompt.contains(&format!(
@@ -926,7 +937,7 @@ mod tests {
     fn gather_inputs_skips_missing_directories_gracefully() {
         let tmp = TempDir::new().unwrap();
         // No openspec, no docs, no README.
-        let inputs = gather_inputs(tmp.path());
+        let inputs = gather_inputs(tmp.path(), &fixture_repo());
         assert!(inputs.is_empty());
     }
 

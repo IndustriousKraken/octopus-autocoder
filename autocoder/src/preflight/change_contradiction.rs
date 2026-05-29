@@ -129,11 +129,12 @@ const RESPONSE_EXCERPT_MAX: usize = 200;
 /// specific failure so operators can investigate via journalctl.
 pub async fn check_change_internal_contradictions(
     workspace_root: &Path,
+    repo: &crate::config::RepositoryConfig,
     change_slug: &str,
     llm: &dyn LlmClient,
     prompt_template: &str,
 ) -> Result<Vec<ContradictionFinding>> {
-    let input = build_spec_input(workspace_root, change_slug)?;
+    let input = build_spec_input(workspace_root, repo, change_slug)?;
     let prompt = format!(
         "{template}{delim}{input}",
         template = prompt_template.trim_end(),
@@ -171,9 +172,14 @@ pub async fn check_change_internal_contradictions(
 /// string when the change has no `specs/` subdir or no per-capability
 /// spec files — the caller passes that through to the LLM, which
 /// reports `{"contradictions": []}` on an empty input.
-fn build_spec_input(workspace_root: &Path, change_slug: &str) -> Result<String> {
-    let specs_dir = workspace_root
-        .join("openspec/changes")
+fn build_spec_input(
+    workspace_root: &Path,
+    repo: &crate::config::RepositoryConfig,
+    change_slug: &str,
+) -> Result<String> {
+    // a26: route the change-dir lookup via SpecRoot so external
+    // spec_storage is consulted when configured.
+    let specs_dir = crate::workspace::spec_root::changes_dir(repo, workspace_root)
         .join(change_slug)
         .join("specs");
     if !specs_dir.is_dir() {
@@ -311,6 +317,22 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
+    fn cc_fixture_repo() -> crate::config::RepositoryConfig {
+        crate::config::RepositoryConfig {
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".to_string(),
+            agent_branch: "agent-q".to_string(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+        }
+    }
+
     struct FixedResponseLlm {
         body: Mutex<Option<String>>,
         error: Mutex<Option<String>>,
@@ -382,7 +404,7 @@ mod tests {
             "## ADDED Requirements\n\n### Requirement: New\nThe system SHALL new.\n",
         );
         let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -408,7 +430,7 @@ mod tests {
           ]
         }"#;
         let llm = FixedResponseLlm::ok(body);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -428,7 +450,7 @@ mod tests {
             "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
         );
         let llm = FixedResponseLlm::ok("this is not json at all");
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert!(out.is_empty(), "malformed JSON must fail open: {out:?}");
@@ -445,7 +467,7 @@ mod tests {
             "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
         );
         let llm = FixedResponseLlm::err("simulated network error");
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert!(out.is_empty(), "transport error must fail open: {out:?}");
@@ -463,7 +485,7 @@ mod tests {
         );
         let body = "Here's my answer:\n```json\n{\"contradictions\": [{\"requirement_a\":\"A\",\"requirement_b\":\"B\",\"summary\":\"x\"}]}\n```\n";
         let llm = FixedResponseLlm::ok(body);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -476,7 +498,7 @@ mod tests {
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/c1")).unwrap();
         let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
+        let out = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "template")
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -548,7 +570,7 @@ mod tests {
             "## ADDED Requirements\n\n### Requirement: B1\nBody.\n",
         );
         let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let _ = check_change_internal_contradictions(ws, "c1", &llm, "PROMPT_TEMPLATE")
+        let _ = check_change_internal_contradictions(ws, &cc_fixture_repo(), "c1", &llm, "PROMPT_TEMPLATE")
             .await
             .unwrap();
         let p = llm.last_prompt();

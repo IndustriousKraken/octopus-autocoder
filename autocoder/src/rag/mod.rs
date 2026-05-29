@@ -64,7 +64,14 @@ pub fn shared_config() -> Option<&'static crate::config::CanonicalRagConfig> {
 /// corpus and registers the store under the workspace's sanitized
 /// basename. Fail-open: any error logs WARN and the store is omitted
 /// from the registry (subsequent queries return empty Vec).
-pub async fn workspace_init_hook(workspace: &std::path::Path) {
+///
+/// a26: `repo` is consulted so the spec corpus is sourced from the
+/// repo's resolved spec root — either `<workspace>/openspec/` (default)
+/// OR `<spec_storage.path>/openspec/` (when configured).
+pub async fn workspace_init_hook(
+    workspace: &std::path::Path,
+    repo: &crate::config::RepositoryConfig,
+) {
     let Some(registry) = shared_registry() else {
         return;
     };
@@ -78,7 +85,7 @@ pub async fn workspace_init_hook(workspace: &std::path::Path) {
     if registry.contains(&basename).await {
         return; // Already initialized for this workspace.
     }
-    match CanonicalRagStore::rebuild_for_workspace(workspace, config.clone()).await {
+    match CanonicalRagStore::rebuild_for_workspace(workspace, repo, config.clone()).await {
         Ok(store) => {
             let count = store.entry_count().await;
             registry
@@ -105,6 +112,7 @@ pub async fn workspace_init_hook(workspace: &std::path::Path) {
 /// error logs WARN and the prior embeds are retained.
 pub async fn post_archive_hook(
     workspace: &std::path::Path,
+    repo: &crate::config::RepositoryConfig,
     affected_capabilities: &[String],
 ) {
     if affected_capabilities.is_empty() {
@@ -124,7 +132,7 @@ pub async fn post_archive_hook(
         return;
     };
     match store
-        .rebuild_capabilities(workspace, affected_capabilities)
+        .rebuild_capabilities(workspace, repo, affected_capabilities)
         .await
     {
         Ok(()) => {
@@ -225,6 +233,7 @@ impl CanonicalRagStore {
     /// omits the store from the registry on failure.
     pub async fn rebuild_for_workspace(
         workspace: &Path,
+        repo: &crate::config::RepositoryConfig,
         config: CanonicalRagConfig,
     ) -> Result<Self> {
         let workspace_basename = sanitize_workspace_basename(workspace);
@@ -235,7 +244,8 @@ impl CanonicalRagStore {
             config,
             entries: RwLock::new(Vec::new()),
         };
-        let spec_paths = discover_canonical_specs(workspace)?;
+        let specs_root = crate::workspace::spec_root::specs_dir(repo, workspace);
+        let spec_paths = discover_canonical_specs_in(&specs_root)?;
         store.embed_paths(&spec_paths).await?;
         Ok(store)
     }
@@ -247,6 +257,7 @@ impl CanonicalRagStore {
     pub async fn rebuild_capabilities(
         &self,
         workspace: &Path,
+        repo: &crate::config::RepositoryConfig,
         capabilities: &[String],
     ) -> Result<()> {
         let mut new_paths = Vec::new();
@@ -256,11 +267,10 @@ impl CanonicalRagStore {
             let mut guard = self.entries.write().await;
             guard.retain(|e| !to_remove.contains(e.input.capability.as_str()));
         }
+        // a26: route spec reads via the resolver so spec_storage works.
+        let specs_root = crate::workspace::spec_root::specs_dir(repo, workspace);
         for cap in capabilities {
-            let path = workspace
-                .join("openspec/specs")
-                .join(cap)
-                .join("spec.md");
+            let path = specs_root.join(cap).join("spec.md");
             if path.is_file() {
                 new_paths.push(path);
             }
@@ -417,13 +427,16 @@ pub fn sanitize_workspace_basename(workspace: &Path) -> String {
         .unwrap_or_else(|| "unknown_workspace".to_string())
 }
 
-fn discover_canonical_specs(workspace: &Path) -> Result<Vec<PathBuf>> {
-    let specs_root = workspace.join("openspec/specs");
+/// Variant that operates on an already-resolved specs root. a26:
+/// production callers MUST consult the [`crate::workspace::spec_root`]
+/// resolver to derive the correct directory; this helper itself is
+/// resolver-agnostic.
+fn discover_canonical_specs_in(specs_root: &Path) -> Result<Vec<PathBuf>> {
     if !specs_root.is_dir() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&specs_root)? {
+    for entry in std::fs::read_dir(specs_root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -435,6 +448,11 @@ fn discover_canonical_specs(workspace: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+#[cfg(test)]
+fn discover_canonical_specs(workspace: &Path) -> Result<Vec<PathBuf>> {
+    discover_canonical_specs_in(&workspace.join("openspec/specs"))
 }
 
 #[cfg(test)]
@@ -462,6 +480,22 @@ mod tests {
         let dir = workspace.join("openspec/specs").join(capability);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("spec.md"), body).unwrap();
+    }
+
+    fn fake_repo_for_rag_tests() -> crate::config::RepositoryConfig {
+        crate::config::RepositoryConfig {
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".to_string(),
+            agent_branch: "agent-q".to_string(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+        }
     }
 
     /// Test client: maps a chunk's first non-empty word to a one-hot
@@ -557,7 +591,7 @@ mod tests {
             "### Requirement: Audit cadence\nSHALL run audits.\n\n### Requirement: New audit type\nSHALL register new type.\n",
         );
         store
-            .rebuild_capabilities(tmp.path(), &["audits".to_string()])
+            .rebuild_capabilities(tmp.path(), &fake_repo_for_rag_tests(), &["audits".to_string()])
             .await
             .unwrap();
         let entries = store.entries.read().await;

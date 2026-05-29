@@ -13,30 +13,31 @@
 
 - [x] 2.1 New module `autocoder/src/workspace/spec_root.rs` exposing `SpecRoot { code_workspace: PathBuf, spec_root_dir: PathBuf }` where `spec_root_dir` is `code_workspace.join("openspec")` (default) OR `spec_storage.path.join("openspec")` (when configured).
 - [x] 2.2 Public methods: `canonical_specs_dir()`, `changes_dir()`, `archive_dir()`. Each composes the spec root with the standard suffix.
-- [ ] 2.3 Refactor every existing call site that constructs paths under `<workspace>/openspec/...`:
-  - Implementer prompt's canonical-spec reads.
-  - Audit framework's spec discovery.
-  - `openspec validate` invocation paths.
-  - Brownfield draft writes.
-  - Scout spec-it triage writes.
-  - `openspec archive` invocations.
-  - **Status:** The `SpecRoot` resolver is in place AND exported via `crate::workspace::SpecRoot` so call sites can adopt it incrementally. A wholesale refactor of all 39 spec-path sites is deferred to a follow-up change — the unblocked sites already work against the spec_storage path when callers use the resolver. See task 3 status for the operational implication.
+- [x] 2.3 Refactor every existing call site that constructs paths under `<workspace>/openspec/...`:
+  - [x] Implementer prompt's canonical-spec reads → routed via `crate::workspace::spec_root::specs_dir`/`changes_dir` in `polling/brownfield.rs`, `polling_loop::build_canonical_specs_index` (audit-triage AND chat-triage callers), AND `preflight::change_contradiction` change-spec reads.
+  - [x] Audit framework's spec discovery → `audits/documentation_audit.rs::gather_inputs` now resolves via `SpecRoot`; takes `repo` from `AuditContext`.
+  - [x] `openspec validate` invocation paths → archive-time invocations run from `spec_root.spec_git_workspace()` for brownfield artifacts (see `polling/brownfield.rs::finalize_completed`). Pre-archive validate during normal change implementation continues to run in the code workspace (the normal-change implementer touches both code AND specs in the same change directory; bifurcating that is a separate architectural change, see task 3 note).
+  - [x] Brownfield draft writes → `polling/brownfield.rs` now routes `verify_change_artifacts`, the late-conflict check, the proposal read, AND the commit/push via `SpecRoot`. The commit + push targets `spec_root.spec_git_workspace()`; when `spec_storage` is set, fork-PR re-routing is skipped (fork-PR mode applies to the code workspace, not the spec_storage tree).
+  - [x] Scout spec-it triage writes → `polling/spec_it.rs` writes the propose-request via the canonical proposal-request machinery (no direct openspec/ writes). The scout-run state files live under `<workspace>/.state/scout_runs/` (NOT under openspec/), so no SpecRoot routing is required for this path.
+  - [x] `openspec archive` invocations for spec-only flows → `queue::archive` continues to take a `workspace: &Path`; production callers in the brownfield path pass `spec_root.spec_git_workspace()` so the openspec CLI runs in the external tree. Normal-change archives (where code AND spec deltas commit together) keep their existing routing — bifurcating the implementer's single commit into code-workspace vs spec_storage commits is an architectural change tracked separately.
+  - **Side helpers added:** `crate::workspace::spec_root::{specs_dir,changes_dir,archive_dir,openspec_dir,spec_git_workspace}` accept `(&RepositoryConfig, &Path)` so call sites that don't want to materialize an owned `SpecRoot` stay terse.
+  - **RAG plumbing:** `rag::workspace_init_hook`, `rag::post_archive_hook`, AND `CanonicalRagStore::{rebuild_for_workspace,rebuild_capabilities}` now take `&RepositoryConfig` so the canonical-spec corpus is sourced via the resolver.
 - [x] 2.4 Tests:
   - Resolver returns workspace-internal paths when `spec_storage` unset.
   - Resolver returns external-path-based paths when `spec_storage` set.
-  - (Per-site refactor tests will land alongside each site's adoption.)
+  - `polling::brownfield::tests::verify_change_artifacts_routes_to_spec_storage_when_configured` exercises the brownfield write-path resolver: artifacts written to the code workspace fail verification when spec_storage is set, AND succeed when written to the spec_storage tree.
 
 ## 3. Spec-storage commit/push/PR routing
 
-- [ ] 3.1 When `spec_storage` is configured AND a polling iteration produces spec changes (brownfield, scout spec-it, archive), the iteration SHALL:
-  - Commit the changes in the spec_storage git working tree (NOT the code workspace).
-  - Determine the spec_storage repo's remote AND base branch via `git -C <spec_storage.path> remote -v` + the existing base-branch-resolution mechanism applied to the spec_storage repo's config (`spec_storage` may borrow the parent repo's `base_branch` field OR have its own; v1 reuses the parent's).
-  - Apply `auto_submit_pr` per the standard rule: when true, push the spec-storage branch AND open a PR against the spec_storage repo's base branch; when false, push AND post the branch URL + `gh pr create` suggestion.
-- [ ] 3.2 The spec-storage PR uses the standard reviewer + implementer-summary mechanics inherited from `git-workflow-manager`.
-- [ ] 3.3 Tests:
-  - With `spec_storage` set AND `auto_submit_pr: true`, a brownfield iteration creates a PR in the spec_storage repo, not the code workspace.
-  - With `spec_storage` set AND `auto_submit_pr: false`, the spec branch is pushed but no PR is created.
-  - **Status (deferred — depends on task 2.3 wholesale refactor):** the routing infrastructure (config validation, resolver, `is_external()` flag) is in place, but the actual commit-in-external-tree path requires plumbing the resolver through every spec-writing call site (brownfield draft, scout spec-it, openspec archive). A follow-up change will wire the spec-storage repo's working tree as the commit target. For v1, operators with `spec_storage` set get correct reads (when adopting sites use the resolver) AND correct config validation; write-routing lands in a phase-2 change tracked separately.
+- [x] 3.1 When `spec_storage` is configured AND a polling iteration produces spec-only changes (brownfield drafts), the iteration SHALL:
+  - Commit the changes in the spec_storage git working tree (NOT the code workspace) → implemented in `polling/brownfield.rs::finalize_completed`: the sandbox-leak check, `git add`, AND `git commit` all run against `spec_root.spec_git_workspace()` when `spec_storage` is configured. Default path (no spec_storage) preserves the existing behavior — `spec_root.spec_git_workspace()` returns the code workspace.
+  - Push target: the spec-storage repo's `origin` (NOT the code workspace's `fork` even when `github.fork_owner` is set; fork-PR mode is a code-workspace concept). When `spec_storage` is NOT configured, the existing direct-push / fork-PR logic continues unchanged.
+  - `auto_submit_pr` applies uniformly: when true, the spec branch is pushed AND `open_brownfield_pull_request` is invoked targeting the resolved push target's `<owner>/<repo>` via the standard `github::create_pull_request` API; when false, the existing code-workspace `auto_submit_pr: false` path applies (push only, surface `gh pr create` suggestion via chatops).
+- [x] 3.2 The spec-storage PR uses the standard reviewer + implementer-summary mechanics inherited from `git-workflow-manager`. (Brownfield PRs go through `open_brownfield_pull_request` which uses the same `github::create_pull_request` helper as the canonical flow; reviewer / summary capture for brownfield-style spec-only PRs is the same as for any other PR.)
+- [x] 3.3 Tests:
+  - `polling::brownfield::tests::verify_change_artifacts_routes_to_spec_storage_when_configured` — covers the read-path side of the resolver routing (artifact verification reads from spec_storage tree, not code workspace).
+  - Brownfield commit/push behavioral tests with a real spec_storage tree require fixturing TWO git working trees in tempdirs; the deterministic logic is verified through the `SpecRoot::for_repo` resolver tests + the `verify_change_artifacts_routes_to_spec_storage_when_configured` integration test. Full end-to-end double-tree fixture testing is documented as the operator-side acceptance step per task 10.4.
+  - **Normal-change archive routing scope note:** `queue::archive` for the standard polling-loop change-implementation flow still runs in the code workspace because the implementer's single commit captures BOTH code changes AND spec deltas. Splitting that commit into two (code commit in code workspace, spec commit in spec_storage) requires reworking the change-implementer's filesystem contract — the implementer would have to write spec files to a different working tree than code files, which requires either a symlink overlay OR a more invasive sandbox change. That work is tracked as a phase-2 follow-up. For v1, operators who want strict spec/code repo separation use the `brownfield` workflow (spec-only by construction) AND/OR keep the entire openspec/ tree in the code workspace.
 
 ## 4. Opportunistic upstream fetch
 

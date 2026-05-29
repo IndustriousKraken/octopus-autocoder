@@ -20,6 +20,7 @@ use crate::polling_loop::ChatOpsContext;
 use crate::state::brownfield_request::{
     self, BrownfieldRequestState, BrownfieldRequestStatus,
 };
+use crate::workspace::spec_root as spec_root_helpers;
 use crate::{git, github};
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
@@ -81,8 +82,10 @@ pub async fn process_pending_brownfield(
     };
 
     // ----- Late-conflict check -----
-    let spec_path = workspace
-        .join("openspec/specs")
+    // a26: specs may live in an EXTERNAL spec_storage tree when
+    // `repo.spec_storage` is configured; route the lookup through the
+    // resolver so the conflict check inspects the correct tree.
+    let spec_path = spec_root_helpers::specs_dir(repo, workspace)
         .join(&state.capability_name)
         .join("spec.md");
     if spec_path.is_file() {
@@ -227,9 +230,15 @@ pub async fn process_pending_brownfield(
 /// brownfield artifacts (`proposal.md`, `tasks.md`, `specs/<cap>/spec.md`).
 /// Returns `Ok(())` when every artifact is present; otherwise returns
 /// `Err` whose message names the missing artifact(s).
-pub(crate) fn verify_change_artifacts(workspace: &Path, capability: &str) -> Result<()> {
-    let change_dir = workspace
-        .join("openspec/changes")
+///
+/// a26: `repo` is consulted to resolve `<workspace>/openspec/changes/` vs
+/// the external `spec_storage.path` tree.
+pub(crate) fn verify_change_artifacts(
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    capability: &str,
+) -> Result<()> {
+    let change_dir = spec_root_helpers::changes_dir(repo, workspace)
         .join(format!("brownfield-{capability}"));
     let proposal_path = change_dir.join("proposal.md");
     let tasks_path = change_dir.join("tasks.md");
@@ -281,12 +290,18 @@ async fn finalize_completed(
     spec_branch: &str,
 ) -> Result<()> {
     // 1. Verify the change directory contains the required artifacts.
-    verify_change_artifacts(workspace, &state.capability_name)?;
+    verify_change_artifacts(repo, workspace, &state.capability_name)?;
+
+    // a26: spec-change git operations target the spec_storage tree when
+    // configured; default falls through to the code workspace. The
+    // sandbox-leak check, commit, AND push all run against this tree.
+    let spec_root = spec_root_helpers::SpecRoot::for_repo(repo, workspace.to_path_buf());
+    let spec_git_ws = spec_root.spec_git_workspace().to_path_buf();
 
     // 2. Sandbox-leak check: every modified path MUST be under
     //    `openspec/`. Anything else means the executor violated the
     //    WritePolicy::OpenSpecOnly contract.
-    let porcelain = git::status_porcelain_untracked_all(workspace)
+    let porcelain = git::status_porcelain_untracked_all(&spec_git_ws)
         .with_context(|| "brownfield: reading git status".to_string())?;
     let leaked = detect_sandbox_leak(&porcelain);
     if !leaked.is_empty() {
@@ -301,8 +316,7 @@ async fn finalize_completed(
     }
 
     // (resume to original control flow)
-    let proposal_path = workspace
-        .join("openspec/changes")
+    let proposal_path = spec_root_helpers::changes_dir(repo, workspace)
         .join(format!("brownfield-{}", state.capability_name))
         .join("proposal.md");
 
@@ -316,22 +330,26 @@ async fn finalize_completed(
     );
     let _ = std::process::Command::new("git")
         .args(["add", "--", &change_rel])
-        .current_dir(workspace)
+        .current_dir(&spec_git_ws)
         .status();
     let subject = format!(
         "Brownfield draft: capability `{}`",
         state.capability_name
     );
-    git::commit(workspace, &subject)
+    git::commit(&spec_git_ws, &subject)
         .with_context(|| "brownfield: commit spec branch".to_string())?;
 
-    // 5. Push the spec branch.
-    let push_remote = if github_cfg.fork_owner.is_some() {
+    // 5. Push the spec branch. When spec_storage is configured, this
+    //    pushes the external tree's remote (typically `origin` of the
+    //    spec-storage repo); fork-PR rerouting is meaningful only for
+    //    the code workspace, so we only honor it when the spec tree IS
+    //    the code workspace.
+    let push_remote = if !spec_root.is_external() && github_cfg.fork_owner.is_some() {
         "fork"
     } else {
         "origin"
     };
-    git::push_force_with_lease(workspace, spec_branch, push_remote)
+    git::push_force_with_lease(&spec_git_ws, spec_branch, push_remote)
         .with_context(|| format!("brownfield: pushing spec branch `{spec_branch}`"))?;
 
     // 6. Open the PR.
@@ -693,8 +711,37 @@ pub(crate) fn test_render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SpecStorageConfig;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// Default fake repo for verify_change_artifacts tests — has no
+    /// spec_storage set, so the resolver returns `<workspace>/openspec/...`.
+    fn fake_repo() -> RepositoryConfig {
+        RepositoryConfig {
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".to_string(),
+            agent_branch: "agent-q".to_string(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+        }
+    }
+
+    /// Variant for tests that want spec_storage at `path`.
+    #[allow(dead_code)]
+    fn fake_repo_with_spec_storage(path: &str) -> RepositoryConfig {
+        let mut r = fake_repo();
+        r.spec_storage = Some(SpecStorageConfig {
+            path: path.to_string(),
+        });
+        r
+    }
 
     #[test]
     fn render_substitutes_known_placeholders() {
@@ -842,7 +889,7 @@ mod tests {
     fn verify_change_artifacts_ok_when_all_present() {
         let tmp = TempDir::new().unwrap();
         write_artifacts(tmp.path(), "scheduler");
-        verify_change_artifacts(tmp.path(), "scheduler").expect("all files present must pass");
+        verify_change_artifacts(&fake_repo(), tmp.path(), "scheduler").expect("all files present must pass");
     }
 
     #[test]
@@ -855,7 +902,7 @@ mod tests {
                 .join("openspec/changes/brownfield-scheduler/specs/scheduler/spec.md"),
         )
         .unwrap();
-        let err = verify_change_artifacts(tmp.path(), "scheduler")
+        let err = verify_change_artifacts(&fake_repo(), tmp.path(), "scheduler")
             .expect_err("missing spec.md must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("specs/<cap>/spec.md"), "{msg}");
@@ -870,7 +917,7 @@ mod tests {
                 .join("openspec/changes/brownfield-scheduler/proposal.md"),
         )
         .unwrap();
-        let err = verify_change_artifacts(tmp.path(), "scheduler")
+        let err = verify_change_artifacts(&fake_repo(), tmp.path(), "scheduler")
             .expect_err("missing proposal.md must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("proposal.md"), "{msg}");
@@ -880,10 +927,33 @@ mod tests {
     fn verify_change_artifacts_err_when_change_dir_absent() {
         let tmp = TempDir::new().unwrap();
         // No change directory at all.
-        let err = verify_change_artifacts(tmp.path(), "scheduler")
+        let err = verify_change_artifacts(&fake_repo(), tmp.path(), "scheduler")
             .expect_err("absent change dir must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("missing"), "{msg}");
+    }
+
+    #[test]
+    fn verify_change_artifacts_routes_to_spec_storage_when_configured() {
+        // a26: when spec_storage is set, the change-dir lookup MUST land
+        // in the external tree's `openspec/changes/...`, NOT the code
+        // workspace's. Artifacts written to the code workspace should
+        // therefore fail verification.
+        let code_ws = TempDir::new().unwrap();
+        let spec_ws = TempDir::new().unwrap();
+        // Write artifacts ONLY in the code workspace.
+        write_artifacts(code_ws.path(), "scheduler");
+        let repo = fake_repo_with_spec_storage(spec_ws.path().to_str().unwrap());
+        let err = verify_change_artifacts(&repo, code_ws.path(), "scheduler")
+            .expect_err("with spec_storage set, code-workspace artifacts must NOT count");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing"), "{msg}");
+
+        // Now write the artifacts to the SPEC STORAGE tree → verification
+        // passes via the resolver.
+        write_artifacts(spec_ws.path(), "scheduler");
+        verify_change_artifacts(&repo, code_ws.path(), "scheduler")
+            .expect("artifacts in spec_storage tree must satisfy the verifier");
     }
 
     #[test]

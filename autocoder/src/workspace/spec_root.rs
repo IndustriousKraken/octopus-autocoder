@@ -104,7 +104,6 @@ impl SpecRoot {
     /// tree (i.e., `spec_storage` is configured). Callers that commit
     /// spec changes SHOULD branch on this to decide which git working
     /// tree to operate against.
-    #[allow(dead_code)]
     pub fn is_external(&self) -> bool {
         self.spec_storage_configured
     }
@@ -112,10 +111,44 @@ impl SpecRoot {
     /// The git working tree that holds the spec files — equals
     /// [`spec_root_dir`] when `spec_storage` is configured, otherwise
     /// [`code_workspace`].
-    #[allow(dead_code)]
     pub fn spec_git_workspace(&self) -> &Path {
         &self.spec_root_dir
     }
+}
+
+// --------------------------------------------------------------------------
+// Module-level convenience helpers. Use these at call sites that have
+// `&RepositoryConfig` AND `&Path` (workspace) but don't want to
+// materialize an owned `SpecRoot` every time.
+// --------------------------------------------------------------------------
+
+/// `<spec_root>/openspec/specs/` for `repo` given its resolved
+/// `code_workspace`. Equivalent to `SpecRoot::for_repo(repo, ws).canonical_specs_dir()`.
+pub fn specs_dir(repo: &RepositoryConfig, code_workspace: &Path) -> PathBuf {
+    SpecRoot::for_repo(repo, code_workspace.to_path_buf()).canonical_specs_dir()
+}
+
+/// `<spec_root>/openspec/changes/` for `repo`.
+pub fn changes_dir(repo: &RepositoryConfig, code_workspace: &Path) -> PathBuf {
+    SpecRoot::for_repo(repo, code_workspace.to_path_buf()).changes_dir()
+}
+
+/// `<spec_root>/openspec/changes/archive/` for `repo`.
+pub fn archive_dir(repo: &RepositoryConfig, code_workspace: &Path) -> PathBuf {
+    SpecRoot::for_repo(repo, code_workspace.to_path_buf()).archive_dir()
+}
+
+/// `<spec_root>/openspec/` for `repo`.
+pub fn openspec_dir(repo: &RepositoryConfig, code_workspace: &Path) -> PathBuf {
+    SpecRoot::for_repo(repo, code_workspace.to_path_buf()).openspec_dir()
+}
+
+/// The git working tree that holds spec files — either the code
+/// workspace (default) OR the configured `spec_storage.path` (external).
+pub fn spec_git_workspace(repo: &RepositoryConfig, code_workspace: &Path) -> PathBuf {
+    SpecRoot::for_repo(repo, code_workspace.to_path_buf())
+        .spec_git_workspace()
+        .to_path_buf()
 }
 
 #[cfg(test)]
