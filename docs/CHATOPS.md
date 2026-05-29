@@ -178,6 +178,77 @@ On any failure (executor returned `Failed`, missing artifacts, sandbox leak, pus
 
 **Relationship to `propose`.** Use `brownfield` to introduce a capability's canonical spec to the workspace for the first time. After the brownfield PR merges, the standard `propose` flow handles any subsequent change to that capability (the `openspec/specs/<capability-name>/spec.md` file then exists, AND brownfield refuses to overwrite it). See [OPERATIONS.md → onboarding existing projects](OPERATIONS.md#onboarding-existing-projects) for the recommended cadence.
 
+### scout
+
+The `scout` verb is the on-demand discovery counterpart to `propose`. Where `propose` says "implement this thing I already know I want," `scout` says "I don't yet know what to work on — survey the repo AND surface a list of opportunities I might consider."
+
+```
+@<bot> scout <repo-substring> [optional guidance]
+```
+
+- `<repo-substring>` — case-insensitive substring matching the configured repo URL.
+- `[optional guidance]` — free-form focus text (e.g., `focus on security fixes and helpful error messages`). Trimmed, line breaks preserved, capped at 10,000 characters. Passed verbatim to the scout prompt.
+
+**Ack and lifecycle thread.** The bot posts a top-level ack:
+
+```
+✓ Queued scout for <repo_url>. The next polling iteration will run it (~Nm). Follow along in this thread.
+```
+
+The ack's `ts` becomes the **lifecycle thread**. The scout-mode executor runs read-only (Read, Glob, Grep, Bash including `gh api` for issues) under `WritePolicy::None`, AND the polling-iteration handler posts the resulting curated list as a threaded reply on the lifecycle thread.
+
+**Output shape.** Items are grouped by category. Each item line has the form `*<id>.* [<category>] <title> — <first-sentence-of-body> _(source: <pointer>; tractability: <small|medium|large>)_`. Categories are: `security`, `bug`, `error_handling`, `type_tightening`, `code_smell`, `perf`, `documentation`, `test_coverage`, `issue`, `todo_fixme`, `research`. The closing line reads `Reply with @<bot> spec-it <N> [optional guidance] to scope work on any item.`
+
+The rendered list is capped at `features.scout.max_items` (default 30; valid range `1..=50`). When the rendered output exceeds the chat backend's threaded-notification limit, the message truncates with `… (truncated; full list in <workspace>/.state/scout_runs/<request_id>.json)` AND the full list stays on disk so `spec-it` still works against every id.
+
+**Refusals.**
+
+- `✗ scout: missing repo-substring. Usage: @<bot> scout <repo> [optional guidance]`
+- The standard "be more specific" reply when the substring matches multiple configured repos.
+- The standard "no repo matched" reply when the substring doesn't resolve.
+- `✗ scout: disabled in this workspace's config (features.scout.enabled=false).` — operator opted the verb out at the workspace level. See [CONFIG.md → `features.scout`](CONFIG.md#featuresscout).
+
+**Per-workspace prompt override.** Operators MAY point the scout handler at a custom prompt template via `features.scout.prompt_path` (workspace-relative). When the path is unset OR the file does not exist at run time, the handler falls back to the embedded `prompts/scout.md`. See [CONFIG.md → `features.scout`](CONFIG.md#featuresscout).
+
+**`gh api` access.** Scout attempts `gh api repos/<owner>/<repo>/issues?state=open --paginate` when `features.scout.include_issues: true`. On failure (auth, rate limit, network), scout logs a WARN AND proceeds with code-derived items only; the thread reply notes "issue-derived items were skipped this run."
+
+**Tone.** The scout prompt explicitly forbids ranking-style phrasing (no "high impact," "must," "urgent"). Items are surfaced as "things you might consider," not advocated for. The operator does the ranking.
+
+### spec-it
+
+The `spec-it` verb is **scout-thread-only**: it MUST be posted as a reply inside a scout lifecycle thread. Outside one, the bot replies `✗ spec-it: only valid as a reply in a scout thread. Run @<bot> scout <repo> first.`
+
+```
+@<bot> spec-it <item-number> [optional guidance]
+```
+
+- `<item-number>` — a positive integer matching an item id in the most-recent scout run for the resolved repo. Out-of-range numbers produce `✗ spec-it: item #<N> not in this scout's list (range: 1..<max>).` Non-integers produce `✗ spec-it: <token> is not a valid item number. Usage: @<bot> spec-it <N> [guidance]`.
+- `[optional guidance]` — free-form text the operator can use to refine the scope (e.g., `stick to the OAuth scope, ignore the rate-limit angle`). Trimmed, capped at 10,000 characters. Concatenated onto the constructed propose-request text.
+
+**Translation to `propose`.** The spec-it polling-iteration handler loads the referenced `ScoutRunState`, looks up the item by id, AND submits a `ProposeRequest` whose text is:
+
+```
+[scout-item #<N>] <item.title>
+
+<item.body>
+
+Source: <item.source>
+Category: <item.category>
+Tractability: <item.tractability>
+
+<operator guidance, if any>
+```
+
+The standard propose lifecycle takes over from there — triage classifies as DIRECTIVE/QUESTION/AMBIGUOUS, the executor runs, the iteration produces a fixes PR AND/OR spec PR per the existing two-PR mechanic, AND `@<bot> revise <text>` works on the resulting PR(s). Status updates from the proposal lifecycle post into the **same scout thread**, so the scout → pick → spec → PR chain stays in one visible conversation.
+
+**Staleness handling.** When the scout's `completed_at` is older than `features.scout.staleness_warn_days` days OR the workspace's current HEAD has drifted from `head_sha_at_run`, the bot posts a single warning before submitting the propose-request:
+
+```
+⚠️ Scout from <relative-time> ago; HEAD has <unchanged|moved <N> commits>. Proceeding with the scouted item; consider re-running scout for fresh results.
+```
+
+Staleness warns but does NOT block. Operators who want fresh results re-run `@<bot> scout <repo>` themselves.
+
 ### Acting on audit findings: `send it`
 
 When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭`/`📚` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
@@ -301,6 +372,7 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 | `clear-ignore` | `@<bot> clear-ignore <repo-substring> <change-slug>` | Removes `openspec/changes/<change>/.ignore-for-queue.json`. The queue resumes blocking on the underlying marker. Refuses when no ignore-marker exists. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `<cache_dir>/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
+| `clear-scout` | `@<bot> clear-scout <repo-substring>` | Wipes every `ScoutRunState` file under `<workspace>/.state/scout_runs/`. Idempotent — running it twice (or against a repo with no runs) replies with `✓ Cleared 0 scout run(s) for <repo>.`. See [scout](#scout) above for the lifecycle. |
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
@@ -323,6 +395,18 @@ When you don't remember the exact substring of a configured repo, type `@<bot> s
 ```
 
 If any individual repo's state cannot be assembled (workspace mid-failure, control-socket per-repo error), that repository's section renders `(unavailable: <error excerpt>)` in place of the summary line. The menu still ships every other repository's section so a single broken workspace doesn't blank the whole list. From the menu, pick a repo and re-issue `@<bot> status <substring>` for the full per-repo detail.
+
+### clear-scout
+
+`clear-scout` wipes every `ScoutRunState` JSON file under `<workspace>/.state/scout_runs/` for the matched repo. The verb is idempotent — running it twice (or against a repo with no runs) replies with `✓ Cleared 0 scout run(s) for <repo>.`
+
+Use cases:
+
+- Force the next `@<bot> scout <repo>` to be the canonical "current" run when the most-recent-by-mtime resolution is producing stale results.
+- Recover after a misconfigured scout prompt produced a malformed list AND you want to retry without the stale state polluting the directory.
+- Make sure `@<bot> spec-it <N>` against an old request fails fast (since `spec-it` would otherwise still resolve against an older scout state if its `thread_ts` was matched).
+
+Refusals: missing/ambiguous repo (per the standard matcher); `✗ clear-scout: scout disabled in this workspace's config (features.scout.enabled=false).` when the verb is gated off.
 
 ### Two-step confirmation for `wipe-workspace`
 

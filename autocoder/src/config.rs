@@ -212,13 +212,14 @@ impl CanonicalRagConfig {
 }
 
 /// Top-level feature-flag block. Each sub-block is opt-in; absent
-/// sub-blocks take their type-default behaviour. Today only
-/// `brownfield` is defined.
+/// sub-blocks take their type-default behaviour.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub brownfield: BrownfieldFeatureConfig,
+    #[serde(default)]
+    pub scout: ScoutFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -253,6 +254,76 @@ impl Default for BrownfieldFeatureConfig {
 
 fn default_brownfield_enabled() -> bool {
     true
+}
+
+/// Config for the `scout` chatops verb (a25). The verb is enabled
+/// per-workspace by default; operators opt out by setting
+/// `enabled: false`. `prompt_path` overrides the embedded scout prompt
+/// template per the uniform a24 pattern. `max_items` caps the size of
+/// the executor's returned opportunity list (valid range `1..=50`).
+/// `include_issues` controls whether the handler attempts a `gh api`
+/// fetch for open issues. `staleness_warn_days` is the threshold that
+/// triggers the spec-it staleness warning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScoutFeatureConfig {
+    #[serde(default = "default_scout_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+    #[serde(default = "default_scout_max_items")]
+    pub max_items: usize,
+    #[serde(default = "default_scout_include_issues")]
+    pub include_issues: bool,
+    #[serde(default = "default_scout_staleness_warn_days")]
+    pub staleness_warn_days: u64,
+}
+
+impl Default for ScoutFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scout_enabled(),
+            prompt_path: None,
+            max_items: default_scout_max_items(),
+            include_issues: default_scout_include_issues(),
+            staleness_warn_days: default_scout_staleness_warn_days(),
+        }
+    }
+}
+
+fn default_scout_enabled() -> bool {
+    true
+}
+
+fn default_scout_max_items() -> usize {
+    30
+}
+
+fn default_scout_include_issues() -> bool {
+    true
+}
+
+fn default_scout_staleness_warn_days() -> u64 {
+    7
+}
+
+/// Valid range for `features.scout.max_items`. Values outside this
+/// range fail config-load.
+pub const SCOUT_MAX_ITEMS_MIN: usize = 1;
+pub const SCOUT_MAX_ITEMS_MAX: usize = 50;
+
+impl ScoutFeatureConfig {
+    /// Validate the resolved scout config. Returns `Err(msg)` when
+    /// `max_items` is outside the documented range.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_items < SCOUT_MAX_ITEMS_MIN || self.max_items > SCOUT_MAX_ITEMS_MAX {
+            return Err(format!(
+                "features.scout.max_items ({}) outside valid range {}..={}",
+                self.max_items, SCOUT_MAX_ITEMS_MIN, SCOUT_MAX_ITEMS_MAX
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Modernized nested prompt-override block (a24). Used as the value
@@ -1814,6 +1885,14 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             FindingCategory::Schema,
             "executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured",
             Some("executor/change_internal_contradiction_check_llm".into()),
+        );
+    }
+    // a25: features.scout.max_items must be within 1..=50.
+    if let Err(msg) = config.features.scout.validate() {
+        report.push_error(
+            FindingCategory::Schema,
+            msg,
+            Some("features/scout/max_items".into()),
         );
     }
 }
@@ -5527,6 +5606,113 @@ reviewer:
         assert_eq!(
             rv.code_review.as_ref().and_then(|b| b.prompt_path.as_deref()),
             Some(Path::new("./prompts/review-custom.md"))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // features.scout (a25)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_scout_block_omitted_uses_defaults() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        assert!(cfg.features.scout.enabled, "default enabled must be true");
+        assert!(cfg.features.scout.prompt_path.is_none());
+        assert_eq!(cfg.features.scout.max_items, 30);
+        assert!(cfg.features.scout.include_issues);
+        assert_eq!(cfg.features.scout.staleness_warn_days, 7);
+    }
+
+    #[test]
+    fn features_scout_explicit_block_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  scout:
+    enabled: false
+    prompt_path: "./prompts/scout-custom.md"
+    max_items: 15
+    include_issues: false
+    staleness_warn_days: 14
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit scout block parses");
+        assert!(!cfg.features.scout.enabled);
+        assert_eq!(
+            cfg.features.scout.prompt_path.as_deref(),
+            Some(Path::new("./prompts/scout-custom.md"))
+        );
+        assert_eq!(cfg.features.scout.max_items, 15);
+        assert!(!cfg.features.scout.include_issues);
+        assert_eq!(cfg.features.scout.staleness_warn_days, 14);
+    }
+
+    #[test]
+    fn features_scout_max_items_zero_fails_validation() {
+        let cfg = ScoutFeatureConfig {
+            max_items: 0,
+            ..ScoutFeatureConfig::default()
+        };
+        let err = cfg.validate().expect_err("max_items=0 invalid");
+        assert!(err.contains("max_items"), "{err}");
+        assert!(err.contains("1..=50"), "{err}");
+    }
+
+    #[test]
+    fn features_scout_max_items_above_50_fails_validation() {
+        let cfg = ScoutFeatureConfig {
+            max_items: 51,
+            ..ScoutFeatureConfig::default()
+        };
+        let err = cfg.validate().expect_err("max_items=51 invalid");
+        assert!(err.contains("max_items"), "{err}");
+        assert!(err.contains("1..=50"), "{err}");
+    }
+
+    #[test]
+    fn features_scout_max_items_invalid_surfaces_in_validate_config() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 60
+github:
+  token_env: GITHUB_TOKEN
+features:
+  scout:
+    max_items: 100
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("parses; range check is in validate");
+        let report = validate_config(&cfg);
+        assert!(
+            report.errors.iter().any(|f| f.message.contains("max_items")
+                && f.message.contains("1..=50")),
+            "expected schema error naming max_items range; got: {:?}",
+            report.errors
         );
     }
 

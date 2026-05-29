@@ -521,6 +521,31 @@ github:
 #     # handler logs a WARN naming the path AND falls back to the
 #     # embedded default. Default: null (use embedded).
 #     # prompt_path: ./prompts/brownfield-custom.md
+#
+#   scout:
+#     # When `false`, the chatops dispatcher refuses `@<bot> scout`,
+#     # `@<bot> spec-it`, AND `@<bot> clear-scout` at parse time. Default: true.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom scout prompt template.
+#     # Resolved via the uniform Prompt overrides table (see docs/CONFIG.md).
+#     # Default: null (use the embedded `prompts/scout.md`).
+#     # prompt_path: ./prompts/scout-custom.md
+#
+#     # Cap on the scout's returned opportunity list. Valid range 1..=50.
+#     # Default: 30.
+#     # max_items: 30
+#
+#     # When `true`, the scout handler attempts `gh api repos/<owner>/<repo>/issues?state=open`.
+#     # On failure (auth, rate limit, network), a WARN logs AND scout
+#     # proceeds with code-derived items only. Default: true.
+#     # include_issues: true
+#
+#     # When `spec-it` references a scout older than this many days OR
+#     # the workspace HEAD has drifted from the scout's recorded HEAD,
+#     # the polling handler posts a one-time warning naming the gap.
+#     # The warning does NOT block. Default: 7.
+#     # staleness_warn_days: 7
 
 
 # Canonical-spec RAG (a21). Optional top-level block. When absent OR
