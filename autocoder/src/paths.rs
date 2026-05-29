@@ -18,12 +18,33 @@
 //!   4. XDG defaults under `$HOME` (dev mode).
 //!   5. Hard fallback to `/var/lib/autocoder` etc.
 //!
-//! A successfully resolved `DaemonPaths` is installed into a process-
-//! global `OnceLock` via [`install_global`] at daemon start; callsites
-//! that already exist throughout the daemon use [`get_global`] /
-//! [`with_global`] to discover the paths without threading the struct
-//! through every signature. Tests that need explicit isolation install
-//! their own paths via [`install_global_for_test`].
+//! # Threading convention (target state per `a27-thread-daemon-paths`)
+//!
+//! Production code threads `DaemonPaths` through APIs instead of
+//! reading it from a process-global. The daemon constructs exactly
+//! ONE `DaemonPaths` value at startup (in `cli::run::execute`) via
+//! [`resolve_daemon_paths`] AND hands it (by ownership, reference,
+//! OR `Arc<DaemonPaths>`) to the top-level types it constructs.
+//! Every consumer module receives its `DaemonPaths` via its
+//! constructor (for struct-shaped consumers) OR as an explicit
+//! function parameter (for free-function helpers). No module reads
+//! paths from a process-global cell, lazy-static, OR thread-local at
+//! runtime.
+//!
+//! Tests construct their own `DaemonPaths` via
+//! [`crate::testing::test_daemon_paths`] (which hands out a tempdir-
+//! scoped instance) AND pass it explicitly into the production APIs
+//! they exercise. Two concurrent tests' fixtures live under DISJOINT
+//! tempdirs, so they cannot collide on disk.
+//!
+//! A CI scanner (extending the `a10` `path_literals_audit`) blocks
+//! reintroduction of removed-global accessor names — see
+//! `autocoder/tests/path_literals_audit.rs`.
+//!
+//! The legacy process-global accessors
+//! ([`install_global`], [`get_global`], [`current`], [`test_fallback`])
+//! are retained during the migration but `#[deprecated]`; they will
+//! be removed once every call site has been threaded.
 
 use crate::config::Config;
 use anyhow::{Result, anyhow};
