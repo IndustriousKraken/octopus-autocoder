@@ -17,6 +17,49 @@ A list of one or more repositories to manage. Each entry:
 | `local_path`         | no       | derived | See [Workspace path derivation](OPERATIONS.md#workspace-path-derivation). |
 | `chatops_channel_id` | no       | falls back to `chatops.default_channel_id` | See [ChatOps Escalation](CHATOPS.md). |
 | `max_changes_per_pr` | no       | falls back to `executor.max_changes_per_pr`, then `3` | Upper bound on archived changes committed in one iteration's PR. Remaining pending changes wait for the next iteration. A value of `0` is clamped to `1` with a WARN log at startup. |
+| `spec_storage`       | no       | _absent_ (specs in `<workspace>/openspec/`) | **a26 OSS-fork workflow.** When set, canonical specs live in a SEPARATE git working tree at `spec_storage.path`. See [`spec_storage`](#per-repository-spec_storage-block-a26-oss-fork-workflow) below AND [OPERATIONS.md → OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow). |
+| `upstream`           | no       | _absent_ (no upstream remote managed) | **a26 OSS-fork workflow.** When set, the polling iteration opportunistically `git fetch`es the named upstream remote AND the `sync-upstream` chatops verb rebases the workspace's base branch onto upstream. See [`upstream`](#per-repository-upstream-block-a26-oss-fork-workflow) below. |
+| `auto_submit_pr`     | no       | `true` | **a26 OSS-fork workflow.** When `false`, end-of-iteration pushes the agent branch as usual but SKIPS the PR-creation API call. The chatops notification surfaces `📦 Branch pushed: <url>` followed by a templated `gh pr create` command suggestion the operator runs manually. See [`auto_submit_pr`](#per-repository-auto_submit_pr-field-a26-oss-fork-workflow) below. |
+
+### Per-repository `spec_storage` block (a26 OSS-fork workflow)
+
+Redirects spec reads AND writes to an external git working tree, leaving the code workspace's `openspec/` directory untouched. Used in the [OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow) so unrelated `openspec/` files do not land in PRs against upstream projects.
+
+| Field  | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `path` | yes      | —       | Workspace-relative OR absolute path to a git working tree that contains an `openspec/` subdirectory. |
+
+**Validation (fail-fast at config-load):**
+- The resolved path must exist AND be a directory.
+- The directory must be a git working tree (verified via `git -C <path> rev-parse --is-inside-work-tree`).
+- The subdirectory `<path>/openspec/` must exist.
+
+Any validation failure aborts daemon startup with an error naming the offending field AND the resolved path.
+
+### Per-repository `upstream` block (a26 OSS-fork workflow)
+
+Declares a fetch-only upstream remote that the polling iteration opportunistically `git fetch`es at iteration start (best-effort; failures log a WARN AND the iteration continues). Enables the [`sync-upstream`](CHATOPS.md#sync-upstream) chatops verb, which rebases the workspace's base branch onto `<upstream.remote>/<upstream.branch>`.
+
+| Field    | Required | Default      | Description |
+|----------|----------|--------------|-------------|
+| `remote` | no       | `"upstream"` | Git remote name to use locally. |
+| `branch` | no       | `"main"`     | Upstream's primary branch. |
+| `url`    | yes      | —            | The upstream repo's git URL (SSH or HTTPS). |
+
+**Validation (fail-fast at config-load):** `url` must be a non-empty string. Reachability is NOT checked at config-load — that's the polling iteration's concern AND failures are best-effort.
+
+### Per-repository `auto_submit_pr` field (a26 OSS-fork workflow)
+
+Gates the end-of-iteration PR-creation API call.
+
+| Value         | Behavior |
+|---------------|----------|
+| `true` (default) | Existing behavior: push the agent branch AND open a PR per the canonical "Monolithic PR at end of pass" requirement. Chatops notification: `🎉 opened PR <url>`. |
+| `false`          | Push the agent branch per the existing rules (direct-push OR fork-PR mode) BUT skip the PR-creation API call. Chatops notification: `📦 Branch pushed: <branch-url>\nRun: gh pr create --base <base> --head <branch>`. The suggested `--base` is `upstream.branch` when configured, otherwise the workspace's `base_branch`. |
+
+Use `auto_submit_pr: false` when you (the operator) want to review the agent's diff locally before submitting the PR to an upstream project. The standard reviewer + implementer-summary mechanics still run; their output is surfaced via the chatops notification rather than via the (skipped) PR body.
+
+See [OPERATIONS.md → OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow) for the recommended-setup recipe.
 
 ## `executor:` (required)
 

@@ -377,6 +377,7 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `<cache_dir>/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
 | `clear-scout` | `@<bot> clear-scout <repo-substring>` | Wipes every `<workspace>/.state/scout_runs/*.json` file for the matched repo. Idempotent — running it when no scout state exists reports `Cleared 0 scout run(s)`. See [`### scout`](#surfacing-opportunities-to-consider-scout). |
+| `sync-upstream` | `@<bot> sync-upstream <repo-substring>` | OSS-fork workflow: fetches the configured `upstream` remote AND rebases the workspace's base branch onto `<upstream.remote>/<upstream.branch>`. See [`### sync-upstream`](#sync-upstream) below for the detailed contract. |
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
@@ -399,6 +400,27 @@ When you don't remember the exact substring of a configured repo, type `@<bot> s
 ```
 
 If any individual repo's state cannot be assembled (workspace mid-failure, control-socket per-repo error), that repository's section renders `(unavailable: <error excerpt>)` in place of the summary line. The menu still ships every other repository's section so a single broken workspace doesn't blank the whole list. From the menu, pick a repo and re-issue `@<bot> status <substring>` for the full per-repo detail.
+
+### sync-upstream
+
+Operator-driven verb for the OSS-fork workflow: rebase the workspace's base branch onto `<upstream.remote>/<upstream.branch>` so the agent's next iteration builds against fresh upstream state. Requires the per-repo `upstream` config block (see [CONFIG.md](CONFIG.md#per-repository-upstream-block-a26-oss-fork-workflow)). The full OSS-fork operator workflow is documented in [OPERATIONS.md → OSS contribution workflow](OPERATIONS.md#oss-contribution-workflow).
+
+**Syntax:**
+```
+@<bot> sync-upstream <repo-substring>
+```
+
+**Behavior:**
+1. Verifies `upstream` is configured for the repo. If not, posts `✗ sync-upstream: no upstream configured for this repo. Set the upstream block in config.yaml.` AND aborts.
+2. Runs `git fetch <upstream.remote>` (60-second timeout). On failure, posts `✗ sync-upstream: fetch failed: <reason>` AND aborts.
+3. Checks out the workspace's configured base branch.
+4. Runs `git rebase <upstream.remote>/<upstream.branch>`.
+5. **On success:** counts incorporated commits AND posts `✓ sync-upstream: pulled <N> commit(s) from <upstream.remote>/<upstream.branch>. Base branch is <M> commit(s) ahead of upstream.`
+6. **On rebase conflict:** runs `git rebase --abort` to restore the workspace, AND posts `✗ sync-upstream: rebase conflict on <files>. Aborted. Resolve manually in the workspace AND re-run, OR merge manually.`
+
+**No-push guarantee.** The handler NEVER pushes the rebased base branch to any remote — neither `origin` nor `fork`. The operator decides when (or whether) to push to the fork after reviewing the rebased state locally. The `auto_submit_pr` field is unrelated; sync-upstream does not produce PRs.
+
+**Drained at iteration start.** Like `clear-scout`, `sync-upstream` queues into a per-repo VecDeque drained at the start of every polling iteration. Concurrent invocations queue in arrival order; each posts its own thread reply.
 
 ### Two-step confirmation for `wipe-workspace`
 

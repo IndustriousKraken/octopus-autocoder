@@ -36,6 +36,39 @@ repositories:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
     #   architecture_brightline: weekly
+    #
+    # ---------------------------------------------------------------
+    # a26: OSS-fork workflow knobs (all optional, all default to
+    # legacy behavior). See docs/OPERATIONS.md → "OSS contribution
+    # workflow" for the recommended setup combining all three.
+    # ---------------------------------------------------------------
+    #
+    # spec_storage: redirect spec reads AND writes to an external git
+    # working tree (e.g., a sibling specs repo the operator owns).
+    # When unset, specs live in `<workspace>/openspec/` (default).
+    # The configured path MUST be a git working tree containing an
+    # `openspec/` subdirectory; otherwise daemon startup fails-fast.
+    # spec_storage:
+    #   path: "../my-specs"   # workspace-relative OR absolute
+    #
+    # upstream: declare a fetch-only upstream remote. When set, the
+    # polling iteration opportunistically `git fetch`es the upstream
+    # at iteration start (best-effort, 30s timeout) AND the
+    # `@<bot> sync-upstream <repo>` chatops verb rebases the
+    # workspace's base branch onto upstream. Required for the
+    # sync-upstream verb to function. Defaults: `remote: upstream`,
+    # `branch: main`. `url` is required when the block is present.
+    # upstream:
+    #   url: "https://github.com/upstream/project.git"
+    #   # remote: upstream
+    #   # branch: main
+    #
+    # auto_submit_pr: per-repo opt-out of automatic PR creation.
+    # When `false`, end-of-iteration pushes the agent branch as
+    # usual but SKIPS the PR-creation API call AND the chatops
+    # notification surfaces a templated `gh pr create` command the
+    # operator runs manually. Default: `true` (legacy behavior).
+    # auto_submit_pr: true
 
 executor:
   # The default executor wraps the `claude` CLI (Claude Code) installed and

@@ -873,3 +873,84 @@ embed + cosine sim across O(1000) chunks).
   will return empty Vec` — WARN at init.
 - `canonical RAG post-archive re-embed failed: <error>; prior embeds
   retained` — WARN at archive.
+
+## OSS contribution workflow
+
+autocoder's default deployment model assumes the operator owns every repository it works on: specs live alongside the code, PRs auto-open at end-of-iteration, and the workspace's only remote is the operator's own host. For OSS-contribution workflows — where the operator wants autocoder to help land small targeted PRs on projects they do NOT own — three per-repo config knobs reshape that model. Each is independently useful; combining all three produces the recommended OSS-fork setup.
+
+### Recommended setup (six steps)
+
+1. **Fork the upstream project on GitHub.** This is the operator's personal copy of the repo. autocoder will operate ON this fork directly (NOT via the bot-account fork-PR flow that `github.fork_owner` enables).
+2. **Clone the fork as the autocoder workspace.** Either let autocoder derive the workspace path (preferred for fleets) OR set `local_path: /your/path` to pin it.
+3. **Configure the `upstream` block** pointing at the upstream repo. Example:
+   ```yaml
+   upstream:
+     url: "https://github.com/upstream/project.git"
+     # remote: upstream    # default; uncomment to override
+     # branch: main        # default; uncomment to override
+   ```
+   The polling iteration will opportunistically `git fetch upstream` at iteration start (30-second timeout, best-effort). The `@<bot> sync-upstream <repo>` chatops verb uses this block to rebase the workspace's base branch onto upstream when the operator asks.
+4. **Set `auto_submit_pr: false`.** End-of-iteration will push the agent branch to the fork BUT will NOT open a PR. The chatops notification surfaces a templated `gh pr create --base <upstream-branch> --head <agent-branch>` command the operator runs manually after reviewing the diff locally. A bad auto-submitted PR damages the operator's reputation with maintainers in a way an internal PR does not; manual gate is the conservative default.
+5. **Configure `spec_storage.path`** pointing at a sibling specs repo (typically a public repo the operator owns dedicated to OpenSpec artifacts). Example:
+   ```yaml
+   spec_storage:
+     path: "../my-specs"   # workspace-relative OR absolute
+   ```
+   The directory must be a git working tree containing an `openspec/` subdirectory. autocoder validates these invariants at config-load AND aborts startup on failure. With this set, canonical specs AND change artifacts live in the sibling repo (separate git history) — they NEVER pollute PRs against the upstream project.
+6. **(Optional) Configure a tighter implementer prompt** via `executor.implementer.prompt_path` that emphasizes minimal-diff + follow-existing-conventions style. A starting snippet operators can adapt:
+   ```markdown
+   # Implementer instructions — OSS contribution mode
+
+   You are about to land a small change on an OSS project that autocoder's
+   operator does NOT own. Optimize for acceptance by the upstream
+   maintainers:
+
+   - **Minimal diff**: change as little code as possible to satisfy the
+     spec. No drive-by cleanups. No re-formatting. No renaming. No
+     unrelated dependency bumps.
+   - **Follow existing conventions**: imitate the style of the
+     surrounding code, even when it conflicts with your own preferences.
+     Match brace placement, error-handling patterns, naming. The
+     maintainers' aesthetic IS the requirement.
+   - **No new abstractions** unless the spec explicitly calls for one.
+     A one-line fix is better than a refactor that "improves design".
+   - **Self-contained**: do NOT introduce new top-level dependencies,
+     new directories, or new build steps. If the spec requires one,
+     flag the cost in the implementer summary.
+   - **Document the why, not the what**: any new comments should
+     explain a non-obvious invariant or workaround, not narrate code.
+
+   {{change_body}}
+   ```
+   The exact wording varies per upstream project; tune it to the
+   project's CONTRIBUTING.md AND the maintainers' review style.
+
+### The typical operator loop
+
+With the recommended setup, the day-to-day loop looks like:
+
+1. **Scout**: `@<bot> scout <repo> [guidance]` produces a curated triage list of opportunities (good-first-issue-style items, unaddressed TODOs, low-risk improvements).
+2. **Spec-it**: `@<bot> spec-it <N> [guidance]` (in the scout thread) promotes the chosen item into a propose-request that flows through the standard triage → archive lifecycle. The resulting spec change lands in the `spec_storage` repo, NOT the fork.
+3. **Iteration runs.** autocoder produces a diff, pushes the agent branch to the fork, and posts `📦 Branch pushed: <fork-branch-url>\nRun: gh pr create --base main --head <branch>` in chatops.
+4. **Review locally.** Operator checks the diff in their fork, optionally pushes refinement commits.
+5. **Merge the fork PR** when satisfied (the autocoder-produced spec PR in the `spec_storage` repo is independent — merge it whenever).
+6. **Submit upstream manually.** Operator runs the suggested `gh pr create` command (or `gh pr create` with their own framing). The PR description is the operator's — autocoder does not put words in their mouth.
+
+### Keeping the fork current
+
+Upstream keeps moving while you iterate. Use `@<bot> sync-upstream <repo>` to rebase the workspace's base branch onto `<upstream.remote>/<upstream.branch>` without leaving the chat surface. The handler:
+
+- Verifies `upstream` is configured (refuses with a misconfiguration reply otherwise).
+- Runs `git fetch <upstream.remote>` (60s timeout).
+- Checks out the base branch AND rebases onto `<upstream.remote>/<upstream.branch>`.
+- On conflict: aborts the rebase (`git rebase --abort`) AND names the conflicting files in the reply. Resolve manually in the workspace, then re-run.
+- On success: posts `✓ sync-upstream: pulled <N> commit(s) from <upstream.remote>/<upstream.branch>. Base branch is <M> commit(s) ahead of upstream.`
+- **Never pushes** — the operator decides when to push the rebased base to their fork.
+
+See [CHATOPS.md → sync-upstream](CHATOPS.md#sync-upstream) for the verb's full contract.
+
+### Why not a `workspace_mode: oss-fork` discriminator?
+
+The three knobs are independently useful. Own-project operators may want `spec_storage.path` to keep specs in a separate tree without changing anything else. Bot-PR mode operators (`github.fork_owner`) may want `auto_submit_pr: false` for sensitive repos. Treating them as separate knobs is more flexible than a coarse enum AND keeps config validation focused on per-field invariants.
+
+The existing `github.fork_owner` (a bot-account fork-PR mode) remains the right shape for operator-owned repos where a bot account holds the fork. OSS-fork mode is for the inverse: the operator owns the fork, autocoder works directly on it, and upstream is a third party.

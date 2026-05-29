@@ -374,6 +374,62 @@ pub struct RepositoryConfig {
     /// `Disabled`.
     #[serde(default)]
     pub audits: Option<HashMap<String, Cadence>>,
+    /// Optional spec-storage override (a26 OSS-fork workflow). When set,
+    /// canonical specs live in a SEPARATE git working tree rooted at
+    /// `spec_storage.path`, NOT inside the code workspace. Spec reads
+    /// AND writes route to `<spec_storage.path>/openspec/`. Defaults
+    /// to None (legacy: specs live in `<workspace>/openspec/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_storage: Option<SpecStorageConfig>,
+    /// Optional upstream-remote declaration (a26 OSS-fork workflow). When
+    /// set, the polling iteration opportunistically `git fetch`es the
+    /// declared upstream at iteration start AND the `sync-upstream`
+    /// chatops verb rebases the base branch onto upstream. Defaults to
+    /// None (no upstream remote registered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamConfig>,
+    /// Per-repo opt-out of automatic PR creation (a26 OSS-fork workflow).
+    /// When `false`, end-of-iteration pushes the agent branch as usual
+    /// but SKIPS the PR-creation API call AND surfaces a templated
+    /// `gh pr create` command via the chatops notification. Default
+    /// `true` preserves the historical auto-open behavior.
+    #[serde(default = "default_auto_submit_pr")]
+    pub auto_submit_pr: bool,
+}
+
+fn default_auto_submit_pr() -> bool {
+    true
+}
+
+/// Spec-storage override (a26). The single `path` field names a
+/// workspace-relative OR absolute directory that MUST be a git working
+/// tree containing an `openspec/` subdirectory. The path is validated
+/// at config-load time (see [`Config::load_from`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecStorageConfig {
+    pub path: String,
+}
+
+/// Upstream-remote declaration (a26). Used by the polling iteration's
+/// opportunistic-fetch step AND the `sync-upstream` chatops verb's
+/// rebase handler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    #[serde(default = "default_upstream_remote")]
+    pub remote: String,
+    #[serde(default = "default_upstream_branch")]
+    pub branch: String,
+    pub url: String,
+}
+
+fn default_upstream_remote() -> String {
+    "upstream".to_string()
+}
+
+fn default_upstream_branch() -> String {
+    "main".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1656,7 +1712,89 @@ impl Config {
                 SCOUT_MAX_ITEMS_RANGE.end(),
             ));
         }
+        // a26: validate every repo's spec_storage AND upstream block.
+        for (idx, repo) in cfg.repositories.iter().enumerate() {
+            if let Some(ss) = repo.spec_storage.as_ref() {
+                validate_spec_storage(idx, repo, ss)?;
+            }
+            if let Some(up) = repo.upstream.as_ref()
+                && up.url.trim().is_empty()
+            {
+                return Err(anyhow!(
+                    "repositories[{idx}].upstream.url must not be empty"
+                ));
+            }
+        }
         Ok(cfg)
+    }
+}
+
+/// Validate `spec_storage` invariants for one repository: the resolved
+/// path exists, is a directory, is a git working tree, AND contains an
+/// `openspec/` subdirectory. Workspace-relative paths resolve against
+/// the repo's workspace path (per `crate::workspace::resolve_path`); a
+/// missing per-repo workspace (no `local_path` AND derived path not
+/// yet created) falls back to using the spec_storage path verbatim if
+/// it is already absolute, OR returns an error naming the unresolvable
+/// relative path. Called from [`Config::load_from`].
+pub fn validate_spec_storage(
+    idx: usize,
+    repo: &RepositoryConfig,
+    ss: &SpecStorageConfig,
+) -> Result<()> {
+    let path = resolve_spec_storage_path(repo, ss);
+    if !path.exists() {
+        return Err(anyhow!(
+            "repositories[{idx}].spec_storage.path: {} does not exist",
+            path.display(),
+        ));
+    }
+    if !path.is_dir() {
+        return Err(anyhow!(
+            "repositories[{idx}].spec_storage.path: {} is not a directory",
+            path.display(),
+        ));
+    }
+    let git_check = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    let is_work_tree = match git_check {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.trim() == "true"
+        }
+        _ => false,
+    };
+    if !is_work_tree {
+        return Err(anyhow!(
+            "repositories[{idx}].spec_storage.path: {} is not a git working tree (git -C ... rev-parse --is-inside-work-tree failed)",
+            path.display(),
+        ));
+    }
+    let openspec_dir = path.join("openspec");
+    if !openspec_dir.is_dir() {
+        return Err(anyhow!(
+            "repositories[{idx}].spec_storage.path: {} is missing the `openspec/` subdirectory",
+            path.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a `spec_storage.path` value against the repo's workspace.
+/// Absolute paths pass through; relative paths join under the repo's
+/// resolved workspace directory.
+pub fn resolve_spec_storage_path(
+    repo: &RepositoryConfig,
+    ss: &SpecStorageConfig,
+) -> PathBuf {
+    let raw = PathBuf::from(&ss.path);
+    if raw.is_absolute() {
+        raw
+    } else {
+        crate::workspace::resolve_path(repo).join(raw)
     }
 }
 
@@ -3010,6 +3148,9 @@ chatops:
             chatops_channel_id: Some("C_REPO_LEVEL".into()),
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
@@ -3022,6 +3163,9 @@ chatops:
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
@@ -4487,6 +4631,9 @@ github: {}
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -5887,5 +6034,198 @@ github:
             "inline github.token must suppress the token_env WARN; got: {:?}",
             report.warnings
         );
+    }
+
+    // ----------------------------------------------------------------
+    // a26 OSS-fork config: spec_storage, upstream, auto_submit_pr
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn auto_submit_pr_defaults_to_true_when_omitted() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.repositories[0].auto_submit_pr);
+        assert!(cfg.repositories[0].spec_storage.is_none());
+        assert!(cfg.repositories[0].upstream.is_none());
+    }
+
+    #[test]
+    fn auto_submit_pr_can_be_false() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    auto_submit_pr: false
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(!cfg.repositories[0].auto_submit_pr);
+    }
+
+    #[test]
+    fn upstream_defaults_remote_and_branch() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    upstream:
+      url: "https://github.com/upstream/repo.git"
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let up = cfg.repositories[0].upstream.as_ref().unwrap();
+        assert_eq!(up.remote, "upstream");
+        assert_eq!(up.branch, "main");
+        assert_eq!(up.url, "https://github.com/upstream/repo.git");
+    }
+
+    #[test]
+    fn upstream_url_must_not_be_empty() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    upstream:
+      url: ""
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("empty upstream.url must fail-fast");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("upstream.url"), "got: {msg}");
+    }
+
+    #[test]
+    fn spec_storage_missing_path_fails_fast() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "/tmp/definitely-not-a-real-spec-storage-dir-12345xyz"
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("missing spec_storage.path must fail-fast");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("spec_storage.path"), "got: {msg}");
+        assert!(msg.contains("does not exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn spec_storage_non_git_dir_fails_fast() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The dir exists but is NOT a git working tree.
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+executor:
+  kind: claude_cli
+github: {{}}
+"#,
+            tmp.path().display(),
+        );
+        let (_dir, path) = write_config(&yaml);
+        let err = Config::load_from(&path)
+            .expect_err("non-git spec_storage.path must fail-fast");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is not a git working tree"), "got: {msg}");
+    }
+
+    #[test]
+    fn spec_storage_git_dir_missing_openspec_subdir_fails_fast() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Initialize a real git working tree but skip the openspec/
+        // subdirectory.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+executor:
+  kind: claude_cli
+github: {{}}
+"#,
+            tmp.path().display(),
+        );
+        let (_dir, path) = write_config(&yaml);
+        let err = Config::load_from(&path)
+            .expect_err("missing openspec/ subdir must fail-fast");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("openspec/"), "got: {msg}");
+    }
+
+    #[test]
+    fn spec_storage_valid_git_dir_with_openspec_passes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("openspec")).unwrap();
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+executor:
+  kind: claude_cli
+github: {{}}
+"#,
+            tmp.path().display(),
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).expect("valid spec_storage must parse");
+        assert!(cfg.repositories[0].spec_storage.is_some());
     }
 }

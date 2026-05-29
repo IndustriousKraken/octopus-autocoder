@@ -252,6 +252,13 @@ fn clear_scout_missing_repo_reply() -> Reply {
     )
 }
 
+fn sync_upstream_missing_repo_reply() -> Reply {
+    Reply::Sync(
+        "✗ sync-upstream: missing repo. Usage: @<bot> sync-upstream <repo-substring>"
+            .to_string(),
+    )
+}
+
 fn spec_it_outside_thread_reply() -> Reply {
     Reply::Sync(
         "✗ spec-it: only valid as a reply in a scout thread. Run @<bot> scout <repo> first."
@@ -423,6 +430,14 @@ pub enum OperatorCommand {
     /// verb that wipes every scout state file under the matched
     /// workspace.
     ClearScout {
+        repo_substring: String,
+    },
+    /// `@<bot> sync-upstream <repo-substring>` (a26) — operator-driven
+    /// rebase of the workspace's base branch onto `upstream/<branch>`.
+    /// Requires the per-repo `upstream` config block; the handler
+    /// posts a thread reply summarizing the rebase result OR naming
+    /// conflicts that need manual resolution.
+    SyncUpstream {
         repo_substring: String,
     },
     Help,
@@ -852,6 +867,22 @@ fn parse_command_outcome_in_thread(
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
             ParseOutcome::Ok(OperatorCommand::ClearScout {
+                repo_substring: rest[0].to_string(),
+            })
+        }
+        "sync-upstream" => {
+            // `@<bot> sync-upstream <repo-substring>` (a26). Mirrors
+            // `clear-scout`'s shape: single positional repo-substring.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(sync_upstream_missing_repo_reply());
+            }
+            if rest.len() != 1 {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::SyncUpstream {
                 repo_substring: rest[0].to_string(),
             })
         }
@@ -1654,6 +1685,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `brownfield <repo> <capability-name> [optional guidance]` — draft a canonical spec for a capability that already exists\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout state file for a repo\n");
+    out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: rebase the workspace's base branch onto upstream (no push)\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -2172,6 +2204,16 @@ impl OperatorCommandDispatcher {
                 )
                 .await,
             ),
+            ParseOutcome::Ok(OperatorCommand::SyncUpstream { repo_substring }) => Some(
+                self.dispatch_sync_upstream(
+                    &repo_substring,
+                    channel_id,
+                    thread_ts,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
                     .await,
@@ -2546,6 +2588,12 @@ impl OperatorCommandDispatcher {
             OperatorCommand::ClearScout { .. } => {
                 "✗ clear-scout: internal routing error (the dispatcher saw \
                  ClearScout in the String-returning dispatch fn). \
+                 Please file a bug."
+                    .to_string()
+            }
+            OperatorCommand::SyncUpstream { .. } => {
+                "✗ sync-upstream: internal routing error (the dispatcher saw \
+                 SyncUpstream in the String-returning dispatch fn). \
                  Please file a bug."
                     .to_string()
             }
@@ -3193,6 +3241,49 @@ impl OperatorCommandDispatcher {
         // count-cleared reply once it has done the work.
         Reply::Sync(format!(
             "✓ Queued clear-scout for {}. The next polling iteration will run it.",
+            repo.url
+        ))
+    }
+
+    /// Handle the `sync-upstream` verb (a26). Resolves the repo, submits
+    /// the `queue_sync_upstream_request` control-socket action so the
+    /// polling-iteration handler picks up the request, AND returns a
+    /// thread-reply ack. The actual rebase result OR conflict notice is
+    /// posted as a follow-up reply by the handler.
+    async fn dispatch_sync_upstream(
+        &self,
+        repo_substring: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+        let payload = serde_json::json!({
+            "action": "queue_sync_upstream_request",
+            "url": repo.url,
+            "channel": channel_id,
+            "thread_ts": thread_ts.unwrap_or(""),
+            "request_id": uuid::Uuid::new_v4().to_string(),
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Reply::Sync(format!("✗ sync-upstream: could not enqueue request: {err}"));
+        }
+        Reply::Sync(format!(
+            "✓ Queued sync-upstream for {}. Reply incoming.",
             repo.url
         ))
     }
@@ -5331,12 +5422,28 @@ mod tests {
             "clear-ignore",
             "wipe-workspace",
             "rebuild-specs",
+            "sync-upstream",
             "help",
         ] {
             assert!(out.contains(verb), "help must list `{verb}`: {out}");
         }
         // Pointer to the README's confirmation-flow section.
         assert!(out.to_lowercase().contains("readme"));
+    }
+
+    #[test]
+    fn parse_sync_upstream_recognizes_verb() {
+        let cmd = parse_command("@bot sync-upstream myrepo", "@bot");
+        assert!(matches!(
+            cmd,
+            Some(OperatorCommand::SyncUpstream { ref repo_substring }) if repo_substring == "myrepo"
+        ));
+    }
+
+    #[test]
+    fn parse_sync_upstream_without_repo_returns_invalid() {
+        let outcome = parse_command_outcome("@bot sync-upstream", "@bot");
+        assert!(matches!(outcome, ParseOutcome::Invalid(_)));
     }
 
     #[test]

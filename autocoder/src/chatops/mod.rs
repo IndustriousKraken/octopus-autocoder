@@ -739,6 +739,9 @@ mod tests {
             chatops_channel_id: Some("C_SECRET_NEVER_VISIBLE".into()),
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 

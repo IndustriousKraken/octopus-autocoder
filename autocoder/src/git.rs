@@ -64,16 +64,168 @@ pub fn fetch(workspace: &Path) -> Result<()> {
 }
 
 /// `git fetch <remote>` — fetch ALL branches from a named remote
-/// (e.g. `fork`). Currently unused in production; retained for
-/// completeness and as a building block for future callers that need
-/// the wholesale-fetch semantic. Prefer `fetch_remote_branch` for the
-/// post-clone fork sync — fetching only the agent branch avoids
-/// shadow-branch DWIM ambiguity on `git checkout <base_branch>`.
-#[allow(dead_code)]
+/// (e.g. `fork`). Used by the a26 OSS-fork workflow's
+/// opportunistic-upstream-fetch step at polling-iteration start AND by
+/// the `sync-upstream` chatops verb's handler. Prefer
+/// `fetch_remote_branch` for the post-clone fork sync — fetching only
+/// the agent branch avoids shadow-branch DWIM ambiguity on
+/// `git checkout <base_branch>`.
 pub fn fetch_remote(workspace: &Path, remote: &str) -> Result<()> {
     run_git(workspace, "fetch <remote>", &["fetch", remote])?;
     Ok(())
 }
+
+/// `git fetch <remote>` with a wall-clock timeout (seconds). On
+/// timeout the spawned child is killed AND the call returns an error
+/// naming the timeout duration. Used by the a26 OSS-fork workflow's
+/// opportunistic upstream fetch (30s) AND the `sync-upstream` handler
+/// (60s) so a hung upstream remote cannot wedge a polling task.
+pub fn fetch_remote_with_timeout(
+    workspace: &Path,
+    remote: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(["fetch", remote])
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning `git fetch {remote}`"))?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut stdout);
+                }
+                if let Some(mut s) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut stderr);
+                }
+                if !status.success() {
+                    let stderr_s = String::from_utf8_lossy(&stderr).trim().to_string();
+                    let stdout_s = String::from_utf8_lossy(&stdout).trim().to_string();
+                    let msg = match (stderr_s.is_empty(), stdout_s.is_empty()) {
+                        (false, true) => stderr_s,
+                        (false, false) => format!("stderr: {stderr_s}; stdout: {stdout_s}"),
+                        (true, false) => stdout_s,
+                        (true, true) => format!("(no output; exit {:?})", status.code()),
+                    };
+                    return Err(anyhow!("git fetch {remote} failed: {msg}"));
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(
+                        "git fetch {remote} timed out after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(anyhow!("waiting on git fetch {remote}: {e}"));
+            }
+        }
+    }
+}
+
+/// `git rebase <upstream-ref>` in `workspace`. Returns `Ok(())` on
+/// success. On non-zero exit (typically a merge conflict) returns
+/// `Err(RebaseError::Conflict { conflicted_files })` after parsing the
+/// rebase status. Used by the a26 `sync-upstream` handler.
+pub fn rebase_onto(workspace: &Path, upstream_ref: &str) -> Result<(), RebaseError> {
+    let output = Command::new("git")
+        .args(["rebase", upstream_ref])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| RebaseError::SpawnFailure(format!("spawning `git rebase`: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Identify conflicted files via `git diff --name-only
+    // --diff-filter=U` while the rebase is paused.
+    let conflicted = conflicted_files(workspace).unwrap_or_default();
+    if !conflicted.is_empty() {
+        return Err(RebaseError::Conflict {
+            conflicted_files: conflicted,
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(RebaseError::Other(format!(
+        "git rebase {upstream_ref} failed: {}",
+        if stderr.is_empty() {
+            format!("(no stderr; exit {:?})", output.status.code())
+        } else {
+            stderr
+        }
+    )))
+}
+
+/// `git rebase --abort` to roll back a paused rebase. Used by the
+/// `sync-upstream` handler's conflict-path so the workspace is
+/// restored to its pre-rebase HEAD before posting the conflict reply.
+pub fn rebase_abort(workspace: &Path) -> Result<()> {
+    run_git(workspace, "rebase --abort", &["rebase", "--abort"])?;
+    Ok(())
+}
+
+/// Return the list of files currently in conflict (paused-rebase
+/// state). Empty list = no conflicts (or `git diff` failed; the
+/// caller treats both cases as "no specific files to surface").
+fn conflicted_files(workspace: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(workspace)
+        .output()
+        .context("spawning `git diff --name-only --diff-filter=U`")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Structured rebase-failure shape — returned by [`rebase_onto`].
+#[derive(Debug, Clone)]
+pub enum RebaseError {
+    /// Rebase hit a merge conflict and is paused. `conflicted_files`
+    /// names every path with unresolved markers (relative to
+    /// workspace).
+    Conflict { conflicted_files: Vec<String> },
+    /// Could not spawn `git rebase` at all.
+    SpawnFailure(String),
+    /// Rebase failed for some non-conflict reason (bad ref,
+    /// transport, etc.).
+    Other(String),
+}
+
+impl std::fmt::Display for RebaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { conflicted_files } => {
+                write!(f, "rebase conflict on {}", conflicted_files.join(", "))
+            }
+            Self::SpawnFailure(s) => write!(f, "{s}"),
+            Self::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::error::Error for RebaseError {}
 
 /// `git fetch <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>`
 /// — fetch ONLY the named branch from the remote, populating the

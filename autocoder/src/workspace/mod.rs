@@ -1,6 +1,11 @@
 //! Per-repository workspace management: deterministic path derivation,
 //! idempotent clone-or-fetch, and startup-time collision detection.
 
+pub mod spec_root;
+
+#[allow(unused_imports)]
+pub use spec_root::SpecRoot;
+
 use crate::config::GithubConfig;
 use crate::github::{self, DeleteOutcome};
 use crate::github_credentials::resolve_token;
@@ -491,6 +496,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -504,6 +512,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -1207,6 +1218,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
