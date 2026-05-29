@@ -1106,7 +1106,7 @@ fn build_review_context(
         }
     }
 
-    let archive_root = workspace.join("openspec/changes/archive");
+    let archive_root = crate::workspace::spec_root::archive_dir(repo, workspace);
     let mut archived_changes = Vec::with_capacity(processed.len());
     for name in processed {
         let dir = match locate_archive_dir(&archive_root, name)? {
@@ -1159,7 +1159,7 @@ fn build_per_change_contexts(
     // First pass: gather briefs for all changes. The cross-change
     // preamble for change `i` needs the OTHER changes' briefs in full,
     // so we collect them all first.
-    let archive_root = workspace.join("openspec/changes/archive");
+    let archive_root = crate::workspace::spec_root::archive_dir(repo, workspace);
     let mut briefs: Vec<crate::code_reviewer::ChangeBrief> =
         Vec::with_capacity(processed.len());
     for name in processed {
@@ -1390,7 +1390,14 @@ pub async fn run_pass_through_commits(
     if did_refork {
         maybe_post_refork_notification(repo, chatops_ctx).await;
     }
-    let _cleared = queue::clear_stale_locks(workspace)?;
+    // a26: every openspec/changes/<change>/ filesystem access in this
+    // function (and the helpers it calls) routes through `spec_workspace`
+    // so an external `spec_storage.path` is honored. Default resolves to
+    // `workspace` (existing behavior preserved).
+    let spec_workspace_buf =
+        crate::workspace::spec_root::spec_git_workspace(repo, workspace);
+    let spec_workspace: &Path = &spec_workspace_buf;
+    let _cleared = queue::clear_stale_locks(spec_workspace)?;
 
     let dirty = git::status_porcelain(workspace)?;
     // Post-`a16`, alert-state lives in `<state_dir>/alert-state/...`,
@@ -1497,8 +1504,8 @@ pub async fn run_pass_through_commits(
     // — any error logs WARN and the store is omitted from the registry.
     crate::rag::workspace_init_hook(workspace, repo).await;
 
-    let pending_at_start = queue::list_pending(workspace)?;
-    let waiting_at_start = queue::list_waiting(workspace)?;
+    let pending_at_start = queue::list_pending(spec_workspace)?;
+    let waiting_at_start = queue::list_waiting(spec_workspace)?;
     tracing::info!(
         url = %repo.url,
         pending = pending_at_start.len(),
@@ -1512,7 +1519,7 @@ pub async fn run_pass_through_commits(
     // `AlertCategory::ArchiveCollision` is posted per excluded change) so
     // the executor is never invoked on a change that cannot land.
     let pending_filtered =
-        apply_archive_collision_preflight(workspace, repo, chatops_ctx, pending_at_start).await;
+        apply_archive_collision_preflight(spec_workspace, repo, chatops_ctx, pending_at_start).await;
 
     // Process waiting (escalated) changes BEFORE pending. Each resumes if
     // a human reply has arrived. Any change that comes back as Completed
@@ -1538,7 +1545,7 @@ pub async fn run_pass_through_commits(
     // still run after this gate — they are independent of queue state
     // and the operator-visible block is on the queue walk, not on
     // periodic maintenance.
-    let still_waiting = queue::list_waiting(workspace)?;
+    let still_waiting = queue::list_waiting(spec_workspace)?;
     if !still_waiting.is_empty() {
         tracing::info!(
             url = repo.url.as_str(),
@@ -1572,11 +1579,10 @@ pub async fn run_pass_through_commits(
     // companion `.ignore-for-queue.json`, halt the pending walk. The
     // operator opts a specific change out of blocking by stamping
     // `.ignore-for-queue.json` alongside the underlying marker.
-    let blocking_markers = queue::find_queue_blocking_markers(workspace)?;
+    let blocking_markers = queue::find_queue_blocking_markers(spec_workspace)?;
     if !blocking_markers.is_empty() {
         for bm in &blocking_markers {
-            let marker_path = workspace
-                .join("openspec/changes")
+            let marker_path = crate::workspace::spec_root::changes_dir(repo, workspace)
                 .join(&bm.change)
                 .join(&bm.marker);
             tracing::info!(
@@ -1663,7 +1669,7 @@ pub async fn run_pass_through_commits(
     )
     .await;
 
-    let waiting_after = queue::list_waiting(workspace)?.len();
+    let waiting_after = queue::list_waiting(spec_workspace)?.len();
     tracing::info!(
         url = %repo.url,
         committed = processed.len(),
@@ -1726,13 +1732,17 @@ async fn process_waiting_changes(
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
-    let waiting = queue::list_waiting(workspace)?;
+    let spec_workspace_buf =
+        crate::workspace::spec_root::spec_git_workspace(repo, workspace);
+    let spec_workspace: &Path = &spec_workspace_buf;
+    let waiting = queue::list_waiting(spec_workspace)?;
     // Pre-flight archive-collision filter: a change with a dated archive
     // entry already on disk would fail at resume-archive time. Exclude
     // it, alert once (subject to 24h throttle), and proceed with the
     // rest. Same helper as the pending-side filter so behavior is
     // identical at both call sites.
-    let waiting = apply_archive_collision_preflight(workspace, repo, chatops_ctx, waiting).await;
+    let waiting =
+        apply_archive_collision_preflight(spec_workspace, repo, chatops_ctx, waiting).await;
     let mut resumed_archived: Vec<String> = Vec::new();
 
     for change in waiting {
@@ -1840,10 +1850,13 @@ async fn process_one_waiting(
                     ),
                 )
             } else {
-                let subject = build_commit_subject(workspace, change)?;
+                let subject = build_commit_subject(repo, workspace, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
-                queue::archive(workspace, change)?;
+                queue::archive(
+                    &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+                    change,
+                )?;
                 (ResumeDisposition::Archived, None)
             }
         }
@@ -1884,7 +1897,11 @@ async fn process_one_waiting(
                 unarchivable_deltas: Vec::new(),
                 revision_suggestion: revision_suggestion.clone(),
             };
-            if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+            if let Err(e) = spec_revision::write_marker(
+                &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+                change,
+                &detail,
+            ) {
                 tracing::warn!(
                     url = %repo.url,
                     change = %change,
@@ -2228,7 +2245,9 @@ async fn process_one_pending_change(
         }
     }
 
-    queue::lock(workspace, change)
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(repo, workspace);
+    queue::lock(&spec_workspace, change)
         .with_context(|| format!("locking change `{change}`"))?;
 
     // Record which change this iteration is working on so the chatops
@@ -2253,7 +2272,7 @@ async fn process_one_pending_change(
     let result = handle_outcome(workspace, repo, chatops_ctx, change, outcome).await;
     // Always unlock, even after a Completed → archive (archive moved the
     // dir, so the lock is gone, but `queue::unlock` is idempotent).
-    let _ = queue::unlock(workspace, change);
+    let _ = queue::unlock(&spec_workspace, change);
     result
 }
 
@@ -2289,7 +2308,11 @@ async fn handle_archivability_preflight(
         unarchivable_deltas: violations.clone(),
         revision_suggestion: suggestion.clone(),
     };
-    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+    if let Err(e) = spec_revision::write_marker(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+        change,
+        &detail,
+    ) {
         tracing::warn!(
             url = %repo.url,
             change = %change,
@@ -2372,7 +2395,11 @@ async fn handle_contradiction_preflight(
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
     };
-    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+    if let Err(e) = spec_revision::write_marker(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+        change,
+        &detail,
+    ) {
         tracing::warn!(
             url = %repo.url,
             change = %change,
@@ -2445,8 +2472,7 @@ async fn maybe_post_contradiction_findings_alert(
     if !should_alert {
         return;
     }
-    let marker_path = workspace
-        .join("openspec/changes")
+    let marker_path = crate::workspace::spec_root::changes_dir(repo, &workspace)
         .join(change)
         .join(".needs-spec-revision.json");
     let mut findings_block = String::new();
@@ -2524,8 +2550,7 @@ async fn maybe_post_unarchivable_deltas_alert(
     if !should_alert {
         return;
     }
-    let marker_path = workspace
-        .join("openspec/changes")
+    let marker_path = crate::workspace::spec_root::changes_dir(repo, &workspace)
         .join(change)
         .join(".needs-spec-revision.json");
     let mut violations_block = String::new();
@@ -2692,8 +2717,7 @@ async fn handle_failure_counter(
         );
         // Continue to alert — the operator should still know.
     }
-    let marker_path = workspace
-        .join("openspec/changes")
+    let marker_path = crate::workspace::spec_root::changes_dir(repo, workspace)
         .join(change)
         .join(".perma-stuck.json");
     tracing::error!(
@@ -2737,8 +2761,7 @@ async fn post_perma_stuck_alert(
         return;
     }
     let excerpt = truncate_reason(reason);
-    let marker_path = workspace
-        .join("openspec/changes")
+    let marker_path = crate::workspace::spec_root::changes_dir(repo, &workspace)
         .join(change)
         .join(".perma-stuck.json");
     // Tied to the Claude CLI executor's log convention; refactor to an
@@ -2806,8 +2829,7 @@ async fn maybe_post_spec_revision_alert(
     if !should_alert {
         return;
     }
-    let marker_path = workspace
-        .join("openspec/changes")
+    let marker_path = crate::workspace::spec_root::changes_dir(repo, &workspace)
         .join(change)
         .join(".needs-spec-revision.json");
     let log_path = crate::executor::claude_cli::run_log_path(&workspace, change);
@@ -2991,8 +3013,7 @@ async fn maybe_post_start_of_work(
     if !ctx.start_work_enabled {
         return;
     }
-    let proposal_path = workspace
-        .join("openspec/changes")
+    let proposal_path = crate::workspace::spec_root::changes_dir(repo, workspace)
         .join(change)
         .join("proposal.md");
     let summary = match std::fs::read_to_string(&proposal_path) {
@@ -3488,6 +3509,11 @@ async fn handle_outcome(
     change: &str,
     outcome: Result<ExecutorOutcome>,
 ) -> Result<QueueStep> {
+    // a26: every queue operation here (unlock, archive) routes via the
+    // resolver so spec_storage is honored.
+    let spec_workspace_buf =
+        crate::workspace::spec_root::spec_git_workspace(repo, workspace);
+    let spec_workspace: &Path = &spec_workspace_buf;
     match outcome {
         Err(e) => {
             // Executor task error (e.g. spawn failure). This is closer to
@@ -3515,7 +3541,7 @@ async fn handle_outcome(
             // (a) Unlock the change so it's not left in an in-progress
             // state. Mirrors how every other Failed-equivalent outcome
             // hands the change back to operator-managed territory.
-            queue::unlock(workspace, change)?;
+            queue::unlock(spec_workspace, change)?;
             // (b) Write the marker. A failure here is logged but does NOT
             // propagate: the alert still goes out, and the next iteration
             // would simply re-trigger the outcome (the agent's pre-flight
@@ -3525,7 +3551,11 @@ async fn handle_outcome(
                 unarchivable_deltas: Vec::new(),
                 revision_suggestion: revision_suggestion.clone(),
             };
-            if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+            if let Err(e) = spec_revision::write_marker(
+                &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+                change,
+                &detail,
+            ) {
                 tracing::warn!(
                     url = %repo.url,
                     change = %change,
@@ -3555,7 +3585,7 @@ async fn handle_outcome(
             Some(ctx) => {
                 // Unlock BEFORE posting so the change is in a clean
                 // "waiting" state (no .in-progress) as the spec mandates.
-                queue::unlock(workspace, change)?;
+                queue::unlock(spec_workspace, change)?;
                 escalate_to_chatops(workspace, repo, ctx, change, &question, resume_handle.0)
                     .await?;
                 Ok(QueueStep::Escalated)
@@ -3570,7 +3600,7 @@ async fn handle_outcome(
             // tree: the lock file is untracked and would otherwise show up
             // in `git status --porcelain`, contaminating the dirty check
             // and getting swept into the commit by `git add -A`.
-            queue::unlock(workspace, change)?;
+            queue::unlock(spec_workspace, change)?;
             let dirty = git::status_porcelain(workspace)?;
             if dirty.is_empty() {
                 // Self-heal probe: if every task is `[x]` AND
@@ -3579,8 +3609,11 @@ async fn handle_outcome(
                 // only thing missing is the archive move. Run the archive
                 // ourselves rather than burn another iteration on a no-op
                 // Completed.
-                let tasks_complete = tasks_md_all_complete(workspace, change).unwrap_or(false);
-                if tasks_complete && openspec_validate_strict_passes(workspace, change) {
+                let tasks_complete =
+                    tasks_md_all_complete(spec_workspace, change).unwrap_or(false);
+                if tasks_complete
+                    && openspec_validate_strict_passes(spec_workspace, change)
+                {
                     tracing::info!(
                         url = %repo.url,
                         change = %change,
@@ -3588,7 +3621,7 @@ async fn handle_outcome(
                     );
                     let subject =
                         format!("archive: {change}: implementation already in base");
-                    if let Err(e) = queue::archive(workspace, change) {
+                    if let Err(e) = queue::archive(spec_workspace, change) {
                         tracing::error!(
                             url = %repo.url,
                             change = %change,
@@ -3643,13 +3676,13 @@ async fn handle_outcome(
                 // Build the commit subject BEFORE the archive rename: it
                 // reads `openspec/changes/<change>/proposal.md`, which the
                 // archive step moves to `openspec/changes/archive/...`.
-                let subject = build_commit_subject(workspace, change)?;
+                let subject = build_commit_subject(repo, workspace, change)?;
                 // Archive BEFORE the commit so the single commit captures
                 // both the executor's implementation diff AND the archive
                 // rename. After this sequence the working tree is clean,
                 // even for the trailing change of a pass — no dangling
                 // rename for the next iteration's dirty-check to trip on.
-                queue::archive(workspace, change)?;
+                queue::archive(spec_workspace, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
             }
@@ -3743,9 +3776,16 @@ fn has_executor_changes(status: &str, change: &str) -> bool {
 
 /// Build a commit subject from the change name and the first non-empty line of
 /// the `## Why` section of `proposal.md`. Truncated to 72 characters total.
-fn build_commit_subject(workspace: &Path, change: &str) -> Result<String> {
-    let proposal = workspace
-        .join("openspec/changes")
+///
+/// a26: takes `&RepositoryConfig` so it can route the proposal.md read
+/// through the spec_root resolver. Default behaviour (no spec_storage
+/// configured) reads `<workspace>/openspec/changes/<change>/proposal.md`.
+fn build_commit_subject(
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    change: &str,
+) -> Result<String> {
+    let proposal = crate::workspace::spec_root::changes_dir(repo, workspace)
         .join(change)
         .join("proposal.md");
     let raw = std::fs::read_to_string(&proposal)
@@ -3796,7 +3836,11 @@ async fn open_pull_request(
     // the credential authorizing that call must have access to upstream.
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
     let title = build_pr_title(changes);
-    let body = build_pr_body(workspace, changes, includes_self_heal);
+    let body = build_pr_body(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+        changes,
+        includes_self_heal,
+    );
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -4553,7 +4597,9 @@ pub async fn process_audit_triages(
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
     crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
         .with_context(|| "audit-triage: workspace ensure_initialized".to_string())?;
-    let _ = crate::queue::clear_stale_locks(workspace);
+    let _ = crate::queue::clear_stale_locks(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+    );
     let _ = git::reset_hard_head(workspace);
     let _ = git::clean_force(workspace);
     git::fetch(workspace)
@@ -5138,7 +5184,9 @@ pub async fn process_proposal_requests(
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
     crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
         .with_context(|| "chat-triage: workspace ensure_initialized".to_string())?;
-    let _ = crate::queue::clear_stale_locks(workspace);
+    let _ = crate::queue::clear_stale_locks(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+    );
     let _ = git::reset_hard_head(workspace);
     let _ = git::clean_force(workspace);
     git::fetch(workspace).with_context(|| "chat-triage: git fetch".to_string())?;
@@ -5950,7 +5998,8 @@ mod tests {
         std::fs::create_dir_all(proposal.parent().unwrap()).unwrap();
         let long = "A".repeat(200);
         std::fs::write(&proposal, format!("## Why\n{long}\n")).unwrap();
-        let subject = build_commit_subject(ws, change).unwrap();
+        let subject =
+            build_commit_subject(&test_repo_with_auto_submit(true), ws, change).unwrap();
         assert_eq!(subject.chars().count(), 72);
         assert!(subject.starts_with("make-the-thing-better: "));
     }
@@ -5962,7 +6011,8 @@ mod tests {
         let proposal = ws.join("openspec/changes/c/proposal.md");
         std::fs::create_dir_all(proposal.parent().unwrap()).unwrap();
         std::fs::write(&proposal, "## What Changes\n- thing\n").unwrap();
-        let subject = build_commit_subject(ws, "c").unwrap();
+        let subject =
+            build_commit_subject(&test_repo_with_auto_submit(true), ws, "c").unwrap();
         assert_eq!(subject, "c: c");
     }
 

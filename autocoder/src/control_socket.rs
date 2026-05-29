@@ -721,14 +721,17 @@ async fn build_repo_status(
     // `has_ignore_for_queue` flag (a18) so the formatter can annotate
     // the line when the operator has stamped `.ignore-for-queue.json`
     // alongside the blocking marker.
-    let (perma_changes, revision_changes) = queue::list_marker_excluded(workspace_path)?;
+    // a26: marker enumeration AND lookups route via the spec_root resolver
+    // so spec_storage is honored.
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(repo, workspace_path);
+    let changes_root = crate::workspace::spec_root::changes_dir(repo, workspace_path);
+    let (perma_changes, revision_changes) = queue::list_marker_excluded(&spec_workspace)?;
     for change in perma_changes {
-        let marker_path = workspace_path
-            .join("openspec/changes")
-            .join(&change)
-            .join(".perma-stuck.json");
+        let marker_path = changes_root.join(&change).join(".perma-stuck.json");
         let (marked_at, detail) = read_perma_marker(&marker_path);
-        let has_ignore_for_queue = queue::is_ignore_for_queue_marked(workspace_path, &change);
+        let has_ignore_for_queue =
+            queue::is_ignore_for_queue_marked(&spec_workspace, &change);
         resp.perma_stuck_changes.push(MarkerEntry {
             change,
             marked_at,
@@ -737,12 +740,10 @@ async fn build_repo_status(
         });
     }
     for change in revision_changes {
-        let marker_path = workspace_path
-            .join("openspec/changes")
-            .join(&change)
-            .join(".needs-spec-revision.json");
+        let marker_path = changes_root.join(&change).join(".needs-spec-revision.json");
         let marked_at = read_revision_marker(&marker_path);
-        let has_ignore_for_queue = queue::is_ignore_for_queue_marked(workspace_path, &change);
+        let has_ignore_for_queue =
+            queue::is_ignore_for_queue_marked(&spec_workspace, &change);
         resp.revision_marked_changes.push(MarkerEntry {
             change,
             marked_at,
@@ -777,8 +778,8 @@ async fn build_repo_status(
     }
 
     // Queue snapshot.
-    resp.pending_changes = queue::list_pending(workspace_path).unwrap_or_default();
-    resp.waiting_changes = queue::list_waiting(workspace_path).unwrap_or_default();
+    resp.pending_changes = queue::list_pending(&spec_workspace).unwrap_or_default();
+    resp.waiting_changes = queue::list_waiting(&spec_workspace).unwrap_or_default();
 
     // Best-effort last-iteration: failure-state's most recent entry
     // gives us a timestamp for "something happened recently"; without a
@@ -900,14 +901,18 @@ fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
-    if let Err(e) = queue::remove_perma_stuck_marker(&workspace_path, &change) {
+    // a26: marker file lives under the spec_root tree (code workspace by
+    // default; external spec_storage path when configured).
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(&repo, &workspace_path);
+    if let Err(e) = queue::remove_perma_stuck_marker(&spec_workspace, &change) {
         return json!({"ok": false, "error": format!("{e:#}")});
     }
     // Per a18: removing `.perma-stuck.json` also removes any companion
     // `.ignore-for-queue.json` (full resolution — the operator is going
     // to retry the change, so the downgrade marker becomes vestigial).
     let removed_ignore =
-        match queue::remove_ignore_for_queue_marker_idempotent(&workspace_path, &change) {
+        match queue::remove_ignore_for_queue_marker_idempotent(&spec_workspace, &change) {
             Ok(removed) => removed,
             Err(e) => {
                 return json!({
@@ -938,7 +943,9 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
-    match queue::remove_revision_marker(&workspace_path, &change) {
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(&repo, &workspace_path);
+    match queue::remove_revision_marker(&spec_workspace, &change) {
         Ok(()) => json!({"ok": true, "change": change, "url": url}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
     }
@@ -969,11 +976,18 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
+    // a26: marker files AND the git tree that holds them route via the
+    // spec_root resolver. When spec_storage is configured the commit +
+    // push target the external spec-storage repo's `origin` (fork-PR
+    // mode is a code-workspace concept).
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(&repo, &workspace_path);
+    let spec_is_external = spec_workspace != workspace_path;
 
     // Refuse if the change has no underlying blocking marker — stamping
     // ignore on a change with no problem is a confusing no-op.
-    let has_perma_stuck = queue::is_perma_stuck(&workspace_path, &change);
-    let has_needs_revision = queue::is_needs_spec_revision_marked(&workspace_path, &change);
+    let has_perma_stuck = queue::is_perma_stuck(&spec_workspace, &change);
+    let has_needs_revision = queue::is_needs_spec_revision_marked(&spec_workspace, &change);
     if !has_perma_stuck && !has_needs_revision {
         return json!({
             "ok": false,
@@ -984,7 +998,7 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
     // Refuse if the marker is already present so the operator gets a
     // clear "no change" signal rather than a stealth no-op commit.
-    if crate::ignore_for_queue::marker_exists(&workspace_path, &change) {
+    if crate::ignore_for_queue::marker_exists(&spec_workspace, &change) {
         return json!({
             "ok": false,
             "error": format!(
@@ -994,7 +1008,7 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
 
     // Write the marker file.
-    if let Err(e) = crate::ignore_for_queue::write_marker(&workspace_path, &change, &marked_by) {
+    if let Err(e) = crate::ignore_for_queue::write_marker(&spec_workspace, &change, &marked_by) {
         return json!({"ok": false, "error": format!("writing marker: {e:#}")});
     }
 
@@ -1003,25 +1017,29 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     // disk so the next iteration's queue gate honors the operator's
     // intent even if the push didn't land.
     let github_cfg = state.github.load_full();
-    let push_remote = if github_cfg.fork_owner.is_some() {
+    // fork-PR rerouting is a code-workspace concept; spec_storage pushes
+    // to its own `origin` regardless.
+    let push_remote = if !spec_is_external && github_cfg.fork_owner.is_some() {
         "fork"
     } else {
         "origin"
     };
     let subject = format!("chore: ignore-for-queue on {change} (operator {marked_by})");
-    if let Err(e) = git::add_all(&workspace_path) {
+    if let Err(e) = git::add_all(&spec_workspace) {
         return json!({
             "ok": false,
             "error": format!("git add failed after writing marker: {e:#}"),
         });
     }
-    if let Err(e) = git::commit(&workspace_path, &subject) {
+    if let Err(e) = git::commit(&spec_workspace, &subject) {
         return json!({
             "ok": false,
             "error": format!("git commit failed after writing marker: {e:#}"),
         });
     }
-    if let Err(e) = git::push_force_with_lease(&workspace_path, &repo.agent_branch, push_remote) {
+    if let Err(e) =
+        git::push_force_with_lease(&spec_workspace, &repo.agent_branch, push_remote)
+    {
         return json!({
             "ok": false,
             "error": format!("git push failed after commit: {e:#}"),
@@ -1048,42 +1066,49 @@ fn handle_clear_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value 
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
+    // a26: marker file AND the git tree that holds it route via the
+    // spec_root resolver.
+    let spec_workspace =
+        crate::workspace::spec_root::spec_git_workspace(&repo, &workspace_path);
+    let spec_is_external = spec_workspace != workspace_path;
 
     // Remove the marker — propagate the absent-marker error.
-    if let Err(e) = queue::remove_ignore_for_queue_marker(&workspace_path, &change) {
+    if let Err(e) = queue::remove_ignore_for_queue_marker(&spec_workspace, &change) {
         return json!({"ok": false, "error": format!("{e:#}")});
     }
 
     // Surface which underlying marker the queue resumes blocking on, so
     // the chatops reply can name it.
-    let underlying_marker = if queue::is_perma_stuck(&workspace_path, &change) {
+    let underlying_marker = if queue::is_perma_stuck(&spec_workspace, &change) {
         ".perma-stuck.json".to_string()
-    } else if queue::is_needs_spec_revision_marked(&workspace_path, &change) {
+    } else if queue::is_needs_spec_revision_marked(&spec_workspace, &change) {
         ".needs-spec-revision.json".to_string()
     } else {
         "the underlying marker".to_string()
     };
 
     let github_cfg = state.github.load_full();
-    let push_remote = if github_cfg.fork_owner.is_some() {
+    let push_remote = if !spec_is_external && github_cfg.fork_owner.is_some() {
         "fork"
     } else {
         "origin"
     };
     let subject = format!("chore: clear ignore-for-queue on {change}");
-    if let Err(e) = git::add_all(&workspace_path) {
+    if let Err(e) = git::add_all(&spec_workspace) {
         return json!({
             "ok": false,
             "error": format!("git add failed after removing marker: {e:#}"),
         });
     }
-    if let Err(e) = git::commit(&workspace_path, &subject) {
+    if let Err(e) = git::commit(&spec_workspace, &subject) {
         return json!({
             "ok": false,
             "error": format!("git commit failed after removing marker: {e:#}"),
         });
     }
-    if let Err(e) = git::push_force_with_lease(&workspace_path, &repo.agent_branch, push_remote) {
+    if let Err(e) =
+        git::push_force_with_lease(&spec_workspace, &repo.agent_branch, push_remote)
+    {
         return json!({
             "ok": false,
             "error": format!("git push failed after commit: {e:#}"),

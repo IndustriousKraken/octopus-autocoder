@@ -53,7 +53,11 @@ pub async fn process_pending_brownfield(
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
     crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
         .with_context(|| "brownfield: workspace ensure_initialized".to_string())?;
-    let _ = crate::queue::clear_stale_locks(workspace);
+    // a26: clear stale locks against the spec_root tree (code workspace
+    // by default; external spec_storage tree when configured).
+    let _ = crate::queue::clear_stale_locks(&spec_root_helpers::spec_git_workspace(
+        repo, workspace,
+    ));
     let _ = git::reset_hard_head(workspace);
     let _ = git::clean_force(workspace);
     git::fetch(workspace).with_context(|| "brownfield: git fetch".to_string())?;

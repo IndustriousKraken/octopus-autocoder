@@ -75,10 +75,13 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
         }
     }
 
+    // a26: unarchive operates on the spec_root tree so an external
+    // spec_storage path is honored. Default resolves to workspace_path.
+    let spec_workspace = crate::workspace::spec_root::spec_git_workspace(repo, &workspace_path);
     let mut successes: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
     for change in &args.changes {
-        match queue::unarchive(&workspace_path, change) {
+        match queue::unarchive(&spec_workspace, change) {
             Ok(()) => {
                 tracing::info!("unarchived change `{change}`");
                 successes.push(change.clone());

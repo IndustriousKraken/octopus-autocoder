@@ -122,7 +122,10 @@ pub async fn process_changelog_requests(
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
     crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
         .with_context(|| "changelog-stylist: workspace ensure_initialized".to_string())?;
-    let _ = crate::queue::clear_stale_locks(workspace);
+    // a26: clear stale locks against the spec_root tree.
+    let _ = crate::queue::clear_stale_locks(
+        &crate::workspace::spec_root::spec_git_workspace(repo, workspace),
+    );
     let _ = git::reset_hard_head(workspace);
     let _ = git::clean_force(workspace);
     git::fetch(workspace).with_context(|| "changelog-stylist: git fetch".to_string())?;
