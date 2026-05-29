@@ -491,6 +491,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -504,6 +507,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -1207,6 +1213,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 

@@ -36,6 +36,7 @@ mod rag;
 mod recovery_classification;
 mod revisions;
 mod spec_revision;
+mod spec_root;
 mod state;
 #[cfg(test)]
 mod testing;

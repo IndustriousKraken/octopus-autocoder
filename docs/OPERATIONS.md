@@ -872,3 +872,169 @@ embed + cosine sim across O(1000) chunks).
   will return empty Vec` — WARN at init.
 - `canonical RAG post-archive re-embed failed: <error>; prior embeds
   retained` — WARN at archive.
+
+## OSS contribution workflow
+
+Autocoder's default deployment model assumes the operator owns every
+repository it works on: specs live alongside the code, PR creation is
+automatic, and the workspace's only remote is the operator's own host.
+For OSS-contribution workflows — where the operator wants autocoder to
+help land small, targeted PRs against upstream projects they do NOT
+own — three per-repo config knobs (a26) combine into a coherent
+fork-friendly workflow.
+
+This section describes the recommended setup as a discrete operator
+workflow. The knobs are independently useful, but for the canonical
+OSS-fork case you'll likely want all three.
+
+### Step-by-step setup
+
+1. **Fork the upstream project on GitHub.** Use your personal account
+   (or any account you control); autocoder will iterate directly on
+   this fork.
+
+2. **Clone the fork as the autocoder workspace.** Either point your
+   per-repo `url` at the fork (and let autocoder clone), or pre-clone
+   the fork to your workspace directory.
+
+3. **Configure the `upstream` block** pointing at the upstream repo
+   (the one you do NOT own):
+
+   ```yaml
+   repositories:
+     - url: "git@github.com:my-handle/upstream-project-fork.git"
+       base_branch: main
+       agent_branch: agent-q
+       poll_interval_sec: 1800
+       upstream:
+         remote: upstream      # default
+         branch: main          # default
+         url: "https://github.com/upstream-org/upstream-project.git"
+   ```
+
+   Autocoder will ensure the workspace has an `upstream` remote
+   pointing at this URL AND will `git fetch upstream` opportunistically
+   at the start of every polling iteration. The fetch is best-effort:
+   failures log a WARN but do not block the iteration. This block
+   enables — but does NOT trigger — automatic upstream syncing.
+   Operator-initiated sync runs via `@<bot> sync-upstream <repo>`
+   (see `docs/CHATOPS.md`).
+
+4. **Set `auto_submit_pr: false`** so autocoder pushes the agent
+   branch but does NOT auto-open a PR to upstream:
+
+   ```yaml
+   repositories:
+     - url: "git@github.com:my-handle/upstream-project-fork.git"
+       # ...
+       auto_submit_pr: false
+   ```
+
+   At end-of-iteration, the chatops notification posts the branch URL
+   AND a `gh pr create` command suggestion so you can review the work
+   locally before submitting the upstream PR yourself. Auto-submitting
+   bad PRs to upstream projects damages your reputation with
+   maintainers in a way internal PR mistakes do not — this knob
+   prevents that failure mode.
+
+5. **Configure `spec_storage.path`** pointing at a sibling specs repo
+   you own:
+
+   ```yaml
+   repositories:
+     - url: "git@github.com:my-handle/upstream-project-fork.git"
+       # ...
+       spec_storage:
+         path: "../my-specs"   # workspace-relative; absolute also OK
+   ```
+
+   Canonical specs cannot live inside the upstream repo — that would
+   force unrelated `openspec/` directories into every PR. Setting
+   `spec_storage.path` redirects spec reads AND writes to an external
+   git working tree. The path SHALL be a directory that is a git
+   working tree (verified at config-load via `git -C <path> rev-parse
+   --is-inside-work-tree`) AND contain an `openspec/` subdirectory.
+
+6. **(Optional) Tighter implementer-prompt override.** OSS upstream
+   maintainers value minimal-diff PRs that follow the project's
+   existing conventions over sweeping refactors. Override
+   `executor.implementer.prompt_path` with a tighter prompt:
+
+   ```yaml
+   executor:
+     implementer:
+       prompt_path: "./prompts/oss-implementer.md"
+   ```
+
+   Sample snippet operators can adapt (save as
+   `./prompts/oss-implementer.md`):
+
+   ```
+   You are implementing a change in an upstream open-source project
+   that the operator does NOT own.
+
+   Hard constraints:
+   - Minimal diff: change only what the task requires.
+   - Follow the project's existing conventions (naming, formatting,
+     test placement, file structure).
+   - No large refactors. No drive-by cleanups.
+   - No new abstractions unless the task explicitly demands one.
+   - If you find existing tech debt adjacent to your change, leave
+     it alone unless touching it is strictly necessary.
+
+   Before writing code, scan three similar features in the existing
+   codebase and match their idiomatic patterns. The reviewer (an
+   upstream maintainer with no autocoder context) will reject PRs
+   that don't blend in.
+   ```
+
+   Adapt the constraints to the specific upstream project's culture
+   (some projects welcome refactors; some are strict no-mixing).
+
+### The typical operator loop
+
+Once configured, your daily loop is:
+
+1. `@<bot> scout <fork>` — survey the upstream codebase and get a
+   triage list of opportunities.
+2. `@<bot> spec-it <N>` — pick an item from the scout list; autocoder
+   drafts a spec into your `spec_storage` repo AND a fork PR opens
+   against the fork's `agent_branch`.
+3. Review the fork PR — both the spec change (in the
+   `spec_storage` repo) AND the code change (in the fork repo).
+4. Merge the fork PR — agent branch lands on the fork's base branch.
+5. `gh pr create --base main --head <branch>` — manually submit the
+   upstream PR after a final polish (rewrite the PR description for
+   the upstream audience, squash trivial commits, etc.).
+6. (Periodically) `@<bot> sync-upstream <fork>` — pull upstream's
+   newer commits into your fork's base branch so future agent runs
+   start from current upstream.
+
+### Why three independent knobs instead of one mode
+
+Each knob is useful in isolation:
+
+- **`spec_storage`** is useful even on own-projects when the operator
+  wants spec history in a separate tree (auditability, multi-project
+  spec sharing).
+- **`upstream`** is useful even with `auto_submit_pr: true` for any
+  fork-based deployment that wants opportunistic upstream visibility.
+- **`auto_submit_pr: false`** is useful even on own-projects for
+  sensitive repos where every PR should pass an operator eyes-on
+  gate.
+
+Treating them as separate knobs gives you flexibility; combining all
+three gives you the canonical OSS-fork workflow.
+
+### Caveats
+
+- `auto_submit_pr` applies UNIFORMLY to both code-workspace AND
+  `spec_storage` PRs (when set). If you want different behavior for
+  the two repos, split the workspace into separate per-repo
+  configurations.
+- `sync-upstream` NEVER pushes the rebased base branch. After a
+  successful rebase, you decide when to `git push --force-with-lease
+  origin <base>` to update the fork's base branch. This is intentional:
+  autocoder should not silently overwrite the fork's published history.
+- The opportunistic `git fetch upstream` is best-effort. If you need a
+  guaranteed-current view, run `@<bot> sync-upstream <repo>` directly.

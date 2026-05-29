@@ -812,6 +812,12 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             >,
         > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let pending_spec_it_requests_for_task = pending_spec_it_requests.clone();
+        let pending_sync_upstream_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::SyncUpstreamRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_sync_upstream_requests_for_task = pending_sync_upstream_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -842,6 +848,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_brownfield_requests_for_task,
                 pending_scout_requests_for_task,
                 pending_spec_it_requests_for_task,
+                pending_sync_upstream_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -876,6 +883,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_brownfield_requests,
                     pending_scout_requests,
                     pending_spec_it_requests,
+                    pending_sync_upstream_requests,
                     iteration_cancel,
                     iteration_drained,
                 },
@@ -1321,6 +1329,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -1341,6 +1352,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 

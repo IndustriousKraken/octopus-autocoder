@@ -106,6 +106,11 @@ pub async fn run(
             std::collections::VecDeque<crate::control_socket::SpecItRequest>,
         >,
     >,
+    pending_sync_upstream_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SyncUpstreamRequest>,
+        >,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -133,6 +138,7 @@ pub async fn run(
         pending_brownfield_requests,
         pending_scout_requests,
         pending_spec_it_requests,
+        pending_sync_upstream_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -210,6 +216,11 @@ pub async fn run_with_hooks(
     pending_spec_it_requests: Arc<
         std::sync::Mutex<
             std::collections::VecDeque<crate::control_socket::SpecItRequest>,
+        >,
+    >,
+    pending_sync_upstream_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SyncUpstreamRequest>,
         >,
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
@@ -531,6 +542,33 @@ pub async fn run_with_hooks(
             );
         }
 
+        // OSS-fork support (a26): drain at most ONE sync-upstream
+        // request per iteration. The handler fetches the configured
+        // upstream remote, rebases the workspace's base branch, AND
+        // posts a thread reply summarizing the result OR naming
+        // conflicting files. NEVER pushes — the operator decides when
+        // to push to their fork.
+        let sync_upstream_request: Option<crate::control_socket::SyncUpstreamRequest> = {
+            let mut g = pending_sync_upstream_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = sync_upstream_request
+            && let Err(error) = crate::polling::sync_upstream::process_pending_sync_upstream(
+                &workspace,
+                snapshot_ref,
+                chatops_ctx.as_ref(),
+                &req,
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                request_id = req.request_id.as_str(),
+                "sync-upstream-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
         if want_rebuild {
             if let Err(error) = execute_rebuild_iteration(
                 &workspace,
@@ -604,6 +642,36 @@ pub async fn run_with_hooks(
 /// executor-level defaults as separate values so the polling loop can
 /// pick up a hot-swapped per-repo override without taking a reference
 /// to the live `ExecutorConfig`.
+/// OSS-fork support (a26): opportunistic upstream fetch. When the
+/// per-repo `upstream` block is configured, ensure a remote named
+/// `<upstream.remote>` exists pointing at `<upstream.url>` AND run
+/// `git fetch <remote>` with a 30-second timeout. The fetch is
+/// best-effort: any error (remote-add failure, fetch timeout, auth
+/// failure) logs a WARN naming the failure AND the function returns
+/// without affecting the iteration.
+fn opportunistic_upstream_fetch(workspace: &Path, repo: &RepositoryConfig) {
+    let Some(upstream) = repo.upstream.as_ref() else {
+        return;
+    };
+    if let Err(e) = git::ensure_remote(workspace, &upstream.remote, &upstream.url) {
+        tracing::warn!(
+            url = %repo.url,
+            remote = %upstream.remote,
+            upstream_url = %upstream.url,
+            "opportunistic upstream remote-management failed: {e:#}; continuing iteration"
+        );
+        return;
+    }
+    if let Err(e) = git::fetch_remote_with_timeout(workspace, &upstream.remote, 30) {
+        tracing::warn!(
+            url = %repo.url,
+            remote = %upstream.remote,
+            upstream_url = %upstream.url,
+            "opportunistic upstream fetch failed: {e:#}; continuing iteration"
+        );
+    }
+}
+
 fn resolve_max_changes_per_pr(per_repo: Option<u32>, executor_default: Option<u32>) -> u32 {
     const DEFAULT: u32 = 3;
     per_repo.or(executor_default).unwrap_or(DEFAULT).max(1)
@@ -1341,6 +1409,9 @@ pub async fn run_pass_through_commits(
         .await;
         return Err(e);
     }
+    // OSS-fork support (a26): opportunistic upstream fetch.
+    // Best-effort — failures log a WARN but never block the iteration.
+    opportunistic_upstream_fetch(workspace, repo);
     git::checkout(workspace, &repo.base_branch)?;
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
@@ -3265,6 +3336,43 @@ async fn maybe_post_pr_opened(
     }
 }
 
+/// OSS-fork support (a26): post the `📦 Branch pushed` notification
+/// when `auto_submit_pr: false` skipped PR creation. Carries the
+/// branch URL AND the templated `gh pr create` command the operator
+/// can run manually after local review. Gated by the same
+/// `pr_opened_enabled` flag as `maybe_post_pr_opened`.
+async fn maybe_post_branch_pushed_no_pr(
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    branch_url: &str,
+    suggested_command: &str,
+    change_count: usize,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.pr_opened_enabled {
+        return;
+    }
+    let text = format!(
+        "📦 `{url}`: branch pushed with {change_count} change(s): {branch_url}\nRun: {suggested_command}",
+        url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            branch_url = %branch_url,
+            "branch-pushed-no-pr notification failed; continuing: {e:#}"
+        );
+    }
+}
+
+/// OSS-fork support (a26): compose a GitHub branch tree URL of the
+/// shape `https://github.com/<owner>/<repo>/tree/<branch>`. Used by
+/// the `auto_submit_pr: false` path so the chatops notification
+/// links to the pushed branch the operator can review locally.
+fn compose_branch_url(owner: &str, repo: &str, branch: &str) -> String {
+    format!("https://github.com/{owner}/{repo}/tree/{branch}")
+}
+
 /// Post a one-line ChatOps notification announcing a fork recreation.
 /// Re-forking is destructive: any open PRs from the deleted fork are
 /// closed by GitHub when the head ref disappears, so operators should
@@ -3716,6 +3824,41 @@ async fn open_pull_request(
         Some(fork_owner) => format!("{fork_owner}:{}", repo.agent_branch),
         None => repo.agent_branch.clone(),
     };
+
+    // OSS-fork support (a26): when `auto_submit_pr: false`, skip the
+    // PR-creation API call. The branch has already been pushed to its
+    // remote by the caller; we surface the branch URL AND a
+    // templated `gh pr create` command to chatops so the operator can
+    // open the PR manually after local review.
+    if !repo.auto_submit_pr {
+        let branch_url = compose_branch_url(&owner, &repo_name, &repo.agent_branch);
+        let pr_base = repo
+            .upstream
+            .as_ref()
+            .map(|u| u.branch.as_str())
+            .unwrap_or(&repo.base_branch);
+        let suggested = format!(
+            "gh pr create --base {pr_base} --head {}",
+            repo.agent_branch
+        );
+        maybe_post_branch_pushed_no_pr(
+            repo,
+            chatops_ctx,
+            &branch_url,
+            &suggested,
+            changes.len(),
+        )
+        .await;
+        tracing::info!(
+            url = %repo.url,
+            branch_url = %branch_url,
+            "auto_submit_pr: false — skipped PR creation; surfaced branch URL to chatops"
+        );
+        // Best-effort: post implementer-summary comments only when a PR
+        // exists. Without a PR we have no number to attach them to —
+        // skip and rely on chatops surfacing.
+        return Ok(());
+    }
 
     let pr = match create_pull_request_via_hook(
         &owner,
@@ -5955,6 +6098,131 @@ mod tests {
         assert!(st.success());
     }
 
+    // -----------------------------------------------------------------
+    // a26 OSS-fork support: opportunistic upstream fetch tests.
+    // -----------------------------------------------------------------
+
+    fn init_bare(dir: &Path) {
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "bare init failed");
+    }
+
+    fn init_clone(remote: &Path, target: &Path) {
+        let st = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_string_lossy().as_ref(),
+                target.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success(), "clone failed");
+    }
+
+    fn remote_url(workspace: &Path, name: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["remote", "get-url", name])
+            .current_dir(workspace)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn opportunistic_upstream_fetch_no_block_no_action() {
+        // Upstream unconfigured: function is a no-op.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("bare.git");
+        init_bare(&bare);
+        let workspace = dir.path().join("workspace");
+        init_clone(&bare, &workspace);
+        let repo = fixture_repo(&workspace);
+        // Capture pre-state: no `upstream` remote.
+        assert!(remote_url(&workspace, "upstream").is_none());
+        opportunistic_upstream_fetch(&workspace, &repo);
+        // Still no `upstream` remote — function did nothing.
+        assert!(remote_url(&workspace, "upstream").is_none());
+    }
+
+    #[test]
+    fn opportunistic_upstream_fetch_adds_remote_and_fetches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("bare.git");
+        init_bare(&bare);
+        let upstream_bare = dir.path().join("upstream.git");
+        init_bare(&upstream_bare);
+        let workspace = dir.path().join("workspace");
+        init_clone(&bare, &workspace);
+        let mut repo = fixture_repo(&workspace);
+        repo.upstream = Some(crate::config::UpstreamConfig {
+            remote: "upstream".to_string(),
+            branch: "main".to_string(),
+            url: upstream_bare.to_string_lossy().to_string(),
+        });
+        opportunistic_upstream_fetch(&workspace, &repo);
+        let url = remote_url(&workspace, "upstream")
+            .expect("upstream remote should be added");
+        assert_eq!(url, upstream_bare.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn opportunistic_upstream_fetch_corrects_drifted_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("bare.git");
+        init_bare(&bare);
+        let upstream_a = dir.path().join("upstream-a.git");
+        init_bare(&upstream_a);
+        let upstream_b = dir.path().join("upstream-b.git");
+        init_bare(&upstream_b);
+        let workspace = dir.path().join("workspace");
+        init_clone(&bare, &workspace);
+        // Pre-seed an `upstream` remote pointing at A.
+        let st = std::process::Command::new("git")
+            .args(["remote", "add", "upstream"])
+            .arg(upstream_a.to_string_lossy().as_ref())
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        // Configure upstream B in the repo.
+        let mut repo = fixture_repo(&workspace);
+        repo.upstream = Some(crate::config::UpstreamConfig {
+            remote: "upstream".to_string(),
+            branch: "main".to_string(),
+            url: upstream_b.to_string_lossy().to_string(),
+        });
+        opportunistic_upstream_fetch(&workspace, &repo);
+        let url = remote_url(&workspace, "upstream").unwrap();
+        assert_eq!(url, upstream_b.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn opportunistic_upstream_fetch_failure_does_not_propagate() {
+        // Point upstream.url at a path that isn't a git repo — fetch
+        // will fail, function must log a WARN and return cleanly.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("bare.git");
+        init_bare(&bare);
+        let workspace = dir.path().join("workspace");
+        init_clone(&bare, &workspace);
+        let mut repo = fixture_repo(&workspace);
+        repo.upstream = Some(crate::config::UpstreamConfig {
+            remote: "upstream".to_string(),
+            branch: "main".to_string(),
+            url: "/dev/null/definitely-not-a-repo".to_string(),
+        });
+        // Should not panic AND should return normally.
+        opportunistic_upstream_fetch(&workspace, &repo);
+    }
+
     /// Build a `RepositoryConfig` pointing at a fixture workspace. Uses a
     /// non-existent token env var so any attempt to open a PR errors fast
     /// rather than reaching a live API.
@@ -5968,6 +6236,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -7241,6 +7512,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -7279,6 +7553,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
@@ -7448,6 +7725,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -7501,6 +7781,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -7526,6 +7809,53 @@ mod tests {
     }
 
     // ============================================================
+    // a26 OSS-fork support: auto_submit_pr gate helpers.
+    // ============================================================
+
+    #[test]
+    fn compose_branch_url_formats_github_tree_url() {
+        assert_eq!(
+            compose_branch_url("upstream-owner", "upstream-repo", "agent-q"),
+            "https://github.com/upstream-owner/upstream-repo/tree/agent-q"
+        );
+    }
+
+    #[test]
+    fn auto_submit_pr_defaults_to_true_on_fixture() {
+        let repo = open_pr_test_repo();
+        assert!(repo.auto_submit_pr);
+    }
+
+    #[test]
+    fn suggested_pr_command_picks_upstream_branch_when_configured() {
+        // When upstream is set, the suggested gh pr create base is
+        // upstream.branch.
+        let mut repo = open_pr_test_repo();
+        repo.upstream = Some(crate::config::UpstreamConfig {
+            remote: "upstream".to_string(),
+            branch: "trunk".to_string(),
+            url: "https://github.com/up/repo.git".to_string(),
+        });
+        let pr_base = repo
+            .upstream
+            .as_ref()
+            .map(|u| u.branch.as_str())
+            .unwrap_or(&repo.base_branch);
+        assert_eq!(pr_base, "trunk");
+    }
+
+    #[test]
+    fn suggested_pr_command_falls_back_to_base_branch_when_no_upstream() {
+        let repo = open_pr_test_repo();
+        let pr_base = repo
+            .upstream
+            .as_ref()
+            .map(|u| u.branch.as_str())
+            .unwrap_or(&repo.base_branch);
+        assert_eq!(pr_base, "main");
+    }
+
+    // ============================================================
     // open-PR pre-flight check (skip-poll-when-pr-open)
     // ============================================================
 
@@ -7539,6 +7869,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -8469,6 +8802,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -8556,6 +8892,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -8648,6 +8987,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         let github_cfg = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -10874,6 +11216,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         maybe_post_pr_opened(
             &repo,
@@ -10912,6 +11257,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         maybe_post_pr_opened(
             &repo,
@@ -10951,6 +11299,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         // Should not panic; should return Ok-equivalent (it's an async fn
         // returning unit, so "doesn't panic" is the assertion).
@@ -10998,6 +11349,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -11031,6 +11385,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -11046,6 +11403,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         }
     }
 
@@ -11635,6 +11995,9 @@ mod tests {
             chatops_channel_id: None,
             max_changes_per_pr: None,
             audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
         };
         maybe_post_pr_opened(
             &repo,
@@ -11842,6 +12205,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),

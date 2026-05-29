@@ -62,14 +62,16 @@ The git workflow manager SHALL produce one commit per successfully implemented c
   in the working tree
 
 ### Requirement: Monolithic PR at end of pass
-The git workflow manager SHALL push the agent branch and create a single Pull Request via the GitHub REST API at the end of each polling iteration that produced at least one commit, AND SHALL surface the new PR's number to its caller so a follow-up implementer-summary comment can be posted. The push target and PR `head` format depend on whether fork-PR mode is active:
+The git workflow manager SHALL push the agent branch at the end of each polling iteration that produced at least one commit, AND, when `auto_submit_pr` is `true` (the default), SHALL create a single Pull Request via the GitHub REST API AND surface the new PR's number to its caller so a follow-up implementer-summary comment can be posted. When `auto_submit_pr` is `false`, the manager SHALL push the branch but SKIP the PR-creation API call, instead returning a `BranchPushedNoPr { branch_url, suggested_pr_command }` outcome to the caller. The push target and PR `head` format depend on whether fork-PR mode is active:
 
 - **Direct-push mode (`github.fork_owner` unset):** push to `origin`;
   PR `head` is the agent branch name alone.
 - **Fork-PR mode (`github.fork_owner` set):** push to `fork`; PR
   `head` is `<fork-owner>:<agent-branch>` (cross-repo PR syntax).
 
-In both modes the PR is posted to the upstream repository's `/pulls` endpoint. **When the code-reviewer is enabled, the PR body SHALL include the reviewer's report under a `## Code Review` heading, and a `Block` verdict SHALL cause the PR to be created as a draft (with a `do-not-merge` label fallback if the host rejects drafts).** **`github::create_pull_request` SHALL return both the `html_url` AND the `number` of the created PR.**
+In both modes (when PR creation is not skipped) the PR is posted to the upstream repository's `/pulls` endpoint. **When the code-reviewer is enabled, the PR body SHALL include the reviewer's report under a `## Code Review` heading, and a `Block` verdict SHALL cause the PR to be created as a draft (with a `do-not-merge` label fallback if the host rejects drafts).** **`github::create_pull_request` SHALL return both the `html_url` AND the `number` of the created PR.**
+
+When `auto_submit_pr` is `false`, the `suggested_pr_command` SHALL be templated as `gh pr create --base <base> --head <agent-branch>` where `<base>` is `upstream.branch` if the `upstream` config block is set, OR the workspace's configured base branch otherwise. The reviewer-run AND implementer-summary-capture steps still execute when `auto_submit_pr` is `false`; their outputs are surfaced via the polling iteration's chatops notification rather than via the (skipped) PR body.
 
 #### Scenario: Opening a PR in direct-push mode
 - **WHEN** an iteration completes AND the agent branch contains at
@@ -133,6 +135,20 @@ In both modes the PR is posted to the upstream repository's `/pulls` endpoint. *
   section
 - **AND** no LLM API call is made
 - **AND** the response's `number` is returned to the caller
+
+#### Scenario: auto_submit_pr false — push without PR creation
+- **WHEN** an iteration completes AND the agent branch contains at least one commit ahead of base AND `auto_submit_pr: false` is configured for the repo
+- **THEN** the manager pushes the agent branch per the existing direct-push OR fork-PR rule (same push target as it would use with `auto_submit_pr: true`)
+- **AND** NO POST to the GitHub PR API is made
+- **AND** the manager returns `BranchPushedNoPr { branch_url, suggested_pr_command }` to the caller
+- **AND** `branch_url` is `https://github.com/<owner>/<repo>/tree/<agent-branch>` (resolved from the push target's remote URL)
+- **AND** `suggested_pr_command` is `gh pr create --base <upstream.branch | base-branch> --head <agent-branch>`
+
+#### Scenario: auto_submit_pr false — reviewer output surfaced without PR body
+- **WHEN** `auto_submit_pr: false` AND `reviewer.enabled: true` AND `code_reviewer.review` returns `Ok(ReviewReport { verdict: Block, markdown: ... })`
+- **THEN** the manager pushes the branch but does NOT create a PR (the canonical PR-body posting site is skipped because no PR exists)
+- **AND** the reviewer's report is surfaced via the polling iteration's chatops notification (per the polling-iteration's existing notification mechanics) so the operator sees the report before manually running `gh pr create`
+- **AND** the `BranchPushedNoPr` outcome carries the reviewer report alongside the branch URL so the caller can format the chatops notification accordingly
 
 ### Requirement: Implementer-summary PR comment
 After a Pull Request is successfully created at the end of a polling iteration, the git workflow manager SHALL post a single follow-up issue comment to that PR containing the implementer agent's captured stdout for each change that shipped in the pass. The comment is best-effort: any failure to post is logged and ignored, and SHALL NOT roll back or affect the PR's existence. The comment exists to surface the agent's own narrative (modules touched, test counts, deviations from the spec it had to make, meta-observations) directly on the PR page so reviewers can read it without inspecting server-local log files.

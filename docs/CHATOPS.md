@@ -408,6 +408,63 @@ Use cases:
 
 Refusals: missing/ambiguous repo (per the standard matcher); `✗ clear-scout: scout disabled in this workspace's config (features.scout.enabled=false).` when the verb is gated off.
 
+### sync-upstream
+
+**Syntax:**
+
+```
+@<bot> sync-upstream <repo-substring>
+```
+
+OSS-fork workflow (a26): fetch the configured upstream remote AND
+rebase the workspace's base branch on top. Designed for the
+operator-owned-fork case where autocoder iterates on a fork of an
+upstream project the operator does NOT own; the operator runs
+`sync-upstream` periodically to keep the fork's base branch in sync
+without leaving the chatops surface.
+
+Prerequisites:
+
+- The repo's per-repo config has an `upstream` block set
+  (`url`, plus optional `remote` (default `upstream`) AND `branch`
+  (default `main`)). Absent → reply names the misconfiguration AND
+  no git operations run.
+- The workspace is currently quiescent (no in-flight iteration). When
+  busy, the request queues until the next free iteration per the
+  existing per-repo serial-iteration discipline.
+
+Behavior on success:
+
+```
+✓ sync-upstream: pulled 7 commit(s) from upstream/main. Base branch is 0 commit(s) ahead of upstream.
+```
+
+The handler runs `git fetch <upstream.remote>`, checks out the
+configured base branch, AND runs `git rebase <upstream.remote>/<upstream.branch>`.
+The result reply names how many commits were incorporated AND whether
+the workspace is now ahead of OR caught up to upstream.
+
+Behavior on conflict:
+
+```
+✗ sync-upstream: rebase conflict on src/lib.rs, tests/integration.rs. Aborted. Resolve manually in the workspace AND re-run, OR merge manually.
+```
+
+The rebase is aborted (`git rebase --abort`) so the workspace returns
+to its pre-rebase HEAD. The conflicting files are listed so the
+operator can decide between resolving manually in the workspace or
+performing a one-off `git merge` instead.
+
+**No-push guarantee.** The verb NEVER pushes the rebased base branch
+to any remote. The operator decides when to push to their fork
+(typically `git push --force-with-lease origin <base>` after
+inspecting the rebased history locally). `auto_submit_pr` is unrelated:
+`sync-upstream` does not produce PRs.
+
+Refusals: missing/ambiguous repo (per the standard matcher); `✗ sync-upstream: no upstream configured for this repo. Set the upstream block in config.yaml.` when the `upstream` block is absent.
+
+See also `docs/OPERATIONS.md` "OSS contribution workflow" for the end-to-end loop.
+
 ### Two-step confirmation for `wipe-workspace`
 
 `wipe-workspace` is destructive, so the first reply is a warning rather than the action. The warning includes a context preview drawn from the same live data the per-repo `status` command surfaces, so you can make an informed go/no-go call before committing to the wipe:

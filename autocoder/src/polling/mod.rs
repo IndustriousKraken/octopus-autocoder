@@ -4,3 +4,4 @@
 pub mod brownfield;
 pub mod scout;
 pub mod spec_it;
+pub mod sync_upstream;

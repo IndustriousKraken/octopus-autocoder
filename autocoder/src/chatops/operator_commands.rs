@@ -379,6 +379,13 @@ pub enum OperatorCommand {
     ClearScout {
         repo_substring: String,
     },
+    /// `@<bot> sync-upstream <repo-substring>` (a26). Fetches the
+    /// configured upstream remote AND rebases the workspace's base
+    /// branch on top. Best-effort; conflicts abort the rebase. Never
+    /// pushes — operator decides when to push to the fork.
+    SyncUpstreamRequest {
+        repo_substring: String,
+    },
     Help,
 }
 
@@ -808,6 +815,30 @@ fn parse_command_outcome_in_thread(
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
             ParseOutcome::Ok(OperatorCommand::ClearScout {
+                repo_substring: rest[0].to_string(),
+            })
+        }
+        "sync-upstream" => {
+            // `@<bot> sync-upstream <repo-substring>` (a26). One
+            // positional argument — the repo substring. Any other
+            // argument shape is rejected so the operator sees the
+            // usage hint rather than a silent ?.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ sync-upstream: missing repo. Usage: @<bot> sync-upstream <repo-substring>"
+                        .to_string(),
+                ));
+            }
+            if rest.len() != 1 {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ sync-upstream: too many arguments. Usage: @<bot> sync-upstream <repo-substring>"
+                        .to_string(),
+                ));
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::SyncUpstreamRequest {
                 repo_substring: rest[0].to_string(),
             })
         }
@@ -1625,6 +1656,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `spec-it <N> [optional guidance]` — scout-thread-only: scope a scouted item into a propose-equivalent flow\n");
     out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout-run state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
+    out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: fetch+rebase the workspace's base branch onto upstream (no push)\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -2160,6 +2192,16 @@ impl OperatorCommandDispatcher {
                         .await,
                 ),
             ),
+            ParseOutcome::Ok(OperatorCommand::SyncUpstreamRequest { repo_substring }) => Some(
+                self.dispatch_sync_upstream_request(
+                    &repo_substring,
+                    channel_id,
+                    thread_ts,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
                     .await,
@@ -2523,6 +2565,12 @@ impl OperatorCommandDispatcher {
             | OperatorCommand::SpecItRequest { .. }
             | OperatorCommand::ClearScout { .. } => {
                 "✗ scout/spec-it/clear-scout: internal routing error. Please file a bug."
+                    .to_string()
+            }
+            OperatorCommand::SyncUpstreamRequest { .. } => {
+                "✗ sync-upstream: internal routing error (the dispatcher saw \
+                 SyncUpstreamRequest in the String-returning dispatch fn). \
+                 Please file a bug."
                     .to_string()
             }
         }
@@ -3153,6 +3201,52 @@ impl OperatorCommandDispatcher {
         }
         let cleared = resp.get("cleared").and_then(|v| v.as_u64()).unwrap_or(0);
         format!("✓ Cleared {cleared} scout run(s) for {url}.", url = repo.url)
+    }
+
+    /// Handle the `sync-upstream` verb (a26). Resolves the repo
+    /// substring; on unique match, submits a
+    /// `queue_sync_upstream_request` control-socket action so the next
+    /// polling iteration runs the rebase. The ack is a top-level (or
+    /// in-thread) `Reply::Sync` naming the queue placement; the
+    /// rebase-success or conflict reply is posted in the same thread
+    /// by the polling-iteration handler.
+    async fn dispatch_sync_upstream_request(
+        &self,
+        repo_substring: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "action": "queue_sync_upstream_request",
+            "url": repo.url,
+            "request_id": request_id,
+            "channel": channel_id,
+            "thread_ts": thread_ts.unwrap_or(""),
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Reply::Sync(format!("✗ sync-upstream: {err}"));
+        }
+        Reply::Sync(format!(
+            "✓ Queued sync-upstream for {url}. Reply incoming.",
+            url = repo.url
+        ))
     }
 
     /// Handle the `audit` verb. Resolves the audit substring against the
@@ -7981,6 +8075,80 @@ mod tests {
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------
+    // a26 OSS-fork support: `sync-upstream` verb parser tests.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_sync_upstream_happy_path() {
+        let cmd = parse_command(&format!("{BOT} sync-upstream myrepo"), BOT)
+            .expect("sync-upstream must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::SyncUpstreamRequest {
+                repo_substring: "myrepo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sync_upstream_missing_repo_returns_invalid() {
+        let outcome = parse_command_outcome(&format!("{BOT} sync-upstream"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("sync-upstream"), "{text}");
+                assert!(text.contains("missing repo"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_upstream_too_many_args_returns_invalid() {
+        let outcome = parse_command_outcome(
+            &format!("{BOT} sync-upstream myrepo extra-arg"),
+            BOT,
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("sync-upstream"), "{text}");
+                assert!(text.contains("too many arguments"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_upstream_verb_case_insensitive() {
+        for verb in ["sync-upstream", "Sync-Upstream", "SYNC-UPSTREAM"] {
+            let cmd = parse_command(&format!("{BOT} {verb} myrepo"), BOT)
+                .unwrap_or_else(|| panic!("`{verb}` must parse"));
+            assert_eq!(
+                cmd,
+                OperatorCommand::SyncUpstreamRequest {
+                    repo_substring: "myrepo".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn help_output_lists_sync_upstream() {
+        let text = format_help_reply();
+        assert!(
+            text.contains("sync-upstream"),
+            "help must mention sync-upstream: {text}"
+        );
+        assert!(
+            text.contains("OSS-fork workflow"),
+            "sync-upstream help line must call out OSS-fork workflow: {text}"
+        );
+        assert!(
+            text.contains("no push"),
+            "sync-upstream help line must note no-push guarantee: {text}"
+        );
     }
 
     #[test]
