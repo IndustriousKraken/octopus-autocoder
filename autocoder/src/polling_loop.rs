@@ -1768,7 +1768,8 @@ async fn process_one_waiting(
                 let subject = build_commit_subject(workspace, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
-                queue::archive(workspace, change)?;
+                let spec_root = crate::spec_root::SpecRoot::for_repo(repo, workspace);
+                queue::archive_at(&spec_root, change)?;
                 (ResumeDisposition::Archived, None)
             }
         }
@@ -3498,8 +3499,9 @@ async fn handle_outcome(
                 // only thing missing is the archive move. Run the archive
                 // ourselves rather than burn another iteration on a no-op
                 // Completed.
-                let tasks_complete = tasks_md_all_complete(workspace, change).unwrap_or(false);
-                if tasks_complete && openspec_validate_strict_passes(workspace, change) {
+                let spec_root = crate::spec_root::SpecRoot::for_repo(repo, workspace);
+                let tasks_complete = tasks_md_all_complete(&spec_root, change).unwrap_or(false);
+                if tasks_complete && openspec_validate_strict_passes(&spec_root, change) {
                     tracing::info!(
                         url = %repo.url,
                         change = %change,
@@ -3507,7 +3509,7 @@ async fn handle_outcome(
                     );
                     let subject =
                         format!("archive: {change}: implementation already in base");
-                    if let Err(e) = queue::archive(workspace, change) {
+                    if let Err(e) = queue::archive_at(&spec_root, change) {
                         tracing::error!(
                             url = %repo.url,
                             change = %change,
@@ -3568,7 +3570,8 @@ async fn handle_outcome(
                 // rename. After this sequence the working tree is clean,
                 // even for the trailing change of a pass — no dangling
                 // rename for the next iteration's dirty-check to trip on.
-                queue::archive(workspace, change)?;
+                let spec_root = crate::spec_root::SpecRoot::for_repo(repo, workspace);
+                queue::archive_at(&spec_root, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
             }
@@ -4516,11 +4519,8 @@ fn extract_why_section(raw: &str) -> Option<String> {
 /// match-set yields `Ok(false)` — a tasks.md with no checkboxes is not
 /// "all complete". Returns `Err(_)` only on file-read failure or
 /// regex-init failure.
-pub fn tasks_md_all_complete(workspace: &Path, change: &str) -> Result<bool> {
-    let tasks_path = workspace
-        .join("openspec/changes")
-        .join(change)
-        .join("tasks.md");
+pub fn tasks_md_all_complete(spec_root: &crate::spec_root::SpecRoot, change: &str) -> Result<bool> {
+    let tasks_path = spec_root.changes_dir().join(change).join("tasks.md");
     let raw = std::fs::read_to_string(&tasks_path)
         .with_context(|| format!("reading {}", tasks_path.display()))?;
     let re = regex::Regex::new(r"^\s*-\s*\[([ x])\]")
@@ -4542,10 +4542,10 @@ pub fn tasks_md_all_complete(workspace: &Path, change: &str) -> Result<bool> {
 /// transport problem — returns `false`. The caller falls through to the
 /// existing Failed path when self-heal preconditions are unmet, which is
 /// the conservative behavior.
-pub fn openspec_validate_strict_passes(workspace: &Path, change: &str) -> bool {
+pub fn openspec_validate_strict_passes(spec_root: &crate::spec_root::SpecRoot, change: &str) -> bool {
     match std::process::Command::new("openspec")
         .args(["validate", change, "--strict"])
-        .current_dir(workspace)
+        .current_dir(spec_root.openspec_cwd())
         .output()
     {
         Ok(out) => out.status.success(),
@@ -10155,7 +10155,12 @@ mod tests {
             "## 1. things\n- [x] 1.1 first\n- [x] 1.2 second\n  - [x] 1.3 nested\n",
         )
         .unwrap();
-        assert!(tasks_md_all_complete(ws, "c").unwrap());
+        let sr = crate::spec_root::SpecRoot::from_parts(
+            ws.to_path_buf(),
+            ws.join("openspec"),
+            false,
+        );
+        assert!(tasks_md_all_complete(&sr, "c").unwrap());
     }
 
     /// `tasks_md_all_complete`: mixed `[x]` and `[ ]` → false.
@@ -10166,7 +10171,12 @@ mod tests {
         let tasks = ws.join("openspec/changes/c/tasks.md");
         std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
         std::fs::write(&tasks, "- [x] done\n- [ ] still open\n").unwrap();
-        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+        let sr = crate::spec_root::SpecRoot::from_parts(
+            ws.to_path_buf(),
+            ws.join("openspec"),
+            false,
+        );
+        assert!(!tasks_md_all_complete(&sr, "c").unwrap());
     }
 
     /// `tasks_md_all_complete`: every checkbox is `[ ]` → false.
@@ -10177,7 +10187,12 @@ mod tests {
         let tasks = ws.join("openspec/changes/c/tasks.md");
         std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
         std::fs::write(&tasks, "- [ ] a\n- [ ] b\n").unwrap();
-        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+        let sr = crate::spec_root::SpecRoot::from_parts(
+            ws.to_path_buf(),
+            ws.join("openspec"),
+            false,
+        );
+        assert!(!tasks_md_all_complete(&sr, "c").unwrap());
     }
 
     /// `tasks_md_all_complete`: no checkbox lines at all → false.
@@ -10189,7 +10204,12 @@ mod tests {
         let tasks = ws.join("openspec/changes/c/tasks.md");
         std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
         std::fs::write(&tasks, "## Heading\nNo checkboxes here.\n").unwrap();
-        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+        let sr = crate::spec_root::SpecRoot::from_parts(
+            ws.to_path_buf(),
+            ws.join("openspec"),
+            false,
+        );
+        assert!(!tasks_md_all_complete(&sr, "c").unwrap());
     }
 
     /// `tasks_md_all_complete`: missing file → Err.
@@ -10197,7 +10217,12 @@ mod tests {
     fn tasks_md_all_complete_missing_file_returns_err() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = dir.path();
-        assert!(tasks_md_all_complete(ws, "does-not-exist").is_err());
+        let sr = crate::spec_root::SpecRoot::from_parts(
+            ws.to_path_buf(),
+            ws.join("openspec"),
+            false,
+        );
+        assert!(tasks_md_all_complete(&sr, "does-not-exist").is_err());
     }
 
     /// Write a self-heal-ready change into the fixture workspace: a proposal,

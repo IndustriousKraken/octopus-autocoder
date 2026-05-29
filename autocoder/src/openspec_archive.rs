@@ -7,11 +7,10 @@
 //! rebuild path so tests can inject stubs without spawning real
 //! subprocesses.
 
+use crate::spec_root::SpecRoot;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
-const CHANGES_SUBDIR: &str = "openspec/changes";
-const ARCHIVE_SUBDIR: &str = "openspec/changes/archive";
 const MAX_REPORT_CHARS: usize = 500;
 
 /// Captured output from a single `openspec archive <slug> -y`
@@ -28,19 +27,23 @@ pub struct ArchiveRunOutput {
 /// Pluggable runner for `openspec archive`. The production
 /// implementation shells out to the binary; tests substitute stubs to
 /// simulate success, silent skip, abort-marker, or non-zero exit
-/// without touching the host's openspec install.
+/// without touching the host's openspec install. The first argument
+/// is the cwd in which to invoke `openspec` — historically the code
+/// workspace, but per-`a26` it is the parent of the spec root so
+/// `spec_storage`-configured repos invoke openspec in their external
+/// spec tree.
 pub trait ArchiveRunner: Send + Sync {
-    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String>;
+    fn run(&self, openspec_cwd: &Path, slug: &str) -> Result<ArchiveRunOutput, String>;
 }
 
 /// Production runner — shells out to `openspec archive <slug> -y`.
 pub struct RealArchiveRunner;
 
 impl ArchiveRunner for RealArchiveRunner {
-    fn run(&self, workspace: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
+    fn run(&self, openspec_cwd: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
         match std::process::Command::new("openspec")
             .args(["archive", slug, "-y"])
-            .current_dir(workspace)
+            .current_dir(openspec_cwd)
             .output()
         {
             Ok(out) => Ok(ArchiveRunOutput {
@@ -112,10 +115,10 @@ pub enum ArchiveFailure {
 /// [`find_archive_entries_for_slug`].
 pub fn openspec_archive_with_postcondition(
     runner: &dyn ArchiveRunner,
-    workspace: &Path,
+    spec_root: &SpecRoot,
     slug: &str,
 ) -> Result<PathBuf, ArchiveFailure> {
-    let out = match runner.run(workspace, slug) {
+    let out = match runner.run(&spec_root.openspec_cwd(), slug) {
         Ok(out) => out,
         Err(spawn_err) => {
             return Err(ArchiveFailure::NonZeroExit {
@@ -143,7 +146,7 @@ pub fn openspec_archive_with_postcondition(
         });
     }
 
-    let active_path = workspace.join(CHANGES_SUBDIR).join(slug);
+    let active_path = spec_root.changes_dir().join(slug);
     if active_path.exists() {
         return Err(ArchiveFailure::ActivePathStillPresent {
             path: active_path,
@@ -151,7 +154,7 @@ pub fn openspec_archive_with_postcondition(
         });
     }
 
-    let archive_root = workspace.join(ARCHIVE_SUBDIR);
+    let archive_root = spec_root.archive_dir();
     let mut matches = find_archive_entries_for_slug(&archive_root, slug);
     if matches.is_empty() {
         return Err(ArchiveFailure::NoArchiveEntryFound { full_output });
@@ -291,6 +294,14 @@ mod tests {
         dir
     }
 
+    fn ws_spec_root(workspace: &Path) -> SpecRoot {
+        SpecRoot::from_parts(
+            workspace.to_path_buf(),
+            workspace.join("openspec"),
+            false,
+        )
+    }
+
     fn make_active_change(ws: &Path, slug: &str) {
         let dir = ws.join("openspec/changes").join(slug);
         std::fs::create_dir_all(&dir).unwrap();
@@ -386,7 +397,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let path = openspec_archive_with_postcondition(&SuccessRunner, ws, "foo")
+        let path = openspec_archive_with_postcondition(&SuccessRunner, &ws_spec_root(ws), "foo")
             .expect("happy path returns Ok");
         let expected = ws
             .join("openspec/changes/archive")
@@ -402,7 +413,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let err = openspec_archive_with_postcondition(&AbortedRunner, ws, "foo")
+        let err = openspec_archive_with_postcondition(&AbortedRunner, &ws_spec_root(ws), "foo")
             .expect_err("aborted marker must surface as Err");
         match err {
             ArchiveFailure::AbortedMarker {
@@ -430,7 +441,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let err = openspec_archive_with_postcondition(&SilentSkipRunner, ws, "foo")
+        let err = openspec_archive_with_postcondition(&SilentSkipRunner, &ws_spec_root(ws), "foo")
             .expect_err("silent-skip must surface as Err");
         match err {
             ArchiveFailure::ActivePathStillPresent { path, full_output } => {
@@ -450,7 +461,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let err = openspec_archive_with_postcondition(&DataLossRunner, ws, "foo")
+        let err = openspec_archive_with_postcondition(&DataLossRunner, &ws_spec_root(ws), "foo")
             .expect_err("data-loss must surface as Err");
         match err {
             ArchiveFailure::NoArchiveEntryFound { full_output } => {
@@ -469,7 +480,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let err = openspec_archive_with_postcondition(&FailingRunner, ws, "foo")
+        let err = openspec_archive_with_postcondition(&FailingRunner, &ws_spec_root(ws), "foo")
             .expect_err("non-zero exit must surface as Err");
         match err {
             ArchiveFailure::NonZeroExit {
@@ -496,7 +507,7 @@ mod tests {
         let ws = dir.path();
         make_active_change(ws, "foo");
 
-        let err = openspec_archive_with_postcondition(&SpawnFailRunner, ws, "foo")
+        let err = openspec_archive_with_postcondition(&SpawnFailRunner, &ws_spec_root(ws), "foo")
             .expect_err("spawn failure must surface as Err");
         match err {
             ArchiveFailure::NonZeroExit {
@@ -540,7 +551,7 @@ mod tests {
                 })
             }
         }
-        let path = openspec_archive_with_postcondition(&NoopRunner, ws, "foo")
+        let path = openspec_archive_with_postcondition(&NoopRunner, &ws_spec_root(ws), "foo")
             .expect("happy with multi-match returns Ok");
         assert_eq!(path, newer, "lex-highest entry should be picked");
     }

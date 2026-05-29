@@ -97,6 +97,17 @@ impl SpecRoot {
     pub fn is_external(&self) -> bool {
         self.external
     }
+
+    /// Working directory in which to invoke `openspec <subcommand>` —
+    /// the parent of `openspec/`. Equivalent to `code_workspace` when
+    /// not external; otherwise the operator-configured spec_storage
+    /// path.
+    pub fn openspec_cwd(&self) -> PathBuf {
+        self.spec_root_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.spec_root_dir.clone())
+    }
 }
 
 #[cfg(test)]

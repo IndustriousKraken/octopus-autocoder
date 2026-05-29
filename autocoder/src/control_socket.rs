@@ -979,7 +979,8 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
     // Refuse if the marker is already present so the operator gets a
     // clear "no change" signal rather than a stealth no-op commit.
-    if crate::ignore_for_queue::marker_exists(&workspace_path, &change) {
+    let spec_root = crate::spec_root::SpecRoot::for_repo(&repo, &workspace_path);
+    if crate::ignore_for_queue::marker_exists(&spec_root, &change) {
         return json!({
             "ok": false,
             "error": format!(
@@ -989,7 +990,7 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     }
 
     // Write the marker file.
-    if let Err(e) = crate::ignore_for_queue::write_marker(&workspace_path, &change, &marked_by) {
+    if let Err(e) = crate::ignore_for_queue::write_marker(&spec_root, &change, &marked_by) {
         return json!({"ok": false, "error": format!("writing marker: {e:#}")});
     }
 

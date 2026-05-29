@@ -376,7 +376,16 @@ pub async fn rebuild_canonical_with_runner(
         // adds its own multi-match guard on top (a rebuild-specific
         // concern: the chronological replay can leave stale archive
         // entries the helper can't disambiguate).
-        match openspec_archive_with_postcondition(runner, workspace, &slug) {
+        // `cli::sync_specs` operates on a single in-place workspace
+        // (the operator's working tree containing openspec/), so wrap
+        // it in a SpecRoot::from_parts shim — the rebuild loop does
+        // not have a RepositoryConfig to honor spec_storage from.
+        let spec_root = crate::spec_root::SpecRoot::from_parts(
+            workspace.to_path_buf(),
+            workspace.join("openspec"),
+            false,
+        );
+        match openspec_archive_with_postcondition(runner, &spec_root, &slug) {
             Ok(actual_path) => {
                 // Rebuild-only extra check: if there are multiple
                 // archive matches for this slug (a stale entry from a
