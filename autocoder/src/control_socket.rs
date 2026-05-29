@@ -714,6 +714,18 @@ async fn fetch_latest_pr(
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
 ) -> Option<crate::chatops::operator_commands::PrSummary> {
+    fetch_latest_pr_at(github::DEFAULT_API_BASE, repo, github_cfg).await
+}
+
+/// Test-instrumentable variant of `fetch_latest_pr`. Production calls
+/// the no-arg helper above which forwards to `DEFAULT_API_BASE`; tests
+/// pass a mockito URL. Same head_owner-from-fork_owner semantics per
+/// `a20a4`.
+async fn fetch_latest_pr_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> Option<crate::chatops::operator_commands::PrSummary> {
     let (owner, repo_name) = match github::parse_repo_url(&repo.url) {
         Ok(r) => r,
         Err(e) => {
@@ -728,11 +740,18 @@ async fn fetch_latest_pr(
             return None;
         }
     };
+    // Per a20a4: head qualifier owner is fork_owner in fork-PR mode,
+    // upstream owner otherwise. Pre-fix code passed only the upstream
+    // owner; the GitHub query never matched a fork-headed PR, so every
+    // fork-PR-mode status reply showed `latest PR: (none)` regardless
+    // of whether one was open.
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
     match github::latest_pr_for_head(
-        github::DEFAULT_API_BASE,
+        api_base,
         &token,
         &owner,
         &repo_name,
+        head_owner,
         &repo.agent_branch,
     )
     .await
@@ -3365,5 +3384,92 @@ github:
         let err = resp["error"].as_str().unwrap();
         assert!(err.contains("audit_type"), "got: {err}");
         cancel.cancel();
+    }
+
+    // ---------- a20a4: fork-PR-mode head-qualifier regression ----------
+
+    /// Regression test for the a20a4 status bug: in fork-PR mode,
+    /// `fetch_latest_pr` must construct the GitHub head qualifier as
+    /// `<fork_owner>:<branch>`, NOT `<upstream_owner>:<branch>`.
+    ///
+    /// Pre-fix code passed only the upstream owner to
+    /// `latest_pr_for_head`, which used it as both the URL-path owner
+    /// AND the head qualifier owner. In fork-PR mode this produced
+    /// `head=upstream-owner:agent-q` queries that never matched
+    /// fork-headed PRs — operators saw `latest PR: (none)` even when
+    /// a PR was open.
+    ///
+    /// This test mocks GitHub with a strict `head=fork-acc:agent-q`
+    /// matcher. Pre-fix code would issue the wrong query AND mockito's
+    /// `.expect(1)` would not be met; the test would fail.
+    #[tokio::test]
+    async fn status_shows_latest_pr_in_fork_pr_mode() {
+        let env_var = "STATUS_TOKEN_FORK_MODE";
+        // SAFETY: tests run sequentially via tokio runtime; the env var
+        // is unique to this test.
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded(
+                    "head".into(),
+                    "fork-acc:agent-q".into(),
+                ),
+                mockito::Matcher::UrlEncoded("state".into(), "all".into()),
+                mockito::Matcher::UrlEncoded("sort".into(), "created".into()),
+                mockito::Matcher::UrlEncoded(
+                    "direction".into(),
+                    "desc".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 99,
+                    "title": "Fork-mode PR",
+                    "state": "open",
+                    "html_url": "https://example.invalid/pr/99",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "merged_at": null,
+                    "head": {"ref": "agent-q"}
+                }]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let gh = GithubConfig {
+            token_env: env_var.to_string(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: Some("fork-acc".to_string()),
+            recreate_fork_on_reinit: false,
+        };
+
+        let pr = super::fetch_latest_pr_at(&server.url(), &repo, &gh).await;
+        assert!(
+            pr.is_some(),
+            "fork-PR mode must surface the open PR; pre-fix code returned None here"
+        );
+        let pr = pr.unwrap();
+        assert_eq!(pr.number, 99);
+        mock.assert_async().await;
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
     }
 }

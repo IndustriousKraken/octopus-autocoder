@@ -97,9 +97,18 @@ async fn list_open_prs_at(
     Ok(parsed)
 }
 
-/// Fetch the most-recently-created PR whose head equals `head_branch`
-/// in the qualified `owner:branch` form. Used by the operator-status
-/// reply to show "latest PR by the daemon."
+/// Fetch the most-recently-created PR whose head equals
+/// `{head_owner}:{head_branch}`. Used by the operator-status reply to
+/// show "latest PR by the daemon."
+///
+/// In fork-PR mode (`github.fork_owner` set), callers SHALL pass
+/// `head_owner = fork_owner`. In direct-push mode, callers SHALL pass
+/// `head_owner = owner`. Pre-`a20a4` the helper reused the URL-path
+/// `owner` parameter for the head qualifier, which never matched a
+/// fork-headed PR — making the status reply show `(none)` on every
+/// fork-PR-mode deployment even when a PR was open. Aligns with the
+/// caller-builds-head-qualifier pattern used by
+/// `polling_loop.rs::open_pr_exists_for_agent_branch_at`.
 ///
 /// Returns `Ok(Some(PrSummary))` on a 200 with a non-empty list,
 /// `Ok(None)` on a 200 with an empty list (no PR ever opened from this
@@ -111,6 +120,7 @@ pub async fn latest_pr_for_head(
     token: &str,
     owner: &str,
     repo: &str,
+    head_owner: &str,
     head_branch: &str,
 ) -> Result<Option<crate::chatops::operator_commands::PrSummary>> {
     use chrono::{DateTime, Utc};
@@ -132,7 +142,7 @@ pub async fn latest_pr_for_head(
     }
 
     let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
-    let head_qualified = format!("{owner}:{head_branch}");
+    let head_qualified = format!("{head_owner}:{head_branch}");
     let resp = reqwest::Client::new()
         .get(&url)
         .query(&[
@@ -808,15 +818,27 @@ pub async fn list_open_prs_all(
 /// revision dispatcher to find the set of bot-opened PRs to poll for
 /// comment triggers. Pagination beyond 100 is out of scope — a repo with
 /// >100 open PRs from a single agent branch is unrealistic.
+/// List open PRs on `owner/repo` whose head matches
+/// `{head_owner}:{head_branch}`.
+///
+/// In fork-PR mode (`github.fork_owner` set), callers SHALL pass
+/// `head_owner = fork_owner`. In direct-push mode, callers SHALL pass
+/// `head_owner = owner` (the upstream). Pre-`a20a4` the helper reused
+/// the URL-path `owner` parameter for the head qualifier, which never
+/// matched a fork-headed PR — making the revise dispatcher silently
+/// non-functional on every fork-PR-mode deployment. Aligns with the
+/// caller-builds-head-qualifier pattern used by
+/// `polling_loop.rs::open_pr_exists_for_agent_branch_at`.
 pub async fn list_open_prs_for_head(
     api_base: &str,
     token: &str,
     owner: &str,
     repo: &str,
+    head_owner: &str,
     head_branch: &str,
 ) -> Result<Vec<PrSummary>> {
     let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
-    let head_qualified = format!("{owner}:{head_branch}");
+    let head_qualified = format!("{head_owner}:{head_branch}");
     let resp = reqwest::Client::new()
         .get(&url)
         .query(&[
@@ -1518,7 +1540,7 @@ mod tests {
             .create_async()
             .await;
 
-        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect("call should succeed");
         let pr = pr.expect("response with one PR should yield Some");
@@ -1551,7 +1573,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect("call should succeed")
             .expect("one PR");
@@ -1577,7 +1599,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect("call should succeed")
             .expect("one PR");
@@ -1593,7 +1615,7 @@ mod tests {
             .with_body("[]")
             .create_async()
             .await;
-        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect("empty list should be Ok(None)");
         assert!(pr.is_none());
@@ -1608,7 +1630,7 @@ mod tests {
             .with_body(r#"{"message":"Not Found"}"#)
             .create_async()
             .await;
-        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("404 must surface as Err");
         let msg = format!("{err:#}");
@@ -1624,7 +1646,7 @@ mod tests {
             .with_body(r#"{"message":"API rate limit exceeded"}"#)
             .create_async()
             .await;
-        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("rate-limit 403 must surface as Err so caller can swallow");
         let msg = format!("{err:#}");
@@ -1643,7 +1665,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("missing required field must error");
         let msg = format!("{err:#}");
@@ -1771,7 +1793,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let prs = list_open_prs_for_head(&server.url(), "testtoken", "owner", "repo", "agent-q")
+        let prs = list_open_prs_for_head(&server.url(), "testtoken", "owner", "repo", "owner", "agent-q")
             .await
             .expect("call should succeed");
         assert_eq!(prs.len(), 1);
@@ -1792,7 +1814,7 @@ mod tests {
             .with_body("[]")
             .create_async()
             .await;
-        let prs = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let prs = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect("empty list");
         assert!(prs.is_empty());
@@ -1807,7 +1829,7 @@ mod tests {
             .with_body(r#"{"message":"Not Found"}"#)
             .create_async()
             .await;
-        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("404 must surface as Err");
         let msg = format!("{err:#}");
@@ -1823,7 +1845,7 @@ mod tests {
             .with_body("server error")
             .create_async()
             .await;
-        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("500 must surface as Err");
         let msg = format!("{err:#}");
@@ -1839,11 +1861,97 @@ mod tests {
             .with_body(r#"{"message":"Bad credentials"}"#)
             .create_async()
             .await;
-        let err = list_open_prs_for_head(&server.url(), "bad", "owner", "repo", "agent-q")
+        let err = list_open_prs_for_head(&server.url(), "bad", "owner", "repo", "owner", "agent-q")
             .await
             .expect_err("401 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("401"));
+    }
+
+    // ---------- a20a4: head_owner-aware qualifier construction ----------
+
+    /// Regression test for the fork-PR-mode head-qualifier bug. The
+    /// helper MUST use the explicit `head_owner` parameter (the fork
+    /// owner in fork-PR mode), NOT the URL-path `owner` parameter (the
+    /// upstream owner). Pre-fix code reused `owner` for both AND
+    /// produced `head=upstream-owner:agent-q` queries that never
+    /// matched fork-headed PRs. This test fails against pre-fix code
+    /// because mockito would receive an UNMATCHED query (the literal
+    /// mocked `head` value is `fork-owner:agent-q` AND there's no
+    /// fallback handler) AND mockito's `.expect(1)` would not be met.
+    #[tokio::test]
+    async fn list_open_prs_for_head_uses_head_owner_param_for_qualifier() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("state".into(), "open".into()),
+                // Critical assertion: the head qualifier uses the FORK
+                // owner, NOT the upstream owner that owns the URL path.
+                mockito::Matcher::UrlEncoded(
+                    "head".into(),
+                    "fork-owner:agent-q".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        let prs = list_open_prs_for_head(
+            &server.url(),
+            "tok",
+            "upstream-owner",    // URL path owner (the upstream repo)
+            "myrepo",
+            "fork-owner",        // head qualifier owner (the fork)
+            "agent-q",
+        )
+        .await
+        .expect("call should succeed against mock");
+        assert!(prs.is_empty());
+        mock.assert_async().await;
+    }
+
+    /// Same shape for `latest_pr_for_head`. Pre-`a20a4` this query
+    /// produced `head=upstream-owner:agent-q` which never matched a
+    /// fork-headed PR, so the status reply showed `latest PR: (none)`
+    /// for every fork-PR-mode operator.
+    #[tokio::test]
+    async fn latest_pr_for_head_uses_head_owner_param_for_qualifier() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded(
+                    "head".into(),
+                    "fork-owner:agent-q".into(),
+                ),
+                mockito::Matcher::UrlEncoded("state".into(), "all".into()),
+                mockito::Matcher::UrlEncoded("sort".into(), "created".into()),
+                mockito::Matcher::UrlEncoded(
+                    "direction".into(),
+                    "desc".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        let pr = latest_pr_for_head(
+            &server.url(),
+            "tok",
+            "upstream-owner",
+            "myrepo",
+            "fork-owner",
+            "agent-q",
+        )
+        .await
+        .expect("call should succeed against mock");
+        assert!(pr.is_none(), "empty response → None");
+        mock.assert_async().await;
     }
 
     #[tokio::test]

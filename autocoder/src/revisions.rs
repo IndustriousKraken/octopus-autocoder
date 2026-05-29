@@ -356,15 +356,27 @@ pub async fn process_revision_requests_at(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    let open_prs =
-        github::list_open_prs_for_head(api_base, &token, &owner, &repo_name, &repo.agent_branch)
-            .await
-            .with_context(|| {
-                format!(
-                    "listing open PRs for {owner}/{repo_name} head {}",
-                    repo.agent_branch
-                )
-            })?;
+    // Per a20a4: the head qualifier owner is the fork owner in fork-PR
+    // mode, the upstream owner in direct-push mode. Pre-fix code used
+    // the upstream owner unconditionally — which never matched a
+    // fork-headed PR, leaving fork-PR-mode operators without working
+    // `@<bot> revise <text>` since fork-PR mode shipped.
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
+    let open_prs = github::list_open_prs_for_head(
+        api_base,
+        &token,
+        &owner,
+        &repo_name,
+        head_owner,
+        &repo.agent_branch,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "listing open PRs for {owner}/{repo_name} head {head_owner}:{}",
+            repo.agent_branch
+        )
+    })?;
     let open_numbers: HashSet<u64> = open_prs.iter().map(|p| p.number).collect();
     let _pruned = prune_closed_prs(workspace, &open_numbers)?;
     let push_remote = if github_cfg.fork_owner.is_some() {
@@ -1661,6 +1673,94 @@ mod tests {
         // Both state files should be gone (no open PR claims them).
         assert!(read_state(&ws, 5).unwrap().is_none());
         assert!(read_state(&ws, 7).unwrap().is_none());
+
+        token_env_clear(env_var);
+    }
+
+    /// Regression test for the a20a4 fork-PR-mode head-qualifier bug.
+    ///
+    /// Configures `github.fork_owner = "fork-acc"` and mocks GitHub
+    /// with an exact `head=fork-acc:agent-q` matcher. Pre-fix code
+    /// passed `&owner` (the upstream `owner`) to
+    /// `list_open_prs_for_head`, which constructed
+    /// `head=owner:agent-q` — never matching the mock. The mock's
+    /// `.expect(1)` would fail because the request never arrived.
+    ///
+    /// Post-fix, the dispatcher computes
+    /// `head_owner = fork_owner.as_deref().unwrap_or(&owner)` AND passes
+    /// it explicitly. The mock matches, the dispatcher fetches the
+    /// PR's comments, AND the test asserts the dispatcher proceeded
+    /// past the empty-list early-return.
+    #[tokio::test]
+    async fn dispatcher_finds_pr_in_fork_pr_mode() {
+        let env_var = "REVISIONS_TOKEN_FORK_MODE";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        // Strict head matcher — only `fork-acc:agent-q` may match.
+        let pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("state".into(), "open".into()),
+                mockito::Matcher::UrlEncoded(
+                    "head".into(),
+                    "fork-acc:agent-q".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 99,
+                    "title": "PR",
+                    "html_url": "https://example.invalid/pr/99",
+                    "state": "open",
+                    "body": "Changes implemented in this pass:\n\n- my-change",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {"ref": "agent-q"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        // The dispatcher continues into the per-PR processing path; it
+        // fetches comments for PR #99. Stub with an empty list so no
+        // revision attempt is made — we just need to prove the dispatcher
+        // got past the empty-PR-list early-return.
+        let comments = server
+            .mock("GET", "/repos/owner/repo/issues/99/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let mut gh = make_github(env_var);
+        gh.fork_owner = Some("fork-acc".to_string());
+        let executor = StubExecutor::new(Vec::new());
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        // The PR-list mock fired exactly once — the dispatcher used
+        // the fork-owner-qualified `head`. Pre-fix code would not have
+        // matched and this assertion would fail.
+        pulls.assert_async().await;
+        // The dispatcher proceeded past the empty-list early-return
+        // and fetched comments for the PR.
+        comments.assert_async().await;
 
         token_env_clear(env_var);
     }
