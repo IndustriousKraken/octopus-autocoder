@@ -63,6 +63,10 @@ pub const DEFAULT_CHANGELOG_STYLIST_TEMPLATE: &str =
 const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
 const REVISION_DIFF_PLACEHOLDER: &str = "{{pr_diff}}";
 const REVISION_REQUEST_PLACEHOLDER: &str = "{{revision_request}}";
+// Per a20a5: revision prompt is constructed from PR-sourced material.
+const REVISION_PR_BODY_PLACEHOLDER: &str = "{{pr_body}}";
+const REVISION_PR_CHANGE_LIST_PLACEHOLDER: &str = "{{pr_change_list}}";
+const REVISION_AGENT_NOTES_PLACEHOLDER: &str = "{{agent_implementation_notes}}";
 const TRIAGE_FINDINGS_PLACEHOLDER: &str = "{{findings}}";
 const TRIAGE_AUDIT_TYPE_PLACEHOLDER: &str = "{{audit_type}}";
 const TRIAGE_REPO_URL_PLACEHOLDER: &str = "{{repo_url}}";
@@ -309,56 +313,39 @@ impl ClaudeCliExecutor {
     /// instructions apply` and substituting the result into the revision
     /// template (along with the PR diff and the operator's revision
     /// text). Errors propagate the same way as `build_prompt`.
+    /// Build the revision-mode prompt from the executor's
+    /// `RevisionContext`. Per a20a5: ALL material comes from the
+    /// `RevisionContext` (PR-sourced); there is NO subprocess call AND
+    /// NO degraded-prompt fallback. If the dispatcher provided
+    /// incomplete context, the dispatcher already refused to invoke
+    /// the executor — this builder is unreachable in that case.
+    ///
+    /// Pre-a20a5 this function spawned `openspec instructions apply
+    /// --change <X>` to load "the original change material." That call
+    /// always failed (because autocoder enforces `openspec archive`
+    /// before push, so the active change directory is never present
+    /// when revise runs) AND the code "fell back to a placeholder."
+    /// The placeholder path silently degraded 100% of production
+    /// revise attempts. Both the subprocess call AND the placeholder
+    /// are now removed entirely; a20a5's canonical "no degraded-prompt
+    /// path is permitted" invariant forbids reintroducing either.
     fn build_revision_prompt(
         &self,
-        workspace: &Path,
-        change: &str,
+        _workspace: &Path,
+        _change: &str,
         revision_context: &crate::revisions::RevisionContext,
     ) -> Result<String> {
-        let out = std::process::Command::new("openspec")
-            .args(["instructions", "apply", "--change", change])
-            .current_dir(workspace)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow!(
-                        "openspec binary not found on PATH while building revision prompt for `{change}`"
-                    )
-                } else {
-                    anyhow!(
-                        "spawning `openspec instructions apply` for revision of `{change}` failed: {e}"
-                    )
-                }
-            });
-        // Revision mode is best-effort about loading the original change
-        // body: if `openspec instructions apply` cannot find the change
-        // (e.g. it was archived and the active dir is gone), we fall back
-        // to a placeholder note so the executor still gets the PR diff +
-        // revision text and can make targeted edits.
-        let change_body = match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            Ok(o) => {
-                let stderr_tail: String = String::from_utf8_lossy(&o.stderr)
-                    .chars()
-                    .take(200)
-                    .collect();
-                tracing::warn!(
-                    change,
-                    "`openspec instructions apply` for revision-mode failed; falling back to placeholder: {stderr_tail}"
-                );
-                "_(original change material unavailable — `openspec instructions apply` failed; rely on the PR diff and the revision request below.)_"
-                    .to_string()
-            }
-            Err(e) => {
-                tracing::warn!(change, "revision-mode openspec invocation errored: {e:#}");
-                format!(
-                    "_(original change material unavailable — {e}; rely on the PR diff and the revision request below.)_"
-                )
-            }
-        };
         let rendered = self
             .revision_template
-            .replace(PROMPT_BODY_PLACEHOLDER, &change_body)
+            .replace(REVISION_PR_BODY_PLACEHOLDER, &revision_context.pr_body)
+            .replace(
+                REVISION_PR_CHANGE_LIST_PLACEHOLDER,
+                &revision_context.pr_change_list,
+            )
+            .replace(
+                REVISION_AGENT_NOTES_PLACEHOLDER,
+                &revision_context.agent_implementation_notes,
+            )
             .replace(REVISION_DIFF_PLACEHOLDER, &revision_context.pr_diff)
             .replace(REVISION_REQUEST_PLACEHOLDER, &revision_context.revision_text);
         Ok(rendered)
@@ -3005,9 +2992,12 @@ some narrative output before the sentinel\n\
     }
 
     /// 5.4: a revision-mode prompt build with a sample `RevisionContext`
-    /// produces a rendered prompt containing all three substitution
-    /// sections — the original change body, the PR diff, and the
-    /// revision request — in the documented order.
+    /// Per a20a5: the revision prompt is constructed exclusively from
+    /// PR-sourced material in the `RevisionContext`. The builder MUST:
+    /// (a) substitute all FIVE placeholders verbatim into the
+    /// template's positions, (b) NOT spawn any subprocess (the
+    /// pre-a20a5 `openspec instructions apply` call is removed), AND
+    /// (c) NOT contain ANY legacy placeholder fallback string.
     #[test]
     fn build_revision_prompt_substitutes_all_placeholders() {
         let (_dir, ws) = fixture_workspace();
@@ -3016,43 +3006,97 @@ some narrative output before the sentinel\n\
             change_name: "x".to_string(),
             pr_diff: "DIFF_HERE".to_string(),
             revision_text: "REVISION_HERE".to_string(),
+            pr_body: "PR_BODY_HERE".to_string(),
+            pr_change_list: "a17-foo\na18-bar".to_string(),
+            agent_implementation_notes: "AGENT_NOTES_HERE".to_string(),
         };
-        // openspec may or may not be available in the test environment.
-        // The function falls back to a placeholder when it's not, so
-        // either way the prompt contains the diff + revision sections.
         let prompt = executor.build_revision_prompt(&ws, "x", &ctx).unwrap();
+
+        // All five context fields appear in the rendered prompt.
         assert!(
             prompt.contains("DIFF_HERE"),
-            "diff section missing from rendered revision prompt:\n{prompt}"
+            "diff missing:\n{prompt}"
         );
         assert!(
             prompt.contains("REVISION_HERE"),
-            "revision request missing from rendered revision prompt:\n{prompt}"
+            "revision request missing:\n{prompt}"
         );
         assert!(
-            prompt.contains("BEGIN ORIGINAL CHANGE"),
-            "original-change marker missing:\n{prompt}"
+            prompt.contains("PR_BODY_HERE"),
+            "PR body missing:\n{prompt}"
         );
         assert!(
-            prompt.contains("BEGIN PR DIFF"),
-            "PR-diff marker missing:\n{prompt}"
+            prompt.contains("a17-foo"),
+            "change list missing:\n{prompt}"
         );
         assert!(
-            prompt.contains("BEGIN REVISION REQUEST"),
-            "revision-request marker missing:\n{prompt}"
+            prompt.contains("a18-bar"),
+            "change list (second slug) missing:\n{prompt}"
         );
-        // Ordering: original change, then diff, then revision request.
-        let pos_change = prompt
-            .find("BEGIN ORIGINAL CHANGE")
-            .expect("change marker present");
-        let pos_diff = prompt.find("BEGIN PR DIFF").expect("diff marker present");
-        let pos_req = prompt
-            .find("BEGIN REVISION REQUEST")
-            .expect("revision marker present");
         assert!(
-            pos_change < pos_diff && pos_diff < pos_req,
-            "sections out of order: change={pos_change} diff={pos_diff} req={pos_req}"
+            prompt.contains("AGENT_NOTES_HERE"),
+            "agent implementation notes missing:\n{prompt}"
         );
+
+        // Section markers in the new template.
+        for marker in [
+            "BEGIN CHANGES IN THIS PR",
+            "BEGIN PR BODY",
+            "BEGIN ORIGINAL AGENT IMPLEMENTATION NOTES",
+            "BEGIN PR DIFF",
+            "BEGIN REVISION REQUEST",
+        ] {
+            assert!(
+                prompt.contains(marker),
+                "marker `{marker}` missing:\n{prompt}"
+            );
+        }
+
+        // No legacy placeholder fallback strings, no legacy
+        // {{change_body}} placeholder, no unrendered new placeholders.
+        for forbidden in [
+            "original change material unavailable",
+            "openspec instructions apply",
+            "{{change_body}}",
+            "{{pr_body}}",
+            "{{pr_change_list}}",
+            "{{agent_implementation_notes}}",
+            "{{pr_diff}}",
+            "{{revision_request}}",
+            "BEGIN ORIGINAL CHANGE",  // pre-a20a5 marker
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "forbidden string `{forbidden}` present in rendered prompt:\n{prompt}"
+            );
+        }
+    }
+
+    /// a20a5 regression test: build_revision_prompt MUST NOT call
+    /// `openspec` (or any other subprocess). The previous
+    /// implementation spawned `openspec instructions apply` and fell
+    /// back to a placeholder when it failed — that call is removed.
+    /// Verifies via the renderered prompt's contents (the placeholder
+    /// fallback string would surface if the subprocess were re-added
+    /// AND it failed).
+    #[test]
+    fn build_revision_prompt_does_not_invoke_openspec() {
+        let (_dir, ws) = fixture_workspace();
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30);
+        let ctx = crate::revisions::RevisionContext {
+            change_name: "x".to_string(),
+            pr_diff: "diff".to_string(),
+            revision_text: "rev".to_string(),
+            pr_body: "body".to_string(),
+            pr_change_list: "x".to_string(),
+            agent_implementation_notes: "notes".to_string(),
+        };
+        let prompt = executor.build_revision_prompt(&ws, "x", &ctx).unwrap();
+        // If a subprocess fallback were still in place, this would
+        // surface in any error case. The new builder cannot produce
+        // either of these substrings under any input.
+        assert!(!prompt.contains("openspec instructions apply"));
+        assert!(!prompt.contains("original change material unavailable"));
     }
 
     /// End-to-end: after a `run`, the persisted log contains a PROMPT

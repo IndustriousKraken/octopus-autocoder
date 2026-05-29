@@ -65,6 +65,21 @@ pub struct RevisionContext {
     /// The operator's revision text verbatim (after `parse_revision_trigger`
     /// strips the mention and the verb).
     pub revision_text: String,
+    /// PR body verbatim, per a20a5. Contains the `## Code Review`
+    /// section (when the reviewer is enabled) AND any other PR-rendered
+    /// context the human reviewer saw.
+    pub pr_body: String,
+    /// Newline-separated change slugs extracted from the PR body via
+    /// `extract_change_list_from_pr_body`. Lets the LLM resolve which
+    /// change(s) the operator's revision targets (per a20a5's
+    /// multi-change resolution rule).
+    pub pr_change_list: String,
+    /// Concatenated `## Agent implementation notes` issue-comment bodies
+    /// from the PR, in posted order, separated by `\n\n---\n\n` between
+    /// entries. One section per change in multi-change passes. Per
+    /// a20a5: the original implementer's narrative — what the agent
+    /// claimed to do, which is the gap the operator's revision closes.
+    pub agent_implementation_notes: String,
 }
 
 /// Legacy per-workspace directory used as a fallback when the
@@ -567,13 +582,71 @@ async fn process_one_pr(
         }
         // Apply the revision. The change name is derived from the PR's
         // body (the first change listed); v1 supports a single revision
-        // target per PR.
-        let change_name = extract_change_list_from_pr_body(pr.body.as_deref())
-            .into_iter()
-            .next()
+        // target per PR. (Multi-change resolution is delegated to the
+        // LLM via a20a5's pr_change_list field — the dispatcher still
+        // uses the first slug for state-file naming + log routing.)
+        let change_list = extract_change_list_from_pr_body(pr.body.as_deref());
+        let change_name = change_list
+            .first()
+            .cloned()
             .unwrap_or_else(|| repo.agent_branch.clone());
-        let outcome =
-            execute_revision(workspace, repo, executor, &change_name, &revision_text).await;
+
+        // Per a20a5: assemble the executor's revision context from
+        // PR-sourced material. Fetch all-time PR comments to extract
+        // the original implementer's `## Agent implementation notes`.
+        // If the fetch fails, post a clear failure comment AND DO NOT
+        // advance the comment-seen marker — the next iteration's
+        // dispatcher pass re-attempts the assembly so transient API
+        // errors don't lose the operator's revise comment.
+        let all_comments = match github::list_issue_comments_since(
+            api_base,
+            token,
+            owner,
+            repo_name,
+            pr.number,
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        )
+        .await
+        {
+            Ok(cs) => cs,
+            Err(e) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    "revise: PR-context assembly failed (comments fetch): {e:#}; refusing without advancing the seen-marker"
+                );
+                let truncated_err: String =
+                    format!("{e:#}").chars().take(200).collect();
+                let body = format!(
+                    "✗ Cannot revise: failed to fetch PR context: {truncated_err}. The daemon will retry on the next polling iteration. If this persists, check journalctl for the daemon's GitHub API errors AND verify the bot's token has Read access on this repo."
+                );
+                let _ = github::post_issue_comment(
+                    api_base, token, owner, repo_name, pr.number, &body,
+                )
+                .await;
+                // CRITICAL: do NOT advance latest_seen — re-attempt
+                // on the next iteration. Break out of the trigger
+                // loop; subsequent triggers (if any) also get
+                // re-fetched on the next iteration.
+                break;
+            }
+        };
+        let agent_implementation_notes =
+            extract_agent_implementation_notes(&all_comments);
+        let pr_body = pr.body.clone().unwrap_or_default();
+        let pr_change_list_str = change_list.join("\n");
+
+        let outcome = execute_revision(
+            workspace,
+            repo,
+            executor,
+            &change_name,
+            &revision_text,
+            pr_body,
+            pr_change_list_str,
+            agent_implementation_notes,
+        )
+        .await;
         match outcome {
             Ok(ExecutorOutcome::Completed { .. }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
@@ -734,21 +807,54 @@ fn apply_revision_commit(
 
 /// Execute the revision via the executor. Captures the PR diff via
 /// `git diff <base>..<agent>` and bundles the context.
+#[allow(clippy::too_many_arguments)]
 async fn execute_revision(
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,
     change_name: &str,
     revision_text: &str,
+    pr_body: String,
+    pr_change_list: String,
+    agent_implementation_notes: String,
 ) -> Result<ExecutorOutcome> {
+    // a20a5 expanded the RevisionContext to carry PR-sourced material
+    // (pr_body, pr_change_list, agent_implementation_notes). The
+    // per-arg expansion crosses clippy's seven-argument threshold;
+    // bundling into a struct would be cleaner but invasive for one
+    // internal call site. Matches the established codebase pattern
+    // (see handle_message_with_context in chatops::operator_commands).
     let pr_diff = crate::git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)
         .unwrap_or_default();
     let ctx = RevisionContext {
         change_name: change_name.to_string(),
         pr_diff,
         revision_text: revision_text.to_string(),
+        pr_body,
+        pr_change_list,
+        agent_implementation_notes,
     };
     executor.run_revision(workspace, change_name, &ctx).await
+}
+
+/// Per a20a5: extract the original implementer's narrative from PR
+/// comments. Matches issue comments whose body starts with the
+/// canonical `## Agent implementation notes` heading (per the
+/// `Implementer-summary PR comment` requirement). Concatenates matched
+/// bodies in posted-order, separated by `\n\n---\n\n`. Returns an
+/// empty string when no matching comments exist (e.g., revise was
+/// posted within the same iteration the PR was created — the LLM
+/// still has the diff + body + revision text to work with).
+pub(crate) fn extract_agent_implementation_notes(
+    comments: &[github::IssueComment],
+) -> String {
+    const HEADING: &str = "## Agent implementation notes";
+    let matches: Vec<&str> = comments
+        .iter()
+        .filter(|c| c.body.starts_with(HEADING))
+        .map(|c| c.body.as_str())
+        .collect();
+    matches.join("\n\n---\n\n")
 }
 
 #[cfg(test)]
@@ -914,6 +1020,73 @@ mod tests {
         assert_eq!(
             parse_revision_trigger("@MyBot revise foo", "mybot"),
             Some("foo".to_string())
+        );
+    }
+
+    // ---------- a20a5: agent-notes extraction ----------
+
+    fn ic(body: &str, ts: chrono::DateTime<chrono::Utc>) -> crate::github::IssueComment {
+        crate::github::IssueComment {
+            id: 1,
+            body: body.to_string(),
+            user: None,
+            created_at: ts,
+        }
+    }
+
+    #[test]
+    fn extract_agent_notes_returns_single_match() {
+        let ts = chrono::Utc::now();
+        let comments = vec![
+            ic("Some unrelated comment", ts),
+            ic("## Agent implementation notes\n\nDid X and Y.", ts),
+        ];
+        let out = extract_agent_implementation_notes(&comments);
+        assert_eq!(out, "## Agent implementation notes\n\nDid X and Y.");
+    }
+
+    #[test]
+    fn extract_agent_notes_concatenates_multiple_with_separator() {
+        let ts = chrono::Utc::now();
+        let comments = vec![
+            ic("## Agent implementation notes\n\nFirst pass.", ts),
+            ic("Some revise reply.", ts),
+            ic("## Agent implementation notes\n\nSecond pass.", ts),
+        ];
+        let out = extract_agent_implementation_notes(&comments);
+        assert_eq!(
+            out,
+            "## Agent implementation notes\n\nFirst pass.\n\n---\n\n## Agent implementation notes\n\nSecond pass."
+        );
+    }
+
+    #[test]
+    fn extract_agent_notes_returns_empty_when_no_matches() {
+        let ts = chrono::Utc::now();
+        let comments = vec![
+            ic("Some unrelated comment", ts),
+            ic("@bot revise add a thing", ts),
+            ic("✅ Revision applied: blah.", ts),
+        ];
+        let out = extract_agent_implementation_notes(&comments);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn extract_agent_notes_requires_exact_heading_prefix() {
+        let ts = chrono::Utc::now();
+        let comments = vec![
+            // Indented heading does NOT match — must start at column 0.
+            ic("  ## Agent implementation notes\n\nIndented.", ts),
+            // Wrong case does NOT match.
+            ic("## agent implementation notes\n\nLowercase.", ts),
+            // Subtle word difference does NOT match.
+            ic("## Agent's implementation notes\n\nApostrophe.", ts),
+        ];
+        let out = extract_agent_implementation_notes(&comments);
+        assert!(
+            out.is_empty(),
+            "false-match in extracted notes:\n{out}"
         );
     }
 
