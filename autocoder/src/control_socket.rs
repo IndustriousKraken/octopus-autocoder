@@ -168,6 +168,41 @@ pub struct SyncUpstreamRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight brownfield-survey request (a29). The chatops
+/// dispatcher's `brownfield-survey` verb appends to
+/// `RepoTaskHandle::pending_brownfield_survey_requests`; the polling
+/// loop drains at most ONE entry per iteration AND runs the survey
+/// pass in survey mode (read-only sandbox; JSON-array response). The
+/// survey state is NOT persisted by the dispatcher — the survey
+/// handler creates `BrownfieldSurveyState` AFTER the executor pass
+/// validates.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BrownfieldSurveyRequest {
+    pub request_id: String,
+    pub repo_url: String,
+    pub guidance: Option<String>,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One in-flight brownfield-batch request (a29). The chatops
+/// dispatcher's `send it`-in-survey-thread routing pushes here. The
+/// polling loop's batch handler loads the referenced
+/// `BrownfieldSurveyState`, transitions it to `InProgress`, AND drains
+/// one `SurveyItem` per iteration into a single-capability brownfield
+/// run.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BrownfieldBatchRequest {
+    pub repo_url: String,
+    pub survey_request_id: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -248,6 +283,21 @@ pub struct RepoTaskHandle {
     /// queueing within a single window is deduplicated on insert.
     pub pending_sync_upstream_requests:
         Arc<Mutex<std::collections::VecDeque<SyncUpstreamRequest>>>,
+    /// Queue of chat-driven brownfield-survey requests (a29). The
+    /// chatops dispatcher's `brownfield-survey` verb pushes here via
+    /// the `queue_brownfield_survey_request` control-socket action;
+    /// the polling loop drains at most ONE entry per iteration.
+    pub pending_brownfield_survey_requests:
+        Arc<Mutex<std::collections::VecDeque<BrownfieldSurveyRequest>>>,
+    /// Queue of chat-driven brownfield-batch requests (a29). The
+    /// chatops dispatcher's `send it`-in-survey-thread routing pushes
+    /// here via the `queue_brownfield_batch_request` control-socket
+    /// action; the polling loop drains at most ONE entry per iteration
+    /// to flip the referenced survey into `InProgress`. Once in
+    /// progress, the survey's items drain one-per-iteration through
+    /// the batch handler.
+    pub pending_brownfield_batch_requests:
+        Arc<Mutex<std::collections::VecDeque<BrownfieldBatchRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -483,6 +533,9 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_spec_it_request" => handle_queue_spec_it_request(&parsed, state),
         "queue_clear_scout" => handle_queue_clear_scout(&parsed, state),
         "queue_sync_upstream_request" => handle_queue_sync_upstream_request(&parsed, state),
+        "queue_brownfield_survey_request" => handle_queue_brownfield_survey_request(&parsed, state),
+        "queue_brownfield_batch_request" => handle_queue_brownfield_batch_request(&parsed, state),
+        "queue_clear_survey" => handle_queue_clear_survey(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
@@ -1891,6 +1944,166 @@ fn handle_queue_clear_scout(parsed: &Value, state: &ControlState) -> Value {
     })
 }
 
+/// Queue a chat-driven brownfield-survey request for the repo's next
+/// polling iteration (a29). The survey state file is NOT yet on disk
+/// (the survey polling handler creates it AFTER the executor pass);
+/// this handler enqueues an in-memory `BrownfieldSurveyRequest`
+/// carrying every field the polling-iteration handler needs.
+fn handle_queue_brownfield_survey_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let guidance = parsed
+        .get("guidance")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_brownfield_survey_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push_back(BrownfieldSurveyRequest {
+                request_id: request_id.clone(),
+                repo_url: url.clone(),
+                guidance,
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Queue a chat-driven brownfield-batch request for the repo's next
+/// polling iteration (a29). The referenced survey state file MUST
+/// already exist; the polling handler loads it to begin the batch
+/// drain.
+fn handle_queue_brownfield_batch_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let survey_request_id = match require_str(parsed, "survey_request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_brownfield_batch_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.survey_request_id == survey_request_id) {
+            g.push_back(BrownfieldBatchRequest {
+                repo_url: url.clone(),
+                survey_request_id: survey_request_id.clone(),
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "survey_request_id": survey_request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Handle the `queue_clear_survey` action (a29). Synchronously deletes
+/// every `BrownfieldSurveyState` file in the matched repo's workspace
+/// AND returns the count cleared. The chatops dispatcher posts the
+/// reply using that count.
+fn handle_queue_clear_survey(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = crate::workspace::resolve_path(&repo);
+    let cleared = match crate::state::brownfield_survey::clear_all(&workspace) {
+        Ok(n) => n,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("clearing brownfield-survey state: {e:#}"),
+            });
+        }
+    };
+    json!({
+        "ok": true,
+        "url": url,
+        "cleared": cleared,
+    })
+}
+
 /// Handle the `query_canonical_specs` action (a21). Looks up the
 /// workspace's `CanonicalRagStore` in the daemon's registry; on hit,
 /// runs the query and returns ranked chunks. Every error path is
@@ -2415,6 +2628,10 @@ mod tests {
                     pending_spec_it_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_sync_upstream_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_brownfield_survey_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
@@ -3648,6 +3865,10 @@ github:
                     pending_spec_it_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_sync_upstream_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_brownfield_survey_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),

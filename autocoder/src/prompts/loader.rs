@@ -66,6 +66,8 @@ pub enum PromptId {
     AuditDocumentation,
     /// `prompts/brownfield-draft.md` — brownfield-draft handler.
     BrownfieldDraft,
+    /// `prompts/brownfield-survey.md` — brownfield-survey handler (a29).
+    BrownfieldSurvey,
     /// `prompts/scout.md` — scout handler (a25).
     Scout,
     /// `prompts/change-contradiction-check.md` — contradiction
@@ -97,6 +99,7 @@ const PROMPT_SECURITY_BUG_AUDIT: &str =
 const PROMPT_DOCUMENTATION_AUDIT: &str =
     include_str!("../../../prompts/documentation-audit.md");
 const PROMPT_BROWNFIELD_DRAFT: &str = include_str!("../../../prompts/brownfield-draft.md");
+const PROMPT_BROWNFIELD_SURVEY: &str = include_str!("../../../prompts/brownfield-survey.md");
 const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
 const PROMPT_CHANGE_CONTRADICTION_CHECK: &str =
     include_str!("../../../prompts/change-contradiction-check.md");
@@ -117,6 +120,7 @@ impl PromptId {
             Self::AuditSecurityBug => PROMPT_SECURITY_BUG_AUDIT,
             Self::AuditDocumentation => PROMPT_DOCUMENTATION_AUDIT,
             Self::BrownfieldDraft => PROMPT_BROWNFIELD_DRAFT,
+            Self::BrownfieldSurvey => PROMPT_BROWNFIELD_SURVEY,
             Self::Scout => PROMPT_SCOUT,
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
         }
@@ -139,6 +143,7 @@ impl PromptId {
             Self::AuditSecurityBug => "security-bug-audit.md",
             Self::AuditDocumentation => "documentation-audit.md",
             Self::BrownfieldDraft => "brownfield-draft.md",
+            Self::BrownfieldSurvey => "brownfield-survey.md",
             Self::Scout => "scout.md",
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
         }
@@ -159,6 +164,7 @@ impl PromptId {
             Self::AuditSecurityBug => "AuditSecurityBug",
             Self::AuditDocumentation => "AuditDocumentation",
             Self::BrownfieldDraft => "BrownfieldDraft",
+            Self::BrownfieldSurvey => "BrownfieldSurvey",
             Self::Scout => "Scout",
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
         }
@@ -180,6 +186,7 @@ impl PromptId {
             Self::AuditSecurityBug,
             Self::AuditDocumentation,
             Self::BrownfieldDraft,
+            Self::BrownfieldSurvey,
             Self::Scout,
             Self::ChangeContradictionCheck,
         ]

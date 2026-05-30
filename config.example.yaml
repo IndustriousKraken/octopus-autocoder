@@ -579,6 +579,21 @@ github:
 #     # the polling handler posts a one-time warning naming the gap.
 #     # The warning does NOT block. Default: 7.
 #     # staleness_warn_days: 7
+#
+#   brownfield_survey:
+#     # When `false`, the chatops dispatcher refuses `@<bot> brownfield-survey`,
+#     # `@<bot> clear-survey`, AND `@<bot> send it` in survey threads at
+#     # parse time. Default: true.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom brownfield-survey prompt
+#     # template. Resolved via the uniform Prompt overrides table.
+#     # Default: null (use the embedded `prompts/brownfield-survey.md`).
+#     # prompt_path: ./prompts/brownfield-survey-custom.md
+#
+#     # Cap on the survey's returned proposed-capability list. Valid
+#     # range 1..=50. Default: 20.
+#     # max_capabilities: 20
 
 
 # Canonical-spec RAG (a21). Optional top-level block. When absent OR

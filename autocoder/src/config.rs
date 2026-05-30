@@ -220,6 +220,8 @@ pub struct FeaturesConfig {
     pub brownfield: BrownfieldFeatureConfig,
     #[serde(default)]
     pub scout: ScoutFeatureConfig,
+    #[serde(default)]
+    pub brownfield_survey: BrownfieldSurveyFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -320,6 +322,64 @@ impl ScoutFeatureConfig {
             return Err(format!(
                 "features.scout.max_items ({}) outside valid range {}..={}",
                 self.max_items, SCOUT_MAX_ITEMS_MIN, SCOUT_MAX_ITEMS_MAX
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Config for the `brownfield-survey` chatops verb (a29). The verb is
+/// enabled per-workspace by default; operators opt out by setting
+/// `enabled: false`. `prompt_path` overrides the embedded survey
+/// prompt template per the uniform a24 pattern. `max_capabilities`
+/// caps the size of the executor's returned proposed-capability list
+/// (valid range `1..=50`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrownfieldSurveyFeatureConfig {
+    #[serde(default = "default_brownfield_survey_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+    #[serde(default = "default_brownfield_survey_max_capabilities")]
+    pub max_capabilities: usize,
+}
+
+impl Default for BrownfieldSurveyFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_brownfield_survey_enabled(),
+            prompt_path: None,
+            max_capabilities: default_brownfield_survey_max_capabilities(),
+        }
+    }
+}
+
+fn default_brownfield_survey_enabled() -> bool {
+    true
+}
+
+fn default_brownfield_survey_max_capabilities() -> usize {
+    20
+}
+
+/// Valid range for `features.brownfield_survey.max_capabilities`.
+pub const BROWNFIELD_SURVEY_MAX_CAPABILITIES_MIN: usize = 1;
+pub const BROWNFIELD_SURVEY_MAX_CAPABILITIES_MAX: usize = 50;
+
+impl BrownfieldSurveyFeatureConfig {
+    /// Validate the resolved brownfield-survey config. Returns
+    /// `Err(msg)` when `max_capabilities` is outside the documented
+    /// range.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_capabilities < BROWNFIELD_SURVEY_MAX_CAPABILITIES_MIN
+            || self.max_capabilities > BROWNFIELD_SURVEY_MAX_CAPABILITIES_MAX
+        {
+            return Err(format!(
+                "features.brownfield_survey.max_capabilities ({}) outside valid range {}..={}",
+                self.max_capabilities,
+                BROWNFIELD_SURVEY_MAX_CAPABILITIES_MIN,
+                BROWNFIELD_SURVEY_MAX_CAPABILITIES_MAX
             ));
         }
         Ok(())
@@ -2092,6 +2152,14 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             FindingCategory::Schema,
             msg,
             Some("features/scout/max_items".into()),
+        );
+    }
+    // a29: features.brownfield_survey.max_capabilities must be within 1..=50.
+    if let Err(msg) = config.features.brownfield_survey.validate() {
+        report.push_error(
+            FindingCategory::Schema,
+            msg,
+            Some("features/brownfield_survey/max_capabilities".into()),
         );
     }
 }
@@ -5924,6 +5992,113 @@ features:
             report.errors.iter().any(|f| f.message.contains("max_items")
                 && f.message.contains("1..=50")),
             "expected schema error naming max_items range; got: {:?}",
+            report.errors
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // features.brownfield_survey (a29)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_brownfield_survey_block_omitted_uses_defaults() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        assert!(
+            cfg.features.brownfield_survey.enabled,
+            "default enabled must be true"
+        );
+        assert!(cfg.features.brownfield_survey.prompt_path.is_none());
+        assert_eq!(cfg.features.brownfield_survey.max_capabilities, 20);
+    }
+
+    #[test]
+    fn features_brownfield_survey_explicit_block_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  brownfield_survey:
+    enabled: false
+    prompt_path: "./prompts/survey-custom.md"
+    max_capabilities: 35
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit fields parse");
+        assert!(!cfg.features.brownfield_survey.enabled);
+        assert_eq!(
+            cfg.features.brownfield_survey.prompt_path.as_deref(),
+            Some(Path::new("./prompts/survey-custom.md"))
+        );
+        assert_eq!(cfg.features.brownfield_survey.max_capabilities, 35);
+    }
+
+    #[test]
+    fn features_brownfield_survey_max_capabilities_zero_fails_validation() {
+        let cfg = BrownfieldSurveyFeatureConfig {
+            max_capabilities: 0,
+            ..BrownfieldSurveyFeatureConfig::default()
+        };
+        let err = cfg.validate().expect_err("max_capabilities=0 invalid");
+        assert!(err.contains("max_capabilities"), "{err}");
+        assert!(err.contains("1..=50"), "{err}");
+    }
+
+    #[test]
+    fn features_brownfield_survey_max_capabilities_above_50_fails_validation() {
+        let cfg = BrownfieldSurveyFeatureConfig {
+            max_capabilities: 51,
+            ..BrownfieldSurveyFeatureConfig::default()
+        };
+        let err = cfg.validate().expect_err("max_capabilities=51 invalid");
+        assert!(err.contains("max_capabilities"), "{err}");
+        assert!(err.contains("1..=50"), "{err}");
+    }
+
+    #[test]
+    fn features_brownfield_survey_invalid_max_capabilities_surfaces_in_validate_config() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 60
+github:
+  token_env: GITHUB_TOKEN
+features:
+  brownfield_survey:
+    max_capabilities: 100
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("parses; range check is in validate");
+        let report = validate_config(&cfg);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.message.contains("max_capabilities")
+                    && f.message.contains("1..=50")),
+            "expected schema error naming max_capabilities range; got: {:?}",
             report.errors
         );
     }

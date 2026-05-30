@@ -234,6 +234,7 @@ override at all before the uniform loader landed.
 | `AuditSecurityBug`               | `prompts/security-bug-audit.md`            | `audits.settings.security_bug_audit.prompt_path`             | —                                                          |
 | `AuditDocumentation`             | `prompts/documentation-audit.md`           | `audits.settings.documentation_audit.prompt_path`            | —                                                          |
 | `BrownfieldDraft`                | `prompts/brownfield-draft.md`              | `features.brownfield.prompt_path`                            | —                                                          |
+| `BrownfieldSurvey`               | `prompts/brownfield-survey.md`             | `features.brownfield_survey.prompt_path`                     | —                                                          |
 | `Scout`                          | `prompts/scout.md`                         | `features.scout.prompt_path`                                 | —                                                          |
 | `ChangeContradictionCheck`       | `prompts/change-contradiction-check.md`    | `executor.change_internal_contradiction_check_prompt_path`   | —                                                          |
 
@@ -442,6 +443,28 @@ features:
 **Default behaviour.** Omitting the `features.scout` block (or omitting the entire `features:` parent block) is equivalent to all five defaults above. The verb works out of the box on a fresh install.
 
 **Prompt override.** See the [Prompt overrides](#prompt-overrides) table for the `Scout` entry — `features.scout.prompt_path` is workspace-relative AND falls back to the embedded `prompts/scout.md` template when the configured file is missing or empty.
+
+### `features.brownfield_survey` {#featuresbrownfield_survey}
+
+Config for the `brownfield-survey` chatops verb (a29). The verb surveys an existing codebase AND returns a curated list of proposed capabilities the operator can batch-generate via `send it`. See [CHATOPS.md → brownfield-survey](CHATOPS.md#brownfield-survey) for the verb syntax, refusal cases, AND lifecycle-thread behavior, AND [OPERATIONS.md → Bootstrapping specs for an existing project](OPERATIONS.md#bootstrapping-specs-for-an-existing-project) for the recommended survey → review → batch cadence.
+
+```yaml
+features:
+  brownfield_survey:
+    enabled: true                 # default true; set false to refuse the verb at parse time
+    prompt_path: null             # default null; relative path to a custom survey prompt
+    max_capabilities: 20          # default 20; valid range 1..=50
+```
+
+| Field              | Type             | Default | Description                                                                                                                                                                                                                                                                                                            |
+|--------------------|------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`          | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> brownfield-survey ...`, `@<bot> clear-survey ...`, AND `@<bot> send it` in survey threads at parse time with `✗ brownfield-survey: disabled in this workspace's config (features.brownfield_survey.enabled=false).` (or the analogous text). |
+| `prompt_path`      | `Option<String>` | `None`  | Workspace-relative path to a custom survey prompt template. Resolved via the uniform [Prompt overrides](#prompt-overrides) table — see the `BrownfieldSurvey` row.                                                                                                                                                       |
+| `max_capabilities` | `usize`          | `20`    | Maximum number of proposed-capability items the survey-mode executor may return. **Valid range: `1..=50`**. Values outside this range cause config-load to fail-fast with an error naming `features.brownfield_survey.max_capabilities` AND the valid range.                                                              |
+
+**Default behaviour.** Omitting the `features.brownfield_survey` block (or omitting the entire `features:` parent block) is equivalent to all three defaults above. The verb works out of the box on a fresh install.
+
+**Prompt override.** See the [Prompt overrides](#prompt-overrides) table for the `BrownfieldSurvey` entry — `features.brownfield_survey.prompt_path` is workspace-relative AND falls back to the embedded `prompts/brownfield-survey.md` template when the configured file is missing or empty.
 
 
 ## `canonical_rag:` (optional)

@@ -195,6 +195,10 @@ fn oversize_request_text_reply() -> Reply {
 /// verb (a23). Mirrors the `propose` request-text cap.
 pub const MAX_BROWNFIELD_GUIDANCE_LEN: usize = 10_000;
 
+/// Cap on the operator-supplied guidance accepted by the
+/// `brownfield-survey` verb (a29). Mirrors `brownfield`'s cap.
+pub const MAX_BROWNFIELD_SURVEY_GUIDANCE_LEN: usize = 10_000;
+
 /// Cap on the operator-supplied guidance accepted by the `scout`
 /// AND `spec-it` verbs (a25). Mirrors `propose`'s cap.
 pub const MAX_SCOUT_GUIDANCE_LEN: usize = 10_000;
@@ -384,6 +388,19 @@ pub enum OperatorCommand {
     /// branch on top. Best-effort; conflicts abort the rebase. Never
     /// pushes — operator decides when to push to the fork.
     SyncUpstreamRequest {
+        repo_substring: String,
+    },
+    /// `@<bot> brownfield-survey <repo-substring> [optional guidance]`
+    /// (a29). Surveys the repo's existing capability boundaries AND
+    /// returns a curated proposed-capability list.
+    BrownfieldSurveyRequest {
+        repo_substring: String,
+        guidance: Option<String>,
+    },
+    /// `@<bot> clear-survey <repo-substring>` (a29). Operator-recovery
+    /// verb: wipes every `BrownfieldSurveyState` file for the matched
+    /// repo's workspace.
+    ClearSurvey {
         repo_substring: String,
     },
     Help,
@@ -815,6 +832,57 @@ fn parse_command_outcome_in_thread(
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
             ParseOutcome::Ok(OperatorCommand::ClearScout {
+                repo_substring: rest[0].to_string(),
+            })
+        }
+        "brownfield-survey" => {
+            // `@<bot> brownfield-survey <repo-substring> [optional
+            // guidance]` (a29). Repo substring is the first token after
+            // the verb; guidance is the remainder, capped at
+            // MAX_BROWNFIELD_SURVEY_GUIDANCE_LEN.
+            let verb_len = verb.len();
+            let after_verb = &after_mention[verb_len..];
+            let after_verb = after_verb.trim_start();
+            if after_verb.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ brownfield-survey: missing repo-substring. Usage: @<bot> brownfield-survey <repo> [optional guidance]"
+                        .to_string(),
+                ));
+            }
+            let sub_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let repo_substring = &after_verb[..sub_end];
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let guidance_raw = after_verb[sub_end..].trim();
+            if guidance_raw.chars().count() > MAX_BROWNFIELD_SURVEY_GUIDANCE_LEN {
+                return ParseOutcome::Invalid(Reply::Sync(format!(
+                    "✗ brownfield-survey: guidance text exceeds {MAX_BROWNFIELD_SURVEY_GUIDANCE_LEN} characters."
+                )));
+            }
+            let guidance = if guidance_raw.is_empty() {
+                None
+            } else {
+                Some(guidance_raw.to_string())
+            };
+            ParseOutcome::Ok(OperatorCommand::BrownfieldSurveyRequest {
+                repo_substring: repo_substring.to_string(),
+                guidance,
+            })
+        }
+        "clear-survey" => {
+            if rest.len() != 1 {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ clear-survey: missing repo-substring. Usage: @<bot> clear-survey <repo>"
+                        .to_string(),
+                ));
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::ClearSurvey {
                 repo_substring: rest[0].to_string(),
             })
         }
@@ -1655,6 +1723,9 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `scout <repo> [optional guidance]` — chat-driven workflow: survey the repo AND return a triage list of opportunities\n");
     out.push_str("  • `spec-it <N> [optional guidance]` — scout-thread-only: scope a scouted item into a propose-equivalent flow\n");
     out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout-run state file for the repo\n");
+    out.push_str("  • `brownfield-survey <repo> [optional guidance]` — chat-driven workflow: survey the repo for proposed capability boundaries (use `send it` in the survey thread to batch-generate all specs)\n");
+    out.push_str("  • `send it` (in audit OR brownfield-survey thread) — act on the thread's findings: triage an audit, OR batch-generate specs from a survey (one item per iteration)\n");
+    out.push_str("  • `clear-survey <repo>` — operator-recovery: wipe every brownfield-survey state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: fetch+rebase the workspace's base branch onto upstream (no push)\n");
     out.push_str("  • `help` — this synopsis\n");
@@ -1925,6 +1996,11 @@ pub struct OperatorCommandDispatcher {
     /// `clear-scout` verbs (a25). When `false`, the dispatcher
     /// refuses all three with the documented disabled-message.
     scout_enabled: bool,
+    /// Daemon-wide enable flag for the `brownfield-survey`,
+    /// `clear-survey`, AND `send it`-in-survey-thread routing (a29).
+    /// When `false`, the dispatcher refuses all three with the
+    /// documented disabled-message.
+    brownfield_survey_enabled: bool,
     /// Resolver for the per-repo workspace path. Used by the
     /// `spec-it` dispatcher to find the on-disk scout-state file for
     /// the thread the operator replied in. Production wiring (in
@@ -1955,8 +2031,16 @@ impl OperatorCommandDispatcher {
             chatops: None,
             brownfield_enabled: true,
             scout_enabled: true,
+            brownfield_survey_enabled: true,
             workspace_resolver: None,
         }
+    }
+
+    /// Override the daemon-wide brownfield-survey-feature enable flag (a29).
+    #[allow(dead_code)] // wired by production callers in a follow-up; tests already use it
+    pub fn with_brownfield_survey_enabled(mut self, enabled: bool) -> Self {
+        self.brownfield_survey_enabled = enabled;
+        self
     }
 
     /// Override the daemon-wide scout-feature enable flag (a25).
@@ -2201,6 +2285,25 @@ impl OperatorCommandDispatcher {
                     submitter,
                 )
                 .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::BrownfieldSurveyRequest {
+                repo_substring,
+                guidance,
+            }) => Some(
+                self.dispatch_brownfield_survey_request(
+                    &repo_substring,
+                    guidance.as_deref(),
+                    channel_id,
+                    repositories,
+                    submitter,
+                )
+                .await,
+            ),
+            ParseOutcome::Ok(OperatorCommand::ClearSurvey { repo_substring }) => Some(
+                Reply::Sync(
+                    self.dispatch_clear_survey(&repo_substring, repositories, submitter)
+                        .await,
+                ),
             ),
             ParseOutcome::Ok(cmd) => Some(Reply::Sync(
                 self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
@@ -2522,7 +2625,8 @@ impl OperatorCommandDispatcher {
                 self.dispatch_status_menu(repositories, submitter).await
             }
             OperatorCommand::SendItOnAudit { thread_ts } => {
-                self.dispatch_send_it_on_audit(&thread_ts, submitter).await
+                self.dispatch_send_it_on_audit(&thread_ts, repositories, submitter)
+                    .await
             }
             OperatorCommand::AuditNow {
                 audit_substring,
@@ -2570,6 +2674,12 @@ impl OperatorCommandDispatcher {
             OperatorCommand::SyncUpstreamRequest { .. } => {
                 "✗ sync-upstream: internal routing error (the dispatcher saw \
                  SyncUpstreamRequest in the String-returning dispatch fn). \
+                 Please file a bug."
+                    .to_string()
+            }
+            OperatorCommand::BrownfieldSurveyRequest { .. }
+            | OperatorCommand::ClearSurvey { .. } => {
+                "✗ brownfield-survey/clear-survey: internal routing error. \
                  Please file a bug."
                     .to_string()
             }
@@ -3167,6 +3277,206 @@ impl OperatorCommandDispatcher {
         ))
     }
 
+    /// Handle the `brownfield-survey` verb (a29). Resolves the repo
+    /// substring, posts a top-level ack capturing the lifecycle thread
+    /// ts, AND submits a `queue_brownfield_survey_request` control-
+    /// socket action.
+    async fn dispatch_brownfield_survey_request(
+        &self,
+        repo_substring: &str,
+        guidance: Option<&str>,
+        channel_id: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Reply {
+        if !self.brownfield_survey_enabled {
+            return Reply::Sync(
+                "✗ brownfield-survey: disabled in this workspace's config (features.brownfield_survey.enabled=false)."
+                    .to_string(),
+            );
+        }
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return Reply::Sync(format_multiple_matches(repo_substring, &ms));
+            }
+            RepoMatch::None => {
+                return Reply::Sync(format_no_match(repo_substring, repositories));
+            }
+        };
+        let backend = match self.chatops.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                return Reply::Sync(
+                    "✗ brownfield-survey: chatops backend not configured; cannot post the survey ack"
+                        .to_string(),
+                );
+            }
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let ack_text = format!(
+            "✓ Queued brownfield-survey for {url}. The next polling iteration will run it (~Nm). Follow along in this thread.",
+            url = repo.url
+        );
+        let ack_ts = match backend
+            .post_message_capturing_ts(channel_id, &ack_text)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!(
+                    "brownfield-survey: post_message_capturing_ts failed: {e:#}"
+                );
+                return Reply::Sync(format!(
+                    "✗ brownfield-survey: could not post ack to chat: {e}"
+                ));
+            }
+        };
+        let mut payload = serde_json::json!({
+            "action": "queue_brownfield_survey_request",
+            "url": repo.url,
+            "request_id": request_id,
+            "channel": channel_id,
+            "thread_ts": ack_ts,
+        });
+        if let Some(g) = guidance {
+            payload["guidance"] = serde_json::Value::String(g.to_string());
+        }
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            let body = format!(
+                "✗ brownfield-survey: could not enqueue request: {err}"
+            );
+            if let Err(reply_err) = backend
+                .post_threaded_reply(channel_id, &ack_ts, &body)
+                .await
+            {
+                tracing::warn!(
+                    "brownfield-survey: failure-thread-reply also failed: {reply_err:#}"
+                );
+            }
+        }
+        Reply::Silent
+    }
+
+    /// Handle the `clear-survey` verb (a29). Submits a
+    /// `queue_clear_survey` control-socket action; the response
+    /// carries the count cleared.
+    async fn dispatch_clear_survey(
+        &self,
+        repo_substring: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> String {
+        if !self.brownfield_survey_enabled {
+            return "✗ clear-survey: disabled in this workspace's config (features.brownfield_survey.enabled=false)."
+                .to_string();
+        }
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return format_multiple_matches(repo_substring, &ms);
+            }
+            RepoMatch::None => return format_no_match(repo_substring, repositories),
+        };
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "queue_clear_survey",
+                "url": repo.url,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return format!("✗ clear-survey: {err}");
+        }
+        let cleared = resp.get("cleared").and_then(|v| v.as_u64()).unwrap_or(0);
+        format!(
+            "✓ Cleared {cleared} brownfield-survey(s) for {url}.",
+            url = repo.url
+        )
+    }
+
+    /// Look up the operator-replied `thread_ts` against every known
+    /// repo's brownfield-survey states (a29). On a unique match
+    /// AND `status == Pending`, submits the `queue_brownfield_batch_request`
+    /// action AND returns `Some(reply)`. On a match where the survey
+    /// is already InProgress / Completed, returns the no-op reply.
+    /// Returns `None` when no survey matches — caller falls through to
+    /// the canonical untracked-thread refusal.
+    async fn try_send_it_on_survey(
+        &self,
+        thread_ts: &str,
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<String> {
+        if !self.brownfield_survey_enabled {
+            return None;
+        }
+        let resolver = self.workspace_resolver.as_ref();
+        let mut matched: Option<(String, crate::state::brownfield_survey::BrownfieldSurveyState)> =
+            None;
+        'outer: for repo in repositories {
+            let ws = match resolver {
+                Some(f) => match f(&repo.url) {
+                    Some(p) => p,
+                    None => continue,
+                },
+                None => repo.workspace_path.clone(),
+            };
+            let surveys = match crate::state::brownfield_survey::list_surveys_by_mtime(&ws) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for (request_id, _) in surveys {
+                if let Ok(Some(state)) =
+                    crate::state::brownfield_survey::read_state(&ws, &request_id)
+                    && state.thread_ts == thread_ts
+                {
+                    matched = Some((repo.url.clone(), state));
+                    break 'outer;
+                }
+            }
+        }
+        let (repo_url, survey_state) = matched?;
+        match survey_state.status {
+            crate::state::brownfield_survey::SurveyStatus::InProgress
+            | crate::state::brownfield_survey::SurveyStatus::Completed => {
+                return Some(format!(
+                    "✗ send it: a brownfield batch is already {status} for survey {request_id}.",
+                    status = survey_state.status.label().replace('_', " "),
+                    request_id = survey_state.request_id,
+                ));
+            }
+            crate::state::brownfield_survey::SurveyStatus::Pending => {}
+        }
+        let payload = serde_json::json!({
+            "action": "queue_brownfield_batch_request",
+            "url": repo_url,
+            "survey_request_id": survey_state.request_id,
+            "channel": survey_state.channel,
+            "thread_ts": survey_state.thread_ts,
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(format!("✗ send it: could not enqueue batch: {err}"));
+        }
+        Some(format!(
+            "✓ Queued {n} capability spec generations. The first will start on the next iteration.",
+            n = survey_state.items.len()
+        ))
+    }
+
     /// Handle the `clear-scout` verb (a25). Submits a `queue_clear_scout`
     /// control-socket action; the response carries the count cleared.
     async fn dispatch_clear_scout(
@@ -3314,15 +3624,25 @@ impl OperatorCommandDispatcher {
         )
     }
 
-    /// Handle the `send it` verb. Looks up the audit-thread state, runs
-    /// the four-case decision tree (untracked / stale / already-acted /
-    /// fresh-and-open), and on the accept path submits the
-    /// `trigger_audit_action` control-socket action AND flips the state
-    /// file's `status` to `TriagePending`. Returns the operator-facing
-    /// reply text.
+    /// Handle the `send it` verb. The verb has TWO valid contexts:
+    ///
+    ///   1. Audit-notification thread — `read_state` against
+    ///      `<state_root>/audit-threads/<thread_ts>.json`. The
+    ///      canonical four-case decision tree (untracked / stale /
+    ///      already-acted / fresh-and-open) applies.
+    ///   2. Brownfield-survey lifecycle thread (a29) — `read_state`
+    ///      against `<workspace>/.state/brownfield_surveys/*.json`,
+    ///      matching by `thread_ts`. On a fresh-and-open match the
+    ///      dispatcher submits `queue_brownfield_batch_request` AND
+    ///      replies with the queue confirmation.
+    ///
+    /// Audit lookup runs first; survey lookup is the fallback. If
+    /// NEITHER matches, the dispatcher posts the canonical untracked-
+    /// thread refusal.
     async fn dispatch_send_it_on_audit(
         &self,
         thread_ts: &str,
+        repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> String {
         use crate::audits::threads::{
@@ -3332,6 +3652,14 @@ impl OperatorCommandDispatcher {
         let mut state = match read_state(state_root, thread_ts) {
             Ok(Some(s)) => s,
             Ok(None) => {
+                // No audit thread matched — try the survey-thread
+                // fallback before refusing.
+                if let Some(reply) = self
+                    .try_send_it_on_survey(thread_ts, repositories, submitter)
+                    .await
+                {
+                    return reply;
+                }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
             }
             Err(e) => {
@@ -3339,6 +3667,12 @@ impl OperatorCommandDispatcher {
                     thread_ts = %thread_ts,
                     "audit-thread state read failed; treating as untracked: {e:#}"
                 );
+                if let Some(reply) = self
+                    .try_send_it_on_survey(thread_ts, repositories, submitter)
+                    .await
+                {
+                    return reply;
+                }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
             }
         };
@@ -8431,6 +8765,411 @@ mod tests {
         let text = unwrap_sync(reply);
         assert!(text.contains("not in this scout's list"), "{text}");
         assert!(text.contains("range: 1..1"), "{text}");
+        assert!(submitter.calls().is_empty());
+    }
+
+    // ====================================================================
+    // a29 brownfield-survey parser + dispatcher tests
+    // ====================================================================
+
+    #[test]
+    fn parse_brownfield_survey_happy_path_without_guidance() {
+        let cmd = parse_command(&format!("{BOT} brownfield-survey myrepo"), BOT)
+            .expect("brownfield-survey must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::BrownfieldSurveyRequest {
+                repo_substring: "myrepo".into(),
+                guidance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_survey_happy_path_with_guidance() {
+        let cmd = parse_command(
+            &format!(
+                "{BOT} brownfield-survey myrepo focus on the data layer; skip CLI commands"
+            ),
+            BOT,
+        )
+        .expect("brownfield-survey + guidance must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::BrownfieldSurveyRequest {
+                repo_substring: "myrepo".into(),
+                guidance: Some(
+                    "focus on the data layer; skip CLI commands".into()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_survey_missing_repo_returns_invalid() {
+        let outcome =
+            parse_command_outcome(&format!("{BOT} brownfield-survey"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("brownfield-survey"), "{text}");
+                assert!(text.contains("missing repo-substring"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_brownfield_survey_oversize_guidance_returns_invalid() {
+        let big = "x".repeat(MAX_BROWNFIELD_SURVEY_GUIDANCE_LEN + 1);
+        let outcome = parse_command_outcome(
+            &format!("{BOT} brownfield-survey myrepo {big}"),
+            BOT,
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("guidance text exceeds"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_clear_survey_happy_path() {
+        let cmd = parse_command(&format!("{BOT} clear-survey myrepo"), BOT)
+            .expect("clear-survey must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearSurvey {
+                repo_substring: "myrepo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_survey_missing_repo_returns_invalid() {
+        let outcome = parse_command_outcome(&format!("{BOT} clear-survey"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.contains("clear-survey"), "{text}");
+                assert!(text.contains("missing repo-substring"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_output_lists_brownfield_survey_verbs() {
+        let text = format_help_reply();
+        assert!(
+            text.contains("brownfield-survey"),
+            "help must mention brownfield-survey: {text}"
+        );
+        assert!(
+            text.contains("clear-survey"),
+            "help must mention clear-survey: {text}"
+        );
+        assert!(
+            text.contains("audit OR brownfield-survey thread"),
+            "send-it help must name BOTH valid contexts: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_survey_disabled_returns_refusal_no_post() {
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_brownfield_survey_enabled(false);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield-survey myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("disabled"), "{text}");
+        assert!(
+            text.contains("features.brownfield_survey.enabled=false"),
+            "{text}"
+        );
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_survey_disabled_returns_refusal() {
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_brownfield_survey_enabled(false);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-survey myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("clear-survey"), "{text}");
+        assert!(text.contains("disabled"), "{text}");
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_brownfield_survey_happy_path_submits_queue_action() {
+        let backend =
+            std::sync::Arc::new(FakeChatOpsBackend::new("1748400123.001234"));
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter
+            .set_response("queue_brownfield_survey_request", serde_json::json!({"ok": true}));
+        let _ = dispatcher
+            .handle_message(
+                &format!("{BOT} brownfield-survey myrepo focus on storage"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await;
+        let calls = submitter.calls();
+        let queue_call = calls
+            .iter()
+            .find(|c| c["action"] == "queue_brownfield_survey_request")
+            .expect("queue action submitted");
+        assert_eq!(queue_call["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(queue_call["guidance"], "focus on storage");
+        assert_eq!(queue_call["channel"], "C_OPS");
+        assert_eq!(queue_call["thread_ts"], "1748400123.001234");
+        assert!(queue_call.get("request_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_survey_reports_count_from_daemon() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter
+            .set_response("queue_clear_survey", serde_json::json!({"ok": true, "cleared": 4}));
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-survey myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Cleared 4"), "{text}");
+        assert!(text.contains("git@github.com:acme/myrepo.git"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_survey_zero_count_is_idempotent() {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter
+            .set_response("queue_clear_survey", serde_json::json!({"ok": true, "cleared": 0}));
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-survey myrepo"),
+                "C_OPS",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Cleared 0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn send_it_in_survey_thread_routes_to_batch_action() {
+        use crate::state::brownfield_survey::{
+            BrownfieldSurveyState, ComplexityBand, ItemStatus, SurveyItem, SurveyStatus,
+            write_state,
+        };
+        let backend =
+            std::sync::Arc::new(FakeChatOpsBackend::new("1748400999.001234"));
+        let tmp_ws = tempfile::TempDir::new().unwrap();
+
+        let state = BrownfieldSurveyState {
+            request_id: "survey-1".into(),
+            repo_url: "git@github.com:acme/myrepo.git".into(),
+            guidance: None,
+            head_sha_at_survey: "abc".into(),
+            completed_at: chrono::Utc::now(),
+            thread_ts: "1748400111.000111".into(),
+            channel: "C_OPS".into(),
+            items: vec![
+                SurveyItem {
+                    id: 1,
+                    slug: "scheduler".into(),
+                    summary: "x".into(),
+                    scope_in: "in".into(),
+                    scope_out: "out".into(),
+                    source_modules: vec!["src/scheduler/".into()],
+                    estimated_complexity: ComplexityBand::Small,
+                    status: ItemStatus::Pending,
+                    pr_url: None,
+                    failure_reason: None,
+                },
+                SurveyItem {
+                    id: 2,
+                    slug: "auth".into(),
+                    summary: "y".into(),
+                    scope_in: "in".into(),
+                    scope_out: "out".into(),
+                    source_modules: vec!["src/auth/".into()],
+                    estimated_complexity: ComplexityBand::Medium,
+                    status: ItemStatus::Pending,
+                    pr_url: None,
+                    failure_reason: None,
+                },
+            ],
+            status: SurveyStatus::Pending,
+        };
+        write_state(tmp_ws.path(), &state).unwrap();
+
+        let repos = vec![RepoIdentity {
+            url: "git@github.com:acme/myrepo.git".into(),
+            workspace_path: tmp_ws.path().to_path_buf(),
+        }];
+
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_audit_thread_state_dir(
+                tempfile::TempDir::new().unwrap().path().to_path_buf(),
+            );
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "queue_brownfield_batch_request",
+            serde_json::json!({"ok": true}),
+        );
+
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748400111.000111"),
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Queued 2 capability spec generations"), "{text}");
+        let calls = submitter.calls();
+        let batch = calls
+            .iter()
+            .find(|c| c["action"] == "queue_brownfield_batch_request")
+            .expect("batch action submitted");
+        assert_eq!(batch["survey_request_id"], "survey-1");
+        assert_eq!(batch["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(batch["thread_ts"], "1748400111.000111");
+    }
+
+    #[tokio::test]
+    async fn send_it_in_survey_thread_when_in_progress_rejects() {
+        use crate::state::brownfield_survey::{
+            BrownfieldSurveyState, ComplexityBand, ItemStatus, SurveyItem, SurveyStatus,
+            write_state,
+        };
+        let backend =
+            std::sync::Arc::new(FakeChatOpsBackend::new("1748400999.001234"));
+        let tmp_ws = tempfile::TempDir::new().unwrap();
+
+        let state = BrownfieldSurveyState {
+            request_id: "survey-9".into(),
+            repo_url: "git@github.com:acme/myrepo.git".into(),
+            guidance: None,
+            head_sha_at_survey: "abc".into(),
+            completed_at: chrono::Utc::now(),
+            thread_ts: "1748400112.000112".into(),
+            channel: "C_OPS".into(),
+            items: vec![SurveyItem {
+                id: 1,
+                slug: "scheduler".into(),
+                summary: "x".into(),
+                scope_in: "in".into(),
+                scope_out: "out".into(),
+                source_modules: vec!["src/scheduler/".into()],
+                estimated_complexity: ComplexityBand::Small,
+                status: ItemStatus::Pending,
+                pr_url: None,
+                failure_reason: None,
+            }],
+            status: SurveyStatus::InProgress,
+        };
+        write_state(tmp_ws.path(), &state).unwrap();
+
+        let repos = vec![RepoIdentity {
+            url: "git@github.com:acme/myrepo.git".into(),
+            workspace_path: tmp_ws.path().to_path_buf(),
+        }];
+
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_audit_thread_state_dir(
+                tempfile::TempDir::new().unwrap().path().to_path_buf(),
+            );
+        let submitter = FakeSubmitter::new();
+
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748400112.000112"),
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("already in progress"), "{text}");
+        assert!(text.contains("survey-9"), "{text}");
+        assert!(submitter.calls().is_empty(), "no queue action submitted");
+    }
+
+    #[tokio::test]
+    async fn send_it_outside_known_context_returns_untracked_refusal() {
+        let backend =
+            std::sync::Arc::new(FakeChatOpsBackend::new("1748400999.001234"));
+        let tmp_ws = tempfile::TempDir::new().unwrap();
+        let repos = vec![RepoIdentity {
+            url: "git@github.com:acme/myrepo.git".into(),
+            workspace_path: tmp_ws.path().to_path_buf(),
+        }];
+        let dispatcher = OperatorCommandDispatcher::new()
+            .with_chatops(backend.clone())
+            .with_audit_thread_state_dir(
+                tempfile::TempDir::new().unwrap().path().to_path_buf(),
+            );
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1900000000.000000"),
+                BOT,
+                &repos,
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("not tracking"), "{text}");
         assert!(submitter.calls().is_empty());
     }
 }
