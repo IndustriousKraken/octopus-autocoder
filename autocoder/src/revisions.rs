@@ -306,10 +306,19 @@ pub fn extract_change_list_from_pr_body(body: Option<&str>) -> Vec<String> {
 }
 
 /// Per-pass ChatOps context borrowed from the polling loop. The
-/// dispatcher uses it to post cap-decline + AskUser notifications.
+/// dispatcher uses it to post cap-decline + AskUser notifications AND
+/// to post the three revise-lifecycle notifications (picked up,
+/// succeeded, failed). The `failure_alerts_enabled` toggle gates the
+/// revise-lifecycle set; cap-decline + AskUser remain unconditional
+/// (their behavior pre-dates the toggle).
 pub struct ChatOpsCtx<'a> {
     pub chatops: &'a dyn ChatOpsBackend,
     pub channel: &'a str,
+    /// Mirrors `ChatOpsContext::failure_alerts_enabled`. When `false`,
+    /// the three revise-lifecycle notifications (picked up / succeeded
+    /// / failed) are silently skipped. The cap-decline + AskUser
+    /// notifications are NOT gated on this flag.
+    pub failure_alerts_enabled: bool,
 }
 
 /// Walk the set of open PRs on `repo.agent_branch`, prune closed-PR state
@@ -649,6 +658,30 @@ async fn process_one_pr(
         let pr_body = pr.body.clone().unwrap_or_default();
         let pr_change_list_str = change_list.join("\n");
 
+        // Revise-lifecycle "picked up" notification (best-effort,
+        // deduplicated per comment_id). Posted BEFORE the executor
+        // subprocess launches so the operator sees near-immediate
+        // acknowledgment in chat. The change-list summary mirrors
+        // the PR-title shape: `<first_change>` plus an optional
+        // `+N more` when the bundled iteration covers multiple
+        // changes.
+        let comment_id_str = comment.id.to_string();
+        let change_list_summary =
+            crate::polling_loop::format_revise_change_list_summary(&change_list);
+        let operator_quote =
+            crate::polling_loop::truncate_operator_comment(&revision_text, 80);
+        crate::polling_loop::maybe_post_revise_picked_up_alert(
+            chatops_ctx,
+            repo,
+            pr.number,
+            &pr.url,
+            &change_list_summary,
+            &operator_quote,
+            &comment_id_str,
+        )
+        .await;
+
+        let revise_started_at = std::time::Instant::now();
         let outcome = execute_revision(
             workspace,
             repo,
@@ -660,6 +693,7 @@ async fn process_one_pr(
             agent_implementation_notes,
         )
         .await;
+        let revise_duration = revise_started_at.elapsed();
         match outcome {
             Ok(ExecutorOutcome::Completed { .. }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
@@ -670,6 +704,17 @@ async fn process_one_pr(
                         pr_number = pr.number,
                         "revision commit/push failed; reporting as failed: {e:#}"
                     );
+                    let push_failure_reason =
+                        format!("push to {} failed: {e}", repo.agent_branch);
+                    crate::polling_loop::maybe_post_revise_failed_alert(
+                        chatops_ctx,
+                        repo,
+                        pr.number,
+                        &pr.url,
+                        &push_failure_reason,
+                        &comment_id_str,
+                    )
+                    .await;
                     let body = format!(
                         "✗ Revision attempt failed: commit/push failed: {e}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                         bot_username
@@ -684,6 +729,17 @@ async fn process_one_pr(
                     continue;
                 }
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
+                crate::polling_loop::maybe_post_revise_succeeded_alert(
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    &change_list_summary,
+                    &repo.agent_branch,
+                    revise_duration,
+                    &comment_id_str,
+                )
+                .await;
                 let reply = format!(
                     "✅ Revision applied: {}. Revision count: {} of {}.",
                     commit_subject, state.revisions_applied, state.revision_cap,
@@ -730,6 +786,15 @@ async fn process_one_pr(
                 return Ok(());
             }
             Ok(ExecutorOutcome::Failed { reason }) => {
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    &reason,
+                    &comment_id_str,
+                )
+                .await;
                 let body = format!(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     reason, bot_username
@@ -750,6 +815,21 @@ async fn process_one_pr(
                 write_state(workspace, &state)?;
             }
             Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
+                // The revise-lifecycle "failed" notification surfaces the
+                // iteration framing for chat operators. The pending-side
+                // `maybe_post_spec_revision_alert` continues to fire from
+                // its own canonical site when a SpecNeedsRevision marker
+                // is observed during a pending-change run; this lifecycle
+                // notification is additive and per-revise-comment.
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    "spec needs revision (see PR comment for details)",
+                    &comment_id_str,
+                )
+                .await;
                 let body = "✗ Revision attempt failed: executor reported the original change spec is unimplementable. The PR is unchanged."
                     .to_string();
                 let _ = github::post_issue_comment(
@@ -765,6 +845,15 @@ async fn process_one_pr(
                 // they don't have the iteration-pending state machine that
                 // pending changes do. Treat IterationRequested as a Failed-
                 // equivalent so the PR comment surfaces the unhandled case.
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    "executor returned IterationRequested (iteration sequences are not supported on the revise path)",
+                    &comment_id_str,
+                )
+                .await;
                 let body = format!(
                     "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
                     bot_username
@@ -783,6 +872,16 @@ async fn process_one_pr(
                     pr_number = pr.number,
                     "revision executor invocation errored: {e:#}"
                 );
+                let executor_error_reason = format!("executor error: {e:#}");
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    &executor_error_reason,
+                    &comment_id_str,
+                )
+                .await;
                 let body = format!(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     e, bot_username
@@ -1322,14 +1421,29 @@ mod tests {
     /// Minimal ChatOpsBackend stub that records every notification posted.
     /// The dispatcher only ever calls `post_notification`; the other
     /// methods are unused so they return defaults.
-    struct StubChatOps {
-        notifications: Mutex<Vec<String>>,
+    pub(crate) struct StubChatOps {
+        pub(crate) notifications: Mutex<Vec<String>>,
+        /// Records `(top_line, thread_body)` tuples passed to
+        /// `post_notification_with_thread`. Lets revise-lifecycle helper
+        /// tests assert the threaded path was taken without falling back
+        /// to the default-impl single-message degrade.
+        pub(crate) thread_calls: Mutex<Vec<(String, String)>>,
+        /// When `Some(message)`, every `post_notification` /
+        /// `post_notification_with_thread` call returns an error whose
+        /// text is `message`. Lets tests exercise the helpers'
+        /// "post failed → state NOT updated" branch.
+        pub(crate) post_error: Mutex<Option<String>>,
     }
     impl StubChatOps {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 notifications: Mutex::new(Vec::new()),
+                thread_calls: Mutex::new(Vec::new()),
+                post_error: Mutex::new(None),
             }
+        }
+        pub(crate) fn fail_posts_with(&self, message: &str) {
+            *self.post_error.lock().unwrap() = Some(message.to_string());
         }
     }
     #[async_trait]
@@ -1356,8 +1470,26 @@ mod tests {
             Ok(None)
         }
         async fn post_notification(&self, _channel: &str, text: &str) -> Result<()> {
+            if let Some(msg) = self.post_error.lock().unwrap().clone() {
+                return Err(anyhow!("{msg}"));
+            }
             self.notifications.lock().unwrap().push(text.to_string());
             Ok(())
+        }
+        async fn post_notification_with_thread(
+            &self,
+            _channel: &str,
+            top_line: &str,
+            thread_body: &str,
+        ) -> Result<Option<String>> {
+            if let Some(msg) = self.post_error.lock().unwrap().clone() {
+                return Err(anyhow!("{msg}"));
+            }
+            self.thread_calls
+                .lock()
+                .unwrap()
+                .push((top_line.to_string(), thread_body.to_string()));
+            Ok(Some("THREAD_TS_STUB".to_string()))
         }
     }
 
@@ -1820,6 +1952,7 @@ mod tests {
         let ctx = ChatOpsCtx {
             chatops: chatops.as_ref(),
             channel: "C-test",
+            failure_alerts_enabled: true,
         };
         let cancel = CancellationToken::new();
         process_revision_requests_at(
@@ -2405,6 +2538,7 @@ mod tests {
         let ctx = ChatOpsCtx {
             chatops: chatops.as_ref(),
             channel: "C-test",
+            failure_alerts_enabled: true,
         };
 
         // Iteration 1: AskUser → marker held back, no PR reply.
@@ -2439,6 +2573,7 @@ mod tests {
         let ctx2 = ChatOpsCtx {
             chatops: chatops2.as_ref(),
             channel: "C-test",
+            failure_alerts_enabled: true,
         };
         process_revision_requests_at(
             &ws,
@@ -2461,6 +2596,618 @@ mod tests {
         let state = read_state(&ws, 39).unwrap().expect("iter 2 state persisted");
         assert_eq!(state.revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    // -------- revise-lifecycle helper tests --------
+    //
+    // These exercise `polling_loop::maybe_post_revise_*_alert` directly,
+    // using the dispatcher's StubChatOps + a local-path repo so the
+    // alert-state file lives inside a tempdir.
+
+    use crate::alert_state::{AlertState, ReviseNotificationKind};
+    use crate::polling_loop::{
+        maybe_post_revise_failed_alert, maybe_post_revise_picked_up_alert,
+        maybe_post_revise_succeeded_alert,
+    };
+
+    fn make_repo_at(url: &str, workspace: &Path) -> RepositoryConfig {
+        let mut r = make_repo(url);
+        r.local_path = Some(workspace.to_path_buf());
+        r
+    }
+
+    #[tokio::test]
+    async fn picked_up_helper_posts_when_state_clean_and_toggle_on() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_picked_up_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo` +1 more",
+            "drop the error info",
+            "comment-100",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1, "exactly one post on clean state");
+        let body = &notes[0];
+        assert!(body.starts_with("🔧 `git@github.com:o/r.git`: revising PR #17"), "got: {body}");
+        assert!(body.contains("(`a31-foo` +1 more)"), "change list summary embedded");
+        assert!(body.contains("\"drop the error info\""), "operator quote embedded");
+        assert!(body.contains("https://example.invalid/pr/17"), "pr_url on its own line");
+
+        // State updated.
+        let state = AlertState::load_or_default(dir.path());
+        assert!(
+            state.revise_notification_already_posted(
+                "comment-100",
+                ReviseNotificationKind::PickedUp,
+            ),
+            "alert-state must record posted_picked_up_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn picked_up_helper_skips_when_toggle_off() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: false,
+        };
+        maybe_post_revise_picked_up_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo`",
+            "do the thing",
+            "comment-200",
+        )
+        .await;
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "toggle off must suppress the post"
+        );
+        // State NOT updated.
+        let state = AlertState::load_or_default(dir.path());
+        assert!(
+            !state.revise_notification_already_posted(
+                "comment-200",
+                ReviseNotificationKind::PickedUp,
+            ),
+            "toggle off must NOT record state"
+        );
+    }
+
+    #[tokio::test]
+    async fn picked_up_helper_skips_when_already_posted() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        // Pre-seed state.
+        let mut seed = AlertState::default();
+        seed.record_revise_notification(
+            "comment-300",
+            ReviseNotificationKind::PickedUp,
+            Utc::now(),
+        );
+        seed.save(dir.path()).unwrap();
+
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_picked_up_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo`",
+            "do the thing",
+            "comment-300",
+        )
+        .await;
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "already-posted state must suppress the post"
+        );
+    }
+
+    #[tokio::test]
+    async fn picked_up_helper_does_not_update_state_when_post_fails() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        chatops.fail_posts_with("simulated backend error");
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_picked_up_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo`",
+            "x",
+            "comment-400",
+        )
+        .await;
+        // Post never reached the success path.
+        assert!(chatops.notifications.lock().unwrap().is_empty());
+        // State NOT updated → a future retry can succeed.
+        let state = AlertState::load_or_default(dir.path());
+        assert!(!state.revise_notification_already_posted(
+            "comment-400",
+            ReviseNotificationKind::PickedUp,
+        ));
+    }
+
+    #[tokio::test]
+    async fn succeeded_helper_posts_with_duration_human() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_succeeded_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo`",
+            "agent-q",
+            std::time::Duration::from_secs(125),
+            "comment-500",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        let body = &notes[0];
+        assert!(body.starts_with("✓ `git@github.com:o/r.git`: revision applied to PR #17"), "got: {body}");
+        assert!(body.contains("(`a31-foo`)"), "change list summary embedded");
+        assert!(body.contains("force-pushed `agent-q`"));
+        // 125 seconds → "2m" per busy_marker::format_age_human
+        assert!(body.contains("(took 2m)"), "duration uses busy_marker human format: {body}");
+        assert!(body.contains("https://example.invalid/pr/17"));
+
+        let state = AlertState::load_or_default(dir.path());
+        assert!(state.revise_notification_already_posted(
+            "comment-500",
+            ReviseNotificationKind::Succeeded,
+        ));
+    }
+
+    #[tokio::test]
+    async fn succeeded_helper_skips_when_toggle_off() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: false,
+        };
+        maybe_post_revise_succeeded_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "`a31-foo`",
+            "agent-q",
+            std::time::Duration::from_secs(45),
+            "comment-600",
+        )
+        .await;
+        assert!(chatops.notifications.lock().unwrap().is_empty());
+        let state = AlertState::load_or_default(dir.path());
+        assert!(!state.revise_notification_already_posted(
+            "comment-600",
+            ReviseNotificationKind::Succeeded,
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_helper_posts_inline_for_short_reason() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_failed_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "timeout",
+            "comment-700",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("✗ `git@github.com:o/r.git`: revision failed on PR #17: timeout"), "got: {}", notes[0]);
+        assert!(notes[0].contains("https://example.invalid/pr/17"));
+        assert!(
+            chatops.thread_calls.lock().unwrap().is_empty(),
+            "short reason must NOT go through the threaded path"
+        );
+
+        let state = AlertState::load_or_default(dir.path());
+        assert!(state.revise_notification_already_posted(
+            "comment-700",
+            ReviseNotificationKind::Failed,
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_helper_skips_when_already_posted() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let mut seed = AlertState::default();
+        seed.record_revise_notification(
+            "comment-701",
+            ReviseNotificationKind::Failed,
+            Utc::now(),
+        );
+        seed.save(dir.path()).unwrap();
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        maybe_post_revise_failed_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            "timeout",
+            "comment-701",
+        )
+        .await;
+        assert!(chatops.notifications.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_helper_threads_long_reason_with_truncation_pointer() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        let huge_reason: String = "x".repeat(40_000);
+        maybe_post_revise_failed_alert(
+            Some(&ctx),
+            &repo,
+            17,
+            "https://example.invalid/pr/17",
+            &huge_reason,
+            "comment-800",
+        )
+        .await;
+        // The inline path was NOT taken.
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "long reason must NOT post via the inline path"
+        );
+        // The threaded path WAS taken.
+        let thread_calls = chatops.thread_calls.lock().unwrap().clone();
+        assert_eq!(thread_calls.len(), 1, "exactly one threaded post");
+        let (top_line, thread_body) = &thread_calls[0];
+        assert!(top_line.starts_with("✗ `git@github.com:o/r.git`: revision failed on PR #17"), "top_line: {top_line}");
+        assert!(top_line.contains("https://example.invalid/pr/17"));
+        // The thread body is the truncated reason: starts at 35_000 chars
+        // of `x`, then a pointer tail.
+        let truncated_prefix_len = thread_body
+            .chars()
+            .take_while(|c| *c == 'x')
+            .count();
+        assert_eq!(
+            truncated_prefix_len, 35_000,
+            "thread body must hold exactly 35,000 characters of the original reason"
+        );
+        assert!(
+            thread_body.contains("[truncated; full reason at journalctl"),
+            "thread body must end with the documented pointer tail"
+        );
+
+        let state = AlertState::load_or_default(dir.path());
+        assert!(state.revise_notification_already_posted(
+            "comment-800",
+            ReviseNotificationKind::Failed,
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_helpers_silently_skip_when_chatops_ctx_is_none() {
+        let dir = TempDir::new().unwrap();
+        let repo = make_repo_at("git@github.com:o/r.git", dir.path());
+        maybe_post_revise_picked_up_alert(
+            None,
+            &repo,
+            17,
+            "https://x",
+            "`c`",
+            "q",
+            "comment-900",
+        )
+        .await;
+        maybe_post_revise_succeeded_alert(
+            None,
+            &repo,
+            17,
+            "https://x",
+            "`c`",
+            "agent-q",
+            std::time::Duration::from_secs(0),
+            "comment-901",
+        )
+        .await;
+        maybe_post_revise_failed_alert(
+            None,
+            &repo,
+            17,
+            "https://x",
+            "boom",
+            "comment-902",
+        )
+        .await;
+        // No alert-state file should have been created (no post = no save).
+        let state = AlertState::load_or_default(dir.path());
+        assert!(state.revise_notifications.is_empty());
+    }
+
+    // -------- dispatcher revise-lifecycle notification tests --------
+
+    /// Helper: set up a mockito server that returns:
+    ///   GET /user                              → bot username "my-bot"
+    ///   GET /repos/owner/repo/pulls            → one open PR (#`pr_num`)
+    ///   GET /repos/owner/repo/issues/N/comments → one triggering comment
+    ///   POST /repos/owner/repo/issues/N/comments → 201
+    async fn revise_dispatcher_mockito(
+        pr_num: u64,
+        comment_id: u64,
+    ) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+        let mut server = mockito::Server::new_async().await;
+        let m_user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let m_pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{
+                    "number": {pr_num},
+                    "title": "PR",
+                    "html_url": "https://example.invalid/pr/{pr_num}",
+                    "state": "open",
+                    "body": "Changes implemented in this pass:\n\n- target-change",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {{"ref": "agent-q"}},
+                    "base": {{"ref": "main"}}
+                }}]"#
+            ))
+            .create_async()
+            .await;
+        let m_comments = server
+            .mock("GET", format!("/repos/owner/repo/issues/{pr_num}/comments").as_str())
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{
+                    "id": {comment_id},
+                    "body": "@my-bot revise tighten the error handling",
+                    "user": {{"login": "operator"}},
+                    "created_at": "2026-05-25T11:00:00Z"
+                }}]"#
+            ))
+            .create_async()
+            .await;
+        let m_post = server
+            .mock("POST", format!("/repos/owner/repo/issues/{pr_num}/comments").as_str())
+            .match_query(mockito::Matcher::Any)
+            .with_status(201)
+            .with_body(r#"{"id":1}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        (server, vec![m_user, m_pulls, m_comments, m_post])
+    }
+
+    /// 3.4: Completed outcome posts PickedUp then Succeeded (in that
+    /// order) to the chatops backend.
+    #[tokio::test]
+    async fn dispatcher_posts_picked_up_then_succeeded_on_completed() {
+        let env_var = "REVISIONS_REVISE_LIFECYCLE_COMPLETED";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(101, 9001).await;
+
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        // Make resolve_path point at the test workspace so the helpers'
+        // alert-state file lands inside the tempdir.
+        repo.local_path = Some(ws.clone());
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            Some(ctx),
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        let notes = chatops.notifications.lock().unwrap().clone();
+        let revise_notes: Vec<&String> = notes
+            .iter()
+            .filter(|n| n.contains("revising PR") || n.contains("revision applied to PR"))
+            .collect();
+        assert_eq!(
+            revise_notes.len(),
+            2,
+            "expected exactly 2 lifecycle notifications (picked up + succeeded); got: {notes:?}"
+        );
+        assert!(
+            revise_notes[0].starts_with("🔧"),
+            "first notification must be 'picked up' (🔧): {}",
+            revise_notes[0]
+        );
+        assert!(
+            revise_notes[1].starts_with("✓"),
+            "second notification must be 'succeeded' (✓): {}",
+            revise_notes[1]
+        );
+        assert!(revise_notes[1].contains("`agent-q`"), "succeeded body must name agent_branch");
+
+        // State updated for both kinds.
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.revise_notification_already_posted(
+            "9001",
+            ReviseNotificationKind::PickedUp,
+        ));
+        assert!(state.revise_notification_already_posted(
+            "9001",
+            ReviseNotificationKind::Succeeded,
+        ));
+
+        token_env_clear(env_var);
+    }
+
+    /// 3.5: Failed { reason: "timeout" } outcome posts PickedUp then
+    /// Failed (in that order), with the reason text on the Failed body.
+    #[tokio::test]
+    async fn dispatcher_posts_picked_up_then_failed_on_failed_outcome() {
+        let env_var = "REVISIONS_REVISE_LIFECYCLE_FAILED";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(102, 9002).await;
+
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Failed {
+            reason: "timeout".to_string(),
+        }]);
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            Some(ctx),
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        let notes = chatops.notifications.lock().unwrap().clone();
+        let revise_notes: Vec<&String> = notes
+            .iter()
+            .filter(|n| n.contains("revising PR") || n.contains("revision failed on PR"))
+            .collect();
+        assert_eq!(
+            revise_notes.len(),
+            2,
+            "expected exactly 2 lifecycle notifications (picked up + failed); got: {notes:?}"
+        );
+        assert!(revise_notes[0].starts_with("🔧"));
+        assert!(revise_notes[1].starts_with("✗"));
+        assert!(
+            revise_notes[1].contains(": timeout"),
+            "failed body must carry the reason verbatim: {}",
+            revise_notes[1]
+        );
+
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.revise_notification_already_posted(
+            "9002",
+            ReviseNotificationKind::PickedUp,
+        ));
+        assert!(state.revise_notification_already_posted(
+            "9002",
+            ReviseNotificationKind::Failed,
+        ));
+
+        token_env_clear(env_var);
+    }
+
+    /// 3.6: chatops_ctx: None runs to completion without panic AND
+    /// skips all notifications.
+    #[tokio::test]
+    async fn dispatcher_with_no_chatops_ctx_runs_clean_and_skips_notifications() {
+        let env_var = "REVISIONS_REVISE_LIFECYCLE_NONE";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(103, 9003).await;
+
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            None,
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should run to completion with no chatops backend");
+        // No chatops backend means no alert-state mutation.
+        let state = AlertState::load_or_default(&ws);
+        assert!(
+            state.revise_notifications.is_empty(),
+            "no chatops_ctx must not produce any alert-state revise_notifications entries"
+        );
 
         token_env_clear(env_var);
     }
