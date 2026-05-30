@@ -71,15 +71,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # zig_target = '' on macOS keeps the existing cargo build path.
+          # For Linux gnu, the '.2.17' suffix is the cargo-zigbuild GLIBC-floor
+          # pin: the produced binaries load on hosts with GLIBC 2.17+ (RHEL 7+,
+          # Ubuntu 16.04+, Debian 9+) regardless of the build host's libc.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
+            zig_target: x86_64-unknown-linux-gnu.2.17
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: true
+            zig_target: aarch64-unknown-linux-gnu.2.17
           - target: aarch64-apple-darwin
             os: macos-latest
-            use_cross: false
+            zig_target: ''
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -89,26 +93,62 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross toolchain (for aarch64-unknown-linux-gnu)
-        if: matrix.use_cross
-        uses: taiki-e/setup-cross-toolchain-action@v1
+      - name: Install zig (for cargo-zigbuild)
+        if: matrix.zig_target != ''
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          target: ${{ matrix.target }}
+          version: 0.13.0
 
-      - name: Build release binary
+      - name: Install cargo-zigbuild
+        if: matrix.zig_target != ''
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build release binary (Linux gnu via zigbuild)
+        if: matrix.zig_target != ''
+        working-directory: autocoder
+        run: cargo zigbuild --release --target ${{ matrix.zig_target }}
+
+      - name: Build release binary (macOS)
+        if: matrix.zig_target == ''
         working-directory: autocoder
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary (Linux)
+      - name: Verify GLIBC floor (Linux gnu only)
+        if: matrix.zig_target != ''
+        shell: bash
+        # Inspect the dynamic-symbol versions the binary requires and
+        # assert the maximum-required GLIBC is <= 2.17. If a dependency
+        # leaks in a newer-glibc-only symbol the workflow fails before
+        # publish so the regression is caught at build time, not by an
+        # operator on an older distro.
+        run: |
+          set -euo pipefail
+          binary="autocoder/target/${{ matrix.target }}/release/autocoder"
+          if [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]]; then
+            sudo apt-get update
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+            objdump_cmd="aarch64-linux-gnu-objdump"
+          else
+            objdump_cmd="objdump"
+          fi
+          max_glibc="$($objdump_cmd -T "$binary" | grep -oE 'GLIBC_[0-9.]+' | sort -V -u | tail -n1 || true)"
+          echo "Maximum required GLIBC: ${max_glibc:-<none>}"
+          floor="GLIBC_2.17"
+          if [[ -n "$max_glibc" && "$(printf '%s\n%s\n' "$max_glibc" "$floor" | sort -V | tail -n1)" != "$floor" ]]; then
+            echo "GLIBC floor regression: binary requires ${max_glibc}, exceeds floor ${floor}. Investigate the dependency that introduced the newer symbol." >&2
+            $objdump_cmd -T "$binary" | grep -E 'GLIBC_[0-9.]+' | sort -u >&2
+            exit 1
+          fi
+
+      - name: Strip binary (Linux x86_64)
         if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: strip autocoder/target/${{ matrix.target }}/release/autocoder
 
       - name: Strip binary (Linux aarch64 via cross-strip)
         if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu
-          aarch64-linux-gnu-strip autocoder/target/${{ matrix.target }}/release/autocoder
+        # binutils-aarch64-linux-gnu was installed by the GLIBC-floor verify
+        # step; this step reuses it for the strip pass.
+        run: aarch64-linux-gnu-strip autocoder/target/${{ matrix.target }}/release/autocoder
 
       - name: Strip binary (macOS)
         if: runner.os == 'macOS'

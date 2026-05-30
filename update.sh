@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# autocoder unattended binary updater. Resolves installed + target
-# versions, downloads + verifies the new binary, preflights
-# `check-config`, atomically swaps, restarts the unit, and rolls back
-# on failure. See docs/DEPLOYMENT.md "Unattended updates via cron".
+# autocoder unattended binary updater. See docs/DEPLOYMENT.md "Unattended updates via cron".
 # detect_target_triple is kept in sync with install.sh.
 set -euo pipefail
 
@@ -54,6 +51,15 @@ resolve_config_path() {
 
 run_preflight() {
   local new_binary="$1" config_path="$2" rc=0
+  # Smoke test catches GLIBC mismatch / missing .so / arch mismatch / corrupted
+  # download — load failures the dynamic linker rejects before check-config runs.
+  local smoke_err
+  if ! smoke_err="$("$new_binary" --version 2>&1 >/dev/null)"; then
+    echo "update.sh: new binary failed smoke test:" >&2
+    echo "$smoke_err" >&2
+    echo "update.sh: not swapping; daemon continues on $(current_version)." >&2
+    exit 1
+  fi
   set +e; "$new_binary" check-config --config "$config_path" --json; rc=$?; set -e
   case "$rc" in
     0) ;;
@@ -106,16 +112,21 @@ chmod +x "${TMP}/${BASENAME}"
 
 STEP="preflight"
 CONFIG_PATH="$(resolve_config_path || true)"
-if [[ -z "$CONFIG_PATH" || ! -f "$CONFIG_PATH" ]]; then
-  echo "update.sh: cannot find config; pass --config-dir <path> if your install is non-standard" >&2
+if [[ -z "$CONFIG_PATH" ]]; then
+  echo "update.sh: could not resolve config path; pass --config-dir <path> if your install is non-standard" >&2
+  exit 1
+fi
+if [[ -e "$CONFIG_PATH" && ! -r "$CONFIG_PATH" ]]; then
+  echo "update.sh: config at ${CONFIG_PATH} is not readable by $(id -un); try running with sudo" >&2
+  exit 1
+fi
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "update.sh: no config file at ${CONFIG_PATH}; check --config-dir or the systemd unit's --config argument" >&2
   exit 1
 fi
 run_preflight "${TMP}/${BASENAME}" "$CONFIG_PATH"
 
-if (( DRY_RUN )); then
-  echo "[dry-run] Would swap to ${TARGET}"
-  exit 0
-fi
+(( DRY_RUN )) && { echo "[dry-run] Would swap to ${TARGET}"; exit 0; }
 
 STEP="swap"
 BINARY_PATH="${AUTOCODER_BINARY_PATH:-/usr/local/bin/autocoder}"
