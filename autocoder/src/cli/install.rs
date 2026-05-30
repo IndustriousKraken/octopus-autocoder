@@ -1428,6 +1428,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 mode: crate::config::ReviewerMode::Bundled,
                 max_code_reviews_per_pr: 5,
                 suggest_rereview_threshold: None,
+                skip_spec_only_prs: false,
             })
         }
     };
@@ -2190,6 +2191,7 @@ pub(crate) async fn reconfigure_reviewer(
                 mode: crate::config::ReviewerMode::Bundled,
                 max_code_reviews_per_pr: 5,
                 suggest_rereview_threshold: None,
+                skip_spec_only_prs: false,
             });
             reviewer.provider = provider;
             reviewer.model = model;

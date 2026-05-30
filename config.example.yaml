@@ -51,6 +51,16 @@ repositories:
     # Default: unset (specs live alongside code).
     # spec_storage:
     #   path: "../my-specs"
+    #   # a34: optional override for the git remote in the spec_storage
+    #   # working tree that spec-only iterations push to. When unset, the
+    #   # runtime uses `"origin"`. When set, config-load verifies the
+    #   # remote exists in `git -C <spec_storage.path> remote` output.
+    #   # push_remote: "origin"
+    #   # a34: optional override for the PR base branch in the spec_storage
+    #   # repo. When unset, the runtime queries
+    #   # `git -C <spec_storage.path> symbolic-ref refs/remotes/<push_remote>/HEAD`
+    #   # and parses the branch name. On query failure, falls back to "main".
+    #   # base_branch: "main"
     #
     # `upstream` — when set, autocoder ensures a git remote named
     # `<remote>` (default `upstream`) points at `<url>` AND
@@ -361,6 +371,13 @@ github:
 #   # is informational; the operator decides whether to post
 #   # `@<bot> code-review`. Out-of-range values fail config-load.
 #   # suggest_rereview_threshold: 0.5
+#   #
+#   # a34: cost-optimization knob. When `true`, the polling iteration's
+#   # reviewer-invocation step skips the reviewer call AND posts no
+#   # `## Code Review` section for any PR whose ENTIRE diff lives under
+#   # `openspec/` (spec-only PRs from brownfield, scout spec-it, OR
+#   # archive-driven iterations). Default `false` (reviewer runs on every PR).
+#   # skip_spec_only_prs: false
 #   #
 #   # Nested override for the reviewer's prompt template (a24).
 #   # Workspace-relative when not absolute. Preferred over the legacy

@@ -488,6 +488,20 @@ pub struct SpecStorageConfig {
     /// Workspace-relative OR absolute path to a git working tree
     /// containing an `openspec/` subdirectory.
     pub path: String,
+    /// a34: optional override for the git remote in the spec_storage
+    /// working tree that spec-only iterations push to. When unset, the
+    /// runtime uses `"origin"`. When set, config-load verifies the
+    /// remote exists in the spec_storage repo's `git remote` output AND
+    /// fails-fast if not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_remote: Option<String>,
+    /// a34: optional override for the PR base branch in the spec_storage
+    /// repo. When unset, the runtime queries
+    /// `git -C <spec_storage.path> symbolic-ref refs/remotes/<push_remote>/HEAD`
+    /// AND parses the branch name. On query failure, the documented
+    /// fallback is `"main"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// OSS-fork support (a26): per-repo upstream-remote config. When set,
@@ -1143,6 +1157,14 @@ pub struct ReviewerConfig {
     /// a chatops notification recommending `@<bot> code-review` is posted.
     #[serde(default)]
     pub suggest_rereview_threshold: Option<f32>,
+    /// a34: cost-optimization knob. When `true`, the polling iteration's
+    /// reviewer-invocation step skips the reviewer call AND posts no
+    /// `## Code Review` section for any PR whose ENTIRE diff lives
+    /// under `openspec/` (i.e. spec-only PRs from brownfield, scout
+    /// spec-it, OR archive-driven iterations). Default `false`
+    /// (preserves canonical behavior: reviewer runs against every PR).
+    #[serde(default)]
+    pub skip_spec_only_prs: bool,
 }
 
 fn default_prompt_budget_chars() -> usize {
@@ -1962,6 +1984,52 @@ fn validate_spec_storage(
             openspec_dir.display()
         ));
     }
+    // a34: when push_remote is set, verify the remote exists in the
+    // spec_storage repo's `git remote` output. Fail-fast so the daemon
+    // never spins up a polling task pointing at an invalid remote.
+    if let Some(remote_name) = ss.push_remote.as_deref() {
+        let remote_name = remote_name.trim();
+        if remote_name.is_empty() {
+            return Err(anyhow!(
+                "spec_storage.push_remote is set but empty (expected a remote name)"
+            ));
+        }
+        let list = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&resolved)
+            .args(["remote"])
+            .output();
+        match list {
+            Ok(out) if out.status.success() => {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                let available: Vec<&str> =
+                    raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if !available.contains(&remote_name) {
+                    return Err(anyhow!(
+                        "spec_storage.push_remote `{remote_name}` does not exist in \
+                         `git -C {} remote` output (available: [{}])",
+                        resolved.display(),
+                        available.join(", ")
+                    ));
+                }
+            }
+            Ok(out) => {
+                let stderr =
+                    String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(anyhow!(
+                    "spec_storage.push_remote could not be validated: \
+                     `git -C {} remote` failed: {stderr}",
+                    resolved.display()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "spec_storage.push_remote could not be validated: \
+                     `git` invocation failed: {e}",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2747,6 +2815,7 @@ github:
             "mode",
             "max_code_reviews_per_pr",
             "suggest_rereview_threshold",
+            "skip_spec_only_prs",
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
@@ -2778,6 +2847,9 @@ github:
             "spec_storage",
             "upstream",
             "auto_submit_pr",
+            // a34: spec_storage extensions + reviewer skip-spec-only-prs.
+            "push_remote",
+            "base_branch",
         ];
 
         let path = example_yaml_path();
@@ -6680,6 +6752,112 @@ github:
             cfg.repositories[0]
                 .resolved_spec_storage_dir(Path::new("/tmp/ws"))
                 .is_none()
+        );
+    }
+
+    /// a34: defaults round-trip — when `push_remote` and `base_branch`
+    /// are unset in the YAML, the parsed `SpecStorageConfig` retains
+    /// them as `None` so the runtime fallback (`origin` / remote-tracked
+    /// HEAD) is engaged.
+    #[test]
+    fn spec_storage_push_remote_and_base_branch_default_to_none() {
+        let scratch = TempDir::new().unwrap();
+        let specs_repo = scratch.path().join("specs-repo");
+        std::fs::create_dir_all(specs_repo.join("openspec")).unwrap();
+        init_git_repo(&specs_repo);
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#,
+            specs_repo.display()
+        );
+        let (_dir, cfg_path) = write_config(&yaml);
+        let cfg = Config::load_from(&cfg_path).expect("valid spec_storage parses");
+        let ss = cfg.repositories[0].spec_storage.as_ref().unwrap();
+        assert!(
+            ss.push_remote.is_none(),
+            "push_remote must default to None: got {:?}",
+            ss.push_remote
+        );
+        assert!(
+            ss.base_branch.is_none(),
+            "base_branch must default to None: got {:?}",
+            ss.base_branch
+        );
+    }
+
+    /// a34: `reviewer.skip_spec_only_prs` defaults to `false` when unset.
+    #[test]
+    fn reviewer_skip_spec_only_prs_defaults_false() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, cfg_path) = write_config(yaml);
+        let cfg = Config::load_from(&cfg_path).expect("valid reviewer parses");
+        let rv = cfg.reviewer.as_ref().unwrap();
+        assert!(
+            !rv.skip_spec_only_prs,
+            "skip_spec_only_prs must default to false: got {}",
+            rv.skip_spec_only_prs
+        );
+    }
+
+    /// a34: `spec_storage.push_remote` set to a name not present in the
+    /// spec_storage repo's `git remote` output fails config-load with a
+    /// clear message naming the missing remote.
+    #[test]
+    fn spec_storage_push_remote_must_exist() {
+        let scratch = TempDir::new().unwrap();
+        let specs_repo = scratch.path().join("specs-repo");
+        std::fs::create_dir_all(specs_repo.join("openspec")).unwrap();
+        init_git_repo(&specs_repo);
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+      push_remote: "nonexistent-remote"
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#,
+            specs_repo.display()
+        );
+        let (_dir, cfg_path) = write_config(&yaml);
+        let err = Config::load_from(&cfg_path)
+            .expect_err("missing push_remote must fail config-load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent-remote"),
+            "error must name the missing remote, got: {msg}"
         );
     }
 

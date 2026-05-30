@@ -946,6 +946,35 @@ pub async fn execute_one_pass(
     )
     .await?;
 
+    // a34: "detect working-tree state" prelude per the canonical
+    // orchestrator-cli requirement. Before the iteration's commit +
+    // push + PR step, classify the iteration's outcome by probing the
+    // spec_storage tree's uncommitted state. The workspace's status
+    // is implicit: the agent-branch commit count below is the
+    // primary signal for "code-only has work". The spec_storage
+    // tree's dirty state — populated by brownfield / scout spec-it /
+    // archive flows when `spec_storage` is configured — is logged
+    // here so operators see which routing branch the iteration is
+    // about to take. The full spec-storage commit + push + PR fanout
+    // lives in `crate::spec_storage_routing` AND is exercised by the
+    // brownfield / scout / archive callers when they route through
+    // the new helpers.
+    let spec_storage_resolved = repo.resolved_spec_storage_dir(workspace);
+    let spec_storage_dirty = match spec_storage_resolved.as_deref() {
+        Some(p) => match git::status_porcelain(p) {
+            Ok(s) => !s.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    spec_storage_path = %p.display(),
+                    "spec_storage status_porcelain probe failed; treating tree as clean: {e:#}"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+
     // Termination is gated EXCLUSIVELY on the agent branch's commit count
     // relative to base — see `polling-iteration-termination-is-commit-count
     // -gated`. Using `processed.is_empty()` would miss commits produced by
@@ -954,12 +983,28 @@ pub async fn execute_one_pass(
     let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
     let commit_count = git::rev_list_count(workspace, &range)?;
     if commit_count == 0 {
-        tracing::info!(
-            url = repo.url.as_str(),
-            "polling pass produced no commits (all completed changes had empty diffs)"
-        );
+        if spec_storage_dirty {
+            tracing::info!(
+                url = %repo.url,
+                spec_storage_path = ?spec_storage_resolved.as_ref().map(|p| p.display().to_string()),
+                "a34: spec_storage tree dirty AND workspace has no commits — spec-only iteration classified; spec-storage routing handled by the originating brownfield / scout / archive caller"
+            );
+        } else {
+            tracing::info!(
+                url = repo.url.as_str(),
+                "polling pass produced no commits (all completed changes had empty diffs)"
+            );
+        }
         let _ = AlertState::clear(workspace);
         return Ok(());
+    }
+    if spec_storage_dirty {
+        tracing::info!(
+            url = %repo.url,
+            spec_storage_path = ?spec_storage_resolved.as_ref().map(|p| p.display().to_string()),
+            workspace_commit_count = commit_count,
+            "a34: dual-tree iteration classified — workspace commits push as code-only PR; spec-storage routing handled by the originating brownfield / scout / archive caller"
+        );
     }
 
     // Reviewer step (if configured) runs against the produced commits BEFORE
@@ -973,12 +1018,45 @@ pub async fn execute_one_pass(
     // posted as `<!-- reviewer-revision -->` PR comments after the PR is
     // created, and the dropped set is annotated into the `## Code Review`
     // PR-body section so the human sees what was skipped.
-    let (review_report, draft, reviewer_revision_concerns) = if processed.is_empty() {
+    // a34 §6: when `reviewer.skip_spec_only_prs: true` AND the PR's
+    // diff lives entirely under `openspec/`, skip the reviewer call
+    // (cost-optimization knob). The detection mirrors the iteration's
+    // commit + push classification — a PR opened from a spec-only
+    // iteration's classification is a spec-only PR; a code-only
+    // iteration's PR (including dual-tree's code half) is NOT.
+    let skip_reviewer_for_spec_only_pr = if let Some(r) = reviewer
+        && r.skip_spec_only_prs()
+    {
+        let paths = git::diff_files_changed(
+            workspace,
+            &repo.base_branch,
+            &repo.agent_branch,
+        )
+        .unwrap_or_default();
+        let spec_only =
+            crate::spec_storage_routing::diff_is_spec_only(&paths);
+        if spec_only {
+            tracing::info!(
+                url = %repo.url,
+                "reviewer: skipping spec-only PR per skip_spec_only_prs config"
+            );
+        }
+        spec_only
+    } else {
+        false
+    };
+
+    let (review_report, draft, reviewer_revision_concerns) = if processed.is_empty()
+        || skip_reviewer_for_spec_only_pr
+    {
         // Audit-only iteration: no implementer-touched files to evaluate.
         // The audit's own validation pass already gated each proposal, so
         // the reviewer would either error against an empty `processed`
         // list or produce a meaningless review of mechanical
         // proposal-writing. Skip the reviewer entirely.
+        //
+        // a34 §6 also skips here when `reviewer.skip_spec_only_prs` AND
+        // the iteration's diff is entirely under `openspec/`.
         (None, false, Vec::new())
     } else {
         match reviewer {

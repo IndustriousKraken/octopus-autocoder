@@ -40,6 +40,7 @@ mod recovery_classification;
 mod revisions;
 mod spec_revision;
 mod spec_root;
+mod spec_storage_routing;
 mod state;
 #[cfg(test)]
 mod testing;

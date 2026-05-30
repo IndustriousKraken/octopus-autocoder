@@ -269,6 +269,7 @@ mod tests {
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let err = match build_from_config(&cfg) {
             Ok(_) => panic!("no key source must error"),
@@ -309,6 +310,7 @@ mod tests {
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let client = build_from_config(&cfg)
             .expect("inline api_key with no api_key_env should succeed");
@@ -356,6 +358,7 @@ mod tests {
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let client = build_from_config(&cfg).expect("inline build should succeed");
         let _ = client.complete("hi").await.expect("complete succeeds");

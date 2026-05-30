@@ -146,6 +146,10 @@ pub struct CodeReviewer {
     mode: crate::config::ReviewerMode,
     max_code_reviews_per_pr: u32,
     suggest_rereview_threshold: Option<f32>,
+    /// a34 §6: cost-optimization knob. When `true`, the polling
+    /// iteration skips the reviewer call for any PR whose diff lives
+    /// entirely under `openspec/`. Defaults to `false`.
+    skip_spec_only_prs: bool,
 }
 
 impl CodeReviewer {
@@ -158,6 +162,7 @@ impl CodeReviewer {
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         }
     }
 
@@ -180,6 +185,15 @@ impl CodeReviewer {
 
     /// Optional diff-overlap threshold for the post-revision re-review
     /// suggestion (a33). `None` disables the suggestion.
+    pub fn with_skip_spec_only_prs(mut self, b: bool) -> Self {
+        self.skip_spec_only_prs = b;
+        self
+    }
+
+    pub fn skip_spec_only_prs(&self) -> bool {
+        self.skip_spec_only_prs
+    }
+
     pub fn suggest_rereview_threshold(&self) -> Option<f32> {
         self.suggest_rereview_threshold
     }
@@ -250,7 +264,8 @@ impl CodeReviewer {
             .with_prompt_budget(cfg.prompt_budget_chars)
             .with_mode(cfg.mode)
             .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
-            .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold))
+            .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold)
+            .with_skip_spec_only_prs(cfg.skip_spec_only_prs))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
@@ -1049,6 +1064,137 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(r.diff_or_explanation, "DELTA");
     }
 
+    /// a34 §6: `skip_spec_only_prs` defaults to `false` AND propagates
+    /// from `ReviewerConfig` via `from_config`. This is the gate the
+    /// polling iteration consults before invoking the reviewer call.
+    #[test]
+    fn skip_spec_only_prs_defaults_false_and_propagates() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        // Default: unset → false.
+        unsafe { std::env::set_var("REVIEWER_TEST_SKIP_DEFAULT", "k") };
+        let cfg_default = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "x".into(),
+            api_key_env: Some("REVIEWER_TEST_SKIP_DEFAULT".into()),
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+        };
+        let r_default = CodeReviewer::from_config(&cfg_default)
+            .expect("default-config builds");
+        assert!(
+            !r_default.skip_spec_only_prs(),
+            "default must be false: got {}",
+            r_default.skip_spec_only_prs()
+        );
+
+        // Explicit true: propagates.
+        unsafe { std::env::set_var("REVIEWER_TEST_SKIP_TRUE", "k") };
+        let cfg_true = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "x".into(),
+            api_key_env: Some("REVIEWER_TEST_SKIP_TRUE".into()),
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: true,
+        };
+        let r_true = CodeReviewer::from_config(&cfg_true)
+            .expect("skip=true builds");
+        assert!(
+            r_true.skip_spec_only_prs(),
+            "true must propagate: got {}",
+            r_true.skip_spec_only_prs()
+        );
+        unsafe { std::env::remove_var("REVIEWER_TEST_SKIP_DEFAULT") };
+        unsafe { std::env::remove_var("REVIEWER_TEST_SKIP_TRUE") };
+    }
+
+    /// a34 §6.2: a brownfield iteration's PR has only
+    /// `openspec/changes/<change>/...` diff → `diff_is_spec_only`
+    /// returns true. With `skip_spec_only_prs: true` the polling
+    /// iteration's gate skips the reviewer call (verified via the
+    /// predicate the polling code consults).
+    #[test]
+    fn diff_is_spec_only_classifies_brownfield_pr_correctly() {
+        use crate::spec_storage_routing::diff_is_spec_only;
+        let brownfield_paths = vec![
+            "openspec/changes/a36-brownfield-foo/proposal.md".to_string(),
+            "openspec/changes/a36-brownfield-foo/tasks.md".to_string(),
+            "openspec/changes/a36-brownfield-foo/specs/foo/spec.md".to_string(),
+        ];
+        assert!(
+            diff_is_spec_only(&brownfield_paths),
+            "brownfield PR classifies as spec-only"
+        );
+    }
+
+    /// a34 §6.3: a dual-tree iteration's code PR has
+    /// `autocoder/src/foo.rs` diff → `diff_is_spec_only` returns
+    /// false. The polling iteration's gate runs the reviewer normally.
+    #[test]
+    fn diff_is_spec_only_classifies_dual_tree_code_pr_correctly() {
+        use crate::spec_storage_routing::diff_is_spec_only;
+        let dual_code_paths = vec![
+            "autocoder/src/foo.rs".to_string(),
+            "openspec/changes/a36/proposal.md".to_string(),
+        ];
+        assert!(
+            !diff_is_spec_only(&dual_code_paths),
+            "dual-tree's code PR is NOT spec-only"
+        );
+    }
+
+    /// a34 §6.4 (default behavior): with `skip_spec_only_prs: false`,
+    /// the reviewer would be invoked even on a spec-only diff. The
+    /// accessor returns false → the gate condition evaluates to false →
+    /// the reviewer-invocation branch is taken.
+    #[test]
+    fn skip_spec_only_prs_false_does_not_short_circuit_gate() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        unsafe { std::env::set_var("REVIEWER_TEST_SKIP_FALSE_GATE", "k") };
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Anthropic,
+            model: "x".into(),
+            api_key_env: Some("REVIEWER_TEST_SKIP_FALSE_GATE".into()),
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+        };
+        let r = CodeReviewer::from_config(&cfg).expect("config builds");
+        unsafe { std::env::remove_var("REVIEWER_TEST_SKIP_FALSE_GATE") };
+        // The polling-loop gate evaluates `r.skip_spec_only_prs() &&
+        // diff_is_spec_only(...)`. When the first conjunct is false,
+        // the gate is unconditionally false — the reviewer is invoked.
+        assert!(
+            !r.skip_spec_only_prs(),
+            "default-false config keeps the gate inactive"
+        );
+    }
+
     #[test]
     fn from_config_reads_user_provided_template() {
         use crate::config::{ReviewerConfig, ReviewerProvider};
@@ -1072,6 +1218,7 @@ this is not yaml: at all: ::: {{{ broken
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
@@ -1110,6 +1257,7 @@ this is not yaml: at all: ::: {{{ broken
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("missing template must fall back to embedded default");
@@ -1153,6 +1301,7 @@ this is not yaml: at all: ::: {{{ broken
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("nested override resolves");
@@ -1179,6 +1328,7 @@ this is not yaml: at all: ::: {{{ broken
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
             suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };

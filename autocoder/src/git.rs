@@ -229,6 +229,70 @@ pub fn commit(workspace: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// a34: `git -C <tree_path> commit -m <message>` against an arbitrary
+/// working tree (not the daemon's primary `workspace`). Returns the
+/// commit SHA (the `HEAD` post-commit). Used by the spec-storage
+/// routing path so spec-only iterations commit into the spec_storage
+/// repo's working tree without disturbing the code workspace.
+pub fn commit_in_tree(tree_path: &Path, message: &str) -> Result<String> {
+    run_git(tree_path, "commit", &["commit", "-m", message])?;
+    let head_out = run_git(tree_path, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
+    Ok(String::from_utf8_lossy(&head_out.stdout).trim().to_string())
+}
+
+/// a34: `git -C <tree_path> push [--force] <remote> <branch>` against
+/// an arbitrary working tree. Used by the spec-storage routing path so
+/// spec-only iterations push from the spec_storage tree to its remote.
+pub fn push_in_tree(
+    tree_path: &Path,
+    remote: &str,
+    branch: &str,
+    force: bool,
+) -> Result<()> {
+    if force {
+        run_git(
+            tree_path,
+            "push --force",
+            &["push", "--force", remote, branch],
+        )?;
+    } else {
+        run_git(tree_path, "push", &["push", remote, branch])?;
+    }
+    Ok(())
+}
+
+/// a34: return the remote-tracked default branch for `remote` in
+/// `tree_path`, by parsing `git -C <tree_path> symbolic-ref
+/// refs/remotes/<remote>/HEAD`. Strips the
+/// `refs/remotes/<remote>/` prefix from the symref target so callers
+/// get just the branch name (e.g. `main`). Returns Err when the
+/// symbolic-ref is unset; callers MAY then fall back to `"main"` per
+/// the orchestrator-cli spec.
+pub fn default_branch_for_remote(tree_path: &Path, remote: &str) -> Result<String> {
+    let symref = format!("refs/remotes/{remote}/HEAD");
+    let out = run_git(
+        tree_path,
+        "symbolic-ref",
+        &["symbolic-ref", &symref],
+    )?;
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let expected_prefix = format!("refs/remotes/{remote}/");
+    let branch = raw
+        .strip_prefix(&expected_prefix)
+        .ok_or_else(|| {
+            anyhow!(
+                "unexpected symbolic-ref target for refs/remotes/{remote}/HEAD: {raw:?}"
+            )
+        })?
+        .to_string();
+    if branch.is_empty() {
+        return Err(anyhow!(
+            "empty branch name parsed from symbolic-ref output: {raw:?}"
+        ));
+    }
+    Ok(branch)
+}
+
 /// `git reset --hard origin/<branch>` — discard all local changes and align
 /// HEAD with the remote tip of `branch`. Used by startup auto-recovery to
 /// scrub residue from a prior failed iteration.
@@ -1196,6 +1260,99 @@ mod tests {
         assert!(
             msg.contains("TO_STDERR"),
             "stderr content must appear: {msg}"
+        );
+    }
+
+    // ----- a34: arbitrary-tree helpers -----
+
+    /// `commit_in_tree` runs `git commit` against the named tree AND
+    /// returns the resulting HEAD SHA. The SHA matches `rev_parse(HEAD)`
+    /// in the same tree.
+    #[test]
+    fn commit_in_tree_returns_head_sha() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("a34.txt"), "hi").unwrap();
+        add_all(&path).unwrap();
+        let sha = commit_in_tree(&path, "a34: test commit").unwrap();
+        assert_eq!(sha.len(), 40, "expected 40-char SHA, got {sha:?}");
+        let head = rev_parse(&path, "HEAD").unwrap();
+        assert_eq!(sha, head, "commit_in_tree SHA must match HEAD post-commit");
+    }
+
+    /// `push_in_tree` with `force: true` pushes the branch to the named
+    /// remote AND uses `--force` in the argv. We verify by setting up a
+    /// second commit on the workspace, push --force, AND confirm the
+    /// remote's tip moves.
+    #[test]
+    fn push_in_tree_force_moves_remote_tip() {
+        let (_dir, ws, remote) = fixture_clone_with_bare_remote();
+        // Make a second commit on main AND push --force from the helper.
+        std::fs::write(ws.join("EXTRA.md"), "more").unwrap();
+        add_all(&ws).unwrap();
+        commit(&ws, "extra commit").unwrap();
+        push_in_tree(&ws, "origin", "main", true).expect("push --force succeeds");
+        // The remote bare repo's main branch should now point at the
+        // workspace's HEAD.
+        let ws_head = rev_parse(&ws, "main").unwrap();
+        let remote_head_out = Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&remote)
+            .output()
+            .unwrap();
+        let remote_head = String::from_utf8_lossy(&remote_head_out.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(ws_head, remote_head, "remote tip must match workspace HEAD");
+    }
+
+    /// `push_in_tree` with `force: false` performs a non-forced push.
+    #[test]
+    fn push_in_tree_non_force_succeeds_on_ff() {
+        let (_dir, ws, _remote) = fixture_clone_with_bare_remote();
+        // Recreate a fresh branch + commit.
+        recreate_branch(&ws, "agent-q").unwrap();
+        std::fs::write(ws.join("X.md"), "x").unwrap();
+        add_all(&ws).unwrap();
+        commit(&ws, "x").unwrap();
+        push_in_tree(&ws, "origin", "agent-q", false)
+            .expect("fast-forward push without --force succeeds");
+    }
+
+    /// `default_branch_for_remote` reads the remote-tracked HEAD AND
+    /// returns just the branch name (`main`), not the full ref path.
+    #[test]
+    fn default_branch_for_remote_returns_branch_name() {
+        let (_dir, ws, _remote) = fixture_clone_with_bare_remote();
+        // After `git clone -b main`, the remote-tracking HEAD is set.
+        // Some git versions don't auto-create refs/remotes/origin/HEAD,
+        // so we set it explicitly to match the bare repo's default.
+        let st = Command::new("git")
+            .args(["remote", "set-head", "origin", "main"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "remote set-head failed");
+        let branch = default_branch_for_remote(&ws, "origin")
+            .expect("default branch lookup succeeds");
+        assert_eq!(branch, "main", "expected `main`, got {branch:?}");
+    }
+
+    /// `default_branch_for_remote` errors when the remote-tracking HEAD
+    /// is unset, so the caller can fall back per the canonical spec.
+    #[test]
+    fn default_branch_for_remote_errors_when_symref_unset() {
+        let (_dir, ws, _remote) = fixture_clone_with_bare_remote();
+        // Delete the symref so the next query fails.
+        let _ = Command::new("git")
+            .args(["symbolic-ref", "-d", "refs/remotes/origin/HEAD"])
+            .current_dir(&ws)
+            .output();
+        let err = default_branch_for_remote(&ws, "origin")
+            .expect_err("missing symref must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("symbolic-ref"),
+            "error must name symbolic-ref: {msg}"
         );
     }
 

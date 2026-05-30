@@ -351,6 +351,134 @@ pub async fn create_pull_request(
     .await
 }
 
+/// a34: thin wrapper around `create_pull_request` that accepts an
+/// optional `repo: Option<&str>` parameter (the canonical wire form is
+/// `gh pr create --repo <owner>/<name>`).
+///
+/// When `Some("owner/name")`, the underlying PR is opened against
+/// that repo's `/pulls` endpoint (parsing the `<owner>/<name>` slug).
+/// When `None`, the existing behavior is preserved: the PR targets
+/// the caller's `default_owner` + `default_repo` (which corresponds
+/// to the current working tree's origin in the canonical `gh`
+/// invocation).
+///
+/// Used by the spec-storage routing path so a spec-only iteration's PR
+/// opens against the spec_storage repo, not the code workspace repo.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub async fn create_pr(
+    default_owner: &str,
+    default_repo: &str,
+    repo: Option<&str>,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+    review_report: Option<&ReviewReport>,
+    draft: bool,
+) -> Result<CreatedPr> {
+    create_pr_at(
+        DEFAULT_API_BASE,
+        default_owner,
+        default_repo,
+        repo,
+        head,
+        base,
+        title,
+        body,
+        token,
+        review_report,
+        draft,
+    )
+    .await
+}
+
+/// a34: test-only `create_pr` indirection — routes the HTTP call to the
+/// mockito server URL passed in by the test rather than the live
+/// `DEFAULT_API_BASE`. Mirrors the existing
+/// `create_pull_request_at_for_test` pattern.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_pr_at_for_test(
+    api_base: &str,
+    default_owner: &str,
+    default_repo: &str,
+    repo: Option<&str>,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+    review_report: Option<&ReviewReport>,
+    draft: bool,
+) -> Result<CreatedPr> {
+    create_pr_at(
+        api_base,
+        default_owner,
+        default_repo,
+        repo,
+        head,
+        base,
+        title,
+        body,
+        token,
+        review_report,
+        draft,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, dead_code)]
+async fn create_pr_at(
+    api_base: &str,
+    default_owner: &str,
+    default_repo: &str,
+    repo: Option<&str>,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+    review_report: Option<&ReviewReport>,
+    draft: bool,
+) -> Result<CreatedPr> {
+    let (owner_str, repo_str) = match repo {
+        Some(slug) => {
+            let (o, n) = parse_owner_repo_slug(slug)
+                .ok_or_else(|| anyhow!("create_pr: invalid --repo slug `{slug}` (expected `<owner>/<name>`)"))?;
+            (o.to_string(), n.to_string())
+        }
+        None => (default_owner.to_string(), default_repo.to_string()),
+    };
+    create_pull_request_at(
+        api_base,
+        &owner_str,
+        &repo_str,
+        head,
+        base,
+        title,
+        body,
+        token,
+        review_report,
+        draft,
+    )
+    .await
+}
+
+/// Parse a `<owner>/<name>` slug into `(owner, name)`. Returns `None`
+/// when the input does not contain exactly one `/` AND non-empty
+/// segments on either side. Used by `create_pr` to canonicalize the
+/// `--repo` argument.
+#[allow(dead_code)]
+fn parse_owner_repo_slug(slug: &str) -> Option<(&str, &str)> {
+    let trimmed = slug.trim();
+    let (owner, name) = trimmed.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some((owner, name))
+}
+
 /// Test-only re-export of the internal `create_pull_request_at`. Lets
 /// sibling-module tests (e.g. polling_loop's routing test) exercise the
 /// PR HTTP path against a mockito server.
@@ -1139,6 +1267,138 @@ mod tests {
             .expect_err("500 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("500"), "error must name the HTTP status; got: {msg}");
+    }
+
+    // ----- a34 §3: create_pr --repo routing -----
+
+    /// `create_pr` with `repo: Some("foo/bar")` opens the PR against the
+    /// `/repos/foo/bar/pulls` endpoint — the equivalent shape of
+    /// `gh pr create --repo foo/bar`. `default_owner`/`default_repo`
+    /// must NOT influence the target.
+    #[tokio::test]
+    async fn create_pr_with_some_repo_targets_that_repo() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/foo/bar/pulls")
+            .match_header("authorization", "Bearer testtoken")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"html_url":"https://github.com/foo/bar/pull/7","number":7}"#,
+            )
+            .create_async()
+            .await;
+        // Belt-and-suspenders: also assert the default-owner path is
+        // NOT hit. Mock with `expect(0)` so a mis-route fails loudly.
+        let default_mock = server
+            .mock("POST", "/repos/default-owner/default-repo/pulls")
+            .with_status(201)
+            .expect(0)
+            .create_async()
+            .await;
+        let pr = create_pr_at_for_test(
+            &server.url(),
+            "default-owner",
+            "default-repo",
+            Some("foo/bar"),
+            "agent-q",
+            "main",
+            "[specs] t",
+            "b",
+            "testtoken",
+            None,
+            false,
+        )
+        .await
+        .expect("PR creation should succeed");
+        assert_eq!(pr.html_url, "https://github.com/foo/bar/pull/7");
+        assert_eq!(pr.number, 7);
+        mock.assert_async().await;
+        default_mock.assert_async().await;
+    }
+
+    /// `create_pr` with `repo: None` falls back to the
+    /// `default_owner` + `default_repo` — preserving the equivalent of
+    /// `gh pr create` with NO `--repo` argument (the canonical
+    /// regression scenario).
+    #[tokio::test]
+    async fn create_pr_with_none_targets_default_owner_repo() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/default-owner/default-repo/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"html_url":"https://github.com/default-owner/default-repo/pull/3","number":3}"#,
+            )
+            .create_async()
+            .await;
+        let pr = create_pr_at_for_test(
+            &server.url(),
+            "default-owner",
+            "default-repo",
+            None,
+            "agent-q",
+            "main",
+            "t",
+            "b",
+            "testtoken",
+            None,
+            false,
+        )
+        .await
+        .expect("PR creation should succeed");
+        assert_eq!(
+            pr.html_url,
+            "https://github.com/default-owner/default-repo/pull/3"
+        );
+        assert_eq!(pr.number, 3);
+        mock.assert_async().await;
+    }
+
+    /// `create_pr` rejects a malformed slug with a clear error message
+    /// (no embedded `/`, multiple `/`, etc.) — surfaces the
+    /// caller-error so operators see the offending slug.
+    #[tokio::test]
+    async fn create_pr_rejects_malformed_slug() {
+        let err = create_pr_at_for_test(
+            "http://localhost:9", // unused; we should fail before the HTTP call
+            "d",
+            "d",
+            Some("not-a-slug"),
+            "agent-q",
+            "main",
+            "t",
+            "b",
+            "testtoken",
+            None,
+            false,
+        )
+        .await
+        .expect_err("malformed slug must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not-a-slug"),
+            "error must name the offending slug: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_slug_accepts_well_formed() {
+        assert_eq!(parse_owner_repo_slug("foo/bar"), Some(("foo", "bar")));
+        assert_eq!(
+            parse_owner_repo_slug("  speccorp/specs-repo  "),
+            Some(("speccorp", "specs-repo"))
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_slug_rejects_malformed() {
+        assert!(parse_owner_repo_slug("").is_none());
+        assert!(parse_owner_repo_slug("foo").is_none());
+        assert!(parse_owner_repo_slug("/bar").is_none());
+        assert!(parse_owner_repo_slug("foo/").is_none());
+        assert!(parse_owner_repo_slug("a/b/c").is_none());
     }
 
     #[tokio::test]
