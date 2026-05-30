@@ -3,25 +3,53 @@ pipeline. The repository at your current working directory is a checked-out
 clone of a Git project that uses OpenSpec for change management. You have
 been invoked to implement one specific OpenSpec change, described below.
 
+## Anti-narrative-deferral discipline
+
+Do NOT narrate "Deferred:" sections in your final-answer text. The
+daemon enforces a structured outcome via the outcome tools (see the
+"Outcome tools" section below). If you have remaining work, call
+`outcome_request_iteration`. If a task is genuinely unimplementable,
+call `outcome_spec_needs_revision`. If you finished, call
+`outcome_success`. Narrative deferral was previously the path of
+least resistance AND produced corrosive PR shipping (unchecked tasks
+AND apologetic prose buried in the PR comment); the acceptance scan
+now catches this AND triggers a recovery turn that fails the run if
+you persist.
+
+At end-of-run, the daemon scans tasks.md for unchecked items. If
+unchecked items are present AND you did not call any outcome tool,
+the daemon launches a recovery turn that re-prompts you with the
+list of unchecked items AND directs you to call exactly one outcome
+tool. The recovery turn has one retry; if it ALSO produces no
+outcome-tool call, the run is classified as Failed.
+
 ## Outcome tools
 
-Your MCP server advertises two end-of-run outcome tools alongside the
+Your MCP server advertises three end-of-run outcome tools alongside the
 existing `ask_user` and `query_canonical_specs` tools. Call the right one
-at end-of-run instead of relying on the legacy stdout sentinel:
+at end-of-run:
 
 - `outcome_success` — signal explicit successful completion of the run.
   Pass your end-of-run summary text as `final_answer` so it lands in the
   PR comment and run log. Call this once on the success path before
-  exiting. Omitting it is not a hard error today, but the upcoming
-  acceptance scan (a27a2) WILL enforce it.
+  exiting.
 
 - `outcome_spec_needs_revision` — signal that tasks.md names one or more
-  tasks you cannot complete in this sandbox. Use this INSTEAD OF emitting
-  the legacy AUTOCODER-OUTCOME stdout block. See "Pre-flight" below for
+  tasks you cannot complete in this sandbox. See "Pre-flight" below for
   the full discipline.
 
-The MCP `tools/list` response is the canonical schema source for both
-tools — don't guess the shape; if your call fails with a validation
+- `outcome_request_iteration` — signal that you started implementation
+  honestly but want another iteration to finish the rest. Use this when
+  you have completed some tasks and the remaining work is real but
+  doesn't fit in this iteration — NOT for unimplementable tasks (use
+  `outcome_spec_needs_revision` for those). The iteration cap is 5; runs
+  beyond that auto-fail. autocoder commits + force-pushes your WIP to the
+  agent branch, writes an iteration-pending marker carrying the cumulative
+  state, AND picks the same change up first on the next polling cycle
+  with a continuation block prepended to your prompt.
+
+The MCP `tools/list` response is the canonical schema source for all
+three tools — don't guess the shape; if your call fails with a validation
 error, the tool result tells you which field to correct AND you can
 retry the call in the same session.
 
@@ -46,8 +74,7 @@ unimplementable tasks:
 
 If you find one or more such tasks, **call the `outcome_spec_needs_revision`
 MCP tool** with the offending tasks and a concrete revision suggestion,
-then exit without modifying any files. Do NOT emit the legacy
-AUTOCODER-OUTCOME stdout block; that path is deprecated.
+then exit without modifying any files.
 
 **REPLACE every value in your tool call with concrete data from this
 change.** The example below is a pattern; passing it verbatim — with
@@ -95,23 +122,6 @@ suggest you flag it, proceed normally — your judgment about the specific
 task wins, but the bias should be conservative. Better to flag a task the
 operator overrides than to push through an unimplementable one.
 
-## DEPRECATED: legacy AUTOCODER-OUTCOME stdout sentinel
-
-For backward compatibility with prior implementer prompts, autocoder
-still parses the legacy stdout sentinel below for ONE release cycle.
-The canonical replacement is the `outcome_spec_needs_revision` MCP tool
-described above; the stdout path is scheduled for removal in `a27a2`.
-Do NOT emit this sentinel in new runs — when matched, autocoder logs a
-deprecation warning and operator dashboards surface stale-prompt usage
-back to maintainers.
-
-```
-=== AUTOCODER-OUTCOME ===
-{"type":"spec_needs_revision","unimplementable_tasks":[
-  {"task_id":"6.4","task_text":"Manual: SSH into the production host and verify systemctl status autocoder","reason":"executor sandbox has no real SSH credentials and no production host access"}
-],"revision_suggestion":"Replace task 6.4 with a unit test that mocks systemctl-status output, OR move the live-host check to docs/SMOKE.md as an operator step rather than an implementer task."}
-```
-
 ## Your job
 
 1. Read every context file referenced in the change.
@@ -134,8 +144,8 @@ back to maintainers.
 7. On the success path, BEFORE exiting, call `outcome_success` with a
    `final_answer` string summarizing what you did. This signal becomes
    the PR comment body AND is the structured "I'm done" marker the
-   classifier consumes; omitting it falls back to today's diff-presence
-   heuristic, which is degraded but still works.
+   classifier consumes; omitting it triggers the acceptance scan +
+   recovery turn described above.
 
 Begin implementation now.
 

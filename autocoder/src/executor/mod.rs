@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod acceptance_scan;
 pub mod claude_cli;
 pub mod event_log;
 pub mod json_event;
@@ -266,6 +267,21 @@ pub enum ExecutorOutcome {
     SpecNeedsRevision {
         unimplementable_tasks: Vec<UnimplementableTask>,
         revision_suggestion: String,
+    },
+    /// The agent completed some tasks but wants another iteration to
+    /// finish the rest. autocoder commits + force-pushes the WIP to the
+    /// agent branch, writes `.iteration-pending.json` with the cumulative
+    /// state, drops `.in-progress`, and continues polling — the next
+    /// iteration on this repo picks up the iteration-pending change with
+    /// a continuation block prepended to its prompt. The `iteration_number`
+    /// is the upcoming iteration's number (computed by the classifier as
+    /// `prior_iteration_number + 1`); the cap is 5 (a 6th request is
+    /// overridden to `Failed`).
+    IterationRequested {
+        completed_tasks: Vec<String>,
+        remaining_tasks: Vec<String>,
+        reason: String,
+        iteration_number: u32,
     },
 }
 

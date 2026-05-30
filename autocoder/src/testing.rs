@@ -22,7 +22,20 @@
 //! reached for that literal.
 
 use crate::paths::DaemonPaths;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+/// Process-wide serialization point for tests that mutate the
+/// `ORCH_MCP_CONTROL_SOCKET` / `ORCH_MCP_WORKSPACE_BASENAME` env vars,
+/// OR otherwise rely on the daemon's outcome-store control-socket
+/// plumbing. Both `claude_cli` AND `mcp_askuser_server` test modules
+/// share this lock so a test in one module cannot stomp on the env
+/// state observed by a test in the other.
+///
+/// Usage: `let _g = crate::testing::ENV_LOCK.lock().unwrap();` at the
+/// top of any test that sets / unsets one of those env vars.
+#[allow(dead_code)]
+pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Construct a fresh `DaemonPaths` whose four roots live under a new
 /// per-call `TempDir`. The four directories are created on disk so
