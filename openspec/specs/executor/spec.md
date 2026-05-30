@@ -420,81 +420,6 @@ When `executor.output_format` is `"text"`, the executor SHALL omit the `--output
 - **WHEN** the config has `executor.output_format: "text"` AND a run times out
 - **THEN** the log file's STDOUT section reads `=== STDOUT (0 bytes) ===` (the legacy behavior of losing the buffer on kill is preserved verbatim)
 
-### Requirement: Sentinel emission instructions in the implementer prompt include a concrete worked example AND a self-check hint
-Every outcome-sentinel format documented in `prompts/implementer.md` (currently the `SpecNeedsRevision` sentinel; future formats SHALL follow the same pattern) SHALL be presented with three structural elements:
-
-1. **A substitution instruction** appearing IMMEDIATELY BEFORE the example, naming the rule that the example is a pattern AND that emitting it verbatim is a parse failure.
-2. **A worked example with no angle-bracket placeholders** showing what a complete, parseable sentinel looks like. The example SHALL deserialize cleanly into the corresponding Rust type via `serde_json::from_str` AND SHALL contain realistic task ids, prose, AND reasoning that the agent can model.
-3. **A self-check hint** appearing AFTER the example, instructing the agent to scan its emitted sentinel for `<...>` patterns inside string values before emitting AND describing the daemon's placeholder-detection diagnostic.
-
-The implementer prompt SHALL NOT use angle-bracket placeholders (`<id-from-tasks-md>`, `<verbatim quote>`, etc.) inside string values in any sentinel example. Earlier versions of the prompt used this pattern AND triggered literal-emission failures; the lesson is preserved as a hard rule.
-
-Operator-customizable override prompts (loaded via the uniform `PromptLoader` per `a24`'s spec) MAY use any structure the operator prefers — the canonical rule binds the bundled default only. Operators whose customized templates regress to placeholder-style examples will hit the same failure mode the bundled prompt previously hit; the placeholder-detection requirement in `orchestrator-cli` surfaces the diagnostic AND points the operator at the bundled default for reference.
-
-#### Scenario: Bundled prompt's sentinel example is parseable
-- **WHEN** an automated test deserializes the worked-example JSON from `prompts/implementer.md`'s sentinel section into `SpecNeedsRevisionDetail`
-- **THEN** the deserialization succeeds without error
-- **AND** every field's value is a concrete string (no angle-bracket markers, no template variables)
-
-#### Scenario: Bundled prompt contains the three structural elements
-- **WHEN** a maintainer reads `prompts/implementer.md`'s sentinel section
-- **THEN** the section contains a substitution instruction paragraph IMMEDIATELY BEFORE the example
-- **AND** the example itself contains no angle-bracket placeholders inside string values
-- **AND** a self-check hint paragraph appears AFTER the example naming the daemon's placeholder-detection diagnostic
-
-#### Scenario: Future sentinel formats follow the same pattern
-- **WHEN** a future change introduces a new sentinel format in `prompts/implementer.md` (OR a new operator-aimed prompt template added by the daemon)
-- **THEN** the new format's documentation in the prompt follows the substitution-instruction + worked-example + self-check-hint structure
-- **AND** the new format's example deserializes cleanly into its corresponding Rust type
-
-### Requirement: Timeout classification takes precedence over sentinel extraction; sentinel scan is scoped to deliberate-emission content
-The executor's outcome-dispatch path SHALL check `outcome.timed_out` BEFORE attempting any sentinel extraction OR sentinel-parse fallback. When `outcome.timed_out` is `true`, the executor SHALL return `Failed { reason: "timeout" }` (OR the canonical timeout-reason format) WITHOUT scanning for, extracting, OR attempting to parse any sentinel-shaped substring in the captured event stream. The sentinel is by definition a deliberate end-of-run emission; a timed-out run did not reach end-of-run, so no sentinel-shaped scrollback content is semantically the agent's emission.
-
-When the run did NOT time out AND a sentinel scan is performed, the scan's input scope depends on the configured output format:
-
-- **JSON streaming mode** (`executor.output_format: json`, the default): the scanner reads ONLY `outcome.final_answer`. When `final_answer` is `None` (the agent never reached the `result` event for any reason — crash, protocol error, etc.), the sentinel scan returns `None` AND the normal exit-status path handles the outcome. The scanner SHALL NOT fall back to `outcome.stdout`. Rationale: the `result` event's text is the agent's deliberate end-of-run emission; tool-result echoes, prompt-context echoes, AND other event-stream content are NOT deliberate emissions AND must not be matched against the sentinel.
-- **Text mode** (`executor.output_format: text`, the legacy opt-out): the scanner reads `outcome.stdout`. This mode has no separate `result`-event channel, so stdout IS the agent's emission stream. Timeout precedence still applies — a timed-out text-mode run is classified as timeout BEFORE the sentinel scan runs.
-
-This requirement narrows the canonical "Malformed outcome sentinel falls back to Failed" scenario WITHOUT changing it: a malformed sentinel that genuinely appears in the agent's deliberate emission still triggers the canonical fallback. The change is what counts as "the agent's deliberate emission" — sentinel-shaped substrings in tool-result echoes OR prompt-context echoes are no longer in scope.
-
-#### Scenario: Timed-out run with sentinel-shaped scrollback returns timeout
-- **WHEN** the executor invocation completes with `outcome.timed_out: true` AND `outcome.stdout` contains a well-formed `=== AUTOCODER-OUTCOME ===` block followed by valid JSON (the worst-case false-match: sentinel content present, would-be-parseable)
-- **THEN** the executor returns `Failed { reason: "timeout" }`
-- **AND** no sentinel-extraction attempt is made
-- **AND** no `agent emitted unparseable SpecNeedsRevision sentinel` log line fires
-- **AND** the perma-stuck counter increments against a transient-infrastructure category (the canonical "predictable failure" set) if the operator has configured that classification, NOT against a genuine agent failure
-
-#### Scenario: Timed-out run with prompt-template echo in stdout returns timeout
-- **WHEN** the executor invocation completes with `outcome.timed_out: true`, `outcome.final_answer: None`, AND `outcome.stdout` contains a tool-result echo of `prompts/implementer.md` (including the sentinel example block with `\n31\t`-style line-number prefixes)
-- **THEN** the executor returns `Failed { reason: "timeout" }`
-- **AND** the line-number-prefixed pseudo-sentinel content is NOT parsed
-- **AND** no misleading `unparseable sentinel` reason is surfaced to the operator
-
-#### Scenario: JSON streaming mode scans only final_answer
-- **WHEN** the executor invocation completes with `output_format: Json`, `outcome.timed_out: false`, `outcome.final_answer: Some("Implementation complete; all tests pass.")` (no sentinel), AND `outcome.stdout` contains a sentinel-shaped block from a tool-result echo
-- **THEN** the sentinel scanner reads ONLY `final_answer`
-- **AND** the scan returns `None`
-- **AND** the executor proceeds to the normal exit-status path
-- **AND** the stdout echo's sentinel-shaped content is ignored
-
-#### Scenario: JSON streaming mode with sentinel in final_answer parses correctly
-- **WHEN** `output_format: Json`, `outcome.timed_out: false`, AND `outcome.final_answer: Some("=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[...],...}")`
-- **THEN** the sentinel scanner extracts the payload from `final_answer` AND parses it
-- **AND** a well-formed payload returns `SpecNeedsRevision { ... }` per the canonical outcome
-- **AND** a malformed payload triggers the canonical "Malformed outcome sentinel falls back to Failed" path
-
-#### Scenario: Text mode preserves stdout scan for non-timeout runs
-- **WHEN** `output_format: Text`, `outcome.timed_out: false`, AND `outcome.stdout` contains a sentinel block
-- **THEN** the sentinel scanner reads `outcome.stdout` AND extracts the block
-- **AND** the existing parse + dispatch behaviour is unchanged from pre-spec text-mode behaviour
-- **AND** text mode's stdout-as-emission semantic is preserved
-
-#### Scenario: JSON streaming mode with final_answer absent skips the sentinel scan
-- **WHEN** `output_format: Json`, `outcome.timed_out: false` (run completed normally per exit status), AND `outcome.final_answer: None` (no `result` event was captured for some non-timeout reason — protocol error, missing event type, etc.)
-- **THEN** the sentinel scan returns `None` without consulting `outcome.stdout`
-- **AND** the executor proceeds to the normal exit-status path (which may classify as Failed for other reasons)
-- **AND** stdout echo content is not considered for sentinel matching even when final_answer is unexpectedly empty
-
 ### Requirement: Per-execution MCP child exposes `query_canonical_specs` tool via control-socket relay
 The per-execution stdio MCP server (the child process autocoder launches per polling iteration via `.mcp.json`, currently `autocoder/src/mcp_askuser_server.rs`) SHALL advertise a `query_canonical_specs` tool alongside the existing `ask_user` tool. The tool's surface as seen by the wrapped agent:
 
@@ -768,25 +693,27 @@ Validation is performed AT THE MCP LAYER, NOT at the daemon's `record_outcome` h
 
 The executor's outcome-dispatch path (`classify_outcome` in the CLI-wrapping executor backend) SHALL consult the daemon's outcome store via a `consume_outcome` control-socket action BEFORE applying any other classification step. The ordering is:
 
-1. **Tool-recorded outcome lookup** (NEW). The classifier sends a `consume_outcome` action keyed by `(workspace_basename, change)`. When the daemon returns a recorded outcome:
+1. **Tool-recorded outcome lookup.** The classifier sends a `consume_outcome` action keyed by `(workspace_basename, change)`. When the daemon returns a recorded outcome:
    - A `Success` variant maps to `ExecutorOutcome::Completed { final_answer }` using the recorded `final_answer`.
    - A `SpecNeedsRevision` variant maps to the existing `ExecutorOutcome::SpecNeedsRevision { ... }` shape.
+   - An `IterationRequest` variant maps to `ExecutorOutcome::IterationRequested { ... }` per the `a27a1` cap-enforcement rules.
    - The classifier returns the mapped outcome immediately. No further heuristic is applied.
-2. **AskUser marker check** (UNCHANGED from today's behavior; only the ordering shifts — it now runs only when no outcome was tool-recorded).
-3. **Timeout precedence** (UNCHANGED — the existing canonical "Timeout classification takes precedence over sentinel extraction" requirement governs this layer AND its scope-narrowing remains in force).
-4. **Stdout-sentinel scan** (UNCHANGED in extraction behavior; gains an operator-visible deprecation warning per the requirement below).
-5. **Exit-status path** (UNCHANGED).
-6. **Layer-2 stdout heuristic + Completed fallback** (UNCHANGED).
+2. **AskUser marker check** (unchanged from canonical executor behavior).
+3. **Timeout precedence.** When `outcome.timed_out` is `true` AND no tool-recorded outcome was returned, the classifier returns `Failed { reason: "timeout" }` (OR the canonical timeout-reason format).
+4. **Exit-status path** (unchanged).
+5. **Layer-2 stdout heuristic + Completed fallback** (unchanged).
 
-The precedence rule is anchored in the semantics of the signal: a tool-recorded outcome is the agent's deliberate, schema-validated end-of-run emission. It is more authoritative than ANY inferred state (timeout flag, exit status, stdout content). A run that called an outcome tool AND subsequently timed out is classified by the outcome, not the timeout — the agent emitted its signal; the kill happened after.
+The legacy stdout-sentinel scan that previously sat between steps 3 AND 4 (per the original `a27a0` ordering) is REMOVED in this change. The acceptance scan + recovery loop introduced below replace its role: the only narrative-deferral path the classifier still produces (Completed via diff-presence heuristic) is gated by the acceptance scan in `Executor::run`'s post-classification step.
 
-When the daemon's `consume_outcome` action returns `None` (no outcome was recorded), the classifier proceeds to step 2 AND the existing behavior is preserved exactly. This is the path that all pre-a27a0 implementer prompts continue to take.
+The precedence rule is anchored in the semantics of the signal: a tool-recorded outcome is the agent's deliberate, schema-validated end-of-run emission. It is more authoritative than ANY inferred state (timeout flag, exit status, stdout content). A run that called an outcome tool AND subsequently timed out is classified by the outcome, not the timeout.
 
-#### Scenario: Tool-recorded `Success` outcome takes precedence over stdout sentinel
+When the daemon's `consume_outcome` action returns `None` (no outcome was recorded), the classifier proceeds to step 2 AND the existing canonical behavior is preserved exactly.
+
+#### Scenario: Tool-recorded `Success` outcome takes precedence over diff-presence heuristic
 - **WHEN** the classifier runs for a change whose daemon outcome store contains a `Success` outcome from a prior `outcome_success` tool call
-- **AND** `outcome.stdout` ALSO contains a well-formed `=== AUTOCODER-OUTCOME ===` block with a `spec_needs_revision` payload (the worst-case ambiguity: both signals present)
+- **AND** the workspace has a non-empty diff (would otherwise trigger today's Completed-via-diff-presence path with possibly different `final_answer` content)
 - **THEN** the classifier returns `ExecutorOutcome::Completed { final_answer: <recorded final_answer> }`
-- **AND** the stdout sentinel is NOT extracted, parsed, OR considered for the outcome
+- **AND** the recorded `final_answer` (NOT a heuristically-extracted alternative) is the outcome's content
 - **AND** the daemon's outcome store entry for this `(workspace_basename, change)` is cleared (drained by `consume_outcome`)
 
 #### Scenario: Tool-recorded `SpecNeedsRevision` outcome takes precedence over timeout
@@ -796,79 +723,47 @@ When the daemon's `consume_outcome` action returns `None` (no outcome was record
 - **AND** the timeout flag is NOT used
 - **AND** no `Failed { reason: "timeout" }` outcome is produced
 
-#### Scenario: Absent tool-recorded outcome falls through to legacy classifier
+#### Scenario: Absent tool-recorded outcome falls through to AskUser → timeout → exit-status path
 - **WHEN** the classifier runs for a change whose daemon outcome store contains no entry (the agent did not call any outcome tool)
-- **AND** `outcome.stdout` contains a well-formed `=== AUTOCODER-OUTCOME ===` block with a valid `spec_needs_revision` payload
 - **AND** `outcome.timed_out` is `false`
+- **AND** no AskUser marker is present
 - **THEN** the classifier's `consume_outcome` call returns `None`
-- **AND** the classifier proceeds through the existing ordering (AskUser → timeout → stdout sentinel → exit)
-- **AND** the stdout sentinel scan extracts the payload AND returns `ExecutorOutcome::SpecNeedsRevision { ... }` (the legacy path's exact behavior)
-- **AND** the legacy-path deprecation warning is emitted per the requirement below
-
-### Requirement: Legacy stdout-sentinel scan is deprecated; matches emit an operator-visible warning during the transition cycle
-
-The stdout-sentinel scan (the `extract_outcome_sentinel` + `try_parse_spec_needs_revision` pair invoked from `classify_outcome`) SHALL remain functionally unchanged in this change for backward compatibility with the previous-cycle implementer prompt. When the scan actually matches AND returns a parsed `SpecNeedsRevision` outcome (the legacy path is taken because `consume_outcome` returned `None`), the classifier SHALL emit a `tracing::warn!` log line containing:
-
-- The phrase `legacy stdout sentinel matched` (operator-greppable canonical marker).
-- The change name.
-- A directive sentence naming the canonical replacement tool: `please call the outcome_spec_needs_revision MCP tool instead`.
-- The planned removal target: `(stdout sentinel parsing is scheduled for removal in a27a2)`.
-
-The warning IS load-bearing: it produces operator-visible signal that an out-of-date implementer prompt is in use, which is the trigger for closing the deprecation window in a27a2. Operators MAY filter the warning by changing the log level if they accept the legacy behavior; the warning's continued emission for the cycle's duration is the intended operator-feedback channel.
-
-The stdout-sentinel scan's extraction logic, JSON parsing logic, placeholder-detection logic, AND the parse-failure fallback to `Failed { reason: "..." }` are ALL unchanged. The only behavioral delta is the additional warning emission on successful match.
-
-The deprecation is REMOVED in `a27a2`, at which point the stdout-sentinel scan's match path returns the same outcome but the warning is replaced by a hard error (the legacy path becomes unreachable; the scan's continued presence is dead code at that point, removed as a separate task in a27a2).
-
-#### Scenario: Legacy stdout-sentinel match emits the deprecation warning
-- **WHEN** the classifier's `consume_outcome` returns `None`
-- **AND** `outcome.timed_out` is `false`
-- **AND** the stdout-sentinel scan extracts a payload AND parses it successfully as `spec_needs_revision`
-- **THEN** the classifier emits a `tracing::warn!` log line containing the phrase `legacy stdout sentinel matched`, the change name, the `please call the outcome_spec_needs_revision MCP tool instead` directive, AND the planned-removal-target note
-- **AND** the returned outcome is `ExecutorOutcome::SpecNeedsRevision { ... }` (the legacy path's exact result)
-
-#### Scenario: Legacy stdout-sentinel parse failure surfaces unchanged
-- **WHEN** the classifier's `consume_outcome` returns `None`
-- **AND** `outcome.timed_out` is `false`
-- **AND** the stdout-sentinel scan extracts a payload BUT parsing fails (malformed JSON, placeholder-shaped strings, etc.)
-- **THEN** the classifier returns `ExecutorOutcome::Failed { reason: "agent emitted unparseable SpecNeedsRevision sentinel: ..." }` (the existing behavior, verbatim)
-- **AND** no deprecation warning is emitted (the warning is scoped to successful matches; a parse failure is its own failure mode)
+- **AND** the classifier proceeds through the simplified ordering (AskUser → timeout → exit status → diff-presence/Completed)
+- **AND** no stdout-sentinel scan is attempted (the legacy path has been removed)
 
 ### Requirement: Implementer prompt documents the outcome tools by name AND uses them as the canonical end-of-run signal
 
 The bundled `prompts/implementer.md` template SHALL contain an "Outcome tools" section that:
 
-- Names both outcome tools: `outcome_success` AND `outcome_spec_needs_revision`.
+- Names all three outcome tools: `outcome_success`, `outcome_spec_needs_revision`, AND `outcome_request_iteration`.
 - Provides a one-line purpose statement for each tool.
 - Directs the agent to call `outcome_success` (with the agent's end-of-run summary as `final_answer`) at the end of a successful implementation run, BEFORE exiting.
-- Directs the agent to call `outcome_spec_needs_revision` (instead of emitting the `=== AUTOCODER-OUTCOME ===` stdout block) for the pre-flight unimplementable-task case.
-- Notes that input-validation errors from the MCP tool are recoverable: the model receives the error as the tool-call result AND can retry the call with corrected fields in the same session.
+- Directs the agent to call `outcome_spec_needs_revision` for the pre-flight unimplementable-task case.
+- Directs the agent to call `outcome_request_iteration` (per `a27a1`) when honest scope-overflow means another iteration is needed.
+- Notes that input-validation errors from any outcome tool are recoverable: the model receives the error as the tool-call result AND can retry the call with corrected fields in the same session.
 
 The section SHALL NOT inline the full input schemas; the MCP `tools/list` response is the canonical schema source AND duplicating it in the prompt creates a maintenance hazard. Tool names + one-line purposes are sufficient: a model that knows the tool exists AND its purpose can attempt the call AND converge via tool-error feedback if its argument shape is wrong.
 
-The pre-flight unimplementable-task section SHALL be rewritten to use `outcome_spec_needs_revision`. The substitution-instruction + worked-example + self-check-hint structure (per the existing canonical "Sentinel emission instructions in the implementer prompt include a concrete worked example AND a self-check hint" requirement) SHALL be preserved, but the worked example becomes a tool-call shape (a JSON object the agent passes to the tool) rather than a stdout block, AND the self-check hint references the MCP layer's input validation instead of the daemon's post-exit placeholder detection.
-
-The existing `=== AUTOCODER-OUTCOME ===` stdout-sentinel section SHALL be retained for the deprecation cycle, prefixed with a "DEPRECATED" note that names `outcome_spec_needs_revision` as the canonical replacement AND `a27a2` as the planned removal target.
+The legacy stdout-sentinel section (the `=== AUTOCODER-OUTCOME ===` block AND its DEPRECATED-prefixed retention from `a27a0`) is REMOVED. The implementer prompt SHALL NOT contain any reference to `=== AUTOCODER-OUTCOME ===`, the legacy `spec_needs_revision` JSON sentinel format, OR the substitution-instruction-plus-worked-example structural-elements discipline that bound the sentinel section.
 
 Operator-customizable override prompts (loaded via the uniform `PromptLoader` per `a24`'s spec) MAY use any structure the operator prefers — the canonical rule binds the bundled default only.
 
-#### Scenario: Bundled prompt names both outcome tools
+#### Scenario: Bundled prompt names all three outcome tools
 - **WHEN** a maintainer reads `prompts/implementer.md`
 - **THEN** the prompt contains an "Outcome tools" section
-- **AND** the section names both `outcome_success` AND `outcome_spec_needs_revision`
+- **AND** the section names `outcome_success`, `outcome_spec_needs_revision`, AND `outcome_request_iteration`
 - **AND** each tool has a one-line purpose statement
-- **AND** the section directs end-of-run `outcome_success` use AND pre-flight `outcome_spec_needs_revision` use
 
 #### Scenario: Bundled prompt's outcome-tool example deserializes cleanly
 - **WHEN** an automated test extracts any JSON-shaped example from the prompt's outcome-tool sections AND deserializes it into the corresponding tool-argument Rust type
 - **THEN** the deserialization succeeds without error
 - **AND** every string field contains a concrete value (no angle-bracket markers, no template variables)
 
-#### Scenario: Existing stdout-sentinel section retained with DEPRECATED note
+#### Scenario: Stdout-sentinel section is removed from the bundled prompt
 - **WHEN** a maintainer reads `prompts/implementer.md`
-- **THEN** the existing `=== AUTOCODER-OUTCOME ===` sentinel section is still present (for the deprecation cycle)
-- **AND** the section is prefixed with a "DEPRECATED" note naming `outcome_spec_needs_revision` as the canonical replacement
-- **AND** the note names `a27a2` as the planned-removal target for the legacy path
+- **THEN** the prompt contains NO occurrence of the string `=== AUTOCODER-OUTCOME ===`
+- **AND** the prompt contains NO section describing the legacy `spec_needs_revision` stdout-block format
+- **AND** the prompt contains NO DEPRECATED-prefixed retention of the legacy section
 
 ### Requirement: Per-execution MCP child exposes `outcome_request_iteration` tool
 
@@ -1074,4 +969,193 @@ The `outcome_request_iteration` tool SHALL be named in the prompt's "Outcome too
 - **WHEN** a maintainer reads `prompts/implementer.md`'s "Outcome tools" section
 - **THEN** `outcome_request_iteration` is named alongside `outcome_success` AND `outcome_spec_needs_revision`
 - **AND** the section gives a one-line purpose ("you started implementation but want another iteration to finish — NOT for unimplementable tasks") for the new tool
+
+### Requirement: Acceptance scan rejects implementer runs that ship unchecked tasks without a structured outcome
+
+`Executor::run` (the implementer-first-pass entry point, against a real change directory) SHALL apply an acceptance scan AFTER `classify_outcome` returns AND BEFORE finalizing the outcome. The scan SHALL fire ONLY when:
+
+1. The classified outcome is `ExecutorOutcome::Completed`.
+2. The run did NOT produce a tool-recorded outcome (`consume_outcome` returned `None` during classification — i.e. the agent exited without calling any outcome tool).
+
+If either condition does NOT hold, the scan SHALL be skipped AND the classified outcome SHALL be returned unchanged.
+
+When the scan fires, it SHALL count unchecked tasks in `<workspace>/openspec/changes/<change>/tasks.md`. Parsing rules:
+
+- Lines matching `^[ \t]*- \[ \] ` outside fenced code blocks count as unchecked.
+- Lines matching `^[ \t]*- \[x\] ` (case-insensitive on `x`) count as checked AND are ignored.
+- Content inside ` ``` ` fenced blocks is ignored entirely.
+- The parser extracts the trailing text (everything after `- [ ] `) for each unchecked line, paired with the source line number.
+
+If `tasks.md` is absent OR unparseable, the scan SHALL treat the unchecked count as zero (defensive default — absent/corrupt tasks.md is its own diagnostic AND the polling loop's existing validation catches it elsewhere).
+
+When the unchecked count is zero, the classified `Completed` outcome SHALL be returned unchanged. When the unchecked count is non-zero, the recovery loop (per the requirement below) SHALL fire.
+
+The acceptance scan SHALL NOT fire in `run_revision`, `run_triage`, `run_chat_triage`, `run_brownfield_draft`, `run_scout`, OR `run_changelog`. Those flows do not operate against a per-change `tasks.md` in the implementer sense; their existing classification path is preserved.
+
+#### Scenario: All tasks checked AND outcome_success called — no scan triggered
+- **WHEN** `Executor::run` finishes a run where the agent called `outcome_success` AND `tasks.md` has zero unchecked items
+- **THEN** the classified outcome is `Completed` via the tool-outcome precedence path
+- **AND** the acceptance scan does NOT fire (condition 2: tool-recorded outcome was produced)
+- **AND** the finalized outcome is `Completed` unchanged
+
+#### Scenario: Unchecked tasks AND outcome_success called — no scan triggered
+- **WHEN** `Executor::run` finishes a run where the agent called `outcome_success` AND `tasks.md` has unchecked items
+- **THEN** the classified outcome is `Completed` via the tool-outcome precedence path
+- **AND** the acceptance scan does NOT fire (condition 2: tool-recorded outcome was produced)
+- **AND** the finalized outcome is `Completed` unchanged (the agent's structured signal wins over the daemon's heuristic disagreement)
+
+#### Scenario: No outcome tool call AND zero unchecked tasks — Completed unchanged
+- **WHEN** `Executor::run` finishes a run where no outcome tool was called AND `tasks.md` has zero unchecked items
+- **AND** the diff-presence heuristic classifies the outcome as `Completed`
+- **THEN** the acceptance scan fires (condition 1 met, condition 2 met — both triggers true)
+- **AND** the scan returns zero unchecked items
+- **AND** the finalized outcome is `Completed` unchanged
+
+#### Scenario: No outcome tool call AND unchecked tasks present — recovery loop fires
+- **WHEN** `Executor::run` finishes a run where no outcome tool was called AND `tasks.md` has unchecked items (e.g. `- [ ] 3.1 thread Arc<DaemonPaths> through polling_loop::run`)
+- **AND** the diff-presence heuristic would have classified the outcome as `Completed`
+- **THEN** the acceptance scan fires AND returns the non-zero unchecked-item list
+- **AND** the recovery loop (per the requirement below) is invoked
+
+#### Scenario: Absent tasks.md does not trigger acceptance failure
+- **WHEN** `Executor::run` finishes a run AND `<workspace>/openspec/changes/<change>/tasks.md` does NOT exist
+- **THEN** the scan treats the unchecked count as zero
+- **AND** no recovery loop fires
+- **AND** the classified outcome is returned unchanged
+
+#### Scenario: `run_revision` does NOT trigger acceptance scan
+- **WHEN** `Executor::run_revision` finishes a run for an archived change (whose `tasks.md` lives under `archive/<date>-<change>/`, NOT under `openspec/changes/<change>/`)
+- **THEN** the acceptance scan does NOT fire regardless of workspace content
+- **AND** the classification path proceeds via the existing canonical behavior
+
+#### Scenario: Non-implementer flows do NOT trigger acceptance scan
+- **WHEN** `run_triage`, `run_chat_triage`, `run_brownfield_draft`, `run_scout`, OR `run_changelog` finishes a run
+- **THEN** the acceptance scan does NOT fire regardless of workspace content
+- **AND** the classification path proceeds via the existing canonical behavior
+
+### Requirement: Recovery loop re-prompts the same Claude session on acceptance failure; one retry only
+
+When the acceptance scan returns a non-zero unchecked-item list, `Executor::run` SHALL launch a single recovery turn against the original session via `claude --resume <session_id>` (the same mechanism `Executor::resume` uses for AskUser-flow resumption).
+
+The recovery turn's input SHALL be a structured user-message constructed from the canonical template:
+
+```
+Acceptance check failed: your run ended without finishing the change.
+
+tasks.md still has unchecked items:
+  - <line_text_1>
+  - <line_text_2>
+  ...
+
+You did not call any outcome tool to conclude the session. Narrative
+"Deferred:" notes in the final-answer text are not accepted; the
+daemon enforces a structured outcome.
+
+Decide which of the following applies AND call the corresponding tool:
+
+1. The unchecked items are actually done in code — you forgot to mark
+   tasks.md. Update tasks.md to check them, then call:
+       outcome_success({ final_answer: "..." })
+
+2. You completed part AND want another iteration to finish the rest.
+   Call:
+       outcome_request_iteration({
+         completed_tasks: [...],
+         remaining_tasks: [<unchecked list>],
+         reason: "<concrete blocker>"
+       })
+
+3. The unchecked items are unimplementable in this sandbox. Call:
+       outcome_spec_needs_revision({
+         unimplementable_tasks: [...],
+         revision_suggestion: "..."
+       })
+
+Do NOT exit without calling exactly one outcome tool. If you call one
+AND it returns a validation error, fix the error AND retry the call.
+```
+
+The `<line_text_*>` substitutions are the trailing text from each unchecked-item line extracted by the acceptance scan. The list SHALL include every unchecked item the scan returned, in source-order.
+
+The recovery turn SHALL run with the same MCP config (outcome tools available) AND a fresh wall-clock budget equal to the per-run timeout. Within the recovery turn the existing classifier ordering applies: a tool-recorded outcome wins over any heuristic.
+
+After the recovery turn exits, `classify_outcome` SHALL classify its result. If the recovery turn produced a tool-recorded outcome (one of `outcome_success`, `outcome_spec_needs_revision`, `outcome_request_iteration`), that outcome SHALL be returned as `Executor::run`'s final result. The acceptance scan SHALL NOT re-fire on the recovery turn's result.
+
+If the recovery turn did NOT produce a tool-recorded outcome, `Executor::run` SHALL return `ExecutorOutcome::Failed { reason: "acceptance check failed; recovery loop did not produce a structured outcome" }` (exact wording REQUIRED so operators can grep AND scripts can match).
+
+The recovery loop SHALL fire AT MOST ONCE per `Executor::run` invocation. A recovery turn whose own output triggers acceptance failure does NOT fire a second recovery turn.
+
+The recovery turn's stdout/stderr stream SHALL be appended to the per-change run log with a clear divider line. In the summary log: `=== RECOVERY TURN ===` followed by the recovery turn's `final_answer`. In the stream log: `=== RECOVERY TURN ===` followed by the recovery turn's `[tool_use]` / `[tool_result]` / `[assistant]` lines.
+
+#### Scenario: Recovery turn calls outcome_success — final Completed
+- **WHEN** the acceptance scan fires AND the recovery turn launches via `claude --resume <session_id>`
+- **AND** the agent in the recovery turn marks the unchecked tasks complete in `tasks.md` AND calls `outcome_success({ final_answer: "..." })`
+- **THEN** the recovery turn's `consume_outcome` returns a `Success` outcome
+- **AND** `Executor::run` returns `Completed { final_answer: <recovery's final_answer> }`
+- **AND** the run log contains both the original transcript AND the recovery transcript with the `=== RECOVERY TURN ===` divider
+
+#### Scenario: Recovery turn calls outcome_request_iteration — final IterationRequested
+- **WHEN** the acceptance scan fires AND the recovery turn launches
+- **AND** the agent calls `outcome_request_iteration({ completed_tasks: [...], remaining_tasks: [...], reason: "..." })`
+- **THEN** the recovery turn's `consume_outcome` returns an `IterationRequest` outcome
+- **AND** `Executor::run` returns `IterationRequested { ..., iteration_number: <computed per a27a1 rules> }`
+- **AND** the run log contains both transcripts
+
+#### Scenario: Recovery turn produces no outcome tool call — final Failed
+- **WHEN** the acceptance scan fires AND the recovery turn launches
+- **AND** the agent in the recovery turn produces no `outcome_*` tool call AND exits
+- **THEN** `Executor::run` returns `Failed { reason: "acceptance check failed; recovery loop did not produce a structured outcome" }`
+- **AND** the run log contains both transcripts so the operator can review the agent's reasoning across both phases
+
+#### Scenario: Recovery loop fires at most once per run
+- **WHEN** the recovery turn's own result triggers acceptance scan conditions (Completed via diff-presence AND no outcome tool call AND unchecked tasks still present)
+- **THEN** a SECOND recovery turn is NOT launched
+- **AND** `Executor::run` returns `Failed { reason: "acceptance check failed; recovery loop did not produce a structured outcome" }`
+
+### Requirement: Implementer prompt forbids narrative deferral AND describes the acceptance-scan + recovery-loop enforcement
+
+The bundled `prompts/implementer.md` template SHALL contain an "Anti-narrative-deferral" section near the top of the prompt (above the existing pre-flight outcome-tool section). The section SHALL:
+
+- Direct the agent NOT to narrate "Deferred:" sections in the final-answer text.
+- State that the daemon enforces a structured outcome via the outcome tools (`outcome_success`, `outcome_request_iteration`, `outcome_spec_needs_revision`).
+- Describe the acceptance scan: at end-of-run, `tasks.md` is scanned for unchecked items; if any are found AND no outcome tool was called, a recovery turn fires.
+- Describe the recovery turn: it appends a structured message to the session naming the unchecked items AND requesting an outcome-tool call. The recovery turn has one retry; a recovery turn that ALSO does not call an outcome tool produces a Failed run.
+
+The section's tone is informational, NOT scolding. The text SHALL motivate the structural enforcement (narrative deferral was previously the path of least resistance AND produced corrosive PR shipping) so an agent reading the prompt understands WHY the channel exists AND how to use the right tool the first time.
+
+Canonical text the bundled prompt SHALL produce (section heading + body — the heading SHALL be a top-level prompt section but is rendered here without the `##` markdown prefix to avoid confusing the spec parser):
+
+```
+Anti-narrative-deferral discipline
+
+Do NOT narrate "Deferred:" sections in your final-answer text. The
+daemon enforces a structured outcome via the outcome tools (see the
+"Outcome tools" section below). If you have remaining work, call
+`outcome_request_iteration`. If a task is genuinely unimplementable,
+call `outcome_spec_needs_revision`. If you finished, call
+`outcome_success`. Narrative deferral was previously the path of
+least resistance AND produced corrosive PR shipping (unchecked tasks
+AND apologetic prose buried in the PR comment); the acceptance scan
+now catches this AND triggers a recovery turn that fails the run if
+you persist.
+
+At end-of-run, the daemon scans tasks.md for unchecked items. If
+unchecked items are present AND you did not call any outcome tool,
+the daemon launches a recovery turn that re-prompts you with the
+list of unchecked items AND directs you to call exactly one outcome
+tool. The recovery turn has one retry; if it ALSO produces no
+outcome-tool call, the run is classified as Failed.
+```
+
+Operator-customizable override prompts MAY remove OR rewrite this section — the canonical rule binds the bundled default only. Operators who remove this guidance see the structural enforcement (acceptance scan + recovery loop) continue to apply, but their custom implementer agents may not know to expect it.
+
+#### Scenario: Bundled prompt contains the anti-narrative-deferral section
+- **WHEN** a maintainer reads `prompts/implementer.md`
+- **THEN** the prompt contains an "Anti-narrative-deferral discipline" section near the top (above the pre-flight outcome-tool section)
+- **AND** the section names all three outcome tools (`outcome_success`, `outcome_request_iteration`, `outcome_spec_needs_revision`)
+- **AND** the section describes both the acceptance scan AND the recovery turn
+
+#### Scenario: Bundled prompt's canonical text matches the requirement
+- **WHEN** an automated test extracts the "Anti-narrative-deferral discipline" section from `prompts/implementer.md`
+- **THEN** the extracted text matches the canonical text specified above (the structural elements: warning + tool list + acceptance-scan description + recovery-turn description)
 

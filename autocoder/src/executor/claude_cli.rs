@@ -32,8 +32,6 @@ use tokio::process::Command;
 
 const MCP_CONFIG_FILENAME: &str = ".mcp.json";
 const ASKUSER_MARKER_FILENAME: &str = ".askuser-pending.json";
-const OUTCOME_SENTINEL_TAG: &str = "=== AUTOCODER-OUTCOME ===";
-const SENTINEL_EXCERPT_MAX: usize = 200;
 
 /// Built-in default implementer prompt template, embedded at compile time
 /// so the binary runs without requiring `prompts/` on the filesystem.
@@ -494,206 +492,6 @@ impl ClaudeCliExecutor {
         Ok(Some(question))
     }
 
-    /// Scan `stdout` for an `=== AUTOCODER-OUTCOME ===` block followed by a
-    /// JSON object. Returns the JSON payload string (everything between the
-    /// tag line and the first blank line or EOF) and the original byte
-    /// excerpt around the payload for diagnostics on parse failure. Returns
-    /// `None` if no sentinel is present.
-    fn extract_outcome_sentinel(stdout: &str) -> Option<String> {
-        let idx = stdout.find(OUTCOME_SENTINEL_TAG)?;
-        let after = &stdout[idx + OUTCOME_SENTINEL_TAG.len()..];
-        // Skip leading whitespace/newlines to reach the JSON body.
-        let body_start = after
-            .char_indices()
-            .find(|(_, c)| !c.is_whitespace())
-            .map(|(i, _)| i)
-            .unwrap_or(after.len());
-        let body = &after[body_start..];
-        if body.is_empty() {
-            return None;
-        }
-        // The agent emits a single JSON object (object/array depth-tracked).
-        // Find the first `{` and consume until the matching `}` at depth 0,
-        // honoring string literals so braces inside strings don't confuse
-        // the depth counter.
-        let bytes = body.as_bytes();
-        let start = bytes.iter().position(|&b| b == b'{')?;
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut escape = false;
-        let mut end: Option<usize> = None;
-        for (i, &b) in bytes.iter().enumerate().skip(start) {
-            if in_str {
-                if escape {
-                    escape = false;
-                } else if b == b'\\' {
-                    escape = true;
-                } else if b == b'"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match b {
-                b'"' => in_str = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let end = end?;
-        Some(body[start..end].to_string())
-    }
-
-    /// Try to interpret an outcome-sentinel JSON payload as a
-    /// `SpecNeedsRevision` outcome. Returns:
-    ///   - `Ok(Some(outcome))` if the payload is a well-formed
-    ///     `spec_needs_revision` block with a non-empty task list.
-    ///   - `Ok(None)` if the payload is some other outcome type (caller
-    ///     leaves the sentinel alone — other parsers may handle it).
-    ///   - `Err(reason)` if the payload looks like `spec_needs_revision`
-    ///     (matches the `type` field) but is malformed — missing required
-    ///     fields, wrong field types, or an empty `unimplementable_tasks`
-    ///     list. The caller falls back to `Failed` with a diagnostic.
-    fn try_parse_spec_needs_revision(
-        payload: &str,
-    ) -> std::result::Result<Option<ExecutorOutcome>, String> {
-        let value: serde_json::Value = match serde_json::from_str(payload) {
-            Ok(v) => v,
-            Err(e) => return Err(format!("invalid JSON: {e}")),
-        };
-        let type_field = value.get("type").and_then(|v| v.as_str());
-        if type_field != Some("spec_needs_revision") {
-            return Ok(None);
-        }
-        let tasks_val = value.get("unimplementable_tasks");
-        let tasks_array = match tasks_val.and_then(|v| v.as_array()) {
-            Some(a) => a,
-            None => return Err("missing or non-array `unimplementable_tasks`".to_string()),
-        };
-        if tasks_array.is_empty() {
-            return Err("`unimplementable_tasks` is empty".to_string());
-        }
-        let mut tasks: Vec<UnimplementableTask> = Vec::with_capacity(tasks_array.len());
-        for (i, entry) in tasks_array.iter().enumerate() {
-            let task_id = entry
-                .get("task_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("task[{i}] missing string `task_id`"))?;
-            let task_text = entry
-                .get("task_text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("task[{i}] missing string `task_text`"))?;
-            let reason = entry
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("task[{i}] missing string `reason`"))?;
-            // Per a20a1: detect un-substituted placeholders.
-            // The agent's worked example in prompts/implementer.md is
-            // expected to be ANCHORED behaviour; emitting it verbatim
-            // (with `<id-from-tasks-md>` etc. still in fields) is a
-            // template-following bug. Convert to a specific Err so the
-            // caller's WARN log and Failed-reason carry the diagnostic
-            // pointing the operator at the prompt section.
-            for (field_name, field_value) in [
-                ("task_id", task_id),
-                ("task_text", task_text),
-                ("reason", reason),
-            ] {
-                if Self::contains_unsubstituted_placeholder(field_value) {
-                    return Err(format!(
-                        "looks like un-substituted placeholders — the agent emitted the prompt's example verbatim instead of substituting concrete values; see prompts/implementer.md sentinel section (task[{i}].{field_name} contained `<...>` placeholder text: {field_value})"
-                    ));
-                }
-            }
-            tasks.push(UnimplementableTask {
-                task_id: task_id.to_string(),
-                task_text: task_text.to_string(),
-                reason: reason.to_string(),
-            });
-        }
-        let revision_suggestion = value
-            .get("revision_suggestion")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing string `revision_suggestion`".to_string())?
-            .to_string();
-        Ok(Some(ExecutorOutcome::SpecNeedsRevision {
-            unimplementable_tasks: tasks,
-            revision_suggestion,
-        }))
-    }
-
-    /// Detect `<placeholder>` patterns that indicate the agent emitted
-    /// the prompt template's example verbatim instead of substituting
-    /// concrete values. The regex is intentionally narrow — lowercase
-    /// letters, digits, spaces, underscores, hyphens between angle
-    /// brackets, leading char must be a letter — to avoid matching
-    /// legitimate `<...>` content like `@<bot>` mentions or HTML-shaped
-    /// task descriptions. False positives ARE possible (a real task
-    /// whose text happens to match the pattern); per the spec, the
-    /// diagnostic phrase still helps the operator either way.
-    fn contains_unsubstituted_placeholder(s: &str) -> bool {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] != b'<' {
-                i += 1;
-                continue;
-            }
-            let start = i + 1;
-            if start >= bytes.len() {
-                return false;
-            }
-            let first = bytes[start];
-            if !first.is_ascii_lowercase() {
-                i += 1;
-                continue;
-            }
-            let mut j = start + 1;
-            let mut closed = false;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b == b'>' {
-                    closed = true;
-                    break;
-                }
-                let ok = b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || b == b' '
-                    || b == b'_'
-                    || b == b'-';
-                if !ok {
-                    break;
-                }
-                j += 1;
-            }
-            if closed {
-                return true;
-            }
-            i += 1;
-        }
-        false
-    }
-
-    /// Truncate `s` to at most `SENTINEL_EXCERPT_MAX` characters (codepoints)
-    /// for inclusion in a parse-failure reason. Adds an ellipsis when
-    /// truncated.
-    fn excerpt_for_reason(s: &str) -> String {
-        let count = s.chars().count();
-        if count <= SENTINEL_EXCERPT_MAX {
-            s.to_string()
-        } else {
-            let mut out: String = s.chars().take(SENTINEL_EXCERPT_MAX).collect();
-            out.push('…');
-            out
-        }
-    }
-
     /// Layer-2 backstop: scan stdout for a clarification phrase. Returns
     /// the first sentence containing a match, or `None`.
     ///
@@ -892,6 +690,7 @@ impl ClaudeCliExecutor {
                     stderr: "timeout".to_string(),
                     final_answer: None,
                     streamed_log: false,
+                    session_id: None,
                 })
             }
             Some(Err(e)) => Err(e).context("waiting on executor child process"),
@@ -911,6 +710,7 @@ impl ClaudeCliExecutor {
                     stderr: stderr_text,
                     final_answer: None,
                     streamed_log: false,
+                    session_id: None,
                 })
             }
         }
@@ -1046,6 +846,7 @@ impl ClaudeCliExecutor {
             );
         }
         let final_answer = writer.final_answer();
+        let session_id = writer.session_id();
 
         Ok(SubprocessOutcome {
             timed_out,
@@ -1058,111 +859,82 @@ impl ClaudeCliExecutor {
             },
             final_answer,
             streamed_log: true,
+            session_id,
         })
     }
 
     /// Classify a subprocess outcome into an `ExecutorOutcome`, applying
     /// Layer-1 and Layer-2 AskUser detection.
+    ///
+    /// Returns the classified outcome only. The implementer-flow caller
+    /// (`Executor::run`) uses [`Self::classify_outcome_with_meta`] so it
+    /// can branch on whether a tool-recorded outcome was consumed
+    /// (acceptance scan condition).
     async fn classify_outcome(
         &self,
         workspace: &Path,
         change: &str,
         outcome: SubprocessOutcome,
     ) -> Result<ExecutorOutcome> {
+        Ok(self
+            .classify_outcome_with_meta(workspace, change, outcome)
+            .await?
+            .outcome)
+    }
+
+    /// Variant of `classify_outcome` returning both the outcome AND a
+    /// boolean indicating whether the daemon's outcome store had a
+    /// recorded outcome to consume (the agent called one of the
+    /// `outcome_*` MCP tools). The acceptance scan (a27a2) fires only
+    /// when this flag is `false`.
+    async fn classify_outcome_with_meta(
+        &self,
+        workspace: &Path,
+        change: &str,
+        outcome: SubprocessOutcome,
+    ) -> Result<ClassifiedOutcome> {
         // Tool-recorded outcome lookup (a27a0). The per-execution MCP
-        // child relays `outcome_success` / `outcome_spec_needs_revision`
-        // tool calls to the daemon via `record_outcome`; we drain via
-        // `consume_outcome`. A recorded outcome is the agent's
-        // deliberate, schema-validated end-of-run emission and is more
-        // authoritative than ANY inferred state (timeout, exit status,
-        // stdout content). Runs without a recorded outcome fall through
-        // to today's exact classifier ordering, preserving behavior for
-        // pre-a27a0 implementer prompts.
+        // child relays outcome tool calls to the daemon via
+        // `record_outcome`; we drain via `consume_outcome`. A recorded
+        // outcome is the agent's deliberate, schema-validated end-of-run
+        // emission AND is more authoritative than ANY inferred state
+        // (timeout, exit status, stdout content). Runs without a
+        // recorded outcome fall through to the simplified classifier
+        // ordering (a27a2: consume_outcome → AskUser → timeout → exit
+        // status → diff-presence/Layer-2/Completed).
         let workspace_basename = workspace_basename_for(workspace);
         if let Some(recorded) =
             try_consume_outcome(&workspace_basename, change).await
         {
-            return Ok(map_recorded_outcome(workspace, change, recorded));
+            return Ok(ClassifiedOutcome {
+                outcome: map_recorded_outcome(workspace, change, recorded),
+                tool_recorded: true,
+            });
         }
 
         // Layer-1 first: the marker file is the authoritative signal. It
         // may have been written even if the wrapped CLI exited non-zero.
         if let Some(question) = Self::check_askuser_marker(workspace, change)? {
             let handle = build_handle(workspace, change, None);
-            return Ok(ExecutorOutcome::AskUser {
-                question,
-                resume_handle: handle,
+            return Ok(ClassifiedOutcome {
+                outcome: ExecutorOutcome::AskUser {
+                    question,
+                    resume_handle: handle,
+                },
+                tool_recorded: false,
             });
         }
 
         // Timeout precedence (a20a1): a timed-out run by definition did
-        // not reach a deliberate end-of-run point. Any sentinel-shaped
-        // substring in the captured event stream is by-construction NOT
-        // the agent's deliberate emission. Classify as timeout BEFORE
-        // any sentinel extraction so a false-match on prompt-echo OR
-        // tool-result content cannot mask the real cause. Pre-a20a1,
-        // the order was reversed, which caused a21-canonical-spec-rag
-        // to perma-stuck under "unparseable sentinel" when the real
-        // cause was a one-hour timeout.
+        // not reach a deliberate end-of-run point. Classify as timeout
+        // BEFORE the exit-status path so the real cause is not masked.
         if outcome.timed_out {
-            return Ok(ExecutorOutcome::Failed {
-                reason: "timeout".to_string(),
+            return Ok(ClassifiedOutcome {
+                outcome: ExecutorOutcome::Failed {
+                    reason: "timeout".to_string(),
+                },
+                tool_recorded: false,
             });
-        }
-
-        // Outcome sentinel: the agent's pre-flight check writes an
-        // `=== AUTOCODER-OUTCOME ===` block when it identifies an
-        // unimplementable task. We check this BEFORE looking at the exit
-        // status so an agent that exits non-zero after flagging is still
-        // honored, and so the dispatcher's no-diff-Failed fallback never
-        // sees the workspace ahead of the signal.
-        //
-        // Scope (a20a1): in JSON streaming mode the sentinel SHALL be
-        // sought ONLY in `final_answer` (the `result`-event text — the
-        // agent's deliberate end-of-run emission). Tool-result echoes,
-        // prompt-context echoes, and other event-stream content are
-        // NOT deliberate emissions; matching against them produces the
-        // false-positives that drove a21-canonical-spec-rag to perma-
-        // stuck. In text-mode opt-out the only signal IS stdout, so
-        // the legacy stdout scan is retained for that case.
-        let sentinel_source: Option<&str> = match self.output_format {
-            crate::config::ExecutorOutputFormat::Json => outcome.final_answer.as_deref(),
-            crate::config::ExecutorOutputFormat::Text => Some(outcome.stdout.as_str()),
-        };
-        if let Some(source) = sentinel_source
-            && let Some(payload) = Self::extract_outcome_sentinel(source)
-        {
-            match Self::try_parse_spec_needs_revision(&payload) {
-                Ok(Some(spec_revision)) => {
-                    // a27a0 deprecation: this path is the legacy stdout
-                    // sentinel match. The canonical replacement is the
-                    // `outcome_spec_needs_revision` MCP tool. Emit a
-                    // warning so operator logs surface the use of the
-                    // deprecated path; scheduled removal is a27a2.
-                    tracing::warn!(
-                        change = %change,
-                        "legacy stdout sentinel matched for change {change}; please call the outcome_spec_needs_revision MCP tool instead (stdout sentinel parsing is scheduled for removal in a27a2)",
-                    );
-                    return Ok(spec_revision);
-                }
-                Ok(None) => {
-                    // Sentinel present but not a spec_needs_revision payload.
-                    // Other parsers (none today) could match here; fall
-                    // through to normal exit-status handling.
-                }
-                Err(parse_err) => {
-                    let excerpt = Self::excerpt_for_reason(&payload);
-                    tracing::warn!(
-                        change = %change,
-                        "agent emitted unparseable SpecNeedsRevision sentinel: {parse_err}; payload: {excerpt}"
-                    );
-                    return Ok(ExecutorOutcome::Failed {
-                        reason: format!(
-                            "agent emitted unparseable SpecNeedsRevision sentinel: {parse_err}; excerpt: {excerpt}"
-                        ),
-                    });
-                }
-            }
         }
 
         let status = outcome.exit_status.expect("non-timeout path has status");
@@ -1173,7 +945,10 @@ impl ClaudeCliExecutor {
             } else {
                 reason
             };
-            return Ok(ExecutorOutcome::Failed { reason });
+            return Ok(ClassifiedOutcome {
+                outcome: ExecutorOutcome::Failed { reason },
+                tool_recorded: false,
+            });
         }
 
         // Exit-0 path. Check Layer-2 heuristic only when the workspace is
@@ -1183,9 +958,12 @@ impl ClaudeCliExecutor {
         if porcelain.is_empty() {
             if let Some(question) = Self::check_stdout_heuristic(&outcome.stdout) {
                 let handle = build_handle(workspace, change, None);
-                return Ok(ExecutorOutcome::AskUser {
-                    question,
-                    resume_handle: handle,
+                return Ok(ClassifiedOutcome {
+                    outcome: ExecutorOutcome::AskUser {
+                        question,
+                        resume_handle: handle,
+                    },
+                    tool_recorded: false,
                 });
             }
             // Suspicious: exit-0, no diff, no AskUser marker, no
@@ -1204,9 +982,282 @@ impl ClaudeCliExecutor {
             );
         }
 
-        Ok(ExecutorOutcome::Completed {
-            final_answer: outcome.final_answer.clone(),
+        Ok(ClassifiedOutcome {
+            outcome: ExecutorOutcome::Completed {
+                final_answer: outcome.final_answer.clone(),
+            },
+            tool_recorded: false,
         })
+    }
+
+    /// Recovery turn (a27a2). Launches `claude --resume <session_id>`
+    /// (or a fresh subprocess as fallback) with the canonical recovery
+    /// prompt naming the unchecked tasks.md items, classifies the
+    /// result, AND returns either the structured outcome the recovery
+    /// turn produced OR the canonical Failed reason. The recovery loop
+    /// fires AT MOST ONCE per `Executor::run` invocation.
+    async fn run_recovery_turn(
+        &self,
+        workspace: &Path,
+        change: &str,
+        session_id: Option<String>,
+        unchecked: &[crate::executor::acceptance_scan::UncheckedTask],
+    ) -> Result<ExecutorOutcome> {
+        let recovery_prompt = build_recovery_prompt(unchecked);
+
+        // The recovery turn re-uses the same MCP config so the outcome
+        // tools are available. Stale askuser markers should NOT survive
+        // into the recovery turn.
+        let stale_marker = workspace
+            .join("openspec/changes")
+            .join(change)
+            .join(ASKUSER_MARKER_FILENAME);
+        let _ = std::fs::remove_file(&stale_marker);
+        let _mcp_path = Self::write_mcp_config(workspace, change)?;
+
+        let outcome_result = self
+            .run_recovery_subprocess(workspace, change, &recovery_prompt, session_id.as_deref())
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome_result?;
+
+        // Append the recovery turn's content to the existing per-change
+        // log files with a clear divider so the operator sees both
+        // phases.
+        append_recovery_to_log(workspace, change, &outcome);
+
+        // The recovery turn fires AT MOST ONCE — we do not call the
+        // acceptance scan on its result. We do, however, consume any
+        // tool-recorded outcome AND honor it. If no outcome tool was
+        // called by the recovery turn, return the canonical Failed.
+        let classified = self
+            .classify_outcome_with_meta(workspace, change, outcome)
+            .await?;
+        if classified.tool_recorded {
+            return Ok(classified.outcome);
+        }
+        Ok(ExecutorOutcome::Failed {
+            reason: RECOVERY_FAILED_REASON.to_string(),
+        })
+    }
+
+    /// Spawn the wrapped CLI for a recovery turn. When `session_id` is
+    /// `Some`, the spawn includes `--resume <session_id>` so the child
+    /// continues the original conversation. When `None` (text mode,
+    /// missing system event, etc.), the spawn falls back to a fresh
+    /// session — the agent still sees the recovery prompt AND has the
+    /// outcome tools available, so it can converge even without the
+    /// prior context.
+    async fn run_recovery_subprocess(
+        &self,
+        workspace: &Path,
+        change: &str,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> Result<SubprocessOutcome> {
+        let settings_path = self
+            .write_sandbox_settings()
+            .context("generating sandbox settings file for recovery turn")?;
+        let _settings_guard = TempFileGuard(settings_path.clone());
+
+        let json_mode = matches!(
+            self.output_format,
+            crate::config::ExecutorOutputFormat::Json
+        );
+
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args)
+            .arg("--settings")
+            .arg(&settings_path)
+            .arg("--allowedTools")
+            .arg(self.sandbox.allowed_tools.join(","))
+            .arg("--permission-mode")
+            .arg("acceptEdits");
+        if let Some(sid) = session_id {
+            cmd.arg("--resume").arg(sid);
+        }
+        if json_mode {
+            cmd.arg("--verbose")
+                .arg("--output-format")
+                .arg("stream-json");
+        }
+        let mut child = cmd
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .with_context(|| {
+                format!("spawning recovery-turn command `{}`", self.command)
+            })?;
+
+        let _subprocess_marker_guard = if let Some(pid) = child.id() {
+            if let Err(e) = crate::busy_marker::write_subprocess_marker(workspace, pid) {
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    pid,
+                    "failed to write subprocess sidecar marker for recovery turn (run continues): {e:#}"
+                );
+                None
+            } else {
+                Some(SubprocessMarkerGuard {
+                    workspace: workspace.to_path_buf(),
+                })
+            }
+        } else {
+            None
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+        }
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        // Recovery turns capture stdout/stderr at-exit (no structured
+        // log writer is allocated — we append directly into the
+        // existing log files after classification). This keeps the
+        // recovery path simpler AND mirrors what append_recovery_to_log
+        // expects to read from the returned outcome. The session_id
+        // capture isn't needed on the recovery turn (no second loop is
+        // permitted) so we skip the JSON-event dispatcher entirely.
+        let _ = change;
+        self.run_subprocess_legacy(child, stdout_pipe, stderr_pipe)
+            .await
+    }
+}
+
+/// Result of [`ClaudeCliExecutor::classify_outcome_with_meta`]. Carries
+/// both the classified outcome AND the flag the acceptance-scan
+/// dispatcher (a27a2) reads to decide whether to scan tasks.md.
+struct ClassifiedOutcome {
+    outcome: ExecutorOutcome,
+    /// `true` when `consume_outcome` returned `Some(_)` — i.e. the agent
+    /// called one of `outcome_success`, `outcome_spec_needs_revision`,
+    /// OR `outcome_request_iteration` via the MCP tool channel. When
+    /// `false`, the agent exited without a structured outcome signal AND
+    /// the acceptance scan applies (for the implementer flow only).
+    tool_recorded: bool,
+}
+
+/// Exact wording for the acceptance-scan/recovery-loop Failed reason
+/// (a27a2). Operators grep for this AND scripts match against it; the
+/// literal text is required by the canonical executor capability delta.
+pub(crate) const RECOVERY_FAILED_REASON: &str =
+    "acceptance check failed; recovery loop did not produce a structured outcome";
+
+/// Divider line written into the per-change log files AT the start of
+/// the recovery turn's content. Operators navigating the log file split
+/// the original from the recovery transcript on this marker.
+const RECOVERY_LOG_DIVIDER: &str = "=== RECOVERY TURN ===";
+
+/// Build the canonical recovery-turn user message (a27a2). The
+/// `unchecked` list is rendered as bullet lines from each task's
+/// trailing text; the rest of the template is fixed per the executor
+/// capability deltas.
+fn build_recovery_prompt(
+    unchecked: &[crate::executor::acceptance_scan::UncheckedTask],
+) -> String {
+    let mut bullets = String::new();
+    for task in unchecked {
+        bullets.push_str("  - ");
+        bullets.push_str(&task.trailing_text);
+        bullets.push('\n');
+    }
+    format!(
+        "Acceptance check failed: your run ended without finishing the change.\n\
+\n\
+tasks.md still has unchecked items:\n\
+{bullets}\n\
+You did not call any outcome tool to conclude the session. Narrative\n\
+\"Deferred:\" notes in the final-answer text are not accepted; the\n\
+daemon enforces a structured outcome.\n\
+\n\
+Decide which of the following applies AND call the corresponding tool:\n\
+\n\
+1. The unchecked items are actually done in code — you forgot to mark\n\
+   tasks.md. Update tasks.md to check them, then call:\n\
+       outcome_success({{ final_answer: \"...\" }})\n\
+\n\
+2. You completed part AND want another iteration to finish the rest.\n\
+   Call:\n\
+       outcome_request_iteration({{\n\
+         completed_tasks: [...],\n\
+         remaining_tasks: [<unchecked list>],\n\
+         reason: \"<concrete blocker>\"\n\
+       }})\n\
+\n\
+3. The unchecked items are unimplementable in this sandbox. Call:\n\
+       outcome_spec_needs_revision({{\n\
+         unimplementable_tasks: [...],\n\
+         revision_suggestion: \"...\"\n\
+       }})\n\
+\n\
+Do NOT exit without calling exactly one outcome tool. If you call one\n\
+AND it returns a validation error, fix the error AND retry the call.\n",
+    )
+}
+
+/// Append the recovery turn's content to the existing per-change log
+/// files with a clear `=== RECOVERY TURN ===` divider. Errors are
+/// logged at WARN but never propagated — the executor outcome must not
+/// depend on diagnostic side-effects.
+fn append_recovery_to_log(workspace: &Path, change: &str, outcome: &SubprocessOutcome) {
+    use std::io::Write;
+    let summary_path = run_log_path(workspace, change);
+    let stream_path = crate::executor::event_log::stream_path_for(&summary_path);
+
+    let summary_body = match &outcome.final_answer {
+        Some(text) => text.clone(),
+        None => outcome.stdout.clone(),
+    };
+    let summary_text = format!(
+        "\n{divider}\n{body}\n",
+        divider = RECOVERY_LOG_DIVIDER,
+        body = summary_body,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&summary_path)
+        && let Err(e) = f.write_all(summary_text.as_bytes())
+    {
+        tracing::warn!(
+            path = %summary_path.display(),
+            "appending recovery-turn content to summary log failed: {e}"
+        );
+    }
+
+    // The stream log carries the raw action lines. The recovery turn
+    // uses the legacy capture path (stdout/stderr at exit), so we
+    // emit a synthetic `[assistant]` line for the stdout content AND
+    // optionally `[tool_result:error]` for the stderr content. The
+    // divider sits at the top so operators can navigate.
+    let stream_text = if outcome.stderr.trim().is_empty() {
+        format!(
+            "\n{divider}\n[assistant] {stdout}\n",
+            divider = RECOVERY_LOG_DIVIDER,
+            stdout = outcome.stdout.trim(),
+        )
+    } else {
+        format!(
+            "\n{divider}\n[assistant] {stdout}\n[tool_result:error] {stderr}\n",
+            divider = RECOVERY_LOG_DIVIDER,
+            stdout = outcome.stdout.trim(),
+            stderr = outcome.stderr.trim(),
+        )
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&stream_path)
+        && let Err(e) = f.write_all(stream_text.as_bytes())
+    {
+        tracing::warn!(
+            path = %stream_path.display(),
+            "appending recovery-turn content to stream log failed: {e}"
+        );
     }
 }
 
@@ -1290,16 +1341,22 @@ fn build_handle(workspace: &Path, change: &str, session_id: Option<String>) -> R
 }
 
 /// Resolve the workspace basename routing key the daemon uses to key
-/// the outcome store. Mirrors how `ClaudeCliExecutor::write_mcp_config`
-/// resolves it (env var if set, falling back to the path's file name).
+/// the outcome store. Computes from the workspace path's file name.
+/// The MCP child receives the same value via the spawn env in
+/// `write_mcp_config`, so both sides (the recorder AND the consumer)
+/// agree on the key.
+///
+/// Note: pre-a27a2 this also consulted `ENV_WORKSPACE_BASENAME` as an
+/// override, but the override was only used by tests AND produced a
+/// process-wide env-var race when tests ran in parallel. Production
+/// never sets the env var on the daemon side, so dropping the lookup
+/// preserves production semantics.
 fn workspace_basename_for(workspace: &Path) -> String {
-    std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME).unwrap_or_else(|_| {
-        workspace
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown_workspace")
-            .to_string()
-    })
+    workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown_workspace")
+        .to_string()
 }
 
 /// Send a `consume_outcome` action to the daemon's control socket. The
@@ -1479,6 +1536,13 @@ struct SubprocessOutcome {
     /// the legacy `persist_run_log` writer should skip it). False in
     /// text mode where `persist_run_log` still owns the log shape.
     streamed_log: bool,
+    /// Session id captured from the JSON-streaming `system`-event
+    /// init subtype. `None` in text mode (no JSON events to parse)
+    /// OR when the system event was not present in the captured
+    /// stream. The acceptance-scan recovery loop (a27a2) reads this
+    /// to launch `claude --resume <session_id>` against the same
+    /// conversation.
+    session_id: Option<String>,
 }
 
 /// RAII guard that removes a temp file when dropped. Used so the sandbox
@@ -1529,7 +1593,34 @@ impl Executor for ClaudeCliExecutor {
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(workspace, change, &prompt, &outcome);
-        self.classify_outcome(workspace, change, outcome).await
+        let session_id = outcome.session_id.clone();
+        let classified = self
+            .classify_outcome_with_meta(workspace, change, outcome)
+            .await?;
+
+        // Acceptance scan (a27a2). Fires ONLY for the implementer flow's
+        // Completed-via-heuristic path AND only when the agent did not
+        // call any outcome tool. Other outcomes (AskUser, Failed,
+        // SpecNeedsRevision, IterationRequested) bypass the scan — they
+        // are already structured signals.
+        if classified.tool_recorded {
+            return Ok(classified.outcome);
+        }
+        if !matches!(classified.outcome, ExecutorOutcome::Completed { .. }) {
+            return Ok(classified.outcome);
+        }
+        let unchecked =
+            crate::executor::acceptance_scan::scan_change_tasks_md(workspace, change);
+        if unchecked.is_empty() {
+            return Ok(classified.outcome);
+        }
+        tracing::warn!(
+            change = %change,
+            unchecked_count = unchecked.len(),
+            "acceptance check failed; entering recovery turn for change {change}"
+        );
+        self.run_recovery_turn(workspace, change, session_id, &unchecked)
+            .await
     }
 
     async fn resume(&self, handle: ResumeHandle, answer: &str) -> Result<ExecutorOutcome> {
@@ -1701,8 +1792,16 @@ fn dispatch_event_to_log(writer: &StructuredLogWriter, line: &str) {
 
 fn dispatch_parsed_event(writer: &StructuredLogWriter, event: JsonEvent) {
     match event {
-        JsonEvent::System { .. } => {
-            // Init metadata isn't actionable for operators; suppress.
+        JsonEvent::System { content } => {
+            // Init metadata isn't actionable for operators; suppress
+            // from the action stream. We DO capture the session_id so
+            // the recovery loop (a27a2) can launch `claude --resume
+            // <session_id>` against the same conversation.
+            if let Some(id) = content.get("session_id").and_then(|v| v.as_str())
+                && !id.is_empty()
+            {
+                writer.set_session_id(id.to_string());
+            }
         }
         JsonEvent::Assistant { content_blocks } => {
             for block in content_blocks {
@@ -1896,14 +1995,17 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a fixture workspace with one OpenSpec change so `build_prompt`
-    /// has material to produce a non-empty prompt.
+    /// has material to produce a non-empty prompt. The bundled tasks.md
+    /// is fully checked so the a27a2 acceptance scan does NOT trip
+    /// during legacy-completion tests. Tests that exercise the
+    /// acceptance-scan path overwrite tasks.md with an unchecked line.
     fn fixture_workspace() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let change_dir = dir.path().join("openspec/changes/x");
         std::fs::create_dir_all(&change_dir).unwrap();
         std::fs::write(change_dir.join("proposal.md"), "## Why\nfixture\n").unwrap();
         std::fs::write(change_dir.join("design.md"), "design text\n").unwrap();
-        std::fs::write(change_dir.join("tasks.md"), "- [ ] do thing\n").unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [x] do thing\n").unwrap();
         let path = dir.path().to_path_buf();
         (dir, path)
     }
@@ -2828,6 +2930,7 @@ mod tests {
             stderr: "STDERR_SENTINEL".to_string(),
             final_answer: None,
             streamed_log: false,
+            session_id: None,
         };
         persist_run_log(&ws, "my-change", "PROMPT_SENTINEL", &outcome);
 
@@ -2892,6 +2995,7 @@ some tool output\n\
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
         match result {
@@ -2930,139 +3034,7 @@ some tool output\n\
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
-        };
-        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
-        assert!(matches!(
-            result,
-            ExecutorOutcome::Failed { reason } if reason == "timeout"
-        ));
-    }
-
-    /// JSON streaming mode with sentinel in stdout (tool-result echo)
-    /// but final_answer empty — no timeout, no exit-status. The
-    /// sentinel scan must consider final_answer ONLY and find nothing.
-    /// Falls through to the normal exit-status path. Without an exit
-    /// status set, classify_outcome panics ("non-timeout path has
-    /// status"), so we set a fake successful status to drive the path.
-    #[tokio::test]
-    async fn json_mode_sentinel_only_scanned_in_final_answer() {
-        use std::os::unix::process::ExitStatusExt;
-        let executor = fixture_executor_json();
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
-            timed_out: false,
-            exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            // stdout contains a sentinel-shaped block from a tool-result
-            // echo. final_answer is the agent's actual emission — no
-            // sentinel there. Pre-fix would have scanned stdout and
-            // false-matched; post-fix the scan is final_answer-scoped
-            // and returns None.
-            stdout: "\
-[tool_use] Read prompts/implementer.md\n\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
-            stderr: String::new(),
-            final_answer: Some("Implementation complete; all tests pass.".to_string()),
-            streamed_log: true,
-        };
-        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
-        // Exit-status path: zero exit, empty diff → the
-        // no-modifications path; not our concern here. The point: NO
-        // SpecNeedsRevision was returned. The scan ignored stdout.
-        assert!(
-            !matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
-            "JSON-mode sentinel scan must NOT match against stdout content"
-        );
-    }
-
-    /// JSON streaming mode with a real sentinel in final_answer —
-    /// happy-path scoping. The scan SHOULD find it there.
-    #[tokio::test]
-    async fn json_mode_sentinel_in_final_answer_is_honored() {
-        use std::os::unix::process::ExitStatusExt;
-        let executor = fixture_executor_json();
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
-            timed_out: false,
-            exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            stdout: "irrelevant tool noise".to_string(),
-            stderr: String::new(),
-            final_answer: Some(
-                "=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"Replace with CI gate.\"}".to_string(),
-            ),
-            streamed_log: true,
-        };
-        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
-        assert!(matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }));
-    }
-
-    /// JSON streaming mode with final_answer absent (no `result` event)
-    /// AND no timeout: the sentinel scan returns None (no fallback to
-    /// stdout). Falls through to normal exit-status handling.
-    #[tokio::test]
-    async fn json_mode_with_no_final_answer_skips_sentinel_scan() {
-        use std::os::unix::process::ExitStatusExt;
-        let executor = fixture_executor_json();
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
-            timed_out: false,
-            exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            // stdout contains a sentinel block; the pre-a20a1 fallback
-            // path would have matched it. Now: ignored because mode is
-            // Json and final_answer is None.
-            stdout: "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
-            stderr: String::new(),
-            final_answer: None,
-            streamed_log: true,
-        };
-        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
-        assert!(
-            !matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
-            "JSON-mode with no final_answer must not scan stdout"
-        );
-    }
-
-    /// Text mode preserves the stdout sentinel scan for non-timeout
-    /// runs. The legacy opt-out has no `result`-event channel; stdout
-    /// IS the agent's emission. Behavior unchanged.
-    #[tokio::test]
-    async fn text_mode_sentinel_in_stdout_is_honored() {
-        use std::os::unix::process::ExitStatusExt;
-        let executor = fixture_executor_text();
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
-            timed_out: false,
-            exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            stdout: "\
-some leading narrative\n\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"Replace with CI gate.\"}\n".to_string(),
-            stderr: String::new(),
-            final_answer: None,
-            streamed_log: false,
-        };
-        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
-        assert!(matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }));
-    }
-
-    /// Text mode also yields to timeout precedence — a timed-out
-    /// text-mode run is classified as timeout BEFORE the stdout
-    /// scan runs.
-    #[tokio::test]
-    async fn text_mode_timeout_precedence_skips_sentinel_scan() {
-        let executor = fixture_executor_text();
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
-            timed_out: true,
-            exit_status: None,
-            stdout: "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\"revision_suggestion\":\"x\"}\n".to_string(),
-            stderr: "timeout".to_string(),
-            final_answer: None,
-            streamed_log: false,
+            session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
         assert!(matches!(
@@ -3073,42 +3045,11 @@ some leading narrative\n\
 
     // ---------- end a20a1 ----------
 
-    #[test]
-    fn parse_spec_needs_revision_sentinel_round_trips() {
-        let stdout = "\
-some narrative output before the sentinel\n\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
-{\"task_id\":\"5.2\",\"task_text\":\"install actionlint on host\",\"reason\":\"no apt access\"}],\
-\"revision_suggestion\":\"Replace 5.2 with a CI gate.\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let outcome =
-            ClaudeCliExecutor::try_parse_spec_needs_revision(&payload).expect("parse ok");
-        match outcome {
-            Some(ExecutorOutcome::SpecNeedsRevision {
-                unimplementable_tasks,
-                revision_suggestion,
-            }) => {
-                assert_eq!(unimplementable_tasks.len(), 1);
-                assert_eq!(unimplementable_tasks[0].task_id, "5.2");
-                assert_eq!(
-                    unimplementable_tasks[0].task_text,
-                    "install actionlint on host"
-                );
-                assert_eq!(unimplementable_tasks[0].reason, "no apt access");
-                assert_eq!(revision_suggestion, "Replace 5.2 with a CI gate.");
-            }
-            other => panic!("expected SpecNeedsRevision, got {other:?}"),
-        }
-    }
-
     /// a27a0 task 4.5: any JSON snippet shown in the prompt SHALL
     /// deserialize cleanly into the corresponding Rust type via
-    /// `serde_json::from_str`. The bundled prompt now shows TWO
-    /// examples: one for the `outcome_spec_needs_revision` MCP tool's
-    /// `arguments` object, AND the legacy stdout sentinel (still
-    /// retained for the deprecation cycle). Both must round-trip.
+    /// `serde_json::from_str`. The bundled prompt's worked example for
+    /// the `outcome_spec_needs_revision` MCP tool's `arguments` object
+    /// must round-trip through the MCP-layer validator.
     #[test]
     fn bundled_implementer_prompt_outcome_tool_example_validates_at_mcp_layer() {
         // Extract the FIRST `{...}` JSON object inside a fenced
@@ -3147,278 +3088,6 @@ some narrative output before the sentinel\n\
         let _round_trip: crate::outcome_store::RecordedOutcome =
             serde_json::from_value(validated.clone())
                 .expect("validated payload must deserialize as RecordedOutcome");
-    }
-
-    #[test]
-    fn bundled_implementer_prompt_worked_example_parses() {
-        // Per a20a1: the implementer prompt's worked example must
-        // deserialize cleanly into a SpecNeedsRevision outcome with no
-        // angle-bracket placeholders surviving in the parsed fields.
-        // Guards against regressions where the documented example
-        // accidentally reintroduces `<...>` placeholder text that the
-        // agent would then emit verbatim.
-        let prompt = DEFAULT_IMPLEMENTER_TEMPLATE;
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(prompt).expect(
-                "implementer prompt must contain an AUTOCODER-OUTCOME example",
-            );
-        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect("worked example must parse as a SpecNeedsRevision payload");
-        match outcome {
-            Some(ExecutorOutcome::SpecNeedsRevision {
-                unimplementable_tasks,
-                revision_suggestion,
-            }) => {
-                assert!(
-                    !unimplementable_tasks.is_empty(),
-                    "worked example must have at least one task"
-                );
-                for t in &unimplementable_tasks {
-                    assert!(
-                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.task_id),
-                        "task_id contains placeholder text: {}",
-                        t.task_id
-                    );
-                    assert!(
-                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.task_text),
-                        "task_text contains placeholder text: {}",
-                        t.task_text
-                    );
-                    assert!(
-                        !ClaudeCliExecutor::contains_unsubstituted_placeholder(&t.reason),
-                        "reason contains placeholder text: {}",
-                        t.reason
-                    );
-                }
-                assert!(
-                    !revision_suggestion.is_empty(),
-                    "worked example must have a concrete revision_suggestion"
-                );
-            }
-            other => panic!("expected SpecNeedsRevision, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn placeholder_detection_matches_template_markers() {
-        // Each of these is a literal substring from the pre-fix
-        // implementer-prompt template. After the fix, the prompt has
-        // none of them, but the detection must catch any that survive
-        // a misedit OR an operator override.
-        for s in &[
-            "<id-from-tasks-md>",
-            "<verbatim quote>",
-            "<one-line why>",
-            "<free-form text describing what to change>",
-        ] {
-            assert!(
-                ClaudeCliExecutor::contains_unsubstituted_placeholder(s),
-                "expected {s} to match placeholder regex"
-            );
-        }
-    }
-
-    #[test]
-    fn placeholder_detection_ignores_uppercase_and_special_chars() {
-        // Narrow regex: leading char must be ASCII lowercase. Mixed-case
-        // OR symbol-leading angle-bracket content is NOT flagged. Keeps
-        // legitimate task descriptions (`<HTML>`, `<MyType>`, real code
-        // syntax) from triggering false-positive flags.
-        for s in &[
-            "<HTML>",          // uppercase
-            "<MyType>",        // CamelCase
-            "<!doctype>",      // leading symbol
-            "<3>",             // leading digit
-            "<>",              // empty
-            "no brackets at all",
-            "plain text",
-        ] {
-            assert!(
-                !ClaudeCliExecutor::contains_unsubstituted_placeholder(s),
-                "did not expect {s} to match placeholder regex"
-            );
-        }
-    }
-
-    #[test]
-    fn placeholder_detection_catches_template_in_task_id() {
-        // The most-likely failure mode: the agent copies the prompt
-        // template's `task_id` value verbatim. Parser must reject.
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
-{\"task_id\":\"<id-from-tasks-md>\",\"task_text\":\"install actionlint\",\"reason\":\"no apt access\"}],\
-\"revision_suggestion\":\"Replace with CI gate.\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect_err("placeholder must produce parse error");
-        assert!(
-            err.contains("un-substituted placeholders"),
-            "diagnostic phrase missing from: {err}"
-        );
-        assert!(
-            err.contains("prompts/implementer.md"),
-            "prompt reference missing from: {err}"
-        );
-        assert!(
-            err.contains("task_id"),
-            "specific field name missing from: {err}"
-        );
-    }
-
-    #[test]
-    fn placeholder_detection_catches_template_in_task_text_and_reason() {
-        // Both `task_text` and `reason` fields are scanned. Any field
-        // tripping the regex fails the whole payload.
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
-{\"task_id\":\"5.2\",\"task_text\":\"<verbatim quote>\",\"reason\":\"<one-line why>\"}],\
-\"revision_suggestion\":\"Replace with CI gate.\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect_err("placeholder must produce parse error");
-        // Detection short-circuits at task_text (first failing field).
-        assert!(err.contains("un-substituted placeholders"), "err: {err}");
-        assert!(err.contains("task_text"), "err: {err}");
-    }
-
-    #[test]
-    fn placeholder_detection_tolerates_legitimate_angle_brackets() {
-        // A legitimate task whose text happens to include `<HTML>` or
-        // `<MyType>` is NOT flagged — the regex requires lowercase
-        // leading char to avoid this common false-positive shape.
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
-{\"task_id\":\"7.1\",\"task_text\":\"Render <HTML> tags in user input safely\",\"reason\":\"needs DOM sandbox\"}],\
-\"revision_suggestion\":\"Add an HTML sanitizer dependency.\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect("legitimate angle-bracket content must NOT trip placeholder detection");
-        assert!(matches!(
-            outcome,
-            Some(ExecutorOutcome::SpecNeedsRevision { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_spec_needs_revision_missing_required_field_falls_back_to_failed() {
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"revision_suggestion\":\"x\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect_err("missing tasks field must surface as parse error");
-        assert!(
-            err.contains("unimplementable_tasks"),
-            "error should name the missing field: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_spec_needs_revision_with_empty_task_list_treated_as_invalid() {
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[],\"revision_suggestion\":\"x\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel present");
-        let err = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect_err("empty task list must surface as parse error");
-        assert!(err.contains("empty"), "error should mention emptiness: {err}");
-    }
-
-    #[test]
-    fn extract_outcome_sentinel_handles_braces_in_strings() {
-        let stdout = "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[\
-{\"task_id\":\"1.1\",\"task_text\":\"sudo apt-get install x { y }\",\"reason\":\"no apt\"}],\
-\"revision_suggestion\":\"drop {curlies} in description\"}\n";
-        let payload =
-            ClaudeCliExecutor::extract_outcome_sentinel(stdout).expect("sentinel extracted");
-        // The full JSON object must be captured: depth tracker should not
-        // close early on `{` or `}` inside string literals.
-        assert!(payload.ends_with('}'));
-        let outcome = ClaudeCliExecutor::try_parse_spec_needs_revision(&payload)
-            .expect("parse ok")
-            .expect("Some outcome");
-        match outcome {
-            ExecutorOutcome::SpecNeedsRevision {
-                unimplementable_tasks,
-                ..
-            } => {
-                assert!(unimplementable_tasks[0].task_text.contains("{ y }"));
-            }
-            other => panic!("expected SpecNeedsRevision, got {other:?}"),
-        }
-    }
-
-    /// End-to-end: a script that emits a well-formed spec-needs-revision
-    /// sentinel on stdout and exits 0 causes the executor to return
-    /// `SpecNeedsRevision`, not `Completed`. Uses text mode because the
-    /// fixture is a shell script — JSON mode requires the wrapped CLI
-    /// to emit a `result` event channel, which this fixture does not
-    /// simulate. The semantic the test guards (well-formed sentinel
-    /// in agent emission → SpecNeedsRevision) is identical in both
-    /// modes; only the source of "agent emission" differs (a20a1).
-    #[tokio::test]
-    async fn spec_needs_revision_sentinel_routes_through_run() {
-        let (_dir, ws) = fixture_workspace_with_git();
-        let script = write_script(
-            &ws,
-            "needs_revision.sh",
-            "#!/bin/sh\ncat <<'EOF'\nbla bla\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"7.3\",\"task_text\":\"smoke test on macOS\",\"reason\":\"no macOS host in sandbox\"}],\"revision_suggestion\":\"drop the macOS smoke step\"}\nEOF\nexit 0\n",
-        );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
-            .with_output_format(crate::config::ExecutorOutputFormat::Text);
-        let outcome = executor.run(&ws, "x").await.unwrap();
-        match outcome {
-            ExecutorOutcome::SpecNeedsRevision {
-                unimplementable_tasks,
-                revision_suggestion,
-            } => {
-                assert_eq!(unimplementable_tasks.len(), 1);
-                assert_eq!(unimplementable_tasks[0].task_id, "7.3");
-                assert!(revision_suggestion.contains("macOS"));
-            }
-            other => panic!("expected SpecNeedsRevision, got {other:?}"),
-        }
-    }
-
-    /// Unparseable sentinel → Failed with parse-error reason. Production
-    /// invariant from the spec: the daemon must not crash on a malformed
-    /// payload, and it must not silently treat the run as success.
-    #[tokio::test]
-    async fn malformed_spec_needs_revision_sentinel_yields_failed() {
-        let (_dir, ws) = fixture_workspace_with_git();
-        let script = write_script(
-            &ws,
-            "bad_sentinel.sh",
-            "#!/bin/sh\ncat <<'EOF'\n=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[]}\nEOF\nexit 0\n",
-        );
-        // Text mode: stdout IS the agent's emission stream (no JSON
-        // event channel), so the malformed sentinel emitted via the
-        // script SHALL trigger the canonical "unparseable sentinel"
-        // Failed outcome. Per a20a1, JSON mode scopes the scan to
-        // `final_answer` only; a shell-script fixture has no `result`
-        // event so a JSON-mode equivalent test isn't well-defined.
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
-            .with_output_format(crate::config::ExecutorOutputFormat::Text);
-        let outcome = executor.run(&ws, "x").await.unwrap();
-        match outcome {
-            ExecutorOutcome::Failed { reason } => {
-                assert!(
-                    reason.contains("unparseable SpecNeedsRevision sentinel"),
-                    "reason should mention the parse failure: {reason}"
-                );
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
     }
 
     /// 5.4: a revision-mode prompt build with a sample `RevisionContext`
@@ -3825,10 +3494,9 @@ exit 0
     // a27a0: tool-recorded outcome precedence + deprecation warning
     // ---------------------------------------------------------------
 
-    /// Serialize env-var-touching tests so concurrent runs do not race
-    /// on the `ENV_CONTROL_SOCKET` / `ENV_WORKSPACE_BASENAME` mutation.
-    /// Mirrors the lock in `mcp_askuser_server.rs`'s test module.
-    static A27A0_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env-var-touching tests serialize via `crate::testing::ENV_LOCK`
+    // (a27a2 unified the per-module locks into a single process-wide
+    // lock so cross-module tests cannot race).
 
     /// Spin up a Unix-domain-socket listener that handles ONE
     /// `consume_outcome` action by returning the canned `outcome`
@@ -3859,12 +3527,13 @@ exit 0
         (dir, socket)
     }
 
-    /// 3.5 — tool-recorded `Success` outcome takes precedence over a
-    /// stdout sentinel block in the same captured event stream.
+    /// 3.5 — tool-recorded `Success` outcome takes precedence over the
+    /// diff-presence/Completed heuristic. The agent's deliberate
+    /// `outcome_success` signal wins over any inferred state.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
-    async fn tool_recorded_success_takes_precedence_over_stdout_sentinel() {
-        let _g = A27A0_ENV_LOCK.lock().unwrap();
+    async fn tool_recorded_success_takes_precedence() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
         let success_payload = serde_json::json!({
             "type": "success",
             "final_answer": "from-the-tool"
@@ -3884,19 +3553,15 @@ exit 0
             );
         }
         let executor = fixture_executor_text();
-        // stdout contains a well-formed spec_needs_revision block —
-        // pre-a27a0 this would have produced SpecNeedsRevision. Now
-        // the tool-recorded Success wins.
         use std::os::unix::process::ExitStatusExt;
         let outcome = SubprocessOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            stdout: "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"x\",\"reason\":\"r\"}],\"revision_suggestion\":\"s\"}\n".to_string(),
+            stdout: "some normal output".to_string(),
             stderr: String::new(),
             final_answer: None,
             streamed_log: false,
+            session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
         unsafe {
@@ -3916,7 +3581,7 @@ exit 0
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn tool_recorded_spec_revision_takes_precedence_over_timeout() {
-        let _g = A27A0_ENV_LOCK.lock().unwrap();
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
         let revision_payload = serde_json::json!({
             "type": "spec_needs_revision",
             "unimplementable_tasks": [
@@ -3945,6 +3610,7 @@ exit 0
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
         unsafe {
@@ -3961,103 +3627,6 @@ exit 0
             }
             other => panic!("expected SpecNeedsRevision, got {other:?}"),
         }
-    }
-
-    /// 3.7 — when `consume_outcome` returns `None` AND the legacy
-    /// stdout sentinel matches, today's behavior is preserved AND
-    /// a deprecation warning is emitted.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)]
-    async fn legacy_stdout_sentinel_match_emits_deprecation_warning() {
-        use tracing_subscriber::fmt::MakeWriter;
-
-        // tracing-subscriber capture: a thread-local sink that records
-        // every `tracing::warn!` line emitted under the dispatched
-        // subscriber.
-        #[derive(Clone, Default)]
-        struct CaptureWriter {
-            buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-        }
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.buf.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let _g = A27A0_ENV_LOCK.lock().unwrap();
-        let (_sock_dir, socket) = spawn_consume_outcome_responder(None).await;
-        let (_tmp, ws) = fixture_workspace_for_classify();
-        // SAFETY: tests serialize via A27A0_ENV_LOCK.
-        unsafe {
-            std::env::set_var(
-                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
-                socket.as_os_str(),
-            );
-            std::env::set_var(
-                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
-                ws.file_name().unwrap(),
-            );
-        }
-        let executor = fixture_executor_text();
-        use std::os::unix::process::ExitStatusExt;
-        let outcome = SubprocessOutcome {
-            timed_out: false,
-            exit_status: Some(std::process::ExitStatus::from_raw(0)),
-            stdout: "\
-=== AUTOCODER-OUTCOME ===\n\
-{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"x\",\"reason\":\"r\"}],\"revision_suggestion\":\"s\"}\n".to_string(),
-            stderr: String::new(),
-            final_answer: None,
-            streamed_log: false,
-        };
-
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-
-        // `set_default` returns a guard scoped to the current thread,
-        // so all `tracing::warn!` emitted while the guard is alive go
-        // through our capture writer. This stays inside the running
-        // tokio runtime — no nested `block_on`.
-        let result = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            executor.classify_outcome(&ws, "x", outcome).await.unwrap()
-        };
-        unsafe {
-            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
-            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
-        }
-
-        assert!(
-            matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
-            "legacy path must still classify as SpecNeedsRevision; got {result:?}"
-        );
-        let captured = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
-        assert!(
-            captured.contains("legacy stdout sentinel matched"),
-            "deprecation marker missing from log: {captured}"
-        );
-        assert!(
-            captured.contains("outcome_spec_needs_revision"),
-            "directive sentence missing: {captured}"
-        );
-        assert!(
-            captured.contains("a27a2"),
-            "planned-removal target missing: {captured}"
-        );
     }
 
     /// Daemon-recorded outcome maps correctly to `ExecutorOutcome` for
@@ -4228,6 +3797,656 @@ exit 0
                 assert_eq!(iteration_number, 2);
             }
             other => panic!("expected IterationRequested at iteration 2 (corrupt-as-absent), got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // a27a2: acceptance scan + recovery loop integration tests
+    // ---------------------------------------------------------------
+
+    /// Spin up a UDS listener that responds to a configurable number of
+    /// `consume_outcome` round-trips, pulling each response off the
+    /// supplied queue in order. Tests covering the acceptance scan's
+    /// recovery-turn arms drive this with two-element queues (initial
+    /// classify + recovery classify).
+    ///
+    /// The responder filters by `expected_workspace_basename`: requests
+    /// whose `workspace_basename` field does not match are silently
+    /// dropped (the connection closes without a response, which the
+    /// classifier reads as `None`). This isolates parallel test runs
+    /// that happen to read the same `ENV_CONTROL_SOCKET` set by a
+    /// concurrently-executing locked test.
+    async fn spawn_multi_consume_outcome_responder_for(
+        expected_workspace_basename: &str,
+        responses: Vec<Option<serde_json::Value>>,
+    ) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let expected = expected_workspace_basename.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut queue = responses.into_iter();
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let req: serde_json::Value =
+                    match serde_json::from_str(line.trim()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                let req_basename = req
+                    .get("workspace_basename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if req_basename != expected {
+                    // Foreign request: close connection silently so the
+                    // sender's `from_str` over an empty line yields Err
+                    // → fall-through to `None`.
+                    let _ = write_half.shutdown().await;
+                    continue;
+                }
+                let response = match queue.next() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "outcome": response.unwrap_or(serde_json::Value::Null),
+                });
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = write_half.write_all(&bytes).await;
+                let _ = write_half.shutdown().await;
+            }
+        });
+        (dir, socket)
+    }
+
+    /// Build a fake-claude script that emits one JSON `system` init
+    /// event with the supplied session_id, then exits 0. The recovery
+    /// turn does NOT use the JSON stream (uses the legacy at-exit
+    /// capture path), so this fixture is sufficient for both phases.
+    fn write_system_event_script(workspace: &Path, name: &str, session_id: &str) -> PathBuf {
+        let body = format!(
+            "#!/bin/sh\n\
+echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{sid}\"}}'\n\
+echo '{{\"type\":\"result\",\"stop_reason\":\"end_turn\",\"result\":\"agent narrative ending without an outcome tool\"}}'\n\
+exit 0\n",
+            sid = session_id
+        );
+        write_script(workspace, name, &body)
+    }
+
+    /// 6.1: all tasks checked AND outcome_success called → Completed,
+    /// no recovery turn fires. The fixture's tasks.md is fully checked
+    /// (default in `fixture_workspace`) AND the responder returns a
+    /// recorded Success outcome, so the implementer-flow classifier's
+    /// `tool_recorded` path wins immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn acceptance_scan_skipped_when_outcome_success_called() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) = spawn_multi_consume_outcome_responder_for(
+            &basename,
+            vec![Some(serde_json::json!({
+                "type": "success",
+                "final_answer": "all done"
+            }))],
+        )
+        .await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_system_event_script(&ws, "ok.sh", "session-abc");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("all done"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !body.contains(RECOVERY_LOG_DIVIDER),
+            "no recovery turn should have fired: {body}"
+        );
+    }
+
+    /// 6.2: unchecked tasks BUT outcome_success called → Completed,
+    /// no recovery turn fires. The agent's structured signal wins over
+    /// the daemon's would-be heuristic disagreement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn acceptance_scan_skipped_when_unchecked_but_tool_recorded() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        // Overwrite tasks.md with an unchecked item.
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 still on the list\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) = spawn_multi_consume_outcome_responder_for(
+            &basename,
+            vec![Some(serde_json::json!({
+                "type": "success",
+                "final_answer": "shipped despite the leftover checkbox"
+            }))],
+        )
+        .await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_system_event_script(&ws, "ok.sh", "session-xyz");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(
+                    final_answer.as_deref(),
+                    Some("shipped despite the leftover checkbox")
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !body.contains(RECOVERY_LOG_DIVIDER),
+            "no recovery turn should fire when tool was recorded: {body}"
+        );
+    }
+
+    /// 6.3: unchecked tasks AND no outcome tool call → recovery turn
+    /// fires. The recovery turn calls `outcome_success` → final
+    /// Completed. The run log captures both phases with the
+    /// `=== RECOVERY TURN ===` divider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn recovery_turn_outcome_success_yields_completed() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 finish the work\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        // Two-element queue: initial classify returns None (no tool
+        // call) → triggers recovery; recovery classify returns Success.
+        let (_sock_dir, socket) = spawn_multi_consume_outcome_responder_for(
+            &basename,
+            vec![
+                None,
+                Some(serde_json::json!({
+                    "type": "success",
+                    "final_answer": "fixed up and finished"
+                })),
+            ],
+        )
+        .await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_system_event_script(&ws, "ok.sh", "session-recover");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("fixed up and finished"));
+            }
+            other => panic!("expected Completed from recovery, got {other:?}"),
+        }
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains(RECOVERY_LOG_DIVIDER),
+            "log must contain recovery divider: {body}"
+        );
+    }
+
+    /// 6.4: unchecked tasks AND no outcome tool call → recovery turn
+    /// calls `outcome_request_iteration` → final IterationRequested
+    /// (with iteration_number=2 per a27a1 cap rules; no marker present
+    /// at this fixture's workspace).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn recovery_turn_outcome_iteration_yields_iteration_requested() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 first task\n- [ ] 1.2 second task\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) = spawn_multi_consume_outcome_responder_for(
+            &basename,
+            vec![
+                None,
+                Some(serde_json::json!({
+                    "type": "iteration_request",
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "reason": "ran out of room"
+                })),
+            ],
+        )
+        .await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_system_event_script(&ws, "ok.sh", "session-iter");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::IterationRequested {
+                completed_tasks,
+                remaining_tasks,
+                reason,
+                iteration_number,
+            } => {
+                assert_eq!(completed_tasks, vec!["1.1".to_string()]);
+                assert_eq!(remaining_tasks, vec!["1.2".to_string()]);
+                assert_eq!(reason, "ran out of room");
+                assert_eq!(iteration_number, 2);
+            }
+            other => panic!("expected IterationRequested, got {other:?}"),
+        }
+    }
+
+    /// 6.5: unchecked tasks AND no outcome tool call → recovery turn
+    /// ALSO produces no outcome tool call → final Failed with the
+    /// canonical reason (the literal text scripts grep for).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn recovery_turn_with_no_outcome_yields_canonical_failed() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 still needs doing\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) =
+            spawn_multi_consume_outcome_responder_for(&basename, vec![None, None]).await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_system_event_script(&ws, "ok.sh", "session-no-recover");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Failed { reason } => {
+                assert_eq!(reason, RECOVERY_FAILED_REASON);
+            }
+            other => panic!("expected canonical Failed, got {other:?}"),
+        }
+    }
+
+    /// 6.6: `run_revision` with unchecked tasks AND no outcome tool
+    /// call does NOT fire the acceptance scan or the recovery loop.
+    /// The classifier-only path returns whatever today's heuristic
+    /// produces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_revision_skips_acceptance_scan() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 revision unchecked\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        // Only one consume_outcome round-trip — if the scan fired, the
+        // recovery turn would attempt a second call AND the test would
+        // hang waiting for the responder.
+        let (_sock_dir, socket) =
+            spawn_multi_consume_outcome_responder_for(&basename, vec![None]).await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        // The script writes a small file so the workspace has a
+        // diff — that drives classify_outcome to Completed via the
+        // diff-presence path. If the scan WERE applied, a recovery
+        // turn would launch AND a second consume_outcome round-trip
+        // would be issued.
+        let script = write_script(
+            &ws,
+            "rev.sh",
+            "#!/bin/sh\nmkdir -p out && echo touched > out/touched\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let ctx = crate::revisions::RevisionContext {
+            change_name: "x".to_string(),
+            pr_diff: "".to_string(),
+            revision_text: "tweak it".to_string(),
+            pr_body: "".to_string(),
+            pr_change_list: "".to_string(),
+            agent_implementation_notes: "".to_string(),
+        };
+        let outcome = executor.run_revision(&ws, "x", &ctx).await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        assert!(
+            matches!(outcome, ExecutorOutcome::Completed { .. }),
+            "got {outcome:?}"
+        );
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !body.contains(RECOVERY_LOG_DIVIDER),
+            "run_revision must NOT trigger the recovery turn: {body}"
+        );
+    }
+
+    /// 6.7: non-implementer flows (`run_triage`) skip the acceptance
+    /// scan regardless of workspace tasks.md content. We test
+    /// `run_triage` here as a representative; the codepath is shared
+    /// with `run_chat_triage`, `run_brownfield_draft`, `run_scout`,
+    /// AND `run_changelog` (none of which invoke
+    /// `Executor::run`'s implementer-only scan + recovery dispatch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_triage_skips_acceptance_scan() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 not a triage concern\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) =
+            spawn_multi_consume_outcome_responder_for(&basename, vec![None]).await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let script = write_script(
+            &ws,
+            "triage.sh",
+            "#!/bin/sh\necho triage done\nmkdir -p out && echo found > out/found\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let ctx = TriageContext {
+            findings: "f".to_string(),
+            audit_type: "drift_audit".to_string(),
+            repo_url: "https://example.com".to_string(),
+            canonical_specs_index: "".to_string(),
+        };
+        let outcome = executor.run_triage(&ws, &ctx).await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        assert!(
+            matches!(outcome, ExecutorOutcome::Completed { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    /// 6.8: an implementer run that emits a legacy `=== AUTOCODER-OUTCOME ===`
+    /// stdout block AND has unchecked tasks AND does not call any
+    /// outcome tool. The stdout sentinel is NOT parsed (deleted in
+    /// a27a2); the acceptance scan fires; the recovery turn runs.
+    /// Recovery returns no tool call → final canonical Failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn legacy_stdout_sentinel_is_not_parsed_and_scan_fires() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        std::fs::write(
+            ws.join("openspec/changes/x/tasks.md"),
+            "- [ ] 1.1 still leftover\n",
+        )
+        .unwrap();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) =
+            spawn_multi_consume_outcome_responder_for(&basename, vec![None, None]).await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        // Emit a well-formed AUTOCODER-OUTCOME stdout block AND a JSON
+        // result event with the sentinel content as the agent's final
+        // answer. Pre-a27a2 this would have routed to SpecNeedsRevision;
+        // post-a27a2 the sentinel is dead code AND the acceptance scan
+        // fires instead.
+        let script = write_script(
+            &ws,
+            "legacy.sh",
+            r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"legacy-session"}'
+echo '{"type":"result","stop_reason":"end_turn","result":"=== AUTOCODER-OUTCOME ===\n{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"x\",\"reason\":\"r\"}],\"revision_suggestion\":\"s\"}"}'
+exit 0
+"#,
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Failed { reason } => {
+                assert_eq!(
+                    reason, RECOVERY_FAILED_REASON,
+                    "legacy stdout sentinel must NOT shortcut to SpecNeedsRevision; expected canonical Failed"
+                );
+            }
+            ExecutorOutcome::SpecNeedsRevision { .. } => {
+                panic!(
+                    "regression: legacy stdout AUTOCODER-OUTCOME block must NOT classify as SpecNeedsRevision in a27a2"
+                );
+            }
+            other => panic!("expected canonical Failed, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Task 4.9: classifier ordering — one fixture per branch
+    // ---------------------------------------------------------------
+
+    /// Ordering 1/5: tool-recorded outcome (consume_outcome → Some)
+    /// short-circuits BEFORE any other check. Covered by
+    /// `tool_recorded_success_takes_precedence` AND
+    /// `tool_recorded_spec_revision_takes_precedence_over_timeout`
+    /// above — this comment is the cross-reference.
+
+    /// Ordering 2/5: AskUser marker (no tool-recorded outcome) wins
+    /// over the timeout flag. The marker file is present AND
+    /// `outcome.timed_out` is true; the classifier returns AskUser,
+    /// not Failed{timeout}.
+    #[tokio::test]
+    async fn classifier_ordering_askuser_wins_over_timeout() {
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        std::fs::write(
+            ws.join("openspec/changes/x").join(ASKUSER_MARKER_FILENAME),
+            "{\"question\":\"clarify scope\"}",
+        )
+        .unwrap();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(
+            matches!(result, ExecutorOutcome::AskUser { .. }),
+            "AskUser marker must beat timeout precedence: {result:?}"
+        );
+    }
+
+    /// Ordering 3/5: timeout precedence (no marker, no tool-recorded
+    /// outcome) wins over the exit-status path.
+    #[tokio::test]
+    async fn classifier_ordering_timeout_wins_over_exit_status() {
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        assert!(matches!(
+            result,
+            ExecutorOutcome::Failed { reason } if reason == "timeout"
+        ));
+    }
+
+    /// Ordering 4/5: exit-status path (non-zero) wins over the
+    /// Layer-2/Completed fallback.
+    #[tokio::test]
+    async fn classifier_ordering_exit_status_wins_over_layer2() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(1 << 8)),
+            stdout: "could you clarify the scope?".to_string(),
+            stderr: "broke somewhere".to_string(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        match result {
+            ExecutorOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("broke somewhere"),
+                    "exit-status path must surface stderr in reason: {reason}"
+                );
+            }
+            other => panic!("expected Failed via exit status, got {other:?}"),
+        }
+    }
+
+    /// Ordering 5/5: with exit 0 AND no diff AND no clarification
+    /// heuristic, the classifier falls through to `Completed` carrying
+    /// the captured final_answer. The Layer-2 path tested earlier
+    /// covers the clarification branch.
+    #[tokio::test]
+    async fn classifier_ordering_completed_terminal_path() {
+        use std::os::unix::process::ExitStatusExt;
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: String::new(),
+            stderr: String::new(),
+            final_answer: Some("done".to_string()),
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        match result {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("done"));
+            }
+            other => panic!("expected Completed terminal path, got {other:?}"),
         }
     }
 }

@@ -74,6 +74,7 @@ struct Inner {
     final_answer: Option<String>,
     stderr_buf: Vec<u8>,
     finalized: bool,
+    session_id: Option<String>,
 }
 
 /// Compute the stream log path for a given summary log path:
@@ -122,6 +123,7 @@ pub fn open(summary_path: &Path) -> Result<StructuredLogWriter> {
             final_answer: None,
             stderr_buf: Vec::new(),
             finalized: false,
+            session_id: None,
         }),
         summary_path: summary_path.to_path_buf(),
         stream_path,
@@ -223,6 +225,22 @@ impl StructuredLogWriter {
     pub fn final_answer(&self) -> Option<String> {
         let guard = self.inner.lock().unwrap();
         guard.final_answer.clone()
+    }
+
+    /// Capture the session_id from a `system`-event `init` subtype. The
+    /// recovery loop (a27a2) reads this so it can launch `claude
+    /// --resume <session_id>` against the same conversation.
+    pub fn set_session_id(&self, id: String) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.session_id = Some(id);
+    }
+
+    /// In-memory session_id captured from the System event. Returns None
+    /// when no system-init event was seen (text mode, malformed stream,
+    /// timeout before init, etc.).
+    pub fn session_id(&self) -> Option<String> {
+        let guard = self.inner.lock().unwrap();
+        guard.session_id.clone()
     }
 
     /// Path of the summary log file.

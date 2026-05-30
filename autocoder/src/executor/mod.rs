@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod acceptance_scan;
 pub mod claude_cli;
 pub mod event_log;
 pub mod json_event;

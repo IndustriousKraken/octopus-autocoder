@@ -776,9 +776,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    /// Env-var mutation is global; serialize the env-var-touching tests
-    /// so concurrent runs do not race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env-var-touching tests serialize via `crate::testing::ENV_LOCK`
+    // (a27a2 unified the per-module locks into a single process-wide
+    // lock so cross-module tests cannot race).
+    use crate::testing::ENV_LOCK;
 
     /// Drive the server's `handle_request` with a sequence of synthetic
     /// JSON-RPC messages and return everything written to the response
