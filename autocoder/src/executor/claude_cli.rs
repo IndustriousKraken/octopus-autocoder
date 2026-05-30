@@ -587,7 +587,7 @@ impl ClaudeCliExecutor {
             .arg("--settings")
             .arg(&settings_path)
             .arg("--allowedTools")
-            .arg(self.sandbox.allowed_tools.join(","))
+            .arg(build_allowed_tools_arg(&self.sandbox.allowed_tools))
             .arg("--permission-mode")
             .arg("acceptEdits");
         if json_mode {
@@ -1331,6 +1331,28 @@ beyond that are auto-failed.\n\
     )
 }
 
+/// Build the `--allowedTools` argument value passed to Claude CLI: the
+/// operator's configured `executor.sandbox.allowed_tools` plus the
+/// autocoder MCP tools (in `mcp__<server>__<tool>` form). The autocoder
+/// tools are auto-included so operators don't have to enumerate them
+/// per-name in their sandbox config — they're part of the daemon's
+/// contract with the agent, not operator-configurable surface. Without
+/// auto-inclusion, the agent's outcome-tool calls hit Claude CLI's
+/// permission gate AND fail with `permission denied`, which classifies
+/// the run as Failed even when the agent did real work.
+///
+/// Source of truth for the autocoder tool list is
+/// `crate::mcp_askuser_server::PROVIDED_TOOL_NAMES`. Duplicates between
+/// the operator's list AND the auto-included list are harmless (Claude
+/// CLI deduplicates them internally).
+fn build_allowed_tools_arg(sandbox_allowed: &[String]) -> String {
+    let mut combined: Vec<String> = sandbox_allowed.to_vec();
+    for tool in crate::mcp_askuser_server::PROVIDED_TOOL_NAMES {
+        combined.push(crate::mcp_askuser_server::qualified_tool_name(tool));
+    }
+    combined.join(",")
+}
+
 fn build_handle(workspace: &Path, change: &str, session_id: Option<String>) -> ResumeHandle {
     let data = ClaudeResumeData {
         workspace: workspace.to_path_buf(),
@@ -2038,6 +2060,56 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    #[test]
+    fn build_allowed_tools_arg_auto_includes_autocoder_mcp_tools() {
+        // The autocoder MCP server's tools MUST appear in --allowedTools
+        // without operator action — they're part of the daemon's contract
+        // with the agent. Operators who never touched their config still
+        // get a functional outcome-tools path.
+        let operator_tools = vec!["Read".to_string(), "Edit".to_string()];
+        let combined = build_allowed_tools_arg(&operator_tools);
+        let entries: Vec<&str> = combined.split(',').collect();
+
+        // Operator-configured tools preserved verbatim.
+        assert!(entries.contains(&"Read"), "operator's Read tool missing: {combined}");
+        assert!(entries.contains(&"Edit"), "operator's Edit tool missing: {combined}");
+
+        // Every tool the MCP server advertises is auto-allowed in
+        // mcp__<server>__<tool> form.
+        for tool in crate::mcp_askuser_server::PROVIDED_TOOL_NAMES {
+            let qualified = crate::mcp_askuser_server::qualified_tool_name(tool);
+            assert!(
+                entries.iter().any(|e| *e == qualified),
+                "autocoder MCP tool {qualified} not auto-allowed; argv was: {combined}"
+            );
+        }
+
+        // ask_user AND query_canonical_specs are canonical members today.
+        // Pin them explicitly so the test fails loudly if the const drifts.
+        assert!(
+            entries.contains(&"mcp__ask_user__ask_user"),
+            "ask_user not auto-allowed: {combined}"
+        );
+        assert!(
+            entries.contains(&"mcp__ask_user__query_canonical_specs"),
+            "query_canonical_specs not auto-allowed: {combined}"
+        );
+    }
+
+    #[test]
+    fn build_allowed_tools_arg_preserves_empty_operator_list() {
+        // Operators who configure NO sandbox.allowed_tools still get the
+        // autocoder MCP tools auto-allowed — the daemon contract holds
+        // regardless of operator config state.
+        let combined = build_allowed_tools_arg(&[]);
+        let entries: Vec<&str> = combined.split(',').collect();
+        assert!(entries.contains(&"mcp__ask_user__ask_user"));
+        assert!(entries.contains(&"mcp__ask_user__query_canonical_specs"));
+        // No spurious leading/trailing commas from the empty operator list.
+        assert!(!combined.starts_with(','));
+        assert!(!combined.ends_with(','));
     }
 
     #[test]

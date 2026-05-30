@@ -31,6 +31,32 @@ pub const ENV_CONTROL_SOCKET: &str = "ORCH_DAEMON_CONTROL_SOCKET";
 /// so the daemon's handler can look up the right `CanonicalRagStore`.
 pub const ENV_WORKSPACE_BASENAME: &str = "ORCH_MCP_WORKSPACE_BASENAME";
 
+/// The MCP server name registered in `.mcp.json`'s `mcpServers` key.
+/// MUST match the key used in `ClaudeCliExecutor::write_mcp_config`.
+/// Claude CLI exposes MCP tools to the agent as `mcp__<server>__<tool>`,
+/// so changing this string changes the agent-visible tool names AND
+/// requires updating any operator-configured `allowed_tools` entries
+/// that referenced the old name.
+pub const SERVER_NAME: &str = "ask_user";
+
+/// Canonical list of tools this MCP server provides via its `tools/list`
+/// response. MUST be kept in sync with the response body in
+/// `handle_request`'s `"tools/list"` arm. Used by
+/// `ClaudeCliExecutor::run_subprocess` to auto-include these tools in
+/// the `--allowedTools` argument it passes to Claude CLI, so operators
+/// don't have to enumerate them in `executor.sandbox.allowed_tools` —
+/// they're part of the daemon's contract with the agent (not operator-
+/// configurable surface). When adding a new MCP tool, add its name HERE
+/// in addition to the `tools/list` response; the auto-allow path picks
+/// it up on the next polling iteration.
+pub const PROVIDED_TOOL_NAMES: &[&str] = &["ask_user", "query_canonical_specs"];
+
+/// Format a tool name as Claude CLI's `--allowedTools` expects:
+/// `mcp__<server>__<tool>`. Reused by the executor's argv builder.
+pub fn qualified_tool_name(tool: &str) -> String {
+    format!("mcp__{SERVER_NAME}__{tool}")
+}
+
 /// 10-second timeout for the control-socket round trip (read + write).
 const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
