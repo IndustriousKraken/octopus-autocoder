@@ -178,6 +178,47 @@ On any failure (executor returned `Failed`, missing artifacts, sandbox leak, pus
 
 **Relationship to `propose`.** Use `brownfield` to introduce a capability's canonical spec to the workspace for the first time. After the brownfield PR merges, the standard `propose` flow handles any subsequent change to that capability (the `openspec/specs/<capability-name>/spec.md` file then exists, AND brownfield refuses to overwrite it). See [OPERATIONS.md → onboarding existing projects](OPERATIONS.md#onboarding-existing-projects) for the recommended cadence.
 
+### brownfield-survey
+
+The `brownfield-survey` verb is the chat entry point for "this project has no canonical specs at all — survey the codebase AND propose a list of capabilities I might want to spec." Where `brownfield` writes ONE spec for ONE capability the operator already named, `brownfield-survey` produces a curated **list** of candidate capabilities the operator reviews AND optionally batch-generates with `send it`.
+
+```
+@<bot> brownfield-survey <repo-substring> [optional guidance]
+```
+
+- `<repo-substring>` — case-insensitive substring matching the configured repo URL (same rule as the other repo-targeted verbs).
+- `[optional guidance]` — free-form text steering the survey's focus (e.g., `focus on the data layer; skip CLI commands which are well-understood`). Trimmed, capped at 10,000 characters. Passed verbatim into the survey prompt.
+
+**Ack and lifecycle thread.** The bot posts a top-level ack:
+
+```
+✓ Queued brownfield-survey for <repo_url>. The next polling iteration will run it (~Nm). Follow along in this thread.
+```
+
+The ack's `ts` becomes the survey's **lifecycle thread**. The polling-iteration survey handler runs the wrapped agent CLI under `WritePolicy::None` (Read, Glob, Grep, Bash read-only) with the embedded `prompts/brownfield-survey.md` system prompt. The handler then validates the executor's JSON response, persists a `BrownfieldSurveyState` file to `<workspace>/.state/brownfield_surveys/<request_id>.json`, AND posts the rendered list as a threaded reply.
+
+**Output shape.** Each item is numbered, with `slug — complexity — summary` on the top line followed by indented `Scope-in:`, `Scope-out:`, AND `Source:` lines. The closing line names the two follow-up actions:
+
+```
+Reply with @<bot> send it to batch-generate ALL <N> specs (one per iteration).
+Or re-run @<bot> brownfield-survey <repo> <refined guidance> to refresh.
+```
+
+The list is capped at `features.brownfield_survey.max_capabilities` (default 20; valid range `1..=50`).
+
+**Already-specced capabilities are excluded.** The survey prompt receives the list of directories under `<spec-root>/specs/` AND instructs the LLM not to propose any of them. A slug collision in the executor's response is a validation failure (the run does not persist).
+
+**Refusals.**
+
+- `✗ brownfield-survey: missing repo-substring. Usage: @<bot> brownfield-survey <repo> [optional guidance]`
+- The standard "be more specific" reply when the substring matches multiple configured repos.
+- The standard "no repo matched" reply when the substring doesn't resolve.
+- `✗ brownfield-survey: disabled in this workspace's config (features.brownfield_survey.enabled=false).` — operator opted the verb out. See [CONFIG.md → `features.brownfield_survey`](CONFIG.md#featuresbrownfield_survey).
+
+**Per-workspace prompt override.** Operators MAY point the survey handler at a custom prompt template via `features.brownfield_survey.prompt_path` (workspace-relative). When unset OR the file does not exist at run time, the handler falls back to the embedded `prompts/brownfield-survey.md`. See [CONFIG.md → `features.brownfield_survey`](CONFIG.md#featuresbrownfield_survey).
+
+**Relationship to `brownfield`.** Use `brownfield-survey` for whole-project bootstrap on a previously-unspecced codebase. Use `brownfield` for the targeted "this one capability needs a spec" case. See [OPERATIONS.md → Bootstrapping specs for an existing project](OPERATIONS.md#bootstrapping-specs-for-an-existing-project) for the full survey → review → `send it` loop.
+
 ### scout
 
 The `scout` verb is the on-demand discovery counterpart to `propose`. Where `propose` says "implement this thing I already know I want," `scout` says "I don't yet know what to work on — survey the repo AND surface a list of opportunities I might consider."
@@ -249,15 +290,24 @@ The standard propose lifecycle takes over from there — triage classifies as DI
 
 Staleness warns but does NOT block. Operators who want fresh results re-run `@<bot> scout <repo>` themselves.
 
-### Acting on audit findings: `send it`
+### Acting on audit findings AND batch-generating from a brownfield-survey: `send it`
 
-When an audit posts findings to chatops via the threaded-notification path (a `📋`/`📐`/`🧭`/`📚` top-line with the full findings body as a thread reply), the daemon stamps an audit-thread state file on disk so operators can act on those findings by replying inside the same thread.
+The `send it` verb has **two** valid posting contexts:
+
+1. **Inside an audit-notification thread** (the canonical case). The daemon stamps an audit-thread state file on disk when an audit posts findings; replying with `send it` triggers triage of those findings.
+2. **Inside a brownfield-survey lifecycle thread** (a29). The survey handler stamps a `BrownfieldSurveyState` on disk; replying with `send it` triggers batch generation of one spec PR per surveyed capability.
 
 ```
-@<bot> send it       (posted as a reply inside the audit thread)
+@<bot> send it       (posted as a reply inside the audit OR brownfield-survey thread)
 ```
 
-Outside an audit thread, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction. Inside a tracked, fresh, open audit thread it spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** (apply directly to source) or **spec-worthy** (write a new `openspec/changes/<slug>/` proposal), then applies both kinds of output. The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced PRs within one polling cycle.
+Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names both valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second; whichever matches dictates the action.
+
+**Audit-thread context (canonical).** Inside a tracked, fresh, open audit thread `send it` spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** (apply directly to source) or **spec-worthy** (write a new `openspec/changes/<slug>/` proposal), then applies both kinds of output. The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced PRs within one polling cycle.
+
+**Brownfield-survey-thread context (a29).** Inside a brownfield-survey thread whose `BrownfieldSurveyState.status` is `Pending`, `send it` submits a `BrownfieldBatchAction` AND the bot replies `✓ Queued <N> capability spec generations. The first will start on the next iteration.` Subsequent iterations drain ONE survey item per iteration, each invoking the canonical brownfield-generation flow from [`brownfield`](#drafting-a-spec-for-existing-behavior-brownfield) for that capability. Per-item status replies (`✅ Spec PR opened for \`<slug>\` (M/N done): <pr-url>` on success; `✗ Spec for \`<slug>\` failed: <reason> (continuing with next)` on failure; `⏭ Skipped \`<slug>\` (M/N done): spec already exists.` when the spec file appears mid-batch) land in the same lifecycle thread. When every item reaches a terminal state, the bot posts the batch-complete summary `✅ Brownfield batch complete. <X> succeeded, <Y> skipped (already specced), <Z> failed.`
+
+The one-item-per-iteration discipline is deliberate: each brownfield run gets its own fresh executor invocation, eliminating mid-batch context compression as a failure mode. If a `send it` lands on a survey whose `status` is already `InProgress` OR `Completed`, the bot rejects with `✗ send it: a brownfield batch is already <in progress | completed> for survey <request_id>.` Only ONE survey may be `InProgress` per workspace at a time — a second `send it` against a different survey gets `✗ send it: a brownfield batch is already in progress for this workspace (survey <prior-request_id>). Wait for it to finish OR run @<bot> clear-survey <repo> to abort.`
 
 **Two-PR output shape.** autocoder splits the executor's diff by path: anything under the new `openspec/changes/<slug>/` directory becomes a separate **spec PR**; everything else becomes a **fixes PR**. Each PR is created on its own branch off `base_branch` and its body cross-links the companion PR (when both are created). If the triage diff has only code, only the fixes PR is created. If it has only a new spec, only the spec PR is created. If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread.
 
@@ -407,6 +457,18 @@ Use cases:
 - Make sure `@<bot> spec-it <N>` against an old request fails fast (since `spec-it` would otherwise still resolve against an older scout state if its `thread_ts` was matched).
 
 Refusals: missing/ambiguous repo (per the standard matcher); `✗ clear-scout: scout disabled in this workspace's config (features.scout.enabled=false).` when the verb is gated off.
+
+### clear-survey
+
+`clear-survey` wipes every `BrownfieldSurveyState` JSON file under `<workspace>/.state/brownfield_surveys/` for the matched repo. The verb is idempotent — running it twice (or against a repo with no surveys) replies with `✓ Cleared 0 brownfield-survey(s) for <repo>.`
+
+Use cases:
+
+- Abort an in-progress brownfield batch (the next iteration's drain finds no in-progress survey AND becomes a no-op).
+- Force the next `@<bot> brownfield-survey <repo>` to start from a clean slate when a prior survey produced a malformed list.
+- Free the workspace's "one-batch-at-a-time" slot so a fresh survey + `send it` can proceed.
+
+Refusals: missing/ambiguous repo (per the standard matcher); `✗ clear-survey: disabled in this workspace's config (features.brownfield_survey.enabled=false).` when the verb is gated off.
 
 ### sync-upstream
 

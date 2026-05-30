@@ -111,6 +111,16 @@ pub async fn run(
             std::collections::VecDeque<crate::control_socket::SyncUpstreamRequest>,
         >,
     >,
+    pending_brownfield_survey_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldSurveyRequest>,
+        >,
+    >,
+    pending_brownfield_batch_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>,
+        >,
+    >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -139,6 +149,8 @@ pub async fn run(
         pending_scout_requests,
         pending_spec_it_requests,
         pending_sync_upstream_requests,
+        pending_brownfield_survey_requests,
+        pending_brownfield_batch_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -221,6 +233,16 @@ pub async fn run_with_hooks(
     pending_sync_upstream_requests: Arc<
         std::sync::Mutex<
             std::collections::VecDeque<crate::control_socket::SyncUpstreamRequest>,
+        >,
+    >,
+    pending_brownfield_survey_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldSurveyRequest>,
+        >,
+    >,
+    pending_brownfield_batch_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>,
         >,
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
@@ -565,6 +587,85 @@ pub async fn run_with_hooks(
                 url = snapshot_ref.url.as_str(),
                 request_id = req.request_id.as_str(),
                 "sync-upstream-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain at most ONE brownfield-survey request per iteration
+        // (a29). The handler invokes the executor in survey mode
+        // (read-only sandbox) AND persists the result to disk.
+        let brownfield_survey_request: Option<
+            crate::control_socket::BrownfieldSurveyRequest,
+        > = {
+            let mut g = pending_brownfield_survey_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = brownfield_survey_request
+            && let Err(error) =
+                crate::polling::brownfield_survey::process_pending_brownfield_survey(
+                    &workspace,
+                    snapshot_ref,
+                    executor.as_ref(),
+                    chatops_ctx.as_ref(),
+                    &req,
+                )
+                .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                request_id = req.request_id.as_str(),
+                "brownfield-survey-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain at most ONE brownfield-batch action per iteration
+        // (a29). The action only flips the survey state to InProgress
+        // AND posts an ack; the actual item drain happens immediately
+        // afterwards in `drain_next_brownfield_batch_item` so the
+        // first item starts on the next iteration AS the spec
+        // promises.
+        let brownfield_batch_request: Option<
+            crate::control_socket::BrownfieldBatchRequest,
+        > = {
+            let mut g = pending_brownfield_batch_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = brownfield_batch_request
+            && let Err(error) =
+                crate::polling::brownfield_batch::process_pending_brownfield_batch(
+                    &workspace,
+                    snapshot_ref,
+                    chatops_ctx.as_ref(),
+                    &req,
+                )
+                .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                survey_request_id = req.survey_request_id.as_str(),
+                "brownfield-batch-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain one in-progress batch item per iteration (a29). This
+        // pass runs every iteration regardless of whether an action
+        // arrived — once a survey is `InProgress` it owns the per-
+        // iteration item-drain slot.
+        if let Err(error) =
+            crate::polling::brownfield_batch::drain_next_brownfield_batch_item(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                "brownfield-batch item drain errored for {}: {error:#}",
                 snapshot_ref.url
             );
         }
@@ -7870,6 +7971,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -8077,6 +8184,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
@@ -12535,6 +12648,12 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),

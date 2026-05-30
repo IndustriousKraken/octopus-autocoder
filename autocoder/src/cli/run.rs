@@ -704,7 +704,18 @@ async fn spawn_inbound_listener(
                     .collect::<Vec<_>>(),
             )
             .with_chatops(slot.backend.clone())
-            .with_brownfield_enabled(cfg.features.brownfield.enabled),
+            .with_brownfield_enabled(cfg.features.brownfield.enabled)
+            .with_scout_enabled(cfg.features.scout.enabled)
+            .with_brownfield_survey_enabled(cfg.features.brownfield_survey.enabled)
+            .with_workspace_resolver({
+                let task_map_for_resolver = task_map.clone();
+                move |url: &str| -> Option<std::path::PathBuf> {
+                    let guard = task_map_for_resolver.lock().unwrap();
+                    guard
+                        .get(url)
+                        .map(|h| crate::workspace::resolve_path(&h.config.load_full()))
+                }
+            }),
     );
     let task_map_for_provider = task_map.clone();
     let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
@@ -837,6 +848,20 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             >,
         > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let pending_sync_upstream_requests_for_task = pending_sync_upstream_requests.clone();
+        let pending_brownfield_survey_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::BrownfieldSurveyRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_brownfield_survey_requests_for_task =
+            pending_brownfield_survey_requests.clone();
+        let pending_brownfield_batch_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_brownfield_batch_requests_for_task =
+            pending_brownfield_batch_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -868,6 +893,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_scout_requests_for_task,
                 pending_spec_it_requests_for_task,
                 pending_sync_upstream_requests_for_task,
+                pending_brownfield_survey_requests_for_task,
+                pending_brownfield_batch_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -903,6 +930,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_scout_requests,
                     pending_spec_it_requests,
                     pending_sync_upstream_requests,
+                    pending_brownfield_survey_requests,
+                    pending_brownfield_batch_requests,
                     iteration_cancel,
                     iteration_drained,
                 },

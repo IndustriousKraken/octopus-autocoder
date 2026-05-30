@@ -778,6 +778,76 @@ autocoder's spec-driven workflow assumes `openspec/specs/<capability>/spec.md` a
 
 **OSS-fork mode.** When `openspec/` lives in a sibling repo separate from the upstream project (the "specs-only fork" pattern), brownfield is the bootstrap step that produces the initial canonical-spec set the rest of autocoder's machinery reads from. After every capability's canonical spec is in place, `propose` handles the ongoing work the same way it would for a green-field project.
 
+For the "whole codebase has no specs yet AND I don't yet know what the right capability boundaries are" case, see [Bootstrapping specs for an existing project](#bootstrapping-specs-for-an-existing-project) below.
+
+---
+
+## Bootstrapping specs for an existing project {#bootstrapping-specs-for-an-existing-project}
+
+When a codebase has no canonical specs at all AND the operator does NOT already have a list of "the 8 capabilities here are X, Y, Z…" memorized, the recommended workflow is the **survey → review → `send it` batch** loop. This sits one layer above the single-capability [`brownfield`](#onboarding-existing-projects) verb: instead of asking the operator to identify each capability by name in turn, the daemon proposes a list AND lets the operator decide what to batch-generate.
+
+**When to use this vs single-capability `brownfield`.**
+
+- Use **`brownfield-survey` + `send it`** for whole-project bootstrap — the codebase is new to you, you want a curated list of plausible capability boundaries, AND batch generation is more efficient than typing one `@<bot> brownfield` per capability.
+- Use **`brownfield`** (per `a23`) for the targeted "this one capability needs a spec" case — you already know the slug, the rest of the codebase is either specced OR irrelevant.
+
+The two flows interoperate: a `brownfield-survey` excludes already-specced capabilities AND the batch handler skips an item whose `openspec/specs/<slug>/spec.md` appears mid-batch (e.g., because the operator merged a sibling `brownfield` PR in parallel).
+
+**The loop.**
+
+1. **Survey.** `@<bot> brownfield-survey <repo> [optional guidance]` queues a survey run. The polling iteration invokes the agent CLI under a read-only sandbox (Read, Glob, Grep, Bash read-only) with the embedded `prompts/brownfield-survey.md` system prompt. The handler validates the executor's JSON response, persists `<workspace>/.state/brownfield_surveys/<request_id>.json`, AND posts the rendered capability list to the lifecycle thread. The list is capped at `features.brownfield_survey.max_capabilities` (default 20; valid range `1..=50`).
+2. **Review.** Read the list. Each item names a proposed slug, a complexity heuristic (`small` | `medium` | `large`), a one-line summary, scope-in / scope-out paragraphs, AND the source-tree paths the capability covers. The survey's tone is "candidates for consideration," not ranked recommendations.
+3. **Refine, if needed.** If the list looks off — too broad, too narrow, miscategorized boundaries — re-run `@<bot> brownfield-survey <repo> <refined guidance>` with focus text (e.g., `focus on the data layer; skip CLI commands which are well-understood`). The fresh survey supersedes the prior one. Repeat until the list is acceptable.
+4. **Batch.** Reply inside the survey thread with `@<bot> send it`. The bot transitions the survey to `InProgress` AND replies `✓ Queued <N> capability spec generations. The first will start on the next iteration.` Subsequent polling iterations drain **one item per iteration**, each invoking the canonical [single-capability brownfield flow](#onboarding-existing-projects) for that slug. The item's `scope_in`, `scope_out`, AND `source_modules` are appended to the brownfield prompt so the LLM scopes its draft accordingly.
+5. **Per-item progress.** The lifecycle thread receives one status reply per item: `✅ Spec PR opened for \`<slug>\` (M/N done): <pr-url>` on success; `⏭ Skipped \`<slug>\` (M/N done): spec already exists.` when the spec file appears mid-batch (e.g., the operator merged a sibling `brownfield` PR); `✗ Spec for \`<slug>\` failed (M/N done): <reason> (continuing with next)` on per-item failure. A per-item failure does NOT abort the batch — the next iteration moves to the next item.
+6. **Completion.** When every item reaches a terminal state, the bot posts `✅ Brownfield batch complete. <X> succeeded, <Y> skipped (already specced), <Z> failed.` The survey state's `status` flips to `Completed` AND the state file remains on disk for audit (operators can prune with `@<bot> clear-survey <repo>`).
+
+**Why one item per iteration?** Each brownfield run gets its own fresh executor invocation. A whole-project batch run as a single executor pass would hit context compression mid-batch — once the model crosses the compression threshold, later capabilities receive less attention than earlier ones AND the resulting specs degrade. Spreading the work across iterations is the deliberate mechanism for keeping every capability's draft as fresh as the first.
+
+**Worked-example operator transcript.**
+
+```
+operator: @<bot> brownfield-survey myrepo focus on the storage and scheduling layers
+<bot>:    ✓ Queued brownfield-survey for git@github.com:acme/myrepo.git.
+          The next polling iteration will run it (~Nm). Follow along in this thread.
+
+(One iteration later, in the thread:)
+<bot>:    📋 Surveyed capabilities for git@github.com:acme/myrepo.git:
+
+          1. `scheduler` — medium — Cron-style job scheduling
+             Scope-in:  …
+             Scope-out: …
+             Source:    src/scheduler/, src/cron/
+
+          2. `storage-engine` — large — Pluggable backend for durable state
+             Scope-in:  …
+             Scope-out: …
+             Source:    src/storage/
+
+          3. `migrations` — small — Schema migration runner
+             …
+
+          Reply with @<bot> send it to batch-generate ALL 6 specs (one per iteration).
+          Or re-run @<bot> brownfield-survey <repo> <refined guidance> to refresh.
+
+operator: (in the thread) @<bot> send it
+<bot>:    ✓ Queued 6 capability spec generations. The first will start on the next iteration.
+
+(Six iterations later:)
+<bot>:    ✅ Spec PR opened for `scheduler` (1/6 done): https://github.com/acme/myrepo/pull/42
+<bot>:    ✅ Spec PR opened for `storage-engine` (2/6 done): https://github.com/acme/myrepo/pull/43
+<bot>:    ⏭ Skipped `migrations` (3/6 done): spec already exists.
+…
+<bot>:    ✅ Brownfield batch complete. 4 succeeded, 1 skipped (already specced), 1 failed.
+          See the survey thread for individual PR links AND failure reasons.
+```
+
+**Revision loop.** Each spec PR is a normal autocoder-opened PR participating in the standard `@<bot> revise <text>` flow (see [Revising an open PR via comment](#revising-an-open-pr-via-comment)). Revising mid-batch is safe — the revise handler operates per-PR AND does not interact with the in-progress survey state.
+
+**Configuration.** The survey is enabled by default. Toggles, limits, AND prompt override live under `features.brownfield_survey` — see [CONFIG.md → `features.brownfield_survey`](CONFIG.md#featuresbrownfield_survey).
+
+**Operator recovery.** `@<bot> clear-survey <repo>` wipes every `BrownfieldSurveyState` file for the matched repo. Use it to abort an in-progress batch (the next iteration's drain finds no in-progress survey AND becomes a no-op), free the workspace's "one-batch-at-a-time" slot, OR force the next survey to start from a clean slate. See [CHATOPS.md → `clear-survey`](CHATOPS.md#clear-survey).
+
 ---
 
 ## Finding things to work on {#finding-things-to-work-on}

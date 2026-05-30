@@ -6,4 +6,5 @@
 //! of chatops flows grows.
 
 pub mod brownfield_request;
+pub mod brownfield_survey;
 pub mod scout_run;
