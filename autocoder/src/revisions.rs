@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::chatops::ChatOpsBackend;
+use crate::code_reviewer::CodeReviewer;
 use crate::config::{GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome};
 use crate::github;
@@ -44,6 +45,39 @@ pub struct RevisionState {
     pub revision_cap: u32,
     #[serde(default)]
     pub cap_decline_posted: bool,
+    /// Operator-initiated re-reviews triggered via `@<bot> code-review`.
+    /// Does NOT count the original automatic review at PR-open time.
+    #[serde(default)]
+    pub code_reviews_applied: u32,
+    /// Per-PR upper bound on operator-initiated re-reviews. Populated
+    /// from `reviewer.max_code_reviews_per_pr` at state-file write time.
+    /// Defaults to `5` (the documented config default) when missing from
+    /// a legacy state file.
+    #[serde(default = "default_code_review_cap")]
+    pub code_review_cap: u32,
+    /// Set `true` after the one-time cap-decline PR comment AND chatops
+    /// notification are posted on cap exceeded for re-reviews.
+    #[serde(default)]
+    pub cap_decline_posted_for_code_review: bool,
+    /// Records the `revisions_applied` count at which the most recent
+    /// re-review suggestion fired. Used to deduplicate the suggestion
+    /// across polling cycles on the same revision count.
+    #[serde(default)]
+    pub last_suggested_rereview_at_revisions_count: Option<u32>,
+    /// Records the agent-branch head SHA at the time the original
+    /// automatic review completed. Used as the baseline for the
+    /// diff-overlap suggestion. State files written before this change
+    /// deployed have this field as `None`; the suggestion path
+    /// gracefully degrades to "no suggestion" in that case.
+    #[serde(default)]
+    pub original_review_head_sha: Option<String>,
+}
+
+/// Default per-PR cap on operator-initiated re-reviews, used by serde when
+/// a legacy state file is missing the field. Mirrors
+/// [`crate::config::default_max_code_reviews_per_pr`]'s value.
+fn default_code_review_cap() -> u32 {
+    5
 }
 
 /// Bundle of context passed to the executor when it runs in revision mode.
@@ -246,6 +280,36 @@ pub fn parse_revision_trigger(comment_body: &str, bot_username: &str) -> Option<
     Some(revision_text.to_string())
 }
 
+/// Parse a PR comment body for the `@<bot> code-review` trigger pattern
+/// (a33). Returns `true` when the body's first non-whitespace,
+/// non-HTML-comment line begins with `@<bot_username>` (case-insensitive on
+/// the mention) followed by `code-review` (case-insensitive). The verb
+/// takes no arguments in v1; any trailing text on the same line is
+/// ignored. The hyphenated form is canonical — a space-separated
+/// `@<bot> code review` does NOT match.
+pub fn parse_code_review_trigger(body: &str, bot_username: &str) -> bool {
+    let body = strip_leading_html_comment_lines(body);
+    let trimmed = body.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let expected_mention = format!("@{bot_username}");
+    let mention_end = trimmed
+        .find(char::is_whitespace)
+        .unwrap_or(trimmed.len());
+    let mention = &trimmed[..mention_end];
+    if !mention.eq_ignore_ascii_case(&expected_mention) {
+        return false;
+    }
+    let rest = trimmed[mention_end..].trim_start();
+    if rest.is_empty() {
+        return false;
+    }
+    let verb_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let verb = &rest[..verb_end];
+    verb.eq_ignore_ascii_case("code-review")
+}
+
 /// Strip leading whole-line HTML comments (e.g. `<!-- reviewer-revision -->`)
 /// from `body`, returning the remainder. A line counts as "HTML comment
 /// only" when its trimmed contents start with `<!--` and end with `-->`.
@@ -330,10 +394,12 @@ pub struct ChatOpsCtx<'a> {
 /// clamped at config load); it is stamped into freshly-initialized
 /// per-PR state files. PRs whose state file pre-dates a config change
 /// continue to use the cap stored in their state file.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_revision_requests(
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
+    reviewer: Option<&CodeReviewer>,
     executor: &dyn Executor,
     chatops_ctx: Option<ChatOpsCtx<'_>>,
     revision_cap: u32,
@@ -343,6 +409,7 @@ pub async fn process_revision_requests(
         workspace,
         repo,
         github_cfg,
+        reviewer,
         executor,
         chatops_ctx,
         revision_cap,
@@ -360,6 +427,7 @@ pub async fn process_revision_requests_at(
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
+    reviewer: Option<&CodeReviewer>,
     executor: &dyn Executor,
     chatops_ctx: Option<ChatOpsCtx<'_>>,
     revision_cap: u32,
@@ -420,6 +488,7 @@ pub async fn process_revision_requests_at(
             &repo_name,
             &token,
             &bot_username,
+            reviewer,
             executor,
             chatops_ctx.as_ref(),
             revision_cap,
@@ -450,6 +519,7 @@ async fn process_one_pr(
     repo_name: &str,
     token: &str,
     bot_username: &str,
+    reviewer: Option<&CodeReviewer>,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsCtx<'_>>,
     revision_cap: u32,
@@ -457,11 +527,15 @@ async fn process_one_pr(
     api_base: &str,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let _ = reviewer; // wired through; consumed by the code-review branch (task 4)
     // Load or initialize per-PR state. The revision_cap stored in state
     // reflects the cap in effect when the PR was first observed; callers
     // that change `executor.max_revisions_per_pr` mid-PR live with the
     // older cap until the PR closes (matches the chatops-channel
     // hot-reload contract: changes apply to new work, not in-flight).
+    let code_review_cap_initial = reviewer
+        .map(|r| r.max_code_reviews_per_pr())
+        .unwrap_or_else(default_code_review_cap);
     let mut state = match read_state(workspace, pr.number)? {
         Some(s) => s,
         None => RevisionState {
@@ -471,6 +545,11 @@ async fn process_one_pr(
             revisions_applied: 0,
             revision_cap,
             cap_decline_posted: false,
+            code_reviews_applied: 0,
+            code_review_cap: code_review_cap_initial,
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
         },
     };
 
@@ -549,9 +628,167 @@ async fn process_one_pr(
             advance_seen(&mut latest_seen, comment.created_at);
             continue;
         }
+        // a33: try the code-review parser BEFORE the revise parser when the
+        // revise parser does not match. The two verbs are mutually
+        // exclusive on the leading-mention line; whichever fires first
+        // wins per the existing dispatcher's leading-mention semantic.
         let revision_text = match parse_revision_trigger(&comment.body, bot_username) {
             Some(t) => t,
             None => {
+                if parse_code_review_trigger(&comment.body, bot_username) {
+                    // Dispatch the code-review verb in this branch and
+                    // continue the comment loop.
+                    let comment_id_str = comment.id.to_string();
+                    let operator_login = comment.user_login().to_string();
+                    let change_list =
+                        extract_change_list_from_pr_body(pr.body.as_deref());
+                    // Cap check.
+                    if state.code_reviews_applied >= state.code_review_cap {
+                        advance_seen(&mut latest_seen, comment.created_at);
+                        if !state.cap_decline_posted_for_code_review {
+                            let pr_text = format!(
+                                "🛑 Code review cap reached ({} reruns). Further @{} code-review requests will be ignored. Close + re-open the PR or merge as-is.",
+                                state.code_review_cap, bot_username,
+                            );
+                            if let Err(e) = github::post_issue_comment(
+                                api_base, token, owner, repo_name, pr.number, &pr_text,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    url = %repo.url,
+                                    pr_number = pr.number,
+                                    "failed to post code-review cap-decline PR comment: {e:#}"
+                                );
+                            }
+                            if let Some(ctx) = chatops_ctx {
+                                let chat_text = format!(
+                                    "🛑 {}: PR #{} hit the code-review cap of {}. Further @{} code-review requests ignored.",
+                                    repo.url, pr.number, state.code_review_cap, bot_username,
+                                );
+                                if let Err(e) = ctx
+                                    .chatops
+                                    .post_notification(ctx.channel, &chat_text)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        url = %repo.url,
+                                        pr_number = pr.number,
+                                        "failed to post code-review cap-decline chatops notification: {e:#}"
+                                    );
+                                }
+                            }
+                            state.cap_decline_posted_for_code_review = true;
+                            write_state(workspace, &state)?;
+                        }
+                        continue;
+                    }
+                    // Lifecycle: triggered.
+                    crate::polling_loop::maybe_post_code_review_triggered_alert(
+                        chatops_ctx,
+                        repo,
+                        pr.number,
+                        &pr.url,
+                        &operator_login,
+                        &comment_id_str,
+                    )
+                    .await;
+                    let outcome = execute_code_review(
+                        workspace,
+                        repo,
+                        reviewer,
+                        pr,
+                        &change_list,
+                        &mut state,
+                        api_base,
+                        token,
+                        owner,
+                        repo_name,
+                    )
+                    .await;
+                    match outcome {
+                        Ok(CodeReviewOutcome::ReviewerDisabled) => {
+                            let body = "✗ Code review not available: reviewer is disabled in config".to_string();
+                            if let Err(e) = github::post_issue_comment(
+                                api_base, token, owner, repo_name, pr.number, &body,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    url = %repo.url,
+                                    pr_number = pr.number,
+                                    "failed to post reviewer-disabled PR comment: {e:#}"
+                                );
+                            }
+                            advance_seen(&mut latest_seen, comment.created_at);
+                            write_state(workspace, &state)?;
+                        }
+                        Ok(CodeReviewOutcome::CapExceeded) => {
+                            // Should have been caught above; defensive fallthrough.
+                            advance_seen(&mut latest_seen, comment.created_at);
+                            write_state(workspace, &state)?;
+                        }
+                        Ok(CodeReviewOutcome::Completed { verdict }) => {
+                            crate::polling_loop::maybe_post_code_review_complete_alert(
+                                chatops_ctx,
+                                repo,
+                                pr.number,
+                                &pr.url,
+                                verdict.label(),
+                                &comment_id_str,
+                            )
+                            .await;
+                            advance_seen(&mut latest_seen, comment.created_at);
+                            write_state(workspace, &state)?;
+                        }
+                        Ok(CodeReviewOutcome::Failed { reason }) => {
+                            crate::polling_loop::maybe_post_code_review_failed_alert(
+                                chatops_ctx,
+                                repo,
+                                pr.number,
+                                &pr.url,
+                                &reason,
+                                &comment_id_str,
+                            )
+                            .await;
+                            let body = format!(
+                                "✗ Code review failed: {reason}. The PR is unchanged. Reply with another `@{bot_username} code-review` to retry."
+                            );
+                            if let Err(e) = github::post_issue_comment(
+                                api_base, token, owner, repo_name, pr.number, &body,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    url = %repo.url,
+                                    pr_number = pr.number,
+                                    "failed to post re-review failed PR comment: {e:#}"
+                                );
+                            }
+                            advance_seen(&mut latest_seen, comment.created_at);
+                            write_state(workspace, &state)?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                url = %repo.url,
+                                pr_number = pr.number,
+                                "code-review execution errored: {e:#}"
+                            );
+                            crate::polling_loop::maybe_post_code_review_failed_alert(
+                                chatops_ctx,
+                                repo,
+                                pr.number,
+                                &pr.url,
+                                &format!("execution error: {e}"),
+                                &comment_id_str,
+                            )
+                            .await;
+                            advance_seen(&mut latest_seen, comment.created_at);
+                            write_state(workspace, &state)?;
+                        }
+                    }
+                    continue;
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 continue;
             }
@@ -755,6 +992,16 @@ async fn process_one_pr(
                         "failed to post success PR comment: {e:#}"
                     );
                 }
+                // a33 task 7.3: maybe-post the re-review suggestion.
+                maybe_post_rereview_suggestion(
+                    workspace,
+                    repo,
+                    reviewer,
+                    pr,
+                    &mut state,
+                    chatops_ctx,
+                )
+                .await;
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(workspace, &state)?;
             }
@@ -934,6 +1181,215 @@ fn apply_revision_commit(
     Ok(())
 }
 
+/// Outcome of `execute_code_review` (a33). Distinguishes the four
+/// dispatch terminals: reviewer disabled, per-PR cap exceeded, hard
+/// failure during reviewer invocation, OR successful completion with
+/// the resulting verdict.
+#[derive(Debug, Clone)]
+pub enum CodeReviewOutcome {
+    ReviewerDisabled,
+    CapExceeded,
+    Failed { reason: String },
+    Completed { verdict: crate::code_reviewer::Verdict },
+}
+
+/// Execute an operator-initiated code re-review (a33). Sibling to
+/// [`execute_revision`]. Fetches the PR's current state, invokes
+/// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
+/// reviewer's output as a fresh PR comment with the canonical
+/// `## Code Review (rerun N of M)` heading. On `Block` + the reviewer's
+/// `auto_revise_on_block` flag, also posts per-concern
+/// `<!-- reviewer-revision -->`-marked comments.
+#[allow(clippy::too_many_arguments)]
+async fn execute_code_review(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    reviewer: Option<&CodeReviewer>,
+    pr: &github::PrSummary,
+    change_list: &[String],
+    state: &mut RevisionState,
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo_name: &str,
+) -> Result<CodeReviewOutcome> {
+    // Reviewer-not-available short-circuit.
+    let Some(reviewer) = reviewer else {
+        return Ok(CodeReviewOutcome::ReviewerDisabled);
+    };
+    // Cap check.
+    if state.code_reviews_applied >= state.code_review_cap {
+        return Ok(CodeReviewOutcome::CapExceeded);
+    }
+    // Build the ReviewContext from the workspace's git state. The
+    // workspace is checked out at the agent branch; the diff + file
+    // contents reflect the CURRENT PR state. The change_list drives
+    // archived-change brief lookup; unfound briefs are best-effort.
+    let processed: Vec<String> = change_list.to_vec();
+    let ctx = match crate::polling_loop::build_review_context(workspace, repo, &processed) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(CodeReviewOutcome::Failed {
+                reason: format!("review context build failed: {e}"),
+            });
+        }
+    };
+    // Run the reviewer.
+    let result = match crate::code_reviewer::review_pr_at_state_with(reviewer, &ctx).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(CodeReviewOutcome::Failed {
+                reason: format!("reviewer invocation failed: {e}"),
+            });
+        }
+    };
+    // Compose + post the fresh PR comment with the canonical heading.
+    let n = state.code_reviews_applied.saturating_add(1);
+    let m = state.code_review_cap;
+    let body = format!(
+        "## Code Review (rerun {n} of {m})\n\nVERDICT: {verdict}\n\n{markdown}",
+        verdict = result.verdict.label(),
+        markdown = result.markdown,
+    );
+    if let Err(e) =
+        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body).await
+    {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr.number,
+            "failed to post re-review fresh PR comment: {e:#}"
+        );
+        return Ok(CodeReviewOutcome::Failed {
+            reason: format!("PR comment post failed: {e}"),
+        });
+    }
+    // On Block + auto_revise_on_block, post one
+    // `<!-- reviewer-revision -->`-marked PR comment per actionable concern.
+    if matches!(result.verdict, crate::code_reviewer::Verdict::Block)
+        && reviewer.auto_revise_on_block()
+    {
+        for concern in &result.concerns {
+            if !concern.should_request_revision {
+                continue;
+            }
+            let request = concern
+                .actionable_request
+                .as_deref()
+                .unwrap_or(concern.summary.as_str());
+            let comment_body = format!(
+                "{REVIEWER_REVISION_MARKER}\n@{bot_label} revise {request}",
+                bot_label = "<bot>", // dispatcher rewrites mention upstream
+            );
+            if let Err(e) = github::post_issue_comment(
+                api_base, token, owner, repo_name, pr.number, &comment_body,
+            )
+            .await
+            {
+                tracing::warn!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    "failed to post reviewer-revision PR comment: {e:#}"
+                );
+            }
+        }
+    }
+    // Increment the counter; caller writes the state file.
+    state.code_reviews_applied = state.code_reviews_applied.saturating_add(1);
+    Ok(CodeReviewOutcome::Completed {
+        verdict: result.verdict,
+    })
+}
+
+/// a33 task 7.3: maybe post the re-review suggestion notification after
+/// a successful revision iteration. Gated by:
+/// - `reviewer.suggest_rereview_threshold` is `Some`.
+/// - `state.original_review_head_sha` is `Some`.
+/// - `state.last_suggested_rereview_at_revisions_count != Some(state.revisions_applied)`.
+/// - `chatops_ctx.failure_alerts_enabled`.
+/// - The computed overlap >= threshold.
+///
+/// On post, updates `state.last_suggested_rereview_at_revisions_count`
+/// in place. The caller writes the state file as part of its existing
+/// flow.
+async fn maybe_post_rereview_suggestion(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    reviewer: Option<&CodeReviewer>,
+    pr: &github::PrSummary,
+    state: &mut RevisionState,
+    chatops_ctx: Option<&ChatOpsCtx<'_>>,
+) {
+    let Some(reviewer) = reviewer else { return };
+    let Some(threshold) = reviewer.suggest_rereview_threshold() else {
+        return;
+    };
+    let Some(baseline_sha) = state.original_review_head_sha.as_deref() else {
+        return;
+    };
+    if state.last_suggested_rereview_at_revisions_count
+        == Some(state.revisions_applied)
+    {
+        return;
+    }
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let current_head = match crate::git::rev_parse(workspace, &repo.agent_branch) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                pr_number = pr.number,
+                "re-review suggestion: agent-branch rev-parse failed: {e:#}"
+            );
+            return;
+        }
+    };
+    let inputs = crate::code_review_suggestion::OverlapInputs {
+        workspace,
+        base_sha: &repo.base_branch,
+        original_review_head_sha: baseline_sha,
+        current_agent_head_sha: &current_head,
+    };
+    let overlap = match crate::code_review_suggestion::compute_overlap(&inputs) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::debug!(
+                url = %repo.url,
+                pr_number = pr.number,
+                "re-review suggestion: original-diff baseline is empty; skipping"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                pr_number = pr.number,
+                "re-review suggestion: overlap computation failed: {e:#}"
+            );
+            return;
+        }
+    };
+    if overlap.ratio < threshold {
+        return;
+    }
+    let percent = crate::code_review_suggestion::percent_for_text(overlap.ratio);
+    let posted = crate::polling_loop::maybe_post_rereview_suggestion_alert(
+        Some(ctx),
+        repo,
+        pr.number,
+        &pr.url,
+        percent,
+        state.revisions_applied,
+    )
+    .await;
+    if posted {
+        state.last_suggested_rereview_at_revisions_count =
+            Some(state.revisions_applied);
+    }
+}
+
 /// Execute the revision via the executor. Captures the PR diff via
 /// `git diff <base>..<agent>` and bundles the context.
 #[allow(clippy::too_many_arguments)]
@@ -1003,6 +1459,11 @@ mod tests {
             revisions_applied: 1,
             revision_cap: 5,
             cap_decline_posted: false,
+            code_reviews_applied: 0,
+            code_review_cap: 5,
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
         }
     }
 
@@ -1025,9 +1486,61 @@ mod tests {
             revisions_applied: 3,
             revision_cap: 5,
             cap_decline_posted: true,
+            code_reviews_applied: 0,
+            code_review_cap: 5,
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
         };
         write_state(tmp.path(), &original).unwrap();
         let got = read_state(tmp.path(), 42).unwrap().expect("file exists");
+        assert_eq!(got, original);
+    }
+
+    /// Task 2.2: a state file JSON without ANY of the new fields loads
+    /// cleanly with documented defaults.
+    #[test]
+    fn legacy_state_file_loads_with_default_code_review_fields() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = serde_json::json!({
+            "pr_number": 7,
+            "agent_branch": "agent-q",
+            "last_seen_comment_at": "2026-05-25T10:00:00Z",
+            "revisions_applied": 2,
+            "revision_cap": 5,
+            "cap_decline_posted": false
+        });
+        let path = state_path(tmp.path(), 7);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let got = read_state(tmp.path(), 7).unwrap().expect("legacy file loads");
+        assert_eq!(got.code_reviews_applied, 0);
+        assert_eq!(got.code_review_cap, 5);
+        assert!(!got.cap_decline_posted_for_code_review);
+        assert!(got.last_suggested_rereview_at_revisions_count.is_none());
+        assert!(got.original_review_head_sha.is_none());
+    }
+
+    /// Task 2.3: a state file with the new fields populated round-trips
+    /// byte-for-byte through serialize + deserialize.
+    #[test]
+    fn populated_new_fields_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let original = RevisionState {
+            pr_number: 99,
+            agent_branch: "agent-q".to_string(),
+            last_seen_comment_at: ts("2026-05-25T10:00:00Z"),
+            revisions_applied: 3,
+            revision_cap: 5,
+            cap_decline_posted: false,
+            code_reviews_applied: 2,
+            code_review_cap: 5,
+            cap_decline_posted_for_code_review: true,
+            last_suggested_rereview_at_revisions_count: Some(3),
+            original_review_head_sha: Some("abc123def".to_string()),
+        };
+        write_state(tmp.path(), &original).unwrap();
+        let got = read_state(tmp.path(), 99).unwrap().expect("file exists");
         assert_eq!(got, original);
     }
 
@@ -1150,6 +1663,93 @@ mod tests {
             parse_revision_trigger("@MyBot revise foo", "mybot"),
             Some("foo".to_string())
         );
+    }
+
+    // ---------- a33: code-review verb parser ----------
+
+    /// Task 3.3: `@<bot> code-review` matches; `@<bot> code-review please`
+    /// matches (trailing text ignored); `@<bot> revise` does NOT match;
+    /// space-separated `@<bot> code review` does NOT match in v1.
+    #[test]
+    fn parse_code_review_trigger_bare_form_matches() {
+        assert!(parse_code_review_trigger("@bot code-review", "bot"));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_trailing_text_ignored() {
+        assert!(parse_code_review_trigger("@bot code-review please", "bot"));
+        assert!(parse_code_review_trigger(
+            "@bot code-review\n\nsome rationale below",
+            "bot"
+        ));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_case_insensitive_verb_and_mention() {
+        assert!(parse_code_review_trigger("@BOT CODE-REVIEW", "bot"));
+        assert!(parse_code_review_trigger("@MyBot Code-Review please", "mybot"));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_revise_verb_does_not_match() {
+        assert!(!parse_code_review_trigger("@bot revise foo", "bot"));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_space_separated_form_does_not_match() {
+        // v1 canonical form is hyphenated; the space-separated form
+        // parses as verb = `code` followed by argument `review`, which
+        // is not `code-review`.
+        assert!(!parse_code_review_trigger("@bot code review", "bot"));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_wrong_mention_does_not_match() {
+        assert!(!parse_code_review_trigger("@otherbot code-review", "bot"));
+    }
+
+    #[test]
+    fn parse_code_review_trigger_empty_does_not_match() {
+        assert!(!parse_code_review_trigger("", "bot"));
+        assert!(!parse_code_review_trigger("   ", "bot"));
+    }
+
+    /// Task 3.4: both verbs present in the same body — whichever parser
+    /// fires first wins. The dispatcher reads the comment top-to-bottom;
+    /// `parse_revision_trigger` against `@bot revise foo` returns Some
+    /// even when `code-review` appears later in the same body.
+    #[test]
+    fn parse_both_verbs_revision_first_matches_revision() {
+        let body = "@bot revise drop the error\n@bot code-review";
+        assert_eq!(
+            parse_revision_trigger(body, "bot"),
+            Some("drop the error\n@bot code-review".to_string())
+        );
+        // The code-review parser does NOT match because the first
+        // non-whitespace token is `revise`, not `code-review`.
+        assert!(!parse_code_review_trigger(body, "bot"));
+    }
+
+    /// Same set of verbs but `code-review` first AND the line ends
+    /// before the revise verb. Each parser inspects the leading
+    /// non-whitespace, non-HTML-comment line only — that's how the
+    /// dispatcher leading-mention semantic resolves the both-verbs case.
+    #[test]
+    fn parse_both_verbs_code_review_first_matches_code_review() {
+        let body = "@bot code-review\n@bot revise drop the error";
+        assert!(parse_code_review_trigger(body, "bot"));
+        // The revise parser does NOT match because the first verb is
+        // `code-review`, not `revise`.
+        assert!(parse_revision_trigger(body, "bot").is_none());
+    }
+
+    /// Leading HTML-comment lines are stripped before the parser runs,
+    /// mirroring `parse_revision_trigger`'s behavior. This is how the
+    /// reviewer-revision-marked comments get parsed.
+    #[test]
+    fn parse_code_review_trigger_strips_leading_html_comment() {
+        let body = "<!-- some-marker -->\n@bot code-review";
+        assert!(parse_code_review_trigger(body, "bot"));
     }
 
     // ---------- a20a5: agent-notes extraction ----------
@@ -1587,7 +2187,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -1659,7 +2259,7 @@ mod tests {
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -1724,7 +2324,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -1799,7 +2399,7 @@ mod tests {
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -1867,7 +2467,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -1942,6 +2542,11 @@ mod tests {
             revisions_applied: 5,
             revision_cap: 5,
             cap_decline_posted: false,
+            code_reviews_applied: 0,
+            code_review_cap: 5,
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
         };
         write_state(&ws, &pre_state).unwrap();
 
@@ -1956,7 +2561,7 @@ mod tests {
         };
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, Some(ctx), 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, Some(ctx), 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2005,7 +2610,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2088,7 +2693,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2176,6 +2781,11 @@ mod tests {
                 revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
+                code_reviews_applied: 0,
+                code_review_cap: 5,
+                cap_decline_posted_for_code_review: false,
+                last_suggested_rereview_at_revisions_count: None,
+                original_review_head_sha: None,
             },
         )
         .unwrap();
@@ -2185,7 +2795,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2240,6 +2850,11 @@ mod tests {
                 revisions_applied: 1,
                 revision_cap: 5,
                 cap_decline_posted: false,
+                code_reviews_applied: 0,
+                code_review_cap: 5,
+                cap_decline_posted_for_code_review: false,
+                last_suggested_rereview_at_revisions_count: None,
+                original_review_head_sha: None,
             },
         )
         .unwrap();
@@ -2249,7 +2864,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2314,6 +2929,11 @@ mod tests {
                 revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
+                code_reviews_applied: 0,
+                code_review_cap: 5,
+                cap_decline_posted_for_code_review: false,
+                last_suggested_rereview_at_revisions_count: None,
+                original_review_head_sha: None,
             },
         )
         .unwrap();
@@ -2324,7 +2944,7 @@ mod tests {
             StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
-            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2402,6 +3022,11 @@ mod tests {
                 revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
+                code_reviews_applied: 0,
+                code_review_cap: 5,
+                cap_decline_posted_for_code_review: false,
+                last_suggested_rereview_at_revisions_count: None,
+                original_review_head_sha: None,
             },
         )
         .unwrap();
@@ -2421,6 +3046,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             None,
             5,
@@ -2444,6 +3070,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             None,
             5,
@@ -2521,6 +3148,11 @@ mod tests {
                 revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
+                code_reviews_applied: 0,
+                code_review_cap: 5,
+                cap_decline_posted_for_code_review: false,
+                last_suggested_rereview_at_revisions_count: None,
+                original_review_head_sha: None,
             },
         )
         .unwrap();
@@ -2546,6 +3178,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             Some(ctx),
             5,
@@ -2579,6 +3212,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             Some(ctx2),
             5,
@@ -3067,6 +3701,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             Some(ctx),
             5,
@@ -3137,6 +3772,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             Some(ctx),
             5,
@@ -3194,6 +3830,7 @@ mod tests {
             &ws,
             &repo,
             &gh,
+            None,
             &executor,
             None,
             5,
@@ -3210,5 +3847,219 @@ mod tests {
         );
 
         token_env_clear(env_var);
+    }
+
+    // ---------- a33 task 6.5: code-review-lifecycle helper tests ----------
+
+    use crate::alert_state::CodeReviewNotificationKind;
+
+    /// Task 6.5: the triggered helper posts the canonical text AND
+    /// records the dedup timestamp on success.
+    #[tokio::test]
+    async fn code_review_triggered_posts_and_records_dedup() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            Some(&ctx),
+            &repo,
+            42,
+            "https://example.invalid/pr/42",
+            "operator-x",
+            "comment-1",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("🔍"),
+            "must start with 🔍 marker: {}",
+            notes[0]
+        );
+        assert!(notes[0].contains("code review triggered on PR #42"));
+        assert!(notes[0].contains("by @operator-x"));
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.code_review_notification_already_posted(
+            "comment-1",
+            CodeReviewNotificationKind::Triggered,
+        ));
+    }
+
+    /// Task 6.5: failure_alerts_enabled: false → no post, no dedup
+    /// record.
+    #[tokio::test]
+    async fn code_review_triggered_skipped_when_failure_alerts_off() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: false,
+        };
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            Some(&ctx),
+            &repo,
+            42,
+            "https://example.invalid/pr/42",
+            "op",
+            "comment-1",
+        )
+        .await;
+        assert!(chatops.notifications.lock().unwrap().is_empty());
+    }
+
+    /// Task 6.5: chatops_ctx: None → silent skip.
+    #[tokio::test]
+    async fn code_review_triggered_skipped_when_chatops_ctx_none() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            None, &repo, 42, "https://example.invalid/pr/42", "op", "comment-1",
+        )
+        .await;
+        // No alert-state mutation.
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.code_review_notifications.is_empty());
+    }
+
+    /// Task 6.5: dedup — a second call with the same `comment_id` does
+    /// NOT post a second notification.
+    #[tokio::test]
+    async fn code_review_triggered_deduplicates_per_comment_id() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            Some(&ctx), &repo, 42, "url", "op", "comment-1",
+        )
+        .await;
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            Some(&ctx), &repo, 42, "url", "op", "comment-1",
+        )
+        .await;
+        assert_eq!(chatops.notifications.lock().unwrap().len(), 1);
+    }
+
+    /// Task 6.5: complete helper posts the canonical text including the
+    /// verdict.
+    #[tokio::test]
+    async fn code_review_complete_posts_canonical_text_with_verdict() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        crate::polling_loop::maybe_post_code_review_complete_alert(
+            Some(&ctx), &repo, 42, "url", "Approve", "comment-1",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("✓"));
+        assert!(notes[0].contains("code review complete on PR #42"));
+        assert!(notes[0].contains("verdict: Approve"));
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.code_review_notification_already_posted(
+            "comment-1",
+            CodeReviewNotificationKind::Complete,
+        ));
+    }
+
+    /// Task 6.5: failed helper posts the canonical text including the
+    /// reason.
+    #[tokio::test]
+    async fn code_review_failed_posts_canonical_text_with_reason() {
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+            failure_alerts_enabled: true,
+        };
+        crate::polling_loop::maybe_post_code_review_failed_alert(
+            Some(&ctx), &repo, 42, "url", "LLM returned 429", "comment-1",
+        )
+        .await;
+        let notes = chatops.notifications.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("✗"));
+        assert!(notes[0].contains("code review failed on PR #42"));
+        assert!(notes[0].contains("LLM returned 429"));
+        let state = AlertState::load_or_default(&ws);
+        assert!(state.code_review_notification_already_posted(
+            "comment-1",
+            CodeReviewNotificationKind::Failed,
+        ));
+    }
+
+    /// Task 6.5: per-repo routing — each helper uses the channel from
+    /// the supplied `ChatOpsCtx` (the per-repo override is resolved by
+    /// the caller before invoking the helper). This test just confirms
+    /// the channel argument is honored.
+    #[tokio::test]
+    async fn code_review_helpers_use_supplied_channel() {
+        use crate::chatops::ChatOpsBackend;
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        // Channel-capturing stub.
+        struct CapturingChatOps {
+            calls: Mutex<Vec<(String, String)>>,
+        }
+        #[async_trait]
+        impl ChatOpsBackend for CapturingChatOps {
+            fn provider_name(&self) -> &'static str { "cap" }
+            fn is_experimental(&self) -> bool { true }
+            async fn post_question(
+                &self, _: &str, _: &str, _: &str,
+            ) -> Result<String> { unreachable!() }
+            async fn poll_thread_for_human_reply(
+                &self, _: &str, _: &str,
+            ) -> Result<Option<crate::chatops::HumanReply>> { Ok(None) }
+            async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+                self.calls.lock().unwrap().push((channel.to_string(), text.to_string()));
+                Ok(())
+            }
+            async fn post_notification_with_thread(
+                &self, channel: &str, top: &str, _: &str,
+            ) -> Result<Option<String>> {
+                self.calls.lock().unwrap().push((channel.to_string(), top.to_string()));
+                Ok(None)
+            }
+        }
+        let stub = std::sync::Arc::new(CapturingChatOps { calls: Mutex::new(Vec::new()) });
+        let ctx = ChatOpsCtx {
+            chatops: stub.as_ref(),
+            channel: "C-team-alpha",
+            failure_alerts_enabled: true,
+        };
+        crate::polling_loop::maybe_post_code_review_triggered_alert(
+            Some(&ctx), &repo, 9, "url", "op", "c-1",
+        )
+        .await;
+        let calls = stub.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "C-team-alpha");
     }
 }

@@ -417,6 +417,48 @@ pub fn diff_three_dot(workspace: &Path, base: &str, head: &str) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Sum of `additions + deletions` across all non-binary files in the
+/// numstat output of `git diff --numstat <from>..<to>` (a33). Binary
+/// files (which `--numstat` reports as `-\t-\t<path>`) contribute zero.
+/// Returns `0` for a no-diff range. Errors propagate (typically when
+/// `from` or `to` cannot be resolved by git — caller treats those as
+/// "cannot compute overlap" AND skips the suggestion).
+pub fn diff_numstat_total(workspace: &Path, from: &str, to: &str) -> Result<usize> {
+    let range = format!("{from}..{to}");
+    let output = run_git(
+        workspace,
+        "diff --numstat",
+        &["diff", "--numstat", &range],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(sum_numstat_lines(&raw))
+}
+
+/// Pure helper that takes the raw stdout of `git diff --numstat` AND
+/// sums `additions + deletions` across all rows, ignoring binary-file
+/// rows (rendered by git as `-` in either of the first two columns).
+/// Exposed for unit-testability without needing a real git invocation.
+pub(crate) fn sum_numstat_lines(raw: &str) -> usize {
+    let mut total: usize = 0;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut cols = trimmed.split('\t');
+        let Some(adds_s) = cols.next() else { continue };
+        let Some(dels_s) = cols.next() else { continue };
+        if adds_s == "-" || dels_s == "-" {
+            // Binary file: contributes zero (canonical semantic).
+            continue;
+        }
+        let Ok(adds) = adds_s.parse::<usize>() else { continue };
+        let Ok(dels) = dels_s.parse::<usize>() else { continue };
+        total = total.saturating_add(adds).saturating_add(dels);
+    }
+    total
+}
+
 /// Read the latest commit on `branch` and return a `CommitSummary` (short
 /// SHA, subject, age). Returns `Ok(None)` when the branch does not exist
 /// (e.g. fresh clone, agent branch not yet created) — git emits
@@ -627,6 +669,30 @@ mod tests {
             sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "expected lowercase hex, got {sha:?}"
         );
+    }
+
+    #[test]
+    fn sum_numstat_lines_zero_for_empty() {
+        assert_eq!(sum_numstat_lines(""), 0);
+    }
+
+    #[test]
+    fn sum_numstat_lines_adds_text_files() {
+        let raw = "5\t2\tsrc/a.rs\n10\t3\tsrc/b.rs\n";
+        assert_eq!(sum_numstat_lines(raw), 5 + 2 + 10 + 3);
+    }
+
+    #[test]
+    fn sum_numstat_lines_ignores_binary_files() {
+        // git --numstat reports binary files as `-\t-\t<path>`.
+        let raw = "5\t2\tsrc/a.rs\n-\t-\tassets/img.png\n3\t1\tsrc/b.rs\n";
+        assert_eq!(sum_numstat_lines(raw), 5 + 2 + 3 + 1);
+    }
+
+    #[test]
+    fn sum_numstat_lines_skips_garbage_rows() {
+        let raw = "not numbers\n5\t2\tok.rs\nfoo\tbar\tbad.rs\n";
+        assert_eq!(sum_numstat_lines(raw), 7);
     }
 
     #[test]

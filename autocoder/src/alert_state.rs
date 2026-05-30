@@ -102,6 +102,22 @@ pub struct AlertState {
     /// to avoid double-posting.
     #[serde(default)]
     pub revise_notifications: HashMap<String, ReviseNotificationEntry>,
+    /// Per-comment code-review-lifecycle notification deduplication map
+    /// (a33). Keyed by GitHub `comment_id` (the operator's
+    /// `@<bot> code-review` PR comment). Each entry tracks whether the
+    /// three lifecycle notifications (triggered, complete, failed) have
+    /// already been posted for that comment.
+    #[serde(default)]
+    pub code_review_notifications: HashMap<String, CodeReviewNotificationEntry>,
+    /// Per-PR re-review suggestion deduplication (a33). Keyed by the
+    /// per-PR identifier `<owner>/<repo>#<pr_number>` (or a fallback
+    /// such as the PR URL). Records the `revisions_applied` count at
+    /// which the most recent suggestion fired, mirroring the per-PR
+    /// state file's `last_suggested_rereview_at_revisions_count` field.
+    /// The dedup field lives ALSO in the PR state file; this map is a
+    /// best-effort secondary store that survives state-file pruning.
+    #[serde(default)]
+    pub rereview_suggestion_dedup: HashMap<String, u32>,
 }
 
 /// Per-comment record of which revise-lifecycle notifications have
@@ -125,6 +141,28 @@ pub struct ReviseNotificationEntry {
 pub enum ReviseNotificationKind {
     PickedUp,
     Succeeded,
+    Failed,
+}
+
+/// Per-comment record of which code-review-lifecycle notifications have
+/// already been posted (a33). Lives inside
+/// [`AlertState::code_review_notifications`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeReviewNotificationEntry {
+    #[serde(default)]
+    pub posted_triggered_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub posted_complete_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub posted_failed_at: Option<DateTime<Utc>>,
+}
+
+/// Discriminant for the three points in the code-review lifecycle at
+/// which the daemon posts a chatops notification (a33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeReviewNotificationKind {
+    Triggered,
+    Complete,
     Failed,
 }
 
@@ -232,6 +270,42 @@ impl AlertState {
             ReviseNotificationKind::PickedUp => entry.posted_picked_up_at.is_some(),
             ReviseNotificationKind::Succeeded => entry.posted_succeeded_at.is_some(),
             ReviseNotificationKind::Failed => entry.posted_failed_at.is_some(),
+        }
+    }
+
+    /// Insert-or-update the timestamp field on the per-comment
+    /// `code_review_notifications` entry that matches `kind` (a33).
+    pub fn record_code_review_notification(
+        &mut self,
+        comment_id: &str,
+        kind: CodeReviewNotificationKind,
+        when: DateTime<Utc>,
+    ) {
+        let entry = self
+            .code_review_notifications
+            .entry(comment_id.to_string())
+            .or_default();
+        match kind {
+            CodeReviewNotificationKind::Triggered => entry.posted_triggered_at = Some(when),
+            CodeReviewNotificationKind::Complete => entry.posted_complete_at = Some(when),
+            CodeReviewNotificationKind::Failed => entry.posted_failed_at = Some(when),
+        }
+    }
+
+    /// `true` when the per-comment entry for `comment_id` already
+    /// records a timestamp for `kind` (a33).
+    pub fn code_review_notification_already_posted(
+        &self,
+        comment_id: &str,
+        kind: CodeReviewNotificationKind,
+    ) -> bool {
+        let Some(entry) = self.code_review_notifications.get(comment_id) else {
+            return false;
+        };
+        match kind {
+            CodeReviewNotificationKind::Triggered => entry.posted_triggered_at.is_some(),
+            CodeReviewNotificationKind::Complete => entry.posted_complete_at.is_some(),
+            CodeReviewNotificationKind::Failed => entry.posted_failed_at.is_some(),
         }
     }
 

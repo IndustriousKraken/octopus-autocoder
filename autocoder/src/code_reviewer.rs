@@ -144,6 +144,8 @@ pub struct CodeReviewer {
     auto_revise_on_block: bool,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
+    max_code_reviews_per_pr: u32,
+    suggest_rereview_threshold: Option<f32>,
 }
 
 impl CodeReviewer {
@@ -154,7 +156,32 @@ impl CodeReviewer {
             auto_revise_on_block: false,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
+            suggest_rereview_threshold: None,
         }
+    }
+
+    /// Builder-style setter for the per-PR re-review cap.
+    pub fn with_max_code_reviews_per_pr(mut self, cap: u32) -> Self {
+        self.max_code_reviews_per_pr = cap;
+        self
+    }
+
+    /// Builder-style setter for the diff-overlap re-review suggestion threshold.
+    pub fn with_suggest_rereview_threshold(mut self, t: Option<f32>) -> Self {
+        self.suggest_rereview_threshold = t;
+        self
+    }
+
+    /// Per-PR cap on operator-initiated re-reviews (a33).
+    pub fn max_code_reviews_per_pr(&self) -> u32 {
+        self.max_code_reviews_per_pr
+    }
+
+    /// Optional diff-overlap threshold for the post-revision re-review
+    /// suggestion (a33). `None` disables the suggestion.
+    pub fn suggest_rereview_threshold(&self) -> Option<f32> {
+        self.suggest_rereview_threshold
     }
 
     /// Builder-style setter for the prompt-budget cap. Default is
@@ -221,7 +248,9 @@ impl CodeReviewer {
         Ok(Self::new(client, template)
             .with_auto_revise_on_block(cfg.auto_revise_on_block)
             .with_prompt_budget(cfg.prompt_budget_chars)
-            .with_mode(cfg.mode))
+            .with_mode(cfg.mode)
+            .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
+            .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
@@ -273,6 +302,113 @@ impl CodeReviewer {
         let raw = self.client.complete(&body).await?;
         Ok(parse_response(&raw))
     }
+}
+
+/// Operator-facing verdict for the re-review entry point (a33). The
+/// existing `ReviewVerdict::{Pass, Concerns}` both map to `Approve`;
+/// `Block` stays `Block`. The two-state surface matches the spec's
+/// `Verdict (Approve | Block)` contract for operator-initiated re-reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Approve,
+    Block,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Approve => "Approve",
+            Verdict::Block => "Block",
+        }
+    }
+}
+
+impl From<ReviewVerdict> for Verdict {
+    fn from(v: ReviewVerdict) -> Self {
+        match v {
+            ReviewVerdict::Block => Verdict::Block,
+            ReviewVerdict::Pass | ReviewVerdict::Concerns => Verdict::Approve,
+        }
+    }
+}
+
+/// Operator-facing per-concern record (a33). Mirrors [`ReviewConcern`] but
+/// kept as a separate type so the operator-trigger entry point's public
+/// surface does not bind to the LLM-output parsing struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConcernEntry {
+    pub summary: String,
+    pub actionable_request: Option<String>,
+    pub should_request_revision: bool,
+    pub change_slug: Option<String>,
+}
+
+impl From<&ReviewConcern> for ConcernEntry {
+    fn from(c: &ReviewConcern) -> Self {
+        Self {
+            summary: c.summary.clone(),
+            actionable_request: c.actionable_request.clone(),
+            should_request_revision: c.should_request_revision,
+            change_slug: c.change_slug.clone(),
+        }
+    }
+}
+
+/// Operator-facing review result (a33). Returned by
+/// [`review_pr_at_state`]. Carries the verdict, per-concern records, the
+/// rendered markdown body, AND the per-change sections (empty in
+/// bundled mode).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ReviewResult {
+    pub verdict: Verdict,
+    pub per_concern: Vec<ConcernEntry>,
+    pub raw_output: String,
+    pub markdown: String,
+    pub per_change_sections: Vec<PerChangeSection>,
+    pub concerns: Vec<ReviewConcern>,
+}
+
+/// Reusable reviewer entry point (a33 task 5). The polling-loop AND the
+/// operator-trigger dispatcher both invoke this function; the caller
+/// decides what to do with the returned `ReviewResult` (write into PR
+/// body OR post as fresh PR comment).
+///
+/// The function:
+/// - Builds a [`CodeReviewer`] from `cfg`.
+/// - Dispatches via [`CodeReviewer::review`] (bundled mode).
+/// - Wraps the resulting report in a [`ReviewResult`].
+///
+/// Per-change mode requires the caller to pre-build per-change
+/// [`PerChangeContext`] objects AND invoke [`CodeReviewer::review_per_change`]
+/// directly. The single-`ReviewContext` entry point always dispatches
+/// `bundled`-style.
+#[allow(dead_code)]
+pub async fn review_pr_at_state(
+    cfg: &ReviewerConfig,
+    ctx: &ReviewContext,
+) -> Result<ReviewResult> {
+    let reviewer = CodeReviewer::from_config(cfg)?;
+    review_pr_at_state_with(&reviewer, ctx).await
+}
+
+/// Test-friendly variant: dispatches against a caller-supplied
+/// [`CodeReviewer`] so unit tests can stub the LLM client. The polling-
+/// loop AND operator-trigger callers use [`review_pr_at_state`] which
+/// builds the reviewer from config.
+pub async fn review_pr_at_state_with(
+    reviewer: &CodeReviewer,
+    ctx: &ReviewContext,
+) -> Result<ReviewResult> {
+    let report = reviewer.review(ctx).await?;
+    Ok(ReviewResult {
+        verdict: Verdict::from(report.verdict),
+        per_concern: report.concerns.iter().map(ConcernEntry::from).collect(),
+        raw_output: report.markdown.clone(),
+        markdown: report.markdown.clone(),
+        per_change_sections: report.per_change_sections.clone(),
+        concerns: report.concerns,
+    })
 }
 
 /// Emit a single INFO log line describing the rendered prompt's shape:
@@ -934,6 +1070,8 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
@@ -970,6 +1108,8 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("missing template must fall back to embedded default");
@@ -1011,6 +1151,8 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("nested override resolves");
@@ -1035,6 +1177,8 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise_on_block: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
@@ -1333,6 +1477,93 @@ this is not yaml: at all: ::: {{{ broken
             !captured[1].contains("## Skipped (budget exhausted)"),
             "change B's review must NOT be affected by change A's truncation"
         );
+    }
+
+    /// Task 5.3: `review_pr_at_state_with` against a stub LLM returning
+    /// a canned `Pass` verdict produces `ReviewResult { verdict: Approve, ... }`.
+    #[tokio::test]
+    async fn review_pr_at_state_approves_on_pass_verdict() {
+        let (client, _) = stub_with_capture("VERDICT: Pass\n\nAll good.\n");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: "some diff".to_string(),
+        };
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("review succeeds");
+        assert_eq!(result.verdict, Verdict::Approve);
+        assert!(result.markdown.contains("All good."));
+    }
+
+    /// Task 5.3 cont'd: `Concerns` verdict ALSO maps to `Approve` on the
+    /// operator-facing surface.
+    #[tokio::test]
+    async fn review_pr_at_state_approves_on_concerns_verdict() {
+        let (client, _) = stub_with_capture("VERDICT: Concerns\n\nminor nits.\n");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: "some diff".to_string(),
+        };
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("review succeeds");
+        assert_eq!(result.verdict, Verdict::Approve);
+    }
+
+    /// Task 5.4: `Block` verdict surfaces as `Block` AND any concerns
+    /// from the trailing `revision-requests` block are preserved.
+    #[tokio::test]
+    async fn review_pr_at_state_blocks_on_block_verdict() {
+        let raw = "VERDICT: Block\n\nSerious issue.\n\n```revision-requests\n- summary: \"fix the broken thing\"\n  should_request_revision: true\n```\n";
+        let (client, _) = stub_with_capture(raw);
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: "some diff".to_string(),
+        };
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("review succeeds");
+        assert_eq!(result.verdict, Verdict::Block);
+        assert_eq!(result.per_concern.len(), 1);
+        assert!(result.per_concern[0].should_request_revision);
+        assert_eq!(result.per_concern[0].summary, "fix the broken thing");
+    }
+
+    /// Task 5.5: the extracted entry point's output (markdown body) is
+    /// byte-identical to what `CodeReviewer::review`'s `ReviewReport`
+    /// would have produced for the same inputs. Confirms the
+    /// extraction is refactor-only.
+    #[tokio::test]
+    async fn review_pr_at_state_byte_identical_to_review_report() {
+        let raw = "VERDICT: Pass\n\nNothing of note.\n";
+        let (client_a, _) = stub_with_capture(raw);
+        let reviewer_a = CodeReviewer::new(client_a, "{{diff}}".to_string());
+        let ctx_a = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: "abc".to_string(),
+        };
+        let report = reviewer_a.review(&ctx_a).await.unwrap();
+
+        let (client_b, _) = stub_with_capture(raw);
+        let reviewer_b = CodeReviewer::new(client_b, "{{diff}}".to_string());
+        let ctx_b = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: "abc".to_string(),
+        };
+        let result = review_pr_at_state_with(&reviewer_b, &ctx_b)
+            .await
+            .unwrap();
+        assert_eq!(result.markdown, report.markdown);
+        assert_eq!(result.concerns.len(), report.concerns.len());
+        assert_eq!(Verdict::from(report.verdict), result.verdict);
     }
 
     #[test]

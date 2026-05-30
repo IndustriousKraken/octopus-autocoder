@@ -892,6 +892,7 @@ pub async fn execute_one_pass(
             workspace,
             repo,
             github_cfg,
+            reviewer,
             executor,
             chatops_ctx_for_revisions,
             revision_cap,
@@ -1108,7 +1109,7 @@ async fn post_stuck_alert(
 /// unified diff. Reviewer enforces the 2M-char prompt budget when
 /// rendering; this builder is unconstrained — it gathers everything and
 /// lets the reviewer drop/include in priority order.
-fn build_review_context(
+pub(crate) fn build_review_context(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
@@ -3187,6 +3188,219 @@ pub(crate) async fn maybe_post_revise_failed_alert(
     }
 }
 
+/// Maximum number of chars on the "failed" body's `reason` segment
+/// before the helper switches to the threaded-notification path AND
+/// truncates per the canonical 35,000-char rule.
+const CODE_REVIEW_FAILED_REASON_THREAD_CAP: usize = 35_000;
+
+/// Post the chatops "Code review triggered" lifecycle notification (a33)
+/// (best-effort, deduplicated per-comment via the alert-state file's
+/// `code_review_notifications` map). Returns silently when the chatops
+/// backend is absent, `failure_alerts_enabled` is `false`, OR the
+/// notification was already posted for this comment.
+pub(crate) async fn maybe_post_code_review_triggered_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    operator_login: &str,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.code_review_notification_already_posted(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Triggered,
+    ) {
+        return;
+    }
+    let text = format!(
+        "🔍 `{repo_url}`: code review triggered on PR #{pr_number} by @{operator_login}\n{pr_url}",
+        repo_url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "code-review-triggered chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_code_review_notification(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Triggered,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist code-review-triggered notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops "Code review complete" lifecycle notification (a33).
+pub(crate) async fn maybe_post_code_review_complete_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    verdict_label: &str,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.code_review_notification_already_posted(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Complete,
+    ) {
+        return;
+    }
+    let text = format!(
+        "✓ `{repo_url}`: code review complete on PR #{pr_number} — verdict: {verdict_label}\n{pr_url}",
+        repo_url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "code-review-complete chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_code_review_notification(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Complete,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist code-review-complete notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops "Code review failed" lifecycle notification (a33).
+/// When `reason.len() > CODE_REVIEW_FAILED_REASON_THREAD_CAP`, switches
+/// to the threaded-notification path AND truncates per the canonical
+/// 35,000-char rule.
+pub(crate) async fn maybe_post_code_review_failed_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    reason: &str,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.code_review_notification_already_posted(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Failed,
+    ) {
+        return;
+    }
+    let reason_chars = reason.chars().count();
+    let post_result = if reason_chars > CODE_REVIEW_FAILED_REASON_THREAD_CAP {
+        let top_line = format!(
+            "✗ `{repo_url}`: code review failed on PR #{pr_number} (full reason in thread)\n{pr_url}",
+            repo_url = repo.url,
+        );
+        let truncated: String = reason
+            .chars()
+            .take(CODE_REVIEW_FAILED_REASON_THREAD_CAP)
+            .collect();
+        let thread_body = format!(
+            "{truncated}\n\n… [truncated; full reason at journalctl -u autocoder | grep pr={pr_number}]"
+        );
+        ctx.chatops
+            .post_notification_with_thread(ctx.channel, &top_line, &thread_body)
+            .await
+            .map(|_| ())
+    } else {
+        let text = format!(
+            "✗ `{repo_url}`: code review failed on PR #{pr_number}: {reason}\n{pr_url}",
+            repo_url = repo.url,
+        );
+        ctx.chatops.post_notification(ctx.channel, &text).await
+    };
+    if let Err(e) = post_result {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "code-review-failed chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_code_review_notification(
+        comment_id,
+        crate::alert_state::CodeReviewNotificationKind::Failed,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist code-review-failed notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops re-review suggestion (a33). Fires after a revision
+/// iteration when the cumulative-since-original-review diff overlap
+/// exceeds the operator-configured threshold. Best-effort,
+/// `failure_alerts_enabled`-gated, AND deduplicated per-PR per
+/// `revisions_count` via the per-PR state file's
+/// `last_suggested_rereview_at_revisions_count` field (caller updates
+/// the field after a successful post).
+pub(crate) async fn maybe_post_rereview_suggestion_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    overlap_percent: u32,
+    revisions_count: u32,
+) -> bool {
+    let Some(ctx) = chatops_ctx else { return false };
+    if !ctx.failure_alerts_enabled {
+        return false;
+    }
+    let text = format!(
+        "💡 `{repo_url}`: PR #{pr_number} has been substantially revised (~{overlap_percent}% of original diff changed across {revisions_count} revisions). Consider `@<bot> code-review` to re-evaluate.\n{pr_url}",
+        repo_url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            "re-review suggestion chatops notification post failed: {e:#}"
+        );
+        return false;
+    }
+    true
+}
+
 /// Log a mid-iteration recovery failure with its classification (transient
 /// vs. permanent). Transient → WARN (network blips are noisy but
 /// self-recovering); Permanent → ERROR (operator must inspect). The
@@ -4506,6 +4720,48 @@ async fn open_pull_request(
         pr_number = pr.number,
         "opened PR"
     );
+
+    // a33 task 7.2: record the agent-branch head SHA at the time the
+    // original automatic review completed, so the diff-overlap suggestion
+    // path has a baseline. Best-effort — failures here do NOT abort PR
+    // opening. Only fires when a review_report is present (i.e. a
+    // reviewer ran on this iteration).
+    if review_report.is_some()
+        && let Ok(head_sha) = git::rev_parse(workspace, &repo.agent_branch)
+    {
+        {
+            let now = chrono::Utc::now();
+            let existing = crate::revisions::read_state(workspace, pr.number)
+                .ok()
+                .flatten();
+            let state = match existing {
+                Some(mut s) => {
+                    s.original_review_head_sha = Some(head_sha);
+                    s
+                }
+                None => crate::revisions::RevisionState {
+                    pr_number: pr.number,
+                    agent_branch: repo.agent_branch.clone(),
+                    last_seen_comment_at: now,
+                    revisions_applied: 0,
+                    revision_cap: 5,
+                    cap_decline_posted: false,
+                    code_reviews_applied: 0,
+                    code_review_cap: 5,
+                    cap_decline_posted_for_code_review: false,
+                    last_suggested_rereview_at_revisions_count: None,
+                    original_review_head_sha: Some(head_sha),
+                },
+            };
+            if let Err(e) = crate::revisions::write_state(workspace, &state) {
+                tracing::warn!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    "failed to persist original_review_head_sha: {e:#}"
+                );
+            }
+        }
+    }
 
     // Best-effort: post a one-line ChatOps notification with a link to
     // the new PR. PR creation already succeeded; never propagate a

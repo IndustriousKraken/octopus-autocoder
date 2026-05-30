@@ -1124,10 +1124,54 @@ pub struct ReviewerConfig {
     /// `## Code Review: <slug>` section per change in the PR body.
     #[serde(default)]
     pub mode: ReviewerMode,
+    /// Per-PR cap on operator-initiated re-reviews triggered via the
+    /// `@<bot> code-review` PR-comment verb. Default `5`. Independent of
+    /// `executor.max_revisions_per_pr`. Values above
+    /// `MAX_CODE_REVIEWS_PER_PR_CEILING` are clamped down at startup with a
+    /// WARN. The original automatic review at PR-open time does NOT count
+    /// against this cap.
+    #[serde(default = "default_max_code_reviews_per_pr")]
+    pub max_code_reviews_per_pr: u32,
+    /// Optional diff-overlap threshold for the daemon to suggest an
+    /// operator-initiated re-review after a revision iteration. `None`
+    /// disables the suggestion entirely (default). When `Some(threshold)`,
+    /// the value MUST satisfy `0.0..=1.0`; out-of-range values fail
+    /// config-load. After each operator-initiated revision iteration's
+    /// Completed outcome, the daemon computes the cumulative-since-original-
+    /// review diff overlap; when overlap >= threshold AND the suggestion
+    /// has not already fired for the current `revisions_applied` count,
+    /// a chatops notification recommending `@<bot> code-review` is posted.
+    #[serde(default)]
+    pub suggest_rereview_threshold: Option<f32>,
 }
 
 fn default_prompt_budget_chars() -> usize {
     2_000_000
+}
+
+/// Default per-PR cap on operator-initiated re-reviews.
+pub fn default_max_code_reviews_per_pr() -> u32 {
+    5
+}
+
+/// Upper bound on `reviewer.max_code_reviews_per_pr`. Anything above this
+/// is clamped down at startup with a WARN log so the operator notices.
+pub const MAX_CODE_REVIEWS_PER_PR_CEILING: u32 = 20;
+
+/// Clamp the configured per-PR code-review cap. Mirrors
+/// `clamp_log_retention_days`'s shape so callers can observe whether a
+/// WARN was issued without scraping the tracing log.
+pub fn clamp_max_code_reviews_per_pr(requested: u32) -> (u32, Option<String>) {
+    if requested > MAX_CODE_REVIEWS_PER_PR_CEILING {
+        let msg = format!(
+            "reviewer.max_code_reviews_per_pr ({requested}) is above the ceiling of \
+             {MAX_CODE_REVIEWS_PER_PR_CEILING}; clamping to {MAX_CODE_REVIEWS_PER_PR_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (MAX_CODE_REVIEWS_PER_PR_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1802,6 +1846,17 @@ impl Config {
         if let Some(rag) = cfg.canonical_rag.as_mut() {
             let (top_k, _) = clamp_rag_top_k(rag.top_k);
             rag.top_k = top_k;
+        }
+        if let Some(rev) = cfg.reviewer.as_mut() {
+            let (clamped, _) = clamp_max_code_reviews_per_pr(rev.max_code_reviews_per_pr);
+            rev.max_code_reviews_per_pr = clamped;
+            if let Some(t) = rev.suggest_rereview_threshold
+                && !(0.0..=1.0).contains(&t)
+            {
+                return Err(anyhow!(
+                    "reviewer.suggest_rereview_threshold ({t}) is out of range; valid range is 0.0..=1.0"
+                ));
+            }
         }
         // OSS-fork support (a26): validate spec_storage AND upstream
         // blocks. Fail-fast at config-load so the daemon never spins
@@ -2690,6 +2745,8 @@ github:
             "auto_revise_on_block",
             "prompt_budget_chars",
             "mode",
+            "max_code_reviews_per_pr",
+            "suggest_rereview_threshold",
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
@@ -4391,6 +4448,97 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.executor.max_revisions_per_pr, 50);
         assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
+    }
+
+    /// Task 1.4: a reviewer block with no `max_code_reviews_per_pr` /
+    /// `suggest_rereview_threshold` keys defaults the former to `5` and
+    /// the latter to `None`.
+    #[test]
+    fn reviewer_code_review_extension_fields_default_round_trip() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let r = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.max_code_reviews_per_pr, 5);
+        assert!(r.suggest_rereview_threshold.is_none());
+    }
+
+    /// Task 1.5: a `suggest_rereview_threshold` outside `0.0..=1.0`
+    /// fails config-load with a message naming the field AND the valid
+    /// range.
+    #[test]
+    fn reviewer_suggest_rereview_threshold_out_of_range_rejected() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  suggest_rereview_threshold: 1.5
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("out-of-range threshold must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reviewer.suggest_rereview_threshold")
+                && msg.contains("0.0..=1.0"),
+            "error must name field AND range; got: {msg}"
+        );
+    }
+
+    /// Above-ceiling `reviewer.max_code_reviews_per_pr` clamps down at
+    /// startup with the WARN message documented in
+    /// `clamp_max_code_reviews_per_pr`. The raw stored value reflects the
+    /// CLAMPED value (matches `executor.max_revisions_per_pr`'s pattern
+    /// where the field is rewritten in place by `Config::load_from`).
+    #[test]
+    fn reviewer_max_code_reviews_per_pr_above_ceiling_is_clamped() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  max_code_reviews_per_pr: 50
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let r = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.max_code_reviews_per_pr, MAX_CODE_REVIEWS_PER_PR_CEILING);
+        let (clamped, warn) = clamp_max_code_reviews_per_pr(50);
+        assert_eq!(clamped, MAX_CODE_REVIEWS_PER_PR_CEILING);
+        assert!(warn.is_some());
     }
 
     #[test]

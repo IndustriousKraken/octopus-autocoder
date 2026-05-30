@@ -490,6 +490,11 @@ async fn process_one_changelog_pr_revision(
             revisions_applied: 0,
             revision_cap: u32::MAX,
             cap_decline_posted: false,
+            code_reviews_applied: 0,
+            code_review_cap: 5,
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
         },
     };
     let comments = github::list_issue_comments_since(
