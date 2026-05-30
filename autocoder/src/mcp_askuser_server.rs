@@ -49,7 +49,13 @@ pub const SERVER_NAME: &str = "ask_user";
 /// configurable surface). When adding a new MCP tool, add its name HERE
 /// in addition to the `tools/list` response; the auto-allow path picks
 /// it up on the next polling iteration.
-pub const PROVIDED_TOOL_NAMES: &[&str] = &["ask_user", "query_canonical_specs"];
+pub const PROVIDED_TOOL_NAMES: &[&str] = &[
+    "ask_user",
+    "query_canonical_specs",
+    "outcome_success",              // added by a27a0 (PR #73)
+    "outcome_spec_needs_revision",  // added by a27a0 (PR #73)
+    "outcome_request_iteration",    // added by a27a1 (PR #74)
+];
 
 /// Format a tool name as Claude CLI's `--allowedTools` expects:
 /// `mcp__<server>__<tool>`. Reused by the executor's argv builder.
@@ -839,6 +845,47 @@ mod tests {
         assert_eq!(resps[0]["id"], 1);
         assert_eq!(resps[0]["result"]["serverInfo"]["name"], "autocoder-mcp");
         assert!(resps[0]["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn provided_tool_names_matches_tools_list_response() {
+        // Regression: when a27a0/a27a1 added outcome_* tools to the
+        // tools/list response, PROVIDED_TOOL_NAMES wasn't updated, so the
+        // executor's auto-allow path didn't include them — every
+        // outcome-tool call hit Claude CLI's permission gate AND failed
+        // with `permission denied`. This caused a30-release-glibc-floor
+        // to perma-stuck across 3 iterations. This test fails the build
+        // if the two sources drift again.
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#],
+        );
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+        let advertised: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+
+        // Every advertised tool MUST be in PROVIDED_TOOL_NAMES so the
+        // executor's auto-allow path includes it in --allowedTools.
+        for name in &advertised {
+            assert!(
+                PROVIDED_TOOL_NAMES.contains(name),
+                "tool `{name}` advertised in tools/list but missing from PROVIDED_TOOL_NAMES — add it to the const so the executor auto-allows it"
+            );
+        }
+
+        // Every name in PROVIDED_TOOL_NAMES MUST actually exist in
+        // tools/list — listing a non-existent tool in --allowedTools is
+        // harmless but suggests stale const.
+        for name in PROVIDED_TOOL_NAMES {
+            assert!(
+                advertised.contains(name),
+                "PROVIDED_TOOL_NAMES contains `{name}` but it's not in tools/list — either remove it from the const OR add it to the tools/list response"
+            );
+        }
     }
 
     #[test]
