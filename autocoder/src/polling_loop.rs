@@ -886,6 +886,7 @@ pub async fn execute_one_pass(
         let chatops_ctx_for_revisions = chatops_ctx.map(|c| crate::revisions::ChatOpsCtx {
             chatops: c.chatops.as_ref(),
             channel: c.channel.as_str(),
+            failure_alerts_enabled: c.failure_alerts_enabled,
         });
         if let Err(e) = crate::revisions::process_revision_requests(
             workspace,
@@ -2954,6 +2955,235 @@ fn truncate_reason(reason: &str) -> String {
         let mut out: String = reason.chars().take(PERMA_STUCK_REASON_EXCERPT_MAX).collect();
         out.push('…');
         out
+    }
+}
+
+/// Per-canonical-spec character cap on a threaded notification body.
+/// Mirrors the audit-findings threading threshold; see
+/// `audits::AUDIT_THREAD_BODY_CHAR_CAP`.
+const REVISE_FAILED_REASON_THREAD_CAP: usize = 35_000;
+
+/// Render `duration` using the same human-format shape the chatops
+/// `status` reply uses for "started Nm ago" — delegates to
+/// `busy_marker::format_age_human` so the two stay in lockstep.
+fn format_revise_duration(duration: std::time::Duration) -> String {
+    busy_marker::format_age_human(duration.as_secs())
+}
+
+/// Compose the canonical `change_list_summary` segment for a
+/// revise-lifecycle notification: `` `<first_change>` +N more `` (the
+/// `+0 more` suffix is omitted; `+1 more` AND higher are included). The
+/// caller wraps the result in `(...)` when embedding.
+pub(crate) fn format_revise_change_list_summary(change_list: &[String]) -> String {
+    if change_list.is_empty() {
+        return "(unknown change)".to_string();
+    }
+    let first = &change_list[0];
+    let extras = change_list.len().saturating_sub(1);
+    if extras == 0 {
+        format!("`{first}`")
+    } else {
+        format!("`{first}` +{extras} more")
+    }
+}
+
+/// Truncate `operator_comment` to at most `max_chars` characters,
+/// appending `…` when truncated. Used by the picked-up dispatch site to
+/// fit the operator's revise text into the 80-char quote slot.
+pub(crate) fn truncate_operator_comment(operator_comment: &str, max_chars: usize) -> String {
+    let count = operator_comment.chars().count();
+    if count <= max_chars {
+        return operator_comment.to_string();
+    }
+    let mut out: String = operator_comment.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// Post the chatops "Revise picked up" lifecycle notification (best-
+/// effort, deduplicated per-comment via the alert-state file's
+/// `revise_notifications` map). Returns silently when the chatops
+/// backend is absent, `failure_alerts_enabled` is `false`, OR the
+/// notification was already posted for this comment. On post failure,
+/// the alert-state file is NOT updated so a subsequent iteration can
+/// retry.
+pub(crate) async fn maybe_post_revise_picked_up_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    change_list_summary: &str,
+    operator_comment_quote: &str,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.revise_notification_already_posted(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::PickedUp,
+    ) {
+        return;
+    }
+    let text = format!(
+        "🔧 `{repo_url}`: revising PR #{pr_number} ({change_list_summary}): \"{quote}\"\n{pr_url}",
+        repo_url = repo.url,
+        quote = operator_comment_quote,
+    );
+    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "revise-picked-up chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_revise_notification(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::PickedUp,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist revise-picked-up notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops "Revise succeeded" lifecycle notification (mirrors
+/// [`maybe_post_revise_picked_up_alert`] with the `Succeeded` kind).
+/// Posted after the executor returns `Completed` (or `IterationRequested`)
+/// AND the commit + force-push step succeeds.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maybe_post_revise_succeeded_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    change_list_summary: &str,
+    agent_branch: &str,
+    duration: std::time::Duration,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.revise_notification_already_posted(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::Succeeded,
+    ) {
+        return;
+    }
+    let text = format!(
+        "✓ `{repo_url}`: revision applied to PR #{pr_number} ({change_list_summary}) — force-pushed `{agent_branch}` (took {duration_human})\n{pr_url}",
+        repo_url = repo.url,
+        duration_human = format_revise_duration(duration),
+    );
+    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "revise-succeeded chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_revise_notification(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::Succeeded,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist revise-succeeded notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the chatops "Revise failed" lifecycle notification (mirrors
+/// [`maybe_post_revise_picked_up_alert`] with the `Failed` kind). When
+/// `reason.len() > REVISE_FAILED_REASON_THREAD_CAP`, the helper switches
+/// to the threaded-notification API AND truncates the body at 35,000
+/// characters with a pointer-to-daemon-log tail (per the existing
+/// canonical "Thread body truncates at 35,000 characters" requirement).
+pub(crate) async fn maybe_post_revise_failed_alert(
+    chatops_ctx: Option<&crate::revisions::ChatOpsCtx<'_>>,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    pr_url: &str,
+    reason: &str,
+    comment_id: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    if state.revise_notification_already_posted(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::Failed,
+    ) {
+        return;
+    }
+    let reason_chars = reason.chars().count();
+    let post_result = if reason_chars > REVISE_FAILED_REASON_THREAD_CAP {
+        let top_line = format!(
+            "✗ `{repo_url}`: revision failed on PR #{pr_number} (full reason in thread)\n{pr_url}",
+            repo_url = repo.url,
+        );
+        let truncated: String = reason
+            .chars()
+            .take(REVISE_FAILED_REASON_THREAD_CAP)
+            .collect();
+        let thread_body = format!(
+            "{truncated}\n\n… [truncated; full reason at journalctl -u autocoder | grep pr={pr_number}]"
+        );
+        ctx.chatops
+            .post_notification_with_thread(ctx.channel, &top_line, &thread_body)
+            .await
+            .map(|_| ())
+    } else {
+        let text = format!(
+            "✗ `{repo_url}`: revision failed on PR #{pr_number}: {reason}\n{pr_url}",
+            repo_url = repo.url,
+        );
+        ctx.chatops.post_notification(ctx.channel, &text).await
+    };
+    if let Err(e) = post_result {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "revise-failed chatops notification post failed: {e:#}"
+        );
+        return;
+    }
+    state.record_revise_notification(
+        comment_id,
+        crate::alert_state::ReviseNotificationKind::Failed,
+        Utc::now(),
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number = pr_number,
+            comment_id = %comment_id,
+            "failed to persist revise-failed notification state: {e:#}"
+        );
     }
 }
 

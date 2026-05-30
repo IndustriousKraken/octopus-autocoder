@@ -93,6 +93,39 @@ pub struct AlertState {
     /// lifecycle).
     #[serde(default)]
     pub spec_revision_alerts: HashMap<String, AlertEntry>,
+    /// Per-comment revise-lifecycle notification deduplication map.
+    /// Keyed by GitHub `comment_id` (the operator's `@<bot> revise
+    /// <text>` PR comment). Each entry tracks whether the three
+    /// lifecycle notifications (picked up, succeeded, failed) have
+    /// already been posted for that comment. A second pass on the same
+    /// comment (e.g. autocoder restarts mid-revision) consults this map
+    /// to avoid double-posting.
+    #[serde(default)]
+    pub revise_notifications: HashMap<String, ReviseNotificationEntry>,
+}
+
+/// Per-comment record of which revise-lifecycle notifications have
+/// already been posted. Lives inside [`AlertState::revise_notifications`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviseNotificationEntry {
+    #[serde(default)]
+    pub posted_picked_up_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub posted_succeeded_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub posted_failed_at: Option<DateTime<Utc>>,
+}
+
+/// Discriminant for the three points in the revise lifecycle at which
+/// the daemon posts a chatops notification. Passed to
+/// [`AlertState::record_revise_notification`] /
+/// [`AlertState::revise_notification_already_posted`] to select the
+/// matching field on [`ReviseNotificationEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviseNotificationKind {
+    PickedUp,
+    Succeeded,
+    Failed,
 }
 
 /// `true` when the production state-dir layout is active (i.e. the
@@ -160,6 +193,46 @@ impl AlertState {
         tmp.persist(&path)
             .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
         Ok(())
+    }
+
+    /// Insert-or-update the timestamp field on the per-comment
+    /// `revise_notifications` entry that matches `kind`. Used by the
+    /// three revise-lifecycle notification helpers AFTER a successful
+    /// post, before saving the alert-state file.
+    pub fn record_revise_notification(
+        &mut self,
+        comment_id: &str,
+        kind: ReviseNotificationKind,
+        when: DateTime<Utc>,
+    ) {
+        let entry = self
+            .revise_notifications
+            .entry(comment_id.to_string())
+            .or_default();
+        match kind {
+            ReviseNotificationKind::PickedUp => entry.posted_picked_up_at = Some(when),
+            ReviseNotificationKind::Succeeded => entry.posted_succeeded_at = Some(when),
+            ReviseNotificationKind::Failed => entry.posted_failed_at = Some(when),
+        }
+    }
+
+    /// `true` when the per-comment entry for `comment_id` already
+    /// records a timestamp for `kind` (the corresponding `Option` is
+    /// `Some(_)`). Returns `false` for a missing entry OR a present
+    /// entry whose matching field is `None`.
+    pub fn revise_notification_already_posted(
+        &self,
+        comment_id: &str,
+        kind: ReviseNotificationKind,
+    ) -> bool {
+        let Some(entry) = self.revise_notifications.get(comment_id) else {
+            return false;
+        };
+        match kind {
+            ReviseNotificationKind::PickedUp => entry.posted_picked_up_at.is_some(),
+            ReviseNotificationKind::Succeeded => entry.posted_succeeded_at.is_some(),
+            ReviseNotificationKind::Failed => entry.posted_failed_at.is_some(),
+        }
     }
 
     /// Idempotent removal of the alert-state file. A missing file is a
@@ -268,6 +341,108 @@ mod tests {
             "archive collision must serialize as snake_case `archive_collision`; got: {raw}"
         );
         assert_eq!(AlertCategory::ArchiveCollision.label(), "archive collision");
+    }
+
+    #[test]
+    fn revise_notifications_round_trip_through_save_and_load() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AlertState::default();
+        let now = Utc::now();
+        state.record_revise_notification(
+            "comment-42",
+            ReviseNotificationKind::PickedUp,
+            now,
+        );
+        state.record_revise_notification(
+            "comment-42",
+            ReviseNotificationKind::Succeeded,
+            now + chrono::Duration::minutes(3),
+        );
+        state.record_revise_notification(
+            "comment-43",
+            ReviseNotificationKind::Failed,
+            now,
+        );
+        state.save(dir.path()).unwrap();
+
+        let reloaded = AlertState::load_or_default(dir.path());
+        let e42 = reloaded
+            .revise_notifications
+            .get("comment-42")
+            .expect("comment-42 entry must round-trip");
+        assert!(e42.posted_picked_up_at.is_some());
+        assert!(e42.posted_succeeded_at.is_some());
+        assert!(e42.posted_failed_at.is_none());
+        let e43 = reloaded
+            .revise_notifications
+            .get("comment-43")
+            .expect("comment-43 entry must round-trip");
+        assert!(e43.posted_picked_up_at.is_none());
+        assert!(e43.posted_succeeded_at.is_none());
+        assert!(e43.posted_failed_at.is_some());
+
+        // Accessors observe the same fields after round-trip.
+        assert!(reloaded.revise_notification_already_posted(
+            "comment-42",
+            ReviseNotificationKind::PickedUp,
+        ));
+        assert!(reloaded.revise_notification_already_posted(
+            "comment-42",
+            ReviseNotificationKind::Succeeded,
+        ));
+        assert!(!reloaded.revise_notification_already_posted(
+            "comment-42",
+            ReviseNotificationKind::Failed,
+        ));
+        assert!(reloaded.revise_notification_already_posted(
+            "comment-43",
+            ReviseNotificationKind::Failed,
+        ));
+        assert!(!reloaded.revise_notification_already_posted(
+            "comment-missing",
+            ReviseNotificationKind::PickedUp,
+        ));
+    }
+
+    #[test]
+    fn revise_notifications_field_defaults_to_empty_when_absent_in_json() {
+        // Simulate an alert-state file written by an older daemon that
+        // doesn't know about `revise_notifications`. Loading must succeed
+        // with the field defaulting to an empty map.
+        let dir = TempDir::new().unwrap();
+        let legacy_json = serde_json::json!({
+            "alerts": {},
+            "perma_stuck_alerts": {},
+            "spec_revision_alerts": {}
+        });
+        let path = alert_state_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap())
+            .unwrap();
+
+        let state = AlertState::load_or_default(dir.path());
+        assert!(
+            state.revise_notifications.is_empty(),
+            "missing revise_notifications field must default to an empty map"
+        );
+        assert!(!state.revise_notification_already_posted(
+            "any-id",
+            ReviseNotificationKind::PickedUp,
+        ));
+    }
+
+    #[test]
+    fn record_revise_notification_updates_existing_entry_in_place() {
+        let mut state = AlertState::default();
+        let t1 = Utc::now();
+        let t2 = t1 + chrono::Duration::seconds(30);
+        state.record_revise_notification("c1", ReviseNotificationKind::PickedUp, t1);
+        state.record_revise_notification("c1", ReviseNotificationKind::Failed, t2);
+        let entry = state.revise_notifications.get("c1").unwrap();
+        assert_eq!(entry.posted_picked_up_at, Some(t1));
+        assert_eq!(entry.posted_failed_at, Some(t2));
+        assert_eq!(entry.posted_succeeded_at, None);
+        assert_eq!(state.revise_notifications.len(), 1);
     }
 
     #[test]
