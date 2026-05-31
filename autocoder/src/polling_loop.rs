@@ -256,7 +256,7 @@ pub async fn run_with_hooks(
 ) {
     {
         let initial = repo.load();
-        let workspace = workspace::resolve_path(initial.as_ref());
+        let workspace = workspace::resolve_path(&paths, initial.as_ref());
         tracing::info!(
             url = initial.url.as_str(),
             workspace = %workspace.display(),
@@ -316,7 +316,7 @@ pub async fn run_with_hooks(
         // mid-iteration reload cannot tear the config.
         let snapshot = repo.load();
         let snapshot_ref: &RepositoryConfig = snapshot.as_ref();
-        let workspace = workspace::resolve_path(snapshot_ref);
+        let workspace = workspace::resolve_path(&paths, snapshot_ref);
         let github_snap = github_holder.load_full();
         let reviewer_snap = reviewer_holder.load_full();
         let chatops_snap = chatops_holder.load_full();
@@ -342,7 +342,7 @@ pub async fn run_with_hooks(
         // thread state files older than 7 days regardless of status, so
         // the audit-threads directory stays bounded. Best-effort; a
         // failure is logged and the iteration continues.
-        let audit_state_root = crate::audits::threads::default_state_root();
+        let audit_state_root = crate::audits::threads::default_state_root(&paths);
         match crate::audits::threads::prune_stale_entries(
             &audit_state_root,
             chrono::Duration::days(7),
@@ -360,7 +360,7 @@ pub async fn run_with_hooks(
         // Same housekeeping for proposal-request state files (per
         // `chat-request-triage`). Stale entries (>7 days) are removed
         // regardless of status so the directory stays bounded.
-        let proposal_state_root = crate::proposal_requests::default_state_root();
+        let proposal_state_root = crate::proposal_requests::default_state_root(&paths);
         match crate::proposal_requests::prune_stale_entries(
             &proposal_state_root,
             chrono::Duration::days(7),
@@ -378,7 +378,7 @@ pub async fn run_with_hooks(
         // Same housekeeping for changelog-request state files (per
         // `a06-chat-driven-changelog`). Stale entries (>7 days) are
         // removed regardless of status so the directory stays bounded.
-        let changelog_state_root = crate::changelog_requests::default_state_root();
+        let changelog_state_root = crate::changelog_requests::default_state_root(&paths);
         match crate::changelog_requests::prune_stale_entries(
             &changelog_state_root,
             chrono::Duration::days(7),
@@ -416,6 +416,7 @@ pub async fn run_with_hooks(
         };
         if !triage_thread_tses.is_empty()
             && let Err(error) = process_audit_triages(
+                &paths,
                 &workspace,
                 snapshot_ref,
                 executor.as_ref(),
@@ -5689,6 +5690,7 @@ async fn open_pr_exists_for_agent_branch(
 /// state's `status` is updated to `TriageFailed` so the operator can
 /// retry via `@<bot> send it` again.
 pub async fn process_audit_triages(
+    paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,

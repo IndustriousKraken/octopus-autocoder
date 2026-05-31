@@ -134,8 +134,12 @@ fn revisions_dir(paths: &crate::paths::DaemonPaths, workspace: &Path) -> PathBuf
 
 /// Read the state file for `pr_number`. A missing file returns
 /// `Ok(None)`; a corrupt file returns `Err`.
-pub fn read_state(workspace: &Path, pr_number: u64) -> Result<Option<RevisionState>> {
-    let path = state_path(workspace, pr_number);
+pub fn read_state(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    pr_number: u64,
+) -> Result<Option<RevisionState>> {
+    let path = state_path(paths, workspace, pr_number);
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let parsed: RevisionState = serde_json::from_str(&raw).with_context(|| {
@@ -150,8 +154,12 @@ pub fn read_state(workspace: &Path, pr_number: u64) -> Result<Option<RevisionSta
 
 /// Atomically write `state` to its per-PR file via temp-file-then-rename
 /// in the same directory. Matches the daemon's other state-file writes.
-pub fn write_state(workspace: &Path, state: &RevisionState) -> Result<()> {
-    let path = state_path(workspace, state.pr_number);
+pub fn write_state(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    state: &RevisionState,
+) -> Result<()> {
+    let path = state_path(paths, workspace, state.pr_number);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("revision-state path has no parent: {}", path.display()))?;
@@ -170,8 +178,12 @@ pub fn write_state(workspace: &Path, state: &RevisionState) -> Result<()> {
 /// a success, not an error. Exposed for callers (and tests) that need to
 /// drop state explicitly outside the prune-on-close path.
 #[allow(dead_code)]
-pub fn remove_state(workspace: &Path, pr_number: u64) -> Result<()> {
-    let path = state_path(workspace, pr_number);
+pub fn remove_state(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    pr_number: u64,
+) -> Result<()> {
+    let path = state_path(paths, workspace, pr_number);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -182,8 +194,12 @@ pub fn remove_state(workspace: &Path, pr_number: u64) -> Result<()> {
 /// Remove every state file whose PR number is not in `open_pr_numbers`.
 /// Returns the number of files removed. A missing revisions directory is
 /// not an error — it returns `0`.
-pub fn prune_closed_prs(workspace: &Path, open_pr_numbers: &HashSet<u64>) -> Result<usize> {
-    let dir = revisions_dir(workspace);
+pub fn prune_closed_prs(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    open_pr_numbers: &HashSet<u64>,
+) -> Result<usize> {
+    let dir = revisions_dir(paths, workspace);
     if !dir.exists() {
         return Ok(0);
     }
@@ -378,6 +394,7 @@ pub struct ChatOpsCtx<'a> {
 /// continue to use the cap stored in their state file.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_revision_requests(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
@@ -388,6 +405,7 @@ pub async fn process_revision_requests(
     cancel: CancellationToken,
 ) -> Result<()> {
     process_revision_requests_at(
+        paths,
         workspace,
         repo,
         github_cfg,
@@ -406,6 +424,7 @@ pub async fn process_revision_requests(
 /// HTTP calls).
 #[allow(clippy::too_many_arguments)]
 pub async fn process_revision_requests_at(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
@@ -452,7 +471,7 @@ pub async fn process_revision_requests_at(
         )
     })?;
     let open_numbers: HashSet<u64> = open_prs.iter().map(|p| p.number).collect();
-    let _pruned = prune_closed_prs(workspace, &open_numbers)?;
+    let _pruned = prune_closed_prs(paths, workspace, &open_numbers)?;
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
     } else {
@@ -463,6 +482,7 @@ pub async fn process_revision_requests_at(
             return Ok(());
         }
         let pr_result = process_one_pr(
+            paths,
             workspace,
             repo,
             pr,
@@ -494,6 +514,7 @@ pub async fn process_revision_requests_at(
 /// errors propagate (the caller logs at WARN and proceeds to the next PR).
 #[allow(clippy::too_many_arguments)]
 async fn process_one_pr(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     pr: &github::PrSummary,
@@ -518,7 +539,7 @@ async fn process_one_pr(
     let code_review_cap_initial = reviewer
         .map(|r| r.max_code_reviews_per_pr())
         .unwrap_or_else(default_code_review_cap);
-    let mut state = match read_state(workspace, pr.number)? {
+    let mut state = match read_state(paths, workspace, pr.number)? {
         Some(s) => s,
         None => RevisionState {
             pr_number: pr.number,
@@ -553,7 +574,7 @@ async fn process_one_pr(
         .await?;
         if let Some(latest) = comments.iter().map(|c| c.created_at).max() {
             state.last_seen_comment_at = latest;
-            write_state(workspace, &state)?;
+            write_state(paths, workspace, &state)?;
         }
         return Ok(());
     }
@@ -576,7 +597,7 @@ async fn process_one_pr(
             // Persist whatever progress we made and return.
             if let Some(t) = latest_seen {
                 state.last_seen_comment_at = t;
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             return Ok(());
         }
@@ -661,7 +682,7 @@ async fn process_one_pr(
                                 }
                             }
                             state.cap_decline_posted_for_code_review = true;
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                         continue;
                     }
@@ -703,12 +724,12 @@ async fn process_one_pr(
                                 );
                             }
                             advance_seen(&mut latest_seen, comment.created_at);
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                         Ok(CodeReviewOutcome::CapExceeded) => {
                             // Should have been caught above; defensive fallthrough.
                             advance_seen(&mut latest_seen, comment.created_at);
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                         Ok(CodeReviewOutcome::Completed { verdict }) => {
                             crate::polling_loop::maybe_post_code_review_complete_alert(
@@ -721,7 +742,7 @@ async fn process_one_pr(
                             )
                             .await;
                             advance_seen(&mut latest_seen, comment.created_at);
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                         Ok(CodeReviewOutcome::Failed { reason }) => {
                             crate::polling_loop::maybe_post_code_review_failed_alert(
@@ -748,7 +769,7 @@ async fn process_one_pr(
                                 );
                             }
                             advance_seen(&mut latest_seen, comment.created_at);
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -766,7 +787,7 @@ async fn process_one_pr(
                             )
                             .await;
                             advance_seen(&mut latest_seen, comment.created_at);
-                            write_state(workspace, &state)?;
+                            write_state(paths, workspace, &state)?;
                         }
                     }
                     continue;
@@ -817,7 +838,7 @@ async fn process_one_pr(
                     }
                 }
                 state.cap_decline_posted = true;
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             break;
         }
@@ -944,7 +965,7 @@ async fn process_one_pr(
                     .await;
                     state.revisions_applied = state.revisions_applied.saturating_add(1);
                     advance_seen(&mut latest_seen, comment.created_at);
-                    write_state(workspace, &state)?;
+                    write_state(paths, workspace, &state)?;
                     continue;
                 }
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
@@ -985,7 +1006,7 @@ async fn process_one_pr(
                 )
                 .await;
                 advance_seen(&mut latest_seen, comment.created_at);
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             Ok(ExecutorOutcome::AskUser { question, resume_handle }) => {
                 // AskUser → existing chatops escalation. No commit, no
@@ -1010,7 +1031,7 @@ async fn process_one_pr(
                 // past the current (unresolved) comment.
                 if let Some(t) = latest_seen {
                     state.last_seen_comment_at = t;
-                    write_state(workspace, &state)?;
+                    write_state(paths, workspace, &state)?;
                 }
                 return Ok(());
             }
@@ -1041,7 +1062,7 @@ async fn process_one_pr(
                 }
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
                 advance_seen(&mut latest_seen, comment.created_at);
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
                 // The revise-lifecycle "failed" notification surfaces the
@@ -1067,7 +1088,7 @@ async fn process_one_pr(
                 .await;
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
                 advance_seen(&mut latest_seen, comment.created_at);
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             Ok(ExecutorOutcome::IterationRequested { .. }) => {
                 // Revisions are single-shot bug fixes against a merged PR;
@@ -1093,7 +1114,7 @@ async fn process_one_pr(
                 .await;
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
                 advance_seen(&mut latest_seen, comment.created_at);
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
             Err(e) => {
                 tracing::warn!(
@@ -1121,7 +1142,7 @@ async fn process_one_pr(
                 .await;
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
                 advance_seen(&mut latest_seen, comment.created_at);
-                write_state(workspace, &state)?;
+                write_state(paths, workspace, &state)?;
             }
         }
     }
@@ -1129,7 +1150,7 @@ async fn process_one_pr(
         && t > state.last_seen_comment_at
     {
         state.last_seen_comment_at = t;
-        write_state(workspace, &state)?;
+        write_state(paths, workspace, &state)?;
     }
     Ok(())
 }

@@ -61,6 +61,7 @@ pub(crate) fn format_alert_text_with_class(
 /// in both cases the function returns without reading or writing the state
 /// file.
 pub async fn handle_predictable_failure(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo_url: &str,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -69,6 +70,7 @@ pub async fn handle_predictable_failure(
     err: &anyhow::Error,
 ) {
     handle_predictable_failure_inner(
+        paths,
         workspace,
         repo_url,
         chatops_ctx,
@@ -87,6 +89,7 @@ pub async fn handle_predictable_failure(
 /// path, and silent-on-disabled behavior are identical to the un-classed
 /// helper.
 pub async fn handle_classified_recovery_failure(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo_url: &str,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -96,6 +99,7 @@ pub async fn handle_classified_recovery_failure(
     class: RecoveryFailureClass,
 ) {
     handle_predictable_failure_inner(
+        paths,
         workspace,
         repo_url,
         chatops_ctx,
@@ -108,6 +112,7 @@ pub async fn handle_classified_recovery_failure(
 }
 
 async fn handle_predictable_failure_inner(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo_url: &str,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -121,7 +126,7 @@ async fn handle_predictable_failure_inner(
     }
     let Some(ctx) = chatops_ctx else { return };
 
-    let mut state = AlertState::load_or_default(workspace);
+    let mut state = AlertState::load_or_default(paths, workspace);
     let now = Utc::now();
     let should_alert = state
         .alerts
@@ -153,7 +158,7 @@ async fn handle_predictable_failure_inner(
             last_error_excerpt: excerpt(err),
         },
     );
-    if let Err(save_err) = state.save(workspace) {
+    if let Err(save_err) = state.save(paths, workspace) {
         // Best-effort: if we can't persist the timestamp the worst case is
         // the next iteration re-alerts. Log so the operator notices.
         tracing::warn!(
