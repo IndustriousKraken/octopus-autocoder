@@ -488,6 +488,20 @@ pub struct SpecStorageConfig {
     /// Workspace-relative OR absolute path to a git working tree
     /// containing an `openspec/` subdirectory.
     pub path: String,
+    /// a34: optional override for the git remote in the spec_storage
+    /// working tree that spec-only iterations push to. When unset, the
+    /// runtime uses `"origin"`. When set, config-load verifies the
+    /// remote exists in the spec_storage repo's `git remote` output AND
+    /// fails-fast if not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_remote: Option<String>,
+    /// a34: optional override for the PR base branch in the spec_storage
+    /// repo. When unset, the runtime queries
+    /// `git -C <spec_storage.path> symbolic-ref refs/remotes/<push_remote>/HEAD`
+    /// AND parses the branch name. On query failure, the documented
+    /// fallback is `"main"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// OSS-fork support (a26): per-repo upstream-remote config. When set,
@@ -1124,10 +1138,62 @@ pub struct ReviewerConfig {
     /// `## Code Review: <slug>` section per change in the PR body.
     #[serde(default)]
     pub mode: ReviewerMode,
+    /// Per-PR cap on operator-initiated re-reviews triggered via the
+    /// `@<bot> code-review` PR-comment verb. Default `5`. Independent of
+    /// `executor.max_revisions_per_pr`. Values above
+    /// `MAX_CODE_REVIEWS_PER_PR_CEILING` are clamped down at startup with a
+    /// WARN. The original automatic review at PR-open time does NOT count
+    /// against this cap.
+    #[serde(default = "default_max_code_reviews_per_pr")]
+    pub max_code_reviews_per_pr: u32,
+    /// Optional diff-overlap threshold for the daemon to suggest an
+    /// operator-initiated re-review after a revision iteration. `None`
+    /// disables the suggestion entirely (default). When `Some(threshold)`,
+    /// the value MUST satisfy `0.0..=1.0`; out-of-range values fail
+    /// config-load. After each operator-initiated revision iteration's
+    /// Completed outcome, the daemon computes the cumulative-since-original-
+    /// review diff overlap; when overlap >= threshold AND the suggestion
+    /// has not already fired for the current `revisions_applied` count,
+    /// a chatops notification recommending `@<bot> code-review` is posted.
+    #[serde(default)]
+    pub suggest_rereview_threshold: Option<f32>,
+    /// a34: cost-optimization knob. When `true`, the polling iteration's
+    /// reviewer-invocation step skips the reviewer call AND posts no
+    /// `## Code Review` section for any PR whose ENTIRE diff lives
+    /// under `openspec/` (i.e. spec-only PRs from brownfield, scout
+    /// spec-it, OR archive-driven iterations). Default `false`
+    /// (preserves canonical behavior: reviewer runs against every PR).
+    #[serde(default)]
+    pub skip_spec_only_prs: bool,
 }
 
 fn default_prompt_budget_chars() -> usize {
     2_000_000
+}
+
+/// Default per-PR cap on operator-initiated re-reviews.
+pub fn default_max_code_reviews_per_pr() -> u32 {
+    5
+}
+
+/// Upper bound on `reviewer.max_code_reviews_per_pr`. Anything above this
+/// is clamped down at startup with a WARN log so the operator notices.
+pub const MAX_CODE_REVIEWS_PER_PR_CEILING: u32 = 20;
+
+/// Clamp the configured per-PR code-review cap. Mirrors
+/// `clamp_log_retention_days`'s shape so callers can observe whether a
+/// WARN was issued without scraping the tracing log.
+pub fn clamp_max_code_reviews_per_pr(requested: u32) -> (u32, Option<String>) {
+    if requested > MAX_CODE_REVIEWS_PER_PR_CEILING {
+        let msg = format!(
+            "reviewer.max_code_reviews_per_pr ({requested}) is above the ceiling of \
+             {MAX_CODE_REVIEWS_PER_PR_CEILING}; clamping to {MAX_CODE_REVIEWS_PER_PR_CEILING}"
+        );
+        tracing::warn!("{msg}");
+        (MAX_CODE_REVIEWS_PER_PR_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1803,6 +1869,17 @@ impl Config {
             let (top_k, _) = clamp_rag_top_k(rag.top_k);
             rag.top_k = top_k;
         }
+        if let Some(rev) = cfg.reviewer.as_mut() {
+            let (clamped, _) = clamp_max_code_reviews_per_pr(rev.max_code_reviews_per_pr);
+            rev.max_code_reviews_per_pr = clamped;
+            if let Some(t) = rev.suggest_rereview_threshold
+                && !(0.0..=1.0).contains(&t)
+            {
+                return Err(anyhow!(
+                    "reviewer.suggest_rereview_threshold ({t}) is out of range; valid range is 0.0..=1.0"
+                ));
+            }
+        }
         // OSS-fork support (a26): validate spec_storage AND upstream
         // blocks. Fail-fast at config-load so the daemon never spins
         // up a polling task pointing at a missing/invalid spec store.
@@ -1906,6 +1983,52 @@ fn validate_spec_storage(
             resolved.display(),
             openspec_dir.display()
         ));
+    }
+    // a34: when push_remote is set, verify the remote exists in the
+    // spec_storage repo's `git remote` output. Fail-fast so the daemon
+    // never spins up a polling task pointing at an invalid remote.
+    if let Some(remote_name) = ss.push_remote.as_deref() {
+        let remote_name = remote_name.trim();
+        if remote_name.is_empty() {
+            return Err(anyhow!(
+                "spec_storage.push_remote is set but empty (expected a remote name)"
+            ));
+        }
+        let list = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&resolved)
+            .args(["remote"])
+            .output();
+        match list {
+            Ok(out) if out.status.success() => {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                let available: Vec<&str> =
+                    raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if !available.contains(&remote_name) {
+                    return Err(anyhow!(
+                        "spec_storage.push_remote `{remote_name}` does not exist in \
+                         `git -C {} remote` output (available: [{}])",
+                        resolved.display(),
+                        available.join(", ")
+                    ));
+                }
+            }
+            Ok(out) => {
+                let stderr =
+                    String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(anyhow!(
+                    "spec_storage.push_remote could not be validated: \
+                     `git -C {} remote` failed: {stderr}",
+                    resolved.display()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "spec_storage.push_remote could not be validated: \
+                     `git` invocation failed: {e}",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2690,6 +2813,9 @@ github:
             "auto_revise_on_block",
             "prompt_budget_chars",
             "mode",
+            "max_code_reviews_per_pr",
+            "suggest_rereview_threshold",
+            "skip_spec_only_prs",
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
@@ -2721,6 +2847,9 @@ github:
             "spec_storage",
             "upstream",
             "auto_submit_pr",
+            // a34: spec_storage extensions + reviewer skip-spec-only-prs.
+            "push_remote",
+            "base_branch",
         ];
 
         let path = example_yaml_path();
@@ -4391,6 +4520,97 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.executor.max_revisions_per_pr, 50);
         assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
+    }
+
+    /// Task 1.4: a reviewer block with no `max_code_reviews_per_pr` /
+    /// `suggest_rereview_threshold` keys defaults the former to `5` and
+    /// the latter to `None`.
+    #[test]
+    fn reviewer_code_review_extension_fields_default_round_trip() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let r = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.max_code_reviews_per_pr, 5);
+        assert!(r.suggest_rereview_threshold.is_none());
+    }
+
+    /// Task 1.5: a `suggest_rereview_threshold` outside `0.0..=1.0`
+    /// fails config-load with a message naming the field AND the valid
+    /// range.
+    #[test]
+    fn reviewer_suggest_rereview_threshold_out_of_range_rejected() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  suggest_rereview_threshold: 1.5
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("out-of-range threshold must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reviewer.suggest_rereview_threshold")
+                && msg.contains("0.0..=1.0"),
+            "error must name field AND range; got: {msg}"
+        );
+    }
+
+    /// Above-ceiling `reviewer.max_code_reviews_per_pr` clamps down at
+    /// startup with the WARN message documented in
+    /// `clamp_max_code_reviews_per_pr`. The raw stored value reflects the
+    /// CLAMPED value (matches `executor.max_revisions_per_pr`'s pattern
+    /// where the field is rewritten in place by `Config::load_from`).
+    #[test]
+    fn reviewer_max_code_reviews_per_pr_above_ceiling_is_clamped() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  max_code_reviews_per_pr: 50
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let r = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.max_code_reviews_per_pr, MAX_CODE_REVIEWS_PER_PR_CEILING);
+        let (clamped, warn) = clamp_max_code_reviews_per_pr(50);
+        assert_eq!(clamped, MAX_CODE_REVIEWS_PER_PR_CEILING);
+        assert!(warn.is_some());
     }
 
     #[test]
@@ -6532,6 +6752,112 @@ github:
             cfg.repositories[0]
                 .resolved_spec_storage_dir(Path::new("/tmp/ws"))
                 .is_none()
+        );
+    }
+
+    /// a34: defaults round-trip — when `push_remote` and `base_branch`
+    /// are unset in the YAML, the parsed `SpecStorageConfig` retains
+    /// them as `None` so the runtime fallback (`origin` / remote-tracked
+    /// HEAD) is engaged.
+    #[test]
+    fn spec_storage_push_remote_and_base_branch_default_to_none() {
+        let scratch = TempDir::new().unwrap();
+        let specs_repo = scratch.path().join("specs-repo");
+        std::fs::create_dir_all(specs_repo.join("openspec")).unwrap();
+        init_git_repo(&specs_repo);
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#,
+            specs_repo.display()
+        );
+        let (_dir, cfg_path) = write_config(&yaml);
+        let cfg = Config::load_from(&cfg_path).expect("valid spec_storage parses");
+        let ss = cfg.repositories[0].spec_storage.as_ref().unwrap();
+        assert!(
+            ss.push_remote.is_none(),
+            "push_remote must default to None: got {:?}",
+            ss.push_remote
+        );
+        assert!(
+            ss.base_branch.is_none(),
+            "base_branch must default to None: got {:?}",
+            ss.base_branch
+        );
+    }
+
+    /// a34: `reviewer.skip_spec_only_prs` defaults to `false` when unset.
+    #[test]
+    fn reviewer_skip_spec_only_prs_defaults_false() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, cfg_path) = write_config(yaml);
+        let cfg = Config::load_from(&cfg_path).expect("valid reviewer parses");
+        let rv = cfg.reviewer.as_ref().unwrap();
+        assert!(
+            !rv.skip_spec_only_prs,
+            "skip_spec_only_prs must default to false: got {}",
+            rv.skip_spec_only_prs
+        );
+    }
+
+    /// a34: `spec_storage.push_remote` set to a name not present in the
+    /// spec_storage repo's `git remote` output fails config-load with a
+    /// clear message naming the missing remote.
+    #[test]
+    fn spec_storage_push_remote_must_exist() {
+        let scratch = TempDir::new().unwrap();
+        let specs_repo = scratch.path().join("specs-repo");
+        std::fs::create_dir_all(specs_repo.join("openspec")).unwrap();
+        init_git_repo(&specs_repo);
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    spec_storage:
+      path: "{}"
+      push_remote: "nonexistent-remote"
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#,
+            specs_repo.display()
+        );
+        let (_dir, cfg_path) = write_config(&yaml);
+        let err = Config::load_from(&cfg_path)
+            .expect_err("missing push_remote must fail config-load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent-remote"),
+            "error must name the missing remote, got: {msg}"
         );
     }
 

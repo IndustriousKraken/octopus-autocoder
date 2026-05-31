@@ -151,6 +151,8 @@ mod tests {
         let mut repo = fixture_repo();
         repo.spec_storage = Some(SpecStorageConfig {
             path: "/abs/specs-repo".to_string(),
+            push_remote: None,
+            base_branch: None,
         });
         let spec_root = SpecRoot::for_repo(&repo, &ws);
         assert_eq!(
@@ -178,6 +180,8 @@ mod tests {
         let mut repo = fixture_repo();
         repo.spec_storage = Some(SpecStorageConfig {
             path: "../my-specs".to_string(),
+            push_remote: None,
+            base_branch: None,
         });
         let spec_root = SpecRoot::for_repo(&repo, &ws);
         assert_eq!(

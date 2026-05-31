@@ -51,6 +51,16 @@ repositories:
     # Default: unset (specs live alongside code).
     # spec_storage:
     #   path: "../my-specs"
+    #   # a34: optional override for the git remote in the spec_storage
+    #   # working tree that spec-only iterations push to. When unset, the
+    #   # runtime uses `"origin"`. When set, config-load verifies the
+    #   # remote exists in `git -C <spec_storage.path> remote` output.
+    #   # push_remote: "origin"
+    #   # a34: optional override for the PR base branch in the spec_storage
+    #   # repo. When unset, the runtime queries
+    #   # `git -C <spec_storage.path> symbolic-ref refs/remotes/<push_remote>/HEAD`
+    #   # and parses the branch name. On query failure, falls back to "main".
+    #   # base_branch: "main"
     #
     # `upstream` — when set, autocoder ensures a git remote named
     # `<remote>` (default `upstream`) points at `<url>` AND
@@ -340,6 +350,34 @@ github:
 #   # you specifically want per-change attention.
 #   # See `docs/CODE-REVIEW.md` § "Per-change reviewer mode".
 #   # mode: bundled
+#   #
+#   # Per-PR cap on operator-initiated re-reviews triggered via the
+#   # `@<bot> code-review` PR-comment verb. Default `5`. The original
+#   # automatic review at PR-open time does NOT count against this cap.
+#   # Values above 20 are clamped down at startup with a WARN. Independent
+#   # of `executor.max_revisions_per_pr` — re-reviews are a separate cost
+#   # surface (one LLM call) from revisions (full executor subprocess).
+#   # max_code_reviews_per_pr: 5
+#   #
+#   # Optional diff-overlap threshold for re-review suggestion. Unset
+#   # (the default) disables the suggestion entirely. When set in the
+#   # range `0.0..=1.0`, the daemon posts a chatops `💡 ...` notification
+#   # after a revision iteration whose cumulative-since-original-review
+#   # diff overlap exceeds the threshold. `0.5` is a reasonable starting
+#   # point ("suggest when half the original diff has been revised").
+#   # `0.0` means "suggest after any non-zero revision" (noisy in
+#   # practice). `1.0` means "suggest only when the revised diff is
+#   # equal-or-larger than the original" (conservative). The suggestion
+#   # is informational; the operator decides whether to post
+#   # `@<bot> code-review`. Out-of-range values fail config-load.
+#   # suggest_rereview_threshold: 0.5
+#   #
+#   # a34: cost-optimization knob. When `true`, the polling iteration's
+#   # reviewer-invocation step skips the reviewer call AND posts no
+#   # `## Code Review` section for any PR whose ENTIRE diff lives under
+#   # `openspec/` (spec-only PRs from brownfield, scout spec-it, OR
+#   # archive-driven iterations). Default `false` (reviewer runs on every PR).
+#   # skip_spec_only_prs: false
 #   #
 #   # Nested override for the reviewer's prompt template (a24).
 #   # Workspace-relative when not absolute. Preferred over the legacy

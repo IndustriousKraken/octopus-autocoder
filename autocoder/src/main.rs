@@ -10,6 +10,7 @@ mod changelog_requests;
 mod changelog_triage;
 mod chatops;
 mod cli;
+mod code_review_suggestion;
 mod code_reviewer;
 mod config;
 mod control_socket;
@@ -39,6 +40,7 @@ mod recovery_classification;
 mod revisions;
 mod spec_revision;
 mod spec_root;
+mod spec_storage_routing;
 mod state;
 #[cfg(test)]
 mod testing;

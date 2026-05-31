@@ -5971,3 +5971,128 @@ Invalid values cause config-load to fail-fast with a clear error.
 - **WHEN** a per-repo config sets `features.brownfield_survey.max_capabilities: 100`
 - **THEN** config-load fails with an error naming the field AND the valid range `1..=50`
 
+### Requirement: Per-PR state file tracks code-review counts AND suggestion deduplication
+
+The per-PR `RevisionState` JSON (at `<workspace>/.autocoder/revisions/<pr_number>.json`, per the canonical `Per-PR state file persists revision count and last-seen timestamp; closed PRs are pruned` requirement) SHALL gain the following fields. All fields SHALL have serde defaults so existing state files load cleanly without migration:
+
+- `code_reviews_applied: u32` (default `0`). Counts operator-initiated re-reviews triggered via `@<bot> code-review`. Does NOT count the original automatic review at PR-open time.
+- `code_review_cap: u32` (default populated from `reviewer.max_code_reviews_per_pr` config at write time; falls back to `5` if config is absent during deserialization). Per-PR upper bound on operator-initiated re-reviews.
+- `cap_decline_posted_for_code_review: bool` (default `false`). Set `true` after the one-time cap-decline PR comment AND chatops notification are posted on cap exceeded. Prevents repeated decline messages.
+- `last_suggested_rereview_at_revisions_count: Option<u32>` (default `None`). Records the `revisions_applied` count at which the most recent re-review suggestion fired. Used to deduplicate the suggestion across polling cycles on the same revision count.
+- `original_review_head_sha: Option<String>` (default `None`). Records the agent-branch head SHA at the time the original automatic review completed. Set by the polling-loop's reviewer-completion path. Used as the baseline for the diff-overlap suggestion. State files written before this change deployed have this field as `None`; the suggestion path gracefully degrades to "no suggestion" in that case.
+
+The state file's atomic-write semantics (per the existing canonical `State writes are atomic` requirement) are preserved unchanged.
+
+The pruning behavior for closed PRs (per the existing canonical `Closed PRs have their state pruned` requirement) applies to the extended state file unchanged: when a PR closes, its entire state file is removed, including the new fields.
+
+#### Scenario: New fields default cleanly when loading legacy state files
+- **WHEN** the daemon loads a `RevisionState` JSON that was written by an older daemon AND contains NO `code_reviews_applied`, `code_review_cap`, `cap_decline_posted_for_code_review`, `last_suggested_rereview_at_revisions_count`, OR `original_review_head_sha` fields
+- **THEN** the loaded `RevisionState` has `code_reviews_applied: 0`, `code_review_cap: 5` (the documented default), `cap_decline_posted_for_code_review: false`, `last_suggested_rereview_at_revisions_count: None`, AND `original_review_head_sha: None`
+- **AND** no error is logged
+
+#### Scenario: New fields round-trip cleanly when populated
+- **WHEN** the daemon writes a `RevisionState` with `code_reviews_applied: 3`, `code_review_cap: 5`, `cap_decline_posted_for_code_review: false`, `last_suggested_rereview_at_revisions_count: Some(2)`, AND `original_review_head_sha: Some("abc123def")`
+- **AND** the file is read back
+- **THEN** the deserialized `RevisionState` matches the written values byte-for-byte
+
+#### Scenario: Original-review-head-sha populated by polling-loop completion path
+- **WHEN** the polling-loop's reviewer-completion code (the path that today writes `## Code Review` into the PR body) completes successfully for the FIRST review on a PR
+- **THEN** the daemon writes `state.original_review_head_sha = Some(<current agent-branch head SHA>)` to the per-PR state file
+- **AND** the state file write uses atomic-rename semantics (per the existing canonical `State writes are atomic` requirement)
+
+#### Scenario: Re-review path does NOT overwrite original_review_head_sha
+- **WHEN** an operator-initiated re-review (via `@<bot> code-review`) completes successfully
+- **THEN** `state.code_reviews_applied` increments
+- **AND** `state.original_review_head_sha` is NOT modified (the baseline for the suggestion's overlap calculation must remain the ORIGINAL review's head SHA, not subsequent re-reviews' SHAs)
+
+#### Scenario: Cap field is independent of revision cap
+- **WHEN** the daemon loads a state file with `revisions_applied: 5`, `revision_cap: 5`, `code_reviews_applied: 2`, AND `code_review_cap: 5`
+- **THEN** an operator `@<bot> revise` comment is rejected as cap-exceeded (revisions are at cap)
+- **AND** an operator `@<bot> code-review` comment IS dispatched (re-reviews are below cap; the two cap counters are independent)
+
+### Requirement: Polling iteration classifies outcome as spec-only, code-only, OR dual-tree before commit + push + PR
+
+The polling iteration's commit + push + PR step SHALL begin with a working-tree-status classification:
+
+1. Run `git -C <code_workspace> status --porcelain` AND check for non-empty output.
+2. When `spec_storage` is configured for the repo, run `git -C <spec_storage.path> status --porcelain` AND check for non-empty output.
+3. Classify the iteration's outcome as:
+   - **Code-only**: code workspace dirty AND spec_storage clean (OR not configured).
+   - **Spec-only**: code workspace clean AND spec_storage dirty.
+   - **Dual-tree**: both dirty.
+   - **Clean**: both clean. (No commit + push + PR happens; the iteration's outcome was Completed with no diff, handled by the existing "exit-0 without modifying workspace" path.)
+
+The classification determines which working trees are committed AND pushed AND which PRs are opened.
+
+#### Scenario: Spec-only iteration commits to spec_storage tree only
+- **WHEN** a polling iteration completes AND the code workspace is clean AND the spec_storage working tree has new files (e.g. brownfield draft, scout spec-it write, OR `openspec archive` rename)
+- **THEN** the iteration's commit step runs `git -C <spec_storage.path> commit ...`
+- **AND** the code workspace's working tree is NOT committed
+- **AND** the push step targets the spec_storage repo's remote (per the resolution requirement below)
+
+#### Scenario: Code-only iteration commits to code workspace tree only
+- **WHEN** a polling iteration completes AND the code workspace is dirty AND the spec_storage working tree is clean (OR not configured)
+- **THEN** the iteration's commit step runs `git -C <code_workspace> commit ...` (existing canonical behavior)
+- **AND** the spec_storage repo is NOT committed (when configured AND clean)
+
+#### Scenario: Dual-tree iteration produces TWO PRs
+- **WHEN** a polling iteration completes AND BOTH the code workspace AND spec_storage working tree are dirty (the iteration drafted spec changes AND modified code-workspace fixtures)
+- **THEN** the commit + push + PR step runs against BOTH working trees independently
+- **AND** TWO PRs are opened (one per repo) with their respective title shapes (per the title-prefix requirement below)
+- **AND** chatops notifications fire for each PR independently
+
+### Requirement: Spec-storage push remote AND base branch resolution rules
+
+When the polling iteration's classification is spec-only OR dual-tree AND `spec_storage` is configured, the push remote AND PR base branch SHALL be resolved per the following rules:
+
+- **Push remote**: `spec_storage.push_remote` (new optional field; default `None`). When `None`, the runtime uses `"origin"`. The resolved value MUST exist in `git -C <spec_storage.path> remote` output; config-load SHALL fail-fast if the field is set to a non-existent remote name.
+- **Base branch**: `spec_storage.base_branch` (new optional field; default `None`). When `None`, the runtime queries `git -C <spec_storage.path> symbolic-ref refs/remotes/<push_remote>/HEAD` AND parses the branch name (e.g. `refs/remotes/origin/main` → `main`). When the symbolic-ref query fails, fall back to `"main"`.
+- **Spec-repo owner/name**: parsed from `git -C <spec_storage.path> remote get-url <push_remote>`. SSH (`git@github.com:owner/name.git`) AND HTTPS (`https://github.com/owner/name.git`) URL forms SHALL both be parsed. On parse failure, the iteration SHALL log WARN AND fall back to the code workspace's owner/name (degrades to opening the PR against the wrong repo; clearly visible to the operator).
+
+The resolution SHALL happen once per polling iteration AND the resolved values SHALL be threaded through the commit + push + PR steps explicitly (no re-resolution mid-step).
+
+#### Scenario: Default resolution uses `origin` AND remote-tracked HEAD
+- **WHEN** a spec-only iteration runs AND `spec_storage.push_remote` AND `spec_storage.base_branch` are both unset
+- **THEN** the resolved push remote is `"origin"`
+- **AND** the resolved base branch is the branch name parsed from `git -C <spec_storage.path> symbolic-ref refs/remotes/origin/HEAD`
+
+#### Scenario: Operator overrides take precedence
+- **WHEN** `spec_storage.push_remote: "upstream-fork"` AND `spec_storage.base_branch: "develop"` are set
+- **THEN** the resolved push remote is `"upstream-fork"`
+- **AND** the resolved base branch is `"develop"`
+- **AND** the iteration's `git push` targets `upstream-fork` AND the PR's `--base` is `develop`
+
+#### Scenario: Push-remote validation at config-load
+- **WHEN** config-load encounters `spec_storage.push_remote: "nonexistent-remote"` AND running `git -C <spec_storage.path> remote` returns a set that does NOT include `nonexistent-remote`
+- **THEN** config-load fails with a message naming the missing remote AND the available remotes
+- **AND** the daemon exits non-zero before any polling task is spawned
+
+#### Scenario: Symbolic-ref query failure falls back to `main`
+- **WHEN** `spec_storage.base_branch` is unset AND `git -C <spec_storage.path> symbolic-ref refs/remotes/origin/HEAD` returns non-zero (e.g. the remote has no default branch set)
+- **THEN** the iteration logs WARN naming the failure
+- **AND** the resolved base branch is `"main"` (the documented fallback)
+
+### Requirement: Spec-only AND dual-tree's spec PR title is prefixed `[specs] `
+
+PRs whose entire diff lives under `openspec/` SHALL have their titles prefixed with `[specs] `. This applies to:
+
+- Spec-only iterations' PRs.
+- The spec-storage PR half of dual-tree iterations.
+
+Code-only iterations' PRs AND the code PR half of dual-tree iterations SHALL remain unprefixed (existing format preserved).
+
+The prefix is operator-visible AND lets operators sort PR lists by title to find spec-only PRs quickly. It does NOT affect any automated processing — the revisions dispatcher, the reviewer, AND the chatops notifications all key on PR number, not title.
+
+#### Scenario: Spec-only PR title carries the prefix
+- **WHEN** a spec-only iteration produces a PR for a brownfield draft change `a36-brownfield-foo` (+ 0 more)
+- **THEN** the PR title is `[specs] a36-brownfield-foo`
+
+#### Scenario: Code-only PR title is unprefixed
+- **WHEN** a code-only iteration produces a PR for change `a40-fix-bar` (+ 0 more)
+- **THEN** the PR title is `a40-fix-bar` (no `[specs] ` prefix)
+
+#### Scenario: Dual-tree produces one prefixed AND one unprefixed PR
+- **WHEN** a dual-tree iteration produces two PRs for change `a42-mixed-baz`
+- **THEN** the spec PR title is `[specs] a42-mixed-baz`
+- **AND** the code PR title is `a42-mixed-baz`
+
