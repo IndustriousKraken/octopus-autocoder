@@ -163,6 +163,41 @@ impl DaemonPaths {
         self.run_logs_dir(workspace_basename).join("audits")
     }
 
+    /// `<state>/iteration-pending/` — root for per-change
+    /// iteration-request markers (a27a1). The marker is pure daemon
+    /// bookkeeping (written by the polling-loop's `IterationRequested`
+    /// arm, read by the prompt-builder + classifier + queue engine,
+    /// never operator-edited), so it lives under `<state>/` per a16's
+    /// "daemon bookkeeping never appears in the managed repo's working
+    /// tree" rule. Earlier a27a1 implementations put the marker at
+    /// `<workspace>/openspec/changes/<change>/.iteration-pending.json`;
+    /// that location caused `git clean -fd` to wipe the marker on the
+    /// next iteration's dirty-workspace recovery, breaking the cap +
+    /// continuation-context mechanics. The state-dir location avoids
+    /// every git-interaction surface.
+    pub fn iteration_pending_dir(&self) -> PathBuf {
+        self.state.join("iteration-pending")
+    }
+
+    /// `<state>/iteration-pending/<workspace_basename>/` — per-workspace
+    /// directory holding one `<change>.json` file per iteration-pending
+    /// change in that workspace.
+    pub fn iteration_pending_basename_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.iteration_pending_dir().join(workspace_basename)
+    }
+
+    /// `<state>/iteration-pending/<workspace_basename>/<change>.json` —
+    /// the per-change iteration-request marker for `change` in the
+    /// workspace identified by `workspace_basename`.
+    pub fn iteration_pending_path(
+        &self,
+        workspace_basename: &str,
+        change: &str,
+    ) -> PathBuf {
+        self.iteration_pending_basename_dir(workspace_basename)
+            .join(format!("{change}.json"))
+    }
+
     /// `<cache>/workspaces/` — per-repo cloned workspaces, keyed by
     /// URL-sanitized basename.
     pub fn workspaces_dir(&self) -> PathBuf {

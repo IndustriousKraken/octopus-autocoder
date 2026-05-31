@@ -201,6 +201,31 @@ pub fn ensure_initialized(
             "could not register .ignore-for-queue.json in .git/info/exclude: {e:#}"
         );
     }
+    // One-time migration of any legacy iteration-pending markers (a27a1
+    // originally placed them at <workspace>/openspec/changes/<change>/.iteration-pending.json,
+    // where `git clean -fd` periodically wiped them). The marker now
+    // lives under <state>/iteration-pending/<basename>/<change>.json
+    // per a16's "daemon bookkeeping never appears in the managed repo's
+    // working tree" rule. The migration moves any legacy workspace
+    // markers to their state-dir location AND deletes the workspace
+    // copies. Idempotent: a workspace with no legacy markers is a
+    // no-op. Failures inside the migration log WARN AND do not block
+    // workspace initialization (a corrupt marker is operator-cleanable).
+    {
+        let paths = crate::paths::current();
+        let basename = workspace
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        if let Err(e) =
+            crate::iteration_pending::migrate_legacy_workspace_markers(&paths, workspace, basename)
+        {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                "iteration-pending legacy-marker migration encountered an error (init proceeding): {e:#}"
+            );
+        }
+    }
     enforce_alert_state_workspace_invariant(workspace);
     Ok(())
 }
@@ -910,13 +935,21 @@ mod tests {
 
         let exclude_path = workspace.join(".git/info/exclude");
         // After ensure_initialized, every per-workspace bookkeeping file
-        // should be registered.
+        // that legitimately lives IN the workspace (operator-action
+        // markers like .perma-stuck.json, .needs-spec-revision.json,
+        // .ignore-for-queue.json — operators inspect AND delete these in
+        // the change directory) must be registered. Pure daemon-state
+        // markers (e.g. .iteration-pending.json) MUST NOT live in the
+        // workspace at all per a16's "daemon bookkeeping never appears
+        // in the managed repo's working tree" rule — they live under
+        // <state_dir>/ instead AND are absent from this list by design.
         let contents = std::fs::read_to_string(&exclude_path).unwrap();
         for entry in [
             ".failure-state.json",
             ".audit-state.json",
             ".perma-stuck.json",
             ".needs-spec-revision.json",
+            ".ignore-for-queue.json",
         ] {
             assert!(
                 contents.lines().any(|l| l.trim() == entry),
@@ -932,6 +965,7 @@ mod tests {
             ".audit-state.json",
             ".perma-stuck.json",
             ".needs-spec-revision.json",
+            ".ignore-for-queue.json",
         ] {
             let occurrences = contents.lines().filter(|l| l.trim() == entry).count();
             assert_eq!(occurrences, 1, "duplicate `{entry}` entry added: {contents}");

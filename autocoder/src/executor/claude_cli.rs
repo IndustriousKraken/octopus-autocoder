@@ -1276,7 +1276,12 @@ pub(crate) fn append_iteration_continuation_block(
     change: &str,
     rendered: String,
 ) -> String {
-    match crate::iteration_pending::read_marker(workspace, change) {
+    let paths = crate::paths::current();
+    let basename = workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    match crate::iteration_pending::read_marker(&paths, basename, change) {
         Ok(Some(marker)) => {
             let block = render_iteration_continuation_block(&marker);
             format!("{rendered}\n{block}")
@@ -1508,8 +1513,15 @@ fn map_recorded_outcome(
             // (the just-finished run). A corrupt / unreadable marker
             // is treated as absent (corrupt-as-absent) per design.md
             // D5's degraded-recovery story.
+            let paths_for_marker = crate::paths::current();
+            let basename_for_marker = workspace
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
             let prior_iteration_number = match crate::iteration_pending::read_marker(
-                workspace, change,
+                &paths_for_marker,
+                basename_for_marker,
+                change,
             ) {
                 Ok(Some(m)) => m.iteration_number,
                 Ok(None) => 1,
@@ -2466,8 +2478,12 @@ mod tests {
     async fn build_prompt_with_marker_appends_continuation_block_verbatim() {
         let (_dir, ws) = fixture_workspace();
         // Write a valid marker for change "x" (the fixture creates it).
+        // Marker lives under state_dir (NOT workspace) since the
+        // marker-out-of-workspace refactor; resolve via the same
+        // accessor `build_prompt` uses internally so write + read agree.
         crate::iteration_pending::write_marker(
-            &ws,
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
             &crate::iteration_pending::IterationPendingMarker {
                 completed_tasks: vec!["1".into(), "2".into()],
@@ -3776,7 +3792,8 @@ exit 0
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
         crate::iteration_pending::write_marker(
-            ws,
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
             &crate::iteration_pending::IterationPendingMarker {
                 completed_tasks: vec!["1".into(), "2".into(), "3".into()],
@@ -3814,7 +3831,13 @@ exit 0
             reason: "prior reason".into(),
             iteration_number: 5,
         };
-        crate::iteration_pending::write_marker(ws, "x", &prior_marker).unwrap();
+        crate::iteration_pending::write_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "x",
+            &prior_marker,
+        )
+        .unwrap();
         let recorded = crate::outcome_store::RecordedOutcome::IterationRequest {
             completed_tasks: vec![
                 "1".into(),
@@ -3836,9 +3859,13 @@ exit 0
             other => panic!("expected Failed (cap-exceeded), got {other:?}"),
         }
         // Marker is NOT modified.
-        let still = crate::iteration_pending::read_marker(ws, "x")
-            .unwrap()
-            .expect("marker preserved");
+        let still = crate::iteration_pending::read_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "x",
+        )
+        .unwrap()
+        .expect("marker preserved");
         assert_eq!(still, prior_marker);
     }
 

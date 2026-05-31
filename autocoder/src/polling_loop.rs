@@ -1007,6 +1007,36 @@ pub async fn execute_one_pass(
         );
     }
 
+    // a38: audit-only-PR suppression on iteration-pending state. When
+    // any `.iteration-pending.json` marker is present in the workspace,
+    // the agent-branch's commits-ahead-of-master include iteration_request
+    // WIP that is explicitly not ready to ship (per a27a1). Opening a PR
+    // on top of that WIP produces a "0 change(s)" PR that misleads the
+    // operator AND, if merged, locks in half-done iteration work.
+    // Suppress the push + PR steps for this iteration; audit-produced
+    // commits (if any) remain on agent-q AND ship in the next iteration
+    // after the iteration-pending change concludes via outcome_success,
+    // outcome_spec_needs_revision, OR the a27a1 5-iteration cap.
+    let pending_iteration_changes = {
+        let paths = crate::paths::current();
+        let basename = workspace
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        crate::iteration_pending::list_pending_changes(&paths, basename)
+    };
+    if !pending_iteration_changes.is_empty() {
+        tracing::info!(
+            url = %repo.url,
+            pending = %pending_iteration_changes.join(","),
+            workspace_commit_count = commit_count,
+            "a38: audit-only PR path suppressed: iteration-pending markers present for {}; deferring push + PR until iteration sequence concludes",
+            pending_iteration_changes.join(", ")
+        );
+        let _ = AlertState::clear(workspace);
+        return Ok(());
+    }
+
     // Reviewer step (if configured) runs against the produced commits BEFORE
     // the push + PR. A failed reviewer is non-fatal: PR still ships with a
     // "(reviewer failed)" note in the body.
@@ -2001,7 +2031,16 @@ async fn process_one_waiting(
             }
             // a27a1: same lifecycle as the pending path — SpecNeedsRevision
             // terminates the iteration sequence; drop the marker.
-            if let Err(e) = crate::iteration_pending::remove_marker(workspace, change) {
+            let paths_for_marker = crate::paths::current();
+            let basename_for_marker = workspace
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            if let Err(e) = crate::iteration_pending::remove_marker(
+                &paths_for_marker,
+                basename_for_marker,
+                change,
+            ) {
                 tracing::warn!(
                     url = %repo.url,
                     change = %change,
@@ -4152,7 +4191,16 @@ async fn handle_outcome(
             // iteration-pending marker so the change reverts to normal
             // queue ordering on the next iteration. Idempotent — absent
             // marker is OK.
-            if let Err(e) = crate::iteration_pending::remove_marker(workspace, change) {
+            let paths_for_marker = crate::paths::current();
+            let basename_for_marker = workspace
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            if let Err(e) = crate::iteration_pending::remove_marker(
+                &paths_for_marker,
+                basename_for_marker,
+                change,
+            ) {
                 tracing::warn!(
                     url = %repo.url,
                     change = %change,
@@ -4298,13 +4346,20 @@ async fn handle_outcome(
                 // archive step moves to `openspec/changes/archive/...`.
                 let subject = build_commit_subject(workspace, change)?;
                 // a27a1: lifecycle — if this Completed terminates a
-                // multi-iteration sequence, delete `.iteration-pending.json`
-                // BEFORE the archive rename so the archived directory
-                // does not carry the marker. Idempotent — absent marker
-                // is fine.
-                if let Err(e) =
-                    crate::iteration_pending::remove_marker(workspace, change)
-                {
+                // multi-iteration sequence, delete the iteration-pending
+                // marker (now in state_dir; no longer in the archived
+                // directory regardless). Idempotent — absent marker is
+                // fine.
+                let paths_for_marker = crate::paths::current();
+                let basename_for_marker = workspace
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                if let Err(e) = crate::iteration_pending::remove_marker(
+                    &paths_for_marker,
+                    basename_for_marker,
+                    change,
+                ) {
                     tracing::warn!(
                         url = %repo.url,
                         change = %change,
@@ -4445,14 +4500,28 @@ async fn run_iteration_requested_steps(
         return Ok(QueueStep::IterationPending);
     }
 
-    // Step 3: write `.iteration-pending.json` atomically.
+    // Step 3: write the iteration-pending marker atomically. The marker
+    // lives under `<state>/iteration-pending/<basename>/<change>.json`
+    // (NOT in the workspace) per a16's "daemon bookkeeping never appears
+    // in the managed repo's working tree" rule; this avoids the
+    // `git clean -fd` wipe that broke earlier in-workspace implementations.
     let marker = crate::iteration_pending::IterationPendingMarker {
         completed_tasks,
         remaining_tasks,
         reason,
         iteration_number,
     };
-    if let Err(e) = crate::iteration_pending::write_marker(workspace, change, &marker) {
+    let paths_for_marker = crate::paths::current();
+    let basename_for_marker = workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    if let Err(e) = crate::iteration_pending::write_marker(
+        &paths_for_marker,
+        basename_for_marker,
+        change,
+        &marker,
+    ) {
         tracing::error!(
             url = %repo.url,
             change = %change,
@@ -15242,8 +15311,19 @@ mod tests {
         );
 
         // (a) The marker was written with the documented payload.
-        let marker =
-            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        // It now lives under `<state>/iteration-pending/<basename>/<change>.json`
+        // (state_dir, NOT the workspace), so read via DaemonPaths +
+        // the workspace's basename — same resolution `handle_outcome`
+        // used internally for the write.
+        let test_paths = crate::paths::current();
+        let test_basename = ws.file_name().and_then(|s| s.to_str()).unwrap();
+        let marker = crate::iteration_pending::read_marker(
+            &test_paths,
+            test_basename,
+            "a31-bar",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(marker.iteration_number, 2);
         assert_eq!(marker.completed_tasks, vec!["1".to_string(), "2".to_string()]);
         assert_eq!(marker.remaining_tasks, vec!["3".to_string()]);
@@ -15304,7 +15384,8 @@ mod tests {
         add_committed_change(&ws, "a31-bar", "fixture reason");
         // Establish a stale marker (prior iteration's IterationRequested).
         crate::iteration_pending::write_marker(
-            &ws,
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &crate::iteration_pending::IterationPendingMarker {
                 completed_tasks: vec!["1".into(), "2".into()],
@@ -15334,7 +15415,11 @@ mod tests {
         // Marker was deleted BEFORE the archive rename, so the
         // archived directory should NOT carry it either.
         assert!(
-            !crate::iteration_pending::marker_exists(&ws, "a31-bar"),
+            !crate::iteration_pending::marker_exists(
+                &crate::paths::current(),
+                ws.file_name().and_then(|s| s.to_str()).unwrap(),
+                "a31-bar",
+            ),
             "iteration-pending marker must be removed on Completed"
         );
         // (sanity) the active dir is gone (it was archived).
@@ -15350,7 +15435,8 @@ mod tests {
         let (_dir, ws) = fixture_workspace_with_remote();
         add_committed_change(&ws, "a31-bar", "fixture reason");
         crate::iteration_pending::write_marker(
-            &ws,
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &crate::iteration_pending::IterationPendingMarker {
                 completed_tasks: vec!["1".into()],
@@ -15385,7 +15471,11 @@ mod tests {
             "expected SpecRevisionMarked; got {step:?}"
         );
         assert!(
-            !crate::iteration_pending::marker_exists(&ws, "a31-bar"),
+            !crate::iteration_pending::marker_exists(
+                &crate::paths::current(),
+                ws.file_name().and_then(|s| s.to_str()).unwrap(),
+                "a31-bar",
+            ),
             "iteration-pending marker must be removed on SpecNeedsRevision"
         );
     }
@@ -15401,7 +15491,13 @@ mod tests {
             reason: "prior".into(),
             iteration_number: 2,
         };
-        crate::iteration_pending::write_marker(&ws, "a31-bar", &marker).unwrap();
+        crate::iteration_pending::write_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "a31-bar",
+            &marker,
+        )
+        .unwrap();
         queue::lock(&ws, "a31-bar").unwrap();
 
         let repo = fixture_repo(&ws);
@@ -15421,8 +15517,13 @@ mod tests {
             matches!(step, QueueStep::Failed { .. }),
             "expected Failed; got {step:?}"
         );
-        let still =
-            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        let still = crate::iteration_pending::read_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "a31-bar",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(still, marker, "Failed must NOT touch the marker");
     }
 
@@ -15440,7 +15541,13 @@ mod tests {
             reason: "prior".into(),
             iteration_number: 2,
         };
-        crate::iteration_pending::write_marker(&ws, "a31-bar", &marker).unwrap();
+        crate::iteration_pending::write_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "a31-bar",
+            &marker,
+        )
+        .unwrap();
         queue::lock(&ws, "a31-bar").unwrap();
 
         let repo = fixture_repo(&ws);
@@ -15461,8 +15568,13 @@ mod tests {
             matches!(step, QueueStep::AskUserExitEarly),
             "expected AskUserExitEarly (no chatops_ctx); got {step:?}"
         );
-        let still =
-            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        let still = crate::iteration_pending::read_marker(
+            &crate::paths::current(),
+            ws.file_name().and_then(|s| s.to_str()).unwrap(),
+            "a31-bar",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(still, marker, "AskUser must NOT touch the marker");
     }
 }

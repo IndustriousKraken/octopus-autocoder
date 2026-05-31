@@ -101,16 +101,26 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
         // preference. A corrupt marker is treated as iteration_number 0
         // for ordering (sorts ahead of any valid marked entries) AND
         // does NOT cause `list_pending` to error.
-        let marker_path = dir.join(crate::iteration_pending::MARKER_FILE);
-        if marker_path.exists() {
-            let iteration_number = match crate::iteration_pending::read_marker(workspace, &name) {
-                Ok(Some(m)) => m.iteration_number,
-                // A truly absent marker shouldn't happen here (we just
-                // checked `exists()`), but treat absent like corrupt for
-                // safety — both produce iteration_number 0.
-                Ok(None) => 0,
-                Err(_) => 0,
-            };
+        //
+        // The marker lives under `<state>/iteration-pending/<basename>/<change>.json`
+        // (NOT the workspace) per the architectural fix that removed
+        // it from the git working tree where `git clean -fd` would
+        // periodically wipe it.
+        let paths = crate::paths::current();
+        let basename = workspace
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        if crate::iteration_pending::marker_exists(&paths, basename, &name) {
+            let iteration_number =
+                match crate::iteration_pending::read_marker(&paths, basename, &name) {
+                    Ok(Some(m)) => m.iteration_number,
+                    // A truly absent marker shouldn't happen here (we just
+                    // checked exists), but treat absent like corrupt for
+                    // safety — both produce iteration_number 0.
+                    Ok(None) => 0,
+                    Err(_) => 0,
+                };
             marked.push((iteration_number, name));
         } else {
             unmarked.push(name);
@@ -1429,7 +1439,12 @@ mod tests {
             reason: "fixture".into(),
             iteration_number,
         };
-        crate::iteration_pending::write_marker(workspace, change, &marker).unwrap();
+        // Marker now lives under state_dir, NOT the workspace. Resolve
+        // via the same path accessor `list_pending` uses internally so
+        // the writer + reader agree on location.
+        let paths = crate::paths::current();
+        let basename = workspace.file_name().and_then(|s| s.to_str()).unwrap();
+        crate::iteration_pending::write_marker(&paths, basename, change, &marker).unwrap();
     }
 
     /// Task 5.3: unmarked vs. marked — the iteration-pending entry
@@ -1495,11 +1510,16 @@ mod tests {
         let ws = dir.path();
         make_change(ws, "a30-corrupt");
         make_change(ws, "a31-valid");
-        // Inject a corrupt marker for a30-corrupt.
+        // Inject a corrupt marker for a30-corrupt at the state-dir
+        // location (post-refactor: markers live under state_dir, NOT
+        // the workspace). We mirror what `list_pending` itself does
+        // to resolve the marker path.
+        let paths = crate::paths::current();
+        let basename = ws.file_name().and_then(|s| s.to_str()).unwrap();
+        let corrupt_dir = paths.iteration_pending_basename_dir(basename);
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
         std::fs::write(
-            ws.join(CHANGES_SUBDIR)
-                .join("a30-corrupt")
-                .join(crate::iteration_pending::MARKER_FILE),
+            paths.iteration_pending_path(basename, "a30-corrupt"),
             "{ truncated json",
         )
         .unwrap();
