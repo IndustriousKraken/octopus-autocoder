@@ -17,6 +17,7 @@ use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHo
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
 use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
 use crate::spec_revision::{self, SpecNeedsRevisionDetail};
+use crate::paths::DaemonPaths;
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow};
@@ -123,6 +124,7 @@ pub async fn run(
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
+    paths: Arc<DaemonPaths>,
     cancel: CancellationToken,
 ) {
     run_with_hooks(
@@ -153,6 +155,7 @@ pub async fn run(
         pending_brownfield_batch_requests,
         iteration_cancel,
         iteration_drained,
+        paths,
         cancel,
         RunHooks::default(),
     )
@@ -247,12 +250,13 @@ pub async fn run_with_hooks(
     >,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
+    paths: Arc<DaemonPaths>,
     cancel: CancellationToken,
     hooks: RunHooks,
 ) {
     {
         let initial = repo.load();
-        let workspace = workspace::resolve_path(initial.as_ref());
+        let workspace = workspace::resolve_path(initial.as_ref(), &paths);
         tracing::info!(
             url = initial.url.as_str(),
             workspace = %workspace.display(),
@@ -312,7 +316,7 @@ pub async fn run_with_hooks(
         // mid-iteration reload cannot tear the config.
         let snapshot = repo.load();
         let snapshot_ref: &RepositoryConfig = snapshot.as_ref();
-        let workspace = workspace::resolve_path(snapshot_ref);
+        let workspace = workspace::resolve_path(snapshot_ref, &paths);
         let github_snap = github_holder.load_full();
         let reviewer_snap = reviewer_holder.load_full();
         let chatops_snap = chatops_holder.load_full();
@@ -1481,7 +1485,7 @@ pub async fn run_pass_through_commits(
     let fork_arg = fork_url
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
-    if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_arg) {
+    if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_arg, paths) {
         let class = classify_recovery_failure(&e);
         log_classified_recovery_failure(&repo.url, "workspace_init", class, &e);
         handle_classified_recovery_failure(
@@ -2598,7 +2602,7 @@ async fn maybe_post_contradiction_findings_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     let now = Utc::now();
     let should_alert = state
@@ -2677,7 +2681,7 @@ async fn maybe_post_unarchivable_deltas_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     let now = Utc::now();
     let should_alert = state
@@ -2899,7 +2903,7 @@ async fn post_perma_stuck_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     let now = Utc::now();
     let should_alert = state
@@ -2969,7 +2973,7 @@ async fn maybe_post_spec_revision_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     let now = Utc::now();
     let should_alert = state
@@ -3099,7 +3103,7 @@ pub(crate) async fn maybe_post_revise_picked_up_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.revise_notification_already_posted(
         comment_id,
@@ -3155,7 +3159,7 @@ pub(crate) async fn maybe_post_revise_succeeded_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.revise_notification_already_posted(
         comment_id,
@@ -3210,7 +3214,7 @@ pub(crate) async fn maybe_post_revise_failed_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.revise_notification_already_posted(
         comment_id,
@@ -3288,7 +3292,7 @@ pub(crate) async fn maybe_post_code_review_triggered_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.code_review_notification_already_posted(
         comment_id,
@@ -3337,7 +3341,7 @@ pub(crate) async fn maybe_post_code_review_complete_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.code_review_notification_already_posted(
         comment_id,
@@ -3389,7 +3393,7 @@ pub(crate) async fn maybe_post_code_review_failed_alert(
     if !ctx.failure_alerts_enabled {
         return;
     }
-    let workspace = workspace::resolve_path(repo);
+    let workspace = workspace::resolve_path(repo, paths);
     let mut state = AlertState::load_or_default(&workspace);
     if state.code_review_notification_already_posted(
         comment_id,
@@ -3655,7 +3659,7 @@ async fn execute_rebuild_iteration(
     let fork_arg = fork_url
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
-    workspace::ensure_initialized(workspace, &repo.url, fork_arg)?;
+    workspace::ensure_initialized(workspace, &repo.url, fork_arg, paths)?;
 
     // If the workspace is dirty (e.g. a SIGTERMed iteration left state),
     // try to recover. Failure to recover is fatal for this iteration.
@@ -5632,7 +5636,7 @@ pub async fn process_audit_triages(
         None => None,
     };
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
-    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg, paths)
         .with_context(|| "audit-triage: workspace ensure_initialized".to_string())?;
     let _ = crate::queue::clear_stale_locks(workspace);
     let _ = git::reset_hard_head(workspace);
@@ -6230,7 +6234,7 @@ pub async fn process_proposal_requests(
         None => None,
     };
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
-    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg, paths)
         .with_context(|| "chat-triage: workspace ensure_initialized".to_string())?;
     let _ = crate::queue::clear_stale_locks(workspace);
     let _ = git::reset_hard_head(workspace);

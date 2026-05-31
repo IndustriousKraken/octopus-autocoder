@@ -62,6 +62,7 @@ pub async fn run_due_audits(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     queued_audit_types: &HashSet<String>,
+    paths: &crate::paths::DaemonPaths,
 ) -> Result<()> {
     if registry.is_empty() {
         return Ok(());
@@ -108,6 +109,7 @@ pub async fn run_due_audits(
                 audit_settings,
                 chatops_ctx,
                 &mut state,
+                paths,
             )
             .await
             {
@@ -163,7 +165,8 @@ pub async fn run_due_audits(
             audit_settings,
             chatops_ctx,
             &mut state,
-        )
+                paths,
+            )
         .await
         {
             Ok(ran) => {
@@ -202,6 +205,7 @@ async fn run_one_audit(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
+    paths: &crate::paths::DaemonPaths,
 ) -> Result<bool> {
     drive_one_audit(
         audit,
@@ -212,6 +216,7 @@ async fn run_one_audit(
         chatops_ctx,
         state,
         /*bypass_cadence=*/ false,
+        paths,
     )
     .await
 }
@@ -232,6 +237,7 @@ async fn run_one_audit_unconditional(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
+    paths: &crate::paths::DaemonPaths,
 ) -> Result<bool> {
     drive_one_audit(
         audit,
@@ -242,6 +248,7 @@ async fn run_one_audit_unconditional(
         chatops_ctx,
         state,
         /*bypass_cadence=*/ true,
+        paths,
     )
     .await
 }
@@ -266,6 +273,7 @@ async fn drive_one_audit(
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
     bypass_cadence: bool,
+    paths: &crate::paths::DaemonPaths,
 ) -> Result<bool> {
     let audit_type = audit.audit_type();
     let cadence = resolved_cadence(repo, audits_cfg, audit_type);
@@ -309,7 +317,7 @@ async fn drive_one_audit(
         }
     }
 
-    let log_writer = AuditLogWriter::open(workspace, audit_type)?;
+    let log_writer = AuditLogWriter::open(workspace, audit_type, paths)?;
     // Record run-prelude metadata so operators reading the log later see
     // exactly when the run started and what cadence/SHA context it had.
     log_writer.write_section(
@@ -1015,7 +1023,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "audit should have run");
@@ -1040,7 +1048,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a2");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "audit must NOT run within cadence");
@@ -1065,7 +1073,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a3");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "HEAD unchanged → skip");
@@ -1089,7 +1097,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a4");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "SHA differs → audit must run");
@@ -1103,7 +1111,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         // No AuditsConfig at all → cadence resolves to Disabled.
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1115,7 +1123,7 @@ mod tests {
             settings: HashMap::new(),
             ..AuditsConfig::default()
         };
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1132,7 +1140,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a6");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         // After the violation handler, the workspace should be clean
@@ -1161,7 +1169,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         // After the OpenSpecOnly violation, src/forbidden.rs must be gone
@@ -1190,7 +1198,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7b");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         // The path is inside the allowed prefix → no revert.
@@ -1226,7 +1234,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .expect("scheduler must not propagate audit errors");
         // af2 (later in registry) MUST have run despite af1 erroring.
@@ -1446,10 +1454,10 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("logged1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
-        let log_dir = crate::paths::current().audit_logs_dir(&basename);
+        let log_dir = paths.audit_logs_dir(&basename);
         assert!(log_dir.exists(), "audit log dir must be created at {}", log_dir.display());
         let entries: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
@@ -1464,7 +1472,7 @@ mod tests {
             log_dir.display()
         );
         // Clean up the global tmp dir we created.
-        let _ = std::fs::remove_dir_all(crate::paths::current().run_logs_dir(&basename));
+        let _ = std::fs::remove_dir_all(paths.run_logs_dir(&basename));
     }
 
     /// When the audit returns `WorkspaceUnavailable`, the scheduler must
@@ -1498,7 +1506,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("wsu1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
 
@@ -1550,7 +1558,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .expect("scheduler must keep going");
         assert_eq!(
@@ -1606,7 +1614,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         no_post.assert_async().await;
@@ -1627,7 +1635,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("ve1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         // State + history updated.
@@ -1665,7 +1673,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("rep_retry");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new(), &paths)
             .await
             .unwrap();
         let state = AuditState::load_or_default(&ws);
@@ -1711,7 +1719,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1782,7 +1790,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -1825,7 +1833,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1851,7 +1859,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         silent_mock.assert_async().await;
@@ -1893,7 +1901,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1946,7 +1954,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new(), &paths)
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -2088,7 +2096,7 @@ mod tests {
         let repo = fixture_repo();
         let mut queued = HashSet::new();
         queued.insert("q3".to_string());
-        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &queued)
+        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &queued, &paths)
             .await
             .unwrap();
         assert_eq!(

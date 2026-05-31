@@ -34,13 +34,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
-    // Resolve + install the daemon-paths global BEFORE any callsite
-    // that reads workspace / control-socket / log / state paths. The
-    // resolution order (config → AUTOCODER_*_DIR → systemd → XDG →
-    // hard fallback) is owned by `paths::resolve_daemon_paths`. After
-    // the install, every callsite that previously read
-    // `<system-temp>/autocoder/...` paths reads the resolved locations
-    // (state on /var/lib, cache on /var/cache, etc.).
+    // Resolve the daemon paths exactly once at startup. The resolution
+    // order (config → AUTOCODER_*_DIR → systemd → XDG → hard fallback)
+    // is owned by `paths::resolve_daemon_paths`. The resulting
+    // `Arc<DaemonPaths>` is threaded explicitly through the daemon's
+    // top-level types (ControlState, polling tasks, executors) instead
+    // of being read from a process-global cell — see the canonical
+    // orchestrator-cli "Production paths SHALL be threaded" rule.
     let daemon_paths = paths::resolve_daemon_paths(&cfg)
         .context("resolving daemon data paths")?;
     paths::ensure_directories(&daemon_paths)
@@ -52,8 +52,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         runtime = %daemon_paths.runtime.display(),
         "daemon paths resolved"
     );
-    paths::install_global(daemon_paths.clone())
-        .context("installing global daemon paths")?;
+    let daemon_paths: Arc<paths::DaemonPaths> = Arc::new(daemon_paths);
 
     // Migrate any legacy /tmp paths into the new layout. Logged but
     // never fatal — operators see ERROR lines in journalctl and can
@@ -290,7 +289,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
 
     for repo in &cfg.repositories {
-        let derived = workspace::resolve_path(repo);
+        let derived = workspace::resolve_path(repo, &daemon_paths);
         tracing::info!(
             url = repo.url.as_str(),
             workspace = %derived.display(),
@@ -496,6 +495,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
+        daemon_paths: daemon_paths.clone(),
     });
 
     for repo in cfg.repositories.iter().cloned() {
@@ -525,7 +525,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         crate::rag::set_shared(canonical_rag_registry.clone(), rag_cfg.clone());
         // Set the control-socket env var so `ClaudeCliExecutor::write_mcp_config`
         // picks it up when writing the per-execution `.mcp.json`.
-        let socket = crate::control_socket::socket_path();
+        let socket = crate::control_socket::socket_path(&daemon_paths);
         unsafe {
             std::env::set_var(
                 crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
@@ -541,7 +541,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // outcome tools, independent of canonical_rag. Set it unconditionally
     // if not already set by the canonical_rag block above.
     if std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).is_err() {
-        let socket = crate::control_socket::socket_path();
+        let socket = crate::control_socket::socket_path(&daemon_paths);
         // SAFETY: daemon startup is single-threaded at this point; we
         // are the sole writer to the process env.
         unsafe {
@@ -562,6 +562,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
         outcome_store: crate::outcome_store::OutcomeStore::new(),
+        paths: daemon_paths.clone(),
     };
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
@@ -584,6 +585,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         chatops_holder.clone(),
         task_map.clone(),
         audit_registry.clone(),
+        daemon_paths.clone(),
         cancel.clone(),
     )
     .await;
@@ -638,6 +640,7 @@ async fn spawn_inbound_listener(
     chatops_holder: ChatOpsHolder,
     task_map: RepoTaskMap,
     audit_registry: Arc<AuditRegistry>,
+    daemon_paths: Arc<paths::DaemonPaths>,
     cancel: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let slot_arc = chatops_holder.load_full();
@@ -709,11 +712,15 @@ async fn spawn_inbound_listener(
             .with_brownfield_survey_enabled(cfg.features.brownfield_survey.enabled)
             .with_workspace_resolver({
                 let task_map_for_resolver = task_map.clone();
+                let paths_for_resolver = daemon_paths.clone();
                 move |url: &str| -> Option<std::path::PathBuf> {
                     let guard = task_map_for_resolver.lock().unwrap();
                     guard
                         .get(url)
-                        .map(|h| crate::workspace::resolve_path(&h.config.load_full()))
+                        .map(|h| crate::workspace::resolve_path(
+                            &h.config.load_full(),
+                            &paths_for_resolver,
+                        ))
                 }
             }),
     );
@@ -762,6 +769,7 @@ struct SpawnDeps {
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
+    daemon_paths: Arc<paths::DaemonPaths>,
 }
 
 /// Build a `SpawnRepoFn` that runs the repo's startup check, then spawns
@@ -783,7 +791,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         // Startup check uses the live github config (post-reload it may
         // differ from what was on disk at process start).
         let github_snap = deps.github_holder.load_full();
-        if !repo_passes_startup_check(&repo, &github_snap) {
+        if !repo_passes_startup_check(&repo, &github_snap, &deps.daemon_paths) {
             return SpawnOutcome::StartupCheckFailed;
         }
         let child_cancel = deps.global_cancel.child_token();
@@ -868,6 +876,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
+        let paths_for_task = deps.daemon_paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
                 config_for_task,
@@ -897,6 +906,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_brownfield_batch_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
+                paths_for_task,
                 cancel_for_task,
             );
             crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut)
@@ -1190,8 +1200,12 @@ pub async fn ensure_forks_exist(
 /// of skipping the repo for the daemon's lifetime. For now startup keeps
 /// its conservative skip-for-lifetime contract: any failure here removes
 /// the repo from the polling set until the operator restarts the daemon.
-pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig) -> bool {
-    let workspace_path = workspace::resolve_path(repo);
+pub fn repo_passes_startup_check(
+    repo: &RepositoryConfig,
+    github: &GithubConfig,
+    paths: &paths::DaemonPaths,
+) -> bool {
+    let workspace_path = workspace::resolve_path(repo, paths);
     let fork_url = match github.fork_owner.as_deref() {
         Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
             Ok(u) => Some(u),
@@ -1224,7 +1238,7 @@ pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig)
     let fork_arg = fork_url
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
-    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg) {
+    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg, paths) {
         tracing::error!(
             url = repo.url.as_str(),
             workspace = %workspace_path.display(),

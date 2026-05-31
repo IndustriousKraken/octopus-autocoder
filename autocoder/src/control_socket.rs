@@ -375,6 +375,12 @@ pub struct ControlState {
     /// action when the executor's classifier runs after subprocess
     /// exit. Keyed by `(workspace_basename, change)`.
     pub outcome_store: crate::outcome_store::OutcomeStore,
+    /// Threaded `Arc<DaemonPaths>` constructed once at daemon startup
+    /// AND passed to every handler that needs to resolve workspace,
+    /// state, cache, log, OR runtime paths. Replaces the prior
+    /// process-global `paths::current()` accessor per the canonical
+    /// orchestrator-cli "Production paths SHALL be threaded" rule.
+    pub paths: Arc<crate::paths::DaemonPaths>,
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -382,14 +388,15 @@ pub struct ControlState {
 /// `/run/autocoder/` under systemd or `${XDG_RUNTIME_DIR}/autocoder/`
 /// in dev mode); reboot-cleared tmpfs is the correct location for a
 /// socket that should never outlive the process that owns it.
-pub fn socket_path() -> PathBuf {
-    crate::paths::current().control_socket_path()
+pub fn socket_path(paths: &crate::paths::DaemonPaths) -> PathBuf {
+    paths.control_socket_path()
 }
 
 /// Bind the listener at the canonical socket path and accept connections
 /// until `cancel` fires. Removes the socket file on shutdown.
 pub async fn listen(state: ControlState, cancel: CancellationToken) -> Result<()> {
-    listen_at(socket_path(), state, cancel).await
+    let socket = socket_path(&state.paths);
+    listen_at(socket, state, cancel).await
 }
 
 /// Same as `listen` but binds at an explicit path. Used by tests so
@@ -566,7 +573,7 @@ fn find_repo_by_workspace(state: &ControlState, target: &Path) -> Option<String>
     let cfg = state.last_config.load_full();
     let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     for repo in cfg.repositories.iter() {
-        let ws = workspace::resolve_path(repo);
+        let ws = workspace::resolve_path(repo, &state.paths);
         if ws == target {
             return Some(repo.url.clone());
         }
@@ -592,7 +599,7 @@ fn managed_repo_list_for_error(state: &ControlState) -> String {
             format!(
                 "`{}` @ `{}`",
                 r.url,
-                workspace::resolve_path(r).display()
+                workspace::resolve_path(r, &state.paths).display()
             )
         })
         .collect::<Vec<_>>()
@@ -616,7 +623,7 @@ async fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
     let github_cfg = state.github.load_full();
     let stale_threshold = state
         .last_config
@@ -661,7 +668,7 @@ async fn handle_repo_status_all(state: &ControlState) -> Value {
         .busy_marker_stale_threshold_secs();
     let mut results = Vec::with_capacity(repos.len());
     for repo in repos {
-        let workspace_path = workspace::resolve_path(&repo);
+        let workspace_path = workspace::resolve_path(&repo, &state.paths);
         let url = repo.url.clone();
         let entry = match build_repo_status(&workspace_path, &repo, &github_cfg, stale_threshold).await {
             Ok(resp) => match serde_json::to_value(&resp) {
@@ -955,7 +962,7 @@ fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
     if let Err(e) = queue::remove_perma_stuck_marker(&workspace_path, &change) {
         return json!({"ok": false, "error": format!("{e:#}")});
     }
@@ -993,7 +1000,7 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
     match queue::remove_revision_marker(&workspace_path, &change) {
         Ok(()) => json!({"ok": true, "change": change, "url": url}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
@@ -1024,7 +1031,7 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
 
     // Refuse if the change has no underlying blocking marker — stamping
     // ignore on a change with no problem is a confusing no-op.
@@ -1104,7 +1111,7 @@ fn handle_clear_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value 
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
 
     // Remove the marker — propagate the absent-marker error.
     if let Err(e) = queue::remove_ignore_for_queue_marker(&workspace_path, &change) {
@@ -1175,7 +1182,7 @@ async fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace_path = workspace::resolve_path(&repo);
+    let workspace_path = workspace::resolve_path(&repo, &state.paths);
     let display = workspace_path.display().to_string();
 
     // Look up the per-repo handle's iteration_cancel handle + drained
@@ -1292,7 +1299,7 @@ async fn handle_rebuild_specs(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace = workspace::resolve_path(&repo);
+    let workspace = workspace::resolve_path(&repo, &state.paths);
 
     if immediate {
         if let Err(e) =
@@ -1658,7 +1665,7 @@ fn handle_queue_brownfield_request(parsed: &Value, state: &ControlState) -> Valu
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace = crate::workspace::resolve_path(&repo);
+    let workspace = crate::workspace::resolve_path(&repo, &state.paths);
     let brownfield_state = match crate::state::brownfield_request::read_state(
         &workspace,
         &request_id,
@@ -1927,7 +1934,7 @@ fn handle_queue_clear_scout(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace = crate::workspace::resolve_path(&repo);
+    let workspace = crate::workspace::resolve_path(&repo, &state.paths);
     let cleared = match crate::state::scout_run::clear_all(&workspace) {
         Ok(n) => n,
         Err(e) => {
@@ -2087,7 +2094,7 @@ fn handle_queue_clear_survey(parsed: &Value, state: &ControlState) -> Value {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let workspace = crate::workspace::resolve_path(&repo);
+    let workspace = crate::workspace::resolve_path(&repo, &state.paths);
     let cleared = match crate::state::brownfield_survey::clear_all(&workspace) {
         Ok(n) => n,
         Err(e) => {
@@ -3780,7 +3787,7 @@ github:
             .iter()
             .map(|r| RepoIdentity {
                 url: r.url.clone(),
-                workspace_path: crate::workspace::resolve_path(r),
+                workspace_path: crate::workspace::resolve_path(r, &state.paths),
             })
             .collect();
         let bot = "<@UBOT>";

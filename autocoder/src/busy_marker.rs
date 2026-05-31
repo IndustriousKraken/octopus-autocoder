@@ -4,8 +4,10 @@
 //! is not deleted unless its RAII guard drops, so SIGKILL or segfault
 //! leaves it for the next daemon start to discover and recover from).
 //!
-//! Path layout: `<system-temp>/autocoder/busy/<workspace-basename>.json`.
+//! Path layout: `<runtime_dir>/busy/<workspace-basename>.json` (resolved
+//! via the threaded `DaemonPaths` value).
 
+use crate::paths::DaemonPaths;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -127,12 +129,12 @@ impl Drop for BusyGuard {
 /// never leaves a stale marker file across the next host boot — by
 /// design ephemeral, matching the semantics of an "is the daemon
 /// currently working on this repo?" question.
-pub fn marker_path(workspace: &Path) -> PathBuf {
+pub fn marker_path(workspace: &Path, paths: &DaemonPaths) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
+    paths
         .busy_markers_dir()
         .join(format!("{basename}.json"))
 }
@@ -143,12 +145,12 @@ pub fn marker_path(workspace: &Path) -> PathBuf {
 /// with `process_group(0)`) so stuck-state recovery can target the right
 /// process group when the daemon's own pgid does not cover orphaned
 /// children.
-pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
+pub fn subprocess_marker_path(workspace: &Path, paths: &DaemonPaths) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
+    paths
         .busy_markers_dir()
         .join(format!("{basename}.subprocess"))
 }
@@ -156,8 +158,8 @@ pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
 /// Atomically record `pid` to the subprocess-sidecar file for `workspace`.
 /// Writes via temp-file-then-rename so concurrent readers never see a
 /// partial value.
-pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
-    let path = subprocess_marker_path(workspace);
+pub fn write_subprocess_marker(workspace: &Path, pid: u32, paths: &DaemonPaths) -> Result<()> {
+    let path = subprocess_marker_path(workspace, paths);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating subprocess-marker dir {}", parent.display()))?;
@@ -186,8 +188,8 @@ pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
 /// against the same daemon's own writes. A missing or malformed marker
 /// is logged at DEBUG and ignored — the status reply gracefully
 /// degrades to `currently: idle`.
-pub fn update_change(workspace: &Path, change: &str) {
-    let path = marker_path(workspace);
+pub fn update_change(workspace: &Path, change: &str, paths: &DaemonPaths) {
+    let path = marker_path(workspace, paths);
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
         Err(e) => {
@@ -237,8 +239,9 @@ pub fn update_change(workspace: &Path, change: &str) {
 pub fn current(
     workspace: &Path,
     stale_threshold_secs: u64,
+    paths: &DaemonPaths,
 ) -> Option<crate::chatops::operator_commands::BusySummary> {
-    current_with(workspace, stale_threshold_secs, &RealProcessOps)
+    current_with(workspace, stale_threshold_secs, &RealProcessOps, paths)
 }
 
 /// Test-injectable variant of [`current`]. `ops` is used for the PID-
@@ -248,13 +251,14 @@ pub fn current_with(
     workspace: &Path,
     stale_threshold_secs: u64,
     ops: &dyn ProcessOps,
+    paths: &DaemonPaths,
 ) -> Option<crate::chatops::operator_commands::BusySummary> {
-    let path = marker_path(workspace);
+    let path = marker_path(workspace, paths);
     let raw = std::fs::read_to_string(&path).ok()?;
     let marker: BusyMarker = serde_json::from_str(&raw).ok()?;
     let pid_alive = ops.pid_alive(marker.pid);
     let audit_type = if marker.stage == Stage::Executor && marker.change.trim().is_empty() {
-        find_audit_for_marker(workspace, marker.started_at)
+        find_audit_for_marker(workspace, marker.started_at, paths)
     } else {
         None
     };
@@ -283,9 +287,10 @@ pub fn current_with(
 fn find_audit_for_marker(
     workspace: &Path,
     started_at: chrono::DateTime<chrono::Utc>,
+    paths: &DaemonPaths,
 ) -> Option<String> {
     let basename = workspace.file_name().and_then(|n| n.to_str())?;
-    let dir = crate::paths::current().audit_logs_dir(basename);
+    let dir = paths.audit_logs_dir(basename);
     let entries = std::fs::read_dir(&dir).ok()?;
     // Candidate safe-timestamps: marker_started_at ± 1 second. Audit
     // log files are opened immediately after the marker is stamped, so
@@ -318,8 +323,8 @@ fn find_audit_for_marker(
 /// Best-effort read of the subprocess-sidecar file. Returns `None` if the
 /// file is absent, unreadable, or fails to parse — recovery never
 /// propagates errors out of this read because the sidecar is diagnostic.
-pub fn read_subprocess_marker(workspace: &Path) -> Option<i32> {
-    let path = subprocess_marker_path(workspace);
+pub fn read_subprocess_marker(workspace: &Path, paths: &DaemonPaths) -> Option<i32> {
+    let path = subprocess_marker_path(workspace, paths);
     let raw = std::fs::read_to_string(&path).ok()?;
     let first = raw.split_whitespace().next()?;
     first.parse::<i32>().ok()
@@ -327,8 +332,8 @@ pub fn read_subprocess_marker(workspace: &Path) -> Option<i32> {
 
 /// Best-effort removal of the subprocess-sidecar file. Silent on
 /// `NotFound`; WARN-logs other errors so recovery can continue.
-pub fn remove_subprocess_marker(workspace: &Path) {
-    let path = subprocess_marker_path(workspace);
+pub fn remove_subprocess_marker(workspace: &Path, paths: &DaemonPaths) {
+    let path = subprocess_marker_path(workspace, paths);
     if let Err(e) = std::fs::remove_file(&path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -355,12 +360,14 @@ pub fn try_acquire(
     workspace: &Path,
     repo_url: &str,
     stuck_threshold_secs: u64,
+    paths: &DaemonPaths,
 ) -> Result<AcquireOutcome> {
     try_acquire_with(
         workspace,
         repo_url,
         stuck_threshold_secs,
         &RealProcessOps,
+        paths,
     )
 }
 
@@ -371,8 +378,9 @@ pub fn try_acquire_with(
     repo_url: &str,
     stuck_threshold_secs: u64,
     ops: &dyn ProcessOps,
+    paths: &DaemonPaths,
 ) -> Result<AcquireOutcome> {
-    let path = marker_path(workspace);
+    let path = marker_path(workspace, paths);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating busy-marker dir {}", parent.display()))?;
@@ -417,7 +425,7 @@ pub fn try_acquire_with(
                             "busy_marker: existing file is malformed ({parse_err:#}); deleting and retrying"
                         );
                         let _ = std::fs::remove_file(&path);
-                        remove_subprocess_marker(workspace);
+                        remove_subprocess_marker(workspace, paths);
                         if attempt == 0 {
                             continue;
                         }
@@ -458,7 +466,7 @@ pub fn try_acquire_with(
                         "busy_marker: PID dead; clearing marker and acquiring (no age gate)"
                     );
                     let _ = std::fs::remove_file(&path);
-                    remove_subprocess_marker(workspace);
+                    remove_subprocess_marker(workspace, paths);
                     if attempt == 0 {
                         continue;
                     }
@@ -512,7 +520,7 @@ pub fn try_acquire_with(
                 // that PID. Fall back to the marker's `pgid` only when
                 // no sidecar exists (older daemon, or the subprocess
                 // never started).
-                let sidecar_pid = read_subprocess_marker(workspace);
+                let sidecar_pid = read_subprocess_marker(workspace, paths);
                 let target_pgid = sidecar_pid.unwrap_or(existing.pgid);
                 let wait_pid: u32 = match sidecar_pid {
                     Some(p) if p > 0 => p as u32,
@@ -537,7 +545,7 @@ pub fn try_acquire_with(
                     ops.killpg_kill(target_pgid);
                 }
                 let _ = std::fs::remove_file(&path);
-                remove_subprocess_marker(workspace);
+                remove_subprocess_marker(workspace, paths);
                 if attempt == 0 {
                     continue;
                 }
@@ -759,8 +767,9 @@ mod tests {
         pid: u32,
         comm: &str,
         age_secs: i64,
+        paths: &DaemonPaths,
     ) {
-        let path = marker_path(workspace);
+        let path = marker_path(workspace, paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let started = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
         let marker = BusyMarker {
@@ -777,14 +786,15 @@ mod tests {
 
     #[test]
     fn acquire_on_clean_returns_acquired() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let (_dir, ws) = fixture_workspace();
-        match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(guard) => {
                 assert!(guard.path().exists(), "marker file must exist");
                 assert_eq!(guard.contents.repo_url, "git@github.com:test/repo.git");
                 assert_eq!(guard.contents.stage, Stage::Executor);
                 drop(guard);
-                assert!(!marker_path(&ws).exists(), "Drop must remove file");
+                assert!(!marker_path(&ws, &paths).exists(), "Drop must remove file");
             }
             _ => panic!("expected Acquired"),
         }
@@ -792,8 +802,9 @@ mod tests {
 
     #[test]
     fn acquire_when_fresh_returns_skip_fresh() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 10);
+        pre_populate_marker(&ws, 99999, "claude", 10, &paths);
         // The fresh-skip path is age < threshold AND pid_alive. The
         // pre-spec test relied on `MockOps::new()` returning false for
         // pid_alive AND letting the age check fire first; under the
@@ -801,7 +812,7 @@ mod tests {
         // hits the dead-pid recovery branch. Mark the PID alive so
         // the test exercises the fresh-skip branch it documents.
         let ops = MockOps::new().with_alive(99999);
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::SkipFreshInProgress(details)) => {
                 assert_eq!(details.marker.pid, 99999);
                 assert_eq!(details.threshold_secs, 1800);
@@ -811,7 +822,7 @@ mod tests {
                     "live + fresh marker is not recovery-eligible"
                 );
                 // Marker MUST remain untouched.
-                assert!(marker_path(&ws).exists());
+                assert!(marker_path(&ws, &paths).exists());
             }
             other => panic!("expected SkipFreshInProgress, got something else; result was: {:?}",
                 other.map(|o| match o {
@@ -821,16 +832,17 @@ mod tests {
                 })),
         }
         // Cleanup so subsequent tests don't see stale file.
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     #[test]
     fn acquire_when_stale_dead_pid_recovers() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
         // MockOps with no alive PIDs → pid_alive(99999) returns false.
         let ops = MockOps::new();
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 assert!(guard.path().exists());
                 // The marker should be FRESH (recently written) — old PID
@@ -844,11 +856,12 @@ mod tests {
 
     #[test]
     fn acquire_when_malformed_recovers() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let (_dir, ws) = fixture_workspace();
-        let path = marker_path(&ws);
+        let path = marker_path(&ws, &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not valid JSON {{{").unwrap();
-        match try_acquire(&ws, "git@github.com:test/repo.git", 1800) {
+        match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 drop(guard);
             }
@@ -859,9 +872,9 @@ mod tests {
     #[test]
     fn acquire_when_stuck_kills_pgid_and_recovers() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 // Precedence rule: stuck-recovery prefers the subprocess
                 // sidecar's PGID over the marker's `pgid`. This test
@@ -883,24 +896,24 @@ mod tests {
         // Recorded comm was "claude", but the live PID's comm is "vim" —
         // either the PID was reused or this isn't an autocoder-spawned
         // process. Conservative path: leave file, skip iteration.
-        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "vim");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::SkipAmbiguous(m)) => {
                 assert_eq!(m.comm, "claude");
-                assert!(marker_path(&ws).exists(),
+                assert!(marker_path(&ws, &paths).exists(),
                     "ambiguous case MUST leave the file for human inspection");
             }
             _ => panic!("expected SkipAmbiguous"),
         }
         // Cleanup so test doesn't leak the marker.
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     #[test]
     fn set_stage_persists_atomically() {
         let (_dir, ws) = fixture_workspace();
-        let mut guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        let mut guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
@@ -912,7 +925,7 @@ mod tests {
     #[test]
     fn guard_drop_removes_file() {
         let (_dir, ws) = fixture_workspace();
-        let path = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        let path = match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(g) => {
                 let p = g.path().to_path_buf();
                 assert!(p.exists());
@@ -926,7 +939,7 @@ mod tests {
 
     #[test]
     fn marker_path_layout_under_autocoder_busy() {
-        let path = marker_path(Path::new("/tmp/workspaces/github_com_owner_repo"));
+        let path = marker_path(Path::new("/tmp/workspaces/github_com_owner_repo"), &paths);
         let s = path.to_string_lossy();
         assert!(s.contains("autocoder"));
         assert!(s.contains("busy"));
@@ -941,8 +954,8 @@ mod tests {
 
     /// Pre-populate a sidecar file at `subprocess_marker_path(workspace)`
     /// containing `pid` so stuck-recovery can read it as the kill target.
-    fn pre_populate_subprocess_marker(workspace: &Path, pid: i32) {
-        let path = subprocess_marker_path(workspace);
+    fn pre_populate_subprocess_marker(workspace: &Path, pid: i32, paths: &DaemonPaths) {
+        let path = subprocess_marker_path(workspace, paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pid}\n")).unwrap();
     }
@@ -953,10 +966,10 @@ mod tests {
     #[test]
     fn stuck_recovery_uses_sidecar_pgid_when_present() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600); // marker.pgid = 1234
-        pre_populate_subprocess_marker(&ws, 5678);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths); // marker.pgid = 1234
+        pre_populate_subprocess_marker(&ws, 5678, &paths);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 let term = ops.killpg_terminate_called.lock().unwrap().clone();
                 assert_eq!(
@@ -968,12 +981,12 @@ mod tests {
                 // marker (held by `guard`) should not be accompanied by
                 // a stale sidecar.
                 assert!(
-                    !subprocess_marker_path(&ws).exists(),
+                    !subprocess_marker_path(&ws, &paths).exists(),
                     "sidecar must be removed after stuck-recovery"
                 );
                 drop(guard);
                 assert!(
-                    !marker_path(&ws).exists(),
+                    !marker_path(&ws, &paths).exists(),
                     "marker must be removed when guard is dropped"
                 );
             }
@@ -987,10 +1000,10 @@ mod tests {
     #[test]
     fn stuck_recovery_falls_back_to_marker_pgid_when_no_sidecar() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600); // marker.pgid = 1234
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths); // marker.pgid = 1234
         // No sidecar pre-written.
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 let term = ops.killpg_terminate_called.lock().unwrap().clone();
                 assert_eq!(
@@ -1010,10 +1023,10 @@ mod tests {
     #[test]
     fn write_and_read_subprocess_marker_roundtrip() {
         let (_dir, ws) = fixture_workspace();
-        write_subprocess_marker(&ws, 99).unwrap();
-        assert_eq!(read_subprocess_marker(&ws), Some(99));
-        remove_subprocess_marker(&ws);
-        assert_eq!(read_subprocess_marker(&ws), None);
+        write_subprocess_marker(&ws, 99, &paths).unwrap();
+        assert_eq!(read_subprocess_marker(&ws, &paths), Some(99));
+        remove_subprocess_marker(&ws, &paths);
+        assert_eq!(read_subprocess_marker(&ws, &paths), None);
     }
 
     /// A sidecar containing non-numeric content yields None (no panic).
@@ -1021,10 +1034,10 @@ mod tests {
     #[test]
     fn read_subprocess_marker_returns_none_on_garbage() {
         let (_dir, ws) = fixture_workspace();
-        let path = subprocess_marker_path(&ws);
+        let path = subprocess_marker_path(&ws, &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not a number\n").unwrap();
-        assert_eq!(read_subprocess_marker(&ws), None);
+        assert_eq!(read_subprocess_marker(&ws, &paths), None);
         // Cleanup so subsequent tests don't see the leftover file.
         let _ = std::fs::remove_file(&path);
     }
@@ -1034,20 +1047,20 @@ mod tests {
     #[test]
     fn stale_dead_pid_also_removes_sidecar() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600);
-        pre_populate_subprocess_marker(&ws, 5678);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
+        pre_populate_subprocess_marker(&ws, 5678, &paths);
         // MockOps with no alive PIDs → pid_alive(99999) returns false →
         // stale-dead branch fires.
         let ops = MockOps::new();
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 assert!(
-                    !subprocess_marker_path(&ws).exists(),
+                    !subprocess_marker_path(&ws, &paths).exists(),
                     "sidecar must be removed in the stale-dead branch"
                 );
                 drop(guard);
                 assert!(
-                    !marker_path(&ws).exists(),
+                    !marker_path(&ws, &paths).exists(),
                     "marker must be removed when guard is dropped"
                 );
             }
@@ -1058,7 +1071,7 @@ mod tests {
     #[test]
     fn current_returns_none_when_marker_absent() {
         let (_dir, ws) = fixture_workspace();
-        assert!(current(&ws, 600).is_none());
+        assert!(current(&ws, 600, &paths).is_none());
     }
 
     #[test]
@@ -1069,11 +1082,11 @@ mod tests {
         // can surface the marker's actual contents (audit run,
         // post-executor stage, etc.) instead of misleadingly
         // collapsing to `currently: idle`.
-        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
-        let summary = current(&ws, 600).expect("current must return Some for any present marker");
+        let summary = current(&ws, 600, &paths).expect("current must return Some for any present marker");
         assert!(summary.change.is_empty());
         assert_eq!(summary.stage, "executor");
         assert_eq!(summary.pid, std::process::id());
@@ -1086,12 +1099,12 @@ mod tests {
     #[test]
     fn current_reports_change_and_started_at_when_set() {
         let (_dir, ws) = fixture_workspace();
-        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
-        update_change(&ws, "a05-foo");
-        let summary = current(&ws, 600).expect("current must return Some after update_change");
+        update_change(&ws, "a05-foo", &paths);
+        let summary = current(&ws, 600, &paths).expect("current must return Some after update_change");
         assert_eq!(summary.change, "a05-foo");
         // started_at is the marker's recorded RFC3339 timestamp; on the
         // happy path it's "very recent" — within the last minute should
@@ -1107,14 +1120,14 @@ mod tests {
     #[test]
     fn current_does_not_take_marker() {
         let (_dir, ws) = fixture_workspace();
-        let guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+        let guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800, &paths).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
-        update_change(&ws, "a05-foo");
-        let marker_before = marker_path(&ws);
+        update_change(&ws, "a05-foo", &paths);
+        let marker_before = marker_path(&ws, &paths);
         assert!(marker_before.exists());
-        let _ = current(&ws, 600);
+        let _ = current(&ws, 600, &paths);
         // Peek MUST NOT remove the marker.
         assert!(
             marker_before.exists(),
@@ -1135,11 +1148,11 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             .replace(':', "-");
         let basename = ws.file_name().unwrap().to_str().unwrap().to_string();
-        let logs_dir = crate::paths::current().audit_logs_dir(&basename);
+        let logs_dir = paths.audit_logs_dir(&basename);
         std::fs::create_dir_all(&logs_dir).unwrap();
         let log_path = logs_dir.join(format!("architecture_consultative-{safe_ts}.log"));
         std::fs::write(&log_path, "").unwrap();
-        let path = marker_path(&ws);
+        let path = marker_path(&ws, &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let marker = BusyMarker {
             repo_url: "git@github.com:test/repo.git".into(),
@@ -1151,19 +1164,19 @@ mod tests {
             change: String::new(),
         };
         write_atomic(&path, &marker).unwrap();
-        let summary = current(&ws, 600).expect("marker present");
+        let summary = current(&ws, 600, &paths).expect("marker present");
         assert_eq!(summary.audit_type.as_deref(), Some("architecture_consultative"));
         // Cleanup so this fixture doesn't bleed into other tests sharing
         // the same logs root.
         let _ = std::fs::remove_file(&log_path);
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     #[test]
     fn current_audit_type_none_when_no_log_matches() {
         let (_dir, ws) = fixture_workspace();
         let started = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let path = marker_path(&ws);
+        let path = marker_path(&ws, &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let marker = BusyMarker {
             repo_url: "git@github.com:test/repo.git".into(),
@@ -1175,9 +1188,9 @@ mod tests {
             change: String::new(),
         };
         write_atomic(&path, &marker).unwrap();
-        let summary = current(&ws, 600).expect("marker present");
+        let summary = current(&ws, 600, &paths).expect("marker present");
         assert!(summary.audit_type.is_none());
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     #[test]
@@ -1187,7 +1200,7 @@ mod tests {
         // branch is skipped and audit_type stays None. Belt-and-braces
         // since the formatter's "change non-empty" branch wins anyway.
         let started = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let path = marker_path(&ws);
+        let path = marker_path(&ws, &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let marker = BusyMarker {
             repo_url: "git@github.com:test/repo.git".into(),
@@ -1199,10 +1212,10 @@ mod tests {
             change: "a36-expense-tracking".into(),
         };
         write_atomic(&path, &marker).unwrap();
-        let summary = current(&ws, 600).expect("marker present");
+        let summary = current(&ws, 600, &paths).expect("marker present");
         assert_eq!(summary.change, "a36-expense-tracking");
         assert!(summary.audit_type.is_none());
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     // -----------------------------------------------------------------
@@ -1216,11 +1229,11 @@ mod tests {
     #[test]
     fn dead_pid_recovers_immediately_when_age_below_threshold() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 1);
+        pre_populate_marker(&ws, 99999, "claude", 1, &paths);
         // MockOps::new() → pid_alive(99999) returns false → dead-pid
         // branch fires regardless of the marker's age.
         let ops = MockOps::new();
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 assert!(guard.path().exists());
                 assert_eq!(guard.contents.pid, std::process::id());
@@ -1239,9 +1252,9 @@ mod tests {
     fn dead_pid_recovers_immediately_when_age_above_threshold() {
         let (_dir, ws) = fixture_workspace();
         // 90 days ≈ 7_776_000s — far above any plausible threshold.
-        pre_populate_marker(&ws, 99999, "claude", 90 * 86_400);
+        pre_populate_marker(&ws, 99999, "claude", 90 * 86_400, &paths);
         let ops = MockOps::new();
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 assert_eq!(guard.contents.pid, std::process::id());
                 drop(guard);
@@ -1255,20 +1268,20 @@ mod tests {
     #[test]
     fn live_pid_fresh_skips_iteration() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 1);
+        pre_populate_marker(&ws, 99999, "claude", 1, &paths);
         let ops = MockOps::new().with_alive(99999);
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops, &paths) {
             Ok(AcquireOutcome::SkipFreshInProgress(details)) => {
                 assert_eq!(details.marker.pid, 99999);
                 assert_eq!(details.threshold_secs, 600);
                 assert!(details.age_secs < 60);
                 assert!(details.pid_alive);
                 assert!(!details.recovery_eligible());
-                assert!(marker_path(&ws).exists(), "fresh marker must NOT be deleted");
+                assert!(marker_path(&ws, &paths).exists(), "fresh marker must NOT be deleted");
             }
             _ => panic!("live + fresh marker must produce SkipFreshInProgress"),
         }
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     /// Live PID + age past threshold + comm matches → SIGTERM the
@@ -1277,9 +1290,9 @@ mod tests {
     #[test]
     fn live_pid_past_threshold_comm_matches_kills_and_recovers() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops, &paths) {
             Ok(AcquireOutcome::Acquired(guard)) => {
                 let term = ops.killpg_terminate_called.lock().unwrap().clone();
                 assert_eq!(
@@ -1300,22 +1313,22 @@ mod tests {
     #[test]
     fn live_pid_past_threshold_comm_differs_skips_ambiguous() {
         let (_dir, ws) = fixture_workspace();
-        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_marker(&ws, 99999, "claude", 3600, &paths);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "sshd");
-        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops) {
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 600, &ops, &paths) {
             Ok(AcquireOutcome::SkipAmbiguous(m)) => {
                 assert_eq!(m.comm, "claude");
                 // No kill signals should have fired in the ambiguous branch.
                 assert!(ops.killpg_terminate_called.lock().unwrap().is_empty());
                 assert!(ops.killpg_kill_called.lock().unwrap().is_empty());
                 assert!(
-                    marker_path(&ws).exists(),
+                    marker_path(&ws, &paths).exists(),
                     "ambiguous marker MUST remain for human inspection"
                 );
             }
             _ => panic!("live + stale + comm-differs must produce SkipAmbiguous"),
         }
-        let _ = std::fs::remove_file(marker_path(&ws));
+        let _ = std::fs::remove_file(marker_path(&ws, &paths));
     }
 
     // -----------------------------------------------------------------
@@ -1452,9 +1465,7 @@ mod tests {
 
     #[test]
     fn subprocess_marker_path_layout_under_autocoder_busy() {
-        let path = subprocess_marker_path(Path::new(
-            "/tmp/workspaces/github_com_owner_repo",
-        ));
+        let path = subprocess_marker_path(Path::new("/tmp/workspaces/github_com_owner_repo"), &paths);
         let s = path.to_string_lossy();
         assert!(s.contains("autocoder"));
         assert!(s.contains("busy"));

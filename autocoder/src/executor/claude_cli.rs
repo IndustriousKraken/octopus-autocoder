@@ -1952,12 +1952,12 @@ fn format_tool_input_summary(input: &serde_json::Value) -> String {
 /// URL-sanitized form produced by `workspace::derive_path`; this keeps
 /// the per-repo subdirectory consistent with the workspace's own
 /// naming.
-pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
+pub(crate) fn run_log_path(workspace: &Path, change: &str, paths: &crate::paths::DaemonPaths) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
+    paths
         .run_logs_dir(&basename)
         .join(format!("{change}.log"))
 }

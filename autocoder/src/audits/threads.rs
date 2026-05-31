@@ -10,6 +10,7 @@
 //! State files are JSON, atomically written via tempfile-then-rename so a
 //! torn write is never visible to a concurrent reader.
 
+use crate::paths::DaemonPaths;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -81,8 +82,8 @@ pub fn state_dir(root: &Path) -> PathBuf {
 /// audit-threads files survive reboot alongside audit cadence, failure
 /// counters, and revision state — they belong to the same persistent
 /// data category.
-pub fn default_state_root() -> PathBuf {
-    crate::paths::current().state
+pub fn default_state_root(paths: &DaemonPaths) -> PathBuf {
+    paths.state.clone()
 }
 
 /// Atomically write `state` to its canonical file. Parent directory is

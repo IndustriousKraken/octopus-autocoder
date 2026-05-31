@@ -18,18 +18,16 @@
 //!   4. XDG defaults under `$HOME` (dev mode).
 //!   5. Hard fallback to `/var/lib/autocoder` etc.
 //!
-//! # Threading convention (target state per `a27-thread-daemon-paths`)
+//! # Threading convention
 //!
-//! Production code threads `DaemonPaths` through APIs instead of
-//! reading it from a process-global. The daemon constructs exactly
-//! ONE `DaemonPaths` value at startup (in `cli::run::execute`) via
-//! [`resolve_daemon_paths`] AND hands it (by ownership, reference,
-//! OR `Arc<DaemonPaths>`) to the top-level types it constructs.
-//! Every consumer module receives its `DaemonPaths` via its
-//! constructor (for struct-shaped consumers) OR as an explicit
-//! function parameter (for free-function helpers). No module reads
-//! paths from a process-global cell, lazy-static, OR thread-local at
-//! runtime.
+//! `Arc<DaemonPaths>` is constructed exactly ONCE at daemon startup
+//! (in `cli::run::execute`) via [`resolve_daemon_paths`] AND threaded
+//! explicitly through APIs that need it: as a constructor field on
+//! struct-shaped consumers, OR as an explicit function parameter on
+//! free-function helpers. No process-global cell, lazy-static, OR
+//! thread-local at runtime — see the canonical orchestrator-cli
+//! "Production paths SHALL be threaded through APIs, NOT read from a
+//! process-global" requirement.
 //!
 //! Tests construct their own `DaemonPaths` via
 //! [`crate::testing::test_daemon_paths`] (which hands out a tempdir-
@@ -40,16 +38,10 @@
 //! A CI scanner (extending the `a10` `path_literals_audit`) blocks
 //! reintroduction of removed-global accessor names — see
 //! `autocoder/tests/path_literals_audit.rs`.
-//!
-//! The legacy process-global accessors
-//! ([`install_global`], [`get_global`], [`current`], [`test_fallback`])
-//! are retained during the migration but `#[deprecated]`; they will
-//! be removed once every call site has been threaded.
 
 use crate::config::Config;
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 /// The four standard daemon paths, resolved at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,68 +375,6 @@ pub fn ensure_directories(paths: &DaemonPaths) -> Result<()> {
         }
     }
     Ok(())
-}
-
-static GLOBAL: OnceLock<DaemonPaths> = OnceLock::new();
-
-/// Install the resolved `DaemonPaths` into the process-global cell.
-/// Returns an error if the cell has already been initialized (which
-/// would indicate a logic bug — only `cli::run::execute` should call
-/// this in production).
-pub fn install_global(paths: DaemonPaths) -> Result<()> {
-    GLOBAL
-        .set(paths)
-        .map_err(|_| anyhow!("daemon paths already initialized"))
-}
-
-/// Read-only access to the process-global `DaemonPaths`. Returns
-/// `None` until [`install_global`] has been called. Most callsites
-/// should prefer [`with_global`] which constructs a per-call fallback.
-pub fn get_global() -> Option<&'static DaemonPaths> {
-    GLOBAL.get()
-}
-
-/// Return the global `DaemonPaths` if installed, otherwise construct a
-/// process-stable test default rooted under `<system-temp>/autocoder`.
-/// The fallback is what existing tests have always written through
-/// (before this module existed); it preserves their behavior without
-/// requiring every test to install paths explicitly.
-pub fn current() -> DaemonPaths {
-    if let Some(p) = GLOBAL.get() {
-        return p.clone();
-    }
-    test_fallback()
-}
-
-fn test_fallback() -> DaemonPaths {
-    // Pre-`DaemonPaths` callsites wrote under `<system-temp>/autocoder/`
-    // with their own subdirectories (`workspaces/`, `logs/`, `busy/`,
-    // `control/`, `audit-threads/`, etc.). To preserve those exact
-    // paths for existing tests that hard-code expectations, the
-    // fallback collapses every category onto that one root: a
-    // workspace path therefore resolves to
-    // `<system-temp>/autocoder/workspaces/<sanitized-url>` exactly as
-    // before. Production code always installs the real `DaemonPaths`
-    // before any callsite reads from `current()`, so this collision is
-    // a test-mode-only quirk.
-    let root = std::env::temp_dir().join("autocoder");
-    DaemonPaths {
-        state: root.clone(),
-        cache: PathBuf::from("/tmp"),
-        logs: root.clone(),
-        runtime: root,
-    }
-}
-
-/// Test-only helper: install `paths` into the global cell, ignoring an
-/// already-installed cell (replacing it is impossible with `OnceLock`,
-/// so subsequent calls are silent no-ops — tests that need true
-/// per-test isolation construct their own `DaemonPaths` and pass them
-/// to the API directly instead of relying on the global).
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn install_global_for_test(paths: DaemonPaths) {
-    let _ = GLOBAL.set(paths);
 }
 
 #[cfg(test)]

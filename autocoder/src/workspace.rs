@@ -4,27 +4,25 @@
 use crate::config::GithubConfig;
 use crate::github::{self, DeleteOutcome};
 use crate::github_credentials::resolve_token;
+use crate::paths::DaemonPaths;
 use crate::{config::RepositoryConfig, git};
-use crate::paths;
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Compute the workspace root: `<cache_dir>/workspaces/`. Resolved from
-/// the process-global `DaemonPaths` when initialized (production); in
-/// tests that haven't installed paths this falls back to a fixed root
-/// under the system temp dir, preserving pre-`DaemonPaths` behavior for
-/// existing test fixtures.
-pub fn workspace_root() -> PathBuf {
-    paths::current().workspaces_dir()
+/// the threaded `DaemonPaths` value (constructed at daemon startup and
+/// passed in by the caller).
+pub fn workspace_root(paths: &DaemonPaths) -> PathBuf {
+    paths.workspaces_dir()
 }
 
 /// Derive a per-repo workspace path under `<cache_dir>/workspaces/`.
 /// Deterministic: the same URL always produces the same path. SSH and
 /// HTTPS forms of the same repository collapse to the same derived path.
-pub fn derive_path(url: &str) -> PathBuf {
-    workspace_root().join(sanitize(url))
+pub fn derive_path(url: &str, paths: &DaemonPaths) -> PathBuf {
+    workspace_root(paths).join(sanitize(url))
 }
 
 /// URL → directory-name sanitization, exposed so other state writes
@@ -56,11 +54,11 @@ fn sanitize(url: &str) -> String {
 }
 
 /// Resolve the workspace path for a repository: explicit `local_path` if set,
-/// otherwise the derived path.
-pub fn resolve_path(repo: &RepositoryConfig) -> PathBuf {
+/// otherwise the derived path under the threaded daemon cache dir.
+pub fn resolve_path(repo: &RepositoryConfig, paths: &DaemonPaths) -> PathBuf {
     repo.local_path
         .clone()
-        .unwrap_or_else(|| derive_path(&repo.url))
+        .unwrap_or_else(|| derive_path(&repo.url, paths))
 }
 
 /// Ensure the repository is locally cloned. If the path does not exist, run
@@ -82,6 +80,7 @@ pub fn ensure_initialized(
     workspace: &Path,
     url: &str,
     fork: Option<(&str, &str)>,
+    paths: &DaemonPaths,
 ) -> Result<()> {
     // Partial-clone self-heal: if the directory exists but has no
     // `.git/`, it is almost certainly leftover from a previously
@@ -201,7 +200,7 @@ pub fn ensure_initialized(
             "could not register .ignore-for-queue.json in .git/info/exclude: {e:#}"
         );
     }
-    enforce_alert_state_workspace_invariant(workspace);
+    enforce_alert_state_workspace_invariant(workspace, paths);
     Ok(())
 }
 
@@ -213,8 +212,7 @@ pub fn ensure_initialized(
 /// file. When the marker is absent, this check is a no-op — the
 /// first-startup migration in `alert_state_migration::migrate_*`
 /// handles pre-migration workspaces explicitly.
-pub(crate) fn enforce_alert_state_workspace_invariant(workspace: &Path) {
-    let paths = crate::paths::current();
+pub(crate) fn enforce_alert_state_workspace_invariant(workspace: &Path, paths: &DaemonPaths) {
     let marker = paths
         .alert_state_dir()
         .join(crate::alert_state_migration::MIGRATION_MARKER);
@@ -458,10 +456,10 @@ async fn recreate_fork_inner(
 
 /// Detect any two configured repositories that resolve to the same workspace
 /// path. Returns an error naming both URLs and the shared path when found.
-pub fn detect_collisions(repos: &[RepositoryConfig]) -> Result<()> {
+pub fn detect_collisions(repos: &[RepositoryConfig], paths: &DaemonPaths) -> Result<()> {
     let mut seen: HashMap<PathBuf, &str> = HashMap::new();
     for repo in repos {
-        let path = resolve_path(repo);
+        let path = resolve_path(repo, paths);
         if let Some(prior_url) = seen.get(&path) {
             return Err(anyhow!(
                 "workspace path collision: `{prior}` and `{current}` both resolve to {path}",
@@ -478,6 +476,7 @@ pub fn detect_collisions(repos: &[RepositoryConfig]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::test_daemon_paths;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -515,7 +514,8 @@ mod tests {
 
     #[test]
     fn derive_path_ssh_form() {
-        let p = derive_path("git@github.com:owner/repo.git");
+        let (_t, paths) = test_daemon_paths();
+        let p = derive_path("git@github.com:owner/repo.git", &paths);
         assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
         assert_eq!(
             p.parent().unwrap().file_name().and_then(|s| s.to_str()),
@@ -526,37 +526,42 @@ mod tests {
 
     #[test]
     fn derive_path_https_form() {
-        let p = derive_path("https://github.com/owner/repo.git");
+        let (_t, paths) = test_daemon_paths();
+        let p = derive_path("https://github.com/owner/repo.git", &paths);
         assert_eq!(p.file_name().unwrap(), "github_com_owner_repo");
     }
 
     #[test]
     fn derive_path_strips_git_suffix() {
-        let with_git = derive_path("git@github.com:owner/repo.git");
-        let without = derive_path("git@github.com:owner/repo");
+        let (_t, paths) = test_daemon_paths();
+        let with_git = derive_path("git@github.com:owner/repo.git", &paths);
+        let without = derive_path("git@github.com:owner/repo", &paths);
         assert_eq!(with_git, without);
     }
 
     #[test]
     fn derive_path_distinct_for_different_repos() {
-        let a = derive_path("git@github.com:owner/repo-a.git");
-        let b = derive_path("git@github.com:owner/repo-b.git");
+        let (_t, paths) = test_daemon_paths();
+        let a = derive_path("git@github.com:owner/repo-a.git", &paths);
+        let b = derive_path("git@github.com:owner/repo-b.git", &paths);
         assert_ne!(a, b);
     }
 
     #[test]
     fn derive_path_is_stable() {
+        let (_t, paths) = test_daemon_paths();
         let url = "git@github.com:owner/repo.git";
-        assert_eq!(derive_path(url), derive_path(url));
+        assert_eq!(derive_path(url, &paths), derive_path(url, &paths));
     }
 
     #[test]
     fn collision_detected() {
+        let (_t, paths) = test_daemon_paths();
         let repos = vec![
             cfg("git@github.com:owner/repo.git"),
             cfg("https://github.com/owner/repo.git"),
         ];
-        let err = detect_collisions(&repos).expect_err("should detect collision");
+        let err = detect_collisions(&repos, &paths).expect_err("should detect collision");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("git@github.com:owner/repo.git"),
@@ -570,22 +575,24 @@ mod tests {
 
     #[test]
     fn collision_detected_via_explicit_local_path() {
+        let (_t, paths) = test_daemon_paths();
         let repos = vec![
             cfg_with_local("git@github.com:owner/a.git", "/tmp/workspaces/shared"),
             cfg_with_local("git@github.com:owner/b.git", "/tmp/workspaces/shared"),
         ];
-        let err = detect_collisions(&repos).expect_err("should detect explicit collision");
+        let err = detect_collisions(&repos, &paths).expect_err("should detect explicit collision");
         let msg = format!("{err:#}");
         assert!(msg.contains("/tmp/workspaces/shared"), "got: {msg}");
     }
 
     #[test]
     fn no_collisions_when_distinct() {
+        let (_t, paths) = test_daemon_paths();
         let repos = vec![
             cfg("git@github.com:owner/a.git"),
             cfg("git@github.com:owner/b.git"),
         ];
-        detect_collisions(&repos).expect("distinct repos should pass");
+        detect_collisions(&repos, &paths).expect("distinct repos should pass");
     }
 
     fn run_git(path: &Path, args: &[&str]) {
@@ -607,28 +614,30 @@ mod tests {
 
     #[test]
     fn ensure_initialized_clones_when_absent() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         assert!(workspace.join(".git").is_dir());
         assert!(workspace.join("README.md").is_file());
     }
 
     #[test]
     fn ensure_initialized_fetches_when_present() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         // Make a local branch in the workspace; we'll verify it survives a fetch.
         run_git(&workspace, &["branch", "local-only-branch"]);
         // Second call should fetch (not re-clone) and preserve local branches.
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         let output = Command::new("git")
             .args(["branch", "--list", "local-only-branch"])
             .current_dir(&workspace)
@@ -651,6 +660,7 @@ mod tests {
 
     #[test]
     fn adds_fork_remote_on_first_clone() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -659,7 +669,7 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
         let remotes = list_remotes(&workspace);
         assert!(remotes.contains("origin"), "origin must be present: {remotes}");
         assert!(remotes.contains("fork"), "fork must be present: {remotes}");
@@ -668,6 +678,7 @@ mod tests {
 
     #[test]
     fn fork_remote_is_idempotent() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -676,9 +687,9 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
         // Second invocation must not error or duplicate the remote.
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
         let remotes = list_remotes(&workspace);
         let fork_lines = remotes.lines().filter(|l| l.starts_with("fork")).count();
         // git remote -v emits two lines per remote (fetch + push).
@@ -687,6 +698,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_fetches_fork_on_fresh_clone() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -703,7 +715,7 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
 
         // refs/remotes/fork/main must resolve (the fetch ran).
         let probe = Command::new("git")
@@ -730,6 +742,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_does_not_re_fetch_fork_on_existing_workspace() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -740,7 +753,7 @@ mod tests {
         let fork_url = fork.to_string_lossy().to_string();
         // First init: fresh clone → fetch fork runs, captures fork's
         // current HEAD.
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
         let initial = Command::new("git")
             .args(["rev-parse", "refs/remotes/fork/main"])
             .current_dir(&workspace)
@@ -755,7 +768,7 @@ mod tests {
 
         // Second init: workspace exists → only `git fetch origin` runs,
         // NOT `git fetch fork`. Local tracking ref must remain stale.
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
         let after = Command::new("git")
             .args(["rev-parse", "refs/remotes/fork/main"])
             .current_dir(&workspace)
@@ -771,6 +784,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_fetches_only_agent_branch_from_fork() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -788,7 +802,7 @@ mod tests {
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
         // Pretend `main` is the agent branch (fixture's only branch).
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "main")), &paths).unwrap();
 
         // refs/remotes/fork/main MUST resolve (the agent branch was fetched).
         let main_probe = Command::new("git")
@@ -815,6 +829,7 @@ mod tests {
 
     #[test]
     fn checkout_base_branch_after_fork_init_does_not_ambiguate() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         let fork = dir.path().join("fork");
@@ -848,7 +863,7 @@ mod tests {
         let workspace = dir.path().join("local");
         let upstream_url = upstream.to_string_lossy().to_string();
         let fork_url = fork.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "agent-q"))).unwrap();
+        ensure_initialized(&workspace, &upstream_url, Some((&fork_url, "agent-q")), &paths).unwrap();
 
         // The regression: `git checkout dev` must succeed without DWIM
         // ambiguity. (origin/dev is the only candidate; fork's dev
@@ -871,6 +886,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_tolerates_fork_fetch_failure() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let upstream = dir.path().join("upstream");
         make_fixture_remote(&upstream);
@@ -879,7 +895,7 @@ mod tests {
         // Point fork to a non-existent path — the fetch will fail.
         let bogus_fork_url = dir.path().join("does-not-exist").to_string_lossy().to_string();
         // ensure_initialized must still return Ok (the fetch is best-effort).
-        ensure_initialized(&workspace, &upstream_url, Some((&bogus_fork_url, "main")))
+        ensure_initialized(&workspace, &upstream_url, Some((&bogus_fork_url, "main")), &paths)
             .expect("ensure_initialized must tolerate fork fetch failure");
         // The fork remote was still registered.
         let remotes = list_remotes(&workspace);
@@ -888,12 +904,13 @@ mod tests {
 
     #[test]
     fn no_fork_remote_when_disabled() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         make_fixture_remote(&remote);
         let workspace = dir.path().join("local");
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         let remotes = list_remotes(&workspace);
         assert!(remotes.contains("origin"), "origin must be present");
         assert!(!remotes.contains("fork"), "fork must NOT be present");
@@ -901,12 +918,13 @@ mod tests {
 
     #[test]
     fn ensure_git_info_excluded_adds_once_and_is_idempotent() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
 
         let exclude_path = workspace.join(".git/info/exclude");
         // After ensure_initialized, every per-workspace bookkeeping file
@@ -925,7 +943,7 @@ mod tests {
         }
 
         // Calling ensure_initialized again must NOT duplicate any entry.
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         let contents = std::fs::read_to_string(&exclude_path).unwrap();
         for entry in [
             ".failure-state.json",
@@ -1067,6 +1085,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_auto_cleans_partial_clone_and_re_clones() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("local");
@@ -1081,7 +1100,7 @@ mod tests {
         )
         .unwrap();
         let url = remote.to_string_lossy().to_string();
-        ensure_initialized(&workspace, &url, None)
+        ensure_initialized(&workspace, &url, None, &paths)
             .expect("auto-cleanup + re-clone must succeed on a partial-clone artifact");
         assert!(
             workspace.join(".git").is_dir(),
@@ -1099,12 +1118,13 @@ mod tests {
 
     #[test]
     fn ensure_initialized_auto_clean_refuses_on_marker() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("not-a-repo");
         let change_dir = workspace.join("openspec/changes/foo");
         std::fs::create_dir_all(&change_dir).unwrap();
         std::fs::write(change_dir.join(".perma-stuck.json"), "{}").unwrap();
-        let err = ensure_initialized(&workspace, "irrelevant-url", None)
+        let err = ensure_initialized(&workspace, "irrelevant-url", None, &paths)
             .expect_err("auto-cleanup must be refused when a marker is present");
         let msg = format!("{err:#}");
         assert!(msg.contains(".git"), "error should mention missing .git: {msg}");
@@ -1125,6 +1145,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_re_clone_failure_surfaces_real_error() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("local");
         // Workspace exists with partial-clone-shape content but no .git/.
@@ -1136,7 +1157,7 @@ mod tests {
         .unwrap();
         // Bogus URL guarantees the second clone fails.
         let bogus_url = dir.path().join("does-not-exist").to_string_lossy().to_string();
-        let err = ensure_initialized(&workspace, &bogus_url, None)
+        let err = ensure_initialized(&workspace, &bogus_url, None, &paths)
             .expect_err("re-clone must fail when remote URL is bogus");
         let msg = format!("{err:#}");
         assert!(
@@ -1151,6 +1172,7 @@ mod tests {
 
     #[test]
     fn ensure_initialized_does_not_auto_clean_when_workspace_absent() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("never-existed");
@@ -1159,20 +1181,21 @@ mod tests {
         // Workspace doesn't exist at all → fresh-clone path; auto-clean
         // branch must NOT be entered. The outcome is identical to the
         // happy-path clone.
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         assert!(workspace.join(".git").is_dir());
         assert!(workspace.join("README.md").is_file());
     }
 
     #[test]
     fn ensure_initialized_does_not_auto_clean_when_git_present() {
+        let (_t, paths) = test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let remote = dir.path().join("remote");
         let workspace = dir.path().join("local");
         make_fixture_remote(&remote);
         let url = remote.to_string_lossy().to_string();
         // First call clones normally.
-        ensure_initialized(&workspace, &url, None).unwrap();
+        ensure_initialized(&workspace, &url, None, &paths).unwrap();
         // Plant a marker INSIDE openspec/changes/ to prove the safety
         // check is NOT invoked on the existing-with-.git/ path: if the
         // auto-cleanup branch were taken, the marker would trip the
@@ -1183,7 +1206,7 @@ mod tests {
             "{}",
         )
         .unwrap();
-        ensure_initialized(&workspace, &url, None)
+        ensure_initialized(&workspace, &url, None, &paths)
             .expect("existing .git/ takes the fetch path; auto-clean branch must not fire");
         // Marker survives because we took the fetch path, not auto-clean.
         assert!(workspace.join("openspec/changes/foo/.perma-stuck.json").exists());

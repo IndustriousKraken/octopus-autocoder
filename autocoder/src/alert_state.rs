@@ -1,6 +1,6 @@
 //! Per-workspace persistence for predictable-failure alert throttling.
 //!
-//! Production layout: `<state_dir>/alert-state/<workspace-basename>.json`
+//! Layout: `<state_dir>/alert-state/<workspace-basename>.json`
 //! (resolved via `DaemonPaths::alert_state_path()`). The file lives
 //! OUTSIDE the managed repository's workspace — daemon bookkeeping
 //! never appears in `git status` or any `git checkout` clobber-protection
@@ -8,11 +8,13 @@
 //! moves any legacy `<workspace>/.alert-state.json` files to the new
 //! location.
 //!
-//! Test layout (when the daemon-paths global has not been installed):
-//! the module falls back to the legacy `<workspace>/.alert-state.json`
-//! layout. Tests that build workspaces in `TempDir`s thus stay
-//! self-contained without each one needing to install paths.
+//! The `DaemonPaths` value is threaded explicitly through every public
+//! API (load/save/clear). Tests construct one via
+//! [`crate::testing::test_daemon_paths`] AND pass it explicitly — see
+//! the canonical orchestrator-cli "Production paths SHALL be threaded"
+//! requirement.
 
+use crate::paths::DaemonPaths;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -166,35 +168,21 @@ pub enum CodeReviewNotificationKind {
     Failed,
 }
 
-/// `true` when the production state-dir layout is active (i.e. the
-/// daemon has installed its `DaemonPaths` global). When `false`, the
-/// module falls back to a single-file-per-workspace layout — keeps
-/// tests that build workspaces in `TempDir`s working without each one
-/// needing to install paths.
-fn state_dir_layout_active() -> bool {
-    crate::paths::get_global().is_some()
-}
-
-/// Resolve the on-disk path of `<workspace>`'s alert-state file. Uses
-/// the state-dir layout in production and the legacy in-workspace path
-/// in tests that have not installed daemon-paths.
-fn alert_state_path(workspace: &Path) -> PathBuf {
-    if state_dir_layout_active() {
-        let basename = workspace
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        crate::paths::current().alert_state_path(&basename)
-    } else {
-        workspace.join(LEGACY_ALERT_STATE_FILE)
-    }
+/// Resolve the on-disk path of `<workspace>`'s alert-state file under
+/// the threaded `DaemonPaths`.
+fn alert_state_path(workspace: &Path, paths: &DaemonPaths) -> PathBuf {
+    let basename = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    paths.alert_state_path(&basename)
 }
 
 impl AlertState {
     /// Load the per-workspace alert state. A missing file is not an error —
     /// it parses to an empty state (no prior alerts).
-    pub fn load_or_default(workspace: &Path) -> Self {
-        let path = alert_state_path(workspace);
+    pub fn load_or_default(workspace: &Path, paths: &DaemonPaths) -> Self {
+        let path = alert_state_path(workspace, paths);
         match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
                 tracing::warn!(
@@ -217,8 +205,8 @@ impl AlertState {
     /// Atomically persist this state at the resolved alert-state path
     /// via tempfile-then-rename in the same directory so a torn write
     /// can never be observed by a concurrent reader.
-    pub fn save(&self, workspace: &Path) -> Result<()> {
-        let path = alert_state_path(workspace);
+    pub fn save(&self, workspace: &Path, paths: &DaemonPaths) -> Result<()> {
+        let path = alert_state_path(workspace, paths);
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
@@ -311,8 +299,8 @@ impl AlertState {
 
     /// Idempotent removal of the alert-state file. A missing file is a
     /// success, not an error.
-    pub fn clear(workspace: &Path) -> Result<()> {
-        let path = alert_state_path(workspace);
+    pub fn clear(workspace: &Path, paths: &DaemonPaths) -> Result<()> {
+        let path = alert_state_path(workspace, paths);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -328,13 +316,15 @@ mod tests {
 
     #[test]
     fn load_missing_returns_empty() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(dir.path(), &paths);
         assert!(state.alerts.is_empty());
     }
 
     #[test]
     fn save_and_reload_roundtrip() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let mut state = AlertState::default();
         let now = Utc::now();
@@ -345,9 +335,9 @@ mod tests {
                 last_error_excerpt: "refusing to update protected branch".into(),
             },
         );
-        state.save(dir.path()).unwrap();
+        state.save(dir.path(), &paths).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(dir.path(), &paths);
         let entry = reloaded
             .alerts
             .get(&AlertCategory::BranchPushFailure)
@@ -361,6 +351,7 @@ mod tests {
 
     #[test]
     fn clear_is_idempotent() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let mut state = AlertState::default();
         state.alerts.insert(
@@ -370,23 +361,25 @@ mod tests {
                 last_error_excerpt: "403 Forbidden".into(),
             },
         );
-        state.save(dir.path()).unwrap();
-        assert!(alert_state_path(dir.path()).exists());
-        AlertState::clear(dir.path()).expect("first clear ok");
-        assert!(!alert_state_path(dir.path()).exists());
+        state.save(dir.path(), &paths).unwrap();
+        assert!(alert_state_path(dir.path(), &paths).exists());
+        AlertState::clear(dir.path(), &paths).expect("first clear ok");
+        assert!(!alert_state_path(dir.path(), &paths).exists());
         // Second clear must also succeed.
-        AlertState::clear(dir.path()).expect("second clear ok");
+        AlertState::clear(dir.path(), &paths).expect("second clear ok");
     }
 
     #[test]
     fn clear_does_not_error_on_missing() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         // File never created.
-        AlertState::clear(dir.path()).expect("clear without prior save must succeed");
+        AlertState::clear(dir.path(), &paths).expect("clear without prior save must succeed");
     }
 
     #[test]
     fn archive_collision_variant_roundtrips_through_save_and_load() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let mut state = AlertState::default();
         let now = Utc::now();
@@ -397,9 +390,9 @@ mod tests {
                 last_error_excerpt: "archive destination already exists".into(),
             },
         );
-        state.save(dir.path()).unwrap();
+        state.save(dir.path(), &paths).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(dir.path(), &paths);
         let entry = reloaded
             .alerts
             .get(&AlertCategory::ArchiveCollision)
@@ -409,7 +402,7 @@ mod tests {
         assert!(diff < 5, "timestamps must roundtrip within 5ms; diff = {diff}");
 
         // Pin the on-disk JSON key.
-        let raw = std::fs::read_to_string(alert_state_path(dir.path())).unwrap();
+        let raw = std::fs::read_to_string(alert_state_path(dir.path(), &paths)).unwrap();
         assert!(
             raw.contains("archive_collision"),
             "archive collision must serialize as snake_case `archive_collision`; got: {raw}"
@@ -419,6 +412,7 @@ mod tests {
 
     #[test]
     fn revise_notifications_round_trip_through_save_and_load() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let mut state = AlertState::default();
         let now = Utc::now();
@@ -437,9 +431,9 @@ mod tests {
             ReviseNotificationKind::Failed,
             now,
         );
-        state.save(dir.path()).unwrap();
+        state.save(dir.path(), &paths).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(dir.path(), &paths);
         let e42 = reloaded
             .revise_notifications
             .get("comment-42")
@@ -480,6 +474,7 @@ mod tests {
 
     #[test]
     fn revise_notifications_field_defaults_to_empty_when_absent_in_json() {
+        let (_t, paths) = crate::testing::test_daemon_paths();
         // Simulate an alert-state file written by an older daemon that
         // doesn't know about `revise_notifications`. Loading must succeed
         // with the field defaulting to an empty map.
@@ -489,12 +484,12 @@ mod tests {
             "perma_stuck_alerts": {},
             "spec_revision_alerts": {}
         });
-        let path = alert_state_path(dir.path());
+        let path = alert_state_path(dir.path(), &paths);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap())
             .unwrap();
 
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(dir.path(), &paths);
         assert!(
             state.revise_notifications.is_empty(),
             "missing revise_notifications field must default to an empty map"
