@@ -116,38 +116,20 @@ pub struct RevisionContext {
     pub agent_implementation_notes: String,
 }
 
-/// Legacy per-workspace directory used as a fallback when the
-/// daemon-paths global is not installed (i.e. tests that build their
-/// workspace without going through `cli::run`). Preserves
-/// pre-`DaemonPaths` test-fixture expectations.
-const LEGACY_REVISIONS_DIR: &str = ".autocoder/revisions";
-
-/// Return the path to a PR's state file for `workspace`. In
-/// production, lives at
-/// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`. In tests
-/// where the daemon-paths global has not been installed, falls back to
-/// `<workspace>/.autocoder/revisions/<pr_number>.json`.
-pub fn state_path(workspace: &Path, pr_number: u64) -> PathBuf {
-    revisions_dir(workspace).join(format!("{pr_number}.json"))
+/// Return the path to a PR's state file for `workspace`, resolved to
+/// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`.
+pub fn state_path(paths: &crate::paths::DaemonPaths, workspace: &Path, pr_number: u64) -> PathBuf {
+    revisions_dir(paths, workspace).join(format!("{pr_number}.json"))
 }
 
 /// Return the directory under which all per-PR state files for one
-/// repo live. Resolved to `<state_dir>/revisions/<repo-sanitized>/` in
-/// production, or `<workspace>/.autocoder/revisions/` in the
-/// global-paths-not-installed fallback.
-fn revisions_dir(workspace: &Path) -> PathBuf {
-    if crate::paths::get_global().is_some() {
-        let basename = workspace
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        crate::paths::current()
-            .state
-            .join("revisions")
-            .join(basename)
-    } else {
-        workspace.join(LEGACY_REVISIONS_DIR)
-    }
+/// repo live: `<state_dir>/revisions/<repo-sanitized>/`.
+fn revisions_dir(paths: &crate::paths::DaemonPaths, workspace: &Path) -> PathBuf {
+    let basename = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    paths.revisions_dir().join(basename)
 }
 
 /// Read the state file for `pr_number`. A missing file returns
