@@ -15,6 +15,7 @@ use crate::code_reviewer::{
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
+use crate::paths::DaemonPaths;
 use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
 use crate::spec_revision::{self, SpecNeedsRevisionDetail};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
@@ -68,6 +69,7 @@ pub struct ChatOpsContext {
 /// picks up any swap that happened during the previous sleep.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    paths: Arc<DaemonPaths>,
     repo: Arc<ArcSwap<RepositoryConfig>>,
     executor: Arc<dyn Executor>,
     github_holder: GithubHolder,
@@ -126,6 +128,7 @@ pub async fn run(
     cancel: CancellationToken,
 ) {
     run_with_hooks(
+        paths,
         repo,
         executor,
         github_holder,
@@ -192,6 +195,7 @@ impl Drop for IterationGuard<'_> {
 /// Same as `run` but accepts a `RunHooks` for test-only synchronization.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_hooks(
+    paths: Arc<DaemonPaths>,
     repo: Arc<ArcSwap<RepositoryConfig>>,
     executor: Arc<dyn Executor>,
     github_holder: GithubHolder,
@@ -687,6 +691,7 @@ pub async fn run_with_hooks(
                 );
             }
         } else if let Err(error) = execute_one_pass(
+            &paths,
             &workspace,
             snapshot_ref,
             executor.as_ref(),
@@ -829,6 +834,7 @@ fn build_chatops_ctx(repo: &RepositoryConfig, slot: &ChatOpsSlot) -> ChatOpsCont
 /// produced.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_one_pass(
+    paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,

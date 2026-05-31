@@ -34,13 +34,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
-    // Resolve + install the daemon-paths global BEFORE any callsite
-    // that reads workspace / control-socket / log / state paths. The
-    // resolution order (config → AUTOCODER_*_DIR → systemd → XDG →
-    // hard fallback) is owned by `paths::resolve_daemon_paths`. After
-    // the install, every callsite that previously read
-    // `<system-temp>/autocoder/...` paths reads the resolved locations
-    // (state on /var/lib, cache on /var/cache, etc.).
+    // Resolve the daemon paths via the env-driven resolver, then wrap
+    // in an `Arc<DaemonPaths>` AND thread the value explicitly into
+    // every consumer (per the canonical `Production paths SHALL be
+    // threaded` requirement). The single `Arc` is constructed here
+    // exactly once per daemon process AND handed by clone into the
+    // top-level orchestrator types (`ClaudeCliExecutor`, `ControlState`,
+    // `polling_loop::run`).
     let daemon_paths = paths::resolve_daemon_paths(&cfg)
         .context("resolving daemon data paths")?;
     paths::ensure_directories(&daemon_paths)
@@ -52,8 +52,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         runtime = %daemon_paths.runtime.display(),
         "daemon paths resolved"
     );
-    paths::install_global(daemon_paths.clone())
-        .context("installing global daemon paths")?;
+    let daemon_paths: Arc<paths::DaemonPaths> = Arc::new(daemon_paths);
 
     // Migrate any legacy /tmp paths into the new layout. Logged but
     // never fatal — operators see ERROR lines in journalctl and can
@@ -479,6 +478,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
+        paths: daemon_paths.clone(),
         executor: executor.clone(),
         github_holder: github_holder.clone(),
         reviewer_holder: reviewer_holder.clone(),
@@ -744,6 +744,7 @@ async fn spawn_inbound_listener(
 /// Dependencies the daemon captures into the spawn closure so the reload
 /// handler can launch new polling tasks without re-deriving them.
 struct SpawnDeps {
+    paths: Arc<paths::DaemonPaths>,
     executor: Arc<dyn Executor>,
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
@@ -868,8 +869,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
+        let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
+                paths_for_task,
                 config_for_task,
                 executor_for_task,
                 github_for_task,

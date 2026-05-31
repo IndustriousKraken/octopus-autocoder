@@ -4,8 +4,14 @@
 //! is not deleted unless its RAII guard drops, so SIGKILL or segfault
 //! leaves it for the next daemon start to discover and recover from).
 //!
-//! Path layout: `<system-temp>/autocoder/busy/<workspace-basename>.json`.
+//! Path layout: `<runtime_dir>/busy/<workspace-basename>.json`, resolved
+//! via [`crate::paths::DaemonPaths::busy_markers_dir`].
+//!
+//! The `DaemonPaths` reference is threaded explicitly into every public
+//! function (function-parameter pattern per the canonical
+//! `Production paths SHALL be threaded` requirement).
 
+use crate::paths::DaemonPaths;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -127,14 +133,12 @@ impl Drop for BusyGuard {
 /// never leaves a stale marker file across the next host boot — by
 /// design ephemeral, matching the semantics of an "is the daemon
 /// currently working on this repo?" question.
-pub fn marker_path(workspace: &Path) -> PathBuf {
+pub fn marker_path(paths: &DaemonPaths, workspace: &Path) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
-        .busy_markers_dir()
-        .join(format!("{basename}.json"))
+    paths.busy_markers_dir().join(format!("{basename}.json"))
 }
 
 /// Compute the subprocess-sidecar path for the given workspace.
@@ -143,21 +147,19 @@ pub fn marker_path(workspace: &Path) -> PathBuf {
 /// with `process_group(0)`) so stuck-state recovery can target the right
 /// process group when the daemon's own pgid does not cover orphaned
 /// children.
-pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
+pub fn subprocess_marker_path(paths: &DaemonPaths, workspace: &Path) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
-        .busy_markers_dir()
-        .join(format!("{basename}.subprocess"))
+    paths.busy_markers_dir().join(format!("{basename}.subprocess"))
 }
 
 /// Atomically record `pid` to the subprocess-sidecar file for `workspace`.
 /// Writes via temp-file-then-rename so concurrent readers never see a
 /// partial value.
-pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
-    let path = subprocess_marker_path(workspace);
+pub fn write_subprocess_marker(paths: &DaemonPaths, workspace: &Path, pid: u32) -> Result<()> {
+    let path = subprocess_marker_path(paths, workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating subprocess-marker dir {}", parent.display()))?;
@@ -186,8 +188,8 @@ pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
 /// against the same daemon's own writes. A missing or malformed marker
 /// is logged at DEBUG and ignored — the status reply gracefully
 /// degrades to `currently: idle`.
-pub fn update_change(workspace: &Path, change: &str) {
-    let path = marker_path(workspace);
+pub fn update_change(paths: &DaemonPaths, workspace: &Path, change: &str) {
+    let path = marker_path(paths, workspace);
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
         Err(e) => {
@@ -235,26 +237,28 @@ pub fn update_change(workspace: &Path, change: &str) {
 ///
 /// Does NOT take, hold, or release the marker — purely informational.
 pub fn current(
+    paths: &DaemonPaths,
     workspace: &Path,
     stale_threshold_secs: u64,
 ) -> Option<crate::chatops::operator_commands::BusySummary> {
-    current_with(workspace, stale_threshold_secs, &RealProcessOps)
+    current_with(paths, workspace, stale_threshold_secs, &RealProcessOps)
 }
 
 /// Test-injectable variant of [`current`]. `ops` is used for the PID-
 /// liveness check so unit tests can simulate "dead pid" without having
 /// to find or kill a real process.
 pub fn current_with(
+    paths: &DaemonPaths,
     workspace: &Path,
     stale_threshold_secs: u64,
     ops: &dyn ProcessOps,
 ) -> Option<crate::chatops::operator_commands::BusySummary> {
-    let path = marker_path(workspace);
+    let path = marker_path(paths, workspace);
     let raw = std::fs::read_to_string(&path).ok()?;
     let marker: BusyMarker = serde_json::from_str(&raw).ok()?;
     let pid_alive = ops.pid_alive(marker.pid);
     let audit_type = if marker.stage == Stage::Executor && marker.change.trim().is_empty() {
-        find_audit_for_marker(workspace, marker.started_at)
+        find_audit_for_marker(paths, workspace, marker.started_at)
     } else {
         None
     };
@@ -281,11 +285,12 @@ pub fn current_with(
 /// selection and the audit-scheduler step); the formatter then falls
 /// through to the generic `executor in progress` line.
 fn find_audit_for_marker(
+    paths: &DaemonPaths,
     workspace: &Path,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
     let basename = workspace.file_name().and_then(|n| n.to_str())?;
-    let dir = crate::paths::current().audit_logs_dir(basename);
+    let dir = paths.audit_logs_dir(basename);
     let entries = std::fs::read_dir(&dir).ok()?;
     // Candidate safe-timestamps: marker_started_at ± 1 second. Audit
     // log files are opened immediately after the marker is stamped, so
@@ -318,8 +323,8 @@ fn find_audit_for_marker(
 /// Best-effort read of the subprocess-sidecar file. Returns `None` if the
 /// file is absent, unreadable, or fails to parse — recovery never
 /// propagates errors out of this read because the sidecar is diagnostic.
-pub fn read_subprocess_marker(workspace: &Path) -> Option<i32> {
-    let path = subprocess_marker_path(workspace);
+pub fn read_subprocess_marker(paths: &DaemonPaths, workspace: &Path) -> Option<i32> {
+    let path = subprocess_marker_path(paths, workspace);
     let raw = std::fs::read_to_string(&path).ok()?;
     let first = raw.split_whitespace().next()?;
     first.parse::<i32>().ok()
@@ -327,8 +332,8 @@ pub fn read_subprocess_marker(workspace: &Path) -> Option<i32> {
 
 /// Best-effort removal of the subprocess-sidecar file. Silent on
 /// `NotFound`; WARN-logs other errors so recovery can continue.
-pub fn remove_subprocess_marker(workspace: &Path) {
-    let path = subprocess_marker_path(workspace);
+pub fn remove_subprocess_marker(paths: &DaemonPaths, workspace: &Path) {
+    let path = subprocess_marker_path(paths, workspace);
     if let Err(e) = std::fs::remove_file(&path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -352,11 +357,13 @@ pub fn remove_subprocess_marker(workspace: &Path) {
 /// doesn't exist cannot be doing legitimate work, so the marker is
 /// unambiguously stale.
 pub fn try_acquire(
+    paths: &DaemonPaths,
     workspace: &Path,
     repo_url: &str,
     stuck_threshold_secs: u64,
 ) -> Result<AcquireOutcome> {
     try_acquire_with(
+        paths,
         workspace,
         repo_url,
         stuck_threshold_secs,
@@ -367,12 +374,13 @@ pub fn try_acquire(
 /// Test-injectable acquire. `ops` lets unit tests simulate "PID alive vs
 /// dead" and "comm matches vs differs" without spawning real processes.
 pub fn try_acquire_with(
+    paths: &DaemonPaths,
     workspace: &Path,
     repo_url: &str,
     stuck_threshold_secs: u64,
     ops: &dyn ProcessOps,
 ) -> Result<AcquireOutcome> {
-    let path = marker_path(workspace);
+    let path = marker_path(paths, workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating busy-marker dir {}", parent.display()))?;
@@ -417,7 +425,7 @@ pub fn try_acquire_with(
                             "busy_marker: existing file is malformed ({parse_err:#}); deleting and retrying"
                         );
                         let _ = std::fs::remove_file(&path);
-                        remove_subprocess_marker(workspace);
+                        remove_subprocess_marker(paths, workspace);
                         if attempt == 0 {
                             continue;
                         }
@@ -458,7 +466,7 @@ pub fn try_acquire_with(
                         "busy_marker: PID dead; clearing marker and acquiring (no age gate)"
                     );
                     let _ = std::fs::remove_file(&path);
-                    remove_subprocess_marker(workspace);
+                    remove_subprocess_marker(paths, workspace);
                     if attempt == 0 {
                         continue;
                     }
@@ -512,7 +520,7 @@ pub fn try_acquire_with(
                 // that PID. Fall back to the marker's `pgid` only when
                 // no sidecar exists (older daemon, or the subprocess
                 // never started).
-                let sidecar_pid = read_subprocess_marker(workspace);
+                let sidecar_pid = read_subprocess_marker(paths, workspace);
                 let target_pgid = sidecar_pid.unwrap_or(existing.pgid);
                 let wait_pid: u32 = match sidecar_pid {
                     Some(p) if p > 0 => p as u32,
@@ -537,7 +545,7 @@ pub fn try_acquire_with(
                     ops.killpg_kill(target_pgid);
                 }
                 let _ = std::fs::remove_file(&path);
-                remove_subprocess_marker(workspace);
+                remove_subprocess_marker(paths, workspace);
                 if attempt == 0 {
                     continue;
                 }

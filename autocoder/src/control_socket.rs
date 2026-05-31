@@ -375,6 +375,12 @@ pub struct ControlState {
     /// action when the executor's classifier runs after subprocess
     /// exit. Keyed by `(workspace_basename, change)`.
     pub outcome_store: crate::outcome_store::OutcomeStore,
+    /// Daemon-wide resolved `DaemonPaths`, threaded from the entrypoint
+    /// per the canonical `Production paths SHALL be threaded` requirement
+    /// (constructor-field pattern). Every handler that resolves a
+    /// state/cache/logs/runtime path uses this reference instead of a
+    /// process-global.
+    pub paths: Arc<crate::paths::DaemonPaths>,
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -382,14 +388,15 @@ pub struct ControlState {
 /// `/run/autocoder/` under systemd or `${XDG_RUNTIME_DIR}/autocoder/`
 /// in dev mode); reboot-cleared tmpfs is the correct location for a
 /// socket that should never outlive the process that owns it.
-pub fn socket_path() -> PathBuf {
-    crate::paths::current().control_socket_path()
+pub fn socket_path(paths: &crate::paths::DaemonPaths) -> PathBuf {
+    paths.control_socket_path()
 }
 
 /// Bind the listener at the canonical socket path and accept connections
 /// until `cancel` fires. Removes the socket file on shutdown.
 pub async fn listen(state: ControlState, cancel: CancellationToken) -> Result<()> {
-    listen_at(socket_path(), state, cancel).await
+    let path = socket_path(&state.paths);
+    listen_at(path, state, cancel).await
 }
 
 /// Same as `listen` but binds at an explicit path. Used by tests so

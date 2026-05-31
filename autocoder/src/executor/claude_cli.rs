@@ -99,6 +99,11 @@ pub struct ClaudeCliExecutor {
     args: Vec<String>,
     timeout: Duration,
     sandbox: crate::config::ResolvedSandbox,
+    /// Daemon-wide resolved `DaemonPaths`, threaded from the entrypoint
+    /// per the canonical `Production paths SHALL be threaded` requirement
+    /// (constructor-field pattern). Every `run_log_path`, busy-marker
+    /// sidecar, and control-socket lookup uses this reference.
+    paths: std::sync::Arc<crate::paths::DaemonPaths>,
     template: String,
     /// Stylist prompt template for the chat-driven `changelog` flow.
     /// Resolved from `executor.changelog_stylist.prompt_path` (nested,
@@ -143,11 +148,17 @@ struct ClaudeResumeData {
 }
 
 impl ClaudeCliExecutor {
-    pub fn new(command: String, timeout_secs: u64) -> Self {
+    #[cfg(test)]
+    pub fn new(
+        command: String,
+        timeout_secs: u64,
+        paths: std::sync::Arc<crate::paths::DaemonPaths>,
+    ) -> Self {
         Self::new_with_sandbox(
             command,
             timeout_secs,
             crate::config::ResolvedSandbox::resolve(None),
+            paths,
         )
     }
 
@@ -155,12 +166,14 @@ impl ClaudeCliExecutor {
         command: String,
         timeout_secs: u64,
         sandbox: crate::config::ResolvedSandbox,
+        paths: std::sync::Arc<crate::paths::DaemonPaths>,
     ) -> Self {
         Self {
             command,
             args: Vec::new(),
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
+            paths,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
             changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
             revision_template: DEFAULT_REVISION_TEMPLATE.to_string(),
@@ -186,7 +199,10 @@ impl ClaudeCliExecutor {
     /// loader's precedence chain (nested → flat-legacy → embedded);
     /// missing/empty configured override paths log a one-shot WARN at
     /// daemon-startup AND fall back to the embedded default.
-    pub fn from_config(cfg: &crate::config::ExecutorConfig) -> Result<Self> {
+    pub fn from_config(
+        cfg: &crate::config::ExecutorConfig,
+        paths: std::sync::Arc<crate::paths::DaemonPaths>,
+    ) -> Result<Self> {
         use crate::prompts::{PromptId, PromptLoader};
         let template = PromptLoader::load(
             PromptId::Implementer,
@@ -229,6 +245,7 @@ impl ClaudeCliExecutor {
             args: Vec::new(),
             timeout: Duration::from_secs(cfg.timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
+            paths,
             template,
             changelog_stylist_template,
             revision_template,
@@ -242,12 +259,18 @@ impl ClaudeCliExecutor {
     /// Test/extension constructor allowing additional args to be passed to
     /// the wrapped command. Production wiring uses `from_config`.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn with_args(command: String, args: Vec<String>, timeout_secs: u64) -> Self {
+    pub fn with_args(
+        command: String,
+        args: Vec<String>,
+        timeout_secs: u64,
+        paths: std::sync::Arc<crate::paths::DaemonPaths>,
+    ) -> Self {
         Self {
             command,
             args,
             timeout: Duration::from_secs(timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(None),
+            paths,
             template: DEFAULT_IMPLEMENTER_TEMPLATE.to_string(),
             changelog_stylist_template: DEFAULT_CHANGELOG_STYLIST_TEMPLATE.to_string(),
             revision_template: DEFAULT_REVISION_TEMPLATE.to_string(),
@@ -1964,12 +1987,16 @@ fn format_tool_input_summary(input: &serde_json::Value) -> String {
 /// URL-sanitized form produced by `workspace::derive_path`; this keeps
 /// the per-repo subdirectory consistent with the workspace's own
 /// naming.
-pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
+pub(crate) fn run_log_path(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    change: &str,
+) -> PathBuf {
     let basename = workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::paths::current()
+    paths
         .run_logs_dir(&basename)
         .join(format!("{change}.log"))
 }
