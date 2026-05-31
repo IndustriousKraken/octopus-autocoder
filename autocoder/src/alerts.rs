@@ -306,6 +306,7 @@ mod tests {
     async fn first_failure_posts_and_saves_state() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
         let mock = server
@@ -318,6 +319,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         handle_predictable_failure(
+            &paths,
             ws,
             "git@github.com:owner/repo.git",
             Some(&ctx),
@@ -328,7 +330,7 @@ mod tests {
         .await;
 
         mock.assert_async().await;
-        let state = AlertState::load_or_default(ws);
+        let state = AlertState::load_or_default(&paths, ws);
         assert!(
             state.alerts.contains_key(&AlertCategory::WorkspaceInitFailure),
             "state must persist the alerted-at timestamp after a successful post"
@@ -344,6 +346,7 @@ mod tests {
     async fn repeat_within_24h_is_silent() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-populate state as if we alerted 1 hour ago.
         let mut state = AlertState::default();
         state.alerts.insert(
@@ -353,7 +356,7 @@ mod tests {
                 last_error_excerpt: "prior".into(),
             },
         );
-        state.save(ws).unwrap();
+        state.save(&paths, ws).unwrap();
 
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
@@ -365,6 +368,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         handle_predictable_failure(
+            &paths,
             ws,
             "git@github.com:owner/repo.git",
             Some(&ctx),
@@ -376,7 +380,7 @@ mod tests {
 
         mock.assert_async().await;
         // State must be unchanged.
-        let state_after = AlertState::load_or_default(ws);
+        let state_after = AlertState::load_or_default(&paths, ws);
         assert_eq!(
             state_after.alerts[&AlertCategory::BranchPushFailure].last_error_excerpt,
             "prior"
@@ -387,6 +391,7 @@ mod tests {
     async fn beyond_24h_re_alerts_and_updates_state() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let old_time = Utc::now() - ChronoDuration::hours(25);
         let mut state = AlertState::default();
         state.alerts.insert(
@@ -396,7 +401,7 @@ mod tests {
                 last_error_excerpt: "stale-error".into(),
             },
         );
-        state.save(ws).unwrap();
+        state.save(&paths, ws).unwrap();
 
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
@@ -410,6 +415,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         handle_predictable_failure(
+            &paths,
             ws,
             "git@github.com:owner/repo.git",
             Some(&ctx),
@@ -420,7 +426,7 @@ mod tests {
         .await;
 
         mock.assert_async().await;
-        let state_after = AlertState::load_or_default(ws);
+        let state_after = AlertState::load_or_default(&paths, ws);
         let entry = &state_after.alerts[&AlertCategory::PrCreationFailure];
         assert_ne!(entry.last_alerted_at, old_time, "timestamp must update");
         assert!(entry.last_error_excerpt.contains("fresh failure 422"));
@@ -430,6 +436,7 @@ mod tests {
     async fn post_failure_does_not_update_state() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
         // Slack returns ok:false → post errors.
@@ -442,6 +449,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         handle_predictable_failure(
+            &paths,
             ws,
             "git@github.com:owner/repo.git",
             Some(&ctx),
@@ -452,8 +460,12 @@ mod tests {
         .await;
 
         // State file must NOT be written when the post fails.
+        let basename = ws
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
         assert!(
-            !ws.join(".alert-state.json").exists(),
+            !paths.alert_state_path(&basename).exists(),
             "state file must not be written when chatops post fails"
         );
     }
@@ -462,6 +474,7 @@ mod tests {
     async fn disabled_skips_even_reading_state() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
 
         // Make the workspace read-only-looking: place a state file we'd
         // expect to remain untouched (no read means no surprise behavior).
@@ -473,7 +486,7 @@ mod tests {
                 last_error_excerpt: "should-not-be-read".into(),
             },
         );
-        state.save(ws).unwrap();
+        state.save(&paths, ws).unwrap();
 
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
@@ -485,6 +498,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         handle_predictable_failure(
+            &paths,
             ws,
             "git@github.com:owner/repo.git",
             Some(&ctx),
@@ -496,7 +510,7 @@ mod tests {
 
         mock.assert_async().await;
         // State file untouched.
-        let state_after = AlertState::load_or_default(ws);
+        let state_after = AlertState::load_or_default(&paths, ws);
         assert_eq!(
             state_after.alerts[&AlertCategory::WorkspaceInitFailure].last_error_excerpt,
             "should-not-be-read"

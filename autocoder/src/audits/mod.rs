@@ -1458,7 +1458,8 @@ mod tests {
         let basename = format!("test-ws-{}", uuid::Uuid::new_v4());
         let workspace = dir.path().join(&basename);
         std::fs::create_dir_all(&workspace).unwrap();
-        let writer = AuditLogWriter::open(&workspace, "architecture_brightline")
+        let paths = crate::paths::DaemonPaths::under_root(dir.path());
+        let writer = AuditLogWriter::open(&paths, &workspace, "architecture_brightline")
             .expect("log open succeeds");
         writer.write_section("prompt", "(none)").unwrap();
         writer.write_section("output", "no findings").unwrap();

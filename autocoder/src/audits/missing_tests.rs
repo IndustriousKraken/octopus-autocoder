@@ -270,7 +270,9 @@ mod tests {
     }
 
     fn make_log_writer(workspace: &Path) -> AuditLogWriter {
-        AuditLogWriter::open(workspace, MissingTestsAudit::TYPE)
+        let (td, paths) = crate::testing::test_daemon_paths();
+        std::mem::forget(td);
+        AuditLogWriter::open(&paths, workspace, MissingTestsAudit::TYPE)
             .expect("audit log open succeeds")
     }
 

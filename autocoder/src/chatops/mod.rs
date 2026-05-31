@@ -688,12 +688,15 @@ mod tests {
     #[tokio::test]
     async fn default_inbound_listener_errors_with_provider_name() {
         let backend = StubBackend("stubbo");
-        let dispatcher = StdArc::new(OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1));
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let dispatcher = StdArc::new(OperatorCommandDispatcher::new(&paths));
+        let paths_arc = std::sync::Arc::new(paths);
         let repos: StdArc<dyn RepoIdentityProvider> =
-            StdArc::new(TaskMapRepoIdentities::new(std::sync::Arc::new(crate::testing::test_daemon_paths().1), Vec::new));
+            StdArc::new(TaskMapRepoIdentities::new(paths_arc.clone(), Vec::new));
         let channels = StdArc::new(HashSet::<String>::new());
         let err = backend
             .start_inbound_listener(
+                paths_arc.clone(),
                 dispatcher,
                 repos,
                 channels,

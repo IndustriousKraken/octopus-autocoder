@@ -505,7 +505,9 @@ mod outcome_tests {
     use tempfile::TempDir;
 
     fn make_log_writer(workspace: &std::path::Path) -> AuditLogWriter {
-        AuditLogWriter::open(workspace, "test_audit").expect("log writer opens")
+        let (td, paths) = crate::testing::test_daemon_paths();
+        std::mem::forget(td);
+        AuditLogWriter::open(&paths, workspace, "test_audit").expect("log writer opens")
     }
 
     /// Pure-data test: feed a synthesized `SubprocessOutcome` with

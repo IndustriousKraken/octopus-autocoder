@@ -34,11 +34,11 @@ use std::path::Path;
 /// referenced survey to `InProgress` AND posts the queue
 /// confirmation. Subsequent iterations drive the actual item drain.
 pub async fn process_pending_brownfield_batch(
-    paths: &crate::paths::DaemonPaths,
+    _paths: &crate::paths::DaemonPaths,
     workspace: &Path,
-    repo: &RepositoryConfig,
-    executor: &dyn crate::executor::Executor,
-    github_cfg: &crate::config::GithubConfig,
+    _repo: &RepositoryConfig,
+    _executor: &dyn crate::executor::Executor,
+    _github_cfg: &crate::config::GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     request: &crate::control_socket::BrownfieldBatchRequest,
 ) -> Result<()> {

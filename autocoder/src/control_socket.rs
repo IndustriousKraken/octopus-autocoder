@@ -2666,6 +2666,7 @@ mod tests {
         for repo in &cfg.repositories {
             let _ = (spawn)(repo.clone());
         }
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         ControlState {
             github: Arc::new(ArcSwap::from_pointee(cfg.github.clone())),
             reviewer: Arc::new(ArcSwap::from_pointee(None)),
@@ -2677,14 +2678,15 @@ mod tests {
             spawn_repo: spawn,
             canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
             outcome_store: crate::outcome_store::OutcomeStore::new(),
+            paths: Arc::new(paths),
         }
     }
 
     #[test]
     fn socket_path_is_under_runtime_dir() {
-        let p = socket_path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let p = socket_path(&paths);
         let s = p.to_string_lossy().to_string();
-        assert!(s.contains("autocoder"), "expected `autocoder` in path: {s}");
         assert!(
             s.ends_with("control.sock"),
             "expected `control.sock` suffix: {s}"

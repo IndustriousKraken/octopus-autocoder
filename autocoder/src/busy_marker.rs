@@ -943,9 +943,9 @@ mod tests {
 
     #[test]
     fn marker_path_layout_under_autocoder_busy() {
-        let path = marker_path(Path::new("/tmp/workspaces/github_com_owner_repo"));
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let path = marker_path(&paths, Path::new("/tmp/workspaces/github_com_owner_repo"));
         let s = path.to_string_lossy();
-        assert!(s.contains("autocoder"));
         assert!(s.contains("busy"));
         assert!(s.ends_with("github_com_owner_repo.json"));
     }
@@ -958,8 +958,8 @@ mod tests {
 
     /// Pre-populate a sidecar file at `subprocess_marker_path(workspace)`
     /// containing `pid` so stuck-recovery can read it as the kill target.
-    fn pre_populate_subprocess_marker(workspace: &Path, pid: i32) {
-        let path = subprocess_marker_path(workspace);
+    fn pre_populate_subprocess_marker(paths: &DaemonPaths, workspace: &Path, pid: i32) {
+        let path = subprocess_marker_path(paths, workspace);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pid}\n")).unwrap();
     }
@@ -972,7 +972,7 @@ mod tests {
         let (_dir, ws) = fixture_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         pre_populate_marker(&paths, &ws, 99999, "claude", 3600); // marker.pgid = 1234
-        pre_populate_subprocess_marker(&ws, 5678);
+        pre_populate_subprocess_marker(&paths, &ws, 5678);
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
         match try_acquire_with(&paths, &ws, "git@github.com:test/repo.git", 1800, &ops) {
             Ok(AcquireOutcome::Acquired(guard)) => {
@@ -1057,7 +1057,7 @@ mod tests {
         let (_dir, ws) = fixture_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         pre_populate_marker(&paths, &ws, 99999, "claude", 3600);
-        pre_populate_subprocess_marker(&ws, 5678);
+        pre_populate_subprocess_marker(&paths, &ws, 5678);
         // MockOps with no alive PIDs → pid_alive(99999) returns false →
         // stale-dead branch fires.
         let ops = MockOps::new();
@@ -1162,7 +1162,7 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             .replace(':', "-");
         let basename = ws.file_name().unwrap().to_str().unwrap().to_string();
-        let logs_dir = crate::testing::test_daemon_paths().1.audit_logs_dir(&basename);
+        let logs_dir = paths.audit_logs_dir(&basename);
         std::fs::create_dir_all(&logs_dir).unwrap();
         let log_path = logs_dir.join(format!("architecture_consultative-{safe_ts}.log"));
         std::fs::write(&log_path, "").unwrap();
@@ -1486,11 +1486,11 @@ mod tests {
 
     #[test]
     fn subprocess_marker_path_layout_under_autocoder_busy() {
-        let path = subprocess_marker_path(Path::new(
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let path = subprocess_marker_path(&paths, Path::new(
             "/tmp/workspaces/github_com_owner_repo",
         ));
         let s = path.to_string_lossy();
-        assert!(s.contains("autocoder"));
         assert!(s.contains("busy"));
         assert!(s.ends_with("github_com_owner_repo.subprocess"));
     }

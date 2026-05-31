@@ -7433,7 +7433,6 @@ mod tests {
         workspace: &Path,
         executor: &dyn Executor,
     ) -> Result<Vec<String>> {
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let (_td, paths) = crate::testing::test_daemon_paths();
         let repo = fixture_repo(workspace);
         let github_cfg = GithubConfig {
@@ -7493,7 +7492,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn branch_init_resets_agent_to_base() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         // Empty queue is fine — we only care about the branch init step.
 
         let executor = CompletingExecutorNoDiff;
@@ -7513,7 +7512,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_subject_matches_spec_format() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "add-greetings", "Make the project greet users on startup");
 
         let executor = CompletingExecutorWithDiff {
@@ -7597,7 +7596,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pull_conflict_aborts_iteration_without_touching_agent_branch() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
 
         // Reach into the remote (the fixture's `remote/` sibling) to advance
         // origin/main with a commit our local doesn't have.
@@ -8565,7 +8564,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_pass_produces_no_commits_and_no_pr() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         // No changes added — queue is empty.
 
         let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
@@ -8624,7 +8623,7 @@ mod tests {
         // returns `Failed` on every change. Failed changes stay in the queue
         // (no archive), so each iteration re-locks, re-invokes, and re-fails.
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         // One pending change so each pass invokes the executor. The change
         // material must be committed in the fixture so the workspace is not
         // dirty when the polling pass starts (production repos commit their
@@ -9071,7 +9070,9 @@ mod tests {
             .create_async()
             .await;
 
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let result = open_pr_exists_for_agent_branch_at(
+            &paths,
             &server.url(),
             &open_pr_test_repo(),
             &open_pr_test_github(&server.url()),
@@ -9095,7 +9096,9 @@ mod tests {
             .create_async()
             .await;
 
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let result = open_pr_exists_for_agent_branch_at(
+            &paths,
             &server.url(),
             &open_pr_test_repo(),
             &open_pr_test_github(&server.url()),
@@ -9117,7 +9120,9 @@ mod tests {
 
         // Best-effort fallback: a 500 from GitHub should not block the
         // iteration — log WARN and proceed as if no PR exists.
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let result = open_pr_exists_for_agent_branch_at(
+            &paths,
             &server.url(),
             &open_pr_test_repo(),
             &open_pr_test_github(&server.url()),
@@ -9144,7 +9149,9 @@ mod tests {
 
         let mut gh = open_pr_test_github(&server.url());
         gh.fork_owner = Some("bot-machine-user".into());
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let result = open_pr_exists_for_agent_branch_at(
+            &paths,
             &server.url(),
             &open_pr_test_repo(),
             &gh,
@@ -9310,6 +9317,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failure_alert_posted_then_suppressed_within_24h() {
         let (_dir, ws) = fixture_workspace_with_broken_remote("alert-throttle");
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "needs-push", "push-failure fixture");
 
         let mut server = mockito::Server::new_async().await;
@@ -9357,8 +9365,7 @@ mod tests {
         // Iteration 1: pass through commits succeeds, push fails → alert
         // is posted and `.alert-state.json` is written.
         let stuck_secs = 2400u64;
-        let _ = execute_one_pass(
-            &ws,
+        let _ = execute_one_pass(&paths, &ws,
             &fixture_repo(&ws),
             &executor,
             &github,
@@ -9374,8 +9381,9 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .await;
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            ws.join(".alert-state.json").exists(),
+            paths.alert_state_path(&basename).exists(),
             "iter 1's push failure must persist alert state"
         );
 
@@ -9384,8 +9392,7 @@ mod tests {
         // recent (< 24h), so should_alert is false → no post, mock counter
         // stays at 1. This is the throttle assertion: a repeat failure
         // within the window is silent.
-        crate::alerts::handle_predictable_failure(
-            &ws,
+        crate::alerts::handle_predictable_failure(&paths, &ws,
             &fixture_repo(&ws).url,
             Some(&chatops_ctx),
             true,
@@ -9412,6 +9419,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failure_alert_cleared_on_subsequent_success() {
         let (_dir, ws) = fixture_workspace_with_broken_remote("alert-cleared");
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "round-1", "fixture round 1");
 
         let mut server = mockito::Server::new_async().await;
@@ -9456,8 +9464,7 @@ mod tests {
         let stuck_secs = 2400u64;
 
         // Iteration 1: push fails → alert #1 fires AND state is saved.
-        let _ = execute_one_pass(
-            &ws,
+        let _ = execute_one_pass(&paths, &ws,
             &fixture_repo(&ws),
             &executor,
             &github,
@@ -9473,8 +9480,9 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .await;
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            ws.join(".alert-state.json").exists(),
+            paths.alert_state_path(&basename).exists(),
             "alert state should be written after first failure"
         );
 
@@ -9484,17 +9492,16 @@ mod tests {
         // empty, or when commit_count is zero). The clear paths are
         // covered by `AlertState::clear`'s own unit tests; here we just
         // need the on-disk state to be gone so iter 3 can re-alert.
-        crate::alert_state::AlertState::clear(&ws).unwrap();
+        crate::alert_state::AlertState::clear(&paths, &ws).unwrap();
         assert!(
-            !ws.join(".alert-state.json").exists(),
+            !paths.alert_state_path(&basename).exists(),
             "alert state must be gone after clear"
         );
 
         // Iteration 3: simulate another push failure via the helper. State
         // file is gone (cleared in iter 2), so this re-alerts even though
         // less than 24h has elapsed since iter 1's alert.
-        crate::alerts::handle_predictable_failure(
-            &ws,
+        crate::alerts::handle_predictable_failure(&paths, &ws,
             &fixture_repo(&ws).url,
             Some(&chatops_ctx),
             true,
@@ -9514,8 +9521,8 @@ mod tests {
     /// `<system-temp>/autocoder/logs/<workspace-basename>/<change>.log` so
     /// `build_implementer_summary` can find it without invoking the
     /// executor.
-    fn write_fixture_run_log(workspace: &Path, change: &str, prompt: &str, stdout: &str, stderr: &str) {
-        let path = crate::executor::claude_cli::run_log_path(workspace, change);
+    fn write_fixture_run_log(paths: &crate::paths::DaemonPaths, workspace: &Path, change: &str, prompt: &str, stdout: &str, stderr: &str) {
+        let path = crate::executor::claude_cli::run_log_path(paths, workspace, change);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let body = format!(
             "=== PROMPT ({p} bytes) ===\n{prompt}\n=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
@@ -9541,14 +9548,16 @@ mod tests {
     fn build_implementer_summary_extracts_stdout_only() {
         let dir = unique_workspace("extract-stdout");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_fixture_run_log(
+            &paths,
             ws,
             "alpha",
             "PROMPT_BODY_SECRET",
             "STDOUT_NARRATIVE_VISIBLE",
             "STDERR_LOG_NOISE",
         );
-        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
         assert!(out.contains("## Agent implementation notes"));
         assert!(out.contains("### alpha"));
         assert!(out.contains("STDOUT_NARRATIVE_VISIBLE"));
@@ -9562,9 +9571,11 @@ mod tests {
     fn build_implementer_summary_skips_missing_log() {
         let dir = unique_workspace("skip-missing");
         let ws = dir.path();
-        write_fixture_run_log(ws, "present", "p", "PRESENT_STDOUT", "");
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_fixture_run_log(&paths, ws, "present", "p", "PRESENT_STDOUT", "");
         // "absent" has no log file written.
         let out = build_implementer_summary(
+            &paths,
             ws,
             &["present".to_string(), "absent".to_string()],
         );
@@ -9577,7 +9588,9 @@ mod tests {
     fn build_implementer_summary_returns_empty_when_all_missing() {
         let dir = unique_workspace("all-missing");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let out = build_implementer_summary(
+            &paths,
             ws,
             &["nope-1".to_string(), "nope-2".to_string()],
         );
@@ -9588,8 +9601,9 @@ mod tests {
     fn build_implementer_summary_uses_placeholder_for_empty_stdout() {
         let dir = unique_workspace("empty-stdout");
         let ws = dir.path();
-        write_fixture_run_log(ws, "silent", "p", "", "");
-        let out = build_implementer_summary(ws, &["silent".to_string()]);
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_fixture_run_log(&paths, ws, "silent", "p", "", "");
+        let out = build_implementer_summary(&paths, ws, &["silent".to_string()]);
         assert!(out.contains("### silent"));
         assert!(out.contains("_(no implementer output captured)_"));
     }
@@ -9599,6 +9613,7 @@ mod tests {
     /// tests that verify the PR-comment construction path reads from
     /// FINAL ANSWER, not the action stream.
     fn write_fixture_json_run_log(
+        paths: &crate::paths::DaemonPaths,
         workspace: &Path,
         change: &str,
         prompt: &str,
@@ -9606,7 +9621,7 @@ mod tests {
         final_answer: &str,
         stderr: &str,
     ) {
-        let path = crate::executor::claude_cli::run_log_path(workspace, change);
+        let path = crate::executor::claude_cli::run_log_path(paths, workspace, change);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut body = format!(
             "=== PROMPT ({p} bytes) ===\n{prompt}\n\n=== ACTIONS ===\n",
@@ -9628,7 +9643,9 @@ mod tests {
     fn build_implementer_summary_reads_final_answer_from_json_log() {
         let dir = unique_workspace("final-answer");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_fixture_json_run_log(
+            &paths,
             ws,
             "alpha",
             "PROMPT_BODY",
@@ -9640,7 +9657,7 @@ mod tests {
             "FINAL_SUMMARY_TEXT",
             "",
         );
-        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
         assert!(out.contains("FINAL_SUMMARY_TEXT"));
         // Action stream MUST NOT leak into the PR comment.
         assert!(!out.contains("[tool_use]"));
@@ -9653,7 +9670,9 @@ mod tests {
     fn build_implementer_summary_falls_back_to_timeout_placeholder() {
         let dir = unique_workspace("timeout-fallback");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_fixture_json_run_log(
+            &paths,
             ws,
             "alpha",
             "p",
@@ -9661,7 +9680,7 @@ mod tests {
             "", // empty FINAL ANSWER → timeout case
             "",
         );
-        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
         assert!(
             out.contains("(executor timed out before final summary; see daemon log for action stream)"),
             "expected timeout fallback in: {out}"
@@ -9675,8 +9694,9 @@ mod tests {
         // the raw stdout (today's behavior preserved).
         let dir = unique_workspace("legacy-shape");
         let ws = dir.path();
-        write_fixture_run_log(ws, "alpha", "p", "LEGACY_STDOUT_CONTENT", "");
-        let out = build_implementer_summary(ws, &["alpha".to_string()]);
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_fixture_run_log(&paths, ws, "alpha", "p", "LEGACY_STDOUT_CONTENT", "");
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
         assert!(out.contains("LEGACY_STDOUT_CONTENT"));
     }
 
@@ -9724,7 +9744,9 @@ mod tests {
     async fn post_implementer_summary_comment_hits_endpoint_with_stdout_body() {
         let dir = unique_workspace("integration-comment");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_fixture_run_log(
+            &paths,
             ws,
             "the-change",
             "p",
@@ -9745,9 +9767,7 @@ mod tests {
             .create_async()
             .await;
 
-        post_implementer_summary_comment(
-            &server.url(),
-            ws,
+        post_implementer_summary_comment(&paths, &server.url(), ws,
             "upstream-org",
             "the-repo",
             77,
@@ -9764,6 +9784,7 @@ mod tests {
     async fn post_implementer_summary_comment_skips_when_summary_empty() {
         let dir = unique_workspace("integration-skip");
         let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", mockito::Matcher::Any)
@@ -9771,9 +9792,7 @@ mod tests {
             .create_async()
             .await;
 
-        post_implementer_summary_comment(
-            &server.url(),
-            ws,
+        post_implementer_summary_comment(&paths, &server.url(), ws,
             "owner",
             "repo",
             1,
@@ -9793,6 +9812,7 @@ mod tests {
     /// Uses the existing remote fixture so the workspace's dirty-check
     /// passes — perma-stuck logic exercises the same Failed paths.
     async fn run_one_pass_with_threshold(
+        paths: &DaemonPaths,
         workspace: &Path,
         executor: &dyn Executor,
         threshold: u32,
@@ -9806,6 +9826,7 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, _) = run_pass_through_commits(
+            paths,
             workspace,
             &repo,
             &github_cfg,
@@ -9830,8 +9851,8 @@ mod tests {
         let executor = AlwaysFailingExecutor;
         // Use a high threshold so a single failure does NOT yet mark
         // perma-stuck; we are asserting only the counter side-effect here.
-        let _ = run_one_pass_with_threshold(&ws, &executor, 10).await;
-        let state = failure_state::load(&ws).unwrap();
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 10).await;
+        let state = failure_state::load(&paths, &ws).unwrap();
         let entry = state.entries.get("stuck-change").expect("entry present");
         assert_eq!(entry.count, 1);
         assert!(
@@ -9847,20 +9868,20 @@ mod tests {
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "recovered", "fixture");
         // Pre-populate the failure-state file with a count for this change.
-        let _ = failure_state::record_failure(&ws, "recovered", "earlier fail").unwrap();
+        let _ = failure_state::record_failure(&paths, &ws, "recovered", "earlier fail").unwrap();
         assert!(
-            failure_state::load(&ws).unwrap().entries.contains_key("recovered"),
+            failure_state::load(&paths, &ws).unwrap().entries.contains_key("recovered"),
             "fixture must have a counter entry before the pass"
         );
         let executor = CompletingExecutorWithDiff {
             artifact_name: "RECOVERED.txt".into(),
             artifact_text: "x".into(),
         };
-        let processed = run_one_pass_with_threshold(&ws, &executor, 10)
+        let processed = run_one_pass_with_threshold(&paths, &ws, &executor, 10)
             .await
             .expect("pass succeeds");
         assert_eq!(processed, vec!["recovered".to_string()]);
-        let state = failure_state::load(&ws).unwrap();
+        let state = failure_state::load(&paths, &ws).unwrap();
         assert!(
             !state.entries.contains_key("recovered"),
             "archive must clear the failure-state entry"
@@ -9875,7 +9896,7 @@ mod tests {
         let executor = AlwaysFailingExecutor;
 
         // Pass 1: count 1, no marker.
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
         assert!(
             !ws.join("openspec/changes/doomed/.perma-stuck.json").exists(),
             "no marker after first failure"
@@ -9887,7 +9908,7 @@ mod tests {
         );
 
         // Pass 2: count 2 = threshold → marker written, change excluded.
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
         assert!(
             ws.join("openspec/changes/doomed/.perma-stuck.json").exists(),
             "marker must be written when threshold is reached"
@@ -9930,15 +9951,15 @@ mod tests {
         }
         let executor = CountingFailing(invocations.clone());
 
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
         // 2 invocations so far; marker should now exist.
         assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 2);
         let marker = ws.join("openspec/changes/recoverable/.perma-stuck.json");
         assert!(marker.exists(), "marker must be written by pass 2");
 
         // Pass 3: marker present → excluded → executor NOT invoked.
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -9949,7 +9970,7 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
 
         // Pass 4: change is back in pending, executor runs again.
-        let _ = run_one_pass_with_threshold(&ws, &executor, 2).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 2).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             3,
@@ -9959,11 +9980,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transient_error_does_not_increment_counter() {
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Workspace with no .git directory → workspace::ensure_initialized
         // errors out before the executor is ever invoked. The
         // failure-state file must remain absent.
         let dir = tempfile::TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let ws = dir.path().join("not-a-repo");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("placeholder.txt"), "x").unwrap();
@@ -10008,7 +10029,7 @@ mod tests {
         assert!(result.is_err(), "pre-executor failure must propagate");
         // The per-repo failure-state must remain empty — a transient
         // pre-executor error must not bump the counter.
-        let state = failure_state::load(&ws).unwrap();
+        let state = failure_state::load(&paths, &ws).unwrap();
         assert!(
             state.entries.is_empty(),
             "transient pre-executor errors must not bump the counter; got: {:?}",
@@ -10023,7 +10044,7 @@ mod tests {
     /// its invocations; after the iteration, the counter must be zero.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_scheduler_not_invoked_when_ensure_initialized_fails() {
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         use crate::audits::{
             Audit, AuditContext, AuditOutcome, AuditRegistry, WritePolicy,
         };
@@ -10056,6 +10077,7 @@ mod tests {
         }
 
         let dir = tempfile::TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let ws = dir.path().join("not-a-repo");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("placeholder.txt"), "x").unwrap();
@@ -10122,11 +10144,11 @@ mod tests {
     /// reporting layer — only the WARN log signals it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iteration_auto_recovers_partial_clone_without_failure() {
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         use std::process::Command;
         // Set up a real local fixture remote so the re-clone after
         // auto-cleanup actually succeeds (no network access required).
         let dir = tempfile::TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let remote = dir.path().join("remote");
         std::fs::create_dir_all(&remote).unwrap();
         fn run(path: &Path, args: &[&str]) {
@@ -10498,7 +10520,7 @@ mod tests {
             suggestion: "x".into(),
             invocations: invocations.clone(),
         };
-        let _ = run_one_pass_with_threshold(&ws, &executor, 1).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, 1).await;
         // Marker is present.
         assert!(
             ws.join("openspec/changes/no-counter-bump/.needs-spec-revision.json").exists()
@@ -10506,7 +10528,7 @@ mod tests {
         // failure-state must NOT have an entry for this change. The
         // marker handles exclusion; the counter is operator-action
         // territory, not repeat-failure territory.
-        let state = failure_state::load(&ws).unwrap();
+        let state = failure_state::load(&paths, &ws).unwrap();
         assert!(
             !state.entries.contains_key("no-counter-bump"),
             "SpecNeedsRevision must not write a failure-state entry"
@@ -10546,7 +10568,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -10586,7 +10608,7 @@ mod tests {
         }
         let executor = Counter(invocations.clone());
         // First pass: marker present → executor must not run.
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -10597,7 +10619,7 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
 
         // Second pass: change is back in pending, executor runs.
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -10642,7 +10664,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -10701,7 +10723,7 @@ mod tests {
             count: invocations.clone(),
             seen: invoked_with.clone(),
         };
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         let seen = invoked_with.lock().unwrap().clone();
         assert!(
             !seen.contains(&"01-broken".to_string()),
@@ -10745,7 +10767,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -10778,7 +10800,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -10880,7 +10902,7 @@ mod tests {
         }
         let executor = Counter(invocations.clone());
 
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
 
         // Executor must NOT have been invoked for the broken change.
         assert_eq!(
@@ -10955,7 +10977,7 @@ mod tests {
         }
         let executor = Counter(invocations.clone());
 
-        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+        let _ = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX).await;
 
         // Executor IS invoked: pre-flight was a no-op for the clean change.
         assert_eq!(
@@ -11111,7 +11133,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
         let _ = crate::preflight::change_contradiction::scope(None, fut).await;
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
@@ -11156,7 +11178,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
         let _ = crate::preflight::change_contradiction::scope(
             Some(std::sync::Arc::new(ctx)),
             fut,
@@ -11214,7 +11236,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
         let _ = crate::preflight::change_contradiction::scope(
             Some(std::sync::Arc::new(ctx)),
             fut,
@@ -11294,7 +11316,7 @@ mod tests {
             }
         }
         let executor = Counter(invocations.clone());
-        let fut = run_one_pass_with_threshold(&ws, &executor, u32::MAX);
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
         let _ = crate::preflight::change_contradiction::scope(
             Some(std::sync::Arc::new(ctx)),
             fut,
@@ -11486,7 +11508,7 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -11562,7 +11584,7 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -11625,7 +11647,7 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -11863,7 +11885,7 @@ mod tests {
             "untouched ch04 still pending: {still_pending:?}"
         );
         // ch03 must not have a failure-state entry — it was never attempted.
-        let state = failure_state::load(&ws).unwrap();
+        let state = failure_state::load(&paths, &ws).unwrap();
         assert!(
             !state.entries.contains_key("ch03"),
             "ch03 must not have a failure-state entry — walker never reached it; got: {:?}",
@@ -12241,7 +12263,7 @@ mod tests {
             "error should name the recovery failure; got: {err}"
         );
         mock.assert_async().await;
-        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        let state = crate::alert_state::AlertState::load_or_default(&paths, &ws);
         assert!(
             state
                 .alerts
@@ -12288,8 +12310,7 @@ mod tests {
             "workspace {} still dirty after recovery; refusing to proceed:\n D foo.rs",
             ws.display()
         );
-        crate::alerts::handle_classified_recovery_failure(
-            &ws,
+        crate::alerts::handle_classified_recovery_failure(&paths, &ws,
             "git@github.com:owner/repo.git",
             Some(&chatops_ctx),
             true,
@@ -12335,8 +12356,7 @@ mod tests {
             crate::recovery_classification::RecoveryFailureClass::Transient,
             "fixture should classify as transient"
         );
-        crate::alerts::handle_classified_recovery_failure(
-            &ws,
+        crate::alerts::handle_classified_recovery_failure(&paths, &ws,
             "git@github.com:owner/repo.git",
             Some(&chatops_ctx),
             true,
@@ -12407,7 +12427,7 @@ mod tests {
     #[test]
     fn attempt_dirty_workspace_recovery_clears_untracked_and_tracked_modifications() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let (_td_paths, _paths) = crate::testing::test_daemon_paths();
         // Tracked modification: rewrite README.md.
         std::fs::write(ws.join("README.md"), "modified\n").unwrap();
         // Untracked file.
@@ -12917,7 +12937,6 @@ mod tests {
             return;
         }
         let (_dir, ws) = fixture_workspace_with_remote();
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Seed the OpenSpec layout (with no archived changes, so the
         // rebuild is a no-op). The dirs are committed so the iteration's
         // dirty-recovery step doesn't `git clean -fd` them away as
@@ -12956,7 +12975,9 @@ mod tests {
 
         // Run the rebuild iteration directly. No chatops, so no
         // notification posts.
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         execute_rebuild_iteration(
+            &paths,
             &ws,
             &repo,
             &github_cfg,
@@ -13437,8 +13458,11 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let task_cancel = cancel.clone();
+        let (_td_paths, paths_inner) = crate::testing::test_daemon_paths();
+        let paths_for_run = std::sync::Arc::new(paths_inner);
         let handle = tokio::spawn(async move {
             run(
+                paths_for_run,
                 repo_holder,
                 executor,
                 github_holder,
@@ -14019,7 +14043,7 @@ mod tests {
         );
         // (b) exactly one chatops post under ArchiveCollision
         mock.assert_async().await;
-        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        let state = crate::alert_state::AlertState::load_or_default(&paths, &ws);
         assert!(
             state
                 .alerts
@@ -14027,7 +14051,7 @@ mod tests {
             "ArchiveCollision entry must be persisted after the alert post"
         );
         // (d) failure-state counter for `foo` is NOT incremented
-        let fs = crate::failure_state::load(&ws).unwrap();
+        let fs = crate::failure_state::load(&paths, &ws).unwrap();
         assert!(
             fs.entries.get("foo").is_none(),
             "collision is structural, not a perma-stuck-counting failure; got: {:?}",
@@ -14121,7 +14145,7 @@ mod tests {
         );
         // `foo` excluded with the alert; `bar` archived → counter not touched.
         mock.assert_async().await;
-        let fs = crate::failure_state::load(&ws).unwrap();
+        let fs = crate::failure_state::load(&paths, &ws).unwrap();
         assert!(
             fs.entries.get("foo").is_none(),
             "collided change must not move the failure counter"
@@ -14189,7 +14213,7 @@ mod tests {
         }
 
         mock.assert_async().await;
-        let fs = crate::failure_state::load(&ws).unwrap();
+        let fs = crate::failure_state::load(&paths, &ws).unwrap();
         assert!(
             fs.entries.get("stuck-change").is_none(),
             "collision is not a perma-stuck-counting event across iterations"
@@ -14218,7 +14242,7 @@ mod tests {
         add_committed_change(&ws, "racy", "fixture");
 
         // Sanity: no failure entries yet.
-        let fs0 = crate::failure_state::load(&ws).unwrap();
+        let fs0 = crate::failure_state::load(&paths, &ws).unwrap();
         assert!(fs0.entries.get("racy").is_none());
 
         /// Executor: writes a diff (so we get past the no-diff path)
@@ -14276,7 +14300,7 @@ mod tests {
         )
         .await;
 
-        let fs = crate::failure_state::load(&ws).unwrap();
+        let fs = crate::failure_state::load(&paths, &ws).unwrap();
         let entry = fs
             .entries
             .get("racy")
@@ -14359,7 +14383,7 @@ mod tests {
         assert!(result.is_err(), "iteration must surface the recovery failure");
 
         // The iteration-level alert fired (WorkspaceDirtyMidIteration)…
-        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        let state = crate::alert_state::AlertState::load_or_default(&paths, &ws);
         assert!(
             state
                 .alerts
@@ -14367,7 +14391,7 @@ mod tests {
             "iteration-level failure must route through WorkspaceDirtyMidIteration"
         );
         // …but no per-change counter moved.
-        let fs = crate::failure_state::load(&ws).unwrap();
+        let fs = crate::failure_state::load(&paths, &ws).unwrap();
         assert!(
             fs.entries.is_empty(),
             "iteration-level failure must not increment any per-change counter; got: {:?}",
@@ -15385,8 +15409,7 @@ mod tests {
         let executor = AlwaysFailingExecutor; // unused: no pending changes
 
         let stuck_secs = 2400u64;
-        let result = execute_one_pass(
-            &ws,
+        let result = execute_one_pass(&paths, &ws,
             &fixture_repo(&ws),
             &executor,
             &github_cfg,
@@ -15473,6 +15496,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iteration_requested_commits_pushes_and_writes_marker() {
         let (dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "a31-bar", "fixture reason");
         // Switch to agent-q so the iteration arm's commit + push hits the
         // expected branch. `recreate_branch` is idempotent here.
@@ -15498,7 +15522,7 @@ mod tests {
             iteration_number: 2,
         });
         let step =
-            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+            handle_outcome(&paths, &ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
         assert!(
             matches!(step, QueueStep::IterationPending),
             "expected IterationPending QueueStep; got {step:?}"
@@ -15509,10 +15533,9 @@ mod tests {
         // (state_dir, NOT the workspace), so read via DaemonPaths +
         // the workspace's basename — same resolution `handle_outcome`
         // used internally for the write.
-        let test_paths = crate::testing::test_daemon_paths().1;
         let test_basename = ws.file_name().and_then(|s| s.to_str()).unwrap();
         let marker = crate::iteration_pending::read_marker(
-            &test_paths,
+            &paths,
             test_basename,
             "a31-bar",
         )
@@ -15579,7 +15602,7 @@ mod tests {
         add_committed_change(&ws, "a31-bar", "fixture reason");
         // Establish a stale marker (prior iteration's IterationRequested).
         crate::iteration_pending::write_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &crate::iteration_pending::IterationPendingMarker {
@@ -15605,13 +15628,13 @@ mod tests {
         };
         let outcome = Ok(ExecutorOutcome::Completed { final_answer: None });
         let step =
-            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+            handle_outcome(&paths, &ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
         assert!(matches!(step, QueueStep::Archived), "expected Archived; got {step:?}");
         // Marker was deleted BEFORE the archive rename, so the
         // archived directory should NOT carry it either.
         assert!(
             !crate::iteration_pending::marker_exists(
-                &crate::testing::test_daemon_paths().1,
+                &paths,
                 ws.file_name().and_then(|s| s.to_str()).unwrap(),
                 "a31-bar",
             ),
@@ -15631,7 +15654,7 @@ mod tests {
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change(&ws, "a31-bar", "fixture reason");
         crate::iteration_pending::write_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &crate::iteration_pending::IterationPendingMarker {
@@ -15661,14 +15684,14 @@ mod tests {
             revision_suggestion: "do a thing".into(),
         });
         let step =
-            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+            handle_outcome(&paths, &ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
         assert!(
             matches!(step, QueueStep::SpecRevisionMarked),
             "expected SpecRevisionMarked; got {step:?}"
         );
         assert!(
             !crate::iteration_pending::marker_exists(
-                &crate::testing::test_daemon_paths().1,
+                &paths,
                 ws.file_name().and_then(|s| s.to_str()).unwrap(),
                 "a31-bar",
             ),
@@ -15689,7 +15712,7 @@ mod tests {
             iteration_number: 2,
         };
         crate::iteration_pending::write_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &marker,
@@ -15709,13 +15732,13 @@ mod tests {
             reason: "timeout".into(),
         });
         let step =
-            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+            handle_outcome(&paths, &ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
         assert!(
             matches!(step, QueueStep::Failed { .. }),
             "expected Failed; got {step:?}"
         );
         let still = crate::iteration_pending::read_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
         )
@@ -15740,7 +15763,7 @@ mod tests {
             iteration_number: 2,
         };
         crate::iteration_pending::write_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
             &marker,
@@ -15761,13 +15784,13 @@ mod tests {
             resume_handle: crate::executor::ResumeHandle(serde_json::json!({})),
         });
         let step =
-            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+            handle_outcome(&paths, &ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
         assert!(
             matches!(step, QueueStep::AskUserExitEarly),
             "expected AskUserExitEarly (no chatops_ctx); got {step:?}"
         );
         let still = crate::iteration_pending::read_marker(
-            &crate::testing::test_daemon_paths().1,
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "a31-bar",
         )

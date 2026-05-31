@@ -1389,8 +1389,7 @@ async fn maybe_post_rereview_suggestion(
         return;
     }
     let percent = crate::code_review_suggestion::percent_for_text(overlap.ratio);
-    let posted = crate::polling_loop::maybe_post_rereview_suggestion_alert(
-        Some(ctx),
+    let posted = crate::polling_loop::maybe_post_rereview_suggestion_alert(Some(ctx),
         repo,
         pr.number,
         &pr.url,
@@ -2816,8 +2815,7 @@ mod tests {
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-seed state with `last_seen_comment_at` exactly equal to the
         // comment's `created_at`.
-        write_state(
-            &ws,
+        write_state(&paths, &ws,
             &RevisionState {
                 pr_number: 31,
                 agent_branch: "agent-q".to_string(),
@@ -2886,8 +2884,7 @@ mod tests {
 
         let (_dir, ws) = init_git_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
-        write_state(
-            &ws,
+        write_state(&paths, &ws,
             &RevisionState {
                 pr_number: 33,
                 agent_branch: "agent-q".to_string(),
@@ -2967,8 +2964,7 @@ mod tests {
 
         let (_dir, ws) = init_git_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
-        write_state(
-            &ws,
+        write_state(&paths, &ws,
             &RevisionState {
                 pr_number: 35,
                 agent_branch: "agent-q".to_string(),
@@ -3063,8 +3059,7 @@ mod tests {
         let (_dir, ws) = init_git_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-seed iter-1 state: T0 = 09:00:00Z (before the comment).
-        write_state(
-            &ws,
+        write_state(&paths, &ws,
             &RevisionState {
                 pr_number: 37,
                 agent_branch: "agent-q".to_string(),
@@ -3192,8 +3187,7 @@ mod tests {
         let (_dir, ws) = init_git_workspace();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // T0 = 09:00:00Z; T1 = 11:00:00Z. Pre-seed iter-1 state.
-        write_state(
-            &ws,
+        write_state(&paths, &ws,
             &RevisionState {
                 pr_number: 39,
                 agent_branch: "agent-q".to_string(),
@@ -3310,6 +3304,7 @@ mod tests {
     #[tokio::test]
     async fn picked_up_helper_posts_when_state_clean_and_toggle_on() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3317,8 +3312,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_picked_up_alert(
-            Some(&ctx),
+        maybe_post_revise_picked_up_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3336,7 +3330,7 @@ mod tests {
         assert!(body.contains("https://example.invalid/pr/17"), "pr_url on its own line");
 
         // State updated.
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(
             state.revise_notification_already_posted(
                 "comment-100",
@@ -3349,6 +3343,7 @@ mod tests {
     #[tokio::test]
     async fn picked_up_helper_skips_when_toggle_off() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3356,8 +3351,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: false,
         };
-        maybe_post_revise_picked_up_alert(
-            Some(&ctx),
+        maybe_post_revise_picked_up_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3371,7 +3365,7 @@ mod tests {
             "toggle off must suppress the post"
         );
         // State NOT updated.
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(
             !state.revise_notification_already_posted(
                 "comment-200",
@@ -3384,6 +3378,7 @@ mod tests {
     #[tokio::test]
     async fn picked_up_helper_skips_when_already_posted() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         // Pre-seed state.
         let mut seed = AlertState::default();
@@ -3392,7 +3387,7 @@ mod tests {
             ReviseNotificationKind::PickedUp,
             Utc::now(),
         );
-        seed.save(dir.path()).unwrap();
+        seed.save(&paths, dir.path()).unwrap();
 
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3400,8 +3395,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_picked_up_alert(
-            Some(&ctx),
+        maybe_post_revise_picked_up_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3419,6 +3413,7 @@ mod tests {
     #[tokio::test]
     async fn picked_up_helper_does_not_update_state_when_post_fails() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         chatops.fail_posts_with("simulated backend error");
@@ -3427,8 +3422,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_picked_up_alert(
-            Some(&ctx),
+        maybe_post_revise_picked_up_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3440,7 +3434,7 @@ mod tests {
         // Post never reached the success path.
         assert!(chatops.notifications.lock().unwrap().is_empty());
         // State NOT updated → a future retry can succeed.
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(!state.revise_notification_already_posted(
             "comment-400",
             ReviseNotificationKind::PickedUp,
@@ -3450,6 +3444,7 @@ mod tests {
     #[tokio::test]
     async fn succeeded_helper_posts_with_duration_human() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3457,8 +3452,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_succeeded_alert(
-            Some(&ctx),
+        maybe_post_revise_succeeded_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3478,7 +3472,7 @@ mod tests {
         assert!(body.contains("(took 2m)"), "duration uses busy_marker human format: {body}");
         assert!(body.contains("https://example.invalid/pr/17"));
 
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(state.revise_notification_already_posted(
             "comment-500",
             ReviseNotificationKind::Succeeded,
@@ -3488,6 +3482,7 @@ mod tests {
     #[tokio::test]
     async fn succeeded_helper_skips_when_toggle_off() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3495,8 +3490,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: false,
         };
-        maybe_post_revise_succeeded_alert(
-            Some(&ctx),
+        maybe_post_revise_succeeded_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3507,7 +3501,7 @@ mod tests {
         )
         .await;
         assert!(chatops.notifications.lock().unwrap().is_empty());
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(!state.revise_notification_already_posted(
             "comment-600",
             ReviseNotificationKind::Succeeded,
@@ -3517,6 +3511,7 @@ mod tests {
     #[tokio::test]
     async fn failed_helper_posts_inline_for_short_reason() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3524,8 +3519,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_failed_alert(
-            Some(&ctx),
+        maybe_post_revise_failed_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3542,7 +3536,7 @@ mod tests {
             "short reason must NOT go through the threaded path"
         );
 
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(state.revise_notification_already_posted(
             "comment-700",
             ReviseNotificationKind::Failed,
@@ -3552,6 +3546,7 @@ mod tests {
     #[tokio::test]
     async fn failed_helper_skips_when_already_posted() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let mut seed = AlertState::default();
         seed.record_revise_notification(
@@ -3559,15 +3554,14 @@ mod tests {
             ReviseNotificationKind::Failed,
             Utc::now(),
         );
-        seed.save(dir.path()).unwrap();
+        seed.save(&paths, dir.path()).unwrap();
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
             chatops: chatops.as_ref(),
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        maybe_post_revise_failed_alert(
-            Some(&ctx),
+        maybe_post_revise_failed_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3581,6 +3575,7 @@ mod tests {
     #[tokio::test]
     async fn failed_helper_threads_long_reason_with_truncation_pointer() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
         let chatops = std::sync::Arc::new(StubChatOps::new());
         let ctx = ChatOpsCtx {
@@ -3589,8 +3584,7 @@ mod tests {
             failure_alerts_enabled: true,
         };
         let huge_reason: String = "x".repeat(40_000);
-        maybe_post_revise_failed_alert(
-            Some(&ctx),
+        maybe_post_revise_failed_alert(&paths, Some(&ctx),
             &repo,
             17,
             "https://example.invalid/pr/17",
@@ -3624,7 +3618,7 @@ mod tests {
             "thread body must end with the documented pointer tail"
         );
 
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(state.revise_notification_already_posted(
             "comment-800",
             ReviseNotificationKind::Failed,
@@ -3634,9 +3628,9 @@ mod tests {
     #[tokio::test]
     async fn all_helpers_silently_skip_when_chatops_ctx_is_none() {
         let dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo_at("git@github.com:o/r.git", dir.path());
-        maybe_post_revise_picked_up_alert(
-            None,
+        maybe_post_revise_picked_up_alert(&paths, None,
             &repo,
             17,
             "https://x",
@@ -3645,8 +3639,7 @@ mod tests {
             "comment-900",
         )
         .await;
-        maybe_post_revise_succeeded_alert(
-            None,
+        maybe_post_revise_succeeded_alert(&paths, None,
             &repo,
             17,
             "https://x",
@@ -3656,8 +3649,7 @@ mod tests {
             "comment-901",
         )
         .await;
-        maybe_post_revise_failed_alert(
-            None,
+        maybe_post_revise_failed_alert(&paths, None,
             &repo,
             17,
             "https://x",
@@ -3666,7 +3658,7 @@ mod tests {
         )
         .await;
         // No alert-state file should have been created (no post = no save).
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, dir.path());
         assert!(state.revise_notifications.is_empty());
     }
 
@@ -3791,7 +3783,7 @@ mod tests {
         assert!(revise_notes[1].contains("`agent-q`"), "succeeded body must name agent_branch");
 
         // State updated for both kinds.
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.revise_notification_already_posted(
             "9001",
             ReviseNotificationKind::PickedUp,
@@ -3859,7 +3851,7 @@ mod tests {
             revise_notes[1]
         );
 
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.revise_notification_already_posted(
             "9002",
             ReviseNotificationKind::PickedUp,
@@ -3901,7 +3893,7 @@ mod tests {
         .await
         .expect("dispatcher should run to completion with no chatops backend");
         // No chatops backend means no alert-state mutation.
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(
             state.revise_notifications.is_empty(),
             "no chatops_ctx must not produce any alert-state revise_notifications entries"
@@ -3928,8 +3920,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            Some(&ctx),
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, Some(&ctx),
             &repo,
             42,
             "https://example.invalid/pr/42",
@@ -3946,7 +3937,7 @@ mod tests {
         );
         assert!(notes[0].contains("code review triggered on PR #42"));
         assert!(notes[0].contains("by @operator-x"));
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.code_review_notification_already_posted(
             "comment-1",
             CodeReviewNotificationKind::Triggered,
@@ -3967,8 +3958,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: false,
         };
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            Some(&ctx),
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, Some(&ctx),
             &repo,
             42,
             "https://example.invalid/pr/42",
@@ -3986,12 +3976,11 @@ mod tests {
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            None, &repo, 42, "https://example.invalid/pr/42", "op", "comment-1",
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, None, &repo, 42, "https://example.invalid/pr/42", "op", "comment-1",
         )
         .await;
         // No alert-state mutation.
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.code_review_notifications.is_empty());
     }
 
@@ -4009,12 +3998,10 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            Some(&ctx), &repo, 42, "url", "op", "comment-1",
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, Some(&ctx), &repo, 42, "url", "op", "comment-1",
         )
         .await;
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            Some(&ctx), &repo, 42, "url", "op", "comment-1",
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, Some(&ctx), &repo, 42, "url", "op", "comment-1",
         )
         .await;
         assert_eq!(chatops.notifications.lock().unwrap().len(), 1);
@@ -4034,8 +4021,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        crate::polling_loop::maybe_post_code_review_complete_alert(
-            Some(&ctx), &repo, 42, "url", "Approve", "comment-1",
+        crate::polling_loop::maybe_post_code_review_complete_alert(&paths, Some(&ctx), &repo, 42, "url", "Approve", "comment-1",
         )
         .await;
         let notes = chatops.notifications.lock().unwrap().clone();
@@ -4043,7 +4029,7 @@ mod tests {
         assert!(notes[0].starts_with("✓"));
         assert!(notes[0].contains("code review complete on PR #42"));
         assert!(notes[0].contains("verdict: Approve"));
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.code_review_notification_already_posted(
             "comment-1",
             CodeReviewNotificationKind::Complete,
@@ -4064,8 +4050,7 @@ mod tests {
             channel: "C-test",
             failure_alerts_enabled: true,
         };
-        crate::polling_loop::maybe_post_code_review_failed_alert(
-            Some(&ctx), &repo, 42, "url", "LLM returned 429", "comment-1",
+        crate::polling_loop::maybe_post_code_review_failed_alert(&paths, Some(&ctx), &repo, 42, "url", "LLM returned 429", "comment-1",
         )
         .await;
         let notes = chatops.notifications.lock().unwrap().clone();
@@ -4073,7 +4058,7 @@ mod tests {
         assert!(notes[0].starts_with("✗"));
         assert!(notes[0].contains("code review failed on PR #42"));
         assert!(notes[0].contains("LLM returned 429"));
-        let state = AlertState::load_or_default(&ws);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.code_review_notification_already_posted(
             "comment-1",
             CodeReviewNotificationKind::Failed,
@@ -4122,8 +4107,7 @@ mod tests {
             channel: "C-team-alpha",
             failure_alerts_enabled: true,
         };
-        crate::polling_loop::maybe_post_code_review_triggered_alert(
-            Some(&ctx), &repo, 9, "url", "op", "c-1",
+        crate::polling_loop::maybe_post_code_review_triggered_alert(&paths, Some(&ctx), &repo, 9, "url", "op", "c-1",
         )
         .await;
         let calls = stub.calls.lock().unwrap().clone();

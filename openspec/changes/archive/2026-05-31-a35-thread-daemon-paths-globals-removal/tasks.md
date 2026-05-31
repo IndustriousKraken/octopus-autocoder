@@ -43,20 +43,20 @@ For each module, choose the appropriate pattern (constructor field for struct-sh
 
 ## 4. Test refactors
 
-- [ ] 4.1 Every test that previously invoked production code now requiring a `DaemonPaths` argument SHALL construct one via `test_daemon_paths()` AND pass it explicitly.
-- [ ] 4.2 The test-fixture invariant becomes: each test's writes land under its own tempdir, NOT a shared `<system-temp>/autocoder/...` location. Update any test that asserted against the shared location to assert against its tempdir-scoped path.
-- [ ] 4.3 For tests deeply nested behind constructors (e.g. tests that construct `Daemon::new()`), thread the `Arc<DaemonPaths>` through the constructor.
+- [x] 4.1 Every test that previously invoked production code now requiring a `DaemonPaths` argument SHALL construct one via `test_daemon_paths()` AND pass it explicitly.
+- [x] 4.2 The test-fixture invariant becomes: each test's writes land under its own tempdir, NOT a shared `<system-temp>/autocoder/...` location. Update any test that asserted against the shared location to assert against its tempdir-scoped path.
+- [x] 4.3 For tests deeply nested behind constructors (e.g. tests that construct `Daemon::new()`), thread the `Arc<DaemonPaths>` through the constructor.
 - [x] 4.4 Add one new test that verifies concurrent isolation: `std::thread::spawn` two threads that each construct DIFFERENT `DaemonPaths` via `test_daemon_paths()` AND invoke the same production function (e.g. `AlertState::load_or_default`). Assert: the two threads' writes land in DIFFERENT tempdirs (no cross-contamination). This pins the canonical "Concurrent tests do not collide on disk" scenario.
 
 ## 5. CI scanner activation
 
 - [x] 5.1 In `autocoder/tests/path_literals_audit.rs`, remove the `#[ignore]` attribute from `no_removed_paths_global_accessor_references_in_src`.
-- [ ] 5.2 Verify the scanner passes (`cargo test no_removed_paths_global_accessor_references_in_src` exits 0).
-- [ ] 5.3 (Sanity check) Inject a synthetic `paths::current()` reference into a scratch file under `autocoder/src/` AND verify the scanner FAILS the build. Revert the scratch reference before committing.
+- [x] 5.2 Verify the scanner passes (`cargo test no_removed_paths_global_accessor_references_in_src` exits 0).
+- [x] 5.3 (Sanity check) Inject a synthetic `paths::current()` reference into a scratch file under `autocoder/src/` AND verify the scanner FAILS the build. Revert the scratch reference before committing.
 
 ## 6. Validation
 
-- [ ] 6.1 `cargo test` passes (the activated path-literals audit included).
-- [ ] 6.2 `cargo clippy` produces no NEW warnings against the existing baseline.
-- [ ] 6.3 `openspec validate a35-thread-daemon-paths-globals-removal --strict` passes.
-- [ ] 6.4 Grep verifies: `grep -rn "paths::current\|paths::install_global\|paths::test_fallback\|paths::get_global" autocoder/src/` returns ZERO results.
+- [x] 6.1 `cargo test` passes (the activated path-literals audit included).
+- [x] 6.2 `cargo clippy` produces no NEW warnings against the existing baseline.
+- [x] 6.3 `openspec validate a35-thread-daemon-paths-globals-removal --strict` passes.
+- [x] 6.4 Grep verifies: `grep -rn "paths::current\|paths::install_global\|paths::test_fallback\|paths::get_global" autocoder/src/` returns ZERO results.

@@ -349,8 +349,10 @@ mod tests {
             r#"{"ok":true,"url":"git@github.com:acme/myrepo.git","audit_type":"security_bug_audit","poll_interval_sec":300}"#,
         )
         .await;
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let res = execute_at(
             &socket,
+            &paths,
             PathBuf::from("/tmp/some-workspace"),
             "security_bug_audit".to_string(),
         )
@@ -364,8 +366,10 @@ mod tests {
             r#"{"ok":false,"error":"no managed repository found for workspace path"}"#,
         )
         .await;
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let res = execute_at(
             &socket,
+            &paths,
             PathBuf::from("/tmp/some-workspace"),
             "security_bug_audit".to_string(),
         )
@@ -384,8 +388,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("nope.sock");
         let workspace = dir.path().to_path_buf();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let res = execute_at(
             &socket,
+            &paths,
             workspace,
             "does_not_exist".to_string(),
         )

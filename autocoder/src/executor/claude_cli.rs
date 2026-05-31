@@ -2196,8 +2196,9 @@ mod tests {
             disallowed_bash_patterns: vec!["curl:*".into(), "git push:*".into()],
             disallowed_read_paths: vec!["/home/*/.ssh/**".into()],
         };
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let executor =
-            ClaudeCliExecutor::new_with_sandbox("dummy-claude".into(), 30, sandbox);
+            ClaudeCliExecutor::new_with_sandbox("dummy-claude".into(), 30, sandbox, std::sync::Arc::new(paths));
         let path = executor
             .write_sandbox_settings()
             .expect("settings file writes");
@@ -2641,7 +2642,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
     }
 
@@ -2677,7 +2678,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
     }
 
@@ -2712,7 +2713,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg)
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1))
             .expect("missing override path must fall back to embedded");
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
     }
@@ -2761,7 +2762,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert_eq!(
             executor.changelog_stylist_template,
             DEFAULT_CHANGELOG_STYLIST_TEMPLATE
@@ -2801,7 +2802,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert!(
             executor.changelog_stylist_template.contains("CUSTOM_STYLIST_SENTINEL"),
             "{}",
@@ -2843,7 +2844,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg)
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1))
             .expect("empty stylist override falls back to embedded");
         assert_eq!(
             executor.changelog_stylist_template,
@@ -2884,7 +2885,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg)
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1))
             .expect("empty implementer override falls back to embedded");
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
     }
@@ -2927,7 +2928,7 @@ mod tests {
             audit_triage: None,
             chat_request_triage: None,
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert!(executor.template.contains("NESTED_IMPL"));
         assert!(!executor.template.contains("LEGACY_IMPL"));
     }
@@ -2977,7 +2978,7 @@ mod tests {
                 prompt_path: Some(chat_triage),
             }),
         };
-        let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
+        let executor = ClaudeCliExecutor::from_config(&cfg, std::sync::Arc::new(crate::testing::test_daemon_paths().1)).unwrap();
         assert!(
             executor.triage_template.contains("TRIAGE_SENTINEL"),
             "audit_triage override must load: {}",
