@@ -331,7 +331,7 @@ impl ClaudeCliExecutor {
             ));
         }
         let rendered = self.template.replace(PROMPT_BODY_PLACEHOLDER, &body);
-        Ok(append_iteration_continuation_block(workspace, change, rendered))
+        Ok(append_iteration_continuation_block(&self.paths, workspace, change, rendered))
     }
 
     /// Build the revision-mode prompt for `change` by running `openspec
@@ -641,7 +641,7 @@ impl ClaudeCliExecutor {
         // autocoder's group, not Claude's). The guard cleans the file up
         // on every exit path of this function.
         let _subprocess_marker_guard = if let Some(pid) = child.id() {
-            if let Err(e) = crate::busy_marker::write_subprocess_marker(workspace, pid) {
+            if let Err(e) = crate::busy_marker::write_subprocess_marker(&self.paths, workspace, pid) {
                 tracing::warn!(
                     workspace = %workspace.display(),
                     pid,
@@ -650,6 +650,7 @@ impl ClaudeCliExecutor {
                 None
             } else {
                 Some(SubprocessMarkerGuard {
+                    paths: self.paths.clone(),
                     workspace: workspace.to_path_buf(),
                 })
             }
@@ -757,7 +758,7 @@ impl ClaudeCliExecutor {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let log_path = run_log_path(workspace, change);
+        let log_path = run_log_path(&self.paths, workspace, change);
         let writer = match event_log::open(&log_path) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -930,7 +931,7 @@ impl ClaudeCliExecutor {
             try_consume_outcome(&workspace_basename, change).await
         {
             return Ok(ClassifiedOutcome {
-                outcome: map_recorded_outcome(workspace, change, recorded),
+                outcome: map_recorded_outcome(&self.paths, workspace, change, recorded),
                 tool_recorded: true,
             });
         }
@@ -995,7 +996,7 @@ impl ClaudeCliExecutor {
             // here so journalctl shows *why* on the same line.
             let stdout_tail = tail(&outcome.stdout, 2048);
             let stderr_tail = tail(&outcome.stderr, 2048);
-            let log_path = run_log_path(workspace, change);
+            let log_path = run_log_path(&self.paths, workspace, change);
             tracing::warn!(
                 change = change,
                 log_file = %log_path.display(),
@@ -1047,7 +1048,7 @@ impl ClaudeCliExecutor {
         // Append the recovery turn's content to the existing per-change
         // log files with a clear divider so the operator sees both
         // phases.
-        append_recovery_to_log(workspace, change, &outcome);
+        append_recovery_to_log(&self.paths, workspace, change, &outcome);
 
         // The recovery turn fires AT MOST ONCE — we do not call the
         // acceptance scan on its result. We do, however, consume any
@@ -1116,7 +1117,7 @@ impl ClaudeCliExecutor {
             })?;
 
         let _subprocess_marker_guard = if let Some(pid) = child.id() {
-            if let Err(e) = crate::busy_marker::write_subprocess_marker(workspace, pid) {
+            if let Err(e) = crate::busy_marker::write_subprocess_marker(&self.paths, workspace, pid) {
                 tracing::warn!(
                     workspace = %workspace.display(),
                     pid,
@@ -1125,6 +1126,7 @@ impl ClaudeCliExecutor {
                 None
             } else {
                 Some(SubprocessMarkerGuard {
+                    paths: self.paths.clone(),
                     workspace: workspace.to_path_buf(),
                 })
             }
@@ -1226,9 +1228,14 @@ AND it returns a validation error, fix the error AND retry the call.\n",
 /// files with a clear `=== RECOVERY TURN ===` divider. Errors are
 /// logged at WARN but never propagated — the executor outcome must not
 /// depend on diagnostic side-effects.
-fn append_recovery_to_log(workspace: &Path, change: &str, outcome: &SubprocessOutcome) {
+fn append_recovery_to_log(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    change: &str,
+    outcome: &SubprocessOutcome,
+) {
     use std::io::Write;
-    let summary_path = run_log_path(workspace, change);
+    let summary_path = run_log_path(paths, workspace, change);
     let stream_path = crate::executor::event_log::stream_path_for(&summary_path);
 
     let summary_body = match &outcome.final_answer {
@@ -1295,16 +1302,16 @@ fn append_recovery_to_log(workspace: &Path, change: &str, outcome: &SubprocessOu
 ///   `rendered` unchanged. The corrupt marker is NOT deleted (operator
 ///   can inspect AND repair).
 pub(crate) fn append_iteration_continuation_block(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     change: &str,
     rendered: String,
 ) -> String {
-    let paths = crate::paths::current();
     let basename = workspace
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    match crate::iteration_pending::read_marker(&paths, basename, change) {
+    match crate::iteration_pending::read_marker(paths, basename, change) {
         Ok(Some(marker)) => {
             let block = render_iteration_continuation_block(&marker);
             format!("{rendered}\n{block}")
@@ -1502,6 +1509,7 @@ pub(crate) const ITERATION_CAP_EXCEEDED_REASON: &str =
 /// variant to read the current iteration-pending marker AND enforce the
 /// cap of [`ITERATION_REQUEST_CAP`] iterations per change.
 fn map_recorded_outcome(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     change: &str,
     recorded: crate::outcome_store::RecordedOutcome,
@@ -1536,13 +1544,12 @@ fn map_recorded_outcome(
             // (the just-finished run). A corrupt / unreadable marker
             // is treated as absent (corrupt-as-absent) per design.md
             // D5's degraded-recovery story.
-            let paths_for_marker = crate::paths::current();
             let basename_for_marker = workspace
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
             let prior_iteration_number = match crate::iteration_pending::read_marker(
-                &paths_for_marker,
+                paths,
                 basename_for_marker,
                 change,
             ) {
@@ -1624,12 +1631,13 @@ impl Drop for TempFileGuard {
 /// next iteration's busy-marker recovery only sees a sidecar when an
 /// actual orphan exists (i.e. the daemon crashed before Drop ran).
 struct SubprocessMarkerGuard {
+    paths: std::sync::Arc<crate::paths::DaemonPaths>,
     workspace: PathBuf,
 }
 
 impl Drop for SubprocessMarkerGuard {
     fn drop(&mut self) {
-        crate::busy_marker::remove_subprocess_marker(&self.workspace);
+        crate::busy_marker::remove_subprocess_marker(&self.paths, &self.workspace);
     }
 }
 
@@ -1649,7 +1657,7 @@ impl Executor for ClaudeCliExecutor {
         let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, change, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
         let session_id = outcome.session_id.clone();
         let classified = self
             .classify_outcome_with_meta(workspace, change, outcome)
@@ -1700,7 +1708,7 @@ impl Executor for ClaudeCliExecutor {
         let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, change, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
 
@@ -1723,7 +1731,7 @@ impl Executor for ClaudeCliExecutor {
         let outcome = self.run_subprocess(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, change, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
 
@@ -1741,7 +1749,7 @@ impl Executor for ClaudeCliExecutor {
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
@@ -1758,7 +1766,7 @@ impl Executor for ClaudeCliExecutor {
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
@@ -1778,6 +1786,7 @@ impl Executor for ClaudeCliExecutor {
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(
+            &self.paths,
             workspace,
             BROWNFIELD_DRAFT_LOG_CHANGE_NAME,
             &prompt,
@@ -1799,7 +1808,7 @@ impl Executor for ClaudeCliExecutor {
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
+        persist_run_log(&self.paths, workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, SCOUT_LOG_CHANGE_NAME, outcome)
             .await
     }
@@ -1817,6 +1826,7 @@ impl Executor for ClaudeCliExecutor {
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(
+            &self.paths,
             workspace,
             CHANGELOG_STYLIST_LOG_CHANGE_NAME,
             &prompt,
@@ -2005,13 +2015,19 @@ pub(crate) fn run_log_path(
 /// captured stderr to the per-change log file. Errors are logged at WARN
 /// but never propagated; the executor outcome must not depend on
 /// diagnostic side-effects.
-fn persist_run_log(workspace: &Path, change: &str, prompt: &str, outcome: &SubprocessOutcome) {
+fn persist_run_log(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    change: &str,
+    prompt: &str,
+    outcome: &SubprocessOutcome,
+) {
     // The JSON-streaming path already wrote the structured log
     // incrementally; overwriting here would discard the ACTIONS section.
     if outcome.streamed_log {
         return;
     }
-    let path = run_log_path(workspace, change);
+    let path = run_log_path(paths, workspace, change);
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -2054,6 +2070,26 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// Return a process-wide `Arc<DaemonPaths>` for tests in this
+    /// module. A single tempdir-scoped instance is constructed lazily on
+    /// first call AND reused thereafter so that the executor's `paths`
+    /// field AND any test-side `run_log_path(...)` call agree on the
+    /// same disk layout. The underlying `TempDir` is leaked (OS reaps
+    /// at process exit). Tests that need true per-test isolation (e.g.
+    /// the iteration-pending tests around `map_recorded_outcome`)
+    /// construct their own via `crate::testing::test_daemon_paths()`.
+    fn test_paths_arc() -> std::sync::Arc<crate::paths::DaemonPaths> {
+        use std::sync::OnceLock;
+        static PATHS: OnceLock<std::sync::Arc<crate::paths::DaemonPaths>> = OnceLock::new();
+        PATHS
+            .get_or_init(|| {
+                let (td, paths) = crate::testing::test_daemon_paths();
+                std::mem::forget(td);
+                std::sync::Arc::new(paths)
+            })
+            .clone()
+    }
 
     /// Build a fixture workspace with one OpenSpec change so `build_prompt`
     /// has material to produce a non-empty prompt. The bundled tasks.md
@@ -2187,7 +2223,7 @@ mod tests {
         // Per-test isolated settings dir, so the assertion is not racy with
         // other parallel tests writing to the shared OS temp dir.
         let settings_dir = TempDir::new().unwrap();
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc())
             .with_settings_dir(settings_dir.path().to_path_buf());
         let _ = executor.run(&ws, "x").await.unwrap();
         let leftover: Vec<_> = std::fs::read_dir(settings_dir.path())
@@ -2205,7 +2241,7 @@ mod tests {
     async fn completed_when_command_exits_zero() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
     }
@@ -2218,7 +2254,7 @@ mod tests {
             "fail.sh",
             "#!/bin/sh\necho 'something broke' >&2\nexit 7\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Failed { reason } => {
@@ -2232,7 +2268,7 @@ mod tests {
     async fn failed_when_nonzero_with_no_stderr() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "silent.sh", "#!/bin/sh\nexit 3\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Failed { reason } => {
@@ -2258,7 +2294,7 @@ mod tests {
                 marker_dir.to_string_lossy()
             ),
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::AskUser { question, resume_handle } => {
@@ -2288,7 +2324,7 @@ mod tests {
                 marker_dir.to_string_lossy()
             ),
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::AskUser { question, .. } => {
@@ -2324,7 +2360,7 @@ mod tests {
         commit(&["add", "-A"]);
         commit(&["commit", "-q", "-m", "fixture script"]);
 
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::AskUser { question, .. } => {
@@ -2347,7 +2383,7 @@ mod tests {
             "did_work.sh",
             "#!/bin/sh\necho 'work done; please clarify nothing relevant'\ntouch ARTIFACT\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
     }
@@ -2375,7 +2411,7 @@ mod tests {
         // Use a script that simply exits 0 — resume should treat that as
         // Completed (no diff path).
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
 
         let handle = ResumeHandle(
             serde_json::to_value(ClaudeResumeData {
@@ -2393,7 +2429,7 @@ mod tests {
     async fn resume_errors_on_bad_handle() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let handle = ResumeHandle(serde_json::json!({ "not": "a real handle" }));
         let err = match executor.resume(handle, "x").await {
             Ok(_) => panic!("expected Err from malformed handle"),
@@ -2407,7 +2443,7 @@ mod tests {
     async fn mcp_config_is_cleaned_up_after_run() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         executor.run(&ws, "x").await.unwrap();
         assert!(
             !ws.join(".mcp.json").exists(),
@@ -2427,7 +2463,7 @@ mod tests {
     async fn timeout_kills_child() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "slow.sh", "#!/bin/sh\nsleep 30\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1, test_paths_arc());
         let start = std::time::Instant::now();
         let outcome = executor.run(&ws, "x").await.unwrap();
         let elapsed = start.elapsed();
@@ -2446,7 +2482,7 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_returns_non_empty_for_valid_fixture() {
         let (_dir, ws) = fixture_workspace();
-        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, test_paths_arc());
         let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(!prompt.trim().is_empty(), "prompt must not be empty");
     }
@@ -2454,7 +2490,7 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_errors_when_change_dir_missing() {
         let dir = TempDir::new().unwrap();
-        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, test_paths_arc());
         let err = executor
             .build_prompt(dir.path(), "missing")
             .expect_err("missing change dir should error");
@@ -2471,7 +2507,7 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_substitutes_change_body_into_template() {
         let (_dir, ws) = fixture_workspace();
-        let mut executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let mut executor = ClaudeCliExecutor::new("/bin/true".into(), 30, test_paths_arc());
         executor.template = "ROLE_HEADER\n--- BEGIN ---\n{{change_body}}\n--- END ---".into();
         let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(prompt.starts_with("ROLE_HEADER"), "template prefix missing: {prompt}");
@@ -2490,7 +2526,7 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_without_marker_omits_continuation_block() {
         let (_dir, ws) = fixture_workspace();
-        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, test_paths_arc());
         let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(
             !prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
@@ -2504,12 +2540,9 @@ mod tests {
     #[tokio::test]
     async fn build_prompt_with_marker_appends_continuation_block_verbatim() {
         let (_dir, ws) = fixture_workspace();
-        // Write a valid marker for change "x" (the fixture creates it).
-        // Marker lives under state_dir (NOT workspace) since the
-        // marker-out-of-workspace refactor; resolve via the same
-        // accessor `build_prompt` uses internally so write + read agree.
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         crate::iteration_pending::write_marker(
-            &crate::paths::current(),
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
             &crate::iteration_pending::IterationPendingMarker {
@@ -2520,7 +2553,7 @@ mod tests {
             },
         )
         .unwrap();
-        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, std::sync::Arc::new(paths));
         let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(
             prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
@@ -2565,7 +2598,7 @@ mod tests {
             .join("openspec/changes/x")
             .join(crate::iteration_pending::MARKER_FILE);
         std::fs::write(&marker_path, "{ truncated json").unwrap();
-        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, test_paths_arc());
         let prompt = executor.build_prompt(&ws, "x").unwrap();
         assert!(
             !prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
@@ -2974,12 +3007,12 @@ mod tests {
             "#!/bin/sh\necho hello-out\necho hello-err >&2\nexit 0\n",
         );
         // Text-mode opt-out path: legacy STDOUT/STDERR section names.
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc())
             .with_output_format(crate::config::ExecutorOutputFormat::Text);
         let outcome = executor.run(&ws, "x").await.unwrap();
         assert!(matches!(outcome, ExecutorOutcome::Completed { .. }), "got {outcome:?}");
 
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log)
             .unwrap_or_else(|e| panic!("reading {}: {e}", log.display()));
         assert!(body.contains("=== STDOUT ("), "missing stdout header in:\n{body}");
@@ -2994,7 +3027,7 @@ mod tests {
     #[tokio::test]
     async fn run_log_path_is_under_repo_sanitized_and_change_name() {
         let (_dir, ws) = fixture_workspace_with_git();
-        let path = run_log_path(&ws, "my-change");
+        let path = run_log_path(&test_paths_arc(), &ws, "my-change");
         let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
         let s = path.to_string_lossy();
         assert!(
@@ -3047,9 +3080,9 @@ mod tests {
             streamed_log: false,
             session_id: None,
         };
-        persist_run_log(&ws, "my-change", "PROMPT_SENTINEL", &outcome);
+        persist_run_log(&test_paths_arc(), &ws, "my-change", "PROMPT_SENTINEL", &outcome);
 
-        let log = run_log_path(&ws, "my-change");
+        let log = run_log_path(&test_paths_arc(), &ws, "my-change");
         let body = std::fs::read_to_string(&log).expect("log file written");
         // Ordering and labels.
         let prompt_idx = body.find("=== PROMPT (").expect("PROMPT header");
@@ -3079,11 +3112,11 @@ mod tests {
     }
 
     fn fixture_executor_json() -> ClaudeCliExecutor {
-        ClaudeCliExecutor::new("dummy-claude".into(), 30)
+        ClaudeCliExecutor::new("dummy-claude".into(), 30, test_paths_arc())
     }
 
     fn fixture_executor_text() -> ClaudeCliExecutor {
-        ClaudeCliExecutor::new("dummy-claude".into(), 30)
+        ClaudeCliExecutor::new("dummy-claude".into(), 30, test_paths_arc())
             .with_output_format(crate::config::ExecutorOutputFormat::Text)
     }
 
@@ -3215,7 +3248,7 @@ some tool output\n\
     #[test]
     fn build_revision_prompt_substitutes_all_placeholders() {
         let (_dir, ws) = fixture_workspace();
-        let executor = ClaudeCliExecutor::new("dummy".into(), 30);
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30, test_paths_arc());
         let ctx = crate::revisions::RevisionContext {
             change_name: "x".to_string(),
             pr_diff: "DIFF_HERE".to_string(),
@@ -3296,7 +3329,7 @@ some tool output\n\
     #[test]
     fn build_revision_prompt_does_not_invoke_openspec() {
         let (_dir, ws) = fixture_workspace();
-        let executor = ClaudeCliExecutor::new("dummy".into(), 30);
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30, test_paths_arc());
         let ctx = crate::revisions::RevisionContext {
             change_name: "x".to_string(),
             pr_diff: "diff".to_string(),
@@ -3321,10 +3354,10 @@ some tool output\n\
     async fn run_log_contains_prompt_section() {
         let (_dir, ws) = fixture_workspace_with_git();
         let script = write_script(&ws, "noop.sh", "#!/bin/sh\nexit 0\n");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let _ = executor.run(&ws, "x").await.unwrap();
 
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).expect("log file written");
         assert!(body.contains("=== PROMPT ("), "missing PROMPT header in:\n{body}");
         // The recorded prompt must be non-empty. Different envs may
@@ -3362,7 +3395,7 @@ echo '{"type":"result","stop_reason":"end_turn","result":"Done — the change is
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Completed { final_answer } => {
@@ -3374,7 +3407,7 @@ exit 0
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
         // Per a20a2: summary log has PROMPT, ACTIONS-pointer line,
         // FINAL ANSWER, STDERR. NOT raw action content.
@@ -3418,7 +3451,7 @@ exec </dev/null >/dev/null 2>&1
 sleep 30
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Failed { reason } => {
@@ -3426,7 +3459,7 @@ sleep 30
             }
             other => panic!("expected Failed timeout, got {other:?}"),
         }
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).expect("summary log written");
         // Summary: empty FINAL ANSWER (timeout). Stream: action lines.
         assert!(
@@ -3453,14 +3486,14 @@ echo '{"type":"result","stop_reason":"end_turn","result":"ok"}'
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
         // Raw action lines live in the stream log; the valid `result`
         // event populates FINAL ANSWER in the summary log.
-        let summary = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        let summary = std::fs::read_to_string(run_log_path(&test_paths_arc(), &ws, "x")).unwrap();
         let stream = std::fs::read_to_string(
-            run_log_path(&ws, "x").with_extension("stream.log"),
+            run_log_path(&test_paths_arc(), &ws, "x").with_extension("stream.log"),
         )
         .unwrap();
         assert!(
@@ -3487,12 +3520,12 @@ echo '{"type":"result","stop_reason":"end_turn","result":"done"}'
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let _ = executor.run(&ws, "x").await.unwrap();
         // Per a20a2: unknown-type lines land in the stream log, not
         // the summary.
         let stream = std::fs::read_to_string(
-            run_log_path(&ws, "x").with_extension("stream.log"),
+            run_log_path(&test_paths_arc(), &ws, "x").with_extension("stream.log"),
         )
         .unwrap();
         assert!(
@@ -3515,9 +3548,9 @@ echo 'stderr noise' >&2
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let _ = executor.run(&ws, "x").await.unwrap();
-        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        let body = std::fs::read_to_string(run_log_path(&test_paths_arc(), &ws, "x")).unwrap();
         let stderr_section = body.split("=== STDERR (").nth(1).unwrap();
         assert!(
             stderr_section.contains("stderr noise"),
@@ -3538,7 +3571,7 @@ echo '{"type":"result","stop_reason":"end_turn","result":"FINAL_ANSWER_SENTINEL"
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Completed { final_answer } => {
@@ -3563,7 +3596,7 @@ exit 0
             "slow.sh",
             "#!/bin/sh\nexec </dev/null >/dev/null 2>&1\nsleep 30\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 1, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
             ExecutorOutcome::Failed { .. } => {}
@@ -3582,7 +3615,7 @@ exit 0
             "text.sh",
             "#!/bin/sh\necho 'final summary text from text mode'\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30)
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc())
             .with_output_format(crate::config::ExecutorOutputFormat::Text);
         let outcome = executor.run(&ws, "x").await.unwrap();
         match outcome {
@@ -3594,7 +3627,7 @@ exit 0
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        let body = std::fs::read_to_string(run_log_path(&ws, "x")).unwrap();
+        let body = std::fs::read_to_string(run_log_path(&test_paths_arc(), &ws, "x")).unwrap();
         assert!(body.contains("=== STDOUT ("), "legacy STDOUT section missing");
         assert!(body.contains("=== STDERR ("), "legacy STDERR section missing");
         assert!(!body.contains("=== ACTIONS ==="), "JSON-mode ACTIONS section must be absent");
@@ -3749,13 +3782,14 @@ exit 0
     /// integration tests above are not the only coverage.
     #[test]
     fn map_recorded_outcome_round_trips_both_variants() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
         let recorded_success = crate::outcome_store::RecordedOutcome::Success {
             final_answer: Some("ok".to_string()),
         };
-        match map_recorded_outcome(ws, "x", recorded_success) {
+        match map_recorded_outcome(&paths, ws, "x", recorded_success) {
             ExecutorOutcome::Completed { final_answer } => {
                 assert_eq!(final_answer.as_deref(), Some("ok"));
             }
@@ -3771,7 +3805,7 @@ exit 0
             ],
             revision_suggestion: "s".to_string(),
         };
-        match map_recorded_outcome(ws, "x", recorded_revision) {
+        match map_recorded_outcome(&paths, ws, "x", recorded_revision) {
             ExecutorOutcome::SpecNeedsRevision {
                 unimplementable_tasks,
                 revision_suggestion,
@@ -3787,6 +3821,7 @@ exit 0
     /// present maps to `IterationRequested { iteration_number: 2, ... }`.
     #[test]
     fn map_iteration_request_no_marker_yields_iteration_two() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
@@ -3795,7 +3830,7 @@ exit 0
             remaining_tasks: vec!["3".into()],
             reason: "ran out of time".into(),
         };
-        match map_recorded_outcome(ws, "x", recorded) {
+        match map_recorded_outcome(&paths, ws, "x", recorded) {
             ExecutorOutcome::IterationRequested {
                 completed_tasks,
                 remaining_tasks,
@@ -3815,11 +3850,12 @@ exit 0
     /// (5th iteration is still permitted under the cap).
     #[test]
     fn map_iteration_request_with_marker_iteration_four_yields_five() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
         crate::iteration_pending::write_marker(
-            &crate::paths::current(),
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
             &crate::iteration_pending::IterationPendingMarker {
@@ -3835,7 +3871,7 @@ exit 0
             remaining_tasks: vec!["4b".into()],
             reason: "need more time".into(),
         };
-        match map_recorded_outcome(ws, "x", recorded) {
+        match map_recorded_outcome(&paths, ws, "x", recorded) {
             ExecutorOutcome::IterationRequested {
                 iteration_number, ..
             } => {
@@ -3849,6 +3885,7 @@ exit 0
     /// the cap-exceeded reason; the marker is NOT modified.
     #[test]
     fn map_iteration_request_with_marker_iteration_five_yields_failed_cap_exceeded() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
@@ -3859,7 +3896,7 @@ exit 0
             iteration_number: 5,
         };
         crate::iteration_pending::write_marker(
-            &crate::paths::current(),
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
             &prior_marker,
@@ -3876,7 +3913,7 @@ exit 0
             remaining_tasks: vec!["5b".into()],
             reason: "still need more time".into(),
         };
-        match map_recorded_outcome(ws, "x", recorded) {
+        match map_recorded_outcome(&paths, ws, "x", recorded) {
             ExecutorOutcome::Failed { reason } => {
                 assert!(
                     reason.starts_with("exceeded iteration-request cap (5)"),
@@ -3887,7 +3924,7 @@ exit 0
         }
         // Marker is NOT modified.
         let still = crate::iteration_pending::read_marker(
-            &crate::paths::current(),
+            &paths,
             ws.file_name().and_then(|s| s.to_str()).unwrap(),
             "x",
         )
@@ -3901,6 +3938,7 @@ exit 0
     /// at iteration_number 2.
     #[test]
     fn map_iteration_request_with_corrupt_marker_treats_as_absent() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
@@ -3916,7 +3954,7 @@ exit 0
             remaining_tasks: vec!["2".into()],
             reason: "fresh start".into(),
         };
-        match map_recorded_outcome(ws, "x", recorded) {
+        match map_recorded_outcome(&paths, ws, "x", recorded) {
             ExecutorOutcome::IterationRequested {
                 iteration_number, ..
             } => {
@@ -4040,7 +4078,7 @@ exit 0\n",
             );
         }
         let script = write_system_event_script(&ws, "ok.sh", "session-abc");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
@@ -4052,7 +4090,7 @@ exit 0\n",
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(
             !body.contains(RECOVERY_LOG_DIVIDER),
@@ -4094,7 +4132,7 @@ exit 0\n",
             );
         }
         let script = write_system_event_script(&ws, "ok.sh", "session-xyz");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
@@ -4109,7 +4147,7 @@ exit 0\n",
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(
             !body.contains(RECOVERY_LOG_DIVIDER),
@@ -4156,7 +4194,7 @@ exit 0\n",
             );
         }
         let script = write_system_event_script(&ws, "ok.sh", "session-recover");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
@@ -4168,7 +4206,7 @@ exit 0\n",
             }
             other => panic!("expected Completed from recovery, got {other:?}"),
         }
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(
             body.contains(RECOVERY_LOG_DIVIDER),
@@ -4215,7 +4253,7 @@ exit 0\n",
             );
         }
         let script = write_system_event_script(&ws, "ok.sh", "session-iter");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
@@ -4264,7 +4302,7 @@ exit 0\n",
             );
         }
         let script = write_system_event_script(&ws, "ok.sh", "session-no-recover");
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
@@ -4318,7 +4356,7 @@ exit 0\n",
             "rev.sh",
             "#!/bin/sh\nmkdir -p out && echo touched > out/touched\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let ctx = crate::revisions::RevisionContext {
             change_name: "x".to_string(),
             pr_diff: "".to_string(),
@@ -4336,7 +4374,7 @@ exit 0\n",
             matches!(outcome, ExecutorOutcome::Completed { .. }),
             "got {outcome:?}"
         );
-        let log = run_log_path(&ws, "x");
+        let log = run_log_path(&test_paths_arc(), &ws, "x");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(
             !body.contains(RECOVERY_LOG_DIVIDER),
@@ -4378,7 +4416,7 @@ exit 0\n",
             "triage.sh",
             "#!/bin/sh\necho triage done\nmkdir -p out && echo found > out/found\nexit 0\n",
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let ctx = TriageContext {
             findings: "f".to_string(),
             audit_type: "drift_audit".to_string(),
@@ -4438,7 +4476,7 @@ echo '{"type":"result","stop_reason":"end_turn","result":"=== AUTOCODER-OUTCOME 
 exit 0
 "#,
         );
-        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
         let outcome = executor.run(&ws, "x").await.unwrap();
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);

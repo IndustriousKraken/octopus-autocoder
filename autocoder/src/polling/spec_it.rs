@@ -22,6 +22,7 @@ use std::sync::Arc;
 /// Process the one drained spec-it request. Returns `Ok(())` on every
 /// path (including refusal); irrecoverable errors propagate as `Err`.
 pub async fn process_pending_spec_it(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -102,7 +103,7 @@ pub async fn process_pending_spec_it(
         status: ProposalRequestStatus::Pending,
         reason: None,
     };
-    let state_root = proposal_requests::default_state_root();
+    let state_root = proposal_requests::default_state_root(paths);
     if let Err(e) = proposal_requests::write_state(&state_root, &state) {
         tracing::warn!(
             scout_request_id = %request.scout_request_id,

@@ -2355,9 +2355,15 @@ fn secret_source_resolves(src: &SecretSource) -> bool {
 /// colliding group so the operator sees both indices.
 fn check_workspace_collisions(config: &Config, report: &mut ValidationReport) {
     use std::collections::HashMap;
+    // Resolve paths from this same config so the workspace-derivation
+    // here matches what the daemon would resolve at startup.
+    let paths = match crate::paths::resolve_daemon_paths(config) {
+        Ok(p) => p,
+        Err(_) => return, // path resolution failures are surfaced by another check
+    };
     let mut by_path: HashMap<std::path::PathBuf, Vec<usize>> = HashMap::new();
     for (idx, repo) in config.repositories.iter().enumerate() {
-        let path = crate::workspace::resolve_path(repo);
+        let path = crate::workspace::resolve_path(&paths, repo);
         by_path.entry(path).or_default().push(idx);
     }
     for (path, indices) in by_path {

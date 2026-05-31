@@ -2012,21 +2012,15 @@ pub struct OperatorCommandDispatcher {
     >,
 }
 
-impl Default for OperatorCommandDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl OperatorCommandDispatcher {
-    pub fn new() -> Self {
+    pub fn new(paths: &crate::paths::DaemonPaths) -> Self {
         Self {
             pending: ConfirmationStore::new(),
-            audit_thread_state_dir: crate::audits::threads::default_state_root(),
+            audit_thread_state_dir: crate::audits::threads::default_state_root(paths),
             proposal_request_state_dir:
-                crate::proposal_requests::default_state_root(),
+                crate::proposal_requests::default_state_root(paths),
             changelog_request_state_dir:
-                crate::changelog_requests::default_state_root(),
+                crate::changelog_requests::default_state_root(paths),
             audit_types: Vec::new(),
             chatops: None,
             brownfield_enabled: true,
@@ -4332,7 +4326,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_audit_substring_path_traversal_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -4355,7 +4349,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_audit_substring_shell_metachars_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -4651,7 +4645,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_change_slug_path_traversal_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -4675,7 +4669,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_change_slug_shell_metachars_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         // Tokenizer sees "a;" as one token then "rm" "-rf" "/" — the
         // verb has only 2 args (repo, change), so "a;" is the change.
@@ -4701,7 +4695,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_change_slug_oversized_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let too_long: String = "a".repeat(65);
         let reply = dispatcher
@@ -4724,7 +4718,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_repo_substring_double_dot_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         // `..` is rejected because `.` is in the allowed set but two
         // consecutive `..` is allowed by the substring regex — wait,
@@ -4753,7 +4747,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_repo_substring_oversized_rejected() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let too_long: String = "a".repeat(129);
         let reply = dispatcher
@@ -4776,7 +4770,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_real_world_valid_args_accepted() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response("clear_perma_stuck_marker", serde_json::json!({"ok": true}));
 
@@ -4813,7 +4807,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_repo_substring_with_dot_and_slash_accepted() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "repo_status",
@@ -5670,7 +5664,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_help_returns_sync_synopsis() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(&format!("{BOT} help"), "C1", BOT, &fixture_repos(), &submitter)
@@ -5684,7 +5678,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_help_case_insensitive() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply_lower = dispatcher
             .handle_message(&format!("{BOT} help"), "C1", BOT, &fixture_repos(), &submitter)
@@ -5699,7 +5693,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_returns_formatted_reply() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "repo_status",
@@ -5735,7 +5729,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_perma_stuck_on_unique_repo_submits_action() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response("clear_perma_stuck_marker", serde_json::json!({"ok": true}));
         let reply = dispatcher
@@ -5763,7 +5757,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_ignore_and_continue_submits_action_and_replies_success() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response("ignore_for_queue_marker", serde_json::json!({"ok": true}));
         let reply = dispatcher
@@ -5791,7 +5785,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_ignore_and_continue_refuses_with_no_underlying_marker() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "ignore_for_queue_marker",
@@ -5818,7 +5812,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_ignore_submits_action_and_replies_success() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "clear_ignore_for_queue_marker",
@@ -5851,7 +5845,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_ignore_refuses_when_no_marker_exists() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "clear_ignore_for_queue_marker",
@@ -5878,7 +5872,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_perma_stuck_propagates_action_error() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "clear_perma_stuck_marker",
@@ -5905,7 +5899,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_no_match_replies_with_configured_list() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -5928,7 +5922,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_verb_returns_none() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -5957,7 +5951,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_happy_path_submits_queue_audit() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_audit",
@@ -5994,7 +5988,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_imminent_eta_when_poll_interval_short() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_audit",
@@ -6022,7 +6016,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_ambiguous_audit_substring_lists_candidates() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -6045,7 +6039,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_unknown_audit_lists_all_registered() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -6069,7 +6063,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_ambiguous_repo_substring_lists_candidates() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         let repos = vec![
             RepoIdentity {
@@ -6102,7 +6096,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_unknown_repo_returns_no_match_reply() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -6123,7 +6117,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_audit_now_propagates_daemon_error() {
         let dispatcher =
-            OperatorCommandDispatcher::new().with_audit_types(audit_types());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_audit_types(audit_types());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_audit",
@@ -6152,7 +6146,7 @@ mod tests {
 
     #[tokio::test]
     async fn wipe_workspace_two_step_confirm_happy_path() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         // The first step now fetches live repo_status so the warning can
         // show currently-busy / queue / markers context to the operator.
@@ -6221,7 +6215,7 @@ mod tests {
 
     #[tokio::test]
     async fn wipe_workspace_confirm_without_pending_returns_error() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
@@ -6235,7 +6229,7 @@ mod tests {
 
     #[tokio::test]
     async fn wipe_workspace_expired_confirmation_returns_error_no_wipe() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         // Plant an already-expired entry directly so the test doesn't depend
         // on wall-clock time at all.
@@ -6256,7 +6250,7 @@ mod tests {
 
     #[tokio::test]
     async fn wipe_workspace_cross_channel_confirm_no_match() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         // The first step calls repo_status; the cross-channel confirm
         // must NOT progress to wipe_workspace.
@@ -6332,7 +6326,7 @@ mod tests {
 
     #[tokio::test]
     async fn wipe_workspace_reissue_replaces_prior_pending() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "repo_status",
@@ -6527,7 +6521,7 @@ mod tests {
     async fn run_wipe_with_response(
         wipe_response: serde_json::Value,
     ) -> String {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "repo_status",
@@ -6646,7 +6640,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_send_it_in_untracked_thread_politely_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
@@ -6669,7 +6663,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_send_it_in_stale_thread_politely_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         // 14 days old → past the 7d cap → polite refusal.
@@ -6699,7 +6693,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_send_it_in_fresh_open_thread_schedules_triage() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
@@ -6744,7 +6738,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_send_it_on_already_acted_thread_refuses_with_status() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         write_audit_thread_state(
@@ -6773,7 +6767,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_send_it_on_triage_failed_thread_reschedules() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
@@ -7034,7 +7028,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_menu_empty_repositories_returns_no_repos_configured_line() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(&format!("{BOT} status"), "C1", BOT, &[], &submitter)
@@ -7062,7 +7056,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_menu_bulk_action_three_repos_all_ok() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let repos = vec![
             ident("git@github.com:owner/a.git"),
@@ -7096,7 +7090,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_menu_bulk_action_one_unavailable_two_healthy() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let repos = vec![
             ident("git@github.com:owner/a.git"),
@@ -7137,7 +7131,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_menu_falls_back_to_n_repo_status_calls_when_bulk_unknown() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let repos = vec![
             ident("git@github.com:owner/a.git"),
@@ -7177,7 +7171,7 @@ mod tests {
         // Bulk unsupported → fallback → one of the N per-repo calls
         // errors out. The dispatcher must still ship every other repo's
         // section.
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let repos = vec![
             ident("git@github.com:owner/a.git"),
@@ -7383,7 +7377,7 @@ mod tests {
     async fn dispatch_propose_happy_path_posts_ack_and_writes_state_and_submits_action() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748399999.001234"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_proposal_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7450,7 +7444,7 @@ mod tests {
     async fn dispatch_propose_ambiguous_repo_returns_be_more_specific_no_post() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_proposal_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7477,7 +7471,7 @@ mod tests {
     async fn dispatch_propose_no_repo_match_returns_no_match_no_post() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_proposal_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7502,7 +7496,7 @@ mod tests {
     async fn dispatch_propose_missing_request_text_returns_error() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         let dispatcher =
-            OperatorCommandDispatcher::new().with_chatops(backend.clone());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -7524,7 +7518,7 @@ mod tests {
     async fn dispatch_propose_oversize_text_returns_error() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         let dispatcher =
-            OperatorCommandDispatcher::new().with_chatops(backend.clone());
+            OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let big: String = std::iter::repeat_n('a', MAX_PROPOSE_REQUEST_TEXT_LEN + 1).collect();
         let reply = dispatcher
@@ -7548,7 +7542,7 @@ mod tests {
         // No `.with_chatops(...)` call → the dispatcher cannot post the
         // top-level ack so it surfaces an error.
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_proposal_request_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
@@ -7571,7 +7565,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         backend.force_capture_failure();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_proposal_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7679,7 +7673,7 @@ mod tests {
     async fn dispatch_changelog_happy_path_posts_ack_writes_state_submits_action() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748400000.001234"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7742,7 +7736,7 @@ mod tests {
     async fn dispatch_changelog_missing_repo_substring_refuses_with_no_state() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7766,7 +7760,7 @@ mod tests {
     async fn dispatch_changelog_no_match_lists_configured() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7791,7 +7785,7 @@ mod tests {
     async fn dispatch_changelog_ambiguous_lists_candidates() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7815,7 +7809,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_changelog_without_chatops_backend_returns_error() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
@@ -7836,7 +7830,7 @@ mod tests {
     async fn dispatch_changelog_workspace_override_default_denied() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7862,7 +7856,7 @@ mod tests {
     async fn dispatch_changelog_bad_arg_returns_descriptive_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_changelog_request_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
@@ -7971,7 +7965,7 @@ mod tests {
     async fn dispatch_brownfield_missing_capability_returns_usage_hint_no_post() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let repos = brownfield_repos_at(workspace.path());
         let reply = dispatcher
@@ -7989,7 +7983,7 @@ mod tests {
     async fn dispatch_brownfield_invalid_slug_returns_constraint_message_no_state() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let repos = brownfield_repos_at(workspace.path());
         let reply = dispatcher
@@ -8023,7 +8017,7 @@ mod tests {
     async fn dispatch_brownfield_ambiguous_repo_returns_be_more_specific() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let repos = brownfield_repos_at(workspace.path());
         // Both fixture repos contain "acme" → ambiguous.
@@ -8048,7 +8042,7 @@ mod tests {
     async fn dispatch_brownfield_disabled_returns_disabled_message() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_brownfield_enabled(false);
         let submitter = FakeSubmitter::new();
@@ -8086,7 +8080,7 @@ mod tests {
         std::fs::write(&spec, "## existing").unwrap();
 
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let repos = brownfield_repos_at(workspace.path());
         let reply = dispatcher
@@ -8119,7 +8113,7 @@ mod tests {
     async fn dispatch_brownfield_happy_path_posts_ack_writes_state_submits_action() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748399999.001234"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_brownfield_request",
@@ -8186,7 +8180,7 @@ mod tests {
     async fn dispatch_brownfield_happy_path_without_guidance_writes_none_guidance() {
         let workspace = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("ts-1"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_brownfield_request",
@@ -8508,7 +8502,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_scout_disabled_returns_refusal_no_post() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_scout_enabled(false);
         let submitter = FakeSubmitter::new();
@@ -8531,7 +8525,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_scout_ambiguous_repo_returns_be_more_specific() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         // Both fixture repos contain "acme" → ambiguous.
         let reply = dispatcher
@@ -8554,7 +8548,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_scout_happy_path_posts_ack_and_queues_action() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748.99"));
-        let dispatcher = OperatorCommandDispatcher::new().with_chatops(backend.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_scout_request",
@@ -8595,7 +8589,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_scout_reports_count_from_daemon() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_clear_scout",
@@ -8620,7 +8614,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_scout_zero_runs_uses_zero_count() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter.set_response(
             "queue_clear_scout",
@@ -8642,7 +8636,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_spec_it_outside_recognized_thread_returns_refusal() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message_in_thread(
@@ -8697,7 +8691,7 @@ mod tests {
         crate::state::scout_run::write_state(workspace.path(), &state).unwrap();
         // workspace-resolver maps the only repo URL onto our temp dir.
         let ws_path = workspace.path().to_path_buf();
-        let dispatcher = OperatorCommandDispatcher::new().with_workspace_resolver(
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_workspace_resolver(
             move |_url| Some(ws_path.clone()),
         );
         let submitter = FakeSubmitter::new();
@@ -8747,7 +8741,7 @@ mod tests {
         };
         crate::state::scout_run::write_state(workspace.path(), &state).unwrap();
         let ws_path = workspace.path().to_path_buf();
-        let dispatcher = OperatorCommandDispatcher::new().with_workspace_resolver(
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1).with_workspace_resolver(
             move |_url| Some(ws_path.clone()),
         );
         let submitter = FakeSubmitter::new();
@@ -8877,7 +8871,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_brownfield_survey_disabled_returns_refusal_no_post() {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_brownfield_survey_enabled(false);
         let submitter = FakeSubmitter::new();
@@ -8902,7 +8896,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_survey_disabled_returns_refusal() {
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_brownfield_survey_enabled(false);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
@@ -8925,7 +8919,7 @@ mod tests {
     async fn dispatch_brownfield_survey_happy_path_submits_queue_action() {
         let backend =
             std::sync::Arc::new(FakeChatOpsBackend::new("1748400123.001234"));
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         submitter
@@ -8953,7 +8947,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_survey_reports_count_from_daemon() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter
             .set_response("queue_clear_survey", serde_json::json!({"ok": true, "cleared": 4}));
@@ -8974,7 +8968,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clear_survey_zero_count_is_idempotent() {
-        let dispatcher = OperatorCommandDispatcher::new();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         submitter
             .set_response("queue_clear_survey", serde_json::json!({"ok": true, "cleared": 0}));
@@ -9045,7 +9039,7 @@ mod tests {
             workspace_path: tmp_ws.path().to_path_buf(),
         }];
 
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_audit_thread_state_dir(
                 tempfile::TempDir::new().unwrap().path().to_path_buf(),
@@ -9118,7 +9112,7 @@ mod tests {
             workspace_path: tmp_ws.path().to_path_buf(),
         }];
 
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_audit_thread_state_dir(
                 tempfile::TempDir::new().unwrap().path().to_path_buf(),
@@ -9151,7 +9145,7 @@ mod tests {
             url: "git@github.com:acme/myrepo.git".into(),
             workspace_path: tmp_ws.path().to_path_buf(),
         }];
-        let dispatcher = OperatorCommandDispatcher::new()
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_chatops(backend.clone())
             .with_audit_thread_state_dir(
                 tempfile::TempDir::new().unwrap().path().to_path_buf(),

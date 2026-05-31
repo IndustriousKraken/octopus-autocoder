@@ -601,4 +601,95 @@ mod tests {
         );
     }
 
+    /// Task 4.4: spawn two `std::thread::spawn` threads that each
+    /// construct DIFFERENT `DaemonPaths` via `test_daemon_paths()` AND
+    /// invoke `AlertState::load_or_default` + `save` against their own
+    /// tempdir. Assert: the two threads' writes land in DIFFERENT
+    /// tempdirs (no cross-contamination). Pins the canonical
+    /// "Concurrent tests do not collide on disk" scenario.
+    #[test]
+    fn concurrent_threads_do_not_collide_on_disk() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+
+        let t1 = std::thread::spawn(move || {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws-thread-1");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-1 marker".into(),
+                },
+            );
+            // Sync write to maximize the chance of a collision if paths
+            // were shared.
+            b1.wait();
+            state.save(&paths, &ws).expect("thread-1 save");
+            let written = alert_state_path(&paths, &ws);
+            let body = std::fs::read_to_string(&written).expect("thread-1 read");
+            assert!(body.contains("thread-1 marker"));
+            // Keep tempdir alive until we've returned its root for the
+            // collision assertion below.
+            (temp, written, body)
+        });
+
+        let t2 = std::thread::spawn(move || {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws-thread-2");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-2 marker".into(),
+                },
+            );
+            b2.wait();
+            state.save(&paths, &ws).expect("thread-2 save");
+            let written = alert_state_path(&paths, &ws);
+            let body = std::fs::read_to_string(&written).expect("thread-2 read");
+            assert!(body.contains("thread-2 marker"));
+            (temp, written, body)
+        });
+
+        let (temp_1, path_1, body_1) = t1.join().expect("thread-1 panicked");
+        let (temp_2, path_2, body_2) = t2.join().expect("thread-2 panicked");
+
+        // The two threads' state-file paths MUST live under DIFFERENT
+        // tempdir roots. No prefix overlap.
+        assert_ne!(
+            temp_1.path(),
+            temp_2.path(),
+            "the two test_daemon_paths() calls must return distinct tempdir roots"
+        );
+        assert!(
+            path_1.starts_with(temp_1.path()),
+            "thread-1's write must live under its own tempdir root"
+        );
+        assert!(
+            path_2.starts_with(temp_2.path()),
+            "thread-2's write must live under its own tempdir root"
+        );
+        assert!(
+            !path_1.starts_with(temp_2.path()),
+            "thread-1's write must NOT live under thread-2's tempdir"
+        );
+        assert!(
+            !path_2.starts_with(temp_1.path()),
+            "thread-2's write must NOT live under thread-1's tempdir"
+        );
+        // Each thread sees its OWN marker text — neither read the
+        // other's write.
+        assert!(body_1.contains("thread-1 marker"));
+        assert!(!body_1.contains("thread-2 marker"));
+        assert!(body_2.contains("thread-2 marker"));
+        assert!(!body_2.contains("thread-1 marker"));
+    }
+
 }

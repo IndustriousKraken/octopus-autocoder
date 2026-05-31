@@ -688,6 +688,7 @@ async fn process_one_pr(
                     }
                     // Lifecycle: triggered.
                     crate::polling_loop::maybe_post_code_review_triggered_alert(
+                        paths,
                         chatops_ctx,
                         repo,
                         pr.number,
@@ -733,6 +734,7 @@ async fn process_one_pr(
                         }
                         Ok(CodeReviewOutcome::Completed { verdict }) => {
                             crate::polling_loop::maybe_post_code_review_complete_alert(
+                                paths,
                                 chatops_ctx,
                                 repo,
                                 pr.number,
@@ -746,6 +748,7 @@ async fn process_one_pr(
                         }
                         Ok(CodeReviewOutcome::Failed { reason }) => {
                             crate::polling_loop::maybe_post_code_review_failed_alert(
+                                paths,
                                 chatops_ctx,
                                 repo,
                                 pr.number,
@@ -778,6 +781,7 @@ async fn process_one_pr(
                                 "code-review execution errored: {e:#}"
                             );
                             crate::polling_loop::maybe_post_code_review_failed_alert(
+                                paths,
                                 chatops_ctx,
                                 repo,
                                 pr.number,
@@ -911,6 +915,7 @@ async fn process_one_pr(
         let operator_quote =
             crate::polling_loop::truncate_operator_comment(&revision_text, 80);
         crate::polling_loop::maybe_post_revise_picked_up_alert(
+            paths,
             chatops_ctx,
             repo,
             pr.number,
@@ -947,6 +952,7 @@ async fn process_one_pr(
                     let push_failure_reason =
                         format!("push to {} failed: {e}", repo.agent_branch);
                     crate::polling_loop::maybe_post_revise_failed_alert(
+                        paths,
                         chatops_ctx,
                         repo,
                         pr.number,
@@ -970,6 +976,7 @@ async fn process_one_pr(
                 }
                 state.revisions_applied = state.revisions_applied.saturating_add(1);
                 crate::polling_loop::maybe_post_revise_succeeded_alert(
+                    paths,
                     chatops_ctx,
                     repo,
                     pr.number,
@@ -1037,6 +1044,7 @@ async fn process_one_pr(
             }
             Ok(ExecutorOutcome::Failed { reason }) => {
                 crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
                     chatops_ctx,
                     repo,
                     pr.number,
@@ -1072,6 +1080,7 @@ async fn process_one_pr(
                 // is observed during a pending-change run; this lifecycle
                 // notification is additive and per-revise-comment.
                 crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
                     chatops_ctx,
                     repo,
                     pr.number,
@@ -1096,6 +1105,7 @@ async fn process_one_pr(
                 // pending changes do. Treat IterationRequested as a Failed-
                 // equivalent so the PR comment surfaces the unhandled case.
                 crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
                     chatops_ctx,
                     repo,
                     pr.number,
@@ -1124,6 +1134,7 @@ async fn process_one_pr(
                 );
                 let executor_error_reason = format!("executor error: {e:#}");
                 crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
                     chatops_ctx,
                     repo,
                     pr.number,
@@ -1475,13 +1486,15 @@ mod tests {
     #[test]
     fn read_state_returns_none_when_file_missing() {
         let tmp = TempDir::new().unwrap();
-        let got = read_state(tmp.path(), 99).unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let got = read_state(&paths, tmp.path(), 99).unwrap();
         assert!(got.is_none());
     }
 
     #[test]
     fn write_then_read_round_trips_every_field() {
         let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let original = RevisionState {
             pr_number: 42,
             agent_branch: "agent-q".to_string(),
@@ -1495,8 +1508,8 @@ mod tests {
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
         };
-        write_state(tmp.path(), &original).unwrap();
-        let got = read_state(tmp.path(), 42).unwrap().expect("file exists");
+        write_state(&paths, tmp.path(), &original).unwrap();
+        let got = read_state(&paths, tmp.path(), 42).unwrap().expect("file exists");
         assert_eq!(got, original);
     }
 
@@ -1505,6 +1518,7 @@ mod tests {
     #[test]
     fn legacy_state_file_loads_with_default_code_review_fields() {
         let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let legacy = serde_json::json!({
             "pr_number": 7,
             "agent_branch": "agent-q",
@@ -1513,10 +1527,10 @@ mod tests {
             "revision_cap": 5,
             "cap_decline_posted": false
         });
-        let path = state_path(tmp.path(), 7);
+        let path = state_path(&paths, tmp.path(), 7);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-        let got = read_state(tmp.path(), 7).unwrap().expect("legacy file loads");
+        let got = read_state(&paths, tmp.path(), 7).unwrap().expect("legacy file loads");
         assert_eq!(got.code_reviews_applied, 0);
         assert_eq!(got.code_review_cap, 5);
         assert!(!got.cap_decline_posted_for_code_review);
@@ -1529,6 +1543,7 @@ mod tests {
     #[test]
     fn populated_new_fields_round_trip() {
         let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let original = RevisionState {
             pr_number: 99,
             agent_branch: "agent-q".to_string(),
@@ -1542,52 +1557,56 @@ mod tests {
             last_suggested_rereview_at_revisions_count: Some(3),
             original_review_head_sha: Some("abc123def".to_string()),
         };
-        write_state(tmp.path(), &original).unwrap();
-        let got = read_state(tmp.path(), 99).unwrap().expect("file exists");
+        write_state(&paths, tmp.path(), &original).unwrap();
+        let got = read_state(&paths, tmp.path(), 99).unwrap().expect("file exists");
         assert_eq!(got, original);
     }
 
     #[test]
     fn prune_removes_state_for_closed_prs() {
         let tmp = TempDir::new().unwrap();
-        write_state(tmp.path(), &sample_state(1)).unwrap();
-        write_state(tmp.path(), &sample_state(2)).unwrap();
-        write_state(tmp.path(), &sample_state(3)).unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        write_state(&paths, tmp.path(), &sample_state(1)).unwrap();
+        write_state(&paths, tmp.path(), &sample_state(2)).unwrap();
+        write_state(&paths, tmp.path(), &sample_state(3)).unwrap();
 
         let mut open = HashSet::new();
         open.insert(2u64);
-        let removed = prune_closed_prs(tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
         assert_eq!(removed, 2);
-        assert!(read_state(tmp.path(), 1).unwrap().is_none());
-        assert!(read_state(tmp.path(), 2).unwrap().is_some());
-        assert!(read_state(tmp.path(), 3).unwrap().is_none());
+        assert!(read_state(&paths, tmp.path(), 1).unwrap().is_none());
+        assert!(read_state(&paths, tmp.path(), 2).unwrap().is_some());
+        assert!(read_state(&paths, tmp.path(), 3).unwrap().is_none());
     }
 
     #[test]
     fn prune_missing_directory_is_zero() {
         let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let mut open = HashSet::new();
         open.insert(1u64);
-        let removed = prune_closed_prs(tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
         assert_eq!(removed, 0);
     }
 
     #[test]
     fn prune_ignores_non_json_files_and_garbage_names() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let basename = tmp.path().file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+        let dir = paths.revisions_dir().join(basename);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), "x").unwrap();
         std::fs::write(dir.join("not-a-number.json"), "x").unwrap();
-        write_state(tmp.path(), &sample_state(1)).unwrap();
+        write_state(&paths, tmp.path(), &sample_state(1)).unwrap();
         let mut open = HashSet::new();
-        let removed = prune_closed_prs(tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
         // Only `1.json` removed; non-numeric stems left alone.
         assert_eq!(removed, 1);
         assert!(dir.join("readme.txt").exists());
         assert!(dir.join("not-a-number.json").exists());
         open.insert(99u64);
-        let _ = prune_closed_prs(tmp.path(), &open).unwrap();
+        let _ = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
         assert!(dir.join("readme.txt").exists());
     }
 
@@ -1598,25 +1617,29 @@ mod tests {
     #[test]
     fn atomic_write_tolerates_interrupted_partial_temp() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let basename = tmp.path().file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+        let dir = paths.revisions_dir().join(basename);
         std::fs::create_dir_all(&dir).unwrap();
         // Simulate a temp file left behind by a previous interrupted write.
         std::fs::write(dir.join(".tmpABCDEF"), "{incomplete json").unwrap();
         // The canonical file does NOT exist; read returns None.
-        let got = read_state(tmp.path(), 42).unwrap();
+        let got = read_state(&paths, tmp.path(), 42).unwrap();
         assert!(got.is_none());
         // A successful write then read works as expected.
-        write_state(tmp.path(), &sample_state(42)).unwrap();
-        assert!(read_state(tmp.path(), 42).unwrap().is_some());
+        write_state(&paths, tmp.path(), &sample_state(42)).unwrap();
+        assert!(read_state(&paths, tmp.path(), 42).unwrap().is_some());
     }
 
     #[test]
     fn read_state_errors_on_corrupt_json() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(LEGACY_REVISIONS_DIR);
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let basename = tmp.path().file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+        let dir = paths.revisions_dir().join(basename);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("42.json"), "not json").unwrap();
-        let err = read_state(tmp.path(), 42).expect_err("corrupt JSON must surface as Err");
+        let err = read_state(&paths, tmp.path(), 42).expect_err("corrupt JSON must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("parsing"), "got: {msg}");
     }
@@ -1624,12 +1647,13 @@ mod tests {
     #[test]
     fn remove_state_is_idempotent() {
         let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
         // Removing a never-existing file is Ok.
-        remove_state(tmp.path(), 99).unwrap();
-        write_state(tmp.path(), &sample_state(42)).unwrap();
-        remove_state(tmp.path(), 42).unwrap();
+        remove_state(&paths, tmp.path(), 99).unwrap();
+        write_state(&paths, tmp.path(), &sample_state(42)).unwrap();
+        remove_state(&paths, tmp.path(), 42).unwrap();
         // Second remove is also Ok.
-        remove_state(tmp.path(), 42).unwrap();
+        remove_state(&paths, tmp.path(), 42).unwrap();
     }
 
     // -------- parser tests --------
@@ -2185,11 +2209,13 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2257,18 +2283,20 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         post_reply.assert_async().await;
-        let state = read_state(&ws, 9).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 9).unwrap().expect("state persisted");
         assert_eq!(state.revisions_applied, 1);
 
         token_env_clear(env_var);
@@ -2322,17 +2350,19 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-        let state = read_state(&ws, 11).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 11).unwrap().expect("state persisted");
         // last_seen advanced past the bot comment but no revision applied.
         assert_eq!(state.revisions_applied, 0);
 
@@ -2397,11 +2427,13 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2465,11 +2497,13 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2537,6 +2571,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-seed the state file so the cap is already reached.
         let pre_state = RevisionState {
             pr_number: 13,
@@ -2551,7 +2586,7 @@ mod tests {
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
         };
-        write_state(&ws, &pre_state).unwrap();
+        write_state(&paths, &ws, &pre_state).unwrap();
 
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
@@ -2564,6 +2599,7 @@ mod tests {
         };
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, Some(ctx), 5, cancel, &server.url(),
         )
         .await
@@ -2578,7 +2614,7 @@ mod tests {
             "expected cap-decline chatops notification; got: {notifs:?}"
         );
         // State now records the decline was posted.
-        let state = read_state(&ws, 13).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 13).unwrap().expect("state persisted");
         assert!(state.cap_decline_posted);
 
         token_env_clear(env_var);
@@ -2606,20 +2642,22 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
-        write_state(&ws, &sample_state(5)).unwrap();
-        write_state(&ws, &sample_state(7)).unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_state(&paths, &ws, &sample_state(5)).unwrap();
+        write_state(&paths, &ws, &sample_state(7)).unwrap();
         let repo = make_repo("git@github.com:owner/repo.git");
         let gh = make_github(env_var);
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
         // Both state files should be gone (no open PR claims them).
-        assert!(read_state(&ws, 5).unwrap().is_none());
-        assert!(read_state(&ws, 7).unwrap().is_none());
+        assert!(read_state(&paths, &ws, 5).unwrap().is_none());
+        assert!(read_state(&paths, &ws, 7).unwrap().is_none());
 
         token_env_clear(env_var);
     }
@@ -2690,12 +2728,14 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let repo = make_repo("git@github.com:owner/repo.git");
         let mut gh = make_github(env_var);
         gh.fork_owner = Some("fork-acc".to_string());
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2773,6 +2813,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-seed state with `last_seen_comment_at` exactly equal to the
         // comment's `created_at`.
         write_state(
@@ -2798,6 +2839,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2807,7 +2849,7 @@ mod tests {
             0,
             "comment at exact marker timestamp must not invoke run_revision",
         );
-        let state = read_state(&ws, 31).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 31).unwrap().expect("state persisted");
         assert_eq!(state.revisions_applied, 0);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
@@ -2843,6 +2885,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_state(
             &ws,
             &RevisionState {
@@ -2867,6 +2910,7 @@ mod tests {
         let executor = StubExecutor::new(Vec::new());
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2876,7 +2920,7 @@ mod tests {
             0,
             "comment older than marker must not invoke run_revision",
         );
-        let state = read_state(&ws, 33).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 33).unwrap().expect("state persisted");
         assert_eq!(state.revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
@@ -2922,6 +2966,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         write_state(
             &ws,
             &RevisionState {
@@ -2947,6 +2992,7 @@ mod tests {
             StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         let cancel = CancellationToken::new();
         process_revision_requests_at(
+            &paths,
             &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
         )
         .await
@@ -2957,7 +3003,7 @@ mod tests {
             "comment newer than marker must invoke run_revision exactly once",
         );
         post_reply.assert_async().await;
-        let state = read_state(&ws, 35).unwrap().expect("state persisted");
+        let state = read_state(&paths, &ws, 35).unwrap().expect("state persisted");
         assert_eq!(state.revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T12:00:00Z"));
 
@@ -3015,6 +3061,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // Pre-seed iter-1 state: T0 = 09:00:00Z (before the comment).
         write_state(
             &ws,
@@ -3046,6 +3093,7 @@ mod tests {
 
         // Iteration 1.
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3063,13 +3111,14 @@ mod tests {
             1,
             "iter 1: comment should be processed",
         );
-        let state = read_state(&ws, 37).unwrap().expect("iter 1 state persisted");
+        let state = read_state(&paths, &ws, 37).unwrap().expect("iter 1 state persisted");
         assert_eq!(state.revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         // Iteration 2: same comment is re-fetched, strict-since filter
         // must skip it.
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3088,7 +3137,7 @@ mod tests {
             "iter 2: strict-since filter must skip the duplicate",
         );
         post_reply.assert_async().await;
-        let state = read_state(&ws, 37).unwrap().expect("iter 2 state persisted");
+        let state = read_state(&paths, &ws, 37).unwrap().expect("iter 2 state persisted");
         assert_eq!(
             state.revisions_applied, 1,
             "counter must not be incremented twice",
@@ -3141,6 +3190,7 @@ mod tests {
             .await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         // T0 = 09:00:00Z; T1 = 11:00:00Z. Pre-seed iter-1 state.
         write_state(
             &ws,
@@ -3178,6 +3228,7 @@ mod tests {
 
         // Iteration 1: AskUser → marker held back, no PR reply.
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3195,7 +3246,7 @@ mod tests {
             1,
             "iter 1: AskUser-returning comment was processed",
         );
-        let state = read_state(&ws, 39).unwrap().expect("iter 1 state persisted");
+        let state = read_state(&paths, &ws, 39).unwrap().expect("iter 1 state persisted");
         assert_eq!(state.revisions_applied, 0);
         assert_eq!(
             state.last_seen_comment_at,
@@ -3212,6 +3263,7 @@ mod tests {
             failure_alerts_enabled: true,
         };
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3230,7 +3282,7 @@ mod tests {
             "iter 2: AskUser-preserved comment must be reprocessed",
         );
         post_reply.assert_async().await;
-        let state = read_state(&ws, 39).unwrap().expect("iter 2 state persisted");
+        let state = read_state(&paths, &ws, 39).unwrap().expect("iter 2 state persisted");
         assert_eq!(state.revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
@@ -3688,6 +3740,7 @@ mod tests {
         let (server, _mocks) = revise_dispatcher_mockito(101, 9001).await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         // Make resolve_path point at the test workspace so the helpers'
         // alert-state file lands inside the tempdir.
@@ -3701,6 +3754,7 @@ mod tests {
             failure_alerts_enabled: true,
         };
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3759,6 +3813,7 @@ mod tests {
         let (server, _mocks) = revise_dispatcher_mockito(102, 9002).await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let gh = make_github(env_var);
@@ -3772,6 +3827,7 @@ mod tests {
             failure_alerts_enabled: true,
         };
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3825,11 +3881,13 @@ mod tests {
         let (server, _mocks) = revise_dispatcher_mockito(103, 9003).await;
 
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let gh = make_github(env_var);
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         process_revision_requests_at(
+            &paths,
             &ws,
             &repo,
             &gh,
@@ -3861,6 +3919,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_triggered_posts_and_records_dedup() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let chatops = std::sync::Arc::new(StubChatOps::new());
@@ -3899,6 +3958,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_triggered_skipped_when_failure_alerts_off() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let chatops = std::sync::Arc::new(StubChatOps::new());
@@ -3923,6 +3983,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_triggered_skipped_when_chatops_ctx_none() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         crate::polling_loop::maybe_post_code_review_triggered_alert(
@@ -3939,6 +4000,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_triggered_deduplicates_per_comment_id() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let chatops = std::sync::Arc::new(StubChatOps::new());
@@ -3963,6 +4025,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_complete_posts_canonical_text_with_verdict() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let chatops = std::sync::Arc::new(StubChatOps::new());
@@ -3992,6 +4055,7 @@ mod tests {
     #[tokio::test]
     async fn code_review_failed_posts_canonical_text_with_reason() {
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         let chatops = std::sync::Arc::new(StubChatOps::new());
@@ -4024,6 +4088,7 @@ mod tests {
     async fn code_review_helpers_use_supplied_channel() {
         use crate::chatops::ChatOpsBackend;
         let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         let mut repo = make_repo("git@github.com:owner/repo.git");
         repo.local_path = Some(ws.clone());
         // Channel-capturing stub.

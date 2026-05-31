@@ -38,7 +38,8 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
     let repo = resolve_repo(&repos, args.repo.as_deref())?;
     tracing::info!(url = repo.url.as_str(), "rewind targeting repository");
 
-    let workspace_path = workspace::resolve_path(repo);
+    let paths = crate::cli::resolve_paths_from_env()?;
+    let workspace_path = workspace::resolve_path(&paths, repo);
     let fork_url = match github.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
         None => None,
@@ -46,7 +47,7 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
     let fork_arg = fork_url
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
-    workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg)?;
+    workspace::ensure_initialized(&paths, &workspace_path, &repo.url, fork_arg)?;
     let remote_name = if github.fork_owner.is_some() { "fork" } else { "origin" };
 
     if !args.hard {

@@ -49,7 +49,7 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// ascending for determinism. Operators with stacked dependencies (in
 /// the unmarked tier) encode explicit order via numeric prefixes
 /// (`01-`, `02-`).
-pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
+pub fn list_pending(paths: &crate::paths::DaemonPaths, workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
         return Ok(Vec::new());
@@ -106,14 +106,13 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
         // (NOT the workspace) per the architectural fix that removed
         // it from the git working tree where `git clean -fd` would
         // periodically wipe it.
-        let paths = crate::paths::current();
         let basename = workspace
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
-        if crate::iteration_pending::marker_exists(&paths, basename, &name) {
+        if crate::iteration_pending::marker_exists(paths, basename, &name) {
             let iteration_number =
-                match crate::iteration_pending::read_marker(&paths, basename, &name) {
+                match crate::iteration_pending::read_marker(paths, basename, &name) {
                     Ok(Some(m)) => m.iteration_number,
                     // A truly absent marker shouldn't happen here (we just
                     // checked exists), but treat absent like corrupt for
@@ -622,6 +621,7 @@ mod tests {
 
     #[test]
     fn list_pending_filters_correctly() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "01-feature-a");
@@ -648,14 +648,15 @@ mod tests {
         // Excluded: a regular file (not a directory).
         std::fs::write(ws.join(CHANGES_SUBDIR).join("regular.txt"), "x").unwrap();
 
-        let listed = list_pending(ws).unwrap();
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(listed, vec!["01-feature-a", "02-feature-b"]);
     }
 
     #[test]
     fn list_pending_handles_missing_changes_dir() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
-        let listed = list_pending(dir.path()).unwrap();
+        let listed = list_pending(&paths, dir.path()).unwrap();
         assert!(listed.is_empty());
     }
 
@@ -676,17 +677,19 @@ mod tests {
 
     #[test]
     fn list_pending_excludes_locked_change() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "x");
         make_change(ws, "y");
         lock(ws, "x").unwrap();
-        let listed = list_pending(ws).unwrap();
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(listed, vec!["y"]);
     }
 
     #[test]
     fn clear_stale_locks_removes_in_progress_files() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "x");
@@ -702,7 +705,7 @@ mod tests {
         assert!(!ws.join(CHANGES_SUBDIR).join("y").join(LOCK_FILE).exists());
         assert!(!ws.join(CHANGES_SUBDIR).join("z").join(LOCK_FILE).exists());
         // After cleanup, x and z are pending again.
-        let listed = list_pending(ws).unwrap();
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(listed, vec!["x", "y", "z"]);
     }
 
@@ -805,6 +808,7 @@ mod tests {
 
     #[test]
     fn pending_excludes_waiting() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "ready");
@@ -816,7 +820,7 @@ mod tests {
         )
         .unwrap();
 
-        let pending = list_pending(ws).unwrap();
+        let pending = list_pending(&paths, ws).unwrap();
         assert_eq!(pending, vec!["ready"], "waiting change must be excluded from pending");
     }
 
@@ -872,6 +876,7 @@ mod tests {
 
     #[test]
     fn list_pending_excludes_perma_stuck() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "alpha");
@@ -884,7 +889,7 @@ mod tests {
         )
         .unwrap();
 
-        let pending = list_pending(ws).unwrap();
+        let pending = list_pending(&paths, ws).unwrap();
         assert_eq!(
             pending,
             vec!["alpha".to_string(), "gamma".to_string()],
@@ -894,6 +899,7 @@ mod tests {
 
     #[test]
     fn list_pending_excludes_needs_spec_revision() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "alpha");
@@ -906,7 +912,7 @@ mod tests {
         )
         .unwrap();
 
-        let pending = list_pending(ws).unwrap();
+        let pending = list_pending(&paths, ws).unwrap();
         assert_eq!(
             pending,
             vec!["alpha".to_string(), "gamma".to_string()],
@@ -918,6 +924,7 @@ mod tests {
 
     #[test]
     fn would_collide_on_archive_detects_dated_entry() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -950,7 +957,7 @@ mod tests {
         // with no active dir, list_pending returns empty.
         std::fs::remove_dir_all(ws.join(CHANGES_SUBDIR).join("foo")).unwrap();
         assert!(
-            list_pending(ws).unwrap().is_empty(),
+            list_pending(&paths, ws).unwrap().is_empty(),
             "with only the archive entry, list_pending must not return the change"
         );
 
@@ -962,7 +969,7 @@ mod tests {
         let only_archive = ws2.join(CHANGES_SUBDIR).join(ARCHIVE_DIR).join(format!("{today}-bar"));
         std::fs::create_dir_all(&only_archive).unwrap();
         assert!(would_collide_on_archive(ws2, "bar"));
-        assert!(list_pending(ws2).unwrap().is_empty());
+        assert!(list_pending(&paths, ws2).unwrap().is_empty());
 
         // And on a workspace with NO archive entry, the helper returns false.
         let dir3 = TempDir::new().unwrap();
@@ -1432,31 +1439,33 @@ mod tests {
     // a27a1: iteration-pending two-tier ordering tests
     // -----------------------------------------------------------------
 
-    fn write_iteration_marker(workspace: &Path, change: &str, iteration_number: u32) {
+    fn write_iteration_marker(
+        paths: &crate::paths::DaemonPaths,
+        workspace: &Path,
+        change: &str,
+        iteration_number: u32,
+    ) {
         let marker = crate::iteration_pending::IterationPendingMarker {
             completed_tasks: vec!["1".into()],
             remaining_tasks: vec!["2".into()],
             reason: "fixture".into(),
             iteration_number,
         };
-        // Marker now lives under state_dir, NOT the workspace. Resolve
-        // via the same path accessor `list_pending` uses internally so
-        // the writer + reader agree on location.
-        let paths = crate::paths::current();
         let basename = workspace.file_name().and_then(|s| s.to_str()).unwrap();
-        crate::iteration_pending::write_marker(&paths, basename, change, &marker).unwrap();
+        crate::iteration_pending::write_marker(paths, basename, change, &marker).unwrap();
     }
 
     /// Task 5.3: unmarked vs. marked — the iteration-pending entry
     /// comes first despite alphabetical disadvantage.
     #[test]
     fn list_pending_iteration_marker_preempts_alphabetical_order() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "a30-foo");
         make_change(ws, "a31-bar");
-        write_iteration_marker(ws, "a31-bar", 2);
-        let listed = list_pending(ws).unwrap();
+        write_iteration_marker(&paths, ws, "a31-bar", 2);
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(
             listed,
             vec!["a31-bar".to_string(), "a30-foo".to_string()],
@@ -1467,13 +1476,14 @@ mod tests {
     /// Task 5.4: among marked, lower iteration_number sorts first.
     #[test]
     fn list_pending_marked_tier_sorts_by_iteration_number_ascending() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "a30-foo");
         make_change(ws, "a31-bar");
-        write_iteration_marker(ws, "a30-foo", 3);
-        write_iteration_marker(ws, "a31-bar", 2);
-        let listed = list_pending(ws).unwrap();
+        write_iteration_marker(&paths, ws, "a30-foo", 3);
+        write_iteration_marker(&paths, ws, "a31-bar", 2);
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(
             listed,
             vec!["a31-bar".to_string(), "a30-foo".to_string()],
@@ -1485,12 +1495,13 @@ mod tests {
     /// preserved (regression test against today's enumeration).
     #[test]
     fn list_pending_unmarked_tier_alphabetical_unchanged() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "c-third");
         make_change(ws, "a-first");
         make_change(ws, "b-second");
-        let listed = list_pending(ws).unwrap();
+        let listed = list_pending(&paths, ws).unwrap();
         assert_eq!(
             listed,
             vec![
@@ -1506,15 +1517,11 @@ mod tests {
     /// cause `list_pending` to error.
     #[test]
     fn list_pending_corrupt_marker_treated_as_iteration_zero_and_does_not_error() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "a30-corrupt");
         make_change(ws, "a31-valid");
-        // Inject a corrupt marker for a30-corrupt at the state-dir
-        // location (post-refactor: markers live under state_dir, NOT
-        // the workspace). We mirror what `list_pending` itself does
-        // to resolve the marker path.
-        let paths = crate::paths::current();
         let basename = ws.file_name().and_then(|s| s.to_str()).unwrap();
         let corrupt_dir = paths.iteration_pending_basename_dir(basename);
         std::fs::create_dir_all(&corrupt_dir).unwrap();
@@ -1524,8 +1531,8 @@ mod tests {
         )
         .unwrap();
         // Valid marker for a31-valid with iteration_number 2.
-        write_iteration_marker(ws, "a31-valid", 2);
-        let listed = list_pending(ws).unwrap();
+        write_iteration_marker(&paths, ws, "a31-valid", 2);
+        let listed = list_pending(&paths, ws).unwrap();
         // Both are marked; corrupt's iteration_number-for-ordering is 0
         // (sorts ahead of the valid 2-iteration entry).
         assert_eq!(
@@ -1540,12 +1547,13 @@ mod tests {
     /// unchanged for entries with those markers.
     #[test]
     fn list_pending_iteration_marker_is_not_an_exclusion() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "a30-ready");
         make_change(ws, "a31-iteration");
-        write_iteration_marker(ws, "a31-iteration", 2);
-        let listed = list_pending(ws).unwrap();
+        write_iteration_marker(&paths, ws, "a31-iteration", 2);
+        let listed = list_pending(&paths, ws).unwrap();
         assert!(
             listed.contains(&"a31-iteration".to_string()),
             "iteration-pending change must be returned in the pending list"

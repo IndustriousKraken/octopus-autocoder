@@ -76,7 +76,7 @@ pub fn migrate_alert_state_from_workspace(
     let mut failed = 0u32;
 
     for repo in repos {
-        let workspace_path = workspace::resolve_path(repo);
+        let workspace_path = workspace::resolve_path(paths, repo);
         let basename = workspace_basename(&workspace_path);
         let outcome = migrate_one_repo(paths, repo, github_cfg, &workspace_path, &basename);
         match &outcome {

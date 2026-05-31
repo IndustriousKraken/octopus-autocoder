@@ -34,8 +34,11 @@ use std::path::Path;
 /// referenced survey to `InProgress` AND posts the queue
 /// confirmation. Subsequent iterations drive the actual item drain.
 pub async fn process_pending_brownfield_batch(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
-    _repo: &RepositoryConfig,
+    repo: &RepositoryConfig,
+    executor: &dyn crate::executor::Executor,
+    github_cfg: &crate::config::GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     request: &crate::control_socket::BrownfieldBatchRequest,
 ) -> Result<()> {
@@ -144,6 +147,7 @@ pub async fn process_pending_brownfield_batch(
 /// Runs every polling iteration. No-op when no survey is in progress
 /// OR when every item has reached a terminal state.
 pub async fn drain_next_brownfield_batch_item(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,
@@ -255,6 +259,7 @@ pub async fn drain_next_brownfield_batch_item(
     // its "✅ Brownfield draft PR opened" reply doesn't double up with
     // our survey-specific status message below.
     let exec_result = crate::polling::brownfield::process_pending_brownfield(
+        paths,
         workspace,
         repo,
         executor,

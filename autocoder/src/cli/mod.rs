@@ -6,6 +6,56 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Resolve a `DaemonPaths` from env vars only (no config file). Used by
+/// CLI subcommands that talk to the running daemon (or run standalone)
+/// AND don't take a `--config` flag. The env-driven resolution mirrors
+/// the daemon's own startup priority order minus the config override:
+/// AUTOCODER_*_DIR → systemd dirs → XDG defaults → hard fallback.
+pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
+    let cfg = config::Config {
+        repositories: vec![],
+        executor: config::ExecutorConfig {
+            kind: config::ExecutorKind::ClaudeCli,
+            command: String::new(),
+            timeout_secs: 60,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: None,
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: config::default_wipe_drain_timeout_secs(),
+            output_format: config::default_output_format(),
+            log_retention_days: config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check: config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
+        },
+        github: config::GithubConfig {
+            token_env: "GITHUB_TOKEN".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        },
+        reviewer: None,
+        chatops: None,
+        audits: None,
+        paths: config::DaemonPathsConfig::default(),
+        features: config::FeaturesConfig::default(),
+        canonical_rag: None,
+    };
+    crate::paths::resolve_daemon_paths(&cfg)
+}
+
 pub mod audit;
 pub mod changelog;
 pub mod check_config;

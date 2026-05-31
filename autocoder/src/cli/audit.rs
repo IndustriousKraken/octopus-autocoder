@@ -24,11 +24,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 pub async fn execute(workspace: PathBuf, audit_name: String) -> Result<()> {
-    execute_at(&control_socket::socket_path(), workspace, audit_name).await
+    let paths = crate::cli::resolve_paths_from_env()?;
+    execute_at(&control_socket::socket_path(&paths), &paths, workspace, audit_name).await
 }
 
 pub async fn execute_at(
     socket: &Path,
+    paths: &crate::paths::DaemonPaths,
     workspace: PathBuf,
     audit_name: String,
 ) -> Result<()> {
@@ -40,7 +42,7 @@ pub async fn execute_at(
         Ok(stream) => submit_queue_audit(stream, &workspace, &audit_name).await,
         Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
             // No daemon listening → standalone path.
-            run_standalone(&workspace, &audit_name).await
+            run_standalone(paths, &workspace, &audit_name).await
         }
         Err(e) => Err(anyhow!(
             "could not connect to control socket {}: {e}",
@@ -120,7 +122,7 @@ async fn submit_queue_audit(
 /// named audit, construct a fake `RepositoryConfig` whose `local_path`
 /// is the operator-supplied workspace, and call the audit's `run`
 /// directly. Findings (if any) are printed to stdout.
-async fn run_standalone(workspace: &Path, audit_name: &str) -> Result<()> {
+async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, audit_name: &str) -> Result<()> {
     if !workspace.is_dir() {
         return Err(anyhow!(
             "workspace path {} is not a directory",
@@ -171,7 +173,7 @@ async fn run_standalone(workspace: &Path, audit_name: &str) -> Result<()> {
         })?;
 
     let repo = fake_repo_for_workspace(workspace);
-    let log_writer = AuditLogWriter::open(workspace, audit_arc.audit_type())?;
+    let log_writer = AuditLogWriter::open(paths, workspace, audit_arc.audit_type())?;
     let mut ctx = AuditContext {
         workspace,
         repo: &repo,

@@ -157,16 +157,15 @@ fn banned_global_paths_accessor_names() -> Vec<String> {
     ]
 }
 
-/// Enabled once the threading refactor (`a27-thread-daemon-paths`)
-/// has removed every call site of the global accessors named below.
-/// Until then the test would fail loudly on the 17 known-good
-/// references in production code; running it `#[ignore]`'d preserves
-/// the scanner infrastructure AND keeps the rest of the suite green
-/// while the per-module signature changes are landed. Remove the
-/// `#[ignore]` (and the doc comment above) in the same commit that
-/// removes the last call site.
+/// Scans `autocoder/src/**/*.rs` for any reference to the removed
+/// process-global path accessors (`paths::current`,
+/// `paths::install_global`, `paths::test_fallback`, `paths::get_global`).
+/// The four accessors were removed in `a35-thread-daemon-paths-globals-removal`
+/// (the implementation-completion of the canonical `Production paths
+/// SHALL be threaded through APIs` requirement). The scanner runs
+/// unconditionally: any reintroduction fails the build with a list of
+/// `file:line` violations.
 #[test]
-#[ignore = "enable once a27 removes all paths::current()/install_global()/test_fallback()/get_global() call sites"]
 fn no_removed_paths_global_accessor_references_in_src() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src_root = crate_root.join("src");

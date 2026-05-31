@@ -10,7 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 pub async fn execute() -> Result<()> {
-    execute_at(&control_socket::socket_path()).await
+    let paths = crate::cli::resolve_paths_from_env()?;
+    execute_at(&control_socket::socket_path(&paths)).await
 }
 
 pub async fn execute_at(socket: &Path) -> Result<()> {
