@@ -99,7 +99,7 @@ When an operator picks a provider NOT in a subsystem's valid set, config-load SH
 
 ## MODIFIED Requirements
 
-### Requirement: `canonical_rag:` config-block-driven workspace-init embedding pipeline
+### Requirement: Canonical-spec RAG configuration and pipeline
 
 autocoder SHALL support a per-workspace retrieval-augmented-context pipeline that embeds the workspace's canonical OpenSpec specs (`openspec/specs/<capability>/spec.md`) into an in-memory vector store AND exposes a retrieval surface for the implementer (via `a21`'s executor MCP requirement) AND for downstream pre-flight checks (`a22`'s change-vs-canon contradiction check). The pipeline is configured via a top-level `canonical_rag:` block in `config.yaml`; an absent block disables the feature entirely. A present block with `enabled: false` also disables; both forms preserve "no behavior change" for operators who don't opt in.
 
