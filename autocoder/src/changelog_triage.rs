@@ -227,6 +227,18 @@ async fn process_one_request(
         ExecutorOutcome::IterationRequested { .. } => Err(anyhow!(
             "executor returned IterationRequested during changelog run (iteration sequences not applicable)"
         )),
+        ExecutorOutcome::Aborted { reason } => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. Return Ok(()) so the changelog request is not
+            // marked as a failure; the next iteration after restart
+            // will retry from a clean state.
+            tracing::info!(
+                url = %repo.url,
+                request_id = %state.request_id,
+                "changelog-stylist: executor aborted by daemon shutdown: {reason}"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -637,6 +649,16 @@ async fn re_run_stylist_and_force_push(
             return Err(anyhow!(
                 "executor returned IterationRequested; not supported here"
             ));
+        }
+        ExecutorOutcome::Aborted { reason } => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. Return Ok(()) — the revise loop will retry on
+            // the next iteration after restart.
+            tracing::info!(
+                url = %repo.url,
+                "changelog-revision: executor aborted by daemon shutdown: {reason}"
+            );
+            return Ok(());
         }
     }
     let porcelain = git::status_porcelain(workspace)

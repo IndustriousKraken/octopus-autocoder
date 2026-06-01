@@ -962,6 +962,24 @@ impl ClaudeCliExecutor {
         }
 
         let status = outcome.exit_status.expect("non-timeout path has status");
+        // a39: exit status 143 (= 128 + 15, SIGTERM-killed) while the
+        // daemon is in its own shutdown cascade is operator-initiated
+        // territory, not a real agent failure. The classifier maps it
+        // to `Aborted` so the polling loop bypasses the failure counter
+        // + perma-stuck path. External SIGTERMs (OOM killer, manual
+        // `kill -TERM`, container orchestrator) still hit the existing
+        // `Failed` arm below because the flag is `false` for them.
+        if status.code() == Some(143)
+            && crate::daemon::SHUTDOWN_REQUESTED
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(ClassifiedOutcome {
+                outcome: ExecutorOutcome::Aborted {
+                    reason: "daemon shutdown (SIGTERM cascade)".to_string(),
+                },
+                tool_recorded: false,
+            });
+        }
         if !status.success() {
             let reason: String = outcome.stderr.trim().chars().take(200).collect();
             let reason = if reason.is_empty() {
@@ -4612,6 +4630,182 @@ exit 0
                 assert_eq!(final_answer.as_deref(), Some("done"));
             }
             other => panic!("expected Completed terminal path, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // a39: SIGTERM-aware classifier — exit-143 + SHUTDOWN_REQUESTED
+    // ---------------------------------------------------------------
+    //
+    // Each test takes `crate::daemon::TEST_GUARD` to serialize access
+    // to the process-wide flag AND resets the flag to its default
+    // before exiting. The classifier reads the flag inline, so any
+    // unrelated test that races a flag mutation would see a wrong
+    // result.
+
+    /// Task 3.2: exit_status 143 AND `SHUTDOWN_REQUESTED == true` →
+    /// classifier returns `Aborted { reason: "daemon shutdown (SIGTERM
+    /// cascade)" }`.
+    ///
+    /// The classifier reads a process-wide flag (`crate::daemon::
+    /// SHUTDOWN_REQUESTED`) inline; the test guard MUST stay held
+    /// across the `.await` to keep concurrent classifier tests from
+    /// observing a flipped flag. A `std::sync::Mutex` is correct here
+    /// (the awaited operation is fast AND the lock is contention-free
+    /// outside this test pair), so we silence the clippy lint
+    /// recommending an async-aware mutex.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn classifier_exit_143_with_shutdown_flag_set_returns_aborted() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = crate::daemon::TEST_GUARD.lock().unwrap();
+        crate::daemon::reset_for_test();
+        crate::daemon::request_shutdown();
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            // ExitStatus::from_raw expects the wait-status word; on
+            // Linux a normal exit's status is `code << 8`.
+            exit_status: Some(std::process::ExitStatus::from_raw(143 << 8)),
+            stdout: String::new(),
+            stderr: "killed by signal".to_string(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor
+            .classify_outcome(&ws, "x", outcome)
+            .await
+            .unwrap();
+        crate::daemon::reset_for_test();
+        match result {
+            ExecutorOutcome::Aborted { reason } => {
+                assert_eq!(
+                    reason, "daemon shutdown (SIGTERM cascade)",
+                    "Aborted must carry the canonical reason"
+                );
+            }
+            other => panic!(
+                "expected Aborted when exit=143 AND SHUTDOWN_REQUESTED is true, got {other:?}"
+            ),
+        }
+    }
+
+    /// Task 3.3: exit_status 143 AND `SHUTDOWN_REQUESTED == false` →
+    /// classifier returns the existing `Failed { reason: "executor
+    /// exited with exit status: 143" }` — preserving today's behavior
+    /// for external-source SIGTERMs (OOM, manual kill, etc.).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn classifier_exit_143_without_shutdown_flag_returns_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = crate::daemon::TEST_GUARD.lock().unwrap();
+        crate::daemon::reset_for_test();
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(143 << 8)),
+            stdout: String::new(),
+            // Empty stderr so the exit-status branch falls through to
+            // the `format!("executor exited with {status}")` reason
+            // shape the spec scenario asserts.
+            stderr: String::new(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor
+            .classify_outcome(&ws, "x", outcome)
+            .await
+            .unwrap();
+        crate::daemon::reset_for_test();
+        match result {
+            ExecutorOutcome::Failed { reason } => {
+                assert_eq!(
+                    reason, "executor exited with exit status: 143",
+                    "external-source SIGTERM must keep today's Failed reason"
+                );
+            }
+            other => panic!(
+                "expected Failed when exit=143 AND SHUTDOWN_REQUESTED is false, got {other:?}"
+            ),
+        }
+    }
+
+    /// Task 3.4: exit_status 1 AND `SHUTDOWN_REQUESTED == true` → the
+    /// flag does NOT override non-143 exit codes; classifier returns
+    /// the existing `Failed { reason: <stderr excerpt> }`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn classifier_exit_1_with_shutdown_flag_set_still_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = crate::daemon::TEST_GUARD.lock().unwrap();
+        crate::daemon::reset_for_test();
+        crate::daemon::request_shutdown();
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(1 << 8)),
+            stdout: String::new(),
+            stderr: "real agent failure".to_string(),
+            final_answer: None,
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor
+            .classify_outcome(&ws, "x", outcome)
+            .await
+            .unwrap();
+        crate::daemon::reset_for_test();
+        match result {
+            ExecutorOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("real agent failure"),
+                    "stderr-derived reason must be preserved for exit-1 even with shutdown flag set: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Failed when exit=1 AND SHUTDOWN_REQUESTED is true, got {other:?}"
+            ),
+        }
+    }
+
+    /// Task 3.5: exit_status 0 AND `SHUTDOWN_REQUESTED == true` → the
+    /// flag does NOT override clean exits; classifier proceeds through
+    /// the existing happy-path rules AND returns `Completed`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn classifier_exit_0_with_shutdown_flag_set_still_completed() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = crate::daemon::TEST_GUARD.lock().unwrap();
+        crate::daemon::reset_for_test();
+        crate::daemon::request_shutdown();
+        let executor = fixture_executor_json();
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: String::new(),
+            stderr: String::new(),
+            final_answer: Some("done despite shutdown".to_string()),
+            streamed_log: true,
+            session_id: None,
+        };
+        let result = executor
+            .classify_outcome(&ws, "x", outcome)
+            .await
+            .unwrap();
+        crate::daemon::reset_for_test();
+        match result {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("done despite shutdown"));
+            }
+            other => panic!(
+                "expected Completed when exit=0 AND SHUTDOWN_REQUESTED is true, got {other:?}"
+            ),
         }
     }
 }

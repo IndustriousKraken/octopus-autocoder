@@ -215,6 +215,19 @@ pub async fn process_pending_brownfield(
             let _ = git::reset_hard_head(workspace);
             let _ = git::clean_force(workspace);
         }
+        Ok(ExecutorOutcome::Aborted { reason }) => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. The brownfield-draft state stays InProgress so
+            // the next iteration after restart re-runs from scratch.
+            // Do NOT mark_failed (operator initiated the shutdown).
+            tracing::info!(
+                url = %repo.url,
+                request_id = %state.request_id,
+                "brownfield: executor aborted by daemon shutdown: {reason}"
+            );
+            let _ = git::reset_hard_head(workspace);
+            let _ = git::clean_force(workspace);
+        }
         Err(e) => {
             mark_failed(
                 workspace,

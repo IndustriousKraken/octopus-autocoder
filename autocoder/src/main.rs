@@ -14,6 +14,7 @@ mod code_review_suggestion;
 mod code_reviewer;
 mod config;
 mod control_socket;
+mod daemon;
 mod executor;
 mod failure_state;
 mod git;

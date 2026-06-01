@@ -283,6 +283,15 @@ pub enum ExecutorOutcome {
         reason: String,
         iteration_number: u32,
     },
+    /// Subprocess killed by signal during operator-initiated daemon
+    /// shutdown; should NOT count against `consecutive_failures`. The
+    /// daemon's SIGTERM cascaded to the executor's process group, the
+    /// wrapped CLI child exited with status 143 (= 128 + 15), AND the
+    /// process-wide `SHUTDOWN_REQUESTED` flag was true at classification
+    /// time. The polling loop drops `.in-progress`, leaves
+    /// `.iteration-pending.json` untouched, AND skips the failure-counter
+    /// + perma-stuck + chatops-alert paths.
+    Aborted { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,3 +314,45 @@ impl PartialEq for ResumeHandle {
 /// autocoder can persist it across daemon restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeHandle(pub serde_json::Value);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 1.2: `ExecutorOutcome::Aborted` round-trips through Debug
+    /// AND PartialEq match arms cleanly. The structural shape is
+    /// `Aborted { reason: String }`, matching `Failed`'s shape — this
+    /// test pins the variant's structure AND ensures any future enum
+    /// changes that break it light up.
+    #[test]
+    fn aborted_variant_round_trips_through_debug_and_match() {
+        let v = ExecutorOutcome::Aborted {
+            reason: "daemon shutdown (SIGTERM cascade)".to_string(),
+        };
+        // Debug round-trip — produces a parseable shape.
+        let dbg = format!("{v:?}");
+        assert!(
+            dbg.contains("Aborted") && dbg.contains("daemon shutdown"),
+            "Debug must surface variant name AND reason: {dbg}"
+        );
+        // PartialEq round-trip — Aborted equals itself but not other
+        // variants carrying the same reason text.
+        let other = ExecutorOutcome::Aborted {
+            reason: "daemon shutdown (SIGTERM cascade)".to_string(),
+        };
+        assert_eq!(v, other, "Aborted must compare equal by reason");
+        let failed = ExecutorOutcome::Failed {
+            reason: "daemon shutdown (SIGTERM cascade)".to_string(),
+        };
+        assert_ne!(
+            v, failed,
+            "Aborted must NOT equal Failed even when reason matches — distinct variants"
+        );
+        // Pattern-match arms compile AND extract `reason` cleanly.
+        let reason = match v {
+            ExecutorOutcome::Aborted { reason } => reason,
+            other => panic!("expected Aborted; got {other:?}"),
+        };
+        assert_eq!(reason, "daemon shutdown (SIGTERM cascade)");
+    }
+}
