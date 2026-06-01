@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::config::{CanonicalRagConfig, RagProvider};
+use crate::config::{CanonicalRagConfig, LlmProvider, RagProvider};
 
 pub mod ollama;
 pub mod openai_compatible;
@@ -47,7 +47,7 @@ pub fn build_client(config: &CanonicalRagConfig) -> Result<Arc<dyn EmbedClient>>
                 api_key,
             )))
         }
-        RagProvider::OpenaiCompatible => {
+        RagProvider::OpenAiCompatible => {
             let api_key = config
                 .resolve_api_key()?
                 .ok_or_else(|| anyhow!(
@@ -59,5 +59,52 @@ pub fn build_client(config: &CanonicalRagConfig) -> Result<Arc<dyn EmbedClient>>
                 api_key,
             )))
         }
+        // a37: defensive backstop. Config-load validation rejects
+        // `canonical_rag.provider: anthropic` (Anthropic exposes no
+        // embeddings API), so this arm is unreachable in normal
+        // operation. We keep it instead of `unreachable!()` so a future
+        // code change that bypasses the validation surfaces as a clean
+        // operator-actionable error rather than a panic.
+        LlmProvider::Anthropic => Err(anyhow!(
+            "anthropic does not support embeddings; configure canonical_rag.provider as ollama or openai_compatible"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ChunkStrategy;
+
+    fn rag_with_provider(provider: LlmProvider) -> CanonicalRagConfig {
+        CanonicalRagConfig {
+            enabled: true,
+            provider,
+            model: "any-model".into(),
+            api_base_url: "http://localhost:11434".into(),
+            api_key_env: None,
+            api_key: None,
+            top_k: 10,
+            chunk_strategy: ChunkStrategy::PerRequirement,
+            reembed_on_archive: true,
+        }
+    }
+
+    #[test]
+    fn build_client_rejects_anthropic_with_clear_message() {
+        let cfg = rag_with_provider(LlmProvider::Anthropic);
+        let err = match build_client(&cfg) {
+            Ok(_) => panic!("anthropic must error in RAG dispatch"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("anthropic does not support embeddings"),
+            "must name the rejection reason: {msg}"
+        );
+        assert!(
+            msg.contains("ollama") && msg.contains("openai_compatible"),
+            "must name the valid alternatives: {msg}"
+        );
     }
 }
