@@ -4,7 +4,7 @@
 //! or any OpenAI-compatible endpoint.
 
 use crate::config::{
-    ContradictionCheckLlmConfig, ReviewerConfig, ReviewerProvider,
+    ContradictionCheckLlmConfig, LlmProvider, ReviewerConfig,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -12,7 +12,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 const DEFAULT_ANTHROPIC_BASE: &str = "https://api.anthropic.com";
-const DEFAULT_OPENAI_BASE: &str = "https://api.openai.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
@@ -158,47 +157,124 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 }
 
+/// Ollama native chat client (a37). POSTs to `<api_base>/api/chat` using
+/// Ollama's native chat API (NOT the OpenAI-compat shim at
+/// `/v1/chat/completions`). No `Authorization` header — Ollama does not
+/// authenticate; the per-provider auth-semantics check at config-load
+/// rejects `api_key` for `provider: ollama`, so no key is ever in scope.
+pub struct OllamaChatClient {
+    api_base: String,
+    model: String,
+}
+
+impl OllamaChatClient {
+    pub fn new(api_base: String, model: String) -> Self {
+        Self { api_base, model }
+    }
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaChatMessage,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatMessage {
+    content: String,
+}
+
+#[async_trait]
+impl LlmClient for OllamaChatClient {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let url = format!("{}/api/chat", self.api_base.trim_end_matches('/'));
+        let payload = json!({
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+            }],
+            "stream": false,
+        });
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("ollama request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(500).collect();
+            return Err(anyhow!("ollama API error {status}: {snippet}"));
+        }
+        let parsed: OllamaChatResponse = resp.json().await.map_err(|e| {
+            anyhow!("OllamaChatClient response decode failed: {e}")
+        })?;
+        Ok(parsed.message.content)
+    }
+}
+
 /// Construct the right `LlmClient` for the configured provider. Reads the
-/// API key from the environment variable named by `cfg.api_key_env`.
+/// API key from the environment variable named by `cfg.api_key_env` for
+/// providers that authenticate. The `Ollama` arm skips the api_key
+/// resolution entirely — config-load validation rejects `api_key` when
+/// `provider: ollama`, so no key is ever in scope here.
 pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
-    let api_key = match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
-        (Some(inline), env_name_opt) => {
-            let key = inline.resolve("reviewer.api_key")?;
-            if inline.is_inline() {
-                if let Some(env_name) = env_name_opt {
-                    if std::env::var(env_name).is_ok() {
-                        tracing::warn!(
-                            "reviewer.api_key (inline) takes precedence; env var `{env_name}` is being ignored for the reviewer key"
-                        );
-                    }
-                }
-            }
-            key
-        }
-        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
-            .resolve(&format!("reviewer.api_key_env={env_name}"))?,
-        (None, None) => {
-            return Err(anyhow!(
-                "reviewer config has neither `api_key` (inline) nor `api_key_env` (env var name) set"
-            ));
-        }
-    };
     let provider = cfg.provider;
     let model = cfg.model.clone();
     let base = cfg.api_base_url.clone();
 
-    Ok(match provider {
-        ReviewerProvider::Anthropic => Box::new(AnthropicClient::new(
-            base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
-            api_key,
-            model,
+    match provider {
+        LlmProvider::Ollama => {
+            let base = base.ok_or_else(|| {
+                anyhow!("reviewer.api_base_url is required when provider=ollama")
+            })?;
+            Ok(Box::new(OllamaChatClient::new(base, model)))
+        }
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            let api_key = resolve_reviewer_api_key(cfg)?;
+            Ok(match provider {
+                LlmProvider::Anthropic => Box::new(AnthropicClient::new(
+                    base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+                    api_key,
+                    model,
+                )),
+                LlmProvider::OpenAiCompatible => {
+                    let base = base.ok_or_else(|| {
+                        anyhow!(
+                            "reviewer.api_base_url is required when provider=openai_compatible"
+                        )
+                    })?;
+                    Box::new(OpenAiCompatibleClient::new(base, api_key, model))
+                }
+                LlmProvider::Ollama => unreachable!("handled above"),
+            })
+        }
+    }
+}
+
+fn resolve_reviewer_api_key(cfg: &ReviewerConfig) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("reviewer.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "reviewer.api_key (inline) takes precedence; env var `{env_name}` is being ignored for the reviewer key"
+                );
+            }
+            Ok(key)
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!("reviewer.api_key_env={env_name}")),
+        (None, None) => Err(anyhow!(
+            "reviewer config has neither `api_key` (inline) nor `api_key_env` (env var name) set"
         )),
-        ReviewerProvider::OpenAiCompatible => Box::new(OpenAiCompatibleClient::new(
-            base.unwrap_or_else(|| DEFAULT_OPENAI_BASE.to_string()),
-            api_key,
-            model,
-        )),
-    })
+    }
 }
 
 /// Construct an `LlmClient` for the change-internal contradiction
@@ -208,7 +284,45 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
 pub fn build_from_contradiction_check_config(
     cfg: &ContradictionCheckLlmConfig,
 ) -> Result<Box<dyn LlmClient>> {
-    let api_key = match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+    let provider = cfg.provider;
+    let model = cfg.model.clone();
+    let base = cfg.api_base_url.clone();
+
+    match provider {
+        LlmProvider::Ollama => {
+            let base = base.ok_or_else(|| {
+                anyhow!(
+                    "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
+                )
+            })?;
+            Ok(Box::new(OllamaChatClient::new(base, model)))
+        }
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            let api_key = resolve_contradiction_check_api_key(cfg)?;
+            Ok(match provider {
+                LlmProvider::Anthropic => Box::new(AnthropicClient::new(
+                    base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+                    api_key,
+                    model,
+                )),
+                LlmProvider::OpenAiCompatible => {
+                    let base = base.ok_or_else(|| {
+                        anyhow!(
+                            "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=openai_compatible"
+                        )
+                    })?;
+                    Box::new(OpenAiCompatibleClient::new(base, api_key, model))
+                }
+                LlmProvider::Ollama => unreachable!("handled above"),
+            })
+        }
+    }
+}
+
+fn resolve_contradiction_check_api_key(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
         (Some(inline), env_name_opt) => {
             let key = inline.resolve("executor.change_internal_contradiction_check_llm.api_key")?;
             if inline.is_inline()
@@ -219,33 +333,16 @@ pub fn build_from_contradiction_check_config(
                     "executor.change_internal_contradiction_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
                 );
             }
-            key
+            Ok(key)
         }
         (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
             .resolve(&format!(
                 "executor.change_internal_contradiction_check_llm.api_key_env={env_name}"
-            ))?,
-        (None, None) => {
-            return Err(anyhow!(
-                "executor.change_internal_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
-            ));
-        }
-    };
-    let provider = cfg.provider;
-    let model = cfg.model.clone();
-    let base = cfg.api_base_url.clone();
-    Ok(match provider {
-        ReviewerProvider::Anthropic => Box::new(AnthropicClient::new(
-            base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
-            api_key,
-            model,
+            )),
+        (None, None) => Err(anyhow!(
+            "executor.change_internal_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
         )),
-        ReviewerProvider::OpenAiCompatible => Box::new(OpenAiCompatibleClient::new(
-            base.unwrap_or_else(|| DEFAULT_OPENAI_BASE.to_string()),
-            api_key,
-            model,
-        )),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -574,5 +671,157 @@ mod tests {
             msg.contains("decode failed"),
             "must name decode failure: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // a37: OllamaChatClient — native /api/chat against a mock server
+    // -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ollama_chat_serializes_request_and_parses_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/chat")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"model":"qwen2.5-coder:32b","messages":[{"role":"user","content":"review this diff: ..."}],"stream":false}"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"VERDICT: Pass\n\nLooks good."},"done":true}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = OllamaChatClient::new(server.url(), "qwen2.5-coder:32b".to_string());
+        let out = client.complete("review this diff: ...").await.unwrap();
+        assert_eq!(out, "VERDICT: Pass\n\nLooks good.");
+        mock.assert_async().await;
+    }
+
+    /// Ollama does not authenticate — the client MUST NOT send an
+    /// `Authorization` header. We assert this negatively by configuring
+    /// the mock to ONLY match when `Authorization` is absent; if the
+    /// client adds the header, mockito returns 501 and `complete` errors.
+    #[tokio::test]
+    async fn ollama_chat_sends_no_authorization_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/chat")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"ok"},"done":true}"#,
+            )
+            .create_async()
+            .await;
+        let client = OllamaChatClient::new(server.url(), "qwen2.5".to_string());
+        let _ = client.complete("hi").await.expect("complete succeeds");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_surfaces_non_2xx_with_status_and_snippet() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(404)
+            .with_body(r#"{"error":"model 'nonexistent' not found"}"#)
+            .create_async()
+            .await;
+
+        let client = OllamaChatClient::new(server.url(), "nonexistent".to_string());
+        let err = client.complete("hi").await.expect_err("404 must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"), "must include status: {msg}");
+        assert!(msg.contains("model 'nonexistent' not found"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_errors_when_response_body_is_unparseable_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not-json")
+            .create_async()
+            .await;
+
+        let client = OllamaChatClient::new(server.url(), "qwen2.5".to_string());
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("unparseable JSON must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("OllamaChatClient"),
+            "decode error must name the client: {msg}"
+        );
+        assert!(
+            msg.contains("decode failed"),
+            "decode error must name the failure mode: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_errors_when_response_missing_message_content() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"unexpected_shape": true}"#)
+            .create_async()
+            .await;
+
+        let client = OllamaChatClient::new(server.url(), "qwen2.5".to_string());
+        let err = client
+            .complete("hi")
+            .await
+            .expect_err("missing message.content must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("OllamaChatClient") && msg.contains("decode failed"),
+            "must name client + decode failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_from_config_constructs_ollama_chat_client() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/chat")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"ok"},"done":true}"#,
+            )
+            .create_async()
+            .await;
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: ReviewerProvider::Ollama,
+            model: "qwen2.5-coder:32b".into(),
+            api_key_env: None,
+            api_key: None,
+            api_base_url: Some(server.url()),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: 5,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+        };
+        let client = build_from_config(&cfg)
+            .expect("ollama reviewer must build without api_key");
+        let _ = client.complete("hi").await.expect("complete succeeds");
+        mock.assert_async().await;
     }
 }

@@ -196,6 +196,10 @@ pub enum ReviewerProviderArg {
     Anthropic,
     #[clap(name = "openai_compatible")]
     OpenAiCompatible,
+    /// a37: local Ollama for the reviewer. No `api_key` is collected
+    /// (Ollama does not authenticate); the wizard prompts for
+    /// `api_base_url` and `model` only.
+    Ollama,
 }
 
 /// Master switch for the LLM-driven audits in non-interactive mode. Mirrors
@@ -320,6 +324,10 @@ pub struct WizardAnswers {
     pub reviewer_provider: ReviewerProviderArg,
     pub reviewer_model: Option<String>,
     pub reviewer_api_key: Option<String>,
+    /// a37: reviewer base URL captured for `ollama` (and overridable for
+    /// the other providers via reconfigure). `None` for the default
+    /// hosted-API choice with `anthropic` / `openai_compatible`.
+    pub reviewer_api_base_url: Option<String>,
     /// Resolved cadences per audit slug. Audits the operator declined are
     /// either absent from the map or stored as `Cadence::Disabled`. The
     /// config-assembly step drops `Disabled` entries before emitting YAML.
@@ -930,7 +938,7 @@ impl WizardIo for ScriptedIo {
 // ----------------------------------------------------------------------------
 
 const CHATOPS_OPTIONS: &[&str] = &["none", "slack", "discord", "teams", "mattermost", "matrix"];
-const REVIEWER_OPTIONS: &[&str] = &["none", "anthropic", "openai_compatible"];
+const REVIEWER_OPTIONS: &[&str] = &["none", "anthropic", "openai_compatible", "ollama"];
 
 pub async fn run_wizard(
     io: &mut dyn WizardIo,
@@ -989,18 +997,33 @@ pub async fn run_wizard(
 
     let mut reviewer_model: Option<String> = None;
     let mut reviewer_api_key: Option<String> = None;
+    let mut reviewer_api_base_url: Option<String> = None;
     if reviewer_provider != ReviewerProviderArg::None {
         let default_model = prefill
             .reviewer_model
             .as_deref()
             .unwrap_or(match reviewer_provider {
                 ReviewerProviderArg::Anthropic => "claude-sonnet-4-6",
+                ReviewerProviderArg::Ollama => "qwen2.5-coder:32b",
                 _ => "gpt-4o-mini",
             });
         reviewer_model = Some(ask_default(io, "Reviewer model", default_model).await?);
-        io.print("Reviewer API key (written to secrets.env): ");
-        let k = io.read_password().await?;
-        reviewer_api_key = if k.is_empty() { None } else { Some(k) };
+        if reviewer_provider == ReviewerProviderArg::Ollama {
+            // Ollama: prompt for base URL only (no api_key — Ollama
+            // does not authenticate; the per-provider auth-semantics
+            // validator at config-load REJECTS a configured key).
+            let base = ask_default(
+                io,
+                "Reviewer Ollama base URL",
+                "http://localhost:11434",
+            )
+            .await?;
+            reviewer_api_base_url = Some(base);
+        } else {
+            io.print("Reviewer API key (written to secrets.env): ");
+            let k = io.read_password().await?;
+            reviewer_api_key = if k.is_empty() { None } else { Some(k) };
+        }
     }
 
     let audits = run_audit_prompts(io).await?;
@@ -1019,6 +1042,7 @@ pub async fn run_wizard(
         reviewer_provider,
         reviewer_model,
         reviewer_api_key,
+        reviewer_api_base_url,
         audits,
         canonical_rag,
     })
@@ -1269,6 +1293,7 @@ fn reviewer_arg_to_idx(a: ReviewerProviderArg) -> usize {
         ReviewerProviderArg::None => 0,
         ReviewerProviderArg::Anthropic => 1,
         ReviewerProviderArg::OpenAiCompatible => 2,
+        ReviewerProviderArg::Ollama => 3,
     }
 }
 
@@ -1277,6 +1302,7 @@ fn idx_to_reviewer_arg(i: usize) -> ReviewerProviderArg {
         ReviewerProviderArg::None,
         ReviewerProviderArg::Anthropic,
         ReviewerProviderArg::OpenAiCompatible,
+        ReviewerProviderArg::Ollama,
     ][i]
 }
 
@@ -1307,6 +1333,11 @@ fn reviewer_env_var(p: ReviewerProviderArg) -> Option<&'static str> {
         ReviewerProviderArg::None => None,
         ReviewerProviderArg::Anthropic => Some("ANTHROPIC_API_KEY"),
         ReviewerProviderArg::OpenAiCompatible => Some("OPENAI_API_KEY"),
+        // a37: Ollama does not authenticate; the per-provider auth
+        // validator rejects a configured api_key/api_key_env at
+        // config-load. Returning None here keeps the secrets.env path
+        // (which only writes when the env var name is `Some`) inert.
+        ReviewerProviderArg::Ollama => None,
     }
 }
 
@@ -1405,12 +1436,19 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
 
     cfg.reviewer = match answers.reviewer_provider {
         ReviewerProviderArg::None => None,
-        ReviewerProviderArg::Anthropic | ReviewerProviderArg::OpenAiCompatible => {
+        ReviewerProviderArg::Anthropic
+        | ReviewerProviderArg::OpenAiCompatible
+        | ReviewerProviderArg::Ollama => {
             let provider = match answers.reviewer_provider {
                 ReviewerProviderArg::Anthropic => ReviewerProvider::Anthropic,
                 ReviewerProviderArg::OpenAiCompatible => ReviewerProvider::OpenAiCompatible,
+                ReviewerProviderArg::Ollama => ReviewerProvider::Ollama,
                 _ => unreachable!(),
             };
+            // a37: Ollama needs `api_base_url` (REQUIRED by config-load
+            // validation) AND NO `api_key_env` (Ollama does not
+            // authenticate; configuring a key fails config-load).
+            let is_ollama = answers.reviewer_provider == ReviewerProviderArg::Ollama;
             Some(ReviewerConfig {
                 enabled: true,
                 provider,
@@ -1418,9 +1456,13 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                     .reviewer_model
                     .clone()
                     .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
-                api_key_env: reviewer_env_var(answers.reviewer_provider).map(String::from),
+                api_key_env: if is_ollama {
+                    None
+                } else {
+                    reviewer_env_var(answers.reviewer_provider).map(String::from)
+                },
                 api_key: None,
-                api_base_url: None,
+                api_base_url: answers.reviewer_api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
                 auto_revise_on_block: false,
@@ -1459,7 +1501,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
             provider: match r.provider {
                 RagProviderArg::Ollama => crate::config::RagProvider::Ollama,
                 RagProviderArg::OpenaiCompatible => {
-                    crate::config::RagProvider::OpenaiCompatible
+                    crate::config::RagProvider::OpenAiCompatible
                 }
                 RagProviderArg::None => crate::config::RagProvider::Ollama, // unreachable
             },
@@ -1898,6 +1940,7 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
         reviewer_provider: p.reviewer_provider.unwrap_or(ReviewerProviderArg::None),
         reviewer_model: p.reviewer_model.clone(),
         reviewer_api_key: None,
+        reviewer_api_base_url: None,
         audits: resolve_non_interactive_audits(p),
         canonical_rag,
     })
@@ -2130,6 +2173,7 @@ pub(crate) async fn reconfigure_reviewer(
     let current_provider_arg = match existing.reviewer.as_ref().map(|r| r.provider) {
         Some(ReviewerProvider::Anthropic) => ReviewerProviderArg::Anthropic,
         Some(ReviewerProvider::OpenAiCompatible) => ReviewerProviderArg::OpenAiCompatible,
+        Some(ReviewerProvider::Ollama) => ReviewerProviderArg::Ollama,
         None => ReviewerProviderArg::None,
     };
 
@@ -2146,10 +2190,13 @@ pub(crate) async fn reconfigure_reviewer(
     let mut new_config = existing.clone();
     new_config.reviewer = match provider_arg {
         ReviewerProviderArg::None => None,
-        ReviewerProviderArg::Anthropic | ReviewerProviderArg::OpenAiCompatible => {
+        ReviewerProviderArg::Anthropic
+        | ReviewerProviderArg::OpenAiCompatible
+        | ReviewerProviderArg::Ollama => {
             let provider = match provider_arg {
                 ReviewerProviderArg::Anthropic => ReviewerProvider::Anthropic,
                 ReviewerProviderArg::OpenAiCompatible => ReviewerProvider::OpenAiCompatible,
+                ReviewerProviderArg::Ollama => ReviewerProvider::Ollama,
                 _ => unreachable!(),
             };
             let default_model = existing
@@ -2158,24 +2205,44 @@ pub(crate) async fn reconfigure_reviewer(
                 .map(|r| r.model.clone())
                 .unwrap_or_else(|| match provider_arg {
                     ReviewerProviderArg::Anthropic => "claude-sonnet-4-6".to_string(),
+                    ReviewerProviderArg::Ollama => "qwen2.5-coder:32b".to_string(),
                     _ => "gpt-4o-mini".to_string(),
                 });
             let model = ask_default(io, "Reviewer model", &default_model).await?;
-            let default_env = existing
-                .reviewer
-                .as_ref()
-                .and_then(|r| r.api_key_env.clone())
-                .or_else(|| reviewer_env_var(provider_arg).map(String::from))
-                .unwrap_or_default();
-            let api_key_env_raw = ask_default(io, "Reviewer API key env var", &default_env).await?;
-            let api_key_env = if api_key_env_raw.is_empty() {
-                None
+            // a37: Ollama branch — prompt for `api_base_url` (REQUIRED
+            // by config-load) AND NO `api_key_env` (config-load REJECTS
+            // a key for ollama).
+            let (api_key_env, api_base_url) = if provider_arg == ReviewerProviderArg::Ollama
+            {
+                let existing_base = existing
+                    .reviewer
+                    .as_ref()
+                    .and_then(|r| r.api_base_url.clone())
+                    .unwrap_or_else(|| "http://localhost:11434".to_string());
+                let base = ask_default(io, "Reviewer Ollama base URL", &existing_base).await?;
+                (None, Some(base))
             } else {
-                Some(api_key_env_raw)
+                let default_env = existing
+                    .reviewer
+                    .as_ref()
+                    .and_then(|r| r.api_key_env.clone())
+                    .or_else(|| reviewer_env_var(provider_arg).map(String::from))
+                    .unwrap_or_default();
+                let api_key_env_raw = ask_default(io, "Reviewer API key env var", &default_env).await?;
+                let key_env = if api_key_env_raw.is_empty() {
+                    None
+                } else {
+                    Some(api_key_env_raw)
+                };
+                let existing_base = existing
+                    .reviewer
+                    .as_ref()
+                    .and_then(|r| r.api_base_url.clone());
+                (key_env, existing_base)
             };
             // Preserve all other reviewer fields (inline `api_key`,
-            // `api_base_url`, `prompt_template_path`, etc.) from the
-            // existing config — only provider/model/api_key_env are
+            // `prompt_template_path`, etc.) from the existing config —
+            // only provider/model/api_key_env/api_base_url are
             // reconfigured here.
             let mut reviewer = existing.reviewer.clone().unwrap_or_else(|| ReviewerConfig {
                 enabled: true,
@@ -2183,7 +2250,7 @@ pub(crate) async fn reconfigure_reviewer(
                 model: model.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
-                api_base_url: None,
+                api_base_url: api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
                 auto_revise_on_block: false,
@@ -2196,6 +2263,14 @@ pub(crate) async fn reconfigure_reviewer(
             reviewer.provider = provider;
             reviewer.model = model;
             reviewer.api_key_env = api_key_env;
+            // For ollama, clear any pre-existing inline `api_key` (the
+            // validator would reject it). For other providers, leave
+            // inline `api_key` untouched (the operator may have set
+            // it deliberately).
+            if provider_arg == ReviewerProviderArg::Ollama {
+                reviewer.api_key = None;
+            }
+            reviewer.api_base_url = api_base_url;
             Some(reviewer)
         }
     };
@@ -2413,6 +2488,7 @@ mod tests {
             reviewer_provider: ReviewerProviderArg::None,
             reviewer_model: None,
             reviewer_api_key: None,
+            reviewer_api_base_url: None,
             audits: HashMap::new(),
             canonical_rag: None,
         }
@@ -3891,6 +3967,63 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
             .await
             .unwrap();
         assert!(ans.canonical_rag.is_none());
+    }
+
+    /// a37: reviewer Ollama choice exercises the bare-base-URL + no-api-key
+    /// branch. Mirrors the `wizard_rag_*` shape: feed the scripted answers,
+    /// run the wizard, assert the resolved `WizardAnswers` carries the
+    /// ollama provider AND the captured base URL, AND that
+    /// `assemble_config` produces a `reviewer:` block with the matching
+    /// provider, NO api_key_env, AND the bare base URL.
+    #[tokio::test]
+    async fn wizard_reviewer_ollama_collects_base_url_and_no_api_key() {
+        let mut answers: Vec<&'static str> = vec![
+            "git@github.com:acme/widgets.git",
+            "main",
+            "agent-q",
+            "300",
+            "GITHUB_TOKEN",
+            "ghp_test",
+            "1", // chatops: none
+            "4", // reviewer: ollama (1-indexed: none=1, anthropic=2, openai_compatible=3, ollama=4)
+            "qwen2.5-coder:32b", // reviewer model
+            "http://10.42.11.10:11434", // reviewer Ollama base URL (overrides default)
+            "", // audits LLM gate bare-Enter → no
+            "n", // RAG gate
+        ];
+        let _ = &mut answers;
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert_eq!(ans.reviewer_provider, ReviewerProviderArg::Ollama);
+        assert_eq!(ans.reviewer_model.as_deref(), Some("qwen2.5-coder:32b"));
+        assert!(
+            ans.reviewer_api_key.is_none(),
+            "ollama path must NOT collect an api_key"
+        );
+        assert_eq!(
+            ans.reviewer_api_base_url.as_deref(),
+            Some("http://10.42.11.10:11434")
+        );
+
+        let cfg = assemble_config(&ans).unwrap();
+        let rv = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(rv.provider, ReviewerProvider::Ollama);
+        assert_eq!(rv.model, "qwen2.5-coder:32b");
+        assert_eq!(
+            rv.api_base_url.as_deref(),
+            Some("http://10.42.11.10:11434")
+        );
+        assert!(rv.api_key_env.is_none(), "no api_key_env for ollama");
+        assert!(rv.api_key.is_none(), "no inline api_key for ollama");
+
+        // secrets.env MUST NOT carry a reviewer key for the ollama path.
+        let secrets = assemble_secrets_env(&ans);
+        assert!(
+            !secrets.contains("ANTHROPIC_API_KEY") && !secrets.contains("OPENAI_API_KEY"),
+            "no reviewer key should leak into secrets.env: {secrets}"
+        );
     }
 
     #[tokio::test]

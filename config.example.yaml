@@ -249,13 +249,18 @@ executor:
   # surface (provider | model | api_key_env | api_key | api_base_url)
   # but kept as its own block so operators can pick a cheaper model.
   # change_internal_contradiction_check_llm:
-  #   provider: anthropic               # `anthropic` | `openai_compatible`
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
   #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
-  #   api_key_env: ANTHROPIC_API_KEY
+  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
+  #                                     # FORBIDDEN for ollama (rejected at config-load).
   #   # Inline alternative: when `api_key` is set, `api_key_env` is ignored.
   #   # api_key:
   #   #   value: "sk-ant-yourkeyhere"
   #   # api_base_url: https://api.anthropic.com
+  #   #                                 # API ROOT; client appends the path
+  #   #                                 # (`/v1/messages` for anthropic,
+  #   #                                 # `/chat/completions` for openai_compatible,
+  #   #                                 # `/api/chat` for ollama).
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
@@ -310,17 +315,38 @@ github:
 #
 # reviewer:
 #   enabled: true
-#   provider: anthropic                 # supported: `anthropic` | `openai_compatible`
+#   provider: anthropic                 # supported: `anthropic` | `openai_compatible` | `ollama`
 #   model: claude-sonnet-4-6            # provider-specific model name
 #   api_key_env: ANTHROPIC_API_KEY      # env var holding the API token
+#                                       # NOTE: api_key (inline or env) is REQUIRED
+#                                       # for `anthropic` AND `openai_compatible`,
+#                                       # AND FORBIDDEN for `ollama` (rejected at
+#                                       # config-load — Ollama does not authenticate).
 #   # Inline alternative: put the API key directly in this file. When
 #   # `api_key` is set, `api_key_env` is ignored. Same chmod-600 caveat.
 #   # api_key:
 #   #   value: "sk-ant-yourkeyhere"
-#   # api_base_url:                     # optional override; defaults:
-#   #                                   #   anthropic         → https://api.anthropic.com
-#   #                                   #   openai_compatible → https://api.openai.com/v1
-#   #                                   # set this for OpenRouter, Grok, local Ollama, etc.
+#   # api_base_url:                     # the API ROOT; the client appends its
+#   #                                   # protocol-specific path:
+#   #                                   #   anthropic         → <base>/v1/messages
+#   #                                   #   openai_compatible → <base>/chat/completions
+#   #                                   #   ollama            → <base>/api/chat
+#   #                                   # Anthropic: OPTIONAL (defaults to
+#   #                                   # https://api.anthropic.com).
+#   #                                   # openai_compatible AND ollama: REQUIRED
+#   #                                   # (include `/v1` in the base for hosted
+#   #                                   # services that require it; bare host for
+#   #                                   # local Ollama).
+#   #
+#   # Local Ollama for the reviewer (example):
+#   # reviewer:
+#   #   enabled: true
+#   #   provider: ollama
+#   #   model: qwen2.5-coder:32b
+#   #   api_base_url: http://localhost:11434
+#   #   # no api_key — Ollama does not authenticate
+#   #   prompt_budget_chars: 300000
+#   #   mode: per_change
 #   #
 #   # Reviewer-initiated revisions on `Block` verdicts. When `true`, every
 #   # concern the reviewer marked `should_request_revision: true` posts a
@@ -645,11 +671,19 @@ github:
 #
 # canonical_rag:
 #   enabled: true
-#   provider: ollama                    # | openai_compatible
+#   provider: ollama                    # `ollama` | `openai_compatible`
+#                                       # NOTE: `anthropic` is REJECTED at
+#                                       # config-load — Anthropic exposes no
+#                                       # embeddings API. The daemon exits
+#                                       # non-zero with a clear message if you
+#                                       # set `provider: anthropic` here.
 #   model: nomic-embed-text             # provider-specific identifier
-#   api_base_url: http://localhost:11434
+#   api_base_url: http://localhost:11434  # API ROOT; client appends the path
+#                                       # (`/api/embed` for ollama,
+#                                       # `/embeddings` for openai_compatible)
 #   # api_key_env: VOYAGE_API_KEY       # required for openai_compatible
 #   # api_key: { value: "..." }         # inline alternative (wins with WARN if both set)
+#                                       # FORBIDDEN when provider: ollama
 #   top_k: 10                           # default for tool queries; clamped [1, 100]
 #   chunk_strategy: per_requirement     # per_requirement | per_scenario | per_capability
 #   reembed_on_archive: true            # re-embed affected capabilities post-archive
