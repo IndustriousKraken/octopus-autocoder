@@ -116,11 +116,169 @@ pub struct CanonicalRagConfig {
     pub reembed_on_archive: bool,
 }
 
+/// Canonical LLM-provider enum. Single enum referenced by every
+/// LLM-touching config block (`reviewer:`, `canonical_rag:`,
+/// `executor.change_internal_contradiction_check_llm:`). Per-subsystem
+/// validity (e.g. anthropic-for-RAG rejection) AND per-provider auth
+/// semantics (e.g. ollama-forbids-api-key) are enforced at config-load
+/// by [`validate_llm_provider_config`] AND
+/// [`validate_provider_for_subsystem`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RagProvider {
+pub enum LlmProvider {
+    /// Anthropic's hosted API (`https://api.anthropic.com` default).
+    /// Valid for completion subsystems (reviewer, contradiction-check).
+    /// INVALID for canonical_rag (Anthropic exposes no embeddings API).
+    Anthropic,
+    /// Any OpenAI-API-shaped endpoint (OpenAI itself, Grok, OpenRouter,
+    /// vLLM, local OpenAI-compat shims). Valid for every subsystem.
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    /// Ollama native API (`<base>/api/chat` for completion,
+    /// `<base>/api/embed` for embeddings). Valid for every subsystem;
+    /// does not authenticate (api_key forbidden).
     Ollama,
-    OpenaiCompatible,
+}
+
+impl LlmProvider {
+    /// Operator-facing YAML string. Matches the `#[serde]` rename rules.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::Ollama => "ollama",
+        }
+    }
+}
+
+/// Backward-compatible alias. The pre-spec `RagProvider` was a 2-variant
+/// enum (`ollama | openai_compatible`); the alias preserves source-code
+/// compatibility for callers that imported the type name. Per-subsystem
+/// validity (RAG forbids `anthropic`) is enforced at config-load, not at
+/// the type level.
+pub type RagProvider = LlmProvider;
+
+/// Backward-compatible alias for the pre-spec `ReviewerProvider` (which
+/// was 2-variant: `anthropic | openai_compatible`). The reviewer now
+/// accepts `ollama` too; validity is enforced at config-load.
+pub type ReviewerProvider = LlmProvider;
+
+/// Per-subsystem identity used by [`validate_provider_for_subsystem`].
+/// Different subsystems have different supported provider sets; this
+/// enum names which subsystem is being checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsystemKind {
+    /// AI code-quality review (`reviewer:`). All three providers valid.
+    Reviewer,
+    /// Canonical-spec RAG embedding pipeline (`canonical_rag:`).
+    /// `anthropic` is INVALID — Anthropic does not expose embeddings.
+    CanonicalRag,
+    /// Change-internal contradiction check (`executor.change_internal_contradiction_check_llm:`).
+    /// All three providers valid.
+    ContradictionCheck,
+}
+
+impl SubsystemKind {
+    fn config_label(self) -> &'static str {
+        match self {
+            Self::Reviewer => "reviewer",
+            Self::CanonicalRag => "canonical_rag",
+            Self::ContradictionCheck => "change_internal_contradiction_check_llm",
+        }
+    }
+
+    fn valid_providers(self) -> &'static [LlmProvider] {
+        match self {
+            Self::Reviewer | Self::ContradictionCheck => &[
+                LlmProvider::Anthropic,
+                LlmProvider::OpenAiCompatible,
+                LlmProvider::Ollama,
+            ],
+            Self::CanonicalRag => &[LlmProvider::Ollama, LlmProvider::OpenAiCompatible],
+        }
+    }
+}
+
+/// Per-provider auth + base-URL validation. Called by each subsystem's
+/// config-load helper with the subsystem's name (used verbatim in error
+/// messages). Validation rules:
+///
+/// - `Anthropic`: `api_key` REQUIRED (inline or env-var name). `api_base_url`
+///   OPTIONAL (defaults to `https://api.anthropic.com`).
+/// - `OpenAiCompatible`: `api_key` REQUIRED. `api_base_url` REQUIRED.
+/// - `Ollama`: `api_key` FORBIDDEN. `api_base_url` REQUIRED.
+///
+/// `api_key_present` is `true` when EITHER `api_key` (inline `SecretSource`)
+/// OR `api_key_env` (env var name) is set; callers pass this rolled-up
+/// flag so the validator does not need to know the per-subsystem field
+/// names. Error messages name the `subsystem` AND the offending field so
+/// the operator can locate the YAML quickly.
+pub fn validate_llm_provider_config(
+    provider: LlmProvider,
+    api_key_present: bool,
+    api_base_url: Option<&str>,
+    subsystem: &str,
+) -> Result<()> {
+    let has_base = api_base_url.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    match provider {
+        LlmProvider::Anthropic => {
+            if !api_key_present {
+                return Err(anyhow!(
+                    "{subsystem}: anthropic requires api_key; set {subsystem}.api_key.value or {subsystem}.api_key_env"
+                ));
+            }
+        }
+        LlmProvider::OpenAiCompatible => {
+            if !api_key_present {
+                return Err(anyhow!(
+                    "{subsystem}: openai_compatible requires api_key; set {subsystem}.api_key.value or {subsystem}.api_key_env"
+                ));
+            }
+            if !has_base {
+                return Err(anyhow!(
+                    "{subsystem}: openai_compatible requires api_base_url; set the field to e.g. https://api.openai.com/v1"
+                ));
+            }
+        }
+        LlmProvider::Ollama => {
+            if api_key_present {
+                return Err(anyhow!(
+                    "{subsystem}: ollama does not authenticate; remove api_key field (Ollama silently ignores Authorization headers, so a configured key is a footgun)"
+                ));
+            }
+            if !has_base {
+                return Err(anyhow!(
+                    "{subsystem}: ollama requires api_base_url; set the field to e.g. http://localhost:11434"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-subsystem provider-validity check. Each subsystem has a
+/// per-subsystem supported provider set ([`SubsystemKind::valid_providers`]);
+/// providers outside that set fail config-load with a fully-specified
+/// message naming the rejected provider AND the valid alternatives.
+pub fn validate_provider_for_subsystem(
+    provider: LlmProvider,
+    subsystem: SubsystemKind,
+) -> Result<()> {
+    let valid = subsystem.valid_providers();
+    if valid.contains(&provider) {
+        return Ok(());
+    }
+    let list = valid
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "{} does not support provider '{}'; available providers: {}",
+        subsystem.config_label(),
+        provider.as_str(),
+        list
+    ))
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -1196,14 +1354,6 @@ pub fn clamp_max_code_reviews_per_pr(requested: u32) -> (u32, Option<String>) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewerProvider {
-    Anthropic,
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
-}
-
 #[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerMode {
@@ -1868,6 +2018,18 @@ impl Config {
         if let Some(rag) = cfg.canonical_rag.as_mut() {
             let (top_k, _) = clamp_rag_top_k(rag.top_k);
             rag.top_k = top_k;
+            // a37: per-subsystem AND per-provider validity. The check
+            // fires regardless of `enabled` so an operator with a
+            // partially-filled-out block sees the error at startup
+            // rather than at the first `enabled: true` flip.
+            validate_provider_for_subsystem(rag.provider, SubsystemKind::CanonicalRag)?;
+            let key_present = rag.api_key.is_some() || rag.api_key_env.is_some();
+            validate_llm_provider_config(
+                rag.provider,
+                key_present,
+                Some(&rag.api_base_url),
+                "canonical_rag",
+            )?;
         }
         if let Some(rev) = cfg.reviewer.as_mut() {
             let (clamped, _) = clamp_max_code_reviews_per_pr(rev.max_code_reviews_per_pr);
@@ -1879,6 +2041,31 @@ impl Config {
                     "reviewer.suggest_rereview_threshold ({t}) is out of range; valid range is 0.0..=1.0"
                 ));
             }
+            // a37: per-subsystem AND per-provider validity, enforced
+            // regardless of `enabled` so an unused-but-misconfigured
+            // block surfaces at startup.
+            validate_provider_for_subsystem(rev.provider, SubsystemKind::Reviewer)?;
+            let key_present = rev.api_key.is_some() || rev.api_key_env.is_some();
+            validate_llm_provider_config(
+                rev.provider,
+                key_present,
+                rev.api_base_url.as_deref(),
+                "reviewer",
+            )?;
+        }
+        if let Some(llm) = cfg
+            .executor
+            .change_internal_contradiction_check_llm
+            .as_ref()
+        {
+            validate_provider_for_subsystem(llm.provider, SubsystemKind::ContradictionCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            validate_llm_provider_config(
+                llm.provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "change_internal_contradiction_check_llm",
+            )?;
         }
         // OSS-fork support (a26): validate spec_storage AND upstream
         // blocks. Fail-fast at config-load so the daemon never spins
@@ -3245,6 +3432,7 @@ reviewer:
   provider: openai_compatible
   model: gpt-4o
   api_key_env: OPENAI_API_KEY
+  api_base_url: https://api.openai.com/v1
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
@@ -6865,6 +7053,357 @@ github:
             msg.contains("nonexistent-remote"),
             "error must name the missing remote, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // a37: canonical `LlmProvider` enum + per-provider / per-subsystem
+    // validation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn llm_provider_round_trips_through_serde_anthropic() {
+        let p: LlmProvider = serde_yml::from_str("anthropic").unwrap();
+        assert_eq!(p, LlmProvider::Anthropic);
+        let s = serde_yml::to_string(&p).unwrap();
+        assert_eq!(s.trim(), "anthropic");
+    }
+
+    #[test]
+    fn llm_provider_round_trips_through_serde_openai_compatible() {
+        let p: LlmProvider = serde_yml::from_str("openai_compatible").unwrap();
+        assert_eq!(p, LlmProvider::OpenAiCompatible);
+        let s = serde_yml::to_string(&p).unwrap();
+        assert_eq!(s.trim(), "openai_compatible");
+    }
+
+    #[test]
+    fn llm_provider_round_trips_through_serde_ollama() {
+        let p: LlmProvider = serde_yml::from_str("ollama").unwrap();
+        assert_eq!(p, LlmProvider::Ollama);
+        let s = serde_yml::to_string(&p).unwrap();
+        assert_eq!(s.trim(), "ollama");
+    }
+
+    #[test]
+    fn rag_provider_alias_resolves_to_llm_provider() {
+        // Type-alias check: pre-spec callers that imported the old
+        // names continue to compile.
+        let _: RagProvider = LlmProvider::Ollama;
+        let _: ReviewerProvider = LlmProvider::Anthropic;
+    }
+
+    // ---- validate_llm_provider_config matrix ----
+
+    #[test]
+    fn validate_anthropic_requires_api_key() {
+        let err = validate_llm_provider_config(
+            LlmProvider::Anthropic,
+            false,
+            None,
+            "reviewer",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reviewer"), "{msg}");
+        assert!(msg.contains("anthropic requires api_key"), "{msg}");
+    }
+
+    #[test]
+    fn validate_anthropic_accepts_api_key_without_base_url() {
+        validate_llm_provider_config(
+            LlmProvider::Anthropic,
+            true,
+            None,
+            "reviewer",
+        )
+        .expect("anthropic with api_key + no base_url must pass");
+    }
+
+    #[test]
+    fn validate_openai_compatible_requires_api_key() {
+        let err = validate_llm_provider_config(
+            LlmProvider::OpenAiCompatible,
+            false,
+            Some("https://api.openai.com/v1"),
+            "reviewer",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("openai_compatible requires api_key"), "{msg}");
+    }
+
+    #[test]
+    fn validate_openai_compatible_requires_api_base_url() {
+        let err = validate_llm_provider_config(
+            LlmProvider::OpenAiCompatible,
+            true,
+            None,
+            "change_internal_contradiction_check_llm",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("change_internal_contradiction_check_llm"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("openai_compatible requires api_base_url"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn validate_openai_compatible_passes_with_key_and_url() {
+        validate_llm_provider_config(
+            LlmProvider::OpenAiCompatible,
+            true,
+            Some("https://api.openai.com/v1"),
+            "reviewer",
+        )
+        .expect("openai_compatible with key+url must pass");
+    }
+
+    #[test]
+    fn validate_ollama_forbids_api_key() {
+        let err = validate_llm_provider_config(
+            LlmProvider::Ollama,
+            true,
+            Some("http://localhost:11434"),
+            "reviewer",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reviewer"), "{msg}");
+        assert!(
+            msg.contains("ollama does not authenticate"),
+            "{msg}"
+        );
+        assert!(msg.contains("remove api_key field"), "{msg}");
+    }
+
+    #[test]
+    fn validate_ollama_requires_api_base_url() {
+        let err = validate_llm_provider_config(
+            LlmProvider::Ollama,
+            false,
+            None,
+            "canonical_rag",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ollama requires api_base_url"), "{msg}");
+    }
+
+    #[test]
+    fn validate_ollama_passes_with_url_and_no_key() {
+        validate_llm_provider_config(
+            LlmProvider::Ollama,
+            false,
+            Some("http://localhost:11434"),
+            "reviewer",
+        )
+        .expect("ollama without key + url must pass");
+    }
+
+    // ---- validate_provider_for_subsystem matrix ----
+
+    #[test]
+    fn reviewer_subsystem_accepts_all_three_providers() {
+        for p in [
+            LlmProvider::Anthropic,
+            LlmProvider::OpenAiCompatible,
+            LlmProvider::Ollama,
+        ] {
+            validate_provider_for_subsystem(p, SubsystemKind::Reviewer)
+                .unwrap_or_else(|e| panic!("{p:?} must be valid for reviewer: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn contradiction_check_subsystem_accepts_all_three_providers() {
+        for p in [
+            LlmProvider::Anthropic,
+            LlmProvider::OpenAiCompatible,
+            LlmProvider::Ollama,
+        ] {
+            validate_provider_for_subsystem(p, SubsystemKind::ContradictionCheck).unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_rag_subsystem_rejects_anthropic() {
+        let err = validate_provider_for_subsystem(
+            LlmProvider::Anthropic,
+            SubsystemKind::CanonicalRag,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("canonical_rag does not support provider 'anthropic'"),
+            "{msg}"
+        );
+        assert!(msg.contains("available providers"), "{msg}");
+        assert!(msg.contains("ollama"), "{msg}");
+        assert!(msg.contains("openai_compatible"), "{msg}");
+    }
+
+    #[test]
+    fn canonical_rag_subsystem_accepts_ollama_and_openai_compatible() {
+        validate_provider_for_subsystem(
+            LlmProvider::Ollama,
+            SubsystemKind::CanonicalRag,
+        )
+        .unwrap();
+        validate_provider_for_subsystem(
+            LlmProvider::OpenAiCompatible,
+            SubsystemKind::CanonicalRag,
+        )
+        .unwrap();
+    }
+
+    // ---- Config::load_from integration: validators wired in ----
+
+    #[test]
+    fn config_load_rejects_canonical_rag_with_anthropic_provider() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+canonical_rag:
+  enabled: true
+  provider: anthropic
+  model: claude-haiku-4-5
+  api_base_url: https://api.anthropic.com
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("canonical_rag + anthropic must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("canonical_rag does not support provider 'anthropic'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_reviewer_ollama_with_api_key() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
+  provider: ollama
+  model: qwen2.5-coder:32b
+  api_base_url: http://localhost:11434
+  api_key:
+    value: "anything"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("reviewer ollama + api_key must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reviewer: ollama does not authenticate"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_reviewer_ollama_without_api_key() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
+  provider: ollama
+  model: qwen2.5-coder:32b
+  api_base_url: http://localhost:11434
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path)
+            .expect("reviewer ollama with bare base + no api_key must load");
+        let rv = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(rv.provider, LlmProvider::Ollama);
+        assert_eq!(rv.api_base_url.as_deref(), Some("http://localhost:11434"));
+        assert!(rv.api_key.is_none());
+        assert!(rv.api_key_env.is_none());
+    }
+
+    #[test]
+    fn config_load_rejects_reviewer_openai_compatible_without_api_key() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
+  provider: openai_compatible
+  model: gpt-4o
+  api_base_url: https://api.openai.com/v1
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("openai_compatible without api_key must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("openai_compatible requires api_key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_contradiction_check_ollama() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  change_internal_contradiction_check: enabled
+  change_internal_contradiction_check_llm:
+    provider: ollama
+    model: qwen2.5:7b
+    api_base_url: http://localhost:11434
+github:
+  token_env: GITHUB_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path)
+            .expect("contradiction-check ollama must load");
+        let llm = cfg
+            .executor
+            .change_internal_contradiction_check_llm
+            .as_ref()
+            .unwrap();
+        assert_eq!(llm.provider, LlmProvider::Ollama);
     }
 
     #[test]

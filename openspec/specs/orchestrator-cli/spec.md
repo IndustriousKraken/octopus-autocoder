@@ -4885,9 +4885,10 @@ This requirement is additive to the canonical "Malformed outcome sentinel falls 
 - **AND** the placeholder-detection diagnostic does NOT appear (the new diagnostic is reserved for the deserialize-success-but-contains-placeholder case)
 
 ### Requirement: Canonical-spec RAG configuration and pipeline
+
 autocoder SHALL support a per-workspace retrieval-augmented-context pipeline that embeds the workspace's canonical OpenSpec specs (`openspec/specs/<capability>/spec.md`) into an in-memory vector store AND exposes a retrieval surface for the implementer (via `a21`'s executor MCP requirement) AND for downstream pre-flight checks (`a22`'s change-vs-canon contradiction check). The pipeline is configured via a top-level `canonical_rag:` block in `config.yaml`; an absent block disables the feature entirely. A present block with `enabled: false` also disables; both forms preserve "no behavior change" for operators who don't opt in.
 
-The `canonical_rag:` config block contains: `enabled: bool`, `provider: ollama | openai_compatible`, `model: string`, `api_base_url: string`, `api_key_env: string?` AND `api_key: SecretSource?` (mutually exclusive — inline wins with WARN if both set; same pattern as `reviewer:`), `top_k: usize` (default `10`, clamped `[1, 100]` with WARN), `chunk_strategy: per_requirement | per_scenario | per_capability` (default `per_requirement`), AND `reembed_on_archive: bool` (default `true`).
+The `canonical_rag:` config block contains: `enabled: bool`, `provider: LlmProvider` (subsystem-valid subset: `ollama | openai_compatible`; `anthropic` is rejected at config-load per the per-subsystem provider-validity requirement), `model: string`, `api_base_url: string` (required for both valid providers), `api_key_env: string?` AND `api_key: SecretSource?` (mutually exclusive — inline wins with WARN if both set; same pattern as `reviewer:`; FORBIDDEN entirely when `provider: ollama` per the per-provider auth-semantics requirement), `top_k: usize` (default `10`, clamped `[1, 100]` with WARN), `chunk_strategy: per_requirement | per_scenario | per_capability` (default `per_requirement`), AND `reembed_on_archive: bool` (default `true`).
 
 The embedding pipeline SHALL:
 - Build an `EmbedClient` from the provider config — an Ollama adapter calling `<base_url>/api/embed` for Ollama, OR an OpenAI-compatible adapter calling `<base_url>/embeddings` with `Authorization: Bearer <api_key>` for the openai_compatible path.
@@ -4896,6 +4897,8 @@ The embedding pipeline SHALL:
 - Persist NOTHING to disk. Daemon restart re-embeds from scratch on workspace-init.
 
 Failure modes are fail-open: embedding-provider errors (network, auth, rate-limit) at init log WARN AND omit the workspace's store from the registry. Subsequent queries against the absent store return empty Vec with a structured error hint. The daemon does NOT gate iteration progress on RAG availability; the implementer's non-RAG fallback behavior remains correct.
+
+The `Anthropic` arm of the embedding dispatch SHALL exist as a defensive backstop returning `Err(anyhow!("anthropic does not support embeddings; configure canonical_rag.provider as ollama or openai_compatible"))`. In normal operation this is unreachable (config-load rejects `anthropic` for RAG); the backstop exists in case the validation is bypassed by a future code change.
 
 #### Scenario: Absent `canonical_rag:` block disables the feature
 - **WHEN** `config.yaml` does NOT contain a `canonical_rag:` top-level block
@@ -4944,6 +4947,16 @@ Failure modes are fail-open: embedding-provider errors (network, auth, rate-limi
 - **WHEN** both `canonical_rag.api_key.value` AND `canonical_rag.api_key_env` are set
 - **THEN** the inline value wins
 - **AND** a WARN log at startup names that the env var is being ignored
+
+#### Scenario: `canonical_rag.provider: anthropic` rejected at config-load
+- **WHEN** `config.yaml` contains `canonical_rag: { enabled: true, provider: anthropic, model: <m>, api_base_url: <u> }`
+- **THEN** config-load fails with `canonical_rag does not support provider 'anthropic'; available providers: ollama, openai_compatible`
+- **AND** the daemon exits non-zero before any polling task is spawned
+
+#### Scenario: `canonical_rag.provider: ollama` with `api_key` rejected at config-load
+- **WHEN** `config.yaml` contains `canonical_rag: { enabled: true, provider: ollama, model: <m>, api_base_url: <u>, api_key: { value: "anything" } }`
+- **THEN** config-load fails with `canonical_rag: ollama does not authenticate; remove api_key field`
+- **AND** the daemon exits non-zero
 
 ### Requirement: RAG re-embed cadence (workspace init and post-archive)
 The RAG pipeline SHALL re-embed canonical specs at two events ONLY:
@@ -5239,15 +5252,21 @@ When the assembly succeeds, the dispatcher SHALL pass the populated `RevisionCon
 - **AND** the rendered prompt the executor sees is full-fidelity for the revision task
 
 ### Requirement: Polling iteration termination is gated on agent-branch commit count, NOT on implementer-queue outcome
+
 The polling iteration's "no work to ship" early-return SHALL be gated EXCLUSIVELY on the agent branch's commit count relative to base — computed via `git rev-list --count <base_branch>..<agent_branch>` or equivalent. The early-return SHALL NOT use any higher-level signal (the implementer-processed-changes list, the audit-queue length, the reviewer-finding count, etc.) as the sole gate. The reason: any signal captured BEFORE the audit phase runs (the audit phase runs AFTER the queue walk per the canonical "audit phase runs AFTER pending change queue walk" requirement) can miss commits the audit phase subsequently produced. Using a stale signal to gate the push step causes audit-produced commits to be silently destroyed by the next iteration's `recreate_branch` step, which presented in production as "🔍 created proposal notifications without PRs" across multiple repos.
 
-When the agent-branch commit count is zero — meaning neither the implementer NOR any audit produced commits — the iteration SHALL clear `AlertState` AND return `Ok(())`. When the agent-branch commit count is non-zero, the iteration SHALL proceed to the push + PR-creation steps regardless of how the implementer-queue walk concluded. The canonical "audit's creation commits ship in iteration N's PR" requirement is thereby implementable: an iteration that did no implementer work but had an audit produce proposal commits ships those commits in a PR.
+When the agent-branch commit count is zero — meaning neither the implementer NOR any audit produced commits — the iteration SHALL clear `AlertState` AND return `Ok(())`. When the agent-branch commit count is non-zero, the iteration SHALL proceed to the push + PR-creation steps EXCEPT when iteration-pending markers are present per the suppression rule below. The canonical "audit's creation commits ship in iteration N's PR" requirement is thereby implementable: an iteration that did no implementer work but had an audit produce proposal commits ships those commits in a PR.
 
-This requirement is additive: it codifies an invariant that protects against future regressions of the same bug class. Any code change that introduces a new commit-producing iteration phase (a future spec-writing audit type, a future autonomous-fix mechanism, etc.) automatically benefits — the termination gate is already correct, the new commits already get pushed.
+**Iteration-pending suppression rule (new in this change).** Before invoking the push + PR-creation steps, the polling-loop SHALL scan `<workspace>/openspec/changes/*/.iteration-pending.json` markers. When one or more markers are present, the audit-only-PR path SHALL be SUPPRESSED for this iteration: the iteration SHALL log INFO `audit-only PR path suppressed: iteration-pending markers present for <change-list>` AND return `Ok(())` WITHOUT pushing OR opening a PR. Audit proposals committed during this iteration remain on agent-q AND on disk in `openspec/changes/<aXX>-*` directories; they ship in the NEXT iteration's PR after the iteration-pending change concludes (via `outcome_success`, `outcome_spec_needs_revision`, OR the `a27a1` 5-iteration cap).
+
+The suppression rule trades off two failure modes: opening a PR that mixes iteration_request WIP with audit findings (operator-confusing, mergable-yet-shouldn't-be) versus deferring audit findings by a few polling cycles (operator-invisible, no data loss). The latter is preferred because audit cadences are periodic (operators don't expect immediate proposals on every iteration) AND because the iteration sequence is bounded by `a27a1`'s 5-iteration cap (worst-case audit-finding delay is 5 iterations of the in-progress change).
+
+This requirement is additive: it codifies an invariant that protects against future regressions of the same bug class. Any code change that introduces a new commit-producing iteration phase (a future spec-writing audit type, a future autonomous-fix mechanism, etc.) automatically benefits — the termination gate is already correct, the new commits already get pushed when iteration-pending markers are absent.
 
 #### Scenario: Audit-only iteration pushes and opens PR
 - **WHEN** a polling iteration's queue walk produces zero implementer-processed changes (`processed` is empty)
 - **AND** a spec-writing audit (e.g., `security_bug_audit`) runs during the audit phase AND returns `SpecsWritten` AND commits its produced proposal directories to the agent branch
+- **AND** NO `.iteration-pending.json` markers are present in any change directory
 - **THEN** the iteration's commit-count check returns a non-zero value (the audit's commits ARE on the agent branch)
 - **AND** the iteration proceeds to `git::push_force_with_lease` AND to `github::create_pull_request`
 - **AND** a `✅ PR opened: <url>` notification fires per the existing canonical PR-opened notification requirement
@@ -5262,6 +5281,7 @@ This requirement is additive: it codifies an invariant that protects against fut
 
 #### Scenario: Implementer-non-empty + commit-count-non-zero proceeds normally
 - **WHEN** a polling iteration's queue walk processes one OR more changes AND produces at least one commit
+- **AND** NO `.iteration-pending.json` markers are present (the implementer changes archived cleanly, not iteration_request)
 - **THEN** the commit-count check returns non-zero
 - **AND** the iteration proceeds to the reviewer step (if configured) AND to the push + PR-creation steps
 - **AND** the canonical happy-path scenarios for end-of-iteration push + PR continue to hold
@@ -5274,21 +5294,46 @@ This requirement is additive: it codifies an invariant that protects against fut
 
 #### Scenario: Reviewer skipped on audit-only iterations
 - **WHEN** the iteration reaches the reviewer step AND `processed.is_empty()` is true AND `commit_count > 0`
+- **AND** NO `.iteration-pending.json` markers are present (suppression rule doesn't fire)
 - **THEN** the reviewer's `review()` method is NOT invoked
 - **AND** the PR is opened with NO `## Code Review` section
 - **AND** the rationale is: the audit's own validation pass already gated each proposal (`openspec validate --strict` per the canonical "LLM-driven audits validate their generated proposals before committing" requirement); a code-quality reviewer adds no signal against mechanical proposal-writing
 
-#### Scenario: PR body for audit-only iterations names the audit-produced proposals
-- **WHEN** the iteration opens a PR with `processed.is_empty()` AND `commit_count > 0`
-- **THEN** the PR title takes the form `audit-only: <N> proposal(s) from <comma-separated-audit-types>`
-- **AND** the PR body explicitly states this is an audit-only PR with no implementer changes
-- **AND** the PR body lists the agent-branch commit subjects (sourced from `git log <base>..<agent> --format=%s`) so reviewers see which audits fired AND how many proposals each produced
-- **AND** the PR body notes that the produced `openspec/changes/<prefix>-*` directories will be picked up by the NEXT polling iteration's `list_pending` for implementer routing
+#### Scenario: PR body for audit-only iterations names commits by category
+- **WHEN** the iteration opens a PR with `processed.is_empty()` AND `commit_count > 0` AND NO iteration-pending markers
+- **THEN** the PR body composition partitions the agent-branch commits by message-prefix category: `audit: <type>` → audit-produced; `iteration N of <change>` → iteration WIP; `archive: <change>` → implementer-archived; anything else → manual / unknown
+- **AND** the body includes only sections for non-empty categories (the "Audit-produced proposals" section appears ONLY when audit-produced commits exist)
+- **AND** when ALL commits are audit-produced, the PR title takes the canonical form `audit-only: <N> proposal(s) from <comma-separated-audit-types>`
+- **AND** the PR body lists the agent-branch commit subjects per the present categories (sourced from `git log <base>..<agent> --format=%s`) so reviewers see exactly what the PR contains
+- **AND** the PR body notes that the produced `openspec/changes/<prefix>-*` directories will be picked up by the NEXT polling iteration's `list_pending` for implementer routing (when audit-produced commits are present)
 
 #### Scenario: Regression test guards the gate
 - **WHEN** the test suite runs
-- **THEN** at least one test sets up a fixture iteration with empty `processed` AND a mock audit that produces commits AND asserts: (a) the push function IS called, (b) the PR-creation function IS called, (c) the PR's head ref matches the agent branch
+- **THEN** at least one test sets up a fixture iteration with empty `processed` AND a mock audit that produces commits AND NO `.iteration-pending.json` markers AND asserts: (a) the push function IS called, (b) the PR-creation function IS called, (c) the PR's head ref matches the agent branch
 - **AND** the test fails against any implementation that gates the early-return on `processed.is_empty()` instead of on the agent-branch commit count
+
+#### Scenario: Iteration-pending suppression with iteration_request WIP only
+- **WHEN** a polling iteration's `IterationRequested` arm just committed iteration_request WIP to agent-q for change X
+- **AND** the `.iteration-pending.json` marker for change X is present on disk
+- **AND** no other commits are on agent-q ahead of base
+- **THEN** the commit-count check returns non-zero (the iteration_request commit IS on agent-q)
+- **AND** the iteration-pending scan returns `[X]`
+- **AND** the audit-only-PR path is SUPPRESSED
+- **AND** the iteration logs INFO `audit-only PR path suppressed: iteration-pending markers present for X`
+- **AND** the iteration returns `Ok(())` WITHOUT calling `git::push_force_with_lease` OR `github::create_pull_request`
+- **AND** no PR opens
+
+#### Scenario: Iteration-pending suppression with audit commits AND iteration WIP
+- **WHEN** a polling iteration has BOTH audit-produced commits AND iteration_request WIP commits on agent-q
+- **AND** at least one `.iteration-pending.json` marker is present
+- **THEN** the audit-only-PR path is SUPPRESSED (the suppression rule fires on ANY marker presence; mixed commit content doesn't change the suppression decision)
+- **AND** the audit-produced commits remain on agent-q AND in their respective `openspec/changes/<aXX>-*` directories
+- **AND** the next iteration (after the iteration-pending change concludes) opens an audit-only PR with the audit commits
+
+#### Scenario: Iteration-pending absent → audit-only PR opens as today
+- **WHEN** a polling iteration has audit-produced commits on agent-q AND NO `.iteration-pending.json` markers anywhere
+- **THEN** the audit-only-PR path fires normally (existing happy path)
+- **AND** a PR is opened with the canonical audit-only title format
 
 ### Requirement: Scout polling-iteration handler produces a triage list AND persists `ScoutRunState`
 The daemon's per-repo polling iteration SHALL, after processing pending proposal AND brownfield requests AND before the standard change-processing pass, drain at most one pending scout request from `pending_scout_requests`. The handler SHALL invoke the executor in scout mode with `WritePolicy::None` AND a sandbox profile permitting `Read`, `Glob`, `Grep`, AND `Bash` (read-only, with `gh` permitted).
@@ -6283,4 +6328,133 @@ The workspace resolution rule is uniform across all three subsubcommands.
 - **WHEN** the operator runs `inspect rag` AND the daemon has a `CanonicalRagStore` registered for the workspace
 - **THEN** the response's `hits` array reflects the store's actual content at that instant
 - **AND** the subcommand does NOT load OR query embeddings independently (the daemon is the single source of truth)
+
+### Requirement: Canonical `LlmProvider` enum AND per-provider auth semantics
+
+The autocoder config schema SHALL define a single canonical `LlmProvider` enum with three variants AND their YAML strings:
+
+- `anthropic` — Anthropic's hosted API (`https://api.anthropic.com` default).
+- `openai_compatible` — Any OpenAI-API-shaped endpoint (OpenAI itself, Grok, OpenRouter, vLLM, local OpenAI-compat shims, etc.).
+- `ollama` — Ollama's native API (`<base>/api/chat` for completion, `<base>/api/embed` for embeddings).
+
+`LlmProvider` SHALL be the type of the `provider` field across every LLM-touching config block: `reviewer:`, `canonical_rag:`, AND `executor.change_internal_contradiction_check_llm:`. Backward compatibility: the existing `RagProvider` AND `ReviewerProvider` enum names SHALL be retained as type aliases (`pub type RagProvider = LlmProvider;` etc.) so external-crate or test-code consumers compile unchanged. Existing config files using `provider: anthropic`, `provider: openai_compatible`, AND `provider: ollama` parse identically post-spec.
+
+The `api_key` field's mandatory-ness SHALL be determined by the resolved provider, NOT by the subsystem:
+
+- `anthropic` → `api_key` REQUIRED (either via `api_key.value` inline OR `api_key_env` pointing at a set env var). Config-load fails-fast if absent.
+- `openai_compatible` → `api_key` REQUIRED. Same fail-fast rule.
+- `ollama` → `api_key` FORBIDDEN. Config-load fails-fast if the operator sets one with the message `<subsystem>: ollama does not authenticate; remove api_key field`. This is a behavioral departure from "silently ignore" — operators learn the auth model at startup rather than carrying dummy values forward.
+
+The `api_base_url` field's mandatory-ness SHALL similarly be provider-driven:
+
+- `anthropic` → OPTIONAL (defaults to `https://api.anthropic.com`).
+- `openai_compatible` → REQUIRED (no sensible default for a generic compat endpoint).
+- `ollama` → REQUIRED (operator's Ollama host).
+
+The `api_base_url` SHALL be treated as the API root by every provider's client. Each client knows what protocol-specific path to append:
+
+- `anthropic` → `<base>/v1/messages`.
+- `openai_compatible` → `<base>/chat/completions` (for chat) OR `<base>/embeddings` (for embeddings).
+- `ollama` → `<base>/api/chat` (for chat) OR `<base>/api/embed` (for embeddings).
+
+Operators using `openai_compatible` against hosted services that require `/v1` in the URL (OpenAI, Grok, OpenRouter) SHALL include `/v1` in their `api_base_url`. The client does NOT auto-append `/v1`; the convention is "operator owns the API root."
+
+Validation runs ONCE at config-load (not lazily). A misconfigured provider surfaces as a fail-fast error at `systemctl restart autocoder`, not as a 404 OR permission error on first feature trigger.
+
+#### Scenario: `LlmProvider` round-trips through serde
+- **WHEN** a config file contains `provider: anthropic` (OR `openai_compatible`, OR `ollama`)
+- **THEN** the field deserializes into `LlmProvider::Anthropic` (resp. `OpenAiCompatible`, `Ollama`)
+- **AND** re-serializing produces the same YAML string
+
+#### Scenario: `RagProvider` AND `ReviewerProvider` aliases compile
+- **WHEN** code references the type names `RagProvider` OR `ReviewerProvider`
+- **THEN** the names resolve to `LlmProvider` via type aliases
+- **AND** no source-code change is required to consumers of the old type names
+
+#### Scenario: `anthropic` requires `api_key`
+- **WHEN** a config block sets `provider: anthropic` AND omits both `api_key` AND `api_key_env`
+- **THEN** config-load fails with `<subsystem>: anthropic requires api_key; set <subsystem>.api_key.value or <subsystem>.api_key_env`
+- **AND** the daemon exits non-zero before any polling task is spawned
+
+#### Scenario: `openai_compatible` requires `api_key`
+- **WHEN** a config block sets `provider: openai_compatible` AND omits both `api_key` AND `api_key_env`
+- **THEN** config-load fails with `<subsystem>: openai_compatible requires api_key; set <subsystem>.api_key.value or <subsystem>.api_key_env`
+
+#### Scenario: `openai_compatible` requires `api_base_url`
+- **WHEN** a config block sets `provider: openai_compatible` AND omits `api_base_url`
+- **THEN** config-load fails with `<subsystem>: openai_compatible requires api_base_url; set the field to e.g. https://api.openai.com/v1`
+
+#### Scenario: `ollama` forbids `api_key`
+- **WHEN** a config block sets `provider: ollama` AND sets `api_key.value` OR `api_key_env`
+- **THEN** config-load fails with `<subsystem>: ollama does not authenticate; remove api_key field`
+- **AND** the failure message names that Ollama silently ignores Authorization headers
+
+#### Scenario: `ollama` requires `api_base_url`
+- **WHEN** a config block sets `provider: ollama` AND omits `api_base_url`
+- **THEN** config-load fails with `<subsystem>: ollama requires api_base_url; set the field to e.g. http://localhost:11434`
+
+#### Scenario: `anthropic` defaults `api_base_url` cleanly
+- **WHEN** a config block sets `provider: anthropic`, `api_key.value: <some-key>`, AND omits `api_base_url`
+- **THEN** config-load succeeds
+- **AND** the resolved `api_base_url` is `https://api.anthropic.com`
+
+### Requirement: Per-subsystem provider validity is enforced at config-load
+
+Different LLM-using subsystems have different supported provider sets. Validity SHALL be enforced at config-load with a clear actionable error.
+
+Subsystem validity table:
+
+- `reviewer.provider` → `anthropic | openai_compatible | ollama` (all three valid; reviewer does completion).
+- `executor.change_internal_contradiction_check_llm.provider` → `anthropic | openai_compatible | ollama` (all three valid; same shape as reviewer).
+- `canonical_rag.provider` → `openai_compatible | ollama` (anthropic INVALID; Anthropic does not expose an embeddings API).
+
+When an operator picks a provider NOT in a subsystem's valid set, config-load SHALL fail with the message `<subsystem> does not support provider '<rejected>'; available providers: <comma-separated valid list>` AND the daemon SHALL exit non-zero before any polling task is spawned.
+
+#### Scenario: `canonical_rag.provider: anthropic` rejected
+- **WHEN** a config file contains `canonical_rag: { enabled: true, provider: anthropic, ... }`
+- **THEN** config-load fails with `canonical_rag does not support provider 'anthropic'; available providers: ollama, openai_compatible`
+- **AND** the daemon exits non-zero
+
+#### Scenario: `reviewer.provider: ollama` accepted
+- **WHEN** a config file contains `reviewer: { enabled: true, provider: ollama, model: <model>, api_base_url: http://localhost:11434, ... }` (no api_key)
+- **THEN** config-load succeeds
+- **AND** the resolved reviewer config carries `LlmProvider::Ollama` AND `api_base_url: http://localhost:11434`
+- **AND** the daemon proceeds with normal startup
+
+#### Scenario: `change_internal_contradiction_check_llm.provider: ollama` accepted
+- **WHEN** the contradiction-check LLM is configured with `provider: ollama` AND a base URL AND no api_key
+- **THEN** config-load succeeds
+- **AND** the contradiction-check uses the new `OllamaChatClient`
+
+### Requirement: Integration test verifies `IterationRequested` arm writes the iteration-pending marker AND clears the in-progress lock
+
+A canonical integration test SHALL exercise the polling-loop's `IterationRequested` outcome arm end-to-end against a temp workspace + temp bare git repo fixture AND assert two filesystem postconditions:
+
+1. `<workspace>/openspec/changes/<change>/.iteration-pending.json` exists on disk after the arm completes AND parses to a payload containing `completed_tasks`, `remaining_tasks`, `reason`, AND `iteration_number` per `a27a1`'s "Iteration-pending marker file in the change directory carries state across iteration boundaries" requirement.
+2. `<workspace>/openspec/changes/<change>/.in-progress` does NOT exist on disk after the arm completes, per the canonical openspec-queue-engine "Unlocking after any executor outcome" requirement.
+
+This test pins the implementation against the silent-drop failure mode observed in production: the canonical specs require both filesystem effects, the implementation can silently skip either one, AND unit-level tests of the helpers don't exercise the integration. A failure in either postcondition fails the build with a clear message naming which file is missing AND which canonical requirement governs the expectation.
+
+The test SHALL also assert that the iteration_request commit IS present on the agent branch (commit-count > 0) so a regression where the IterationRequested arm fails the commit + push step BUT still drops the lock is caught.
+
+#### Scenario: IterationRequested arm writes marker AND clears in-progress
+- **WHEN** the integration test drives a polling iteration whose stub executor returns `IterationRequested { completed_tasks: ["1", "2"], remaining_tasks: ["3"], reason: "scope-overflow", iteration_number: 2 }`
+- **AND** the polling loop's `IterationRequested` arm runs end-to-end (commit + force-push + marker write + lock cleanup)
+- **THEN** `<workspace>/openspec/changes/<change>/.iteration-pending.json` exists
+- **AND** the file parses to `{"completed_tasks": ["1", "2"], "remaining_tasks": ["3"], "reason": "scope-overflow", "iteration_number": 2}` byte-for-byte
+- **AND** `<workspace>/openspec/changes/<change>/.in-progress` does NOT exist
+- **AND** `git rev-list --count <base>..<agent>` returns 1 (the iteration_request WIP commit was pushed)
+
+#### Scenario: Missing marker fails the test with a clear message
+- **WHEN** a hypothetical implementation regression causes the IterationRequested arm to skip the marker write
+- **THEN** the integration test fails with a message naming the missing path (`<workspace>/openspec/changes/<change>/.iteration-pending.json`) AND the canonical `a27a1` "Iteration-pending marker file..." requirement as the resolution target
+
+#### Scenario: Stale .in-progress fails the test with a clear message
+- **WHEN** a hypothetical implementation regression causes the IterationRequested arm to skip the `.in-progress` cleanup
+- **THEN** the integration test fails with a message naming the unexpected file (`<workspace>/openspec/changes/<change>/.in-progress`) AND the canonical "Unlocking after any executor outcome" requirement as the resolution target
+
+#### Scenario: Both filesystem effects exercised in one test (NOT two)
+- **WHEN** the integration test is designed
+- **THEN** both postconditions are asserted in the SAME test against the SAME fixture (NOT split across two tests)
+- **AND** the rationale: a single test that runs the full arm once AND asserts both effects catches the "implementation does the commit + push but neither filesystem effect" failure mode cleanly. Splitting into two tests can let the second test pass against a fixture that the first test mutated, masking the same-arm failure
 
