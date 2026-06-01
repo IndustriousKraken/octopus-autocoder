@@ -142,7 +142,8 @@ fn validate_args(args: &SyncSpecsArgs) -> Result<()> {
 /// until the busy marker is released. When no busy marker exists, both
 /// modes are a no-op.
 pub async fn coordinate_with_daemon(workspace: &Path, immediate: bool) -> Result<()> {
-    let marker_path = busy_marker::marker_path(workspace);
+    let paths = crate::cli::resolve_paths_from_env()?;
+    let marker_path = busy_marker::marker_path(&paths, workspace);
     if !marker_path.exists() {
         // No daemon iteration in progress; nothing to coordinate.
         return Ok(());
@@ -153,7 +154,7 @@ pub async fn coordinate_with_daemon(workspace: &Path, immediate: bool) -> Result
             workspace = %workspace.display(),
             "sync-specs --immediate: busy marker present; sending SIGTERM to executor subprocess"
         );
-        if let Some(pid) = busy_marker::read_subprocess_marker(workspace) {
+        if let Some(pid) = busy_marker::read_subprocess_marker(&paths, workspace) {
             if pid > 0 {
                 // SIGTERM to the subprocess pgid (= pid, since executor
                 // spawns with process_group(0)).

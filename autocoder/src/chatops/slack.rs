@@ -510,6 +510,7 @@ impl ChatOpsBackend for SlackBackend {
 
     async fn start_inbound_listener(
         &self,
+        paths: Arc<crate::paths::DaemonPaths>,
         dispatcher: Arc<OperatorCommandDispatcher>,
         repos: Arc<dyn RepoIdentityProvider>,
         allowed_channels: Arc<HashSet<String>>,
@@ -543,6 +544,7 @@ impl ChatOpsBackend for SlackBackend {
             repos,
             allowed_channels,
             dedup_cache,
+            paths,
         };
         let handle = tokio::spawn(run_inbound_listener(ctx, cancel));
         Ok(handle)
@@ -872,6 +874,10 @@ struct InboundListenerContext {
     /// lifetime — reconnects do NOT clear the cache. Drops when the
     /// listener task exits (daemon shutdown).
     pub dedup_cache: Arc<EventDedupCache>,
+    /// Daemon-wide resolved `DaemonPaths`, threaded from the entrypoint
+    /// so the inbound listener can construct a `ControlSocketSubmitter`
+    /// pointing at the canonical socket path.
+    paths: Arc<crate::paths::DaemonPaths>,
 }
 
 /// Outer reconnect loop. Calls `open_socket_mode_url` + connect,
@@ -1185,7 +1191,7 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
     };
     let repos = ctx.repos.snapshot();
     let submitter = crate::chatops::operator_commands::ControlSocketSubmitter::new(
-        crate::control_socket::socket_path(),
+        crate::control_socket::socket_path(&ctx.paths),
     );
     let reply = ctx
         .dispatcher
@@ -1955,7 +1961,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         stamp_audit_thread_state(tmp.path(), "9999.1234");
 
-        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = RecordingSubmitter::new();
         let bot_mention = "<@UBOT>";
@@ -2019,7 +2025,7 @@ mod tests {
         // `?` reaction. This preserves the canonical "send it outside
         // an audit thread is refused" behaviour.
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
             .with_audit_thread_state_dir(tmp.path().to_path_buf());
         let submitter = RecordingSubmitter::new();
         let bot_mention = "<@UBOT>";
@@ -2409,10 +2415,11 @@ mod tests {
             bot_user_id: bot_user_id.to_string(),
             bot_id: bot_id.map(str::to_string),
             app_token: "xapp-1-test".into(),
-            dispatcher: Arc::new(OperatorCommandDispatcher::new()),
-            repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new)),
+            dispatcher: Arc::new(OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)),
+            repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(std::sync::Arc::new(crate::testing::test_daemon_paths().1), Vec::new)),
             allowed_channels: Arc::new(channels.iter().map(|s| s.to_string()).collect()),
             dedup_cache: Arc::new(EventDedupCache::new(100, Duration::from_secs(600))),
+            paths: std::sync::Arc::new(crate::testing::test_daemon_paths().1),
         }
     }
 
@@ -2433,10 +2440,11 @@ mod tests {
             bot_user_id: bot_user_id.to_string(),
             bot_id: None,
             app_token: "xapp-1-test".into(),
-            dispatcher: Arc::new(OperatorCommandDispatcher::new()),
-            repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new)),
+            dispatcher: Arc::new(OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)),
+            repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(std::sync::Arc::new(crate::testing::test_daemon_paths().1), Vec::new)),
             allowed_channels: Arc::new(channels.iter().map(|s| s.to_string()).collect()),
             dedup_cache,
+            paths: std::sync::Arc::new(crate::testing::test_daemon_paths().1),
         }
     }
 
@@ -3095,9 +3103,9 @@ mod tests {
         assert_eq!(backend.dedup_cache_capacity, 42);
         assert_eq!(backend.dedup_cache_ttl_secs, 77);
 
-        let dispatcher = Arc::new(OperatorCommandDispatcher::new());
+        let dispatcher = Arc::new(OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1));
         let repos: Arc<dyn RepoIdentityProvider> =
-            Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new));
+            Arc::new(crate::chatops::TaskMapRepoIdentities::new(std::sync::Arc::new(crate::testing::test_daemon_paths().1), Vec::new));
         let channels = Arc::new(HashSet::<String>::new());
         let cancel = CancellationToken::new();
         cancel.cancel(); // pre-cancel so the listener exits quickly
@@ -3106,7 +3114,13 @@ mod tests {
         // is that listener startup accepts the dedup config without
         // error.
         let _handle = backend
-            .start_inbound_listener(dispatcher, repos, channels, cancel)
+            .start_inbound_listener(
+                std::sync::Arc::new(crate::testing::test_daemon_paths().1),
+                dispatcher,
+                repos,
+                channels,
+                cancel,
+            )
             .await
             .expect("listener should start with dedup config");
     }
@@ -3118,13 +3132,14 @@ mod tests {
         // caller can WARN-and-skip instead of spawning a doomed task.
         let mut server = mockito::Server::new_async().await;
         let backend = fixture_backend(&mut server).await;
-        let dispatcher = Arc::new(OperatorCommandDispatcher::new());
+        let dispatcher = Arc::new(OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1));
         let repos: Arc<dyn RepoIdentityProvider> = Arc::new(
-            crate::chatops::TaskMapRepoIdentities::new(Vec::new),
+            crate::chatops::TaskMapRepoIdentities::new(std::sync::Arc::new(crate::testing::test_daemon_paths().1), Vec::new),
         );
         let channels = Arc::new(HashSet::<String>::new());
         let err = backend
             .start_inbound_listener(
+                std::sync::Arc::new(crate::testing::test_daemon_paths().1),
                 dispatcher,
                 repos,
                 channels,

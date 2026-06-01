@@ -6,9 +6,60 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Resolve a `DaemonPaths` from env vars only (no config file). Used by
+/// CLI subcommands that talk to the running daemon (or run standalone)
+/// AND don't take a `--config` flag. The env-driven resolution mirrors
+/// the daemon's own startup priority order minus the config override:
+/// AUTOCODER_*_DIR → systemd dirs → XDG defaults → hard fallback.
+pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
+    let cfg = config::Config {
+        repositories: vec![],
+        executor: config::ExecutorConfig {
+            kind: config::ExecutorKind::ClaudeCli,
+            command: String::new(),
+            timeout_secs: 60,
+            sandbox: None,
+            implementer_prompt_path: None,
+            changelog_stylist_prompt_path: None,
+            perma_stuck_after_failures: None,
+            max_changes_per_pr: None,
+            startup_jitter_max_secs: None,
+            inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: config::default_wipe_drain_timeout_secs(),
+            output_format: config::default_output_format(),
+            log_retention_days: config::default_log_retention_days(),
+            busy_marker_stale_threshold_secs: None,
+            change_internal_contradiction_check: config::ContradictionCheckMode::Disabled,
+            change_internal_contradiction_check_prompt_path: None,
+            change_internal_contradiction_check_llm: None,
+            implementer: None,
+            changelog_stylist: None,
+            implementer_revision: None,
+            audit_triage: None,
+            chat_request_triage: None,
+        },
+        github: config::GithubConfig {
+            token_env: "GITHUB_TOKEN".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        },
+        reviewer: None,
+        chatops: None,
+        audits: None,
+        paths: config::DaemonPathsConfig::default(),
+        features: config::FeaturesConfig::default(),
+        canonical_rag: None,
+    };
+    crate::paths::resolve_daemon_paths(&cfg)
+}
+
 pub mod audit;
 pub mod changelog;
 pub mod check_config;
+pub mod inspect;
 pub mod install;
 pub mod reload;
 pub mod rewind;
@@ -23,6 +74,79 @@ pub mod sync_specs_deps;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InspectSubcommand {
+    /// Query the running daemon's canonical-spec RAG store and render the
+    /// hits as a human-readable table. Wraps the `query_canonical_specs`
+    /// control-socket action.
+    Rag {
+        /// Workspace basename (e.g. `github_com_owner_repo`) OR repo
+        /// URL. When omitted, the daemon's single configured workspace
+        /// is used; if there are zero OR multiple, the command exits
+        /// non-zero with the available basenames listed.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// The query text to send to the RAG store.
+        #[arg(long)]
+        query: String,
+
+        /// Top-K results to request. Defaults to the daemon's
+        /// `canonical_rag.top_k` when omitted.
+        #[arg(long)]
+        top_k: Option<u32>,
+
+        /// Render the first 500 characters of each hit's
+        /// `requirement_body` below the table.
+        #[arg(long, default_value_t = false)]
+        show_bodies: bool,
+
+        /// Print the raw control-socket response JSON to stdout
+        /// instead of the formatted table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Pretty-print a per-change stream log with tool calls grouped AND
+    /// query/result pairs aligned. Reads `<logs_dir>/runs/<basename>/<change>.stream.log`.
+    Log {
+        /// Workspace basename or URL; see `inspect rag --workspace`.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// The change name (matches `<change>.stream.log` in the
+        /// workspace's runs directory).
+        change: String,
+
+        /// Cap rendered tool-call event groups at N. Default 30;
+        /// `--limit 0` means unlimited.
+        #[arg(long)]
+        limit: Option<u32>,
+
+        /// Print the parsed event stream as a JSON array instead of
+        /// the formatted output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Aggregate stats from a per-change stream log (tool-call counts,
+    /// duration, `query_canonical_specs` distribution).
+    ToolUsage {
+        /// Workspace basename or URL; see `inspect rag --workspace`.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// The change name (matches `<change>.stream.log` in the
+        /// workspace's runs directory).
+        change: String,
+
+        /// Print the aggregated stats as a structured JSON object
+        /// instead of the formatted output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +251,15 @@ pub enum Command {
     /// same output every invocation.
     Changelog(changelog::ChangelogArgs),
 
+    /// Operator-friendly diagnostic surface that wraps the existing
+    /// log + control-socket primitives. Three subsubcommands: `rag`
+    /// queries the canonical RAG store; `log` pretty-prints a stream
+    /// log; `tool-usage` aggregates stats from a stream log.
+    Inspect {
+        #[command(subcommand)]
+        command: InspectSubcommand,
+    },
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -178,6 +311,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 audit::execute(workspace, audit).await
             }
         },
+        Command::Inspect { command } => inspect::dispatch(command).await,
         Command::Rewind {
             changes,
             config: config_path,

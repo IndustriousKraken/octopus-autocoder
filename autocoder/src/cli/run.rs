@@ -34,13 +34,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
-    // Resolve + install the daemon-paths global BEFORE any callsite
-    // that reads workspace / control-socket / log / state paths. The
-    // resolution order (config → AUTOCODER_*_DIR → systemd → XDG →
-    // hard fallback) is owned by `paths::resolve_daemon_paths`. After
-    // the install, every callsite that previously read
-    // `<system-temp>/autocoder/...` paths reads the resolved locations
-    // (state on /var/lib, cache on /var/cache, etc.).
+    // Resolve the daemon paths via the env-driven resolver, then wrap
+    // in an `Arc<DaemonPaths>` AND thread the value explicitly into
+    // every consumer (per the canonical `Production paths SHALL be
+    // threaded` requirement). The single `Arc` is constructed here
+    // exactly once per daemon process AND handed by clone into the
+    // top-level orchestrator types (`ClaudeCliExecutor`, `ControlState`,
+    // `polling_loop::run`).
     let daemon_paths = paths::resolve_daemon_paths(&cfg)
         .context("resolving daemon data paths")?;
     paths::ensure_directories(&daemon_paths)
@@ -52,8 +52,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         runtime = %daemon_paths.runtime.display(),
         "daemon paths resolved"
     );
-    paths::install_global(daemon_paths.clone())
-        .context("installing global daemon paths")?;
+    let daemon_paths: Arc<paths::DaemonPaths> = Arc::new(daemon_paths);
 
     // Migrate any legacy /tmp paths into the new layout. Logged but
     // never fatal — operators see ERROR lines in journalctl and can
@@ -190,7 +189,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
 
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
         ExecutorKind::ClaudeCli => Arc::new(
-            ClaudeCliExecutor::from_config(&cfg.executor)
+            ClaudeCliExecutor::from_config(&cfg.executor, daemon_paths.clone())
                 .context("initializing ClaudeCliExecutor from config")?,
         ),
     };
@@ -290,7 +289,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
 
     for repo in &cfg.repositories {
-        let derived = workspace::resolve_path(repo);
+        let derived = workspace::resolve_path(&daemon_paths, repo);
         tracing::info!(
             url = repo.url.as_str(),
             workspace = %derived.display(),
@@ -479,6 +478,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
+        paths: daemon_paths.clone(),
         executor: executor.clone(),
         github_holder: github_holder.clone(),
         reviewer_holder: reviewer_holder.clone(),
@@ -525,7 +525,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         crate::rag::set_shared(canonical_rag_registry.clone(), rag_cfg.clone());
         // Set the control-socket env var so `ClaudeCliExecutor::write_mcp_config`
         // picks it up when writing the per-execution `.mcp.json`.
-        let socket = crate::control_socket::socket_path();
+        let socket = crate::control_socket::socket_path(&daemon_paths);
         unsafe {
             std::env::set_var(
                 crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
@@ -541,7 +541,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // outcome tools, independent of canonical_rag. Set it unconditionally
     // if not already set by the canonical_rag block above.
     if std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).is_err() {
-        let socket = crate::control_socket::socket_path();
+        let socket = crate::control_socket::socket_path(&daemon_paths);
         // SAFETY: daemon startup is single-threaded at this point; we
         // are the sole writer to the process env.
         unsafe {
@@ -562,6 +562,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
         outcome_store: crate::outcome_store::OutcomeStore::new(),
+        paths: daemon_paths.clone(),
     };
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
@@ -581,6 +582,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // shutdown path awaits the listener before exiting.
     let inbound_handles = spawn_inbound_listener(
         &cfg,
+        daemon_paths.clone(),
         chatops_holder.clone(),
         task_map.clone(),
         audit_registry.clone(),
@@ -635,6 +637,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
 ///     may reload-add channels later).
 async fn spawn_inbound_listener(
     cfg: &Config,
+    daemon_paths: Arc<paths::DaemonPaths>,
     chatops_holder: ChatOpsHolder,
     task_map: RepoTaskMap,
     audit_registry: Arc<AuditRegistry>,
@@ -695,7 +698,7 @@ async fn spawn_inbound_listener(
     }
 
     let dispatcher = Arc::new(
-        crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+        crate::chatops::operator_commands::OperatorCommandDispatcher::new(&daemon_paths)
             .with_audit_types(
                 audit_registry
                     .known_type_names()
@@ -709,17 +712,18 @@ async fn spawn_inbound_listener(
             .with_brownfield_survey_enabled(cfg.features.brownfield_survey.enabled)
             .with_workspace_resolver({
                 let task_map_for_resolver = task_map.clone();
+                let paths_for_resolver = daemon_paths.clone();
                 move |url: &str| -> Option<std::path::PathBuf> {
                     let guard = task_map_for_resolver.lock().unwrap();
                     guard
                         .get(url)
-                        .map(|h| crate::workspace::resolve_path(&h.config.load_full()))
+                        .map(|h| crate::workspace::resolve_path(&paths_for_resolver, &h.config.load_full()))
                 }
             }),
     );
     let task_map_for_provider = task_map.clone();
     let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
-        Arc::new(crate::chatops::TaskMapRepoIdentities::new(move || {
+        Arc::new(crate::chatops::TaskMapRepoIdentities::new(daemon_paths.clone(), move || {
             let guard = task_map_for_provider.lock().unwrap();
             guard
                 .values()
@@ -730,7 +734,7 @@ async fn spawn_inbound_listener(
 
     let backend = slot.backend.clone();
     match backend
-        .start_inbound_listener(dispatcher, repos, allowed_arc, cancel)
+        .start_inbound_listener(daemon_paths, dispatcher, repos, allowed_arc, cancel)
         .await
     {
         Ok(h) => vec![h],
@@ -744,6 +748,7 @@ async fn spawn_inbound_listener(
 /// Dependencies the daemon captures into the spawn closure so the reload
 /// handler can launch new polling tasks without re-deriving them.
 struct SpawnDeps {
+    paths: Arc<paths::DaemonPaths>,
     executor: Arc<dyn Executor>,
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
@@ -783,7 +788,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         // Startup check uses the live github config (post-reload it may
         // differ from what was on disk at process start).
         let github_snap = deps.github_holder.load_full();
-        if !repo_passes_startup_check(&repo, &github_snap) {
+        if !repo_passes_startup_check(&deps.paths, &repo, &github_snap) {
             return SpawnOutcome::StartupCheckFailed;
         }
         let child_cancel = deps.global_cancel.child_token();
@@ -868,8 +873,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
+        let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
+                paths_for_task,
                 config_for_task,
                 executor_for_task,
                 github_for_task,
@@ -1190,8 +1197,12 @@ pub async fn ensure_forks_exist(
 /// of skipping the repo for the daemon's lifetime. For now startup keeps
 /// its conservative skip-for-lifetime contract: any failure here removes
 /// the repo from the polling set until the operator restarts the daemon.
-pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig) -> bool {
-    let workspace_path = workspace::resolve_path(repo);
+pub fn repo_passes_startup_check(
+    paths: &paths::DaemonPaths,
+    repo: &RepositoryConfig,
+    github: &GithubConfig,
+) -> bool {
+    let workspace_path = workspace::resolve_path(paths, repo);
     let fork_url = match github.fork_owner.as_deref() {
         Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
             Ok(u) => Some(u),
@@ -1224,7 +1235,7 @@ pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig)
     let fork_arg = fork_url
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
-    if let Err(e) = workspace::ensure_initialized(&workspace_path, &repo.url, fork_arg) {
+    if let Err(e) = workspace::ensure_initialized(paths, &workspace_path, &repo.url, fork_arg) {
         tracing::error!(
             url = repo.url.as_str(),
             workspace = %workspace_path.display(),
@@ -1580,8 +1591,9 @@ mod tests {
             fork_owner: None,
             recreate_fork_on_reinit: false,
         };
+        let (_td, test_paths) = crate::testing::test_daemon_paths();
         assert!(
-            repo_passes_startup_check(&dirty_repo, &direct_push_github),
+            repo_passes_startup_check(&test_paths, &dirty_repo, &direct_push_github),
             "dirty workspace must auto-recover and pass the startup check"
         );
 
@@ -1705,7 +1717,8 @@ mod tests {
             fork_owner: None,
             recreate_fork_on_reinit: false,
         };
-        assert!(repo_passes_startup_check(&clean_repo, &direct_push_github),
+        let (_td, test_paths) = crate::testing::test_daemon_paths();
+        assert!(repo_passes_startup_check(&test_paths, &clean_repo, &direct_push_github),
             "clean workspace must pass startup check");
     }
 }

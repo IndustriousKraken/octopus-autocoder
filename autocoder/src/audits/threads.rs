@@ -81,8 +81,12 @@ pub fn state_dir(root: &Path) -> PathBuf {
 /// audit-threads files survive reboot alongside audit cadence, failure
 /// counters, and revision state — they belong to the same persistent
 /// data category.
-pub fn default_state_root() -> PathBuf {
-    crate::paths::current().state
+///
+/// The `DaemonPaths` reference is threaded explicitly per the canonical
+/// `Production paths SHALL be threaded` requirement (function-parameter
+/// pattern).
+pub fn default_state_root(paths: &crate::paths::DaemonPaths) -> PathBuf {
+    paths.state.clone()
 }
 
 /// Atomically write `state` to its canonical file. Parent directory is

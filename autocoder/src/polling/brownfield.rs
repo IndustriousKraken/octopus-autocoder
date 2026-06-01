@@ -37,6 +37,7 @@ pub(crate) const DEFAULT_BROWNFIELD_TEMPLATE: &str =
 /// terminal-Failed); irrecoverable errors propagate as `Err` for the
 /// caller to log.
 pub async fn process_pending_brownfield(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,
@@ -50,7 +51,7 @@ pub async fn process_pending_brownfield(
         None => None,
     };
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
-    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+    crate::workspace::ensure_initialized(paths, workspace, &repo.url, fork_arg)
         .with_context(|| "brownfield: workspace ensure_initialized".to_string())?;
     let _ = crate::queue::clear_stale_locks(workspace);
     let _ = git::reset_hard_head(workspace);

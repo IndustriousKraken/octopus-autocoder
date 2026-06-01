@@ -108,6 +108,7 @@ fn extract_changelog_json(workspace: &Path, args: &ParsedChangelogArgs) -> Resul
 /// validates the diff's path scope, commits + pushes to a
 /// `changelog-<short-hash>` branch, AND opens a single PR.
 pub async fn process_changelog_requests(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     executor: &dyn Executor,
@@ -120,7 +121,7 @@ pub async fn process_changelog_requests(
         None => None,
     };
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
-    crate::workspace::ensure_initialized(workspace, &repo.url, fork_arg)
+    crate::workspace::ensure_initialized(paths, workspace, &repo.url, fork_arg)
         .with_context(|| "changelog-stylist: workspace ensure_initialized".to_string())?;
     let _ = crate::queue::clear_stale_locks(workspace);
     let _ = git::reset_hard_head(workspace);
@@ -132,7 +133,7 @@ pub async fn process_changelog_requests(
         format!("changelog-stylist: pull --ff-only `{}`", repo.base_branch)
     })?;
 
-    let state_root = changelog_requests::default_state_root();
+    let state_root = changelog_requests::default_state_root(paths);
     for request in requests {
         let mut state = match changelog_requests::read_state(
             &state_root,
@@ -413,6 +414,7 @@ fn short_id_hash(request_id: &str) -> String {
 /// diff scope is validated, AND the new commit is force-pushed to the
 /// PR's existing branch (no PR close/re-open).
 pub async fn process_changelog_revision_requests(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
@@ -443,6 +445,7 @@ pub async fn process_changelog_revision_requests(
     }
     for pr in &changelog_prs {
         if let Err(e) = process_one_changelog_pr_revision(
+            paths,
             workspace,
             repo,
             github_cfg,
@@ -468,6 +471,7 @@ pub async fn process_changelog_revision_requests(
 
 #[allow(clippy::too_many_arguments)]
 async fn process_one_changelog_pr_revision(
+    paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
@@ -481,7 +485,7 @@ async fn process_one_changelog_pr_revision(
 ) -> Result<()> {
     // Per-PR state lives under the existing `revisions/` directory so
     // both flows share the same prune-on-close machinery.
-    let mut state = match crate::revisions::read_state(workspace, pr.number)? {
+    let mut state = match crate::revisions::read_state(paths, workspace, pr.number)? {
         Some(s) => s,
         None => crate::revisions::RevisionState {
             pr_number: pr.number,
@@ -579,13 +583,13 @@ async fn process_one_changelog_pr_revision(
             .await;
         }
         advance_seen(&mut latest_seen, comment.created_at);
-        crate::revisions::write_state(workspace, &state)?;
+        crate::revisions::write_state(paths, workspace, &state)?;
     }
     if let Some(t) = latest_seen
         && t > state.last_seen_comment_at
     {
         state.last_seen_comment_at = t;
-        crate::revisions::write_state(workspace, &state)?;
+        crate::revisions::write_state(paths, workspace, &state)?;
     }
     Ok(())
 }

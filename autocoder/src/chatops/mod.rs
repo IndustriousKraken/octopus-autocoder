@@ -186,6 +186,7 @@ pub trait ChatOpsBackend: Send + Sync {
     ///   - exits when `cancel` fires (or earlier on unrecoverable error)
     async fn start_inbound_listener(
         &self,
+        _paths: Arc<crate::paths::DaemonPaths>,
         _dispatcher: Arc<OperatorCommandDispatcher>,
         _repos: Arc<dyn RepoIdentityProvider>,
         _allowed_channels: Arc<HashSet<String>>,
@@ -208,6 +209,7 @@ pub trait ChatOpsBackend: Send + Sync {
 /// view.
 pub struct TaskMapRepoIdentities {
     inner: Arc<dyn Fn() -> Vec<RepositoryConfig> + Send + Sync>,
+    paths: Arc<crate::paths::DaemonPaths>,
 }
 
 impl TaskMapRepoIdentities {
@@ -215,12 +217,13 @@ impl TaskMapRepoIdentities {
     /// `RepositoryConfig` values. The closure is invoked once per
     /// `snapshot()` call (i.e. once per inbound command), so it should
     /// be cheap — typically an `ArcSwap` load.
-    pub fn new<F>(snapshotter: F) -> Self
+    pub fn new<F>(paths: Arc<crate::paths::DaemonPaths>, snapshotter: F) -> Self
     where
         F: Fn() -> Vec<RepositoryConfig> + Send + Sync + 'static,
     {
         Self {
             inner: Arc::new(snapshotter),
+            paths,
         }
     }
 }
@@ -231,7 +234,7 @@ impl RepoIdentityProvider for TaskMapRepoIdentities {
             .iter()
             .map(|r| RepoIdentity {
                 url: r.url.clone(),
-                workspace_path: crate::workspace::resolve_path(r),
+                workspace_path: crate::workspace::resolve_path(&self.paths, r),
             })
             .collect()
     }
@@ -685,12 +688,15 @@ mod tests {
     #[tokio::test]
     async fn default_inbound_listener_errors_with_provider_name() {
         let backend = StubBackend("stubbo");
-        let dispatcher = StdArc::new(OperatorCommandDispatcher::new());
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let dispatcher = StdArc::new(OperatorCommandDispatcher::new(&paths));
+        let paths_arc = std::sync::Arc::new(paths);
         let repos: StdArc<dyn RepoIdentityProvider> =
-            StdArc::new(TaskMapRepoIdentities::new(Vec::new));
+            StdArc::new(TaskMapRepoIdentities::new(paths_arc.clone(), Vec::new));
         let channels = StdArc::new(HashSet::<String>::new());
         let err = backend
             .start_inbound_listener(
+                paths_arc.clone(),
                 dispatcher,
                 repos,
                 channels,
@@ -747,12 +753,15 @@ mod tests {
 
     #[test]
     fn repo_identity_provider_only_exposes_url_and_workspace_path() {
-        let provider = TaskMapRepoIdentities::new(|| {
-            vec![
-                fixture_repo_config("git@github.com:acme/a.git"),
-                fixture_repo_config("git@github.com:acme/b.git"),
-            ]
-        });
+        let provider = TaskMapRepoIdentities::new(
+            std::sync::Arc::new(crate::testing::test_daemon_paths().1),
+            || {
+                vec![
+                    fixture_repo_config("git@github.com:acme/a.git"),
+                    fixture_repo_config("git@github.com:acme/b.git"),
+                ]
+            },
+        );
         let snapshot: Vec<RepoIdentity> = provider.snapshot();
         assert_eq!(snapshot.len(), 2);
 
@@ -780,9 +789,10 @@ mod tests {
                 "git@github.com:acme/a.git",
             )]));
         let state_for_closure = state.clone();
-        let provider = TaskMapRepoIdentities::new(move || {
-            state_for_closure.lock().unwrap().clone()
-        });
+        let provider = TaskMapRepoIdentities::new(
+            std::sync::Arc::new(crate::testing::test_daemon_paths().1),
+            move || state_for_closure.lock().unwrap().clone(),
+        );
         assert_eq!(provider.snapshot().len(), 1);
 
         state.lock().unwrap().push(fixture_repo_config("git@github.com:acme/b.git"));

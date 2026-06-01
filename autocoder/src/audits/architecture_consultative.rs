@@ -494,7 +494,9 @@ mod tests {
     }
 
     fn make_log_writer(workspace: &std::path::Path) -> AuditLogWriter {
-        AuditLogWriter::open(workspace, ArchitectureConsultativeAudit::TYPE)
+        let (td, paths) = crate::testing::test_daemon_paths();
+        std::mem::forget(td);
+        AuditLogWriter::open(&paths, workspace, ArchitectureConsultativeAudit::TYPE)
             .expect("log writer opens")
     }
 

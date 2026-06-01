@@ -1,6 +1,6 @@
 //! Per-workspace persistence for predictable-failure alert throttling.
 //!
-//! Production layout: `<state_dir>/alert-state/<workspace-basename>.json`
+//! Layout: `<state_dir>/alert-state/<workspace-basename>.json`
 //! (resolved via `DaemonPaths::alert_state_path()`). The file lives
 //! OUTSIDE the managed repository's workspace — daemon bookkeeping
 //! never appears in `git status` or any `git checkout` clobber-protection
@@ -8,11 +8,11 @@
 //! moves any legacy `<workspace>/.alert-state.json` files to the new
 //! location.
 //!
-//! Test layout (when the daemon-paths global has not been installed):
-//! the module falls back to the legacy `<workspace>/.alert-state.json`
-//! layout. Tests that build workspaces in `TempDir`s thus stay
-//! self-contained without each one needing to install paths.
+//! The `DaemonPaths` reference is threaded explicitly into every public
+//! function (function-parameter pattern per the canonical
+//! `Production paths SHALL be threaded` requirement).
 
+use crate::paths::DaemonPaths;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -166,35 +166,21 @@ pub enum CodeReviewNotificationKind {
     Failed,
 }
 
-/// `true` when the production state-dir layout is active (i.e. the
-/// daemon has installed its `DaemonPaths` global). When `false`, the
-/// module falls back to a single-file-per-workspace layout — keeps
-/// tests that build workspaces in `TempDir`s working without each one
-/// needing to install paths.
-fn state_dir_layout_active() -> bool {
-    crate::paths::get_global().is_some()
-}
-
-/// Resolve the on-disk path of `<workspace>`'s alert-state file. Uses
-/// the state-dir layout in production and the legacy in-workspace path
-/// in tests that have not installed daemon-paths.
-fn alert_state_path(workspace: &Path) -> PathBuf {
-    if state_dir_layout_active() {
-        let basename = workspace
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        crate::paths::current().alert_state_path(&basename)
-    } else {
-        workspace.join(LEGACY_ALERT_STATE_FILE)
-    }
+/// Resolve the on-disk path of `<workspace>`'s alert-state file under
+/// the threaded `DaemonPaths` instance.
+fn alert_state_path(paths: &DaemonPaths, workspace: &Path) -> PathBuf {
+    let basename = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    paths.alert_state_path(&basename)
 }
 
 impl AlertState {
     /// Load the per-workspace alert state. A missing file is not an error —
     /// it parses to an empty state (no prior alerts).
-    pub fn load_or_default(workspace: &Path) -> Self {
-        let path = alert_state_path(workspace);
+    pub fn load_or_default(paths: &DaemonPaths, workspace: &Path) -> Self {
+        let path = alert_state_path(paths, workspace);
         match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
                 tracing::warn!(
@@ -217,8 +203,8 @@ impl AlertState {
     /// Atomically persist this state at the resolved alert-state path
     /// via tempfile-then-rename in the same directory so a torn write
     /// can never be observed by a concurrent reader.
-    pub fn save(&self, workspace: &Path) -> Result<()> {
-        let path = alert_state_path(workspace);
+    pub fn save(&self, paths: &DaemonPaths, workspace: &Path) -> Result<()> {
+        let path = alert_state_path(paths, workspace);
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
@@ -311,8 +297,8 @@ impl AlertState {
 
     /// Idempotent removal of the alert-state file. A missing file is a
     /// success, not an error.
-    pub fn clear(workspace: &Path) -> Result<()> {
-        let path = alert_state_path(workspace);
+    pub fn clear(paths: &DaemonPaths, workspace: &Path) -> Result<()> {
+        let path = alert_state_path(paths, workspace);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -324,18 +310,24 @@ impl AlertState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::testing::test_daemon_paths;
+
+    fn workspace_under(paths: &DaemonPaths) -> PathBuf {
+        paths.cache.join("workspaces").join("ws")
+    }
 
     #[test]
     fn load_missing_returns_empty() {
-        let dir = TempDir::new().unwrap();
-        let state = AlertState::load_or_default(dir.path());
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(state.alerts.is_empty());
     }
 
     #[test]
     fn save_and_reload_roundtrip() {
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         let mut state = AlertState::default();
         let now = Utc::now();
         state.alerts.insert(
@@ -345,9 +337,9 @@ mod tests {
                 last_error_excerpt: "refusing to update protected branch".into(),
             },
         );
-        state.save(dir.path()).unwrap();
+        state.save(&paths, &ws).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(&paths, &ws);
         let entry = reloaded
             .alerts
             .get(&AlertCategory::BranchPushFailure)
@@ -361,7 +353,8 @@ mod tests {
 
     #[test]
     fn clear_is_idempotent() {
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         let mut state = AlertState::default();
         state.alerts.insert(
             AlertCategory::PrCreationFailure,
@@ -370,24 +363,26 @@ mod tests {
                 last_error_excerpt: "403 Forbidden".into(),
             },
         );
-        state.save(dir.path()).unwrap();
-        assert!(alert_state_path(dir.path()).exists());
-        AlertState::clear(dir.path()).expect("first clear ok");
-        assert!(!alert_state_path(dir.path()).exists());
+        state.save(&paths, &ws).unwrap();
+        assert!(alert_state_path(&paths, &ws).exists());
+        AlertState::clear(&paths, &ws).expect("first clear ok");
+        assert!(!alert_state_path(&paths, &ws).exists());
         // Second clear must also succeed.
-        AlertState::clear(dir.path()).expect("second clear ok");
+        AlertState::clear(&paths, &ws).expect("second clear ok");
     }
 
     #[test]
     fn clear_does_not_error_on_missing() {
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         // File never created.
-        AlertState::clear(dir.path()).expect("clear without prior save must succeed");
+        AlertState::clear(&paths, &ws).expect("clear without prior save must succeed");
     }
 
     #[test]
     fn archive_collision_variant_roundtrips_through_save_and_load() {
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         let mut state = AlertState::default();
         let now = Utc::now();
         state.alerts.insert(
@@ -397,9 +392,9 @@ mod tests {
                 last_error_excerpt: "archive destination already exists".into(),
             },
         );
-        state.save(dir.path()).unwrap();
+        state.save(&paths, &ws).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(&paths, &ws);
         let entry = reloaded
             .alerts
             .get(&AlertCategory::ArchiveCollision)
@@ -409,7 +404,7 @@ mod tests {
         assert!(diff < 5, "timestamps must roundtrip within 5ms; diff = {diff}");
 
         // Pin the on-disk JSON key.
-        let raw = std::fs::read_to_string(alert_state_path(dir.path())).unwrap();
+        let raw = std::fs::read_to_string(alert_state_path(&paths, &ws)).unwrap();
         assert!(
             raw.contains("archive_collision"),
             "archive collision must serialize as snake_case `archive_collision`; got: {raw}"
@@ -419,7 +414,8 @@ mod tests {
 
     #[test]
     fn revise_notifications_round_trip_through_save_and_load() {
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         let mut state = AlertState::default();
         let now = Utc::now();
         state.record_revise_notification(
@@ -437,9 +433,9 @@ mod tests {
             ReviseNotificationKind::Failed,
             now,
         );
-        state.save(dir.path()).unwrap();
+        state.save(&paths, &ws).unwrap();
 
-        let reloaded = AlertState::load_or_default(dir.path());
+        let reloaded = AlertState::load_or_default(&paths, &ws);
         let e42 = reloaded
             .revise_notifications
             .get("comment-42")
@@ -483,18 +479,19 @@ mod tests {
         // Simulate an alert-state file written by an older daemon that
         // doesn't know about `revise_notifications`. Loading must succeed
         // with the field defaulting to an empty map.
-        let dir = TempDir::new().unwrap();
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
         let legacy_json = serde_json::json!({
             "alerts": {},
             "perma_stuck_alerts": {},
             "spec_revision_alerts": {}
         });
-        let path = alert_state_path(dir.path());
+        let path = alert_state_path(&paths, &ws);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap())
             .unwrap();
 
-        let state = AlertState::load_or_default(dir.path());
+        let state = AlertState::load_or_default(&paths, &ws);
         assert!(
             state.revise_notifications.is_empty(),
             "missing revise_notifications field must default to an empty map"
@@ -503,6 +500,72 @@ mod tests {
             "any-id",
             ReviseNotificationKind::PickedUp,
         ));
+    }
+
+    /// Canonical "Concurrent tests do not collide on disk" scenario:
+    /// two threads each construct DIFFERENT `DaemonPaths` via
+    /// `test_daemon_paths()` AND invoke `AlertState::load_or_default`
+    /// + `save`. Each thread's writes land under its own tempdir;
+    /// neither thread observes the other's state.
+    #[test]
+    fn concurrent_threads_with_different_paths_do_not_collide() {
+        use std::thread;
+
+        let h1 = thread::spawn(|| {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-1".into(),
+                },
+            );
+            state.save(&paths, &ws).unwrap();
+            let reloaded = AlertState::load_or_default(&paths, &ws);
+            (
+                temp.path().to_path_buf(),
+                alert_state_path(&paths, &ws),
+                reloaded
+                    .alerts
+                    .get(&AlertCategory::BranchPushFailure)
+                    .map(|e| e.last_error_excerpt.clone()),
+            )
+        });
+
+        let h2 = thread::spawn(|| {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-2".into(),
+                },
+            );
+            state.save(&paths, &ws).unwrap();
+            let reloaded = AlertState::load_or_default(&paths, &ws);
+            (
+                temp.path().to_path_buf(),
+                alert_state_path(&paths, &ws),
+                reloaded
+                    .alerts
+                    .get(&AlertCategory::BranchPushFailure)
+                    .map(|e| e.last_error_excerpt.clone()),
+            )
+        });
+
+        let (root1, file1, excerpt1) = h1.join().unwrap();
+        let (root2, file2, excerpt2) = h2.join().unwrap();
+
+        assert_ne!(root1, root2, "two threads must use distinct tempdir roots");
+        assert_ne!(file1, file2, "alert-state files must live under disjoint tempdirs");
+        assert_eq!(excerpt1.as_deref(), Some("thread-1"));
+        assert_eq!(excerpt2.as_deref(), Some("thread-2"));
+        assert!(file1.starts_with(&root1), "file1 must live under root1");
+        assert!(file2.starts_with(&root2), "file2 must live under root2");
     }
 
     #[test]
@@ -536,6 +599,97 @@ mod tests {
             s.contains("workspace_init_failure"),
             "json must use snake_case category key; got: {s}"
         );
+    }
+
+    /// Task 4.4: spawn two `std::thread::spawn` threads that each
+    /// construct DIFFERENT `DaemonPaths` via `test_daemon_paths()` AND
+    /// invoke `AlertState::load_or_default` + `save` against their own
+    /// tempdir. Assert: the two threads' writes land in DIFFERENT
+    /// tempdirs (no cross-contamination). Pins the canonical
+    /// "Concurrent tests do not collide on disk" scenario.
+    #[test]
+    fn concurrent_threads_do_not_collide_on_disk() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+
+        let t1 = std::thread::spawn(move || {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws-thread-1");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-1 marker".into(),
+                },
+            );
+            // Sync write to maximize the chance of a collision if paths
+            // were shared.
+            b1.wait();
+            state.save(&paths, &ws).expect("thread-1 save");
+            let written = alert_state_path(&paths, &ws);
+            let body = std::fs::read_to_string(&written).expect("thread-1 read");
+            assert!(body.contains("thread-1 marker"));
+            // Keep tempdir alive until we've returned its root for the
+            // collision assertion below.
+            (temp, written, body)
+        });
+
+        let t2 = std::thread::spawn(move || {
+            let (temp, paths) = test_daemon_paths();
+            let ws = paths.cache.join("workspaces").join("ws-thread-2");
+            let mut state = AlertState::default();
+            state.alerts.insert(
+                AlertCategory::BranchPushFailure,
+                AlertEntry {
+                    last_alerted_at: Utc::now(),
+                    last_error_excerpt: "thread-2 marker".into(),
+                },
+            );
+            b2.wait();
+            state.save(&paths, &ws).expect("thread-2 save");
+            let written = alert_state_path(&paths, &ws);
+            let body = std::fs::read_to_string(&written).expect("thread-2 read");
+            assert!(body.contains("thread-2 marker"));
+            (temp, written, body)
+        });
+
+        let (temp_1, path_1, body_1) = t1.join().expect("thread-1 panicked");
+        let (temp_2, path_2, body_2) = t2.join().expect("thread-2 panicked");
+
+        // The two threads' state-file paths MUST live under DIFFERENT
+        // tempdir roots. No prefix overlap.
+        assert_ne!(
+            temp_1.path(),
+            temp_2.path(),
+            "the two test_daemon_paths() calls must return distinct tempdir roots"
+        );
+        assert!(
+            path_1.starts_with(temp_1.path()),
+            "thread-1's write must live under its own tempdir root"
+        );
+        assert!(
+            path_2.starts_with(temp_2.path()),
+            "thread-2's write must live under its own tempdir root"
+        );
+        assert!(
+            !path_1.starts_with(temp_2.path()),
+            "thread-1's write must NOT live under thread-2's tempdir"
+        );
+        assert!(
+            !path_2.starts_with(temp_1.path()),
+            "thread-2's write must NOT live under thread-1's tempdir"
+        );
+        // Each thread sees its OWN marker text — neither read the
+        // other's write.
+        assert!(body_1.contains("thread-1 marker"));
+        assert!(!body_1.contains("thread-2 marker"));
+        assert!(body_2.contains("thread-2 marker"));
+        assert!(!body_2.contains("thread-1 marker"));
     }
 
 }

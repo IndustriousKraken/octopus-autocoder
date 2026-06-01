@@ -714,7 +714,8 @@ mod tests {
         let workspace = tmp.path().join("never-existed");
         assert!(!workspace.exists());
 
-        let log_writer = AuditLogWriter::open(tmp.path(), ArchitectureBrightlineAudit::TYPE)
+        let paths = crate::paths::DaemonPaths::under_root(tmp.path());
+        let log_writer = AuditLogWriter::open(&paths, tmp.path(), ArchitectureBrightlineAudit::TYPE)
             .expect("log writer opens");
         let log_path = log_writer.path().to_path_buf();
         let repo = RepositoryConfig {
@@ -773,7 +774,8 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
 
-        let log_writer = AuditLogWriter::open(tmp.path(), ArchitectureBrightlineAudit::TYPE)
+        let paths = crate::paths::DaemonPaths::under_root(tmp.path());
+        let log_writer = AuditLogWriter::open(&paths, tmp.path(), ArchitectureBrightlineAudit::TYPE)
             .expect("log writer opens");
         let log_path = log_writer.path().to_path_buf();
         let repo = RepositoryConfig {
@@ -1071,8 +1073,9 @@ mod tests {
             upstream: None,
             auto_submit_pr: true,
         };
+        let paths = crate::paths::DaemonPaths::under_root(ws);
         let log_writer =
-            AuditLogWriter::open(ws, ArchitectureBrightlineAudit::TYPE)
+            AuditLogWriter::open(&paths, ws, ArchitectureBrightlineAudit::TYPE)
                 .expect("log writer opens");
         let log_path = log_writer.path().to_path_buf();
         let mut ctx = AuditContext {

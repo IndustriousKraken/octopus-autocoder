@@ -55,6 +55,7 @@ use crate::{git, workspace};
 /// skipping any audit type already run via the queue this iteration so
 /// the same audit cannot run twice in one pass.
 pub async fn run_due_audits(
+    paths: &crate::paths::DaemonPaths,
     registry: &AuditRegistry,
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -101,6 +102,7 @@ pub async fn run_due_audits(
                 continue;
             }
             match run_one_audit_unconditional(
+                paths,
                 audit.as_ref(),
                 workspace,
                 repo,
@@ -156,6 +158,7 @@ pub async fn run_due_audits(
             continue;
         }
         match run_one_audit(
+            paths,
             audit.as_ref(),
             workspace,
             repo,
@@ -195,6 +198,7 @@ pub async fn run_due_audits(
 /// unchanged, etc.), and propagates errors from the audit's `run()` for
 /// the caller to log-and-continue.
 async fn run_one_audit(
+    paths: &crate::paths::DaemonPaths,
     audit: &dyn Audit,
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -204,6 +208,7 @@ async fn run_one_audit(
     state: &mut AuditState,
 ) -> Result<bool> {
     drive_one_audit(
+        paths,
         audit,
         workspace,
         repo,
@@ -225,6 +230,7 @@ async fn run_one_audit(
 /// successful invocation; `Ok(false)` is unreachable on this path
 /// because the cadence/HEAD gates are bypassed.
 async fn run_one_audit_unconditional(
+    paths: &crate::paths::DaemonPaths,
     audit: &dyn Audit,
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -234,6 +240,7 @@ async fn run_one_audit_unconditional(
     state: &mut AuditState,
 ) -> Result<bool> {
     drive_one_audit(
+        paths,
         audit,
         workspace,
         repo,
@@ -258,6 +265,7 @@ async fn run_one_audit_unconditional(
 /// the top of the function (used by the on-demand audit-trigger path).
 #[allow(clippy::too_many_arguments)]
 async fn drive_one_audit(
+    paths: &crate::paths::DaemonPaths,
     audit: &dyn Audit,
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -309,7 +317,7 @@ async fn drive_one_audit(
         }
     }
 
-    let log_writer = AuditLogWriter::open(workspace, audit_type)?;
+    let log_writer = AuditLogWriter::open(paths, workspace, audit_type)?;
     // Record run-prelude metadata so operators reading the log later see
     // exactly when the run started and what cadence/SHA context it had.
     log_writer.write_section(
@@ -468,6 +476,7 @@ async fn drive_one_audit(
             violation.reason
         );
         handle_predictable_failure(
+            paths,
             workspace,
             &repo.url,
             chatops_ctx,
@@ -538,6 +547,7 @@ async fn drive_one_audit(
                 .map(|s| s.notify_on_clean)
                 .unwrap_or(false);
             dispatch_reported_to_chatops(
+                paths,
                 chatops_ctx,
                 &repo.url,
                 audit_type,
@@ -706,6 +716,7 @@ fn extract_porcelain_path(line: &str) -> &str {
 }
 
 async fn dispatch_reported_to_chatops(
+    paths: &crate::paths::DaemonPaths,
     chatops_ctx: Option<&ChatOpsContext>,
     repo_url: &str,
     audit_type: &str,
@@ -739,6 +750,7 @@ async fn dispatch_reported_to_chatops(
                 // state so the chatops dispatcher can resolve `@<bot> send
                 // it` against this thread in the operator's reply path.
                 stamp_audit_thread_state(
+                    paths,
                     repo_url,
                     audit_type,
                     &ctx.channel,
@@ -788,6 +800,7 @@ async fn dispatch_reported_to_chatops(
 /// kicks in) but the audit notification has already landed and the
 /// scheduler's job is done.
 fn stamp_audit_thread_state(
+    paths: &crate::paths::DaemonPaths,
     repo_url: &str,
     audit_type: &str,
     channel: &str,
@@ -804,7 +817,7 @@ fn stamp_audit_thread_state(
         status: AuditThreadStatus::Open,
         reason: None,
     };
-    let root = default_state_root();
+    let root = default_state_root(paths);
     if let Err(e) = write_state(&root, &state) {
         tracing::warn!(
             audit_type,
@@ -846,9 +859,21 @@ mod tests {
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
+
+    /// One process-wide tempdir-scoped DaemonPaths for tests in this
+    /// module. Tests in this file don't share state-dir contents — they
+    /// each scope their state files by basename — so a shared paths
+    /// object is fine. The tempdir is leaked at process exit.
+    fn test_paths() -> &'static crate::paths::DaemonPaths {
+        static PATHS: OnceLock<crate::paths::DaemonPaths> = OnceLock::new();
+        PATHS.get_or_init(|| {
+            let (td, paths) = crate::testing::test_daemon_paths();
+            std::mem::forget(td);
+            paths
+        })
+    }
 
     // ---------------- Fixture audits ----------------
 
@@ -1015,7 +1040,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "audit should have run");
@@ -1040,7 +1065,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a2");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "audit must NOT run within cadence");
@@ -1065,7 +1090,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a3");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "HEAD unchanged → skip");
@@ -1089,7 +1114,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a4");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "SHA differs → audit must run");
@@ -1103,7 +1128,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         // No AuditsConfig at all → cadence resolves to Disabled.
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1115,7 +1140,7 @@ mod tests {
             settings: HashMap::new(),
             ..AuditsConfig::default()
         };
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1132,7 +1157,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a6");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         // After the violation handler, the workspace should be clean
@@ -1161,7 +1186,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         // After the OpenSpecOnly violation, src/forbidden.rs must be gone
@@ -1190,7 +1215,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7b");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         // The path is inside the allowed prefix → no revert.
@@ -1226,7 +1251,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .expect("scheduler must not propagate audit errors");
         // af2 (later in registry) MUST have run despite af1 erroring.
@@ -1302,6 +1327,7 @@ mod tests {
         let ctx = make_ctx(chatops);
 
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -1336,6 +1362,7 @@ mod tests {
         let ctx = make_ctx(chatops.clone());
 
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -1374,6 +1401,7 @@ mod tests {
             .create_async()
             .await;
         run_due_audits(
+            test_paths(),
             &registry2,
             &ws,
             &repo,
@@ -1409,6 +1437,7 @@ mod tests {
             .await;
         let ctx = make_ctx(chatops);
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -1446,10 +1475,10 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("logged1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
-        let log_dir = crate::paths::current().audit_logs_dir(&basename);
+        let log_dir = test_paths().audit_logs_dir(&basename);
         assert!(log_dir.exists(), "audit log dir must be created at {}", log_dir.display());
         let entries: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
@@ -1464,7 +1493,7 @@ mod tests {
             log_dir.display()
         );
         // Clean up the global tmp dir we created.
-        let _ = std::fs::remove_dir_all(crate::paths::current().run_logs_dir(&basename));
+        let _ = std::fs::remove_dir_all(test_paths().run_logs_dir(&basename));
     }
 
     /// When the audit returns `WorkspaceUnavailable`, the scheduler must
@@ -1498,7 +1527,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("wsu1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
 
@@ -1550,7 +1579,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .expect("scheduler must keep going");
         assert_eq!(
@@ -1606,7 +1635,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         no_post.assert_async().await;
@@ -1627,7 +1656,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("ve1");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         // State + history updated.
@@ -1665,7 +1694,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("rep_retry");
         let repo = fixture_repo();
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
         let state = AuditState::load_or_default(&ws);
@@ -1711,7 +1740,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1782,7 +1811,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -1825,7 +1854,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1851,7 +1880,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         silent_mock.assert_async().await;
@@ -1893,7 +1922,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1946,7 +1975,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -2015,6 +2044,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("q1".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2061,6 +2091,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("q2".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2088,7 +2119,7 @@ mod tests {
         let repo = fixture_repo();
         let mut queued = HashSet::new();
         queued.insert("q3".to_string());
-        run_due_audits(&registry, &ws, &repo, None, &HashMap::new(), None, &queued)
+        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &queued)
             .await
             .unwrap();
         assert_eq!(
@@ -2112,6 +2143,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("q4".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2142,6 +2174,7 @@ mod tests {
         // scheduler logs a warning and the cadence-sweep continues.
         queued.insert("nonexistent_audit".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2194,6 +2227,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("q6-queued".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2226,6 +2260,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("q7".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2240,6 +2275,7 @@ mod tests {
 
         // Iteration 2: empty queue. Cadence says NOT due (just ran).
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2289,6 +2325,7 @@ mod tests {
         let cfg = audits_cfg_bounded(&["b1-a", "b1-b", "b1-c"], 1);
         let repo = fixture_repo();
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2325,6 +2362,7 @@ mod tests {
         let cfg = audits_cfg_bounded(&["b2-a", "b2-b", "b2-c"], 2);
         let repo = fixture_repo();
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2354,6 +2392,7 @@ mod tests {
         let cfg = audits_cfg_bounded(&["b5-a", "b5-b", "b5-c"], 5);
         let repo = fixture_repo();
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2380,6 +2419,7 @@ mod tests {
         let cfg = audits_cfg_bounded(&["b0-a", "b0-b"], 0);
         let repo = fixture_repo();
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2405,6 +2445,7 @@ mod tests {
         let mut queued = HashSet::new();
         queued.insert("bz-a".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2444,6 +2485,7 @@ mod tests {
         queued.insert("bq-q1".to_string());
         queued.insert("bq-q2".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2487,6 +2529,7 @@ mod tests {
         queued.insert("bq1-b".to_string());
         queued.insert("bq1-c".to_string());
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,
@@ -2527,6 +2570,7 @@ mod tests {
         state.save(&ws).unwrap();
         let repo = fixture_repo();
         run_due_audits(
+            test_paths(),
             &registry,
             &ws,
             &repo,

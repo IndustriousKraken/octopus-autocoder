@@ -87,8 +87,8 @@ pub fn state_dir(state_dir_root: &Path) -> PathBuf {
 /// Default state directory: the daemon's resolved `state_dir`. Mirrors
 /// `proposal_requests`' default-root convention so both flows persist
 /// into the same `state_dir` tree.
-pub fn default_state_root() -> PathBuf {
-    crate::paths::current().state
+pub fn default_state_root(paths: &crate::paths::DaemonPaths) -> PathBuf {
+    paths.state.clone()
 }
 
 /// Atomically write `state` to its canonical file. Parent directories

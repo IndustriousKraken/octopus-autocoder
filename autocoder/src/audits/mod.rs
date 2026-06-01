@@ -299,12 +299,16 @@ impl AuditLogWriter {
     /// The directory is created if absent. The per-repo subdir matches
     /// the per-change run-log layout (see
     /// [`crate::executor::claude_cli::run_log_path`]).
-    pub fn open(workspace: &Path, audit_type: &str) -> Result<Self> {
+    pub fn open(
+        paths: &crate::paths::DaemonPaths,
+        workspace: &Path,
+        audit_type: &str,
+    ) -> Result<Self> {
         let basename = workspace
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("workspace");
-        let dir = crate::paths::current().audit_logs_dir(basename);
+        let dir = paths.audit_logs_dir(basename);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating audit log dir {}", dir.display()))?;
         // Format: type-<RFC3339-with-Z>.log. Replace ':' with '-' so the
@@ -1454,7 +1458,8 @@ mod tests {
         let basename = format!("test-ws-{}", uuid::Uuid::new_v4());
         let workspace = dir.path().join(&basename);
         std::fs::create_dir_all(&workspace).unwrap();
-        let writer = AuditLogWriter::open(&workspace, "architecture_brightline")
+        let paths = crate::paths::DaemonPaths::under_root(dir.path());
+        let writer = AuditLogWriter::open(&paths, &workspace, "architecture_brightline")
             .expect("log open succeeds");
         writer.write_section("prompt", "(none)").unwrap();
         writer.write_section("output", "no findings").unwrap();
