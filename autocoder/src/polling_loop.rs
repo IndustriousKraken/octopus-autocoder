@@ -6606,7 +6606,18 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
             // remove it from disk rather than `git restore` (which would
             // fail with "pathspec did not match").
             let abs = workspace.join(&path);
-            let removal = if abs.is_dir() {
+            // Decide dir-vs-file from the path's OWN metadata (lstat), not
+            // `is_dir()` which follows symlinks. git reports an untracked
+            // symlink as a single entry; following it into `remove_dir_all`
+            // could delete the link TARGET's contents. `symlink_metadata`
+            // reports a symlink as a non-dir, so it is unlinked via
+            // `remove_file` (dropping just the link). A real untracked
+            // directory still routes to `remove_dir_all`.
+            let is_real_dir = abs
+                .symlink_metadata()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            let removal = if is_real_dir {
                 std::fs::remove_dir_all(&abs)
             } else {
                 std::fs::remove_file(&abs)
@@ -6639,22 +6650,33 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
             // staged modification in the index where the caller's `git add
             // -A` + commit would sweep it into the spec PR. Resetting both
             // refs to HEAD unstages and reverts the path regardless.
-            let status = std::process::Command::new("git")
+            let restore = std::process::Command::new("git")
                 .args(["restore", "--source=HEAD", "--staged", "--worktree", "--", &path])
                 .current_dir(workspace)
-                .status()
+                .output()
                 .with_context(|| {
                     format!("discard_non_spec_writes: spawning git restore for `{path}`")
                 })?;
-            if !status.success() {
+            if !restore.status.success() {
+                // Capture git's own diagnostic via `output()` rather than
+                // letting `status()` spill it to the daemon's inherited
+                // stderr, AND surface it in the error so a failed revert is
+                // debuggable (mirrors the `git::run_git` contract).
+                let stderr = String::from_utf8_lossy(&restore.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&restore.stdout).trim().to_string();
+                let diag = match (stderr.is_empty(), stdout.is_empty()) {
+                    (false, _) => stderr,
+                    (true, false) => stdout,
+                    (true, true) => format!("(no output; exit {:?})", restore.status.code()),
+                };
                 tracing::warn!(
                     spec_slug = %spec_slug,
                     path = %path,
-                    "discard_non_spec_writes: git restore exited non-zero reverting tracked non-spec write"
+                    "discard_non_spec_writes: git restore exited non-zero reverting tracked non-spec write: {diag}"
                 );
                 return Err(anyhow!(
                     "discard_non_spec_writes: `git restore --source=HEAD --staged --worktree -- {path}` \
-                     exited non-zero; refusing to proceed so the non-spec write does not leak into the spec-only PR"
+                     exited non-zero ({diag}); refusing to proceed so the non-spec write does not leak into the spec-only PR"
                 ));
             }
         }
@@ -6666,42 +6688,70 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
 }
 
 /// Robustly enumerate the working tree's changed paths via `git status
-/// --porcelain=v1 --untracked-files=all`, returning `(is_untracked,
-/// path)` per entry. Unlike `git::status_porcelain*` (which whole-string
-/// `.trim()`s the output and so strips the leading status space of a
-/// leading ` M <path>` line, corrupting the first path), this parses each
-/// line at the fixed 3-byte `XY ` prefix without trimming line starts.
+/// --porcelain=v1 -z --untracked-files=all`, returning `(is_untracked,
+/// path)` per entry.
+///
+/// `-z` is load-bearing. The default porcelain format wraps any path
+/// containing "unusual" bytes — non-ASCII, a space, control chars — in
+/// double quotes AND C-escapes it (`core.quotePath`, on by default), so a
+/// file like `föö.rs` renders as `"f\303\266\303\266.rs"`. Parsing that
+/// quoted literal would (a) miss the `openspec/changes/` keep-prefix on a
+/// quoted spec path — silently DISCARDING real spec content — AND (b)
+/// hand a path matching nothing on disk to `git restore` / `remove_file`,
+/// leaving the actual file in place to be swept into the supposedly
+/// spec-only commit. `-z` emits NUL-terminated records with NO quoting or
+/// escaping, sidestepping both failures. (It also avoids the
+/// `git::status_porcelain*` whole-string `.trim()` that would corrupt a
+/// leading ` M <path>`.)
+///
+/// Each record is `XY <path>`: two status chars, a separator space, then
+/// the raw path bytes. A rename/copy record carries a SECOND
+/// NUL-terminated field — under `-z` the destination is emitted first AND
+/// the source second — so the source field is consumed (and yielded) to
+/// keep the record stream aligned; both sides of a staged rename are
+/// changes relative to HEAD that must be reverted.
 fn triage_status_entries(workspace: &Path) -> Result<Vec<(bool, String)>> {
     let output = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(workspace)
         .output()
-        .with_context(|| "git status --porcelain=v1 failed to spawn".to_string())?;
+        .with_context(|| "git status --porcelain=v1 -z failed to spawn".to_string())?;
     if !output.status.success() {
         return Err(anyhow!(
-            "git status --porcelain=v1 exited non-zero: {}",
+            "git status --porcelain=v1 -z exited non-zero: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut records = output.stdout.split(|&b| b == 0u8);
     let mut entries = Vec::new();
-    for line in stdout.lines() {
-        // Each porcelain v1 line is `XY <path>` — two status chars, one
-        // space, then the path. Renames are `R  <from> -> <to>`.
-        let is_untracked = line.starts_with("??");
-        let raw = match line.get(3..) {
-            Some(r) => r,
-            None => continue,
-        };
-        let path = if let Some(idx) = raw.rfind(" -> ") {
-            raw[idx + 4..].trim()
-        } else {
-            raw.trim()
-        };
-        if path.is_empty() {
+    while let Some(record) = records.next() {
+        // A valid record is `XY <path>` (>= 4 bytes: 2 status + space +
+        // >= 1 path byte). The split's trailing element after the final
+        // NUL is empty; skip it AND any stray short record. Do NOT trim
+        // the path — under `-z` the bytes are exact, so a filename with a
+        // leading/trailing space must survive verbatim.
+        if record.len() < 4 {
             continue;
         }
-        entries.push((is_untracked, path.to_string()));
+        let is_untracked = record.starts_with(b"??");
+        // `R` (rename) or `C` (copy) in either status column means a
+        // second field (the source path) trails this record.
+        let is_rename_or_copy =
+            matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        if !path.is_empty() {
+            entries.push((is_untracked, path));
+        }
+        if is_rename_or_copy
+            && let Some(source) = records.next()
+        {
+            let source = String::from_utf8_lossy(source).into_owned();
+            if !source.is_empty() {
+                // A staged rename's source is a tracked deletion at HEAD;
+                // revert it alongside the destination.
+                entries.push((false, source));
+            }
+        }
     }
     Ok(entries)
 }
@@ -7563,6 +7613,112 @@ mod tests {
             ws.join("locked/leak.rs").exists(),
             "the un-removable file must still be on disk — the error has to \
              prevent the spec commit rather than the file being quietly gone"
+        );
+    }
+
+    /// a43 revision: paths git would quote under the default
+    /// `core.quotePath` (a space AND non-ASCII bytes both trigger it) must
+    /// still be parsed AND acted on correctly. `triage_status_entries`
+    /// uses `-z`, which disables quoting; the pre-fix default-format parse
+    /// would yield the literal `"f\303\266\303\266.rs"`, so `remove_file`
+    /// would NotFound-no-op AND the real file would survive into the
+    /// spec-only commit. A quoted SPEC path must likewise keep its
+    /// `openspec/changes/` prefix so it is NOT misclassified as non-spec.
+    #[test]
+    fn discard_non_spec_writes_handles_quoted_special_char_paths() {
+        let (_d, ws) = dnsw_repo();
+        // Untracked code files whose names force quoting: a space AND
+        // non-ASCII. Both must be dropped.
+        std::fs::write(ws.join("a b.rs"), "junk\n").unwrap();
+        std::fs::write(ws.join("föö.rs"), "junk\n").unwrap();
+        // A spec file with a quote-forcing name must be KEPT.
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(ws.join("openspec/changes/foo/néw.md"), "## Why\nx\n").unwrap();
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        // Sorted: "a b.rs" (0x61) precedes "föö.rs" (0x66).
+        assert_eq!(
+            dropped,
+            vec!["a b.rs".to_string(), "föö.rs".to_string()],
+            "both quote-forcing untracked code paths must be parsed AND dropped"
+        );
+        assert!(!ws.join("a b.rs").exists(), "the spaced path must be removed");
+        assert!(!ws.join("föö.rs").exists(), "the non-ASCII path must be removed");
+        assert!(
+            ws.join("openspec/changes/foo/néw.md").exists(),
+            "a quote-forcing spec path must be kept, not discarded"
+        );
+    }
+
+    /// a43 revision: a STAGED rename of a tracked code file must be fully
+    /// undone. Under `-z` the rename record is `dest\0source\0`, so the
+    /// parser MUST consume both fields (else the source path leaks back as
+    /// a bogus untracked entry AND the rename half-survives). Both sides
+    /// revert to the committed state.
+    #[test]
+    fn discard_non_spec_writes_reverts_staged_rename() {
+        let (_d, ws) = dnsw_repo();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        // Stage a rename the way an LLM bash tool might.
+        run(&["mv", "src/bar.rs", "src/renamed.rs"]);
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(
+            dropped,
+            vec!["src/bar.rs".to_string(), "src/renamed.rs".to_string()],
+            "both the rename destination AND source must be reported AND reverted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(),
+            "orig\n",
+            "the rename source must be restored to its committed content"
+        );
+        assert!(
+            !ws.join("src/renamed.rs").exists(),
+            "the rename destination must be removed"
+        );
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged rename must be fully undone — index AND worktree"
+        );
+    }
+
+    /// a43 revision: an untracked SYMLINK must be unlinked (dropping just
+    /// the link), NOT followed. `is_dir()` follows the link, so a
+    /// symlink-to-directory would route into `remove_dir_all` and could
+    /// wipe the TARGET's contents; `symlink_metadata` routes it to
+    /// `remove_file` instead. The link target must be left intact.
+    #[test]
+    fn discard_non_spec_writes_unlinks_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+        let (_d, ws) = dnsw_repo();
+        // A directory OUTSIDE the repo (its own temp dir, so git status
+        // never sees it) holding a file we must not touch.
+        let target_guard = tempfile::TempDir::new().unwrap();
+        let target = target_guard.path().join("outside-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("precious.txt"), "do not delete\n").unwrap();
+        // An untracked symlink inside the repo pointing at that directory.
+        symlink(&target, ws.join("linkdir")).unwrap();
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        assert_eq!(dropped, vec!["linkdir".to_string()]);
+        assert!(
+            !ws.join("linkdir").exists(),
+            "the untracked symlink must be removed"
+        );
+        assert!(
+            target.join("precious.txt").exists(),
+            "the symlink target's contents must NOT be followed and deleted"
         );
     }
 
