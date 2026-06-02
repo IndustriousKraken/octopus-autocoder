@@ -195,7 +195,11 @@ impl Audit for DocumentationAudit {
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
         if !workspace_is_valid(ctx.workspace) {
-            return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
+            return Ok(workspace_unavailable_outcome(
+                Self::TYPE,
+                ctx.workspace,
+                &ctx.repo.url,
+            ));
         }
 
         let prompt = self.build_prompt(ctx.workspace)?;
@@ -269,6 +273,7 @@ impl Audit for DocumentationAudit {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
+                    url = %ctx.repo.url,
                     excerpt = %excerpt(&outcome.stdout),
                     "documentation_audit: response parse failure: {e:#}"
                 );
@@ -455,12 +460,14 @@ fn parse_severity(raw: &str) -> Severity {
         "medium" => Severity::Medium,
         "low" => Severity::Low,
         "high" => {
+            // no-url: pure severity parser, no AuditContext in scope
             tracing::warn!(
                 "documentation_audit: LLM emitted `high` severity; demoting to `medium` per the audit's no-high rule"
             );
             Severity::Medium
         }
         other => {
+            // no-url: pure severity parser, no AuditContext in scope
             tracing::warn!(
                 severity = other,
                 "documentation_audit: unexpected severity `{other}`; defaulting to Low"

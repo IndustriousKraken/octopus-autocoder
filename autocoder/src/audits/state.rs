@@ -109,6 +109,7 @@ pub fn reload_from_disk(state_dir: &Path) -> Result<HashMap<String, AuditState>>
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(map),
         Err(e) => {
+            // no-url: daemon-start global state reload, no per-repo context
             tracing::warn!(
                 dir = %dir.display(),
                 "audit-state reload: read_dir failed; treating as empty: {e}"
@@ -120,6 +121,7 @@ pub fn reload_from_disk(state_dir: &Path) -> Result<HashMap<String, AuditState>>
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                // no-url: daemon-start global state reload, no per-repo context
                 tracing::warn!(
                     dir = %dir.display(),
                     "audit-state reload: read_dir entry error: {e}"
@@ -136,6 +138,7 @@ pub fn reload_from_disk(state_dir: &Path) -> Result<HashMap<String, AuditState>>
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
+                // no-url: daemon-start global state reload, no per-repo context
                 tracing::warn!(
                     path = %path.display(),
                     audit_type,
@@ -149,6 +152,7 @@ pub fn reload_from_disk(state_dir: &Path) -> Result<HashMap<String, AuditState>>
                 map.insert(audit_type, state);
             }
             Err(e) => {
+                // no-url: daemon-start global state reload, no per-repo context
                 tracing::warn!(
                     path = %path.display(),
                     audit_type,
@@ -169,6 +173,7 @@ impl AuditState {
         let path = audit_state_path(workspace);
         match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                // no-url: state-file loader keyed on workspace path, no repo URL in scope
                 tracing::warn!(
                     "audit-state file at {} is corrupt; starting empty: {e:#}",
                     path.display()
@@ -177,6 +182,7 @@ impl AuditState {
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
+                // no-url: state-file loader keyed on workspace path, no repo URL in scope
                 tracing::warn!(
                     "audit-state file at {} unreadable; starting empty: {e:#}",
                     path.display()
