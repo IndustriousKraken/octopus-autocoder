@@ -1746,8 +1746,22 @@ fn spawn_signal_handler(cancel: CancellationToken) {
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            () = ctrl_c => tracing::info!("received SIGINT; shutting down"),
-            () = terminate => tracing::info!("received SIGTERM; shutting down"),
+            () = ctrl_c => {
+                // a39: flag the daemon-shutdown path BEFORE cancelling
+                // child tasks. The shutdown SIGTERM cascade reaches the
+                // executor subprocess (systemd cgroup kill / the
+                // process-group setup), killing it by signal 15, AND the
+                // classifier's SIGTERM check (`signal() == Some(15)`)
+                // must observe the flag as `true` so the resulting
+                // outcome is `Aborted` (no counter bump) rather than
+                // `Failed`. Order is load-bearing per the spec.
+                crate::daemon::request_shutdown();
+                tracing::info!("received SIGINT; shutting down");
+            }
+            () = terminate => {
+                crate::daemon::request_shutdown();
+                tracing::info!("received SIGTERM; shutting down");
+            }
         }
         cancel.cancel();
     });

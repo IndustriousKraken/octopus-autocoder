@@ -1126,6 +1126,24 @@ async fn process_one_pr(
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
+            Ok(ExecutorOutcome::Aborted { reason }) => {
+                // a39: subprocess killed by the daemon's own SIGTERM
+                // cascade. Do NOT bump revisions_applied, do NOT post
+                // a failure alert, AND do NOT advance latest_seen — so
+                // the next iteration after restart re-enters this same
+                // comment AND retries.
+                tracing::info!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    "revision: executor aborted by daemon shutdown: {reason}"
+                );
+                // Persist progress on prior comments only.
+                if let Some(t) = latest_seen {
+                    state.last_seen_comment_at = t;
+                    write_state(paths, workspace, &state)?;
+                }
+                return Ok(());
+            }
             Err(e) => {
                 tracing::warn!(
                     url = %repo.url,
