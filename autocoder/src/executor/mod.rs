@@ -286,11 +286,12 @@ pub enum ExecutorOutcome {
     /// Subprocess killed by signal during operator-initiated daemon
     /// shutdown; should NOT count against `consecutive_failures`. The
     /// daemon's SIGTERM cascaded to the executor's process group, the
-    /// wrapped CLI child exited with status 143 (= 128 + 15), AND the
-    /// process-wide `SHUTDOWN_REQUESTED` flag was true at classification
-    /// time. The polling loop drops `.in-progress`, leaves
-    /// `.iteration-pending.json` untouched, AND skips the failure-counter
-    /// + perma-stuck + chatops-alert paths.
+    /// wrapped CLI child was killed by SIGTERM (the reaped status reports
+    /// `signal() == Some(15)`; the "128 + 15 = 143" exit-code form is
+    /// accepted defensively), AND the process-wide `SHUTDOWN_REQUESTED`
+    /// flag was true at classification time. The polling loop drops
+    /// `.in-progress`, leaves `.iteration-pending.json` untouched, AND
+    /// skips the failure-counter + perma-stuck + chatops-alert paths.
     Aborted { reason: String },
 }
 

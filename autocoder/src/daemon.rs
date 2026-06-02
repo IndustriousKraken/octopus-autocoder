@@ -5,19 +5,21 @@
 //! Currently this module only carries `SHUTDOWN_REQUESTED`, the flag the
 //! classifier (`executor::claude_cli::classify_outcome`) reads to
 //! distinguish operator-initiated daemon shutdowns (where the SIGTERM
-//! cascades to the executor subprocess as exit 143) from external
-//! SIGTERMs (OOM killer, manual `kill -TERM`, orchestrator kills) that
-//! should remain protected by the perma-stuck failure counter.
+//! cascades to the executor subprocess, killing it by signal 15) from
+//! external SIGTERMs (OOM killer, manual `kill -TERM`, orchestrator
+//! kills) that should remain protected by the perma-stuck failure
+//! counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-wide flag set to `true` by the daemon's SIGTERM handler
 /// BEFORE the daemon initiates shutdown of child tasks. The classifier
-/// reads this in `claude_cli::classify_outcome` to map exit status 143
-/// (= SIGTERM-killed subprocess) to `ExecutorOutcome::Aborted` instead
-/// of `ExecutorOutcome::Failed` — so an operator-initiated daemon
-/// restart never counts a mid-iteration change against its
-/// `consecutive_failures` budget.
+/// reads this in `claude_cli::classify_outcome` to map a SIGTERM-killed
+/// subprocess (`status.signal() == Some(15)`, or the defensive exit-143
+/// form) to `ExecutorOutcome::Aborted` instead of
+/// `ExecutorOutcome::Failed` — so an operator-initiated daemon restart
+/// never counts a mid-iteration change against its `consecutive_failures`
+/// budget.
 ///
 /// The flag is one-way per process lifetime (`false` → `true`; never
 /// reset). A fresh daemon process starts with the default `false`. See

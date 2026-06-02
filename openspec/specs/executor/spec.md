@@ -1161,7 +1161,7 @@ Operator-customizable override prompts MAY remove OR rewrite this section — th
 
 ### Requirement: `ExecutorOutcome::Aborted` distinguishes operator-shutdown-initiated subprocess kills from real failures
 
-The `ExecutorOutcome` enum SHALL gain a new variant `Aborted { reason: String }`. This variant represents an executor subprocess that exited because the daemon itself was being shut down (the SIGTERM the daemon received cascaded to the executor's process group, killing the wrapped CLI child with exit status `143`). The variant is structurally distinct from `Failed` so the polling-loop AND the failure-counter mechanism can treat it differently — specifically, `Aborted` SHALL NOT count against `executor.perma_stuck_threshold`.
+The `ExecutorOutcome` enum SHALL gain a new variant `Aborted { reason: String }`. This variant represents an executor subprocess that exited because the daemon itself was being shut down (the SIGTERM the daemon received cascaded to the executor's process group, killing the wrapped CLI child by signal — the reaped `ExitStatus` reports `signal() == Some(15)`, i.e. killed by SIGTERM/signal 15). The variant is structurally distinct from `Failed` so the polling-loop AND the failure-counter mechanism can treat it differently — specifically, `Aborted` SHALL NOT count against `executor.perma_stuck_threshold`.
 
 The polling-loop's outcome dispatcher SHALL handle `Aborted` by:
 
@@ -1187,38 +1187,39 @@ The polling-loop's outcome dispatcher SHALL handle `Aborted` by:
 - **AND** the failure counter remains at 0 throughout
 - **AND** the third polling iteration picks up the change fresh AND attempts implementation normally
 
-### Requirement: Classifier returns `Aborted` for exit-143 during daemon shutdown; preserves `Failed` for external-source SIGTERMs
+### Requirement: Classifier returns `Aborted` for a SIGTERM-killed subprocess during daemon shutdown; preserves `Failed` for external-source SIGTERMs
 
-The `classify_outcome` path in `claude_cli.rs` SHALL inspect a process-wide shutdown flag (`crate::daemon::SHUTDOWN_REQUESTED: AtomicBool`) when the wrapped CLI's exit status is `143` (SIGTERM-killed). The flag SHALL be set to `true` by the daemon's SIGTERM handler BEFORE the daemon initiates shutdown of child tasks (so classifier checks happening during the shutdown cascade observe the flag as true). The flag is one-way per process lifetime (false → true; never reset).
+The `classify_outcome` path in `claude_cli.rs` SHALL inspect a process-wide shutdown flag (`crate::daemon::SHUTDOWN_REQUESTED: AtomicBool`) when the wrapped CLI was killed by SIGTERM. Because the daemon spawns the wrapped CLI directly in its own process group, a SIGTERM cascade reaps the child *by signal*, so the reaped `ExitStatus` reports `signal() == Some(15)` (`code()` returns `None` for any signal-killed process). The classifier SHALL detect the SIGTERM kill as `status.signal() == Some(15) || status.code() == Some(143)` — the former is the production shape; the latter is accepted defensively for the shell "128 + 15" convention that surfaces only if a wrapper OR the CLI itself catches SIGTERM and `exit(143)`s. The flag SHALL be set to `true` by the daemon's SIGTERM handler BEFORE the daemon initiates shutdown of child tasks (so classifier checks happening during the shutdown cascade observe the flag as true). The flag is one-way per process lifetime (false → true; never reset).
 
-Classification rules for exit status `143`:
+Classification rules for a SIGTERM-killed subprocess (`signal() == Some(15)` OR `code() == Some(143)`):
 
 - `SHUTDOWN_REQUESTED == true` → return `ExecutorOutcome::Aborted { reason: "daemon shutdown (SIGTERM cascade)" }`. The subprocess was killed by the cascade from the daemon's own SIGTERM; not the change's fault.
-- `SHUTDOWN_REQUESTED == false` → return `ExecutorOutcome::Failed { reason: "executor exited with exit status: 143" }` (today's behavior, preserved). An external source (OOM killer, manual `kill -TERM <pid>`, container orchestrator) sent the executor a SIGTERM; this is treated as a real failure AND counts against the failure budget.
+- `SHUTDOWN_REQUESTED == false` → return `ExecutorOutcome::Failed { reason: <stderr excerpt, OR the Display of the status — e.g. "executor exited with signal: 15 (SIGTERM)"> }` (today's behavior, preserved). An external source (OOM killer, manual `kill -TERM <pid>`, container orchestrator) sent the executor a SIGTERM; this is treated as a real failure AND counts against the failure budget.
 
-Classification rules for exit statuses OTHER than 143 are UNCHANGED by this requirement. The shutdown flag SHALL NOT affect:
+Classification rules for subprocesses NOT killed by SIGTERM are UNCHANGED by this requirement. The shutdown flag SHALL NOT affect:
 
 - Exit status `0` paths (still classified as `Completed` per the diff-presence heuristic OR existing happy-path rules).
-- Other non-zero exit codes (still classified as `Failed` with the stderr-derived reason).
+- Other non-zero exit codes / other signals (still classified as `Failed` with the stderr-derived reason).
 - Timeout cases (still classified per the canonical timeout-precedence requirement).
 - Tool-recorded outcomes (still classified per the canonical "Tool-recorded outcomes take precedence" requirement from `a27a0`).
 
 The flag's purpose is narrow: distinguish the one specific case where the daemon's own shutdown caused the executor's death. Every other classification path is preserved.
 
-#### Scenario: Exit-143 during daemon shutdown classifies as Aborted
-- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 143)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true`
+#### Scenario: SIGTERM-killed subprocess during daemon shutdown classifies as Aborted
+- **WHEN** `classify_outcome` is called with `outcome.exit_status` reporting `signal() == Some(15)` (a SIGTERM-killed child) AND `SHUTDOWN_REQUESTED.load(SeqCst) == true`
 - **THEN** the classifier returns `Ok(ExecutorOutcome::Aborted { reason: "daemon shutdown (SIGTERM cascade)" })`
+- **AND** the same result holds for the defensive `code() == Some(143)` form (a wrapper/CLI catching SIGTERM and exiting 143)
 - **AND** no failure-counter increment OR alert fires downstream
 
-#### Scenario: Exit-143 without daemon shutdown classifies as Failed (today's behavior)
-- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 143)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == false`
-- **THEN** the classifier returns `Ok(ExecutorOutcome::Failed { reason: "executor exited with exit status: 143" })`
+#### Scenario: SIGTERM-killed subprocess without daemon shutdown classifies as Failed (today's behavior)
+- **WHEN** `classify_outcome` is called with `outcome.exit_status` reporting `signal() == Some(15)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == false`
+- **THEN** the classifier returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is the stderr excerpt (or the Display of the signal-killed status when stderr is empty, naming `signal: 15`)
 - **AND** the existing failure-counter + perma-stuck protections fire normally (external SIGTERMs from OOM killer, manual kill, etc., remain protected against loop)
 
 #### Scenario: Exit-1 with shutdown flag set still classifies as Failed
-- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 1)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true` (e.g., the executor genuinely failed AND was THEN caught by the shutdown's process-group kill, but the exit code captured was the original failure)
+- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 1)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true` (e.g., the executor genuinely failed with a non-SIGTERM exit code during the shutdown window)
 - **THEN** the classifier returns `Ok(ExecutorOutcome::Failed { reason: <stderr excerpt> })` per the existing behavior
-- **AND** the shutdown flag does NOT override non-143 exit codes (the flag's gate is specifically on signal-15 deaths, not all exit codes during shutdown)
+- **AND** the shutdown flag does NOT override non-SIGTERM exit codes (the flag's gate is specifically on signal-15 / exit-143 deaths, not all exit codes during shutdown)
 
 #### Scenario: Exit-0 with shutdown flag set still classifies via existing happy-path rules
 - **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 0)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true` (e.g., the executor completed cleanly just before the daemon's shutdown timing)
