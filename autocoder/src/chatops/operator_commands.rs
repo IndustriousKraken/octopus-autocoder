@@ -639,7 +639,10 @@ fn parse_command_outcome_in_thread(
             let sub_end = after_verb
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_verb.len());
-            let repo_substring = &after_verb[..sub_end];
+            // a40: match the tokenized `rest` path — strip a single pair
+            // of surrounding backticks from the manually sliced repo
+            // substring before the regex check.
+            let repo_substring = after_verb[..sub_end].trim_matches('`');
             if !repo_substring_regex().is_match(repo_substring) {
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
@@ -672,7 +675,9 @@ fn parse_command_outcome_in_thread(
             let sub_end = after_verb
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_verb.len());
-            let repo_substring = &after_verb[..sub_end];
+            // a40: strip surrounding backticks from the manually sliced
+            // repo substring before the regex check.
+            let repo_substring = after_verb[..sub_end].trim_matches('`');
             if !repo_substring_regex().is_match(repo_substring) {
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
@@ -704,7 +709,9 @@ fn parse_command_outcome_in_thread(
             let sub_end = after_verb
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_verb.len());
-            let repo_substring = &after_verb[..sub_end];
+            // a40: strip surrounding backticks from the manually sliced
+            // repo substring before the regex check.
+            let repo_substring = after_verb[..sub_end].trim_matches('`');
             if !repo_substring_regex().is_match(repo_substring) {
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
@@ -716,7 +723,9 @@ fn parse_command_outcome_in_thread(
             let cap_end = after_repo
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_repo.len());
-            let capability_name = &after_repo[..cap_end];
+            // a40: strip surrounding backticks from the manually sliced
+            // capability name before the regex check.
+            let capability_name = after_repo[..cap_end].trim_matches('`');
             if !capability_slug_regex().is_match(capability_name) {
                 return ParseOutcome::Invalid(brownfield_invalid_slug_reply(capability_name));
             }
@@ -754,7 +763,9 @@ fn parse_command_outcome_in_thread(
             let sub_end = after_verb
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_verb.len());
-            let repo_substring = &after_verb[..sub_end];
+            // a40: strip surrounding backticks from the manually sliced
+            // repo substring before the regex check.
+            let repo_substring = after_verb[..sub_end].trim_matches('`');
             if !repo_substring_regex().is_match(repo_substring) {
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
@@ -857,7 +868,9 @@ fn parse_command_outcome_in_thread(
             let sub_end = after_verb
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(after_verb.len());
-            let repo_substring = &after_verb[..sub_end];
+            // a40: strip surrounding backticks from the manually sliced
+            // repo substring before the regex check.
+            let repo_substring = after_verb[..sub_end].trim_matches('`');
             if !repo_substring_regex().is_match(repo_substring) {
                 return ParseOutcome::Invalid(invalid_repo_substring_reply());
             }
@@ -4361,6 +4374,119 @@ mod tests {
             other => panic!("expected Sync sanitization reply, got {other:?}"),
         }
         assert!(submitter.calls().is_empty());
+    }
+
+    // -------------------------------------------------------------
+    // a40 backtick-stripping tests for verbs that manually parse
+    // `after_verb` (not the tokenized `rest` path). These verbs
+    // extract `repo_substring` (and, for `brownfield`, `capability_name`)
+    // by slicing on whitespace boundaries; they must still strip
+    // surrounding backticks before the regex check.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_propose_strips_backticks_on_repo_substring() {
+        let cmd = parse_command(
+            &format!("{BOT} propose `myrepo` Build a thing please"),
+            BOT,
+        )
+        .expect("backtick-wrapped repo substring must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ProposeRequest {
+                repo_substring: "myrepo".into(),
+                request_text: "Build a thing please".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_changelog_strips_backticks_on_repo_substring() {
+        let cmd =
+            parse_command(&format!("{BOT} changelog `myrepo` --since 2026-01-01"), BOT)
+                .expect("backtick-wrapped repo substring must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ChangelogRequest {
+                repo_substring: "myrepo".into(),
+                raw_args: "--since 2026-01-01".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_strips_backticks_on_both_args() {
+        let cmd = parse_command(
+            &format!("{BOT} brownfield `myrepo` `auth-service` make it crisp"),
+            BOT,
+        )
+        .expect("backticks must be stripped from repo AND capability");
+        assert_eq!(
+            cmd,
+            OperatorCommand::BrownfieldRequest {
+                repo_substring: "myrepo".into(),
+                capability_name: "auth-service".into(),
+                guidance: Some("make it crisp".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scout_strips_backticks_on_repo_substring() {
+        let cmd = parse_command(&format!("{BOT} scout `myrepo`"), BOT)
+            .expect("backtick-wrapped repo substring must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ScoutRequest {
+                repo_substring: "myrepo".into(),
+                guidance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_survey_strips_backticks_on_repo_substring() {
+        let cmd = parse_command(&format!("{BOT} brownfield-survey `myrepo`"), BOT)
+            .expect("backtick-wrapped repo substring must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::BrownfieldSurveyRequest {
+                repo_substring: "myrepo".into(),
+                guidance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_brownfield_embedded_backtick_in_capability_rejected() {
+        // Mid-token backticks are NOT stripped; regex rejects.
+        let outcome = parse_command_outcome(
+            &format!("{BOT} brownfield myrepo auth`service"),
+            BOT,
+        );
+        match outcome {
+            ParseOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid for embedded backtick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_backtick_wrapped_shell_metachar_still_rejected() {
+        // The strip yields `a;rm` which the repo-substring regex
+        // rejects (`;` not in `[a-zA-Z0-9._/-]`).
+        let outcome = parse_command_outcome(
+            &format!("{BOT} propose `a;rm` Build a thing"),
+            BOT,
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(
+                    text.starts_with("✗ invalid repo substring"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected Invalid sanitization reply, got {other:?}"),
+        }
     }
 
     #[test]
