@@ -415,6 +415,7 @@ impl Drop for SandboxSettingsGuard {
         if let Err(e) = std::fs::remove_file(&self.0)
             && e.kind() != std::io::ErrorKind::NotFound
         {
+            // no-url: RAII temp-file cleanup in Drop, no repo context available
             tracing::warn!(
                 path = %self.0.display(),
                 "failed to remove sandbox settings temp file: {e}"
@@ -696,6 +697,7 @@ pub async fn discard_proposal_and_notify(
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(
+            url = %repo_url,
             slug = %slug,
             audit_type = audit_type,
             path = %change_dir.display(),
@@ -713,6 +715,7 @@ pub async fn discard_proposal_and_notify(
         .await;
         if let Err(e) = post_result {
             tracing::warn!(
+                url = %repo_url,
                 audit_type = audit_type,
                 slug = %slug,
                 "validation-exhausted chatops post failed: {e:#}"
@@ -859,6 +862,7 @@ pub async fn post_proposal_created_notification(
     );
     if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
         tracing::warn!(
+            url = %repo_url,
             audit_type = audit_type,
             slug = %change_slug,
             "proposal-created chatops post failed: {e:#}"
@@ -981,9 +985,15 @@ pub fn workspace_is_valid(workspace: &Path) -> bool {
 /// The variant tag matches the documented strings in the
 /// `audits-require-valid-workspace` spec; callers should not invent
 /// alternate phrasings.
+///
+/// `repo_url` is the URL of the repository whose workspace failed the
+/// validity check; it is emitted as the `url` structured field on the
+/// skip-notice INFO line so operators running many repos can attribute
+/// the skip to a specific repo (see `a42-audit-logs-carry-repo-url`).
 pub fn workspace_unavailable_outcome(
     audit_type: &str,
     workspace: &Path,
+    repo_url: &str,
 ) -> AuditOutcome {
     let reason = if !workspace.exists() {
         "workspace directory does not exist".to_string()
@@ -993,6 +1003,7 @@ pub fn workspace_unavailable_outcome(
         "workspace failed validity check".to_string()
     };
     tracing::info!(
+        url = %repo_url,
         audit_type = %audit_type,
         workspace = %workspace.display(),
         reason = %reason,
@@ -1638,7 +1649,8 @@ mod tests {
     fn workspace_unavailable_outcome_uses_nonexistent_reason_for_missing_dir() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("nope");
-        let outcome = workspace_unavailable_outcome("some_audit", &ws);
+        let outcome =
+            workspace_unavailable_outcome("some_audit", &ws, "https://example.invalid/repo");
         match outcome {
             AuditOutcome::WorkspaceUnavailable {
                 audit_type,
@@ -1658,7 +1670,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let outcome = workspace_unavailable_outcome("some_audit", &ws);
+        let outcome =
+            workspace_unavailable_outcome("some_audit", &ws, "https://example.invalid/repo");
         match outcome {
             AuditOutcome::WorkspaceUnavailable { reason, .. } => {
                 assert_eq!(reason, "workspace exists but has no .git/ subdirectory");

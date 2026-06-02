@@ -97,7 +97,11 @@ pub(crate) async fn run_specs_writing_audit(
     // recreate workspace + openspec/ on a wiped workspace — the very
     // failure mode the gate exists to prevent.
     if !workspace_is_valid(ctx.workspace) {
-        return Ok(workspace_unavailable_outcome(audit_type, ctx.workspace));
+        return Ok(workspace_unavailable_outcome(
+            audit_type,
+            ctx.workspace,
+            &ctx.repo.url,
+        ));
     }
 
     let max_retries = ctx.max_validation_retries;
@@ -208,6 +212,7 @@ pub(crate) async fn run_specs_writing_audit(
                 let path = ctx.workspace.join("openspec/changes").join(d);
                 if let Err(e) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(
+                        url = %ctx.repo.url,
                         audit_type = audit_type,
                         path = %path.display(),
                         "failed to remove over-cap change dir: {e}"
@@ -254,6 +259,7 @@ pub(crate) async fn run_specs_writing_audit(
                 &format!("change: {name}\nattempt: {attempt}\nerror: {err}"),
             );
             tracing::warn!(
+                url = %ctx.repo.url,
                 audit_type = audit_type,
                 change = %name,
                 attempt = attempt,
@@ -267,6 +273,7 @@ pub(crate) async fn run_specs_writing_audit(
                 let path = ctx.workspace.join("openspec/changes").join(name);
                 if let Err(rm_err) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(
+                        url = %ctx.repo.url,
                         audit_type = audit_type,
                         path = %path.display(),
                         "failed to remove invalid change dir: {rm_err}"
@@ -370,6 +377,7 @@ pub(crate) async fn run_specs_writing_audit(
             .await
         {
             tracing::warn!(
+                url = %ctx.repo.url,
                 audit_type = audit_type,
                 "validation-exhausted chatops post failed: {e:#}"
             );

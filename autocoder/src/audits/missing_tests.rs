@@ -529,6 +529,94 @@ mod tests {
         }
     }
 
+    /// `a42-audit-logs-carry-repo-url` capture test: the validation-
+    /// rejection WARN emitted by the shared `run_specs_writing_audit`
+    /// helper (used by both the missing-tests and security-bug audits)
+    /// MUST carry the repository URL as a structured `url` field so a
+    /// multi-repo operator can attribute the rejection. Drives the
+    /// all-invalid path with a unique sentinel repo URL and asserts the
+    /// captured WARN's structured fields include `url=<sentinel>`.
+    ///
+    /// Capture uses `tracing-test`, which installs a process-global
+    /// subscriber and scopes each test's log buffer to a span named after
+    /// the test fn — this is parallel-safe. (A thread-local `set_default`
+    /// subscriber is NOT: a concurrent test that hits the same WARN
+    /// callsite first, with no subscriber installed, leaves its `Interest`
+    /// cached as disabled process-wide, so this thread's subscriber never
+    /// sees the event.) `tracing-test`'s scope filter keeps only physical
+    /// log lines bearing the span name, so the WARN's `url=` field — which
+    /// the fmt layer renders right after the message — must stay on the
+    /// SAME line as the message. The validator below therefore emits its
+    /// error with `printf` (no trailing newline) so the rendered event is
+    /// a single line.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn validation_failure_warn_carries_repo_url() {
+        // Unique, obviously-fake URL so the captured-field assertion is
+        // unambiguous (no other log line in the run names this string).
+        const SENTINEL_URL: &str = "https://example.invalid/sentinel-repo-a42";
+
+        let (_t, ws) = init_workspace_with(&[]);
+        let new = ws
+            .join("openspec/changes/tests-sentinel-shape")
+            .display()
+            .to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\necho '# nope' > '{new}/proposal.md'\nexit 0\n"
+            ),
+        );
+        // Validator fails (nonzero exit) so the validation-rejection WARN
+        // at `specs_writing.rs` fires for the lone change. `printf` (no
+        // trailing newline) keeps the rendered event on one line so its
+        // `url=` field stays within this test's captured scope.
+        let bad_validator = write_script(
+            &ws,
+            "fake-openspec-fail.sh",
+            "#!/bin/sh\nprintf 'spec missing scenarios' >&2\nexit 2\n",
+        );
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(bad_validator.to_string_lossy().to_string());
+        let mut repo = fixture_repo();
+        repo.url = SENTINEL_URL.into();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(outcome, AuditOutcome::ValidationExhausted { .. }),
+            "all-invalid run with no retries must exhaust validation: {outcome:?}"
+        );
+
+        // The validation-rejection WARN must have been emitted...
+        assert!(
+            logs_contain("rejecting agent-produced change that failed"),
+            "expected the validation-rejection WARN to be captured"
+        );
+        // ...carrying the repo URL as a `url` structured field (the fmt
+        // layer renders structured fields as `key=value`).
+        assert!(
+            logs_contain(&format!("url={SENTINEL_URL}")),
+            "validation-rejection WARN must carry `url={SENTINEL_URL}` as a structured field"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
     #[tokio::test]
     async fn validation_success_commits_change_to_agent_branch() {
         let (_t, ws) = init_workspace_with(&[]);

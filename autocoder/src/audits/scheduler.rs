@@ -650,6 +650,7 @@ async fn drive_one_audit(
     if workspace.join(".git").is_dir() {
         if let Err(e) = workspace::ensure_git_info_excluded(workspace, ".audit-state.json") {
             tracing::warn!(
+                url = %repo.url,
                 "could not register .audit-state.json in .git/info/exclude: {e:#}"
             );
         }
@@ -820,6 +821,7 @@ fn stamp_audit_thread_state(
     let root = default_state_root(paths);
     if let Err(e) = write_state(&root, &state) {
         tracing::warn!(
+            url = %repo_url,
             audit_type,
             thread_ts = %thread_ts,
             "failed to stamp audit-thread state (audit-reply-acts `send it` will not resolve this thread): {e:#}"
