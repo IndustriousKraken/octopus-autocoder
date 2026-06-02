@@ -67,3 +67,88 @@ Worth fixing because per-change review is materially more useful than bundled wh
 When an audit fires (drift, brightline, etc.) and the operator addresses the findings via `send it`, the audit's `last_run_sha` is unchanged — the audit only re-runs when HEAD changes. The next audit fire could be days later. An operator who fixes findings and wants to verify the fix worked has to wait for the next cadence OR explicitly re-trigger via `@<bot> audit <type> <repo>`.
 
 Could be improved: when `send it` produces a PR that merges, automatically re-queue the audit that triggered the `send it`. Closes the loop without operator action. Small spec.
+
+## Prompt-content tests are the wrong category — delete the prose assertions, keep the plumbing
+
+`low_confidence_finding_filtering_explicit_in_prompt` (`autocoder/src/audits/security_bug.rs:335`) asserts FOUR verbatim full sentences are present in the embedded security-bug-audit prompt. The 2026-06-02 prompt rewrite reworded two of them without changing their meaning — "Only emit a change for findings you are highly confident about" → "Emit only findings you are highly confident about", AND it dropped the literal "When in doubt, DON'T emit" (the concept survives as "If any is missing, drop the finding"). Two assertions now fail; `cargo test` is red. (Secondary process smell: the PR #81 implementer agent mis-attributed this failure as "pre-existing and unrelated" and shipped anyway, never connecting a prompt-content test failure to the prompt edit on the same branch.)
+
+The deeper problem is not brittleness — it's that this is the wrong kind of test. It is a change-detector that pins the prompt's prose to itself: it passes because someone typed the words and fails because someone retyped them differently. It encodes no independent truth, cannot distinguish a better reword from a deletion, and does not test the actual feature (whether the audit drops low-confidence findings — that is model behavior, invisible to a substring check). The author's rationale ("break CI rather than the operator's mailbox") assumes prompt edits go unreviewed, but they ride the same PR/review pipeline as code, so review already covers it.
+
+Distinguish two categories in the prompt/audit test suites:
+
+- **Plumbing tests (KEEP / strengthen)** — these test logic that can break silently: placeholder substitution (`{{change_body}}`), `MAX_PROPOSALS:` injection, prompt-file override/precedence in the loader, the non-empty-prompt guard, sandbox tool-list construction, custom-prompt-sentinel resolution. The existing `MAX_PROPOSALS:` and drift custom-sentinel tests are this kind; leave them.
+- **Prose-content tests (DELETE)** — any `prompt.contains("<sentence>")` assertion on instruction wording. They add CI churn and catch nothing review doesn't.
+
+Fix:
+1. Delete `low_confidence_finding_filtering_explicit_in_prompt` (and any sibling prose-assertion tests the sweep finds). Do NOT replace it with "robust short-token" versions — converting four brittle sentence-checks into four slightly-less-brittle token-checks just makes a bad test marginally less bad; the category is the problem.
+2. Sweep `autocoder/src/audits/*.rs`, `code_reviewer.rs`, and the loader tests for the same prose-assertion pattern; delete each, preserving only plumbing/structural/sentinel assertions.
+3. OPTIONAL narrow exception: prompts can be edited by agents (documentation_audit, future self-modifying paths) where "reviewed prose" is weaker. If agent-edit insurance is wanted, leave ONE coarse anti-deletion tripwire per agent-editable prompt — "still mentions `confidence` at all" — explicitly documented as a tripwire, not a content test. The project's self-modification guardrails already cover most of this, so this is optional.
+
+Near-term: the red test weakly blocks the `cargo test` acceptance gate for every queued change until removed (agents are working around it by declaring it unrelated). Deleting it is a one-line cleanup worth doing before pushing the queued batch.
+
+---
+
+# Agentic fleet migration (planned spec stream)
+
+A coordinated stream of changes that gives EVERY LLM-driven step — executor, reviewer, pre-checks, post-checks, audits — the same shape: a wrapped agent CLI running an agentic session in a read-only-capable sandbox, with structured output via per-role MCP tools, and a swappable CLI strategy so any provider's model (Anthropic, OpenRouter, Ollama) can drive any role. The purpose is to make larger/more complex LLM-built projects possible by keeping them on the rails with diverse, independent, well-controlled checks — model diversity is load-bearing (a different model reviewing than implementing catches blind-spots a single model's training assumptions miss).
+
+Author the changes in dependency order. Each entry below is a candidate spec; lift it into `openspec/changes/<slug>/` when its turn comes. Keep this manifest in sync as changes graduate.
+
+## Architecture umbrella (shared across the stream)
+
+**The agentic-run primitive.** Wrap a CLI as a subprocess; hand it a prompt; let it run its own session to completion (it decides when done; the CLI owns its own context compaction — the executor already proves long multi-step sessions work). Shared sandbox tools for every role: `Read`, `Grep`, `Glob`, AND `query_canonical_specs` (the a21 semantic-search MCP tool, now fleet-wide). Structured output via a per-role `submit_*` MCP tool — NO stdout-JSON parsing anywhere (stdout-JSON is the fragility behind the Grok-refuses / Qwen-9B-confabulates behavior).
+
+**CLI strategy (two jobs, one trait).** Each wrapped CLI has a strategy implementation that (1) builds the invocation — flags, sandbox/allowed-tools, MCP-config-file format — AND (2) translates the resolved model config into that CLI's model-selection mechanism. `claude` → `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_MODEL` env, AND only speaks the Anthropic Messages wire format. `opencode` → its provider config file, speaks OpenAI-compatible + Ollama + many others natively. The Anthropic-wire constraint is exactly why a provider-agnostic CLI is required for non-Anthropic agentic runs — it is not optional given model diversity is the point.
+
+**Model registry.** A top-level `models:` block defines `(provider, model, base_url, key)` once under a nickname; every role references a nickname (`model: beefy_security`) instead of duplicating provider/key. The registry entry's `provider` resolves the default CLI strategy for agentic runs (anthropic → claude; openai_compatible / ollama → opencode; overridable per model since opencode can also drive Anthropic). The operator thinks only in models; the CLI is resolved underneath. This removes any per-role `command:` field.
+
+**`kind: agentic | oneshot`.** Agentic is the default for reasoning roles. `oneshot` (HTTP `LlmClient.complete()`, the a37 surface) is retained as (a) a fast/cheap opt-in, AND (b) the only path for non-Anthropic models during the claude-only window before the opencode strategy lands. RAG embedding stays one-shot PERMANENTLY — producing an embedding vector is a single forward pass, not a reasoning session; `agentic` is meaningless for it.
+
+**Per-role submit tools.** `submit_review`, `submit_findings`, `submit_contradictions`, `submit_verdict` — per-role, not one generic tool (matches the executor's existing `outcome_*` family idiom; clearer schemas, model can't pick the wrong one). Each schema mirrors the structure that role's downstream consumer needs (e.g. `submit_review` carries verdict + per-concern entries with `actionable_request` + `should_request_revision`, per change, to preserve auto-revise + per_change).
+
+## Change sequence
+
+### 1a. Auto-revise trigger fix (a46 — authored; independent, near-term, live dormant bug)
+`partition_and_annotate_reviewer_revisions` (polling_loop.rs:5109) returns empty unless `verdict == Block`, so auto-revise never fires for the common `Concerns` verdict — even when concerns carry `should_request_revision: true` + a valid `actionable_request`. Conservative reviewers rarely Block, so the feature is dormant. Fix: trigger on the actionable signal (`should_request_revision: true` + non-empty `actionable_request`) REGARDLESS of verdict; rename `reviewer.auto_revise_on_block` → `reviewer.auto_revise` (serde alias). Bounded by the EXISTING `executor.max_revisions_per_pr` cap (which caps all revisions) until 1b refines it, so no runaway in the gap. Authored as `a46-auto-revise-fires-on-actionable`.
+
+### 1b. Caps reframing — automatic-only (a47 — sibling of a46)
+Reframe caps so only AUTOMATIC chains are bounded: the revision cap counts ONLY reviewer-marked (`<!-- reviewer-revision -->`) revisions; human `@<bot> revise` is uncapped. Rename `executor.max_revisions_per_pr` → `executor.max_auto_revisions_per_pr` (alias). Uncap human `@<bot> code-review` entirely (all re-reviews are human — the "No reviewer re-run after revision lands" requirement guarantees no automatic re-review — so the re-review cap guards a deliberate human act with no runaway risk; default it to unlimited, keep the field as an opt-in ceiling). Touches ~5 reviewer-spec requirements + the orchestrator-cli revision-cap requirement; that breadth is why it's split from a46. Compounding fix to fold in here OR separately: malformed-verdict-defaults-to-Approve on the rerun route (memory `reviewer-verdict-parse-failure-defaults-to-approve`).
+
+### 2. Model registry (`models:` block + nickname references)
+Top-level `models:` registry; migrate every LLM-consuming block (reviewer, contradiction-check, audits' future agentic config, RAG) to reference nicknames. Backward-compat: keep inline per-block config accepted, with the registry as the deduped form. Foundational — lands before the agentic roles proliferate so they reference nicknames from birth. Defines the `provider → default CLI` resolution rule.
+
+### 3. Extract the agentic-run primitive + CLI-strategy trait (claude impl) + `submit_*` MCP family
+Pull the shared primitive out of the executor + audit `run_subprocess` paths (refactor both onto it, NO behavior change). Define the `CliStrategy` trait with the claude implementation. Add the per-role `submit_*` MCP tool family to the MCP server. This is the architectural spine; everything below hangs off it. Rule-of-three justifies extracting now (executor + audits + incoming reviewer).
+
+### 4. Migrate audits stdout-JSON → `submit_findings` MCP
+Move drift, architecture_consultative, documentation_audit, AND the specs-writing audits (missing_tests, security_bug) off fragile stdout-JSON onto `submit_findings` / `submit_*`. Kills the confabulation-on-weak-models risk across the fleet. Depends on 3.
+
+### 5. Agentic reviewer (`kind: agentic` default, claude-only)
+Reviewer on the primitive: read-only sandbox, reads files on demand (no 2M-char truncation), `submit_review` structured output. Preserve the full downstream contract: `reviewer.mode: per_change`, auto-revise (post-#1 semantics), the `@<bot> code-review` re-review verb. Retain `kind: oneshot` as fallback. Depends on 3 (and ideally 1 + 4).
+
+### 6. Agentic contradiction-check (second one-shot holdout → primitive)
+Move `change_internal_contradiction_check` off `LlmClient.complete()` onto the primitive with `submit_contradictions`. Depends on 3.
+
+### 7. OpenCode CLI strategy (provider-agnostic)
+Second `CliStrategy` implementation: opencode. Unlocks agentic + OpenRouter/Qwen/Ollama + context for every role. The model-diversity enabler — without it, agentic runs are Anthropic-only, which defeats the cross-check purpose. Conformant MCP-config generation for opencode is the main work (each CLI gets its own config-file format). Depends on 3; sorts late but is in-stream, not deferred.
+
+### 8. Verifier trio on the primitive (may split into multiple changes)
+Three boundary gates, same shape, each a `submit_verdict` role: (a) change-internal consistency [in] — supersedes/absorbs the contradiction-check; (b) change-vs-canon contradiction [in] — the RAG-pre-flight already sketched earlier in this file; (c) did-the-code-implement-the-spec [out] — the aspirational verifier from the README roadmap. Well-bounded gates can run super-budget models (Ollama via opencode). Depends on 3 + 7 (for budget models). Keep mentally distinct from the reviewer (code quality) — different lens, different verdict semantics.
+
+## Default prompts assume Rust/this-project tooling — make them language-neutral (near-term, independent)
+
+The embedded default prompts leak Rust- and this-project-specific tooling into prompts that run against ANY managed repo. Observed: an agent reviewing a Python project noted "there's no Clippy in Python" — the implementer/revision prompts instruct `cargo clippy --all-targets -- -D warnings` and `cargo test` regardless of the target project's language. (Self-inflicted: the 2026-06-02 prompt rewrite baked `cargo clippy` into `prompts/implementer.md`'s final_answer worked example AND into a45's revision-prompt content guidance — both need cleanup as part of this.)
+
+`openspec validate --strict` is fine to keep (every managed repo uses OpenSpec). The leak is language-specific build/lint/test/format commands. Fix options:
+- **Detect-and-run (simplest):** prompts say "run the project's linter / formatter / test suite (detect from the repo's build config — Cargo.toml, package.json, pyproject.toml, go.mod, etc.)" instead of naming `cargo` commands. Language-neutral; relies on the agent to detect.
+- **Per-repo tooling config:** a config block names the lint/test/format commands per repository, injected into prompts via placeholders. More precise, more config surface.
+- **Mix:** default to detect-and-run; allow a per-repo override block.
+
+Scope when authored: sweep ALL default prompts under `prompts/` for language/environment assumptions (not just implementer/revision — check audit + triage + reviewer prompts too). Pairs naturally with the model-registry work (per-repo config surface already in motion) but is independent and near-term because it's actively producing wrong PR comments.
+
+## Open design questions to resolve while authoring
+
+- **Submit-tool relay vs in-process.** The executor's outcome tools relay to the daemon via the control socket. Reviewer/audit submit tools — same relay, or a lighter in-process capture? The relay buys uniformity AND daemon-side ownership of results.
+- **Per-role sandbox toolsets.** All get Read/Grep/Glob + query_canonical_specs. Does the reviewer get `Bash` (to run a build/test) or stay strictly read-only? The audits get Bash today; the reviewer historically did not.
+- **Registry migration ergonomics.** Hard cutover to nicknames, or indefinite dual-acceptance of inline + registry? Affects how aggressively change 2 rewrites existing configs.
+- **opencode MCP maturity.** Spike: confirm opencode's MCP-tool support is robust enough to carry a validated `submit_*` before committing change 7's design (knowledge-cutoff caveat — verify against the current opencode release).
