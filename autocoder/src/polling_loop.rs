@@ -6606,18 +6606,57 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
             // remove it from disk rather than `git restore` (which would
             // fail with "pathspec did not match").
             let abs = workspace.join(&path);
-            if abs.is_dir() {
-                let _ = std::fs::remove_dir_all(&abs);
+            let removal = if abs.is_dir() {
+                std::fs::remove_dir_all(&abs)
             } else {
-                let _ = std::fs::remove_file(&abs);
+                std::fs::remove_file(&abs)
+            };
+            // A surviving untracked file would be swept into the
+            // spec-only commit by the caller's subsequent `git add -A`,
+            // silently violating the spec-only invariant. An already-gone
+            // path is fine (goal achieved); any other failure — a
+            // read-only file, a write-protected parent directory — is
+            // fatal: fail loudly rather than let the write leak.
+            if let Err(e) = removal
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    spec_slug = %spec_slug,
+                    path = %path,
+                    "discard_non_spec_writes: failed to remove untracked non-spec write: {e:#}"
+                );
+                return Err(anyhow!(
+                    "discard_non_spec_writes: failed to remove untracked non-spec write `{path}`: {e}; \
+                     refusing to proceed so it does not leak into the spec-only PR"
+                ));
             }
         } else {
-            // Tracked modification/deletion: revert the worktree to the
-            // committed state.
-            let _ = std::process::Command::new("git")
-                .args(["restore", "--", &path])
+            // Tracked modification/deletion: revert BOTH the index AND the
+            // worktree to the committed (base) state. `--source=HEAD
+            // --staged --worktree` is deliberate: if the executor staged a
+            // code edit with `git add`, a plain `git restore -- <path>`
+            // would only rewrite the worktree from the index, leaving the
+            // staged modification in the index where the caller's `git add
+            // -A` + commit would sweep it into the spec PR. Resetting both
+            // refs to HEAD unstages and reverts the path regardless.
+            let status = std::process::Command::new("git")
+                .args(["restore", "--source=HEAD", "--staged", "--worktree", "--", &path])
                 .current_dir(workspace)
-                .status();
+                .status()
+                .with_context(|| {
+                    format!("discard_non_spec_writes: spawning git restore for `{path}`")
+                })?;
+            if !status.success() {
+                tracing::warn!(
+                    spec_slug = %spec_slug,
+                    path = %path,
+                    "discard_non_spec_writes: git restore exited non-zero reverting tracked non-spec write"
+                );
+                return Err(anyhow!(
+                    "discard_non_spec_writes: `git restore --source=HEAD --staged --worktree -- {path}` \
+                     exited non-zero; refusing to proceed so the non-spec write does not leak into the spec-only PR"
+                ));
+            }
         }
         discarded.push(path);
     }
@@ -7460,6 +7499,71 @@ mod tests {
         let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
         assert!(dropped.is_empty());
         assert_eq!(crate::git::status_porcelain(&ws).unwrap(), "");
+    }
+
+    /// a43 revision: a code edit the executor *staged* with `git add`
+    /// must be fully reverted — index AND worktree. A plain
+    /// `git restore -- <path>` only rewrites the worktree from the index,
+    /// so the staged modification would survive in the index and leak
+    /// into the supposedly spec-only commit. The `--source=HEAD --staged
+    /// --worktree` revert unstages and reverts regardless.
+    #[test]
+    fn discard_non_spec_writes_reverts_staged_code_modification() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::write(ws.join("src/bar.rs"), "STAGED MUTATION\n").unwrap();
+        // Stage the code edit the way an LLM bash tool might.
+        let st = std::process::Command::new("git")
+            .args(["add", "src/bar.rs"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "staging src/bar.rs failed");
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(dropped, vec!["src/bar.rs".to_string()]);
+        // Worktree reverted to the committed base content...
+        assert_eq!(std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(), "orig\n");
+        // ...AND nothing staged survives: the index is clean, so the
+        // caller's `git add -A` + commit cannot sweep the code edit into
+        // the spec-only PR.
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged code modification must be fully unstaged and reverted"
+        );
+    }
+
+    /// a43 revision: when an untracked non-spec write cannot be removed
+    /// (here: a write-protected parent directory blocks the unlink), the
+    /// helper must fail loudly rather than silently leave the file for
+    /// the caller's `git add -A` to sweep into the spec-only PR.
+    #[test]
+    fn discard_non_spec_writes_errors_when_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, ws) = dnsw_repo();
+        // An untracked code file inside a directory we then strip write
+        // permission from (`r-xr-xr-x`) so `remove_file` fails with
+        // PermissionDenied — the unlink needs write permission on the
+        // parent directory, not on the file itself.
+        let locked = ws.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("leak.rs"), "junk\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = discard_non_spec_writes(&ws, "foo");
+
+        // Restore write permission so the TempDir guard can clean up,
+        // regardless of the assertion outcome below.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        assert!(
+            result.is_err(),
+            "a removal failure must surface as an error, not a silent leak"
+        );
+        assert!(
+            ws.join("locked/leak.rs").exists(),
+            "the un-removable file must still be on disk — the error has to \
+             prevent the spec commit rather than the file being quietly gone"
+        );
     }
 
     // ================================================================

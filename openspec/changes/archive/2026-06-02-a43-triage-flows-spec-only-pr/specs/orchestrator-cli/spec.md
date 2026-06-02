@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Completed triage splits into one or two PRs by content path
-After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths AND keep ONLY paths inside `openspec/changes/<derived-slug>/`. Paths outside that subtree (code fixes, doc edits, ANY non-spec content) SHALL be discarded via `git restore` (for tracked modifications) AND `std::fs::remove_file` / `remove_dir_all` (for untracked additions) BEFORE the spec-PR commit. At most ONE PR is created per triage run — the spec PR. The fixes-PR path is removed entirely; code fixes flow through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR.
+After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths AND keep ONLY paths inside `openspec/changes/<derived-slug>/`. Paths outside that subtree (code fixes, doc edits, ANY non-spec content) SHALL be discarded via `git restore --source=HEAD --staged --worktree` (reverting both the index AND the worktree for tracked modifications, so a code edit the executor staged with `git add` cannot survive) AND `std::fs::remove_file` / `remove_dir_all` (for untracked additions) BEFORE the spec-PR commit. If any non-spec write cannot be reverted or removed, the daemon SHALL abort before the spec-PR commit rather than allow the write to leak into the spec PR. At most ONE PR is created per triage run — the spec PR. The fixes-PR path is removed entirely; code fixes flow through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR.
 
 When the discard step drops non-empty paths (the agent wrote code despite the prompt's restriction), the daemon SHALL emit a WARN log naming the dropped paths AND post a chatops reply in the audit-thread naming the dropped paths AND directing the operator to capture the dropped fixes as `tasks.md` items in the spec if they were load-bearing.
 
@@ -14,7 +14,7 @@ When the discard step leaves spec content, the daemon SHALL create the spec bran
 #### Scenario: Mixed diff produces one spec PR; code paths are discarded with chatops warning
 - **GIVEN** the triage executor's Completed working tree contains BOTH new files in `openspec/changes/audit-fix-x/` AND modifications to `src/foo.rs`
 - **WHEN** the audit-triage completion handler runs
-- **THEN** `git restore -- src/foo.rs` (OR equivalent removal for untracked additions) executes BEFORE the commit
+- **THEN** `git restore --source=HEAD --staged --worktree -- src/foo.rs` (OR equivalent removal for untracked additions) executes BEFORE the commit, reverting both the index AND the worktree so a staged code edit cannot survive into the spec commit
 - **AND** the working tree's `src/foo.rs` reverts to the base-branch state
 - **AND** a WARN log fires naming the audit type, the derived slug, AND `src/foo.rs` as the dropped path
 - **AND** the daemon creates a spec branch + PR with ONLY `openspec/changes/audit-fix-x/` paths
