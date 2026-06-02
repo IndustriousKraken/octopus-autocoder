@@ -72,4 +72,4 @@ else
 fi
 
 STEP="handoff"
-exec "${DEST}" install "${PASSTHRU[@]}"
+exec "${DEST}" install ${PASSTHRU[@]+"${PASSTHRU[@]}"}
