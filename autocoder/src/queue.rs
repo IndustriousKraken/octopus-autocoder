@@ -450,25 +450,42 @@ impl ResolvePrefixError {
 /// directory carries the scope-required marker, the prefix is returned as-is
 /// (the operator pasted the full slug from an alert).
 ///
-/// Slow path: enumerate the change-root directory (skipping `archive/` AND
-/// dotfile-named entries — matches `list_pending`'s skip rules), filter to
-/// directories carrying the scope-required marker, AND collect entries whose
-/// name `str::starts_with` the supplied value (case-sensitive). A unique
-/// candidate is returned; zero candidates yield `NoMatch`; two or more yield
-/// `MultiMatch` with the candidate list sorted ascending for determinism.
+/// Exact-name-without-marker: when the prefix names an existing change
+/// directory but that directory does NOT carry the scope marker, return
+/// `NoMatch` immediately — DO NOT fall through to prefix enumeration. Falling
+/// through would otherwise let a longer prefix-extended directory (e.g.,
+/// `a37-foo-bar` when the operator typed exact `a37-foo`) silently
+/// substitute for the operator's named change. The exact-name input is an
+/// operator-named identifier; the resolver must not "upgrade" it.
+///
+/// Slow path (prefix enumeration): only reached when the prefix does NOT
+/// name an existing change directory. Enumerate the change-root directory
+/// (skipping `archive/` AND dotfile-named entries — matches `list_pending`'s
+/// skip rules), filter to directories carrying the scope-required marker,
+/// AND collect entries whose name `str::starts_with` the supplied value
+/// (case-sensitive). A unique candidate is returned; zero candidates yield
+/// `NoMatch`; two or more yield `MultiMatch` with the candidate list sorted
+/// ascending for determinism.
 pub fn resolve_change_prefix(
     workspace: &Path,
     prefix: &str,
     scope: ChangePrefixMarkerScope,
 ) -> Result<String, ResolvePrefixError> {
     let root = changes_dir(workspace);
-    // Fast path: exact-name match + scope marker present.
+    // Exact-name path: the operator named a directory that exists. The
+    // resolution outcome is bound to THAT directory — either it has the
+    // scope marker (Ok) or it does not (NoMatch). We never fall through
+    // to prefix enumeration here, because doing so would let a longer
+    // prefix-extended directory hijack the operator-named slug.
     let exact_dir = root.join(prefix);
-    if exact_dir.is_dir() && scope.dir_has_scope_marker(&exact_dir) {
-        return Ok(prefix.to_string());
+    if exact_dir.is_dir() {
+        if scope.dir_has_scope_marker(&exact_dir) {
+            return Ok(prefix.to_string());
+        }
+        return Err(ResolvePrefixError::NoMatch { scope });
     }
-    // Slow path: enumerate change-root and collect prefix matches that
-    // carry the scope-required marker.
+    // Slow path: the prefix is NOT an existing directory name. Enumerate
+    // change-root and collect prefix matches that carry the scope marker.
     let read_dir = match std::fs::read_dir(&root) {
         Ok(rd) => rd,
         Err(_) => return Err(ResolvePrefixError::NoMatch { scope }),
@@ -1831,6 +1848,36 @@ mod tests {
             }
             other => panic!("expected MultiMatch, got {other:?}"),
         }
+    }
+
+    /// Regression: an exact-named directory without the scope marker
+    /// must NOT silently resolve to a longer prefix-extended directory
+    /// that happens to carry the marker. The operator named a specific
+    /// directory; the resolver must respect that identifier exactly.
+    #[test]
+    fn resolve_change_prefix_exact_name_does_not_hijack_to_prefix_extension() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // a37-foo: operator-named, no marker.
+        make_change(ws, "a37-foo");
+        // a37-foo-bar: prefix-extends a37-foo, carries the scope marker.
+        make_change(ws, "a37-foo-bar");
+        touch_marker(ws, "a37-foo-bar", NEEDS_REVISION_FILE);
+        let err = resolve_change_prefix(
+            ws,
+            "a37-foo",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap_err();
+        // Must be NoMatch — never Ok("a37-foo-bar"). The operator's
+        // exact-named identifier may not be silently upgraded.
+        assert_eq!(
+            err,
+            ResolvePrefixError::NoMatch {
+                scope: ChangePrefixMarkerScope::NeedsRevision
+            },
+            "exact-named directory without marker must NoMatch, not resolve to a prefix-extended sibling"
+        );
     }
 
     #[test]

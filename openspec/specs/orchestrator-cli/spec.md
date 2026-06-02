@@ -6470,7 +6470,10 @@ The per-action marker scope is:
 | `ignore_for_queue_marker` | `.perma-stuck.json` OR `.needs-spec-revision.json` |
 | `clear_ignore_for_queue_marker` | `.ignore-for-queue.json` |
 
-Resolution algorithm: when the supplied `change` value names a directory under `<workspace>/openspec/changes/` AND that directory carries any of the scope-required markers, the resolved value is the supplied value verbatim (fast-path). Otherwise, the handler enumerates the change-root directory (skipping the archive subdirectory AND dotfile entries, matching the canonical `list_pending` skip rules), filters to directories carrying any scope-required marker, AND collects entries whose name `str::starts_with` the supplied value (case-sensitive). A unique candidate is the resolved value. Zero candidates produce a `NoMatch` error. Two or more candidates produce a `MultiMatch` error with the candidate list sorted ascending.
+Resolution algorithm:
+
+1. **Exact-name path.** When the supplied `change` value names an existing directory under `<workspace>/openspec/changes/`, the resolution is bound to THAT directory and SHALL NOT fall through to prefix enumeration. If the named directory carries a scope-required marker, the resolved value is the supplied value verbatim (fast-path success). If it does NOT carry a scope-required marker, the resolver SHALL return `NoMatch` immediately. Falling through to prefix enumeration in this case is forbidden — doing so would let a longer prefix-extended sibling directory (e.g., `a37-foo-bar` when the operator typed exact `a37-foo`) silently hijack the operator-named slug.
+2. **Prefix-enumeration path.** Reached ONLY when the supplied value does NOT name an existing change directory. The handler enumerates the change-root directory (skipping the archive subdirectory AND dotfile entries, matching the canonical `list_pending` skip rules), filters to directories carrying any scope-required marker, AND collects entries whose name `str::starts_with` the supplied value (case-sensitive). A unique candidate is the resolved value. Zero candidates produce a `NoMatch` error. Two or more candidates produce a `MultiMatch` error with the candidate list sorted ascending.
 
 Error messages SHALL name the marker scope explicitly so the operator can act without consulting documentation: `no change matching prefix '<prefix>' has a .needs-spec-revision.json marker` for `clear_revision_marker`'s no-match path, AND analogous messages per action. The multi-match message SHALL list the candidates AND end with `Retype with a longer prefix or the full slug.`
 
@@ -6506,6 +6509,15 @@ When the supplied value exactly equals the canonical slug (the common case for o
 - **WHEN** the operator submits `clear_revision_marker` with `change: "a3"`
 - **THEN** the resolver returns `Err(MultiMatch { candidates: ["a37-foo", "a38-bar"] })`
 - **AND** the response is `{"ok": false, "error": "multiple changes match prefix 'a3': a37-foo, a38-bar. Retype with a longer prefix or the full slug."}`
+- **AND** no marker file is read or modified
+
+#### Scenario: Exact-named directory without scope marker is NoMatch (never a prefix-extension)
+- **GIVEN** the workspace contains `a37-foo/` (no `.needs-spec-revision.json` marker) AND `a37-foo-bar/.needs-spec-revision.json`
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a37-foo"` (an exact directory name)
+- **THEN** the resolver returns `Err(NoMatch { scope: NeedsRevision })` against the operator-named directory
+- **AND** the resolver does NOT fall through to prefix enumeration
+- **AND** the resolver does NOT return `Ok("a37-foo-bar")` — the prefix-extended sibling MUST NOT silently substitute for the operator-named slug
+- **AND** the response is `{"ok": false, "error": "no change matching prefix 'a37-foo' has a .needs-spec-revision.json marker"}`
 - **AND** no marker file is read or modified
 
 #### Scenario: Per-action scope isolates markers correctly
