@@ -7,7 +7,7 @@
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/master/install.sh | bash
 ```
 
 The one-liner downloads a pre-built binary, verifies its SHA-256, places it at `/usr/local/bin/autocoder` (or `~/.local/bin/autocoder` if `sudo` is unavailable or `--user` is passed), then execs `autocoder install`. **The bootstrap script is intentionally tiny (~75 lines, no operator prompts).** Everything else — the configuration wizard, `useradd`/`systemctl`/`apt-get`, optional Claude CLI bootstrap — lives in the `autocoder install` Rust subcommand which ships with `cargo test` coverage.
