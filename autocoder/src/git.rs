@@ -86,45 +86,102 @@ pub fn fetch_remote_with_timeout(
     remote: &str,
     timeout_secs: u64,
 ) -> Result<()> {
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .args(["fetch", remote])
         .current_dir(workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning `git fetch {remote}` in {}", workspace.display()))?;
+
+    let output = wait_capture_with_timeout(child, &format!("git fetch {remote}"), timeout_secs)?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr_s = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(anyhow!("git fetch {remote} failed: {stderr_s}"))
+}
+
+/// Wait for `child` to exit within `timeout_secs`, draining its stdout
+/// AND stderr concurrently so the captured output is bounded only by
+/// memory — NOT by the OS pipe buffer (~64 KiB on Linux).
+///
+/// The caller spawns `child` with both stdout and stderr set to
+/// `Stdio::piped()`; this helper immediately moves each pipe into its own
+/// reader thread that `read_to_end`s into a `Vec<u8>`. It then polls
+/// `try_wait()` on a 100 ms cadence against a deadline of
+/// `Instant::now() + timeout_secs`, WITHOUT touching the pipes in the
+/// loop. Reading concurrently is the whole point: if we instead read only
+/// after the child exits (as the previous inline loop did), a child that
+/// writes more than one pipe buffer before exiting blocks on `write()`
+/// while we block on `try_wait()` — a reader/writer deadlock that escapes
+/// only when the deadline fires, misreporting a healthy-but-large fetch
+/// as a timeout.
+///
+/// On clean exit the reader threads are joined and an `Output` is
+/// returned. On deadline the child is killed AND reaped (which closes the
+/// pipe write ends so the readers reach EOF), the readers are joined to
+/// avoid leaks, and a timeout `Err` is returned. A `try_wait()` error is
+/// surfaced after likewise joining the readers.
+fn wait_capture_with_timeout(
+    mut child: std::process::Child,
+    op_label: &str,
+    timeout_secs: u64,
+) -> Result<Output> {
+    // Start one reader thread per pipe. A read error yields empty bytes
+    // (the child's exit status is still authoritative).
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                match s.read_to_end(&mut buf) {
+                    Ok(_) => buf,
+                    Err(_) => Vec::new(),
+                }
+            })
+        })
+    }
+
+    // Join a reader thread, treating a join error (panicked thread) as
+    // empty bytes so a reader can never block the caller's return.
+    fn collect(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+        handle.and_then(|h| h.join().ok()).unwrap_or_default()
+    }
+
+    let stdout_handle = drain(child.stdout.take());
+    let stderr_handle = drain(child.stderr.take());
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut s) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_end(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_end(&mut stderr);
-                }
-                if status.success() {
-                    return Ok(());
-                }
-                let stderr_s = String::from_utf8_lossy(&stderr).trim().to_string();
-                return Err(anyhow!("git fetch {remote} failed: {stderr_s}"));
+                let stdout = collect(stdout_handle);
+                let stderr = collect(stderr_handle);
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(anyhow!(
-                        "git fetch {remote} timed out after {timeout_secs}s"
-                    ));
+                    // The killed child closed its pipe write ends, so both
+                    // readers reach EOF; join them so neither is leaked.
+                    let _ = collect(stdout_handle);
+                    let _ = collect(stderr_handle);
+                    return Err(anyhow!("{op_label} timed out after {timeout_secs}s"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                return Err(anyhow!("waiting on `git fetch {remote}`: {e}"));
+                let _ = collect(stdout_handle);
+                let _ = collect(stderr_handle);
+                return Err(anyhow!("waiting on `{op_label}`: {e}"));
             }
         }
     }
@@ -1391,5 +1448,54 @@ mod tests {
             !msg.ends_with("failed: "),
             "error must NOT end in a bare colon-space: {msg:?}"
         );
+    }
+
+    /// Regression test for the pipe deadlock: a child that writes far more
+    /// than the OS pipe buffer (~64 KiB) before exiting must complete and
+    /// surface its captured output, NOT escape only via the timeout. If
+    /// the concurrent drain regressed to read-after-exit, the child would
+    /// block on the full stderr pipe, `try_wait()` would never report
+    /// exit, and this would fail closed with a timeout `Err`.
+    #[test]
+    fn wait_capture_drains_more_than_pipe_buffer_without_timeout() {
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 5000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' 1>&2; i=$((i+1)); done; exit 1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_capture_with_timeout(child, "test fetch", 30)
+            .expect("large-output child must complete, not time out");
+        assert!(
+            !output.status.success(),
+            "child exits non-zero; status was {:?}",
+            output.status
+        );
+        assert!(
+            output.stderr.len() > 64 * 1024,
+            "expected >64 KiB of captured stderr, got {} bytes",
+            output.stderr.len()
+        );
+    }
+
+    /// The genuine-timeout path still kills the child and reports a
+    /// timeout when the process never exits within the window.
+    #[test]
+    fn wait_capture_reports_timeout_when_child_never_exits() {
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = wait_capture_with_timeout(child, "test sleep", 1)
+            .expect_err("a child that never exits must time out");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed out after 1s"), "got: {msg}");
     }
 }
