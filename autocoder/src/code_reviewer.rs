@@ -144,7 +144,10 @@ pub struct CodeReviewer {
     auto_revise: bool,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
-    max_code_reviews_per_pr: u32,
+    /// Per-PR cap on operator-initiated re-reviews. `None` means UNLIMITED
+    /// (the default) — re-reviews are deliberate operator actions with no
+    /// runaway path, so the cap is opt-in only.
+    max_code_reviews_per_pr: Option<u32>,
     suggest_rereview_threshold: Option<f32>,
     /// a34 §6: cost-optimization knob. When `true`, the polling
     /// iteration skips the reviewer call for any PR whose diff lives
@@ -160,14 +163,15 @@ impl CodeReviewer {
             auto_revise: false,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
+            max_code_reviews_per_pr: None,
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         }
     }
 
-    /// Builder-style setter for the per-PR re-review cap.
-    pub fn with_max_code_reviews_per_pr(mut self, cap: u32) -> Self {
+    /// Builder-style setter for the per-PR re-review cap. `None` means
+    /// unlimited (the default).
+    pub fn with_max_code_reviews_per_pr(mut self, cap: Option<u32>) -> Self {
         self.max_code_reviews_per_pr = cap;
         self
     }
@@ -178,8 +182,9 @@ impl CodeReviewer {
         self
     }
 
-    /// Per-PR cap on operator-initiated re-reviews (a33).
-    pub fn max_code_reviews_per_pr(&self) -> u32 {
+    /// Per-PR cap on operator-initiated re-reviews (a33/a47). `None` means
+    /// unlimited (the default).
+    pub fn max_code_reviews_per_pr(&self) -> Option<u32> {
         self.max_code_reviews_per_pr
     }
 
@@ -1086,7 +1091,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1112,7 +1117,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: true,
         };
@@ -1182,7 +1187,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1218,7 +1223,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1257,7 +1262,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1301,7 +1306,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1328,7 +1333,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };

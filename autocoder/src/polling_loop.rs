@@ -5032,11 +5032,11 @@ async fn open_pull_request(
                     pr_number: pr.number,
                     agent_branch: repo.agent_branch.clone(),
                     last_seen_comment_at: now,
-                    revisions_applied: 0,
+                    auto_revisions_applied: 0,
                     revision_cap: 5,
                     cap_decline_posted: false,
                     code_reviews_applied: 0,
-                    code_review_cap: 5,
+                    code_review_cap: Some(5),
                     cap_decline_posted_for_code_review: false,
                     last_suggested_rereview_at_revisions_count: None,
                     original_review_head_sha: Some(head_sha),
@@ -16082,7 +16082,7 @@ mod tests {
     }
 
     /// 3-change per-change pass with 2 revision requests per change AND
-    /// `max_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
+    /// `max_auto_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
     /// "(not auto-revised; cap budget exhausted)" inside its OWN per-
     /// change section (not the bundled markdown).
     #[test]
