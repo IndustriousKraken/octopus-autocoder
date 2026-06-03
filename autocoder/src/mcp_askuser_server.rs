@@ -63,6 +63,38 @@ pub fn qualified_tool_name(tool: &str) -> String {
     format!("mcp__{SERVER_NAME}__{tool}")
 }
 
+// ---------------------------------------------------------------------------
+// Outcome-tool `description` text (a44).
+//
+// These three constants are the single source of truth for the `description`
+// field of each outcome tool in the `tools/list` response below. They are the
+// PRIMARY surface for shaping agent behaviour: the agent reads them to decide
+// how to use each tool, so they SHALL stay operationally focused (what to do,
+// what content to produce) and SHALL NOT carry narrative history about prior
+// failure modes or legacy mechanisms.
+//
+// The a44 canonical executor requirement pins load-bearing markers each string
+// MUST contain AND MUST NOT contain. Future contributors MAY reword for clarity
+// or style, but MUST preserve the required substrings AND avoid the forbidden
+// ones — the `outcome_descriptions_satisfy_marker_rules` regression test (in the
+// test module) fails the build otherwise. The required/forbidden table lives in
+// that test as `OUTCOME_DESCRIPTION_MARKERS`.
+//   - outcome_success: contains `final_answer`, `summary`, `PR`;
+//     never `IS the signal` or `no result inspection`.
+//   - outcome_request_iteration: contains `iteration`, `completed`,
+//     `remaining`, `reason`; never `honestly`.
+//   - outcome_spec_needs_revision: contains `tasks.md`, `placeholder`,
+//     `MCP layer`; never `legacy` or `AUTOCODER-OUTCOME`.
+
+/// `description` for the `outcome_success` tool. See the a44 marker contract above.
+pub(crate) const OUTCOME_SUCCESS_DESCRIPTION: &str = "Signal successful completion of the implementation run. Pass `final_answer` with a substantive end-of-run summary (10-20 lines: what you implemented, test counts, clippy + `openspec validate` results, judgment calls, follow-ups). This text becomes the per-change body of the PR's `## Agent implementation notes` section AND is the reviewer's primary surface. Call once on the success path before exiting.";
+
+/// `description` for the `outcome_request_iteration` tool. See the a44 marker contract above.
+pub(crate) const OUTCOME_REQUEST_ITERATION_DESCRIPTION: &str = "Signal that you completed some tasks but want another iteration to finish the rest. NOT for unimplementable tasks (use `outcome_spec_needs_revision` for those). The cumulative completed/remaining lists carry forward across iterations; the reason field documents the concrete blocker. Input is schema-validated at the MCP layer; empty arrays AND placeholder-shaped strings (e.g. `<concrete blocker>`) are rejected with a tool error you can correct AND retry in the same session.";
+
+/// `description` for the `outcome_spec_needs_revision` tool. See the a44 marker contract above.
+pub(crate) const OUTCOME_SPEC_NEEDS_REVISION_DESCRIPTION: &str = "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error you can correct AND retry in the same session.";
+
 /// 10-second timeout for the control-socket round trip (read + write).
 const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -167,7 +199,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_success",
-                        "description": "Signal explicit successful completion of the implementation run. Call once at end-of-run on the success path; the optional `final_answer` carries the agent's end-of-run summary for log capture AND PR-comment rendering. Calling this tool IS the signal; no result inspection is required.",
+                        "description": OUTCOME_SUCCESS_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -180,7 +212,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_request_iteration",
-                        "description": "Signal that you completed some tasks but want another iteration to finish the rest. Use this when you started implementation honestly but ran out of capacity in this iteration — NOT for unimplementable tasks (use `outcome_spec_needs_revision` for those). The cumulative completed/remaining lists carry forward across iterations; the reason field documents the concrete blocker. Input is schema-validated at the MCP layer; empty arrays and placeholder-shaped strings (e.g. `<concrete blocker>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "description": OUTCOME_REQUEST_ITERATION_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -206,7 +238,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_spec_needs_revision",
-                        "description": "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Use this INSTEAD OF emitting the legacy `=== AUTOCODER-OUTCOME ===` stdout block. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "description": OUTCOME_SPEC_NEEDS_REVISION_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -1646,4 +1678,142 @@ mod tests {
             std::env::remove_var(ENV_WORKSPACE_BASENAME);
         }
     }
+
+    // ----- a44: outcome-tool description marker rules -----
+
+    /// Required AND forbidden substrings for each outcome tool's `description`
+    /// field, per the a44 canonical executor requirement. Each tuple is
+    /// `(tool_name, required_substrings, forbidden_substrings)`. This table is
+    /// the binding contract; the prose in the description constants is free to
+    /// change as long as these rules hold.
+    const OUTCOME_DESCRIPTION_MARKERS: &[(&str, &[&str], &[&str])] = &[
+        (
+            "outcome_success",
+            &["final_answer", "summary", "PR"],
+            &["IS the signal", "no result inspection"],
+        ),
+        (
+            "outcome_request_iteration",
+            &["iteration", "completed", "remaining", "reason"],
+            &["honestly"],
+        ),
+        (
+            "outcome_spec_needs_revision",
+            &["tasks.md", "placeholder", "MCP layer"],
+            &["legacy", "AUTOCODER-OUTCOME"],
+        ),
+    ];
+
+    /// Check one tool's description against its marker rules, appending a
+    /// human-readable line to `violations` for each failed check (missing
+    /// required OR present forbidden). Reused by both the static regression
+    /// test (task 2) AND the rendered-output smoke test (task 3) so the two
+    /// stay in lockstep AND both emit a combined listing.
+    fn collect_description_marker_violations(
+        tool: &str,
+        description: &str,
+        required: &[&str],
+        forbidden: &[&str],
+        violations: &mut Vec<String>,
+    ) {
+        for needle in required {
+            if !description.contains(*needle) {
+                violations.push(format!(
+                    "{tool}: missing required substring '{needle}'"
+                ));
+            }
+        }
+        for needle in forbidden {
+            if description.contains(*needle) {
+                violations.push(format!(
+                    "{tool}: forbidden substring '{needle}' is present"
+                ));
+            }
+        }
+    }
+
+    /// Resolve a tool name to its description constant — the single source of
+    /// truth the `tools/list` response renders from.
+    fn description_constant_for(tool: &str) -> &'static str {
+        match tool {
+            "outcome_success" => OUTCOME_SUCCESS_DESCRIPTION,
+            "outcome_request_iteration" => OUTCOME_REQUEST_ITERATION_DESCRIPTION,
+            "outcome_spec_needs_revision" => OUTCOME_SPEC_NEEDS_REVISION_DESCRIPTION,
+            other => panic!("no description constant for tool `{other}`"),
+        }
+    }
+
+    #[test]
+    fn outcome_descriptions_satisfy_marker_rules() {
+        // Task 2: pure, deterministic assertion against the static description
+        // constants — no run_with, no socket, no env. Produces a COMBINED
+        // failure listing so a contributor editing several descriptions sees
+        // every violation (tool + failed check + offending substring) in one
+        // run rather than first-failure-only.
+        let mut violations = Vec::new();
+        for &(tool, required, forbidden) in OUTCOME_DESCRIPTION_MARKERS {
+            collect_description_marker_violations(
+                tool,
+                description_constant_for(tool),
+                required,
+                forbidden,
+                &mut violations,
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "outcome-tool description marker rules violated:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn tools_list_rendered_descriptions_match_constants_and_markers() {
+        // Task 3: smoke test against the rendered tools/list response. Drives
+        // the server in-process via a real tools/list JSON-RPC request, then
+        // asserts each outcome tool's rendered `description` (a) equals its
+        // source constant — catching drift between the static fixture used in
+        // task 2 AND the actual rendered output — AND (b) satisfies the same
+        // marker rules through the real render+serialize path. Deterministic:
+        // tools/list contacts no socket and reads no env.
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":300,"method":"tools/list"}"#],
+        );
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+
+        let mut violations = Vec::new();
+        for &(tool, required, forbidden) in OUTCOME_DESCRIPTION_MARKERS {
+            let tool_obj = tools
+                .iter()
+                .find(|t| t["name"] == tool)
+                .unwrap_or_else(|| panic!("tools/list missing tool `{tool}`"));
+            let rendered = tool_obj["description"].as_str().unwrap_or_else(|| {
+                panic!("tool `{tool}` description is not a string in tools/list")
+            });
+            // Rendered output MUST match the source constant verbatim — this is
+            // what makes the static task-2 assertion trustworthy.
+            if rendered != description_constant_for(tool) {
+                violations.push(format!(
+                    "{tool}: rendered tools/list description drifted from its source constant"
+                ));
+            }
+            collect_description_marker_violations(
+                tool,
+                rendered,
+                required,
+                forbidden,
+                &mut violations,
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "rendered tools/list description checks failed:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    // ----- end a44 -----
 }
