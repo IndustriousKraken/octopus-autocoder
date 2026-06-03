@@ -1706,22 +1706,25 @@ autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit fra
 ### Requirement: Security & bug audit
 autocoder SHALL register a `security_bug_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with an OpenSpec-only sandbox and a security-and-bug-detection prompt; it creates new OpenSpec change directories under `openspec/changes/` describing proposed fixes, commits them, and returns the change names so the same iteration implements them. The audit is `requires_head_change = true` and `WritePolicy::OpenSpecOnly`.
 
-#### Scenario: Prompt instructs confidence-filtered output
-- **WHEN** the prompt is loaded
-- **THEN** the prompt explicitly states:
-  - "Only report findings you are reasonably confident about. A
-    false positive becomes wasted implementer work downstream;
-    err strongly on the side of NOT reporting if you're uncertain."
-  - "Do NOT propose stylistic 'best-practice' changes that don't
-    address a concrete security issue or bug."
-- **AND** the prompt provides categorical guidance: which
-  categories are in-scope (injection, auth/authz mistakes,
-  hard-coded secrets, unsafe deserialization, missing input
-  validation at trust boundaries, race conditions, resource
-  leaks, off-by-one, wrong operator, mishandled None/null,
-  missing error propagation) and which are out-of-scope (code
-  style, naming, architectural opinions, performance unless
-  measurable, anything the project has explicitly accepted)
+The prompt's confidence-filtering and scope guidance below is design intent verified by the drift audit's semantic judgment; it SHALL NOT be pinned by a unit test asserting verbatim substrings of the prompt (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
+
+#### Scenario: Prompt steers the agent toward high-confidence, in-scope findings
+- **WHEN** the security-bug audit prompt is loaded
+- **THEN** it instructs the agent to report only findings it is
+  reasonably confident about and to err toward NOT reporting when
+  uncertain, because a false positive becomes wasted implementer
+  work downstream
+- **AND** it instructs the agent not to propose stylistic
+  "best-practice" changes that do not address a concrete security
+  issue or bug
+- **AND** it scopes findings to concrete in-scope categories
+  (injection, auth/authz mistakes, hard-coded secrets, unsafe
+  deserialization, missing input validation at trust boundaries,
+  race conditions, resource leaks, off-by-one, wrong operator,
+  mishandled None/null, missing error propagation) and excludes
+  out-of-scope categories (code style, naming, architectural
+  opinions, performance unless measurable, anything the project
+  has explicitly accepted)
 
 #### Scenario: Created changes use fix- or secure- prefix
 - **WHEN** the audit creates a change for a proposed fix

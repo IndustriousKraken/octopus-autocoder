@@ -95,18 +95,13 @@ The code-reviewer SHALL accept a structured `ReviewContext` containing the archi
 ### Requirement: Default prompt template enforces code-quality scope
 The code-reviewer SHALL ship a default prompt template that explicitly limits the review to code-quality concerns and instructs the LLM not to assess spec compliance. The template SHALL use the `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders.
 
-#### Scenario: Default template is shipped with the binary
-- **WHEN** autocoder binary is built
-- **THEN** a file named `prompts/code-review-default.md` is included
-  in the project repository at the relative path
-  `prompts/code-review-default.md`
-- **AND** the template's text contains the literal scope statement:
-  `"You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."`
-- **AND** the template specifies the required response format: a
-  verdict line followed by markdown bullets
-- **AND** the template references all three placeholders
-  (`{{change_context}}`, `{{changed_files}}`, `{{diff}}`) at least
-  once
+The scope-limiting intent — that the default template confines the review to code quality and instructs the model not to assess spec compliance — is design intent captured by this requirement and verified by the drift audit's semantic judgment. It SHALL NOT be verified by a unit test asserting a verbatim substring of the template's instruction prose (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`). The placeholder references, being behavior-relevant (the substitution code fills them), SHALL be verified by rendering the real default with sentinel inputs and asserting the substituted values appear — never by asserting the surrounding wording.
+
+#### Scenario: Default template is shipped and substitutes every placeholder
+- **WHEN** the autocoder binary is built AND the default template is rendered with a distinct sentinel value supplied for each of `{{change_context}}`, `{{changed_files}}`, AND `{{diff}}`
+- **THEN** a file named `prompts/code-review-default.md` is included in the project repository at the relative path `prompts/code-review-default.md`
+- **AND** the rendered output contains each placeholder's sentinel value, proving the shipped default references all three placeholders at least once
+- **AND** the test asserts only the substituted sentinel values, NOT any hand-authored instruction wording of the template (the scope-limiting intent is verified by the drift audit, not a substring check)
 
 #### Scenario: User-provided template overrides default
 - **WHEN** `reviewer.prompt_template_path` is set in config

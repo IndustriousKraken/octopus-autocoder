@@ -327,33 +327,6 @@ mod tests {
         assert_eq!(bare.max_proposals_per_run, DEFAULT_MAX_PROPOSALS_PER_RUN);
     }
 
-    /// The prompt must contain the confidence-filter and out-of-scope
-    /// instructions: without them, the audit's noise floor would be
-    /// unacceptable. Asserts on the embedded default so accidental
-    /// prompt drift breaks CI rather than the operator's mailbox.
-    #[test]
-    fn low_confidence_finding_filtering_explicit_in_prompt() {
-        let cfg = executor_cfg("/bin/true");
-        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg);
-        let prompt = audit.resolve_prompt(None).expect("default prompt resolves");
-        assert!(
-            prompt.contains("Only emit a change for findings you are highly confident about"),
-            "prompt must instruct high-confidence filter: {prompt}"
-        );
-        assert!(
-            prompt.contains("false positive wastes downstream implementer work"),
-            "prompt must explain WHY low-confidence findings are harmful: {prompt}"
-        );
-        assert!(
-            prompt.contains("When in doubt, DON'T emit"),
-            "prompt must explicitly tell the agent to drop uncertain findings: {prompt}"
-        );
-        assert!(
-            prompt.contains("Do NOT propose stylistic"),
-            "prompt must forbid stylistic 'best-practice' suggestions: {prompt}"
-        );
-    }
-
     // ------------- Full-run scenarios -------------
 
     #[tokio::test]
