@@ -1266,9 +1266,10 @@ pub enum CodeReviewOutcome {
 /// [`execute_revision`]. Fetches the PR's current state, invokes
 /// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
 /// reviewer's output as a fresh PR comment with the canonical
-/// `## Code Review (rerun N of M)` heading. On `Block` + the reviewer's
-/// `auto_revise_on_block` flag, also posts per-concern
-/// `<!-- reviewer-revision -->`-marked comments.
+/// `## Code Review (rerun N of M)` heading. When the reviewer's
+/// `auto_revise` flag is set, also posts per-concern
+/// `<!-- reviewer-revision -->`-marked comments for every actionable
+/// concern, regardless of the verdict.
 #[allow(clippy::too_many_arguments)]
 async fn execute_code_review(
     workspace: &Path,
@@ -1332,19 +1333,20 @@ async fn execute_code_review(
             reason: format!("PR comment post failed: {e}"),
         });
     }
-    // On Block + auto_revise_on_block, post one
-    // `<!-- reviewer-revision -->`-marked PR comment per actionable concern.
-    if matches!(result.verdict, crate::code_reviewer::Verdict::Block)
-        && reviewer.auto_revise_on_block()
-    {
+    // When `reviewer.auto_revise` is enabled, post one
+    // `<!-- reviewer-revision -->`-marked PR comment per actionable
+    // concern — REGARDLESS of the verdict, mirroring the initial-review
+    // partition logic. A concern is actionable when it carries
+    // `should_request_revision: true` AND a non-empty `actionable_request`.
+    if reviewer.auto_revise() {
         for concern in &result.concerns {
             if !concern.should_request_revision {
                 continue;
             }
-            let request = concern
-                .actionable_request
-                .as_deref()
-                .unwrap_or(concern.summary.as_str());
+            let request = match concern.actionable_request.as_deref() {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => continue,
+            };
             let comment_body = format!(
                 "{REVIEWER_REVISION_MARKER}\n@{bot_label} revise {request}",
                 bot_label = "<bot>", // dispatcher rewrites mention upstream
@@ -4236,5 +4238,124 @@ mod tests {
         let calls = stub.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "C-team-alpha");
+    }
+
+    /// a46 task 3.6: the re-review (rerun) path has its own reviewer-revision
+    /// posting logic. Verify it fires on a `Concerns` verdict (not just
+    /// `Block`) when `reviewer.auto_revise` is enabled: a re-review that
+    /// returns `Concerns` with one actionable concern posts BOTH the rerun
+    /// `## Code Review (rerun N of M)` comment AND exactly one
+    /// `<!-- reviewer-revision -->`-marked comment carrying the actionable
+    /// request.
+    #[tokio::test]
+    async fn rerun_concerns_verdict_with_actionable_concern_posts_reviewer_revision() {
+        // Stub LLM client returning a Concerns review with one actionable
+        // concern. The reviewer ignores the (empty) diff context.
+        struct ReviewStub {
+            response: String,
+        }
+        #[async_trait]
+        impl crate::llm::LlmClient for ReviewStub {
+            async fn complete(&self, _prompt: &str) -> anyhow::Result<String> {
+                Ok(self.response.clone())
+            }
+        }
+        let response = r#"VERDICT: Concerns
+
+## Possible bugs
+- do_thing drops the error context.
+
+```revision-requests
+- summary: "do_thing drops the error context"
+  actionable_request: "propagate the error from do_thing via anyhow::Context"
+  should_request_revision: true
+```
+"#;
+        let reviewer = CodeReviewer::new(
+            Box::new(ReviewStub {
+                response: response.to_string(),
+            }),
+            "review the code".to_string(),
+        )
+        .with_auto_revise(true);
+
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+
+        let mut server = mockito::Server::new_async().await;
+        // The rerun `## Code Review` heading comment.
+        let rerun_mock = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::Regex(
+                r"Code Review \(rerun 1 of 5\)".to_string(),
+            ))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        // Exactly one reviewer-revision-marked comment for the actionable
+        // concern — fired under a Concerns verdict (the decoupling).
+        let revision_mock = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::Regex(
+                "reviewer-revision.*propagate the error from do_thing".to_string(),
+            ))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let pr = github::PrSummary {
+            number: 77,
+            title: "t".to_string(),
+            url: "https://github.com/owner/repo/pull/77".to_string(),
+            state: "open".to_string(),
+            body: None,
+            created_at: ts("2026-05-25T10:00:00Z"),
+            head: github::PrRefSummary {
+                ref_: "agent-q".to_string(),
+            },
+            base: github::PrRefSummary {
+                ref_: "main".to_string(),
+            },
+        };
+        let mut state = sample_state(77);
+
+        let outcome = execute_code_review(
+            &ws,
+            &repo,
+            Some(&reviewer),
+            &pr,
+            &[],
+            &mut state,
+            &server.url(),
+            "test-token",
+            "owner",
+            "repo",
+        )
+        .await
+        .expect("execute_code_review succeeds");
+
+        // A `Concerns` `ReviewVerdict` collapses to the coarse
+        // `Verdict::Approve` (only `Block` maps to `Verdict::Block`). The
+        // old rerun gate `matches!(result.verdict, Verdict::Block)` was
+        // therefore false here — proving the decoupling: the
+        // reviewer-revision comment must still post under a non-Block
+        // outcome, which `revision_mock.assert_async()` confirms.
+        assert!(
+            matches!(
+                outcome,
+                CodeReviewOutcome::Completed {
+                    verdict: crate::code_reviewer::Verdict::Approve
+                }
+            ),
+            "expected a completed non-Block review, got {outcome:?}"
+        );
+        rerun_mock.assert_async().await;
+        revision_mock.assert_async().await;
+        assert_eq!(state.code_reviews_applied, 1);
     }
 }
