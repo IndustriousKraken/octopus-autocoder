@@ -94,30 +94,36 @@ Top-level `models:` registry; nickname references discriminated by presence of `
 ### 3. Extract the agentic-run primitive + CLI-strategy trait + submission MCP infra — AUTHORED as `a56-extract-agentic-run-primitive`
 Collapses the five `run_subprocess` copies (executor + 4 audits) into one `agentic_run`; `CliStrategy` trait + claude impl (model selection via ANTHROPIC_* env, none when no model → CLI-default preserved); per-role submission MCP framework (relay via control-socket `record_submission`/`consume_submission`, role-scoped advertisement via `ORCH_MCP_ROLE`). Behavior-neutral extraction + additive surface; concrete `submit_*` tools land with their roles (4/5/6/8). executor + orchestrator-cli deltas. Validated.
 
-**Numbering for the rest:** change 4 = a57, 5 = a58, 6 = a59, 7 = a60, 8 = a61(+).
+**Numbering for the rest:** change 4 = a57, 5 = a58, 6 = a59, 7 = a60, 8 = a61/a62/a63. All AUTHORED + `--strict`-valid.
 
-### 4. Migrate audits stdout-JSON → `submit_findings` MCP
-Move drift, architecture_consultative, documentation_audit, AND the specs-writing audits (missing_tests, security_bug) off fragile stdout-JSON onto `submit_findings` / `submit_*`. Kills the confabulation-on-weak-models risk across the fleet. Depends on 3.
+### 4. Migrate audits stdout-JSON → `submit_findings` MCP — AUTHORED as `a57-advisory-audits-submit-findings`
+The three ADVISORY audits (drift, architecture_consultative, documentation_audit) move onto `submit_findings`; their orchestrator-cli requirements are MODIFIED (transport stdout-JSON → submit_findings; "malformed stdout fails" → "no valid submission fails", a schema-reject now an in-session correctable). The specs-writing audits (missing_tests, security_bug) stay no-MCP — they emit on-disk proposals, not findings, so they are explicitly OUT of a57's scope (the original "+ specs-writing audits" framing was dropped). Advisory audits switch to `agentic_run` WITH MCP (capture mode). Stacks on a56.
 
-### 5. Agentic reviewer (`kind: agentic` default, claude-only)
-Reviewer on the primitive: read-only sandbox, reads files on demand (no 2M-char truncation), `submit_review` structured output. Preserve the full downstream contract: `reviewer.mode: per_change`, auto-revise (post-#1 semantics), the `@<bot> code-review` re-review verb. Retain `kind: oneshot` as fallback. Depends on 3 (and ideally 1 + 4).
+### 5. Agentic reviewer — AUTHORED as `a58-agentic-reviewer`
+`reviewer.kind: oneshot | agentic` (default `oneshot`). Agentic: read-only sandbox `Read`/`Glob`/`Grep` (NO Bash — resolves the open question below), diff + briefs + file-list prompt, files read on demand (no 2M truncation, `prompt_budget_chars` N/A), `submit_review`. Preserves `reviewer.mode: per_change`, auto-revise, `@<bot> code-review`, caps. No-valid-submission → discard + alert (this is the agentic retirement of the malformed-verdict-defaults-to-approve bug). MODIFY `AI-driven code-quality review` (scoped to oneshot) + ADD `Agentic reviewer mode`. Default flip to agentic is deferred (Anthropic-only until a60) and left as a deliberate operator choice, NOT auto-flipped. Stacks on a55 + a56.
 
-### 6. Agentic contradiction-check (second one-shot holdout → primitive)
-Move `change_internal_contradiction_check` off `LlmClient.complete()` onto the primitive with `submit_contradictions`. Depends on 3.
+### 6. Agentic contradiction-check — AUTHORED as `a59-agentic-contradiction-check`
+`change_internal_contradiction_check` off `LlmClient.complete()` onto `agentic_run` + `submit_contradictions`, read-only sandbox. Migrated wholesale (no `kind` selector) because the check is fail-open: a not-yet-registered strategy (non-Anthropic pre-a60) degrades to a logged no-op, never a break. Stacks on a55 + a56.
 
-### 7. OpenCode CLI strategy (provider-agnostic)
-Second `CliStrategy` implementation: opencode. Unlocks agentic + OpenRouter/Qwen/Ollama + context for every role. The model-diversity enabler — without it, agentic runs are Anthropic-only, which defeats the cross-check purpose. Conformant MCP-config generation for opencode is the main work (each CLI gets its own config-file format). Depends on 3; sorts late but is in-stream, not deferred.
+### 7. OpenCode CLI strategy — AUTHORED as `a60-opencode-cli-strategy`
+`OpencodeStrategy` (second `CliStrategy`): `opencode run`, `--model provider/model`, `opencode.json` (mcp + provider), sandbox→opencode-permissions mapping, capture mode (streaming stays claude). Registering it unblocks the non-Anthropic agentic paths of a58/a59 (pure-ADD: a56/a58/a59 "no registered strategy errors" scenarios were generalized to be timeless so a60 needs no cascade MODIFY). Spike TASKS gate three headless-opencode unknowns (prompt delivery; MCP tool-call surfacing; correctable tool errors). Stacks on a55 + a56.
 
-### 8. Verifier trio on the primitive (may split into multiple changes)
-Three boundary gates, same shape, each a `submit_verdict` role: (a) change-internal consistency [in] — supersedes/absorbs the contradiction-check; (b) change-vs-canon contradiction [in] — the RAG-pre-flight already sketched earlier in this file; (c) did-the-code-implement-the-spec [out] — the aspirational verifier from the README roadmap. Well-bounded gates can run super-budget models (Ollama via opencode). Depends on 3 + 7 (for budget models). Keep mentally distinct from the reviewer (code quality) — different lens, different verdict semantics.
+### 8. Verifier-gate framework + trio — AUTHORED as `a61` / `a62` / `a63` (split: three changes)
+Decision (asked): **three changes**, and the `[out]` gate is **advisory** (annotates, never auto-acts). Lifecycle: `change ─[in]→ self-consistent? ─[canon]→ contradicts canon? ─► executor ─[out]→ code implements spec?`
+- **a61 `verifier-gate-framework`** — thin reframe: names the three gates (`[in]`/`[canon]`/`[out]`), lifecycle positions, fail-open-vs-advisory posture, per-gate diagnostic labels; assigns `[in]` to the a59 check; `[canon]`/`[out]` inert until a62/a63. No config rename, no a59 reproduction. Stacks on a59.
+- **a62 `change-vs-canonical-gate`** — `[canon]` pre-flight: opt-in, fail-open, agentic `submit_canon_contradictions`, marker+alert+halt on a real finding (mirrors a59's disposition). Canon access follows the docs-audit pattern: direct `Read` of `openspec/specs`, `query_canonical_specs` opportunistically when a21 RAG is on (NOT a hard RAG dependency). Stacks on a56 + a61.
+- **a63 `code-implements-spec-gate`** — `[out]` post-executor verifier (the step the reviewer defers to): opt-in, ADVISORY, agentic `submit_verdict`, renders a `## Spec Verification` PR section + chatops note on gaps; never revises, never blocks. Stacks on a56 + a61.
+
+### 9. Flip reviewer default to agentic — AUTHORED as `a64-reviewer-agentic-by-default`
+Follow-on to change 5. `reviewer.kind` default `oneshot` → `agentic`, now safe because a60 makes agentic provider-agnostic. Upgrade-safe: when the effective kind is agentic but the resolved reviewer CLI is unavailable at startup (unregistered strategy OR missing binary), the reviewer falls back to `oneshot` HTTP for that boot with ONE loud WARN — review never disabled (every provider has a working HTTP client). Replaces a58's "unregistered strategy → error" scenario with graceful fallback (reviewer role only; the gate roles keep fail-open/advisory). MODIFY `Agentic reviewer mode`. Stacks on a58 + a60.
 
 ## Default prompts assume Rust/this-project tooling — AUTHORED as `a51-language-neutral-default-prompts`
 
 Detect-and-run approach (the TODO's preferred "mix" default): a project-documentation requirement states default prompts name the project's own tooling (detected from the build config), not a specific toolchain; `openspec validate --strict` stays (shared). Drift-audited, no content test (a negative "no `cargo`" scanner is unenumerable AND the wording-assertion anti-pattern). Sweeps `prompts/`; concrete fixes in `implementer.md` (`cargo clippy` ×2) and `brownfield-draft.md` (`cargo test`). Per-repo tooling-config override deferred to a future change. SHOULD land after a45 to also clean a45's worked example.
 
-## Open design questions to resolve while authoring
+## Open design questions — RESOLVED while authoring
 
-- **Submit-tool relay vs in-process.** The executor's outcome tools relay to the daemon via the control socket. Reviewer/audit submit tools — same relay, or a lighter in-process capture? The relay buys uniformity AND daemon-side ownership of results.
-- **Per-role sandbox toolsets.** All get Read/Grep/Glob + query_canonical_specs. Does the reviewer get `Bash` (to run a build/test) or stay strictly read-only? The audits get Bash today; the reviewer historically did not.
-- **Registry migration ergonomics.** Hard cutover to nicknames, or indefinite dual-acceptance of inline + registry? Affects how aggressively change 2 rewrites existing configs.
-- **opencode MCP maturity.** Spike: confirm opencode's MCP-tool support is robust enough to carry a validated `submit_*` before committing change 7's design (knowledge-cutoff caveat — verify against the current opencode release).
+- **Submit-tool relay vs in-process.** RESOLVED (a56): same control-socket relay as the outcome tools (`record_submission`/`consume_submission`), for uniformity AND daemon-side ownership of results.
+- **Per-role sandbox toolsets.** RESOLVED: reviewer (a58), contradiction-checks (a59/a62), and the `[out]` gate (a63) are strictly read-only `Read`/`Glob`/`Grep` — NO Bash. Only the audits (drift/arch/docs) keep read-only Bash, per their canonical sandbox.
+- **Registry migration ergonomics.** RESOLVED (a55): indefinite dual-acceptance — a block WITH `provider` is legacy inline (unchanged), a block WITHOUT is a nickname reference. No forced cutover.
+- **opencode MCP maturity.** RESOLVED into spike TASKS (a60 §1): web-search spike confirmed `opencode run` + `opencode.json` mcp block are viable; the three load-bearing unknowns (prompt delivery stdin-vs-arg; MCP tool-call surfacing; correctable tool errors for the submit_* retry loop) are verified as implementation tasks before the strategy is wired, with an explicit STOP-and-report if unmet.

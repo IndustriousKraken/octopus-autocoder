@@ -1,0 +1,25 @@
+## Why
+
+a56 abstracted CLI invocation behind a `CliStrategy` trait and shipped one implementation, `claude`. The `claude` strategy selects models through `ANTHROPIC_*` env, so it only reaches Anthropic-shaped endpoints — which is why the agentic reviewer (a58) and contradiction check (a59) default to / fail open for non-Anthropic providers: the registry resolves their `openai_compatible`/`ollama` models to the `opencode` CLI, and no `opencode` strategy is registered yet, so resolution errors.
+
+This change adds the second strategy, `OpencodeStrategy`, registering `opencode` so those resolutions build a real invocation. opencode is provider-agnostic (OpenRouter, Ollama, any custom OpenAI-compatible endpoint, with `--model provider/model` selection and an `opencode.json` config carrying provider creds and MCP servers), which is exactly the shape a model-diverse fleet needs: it lets the agentic roles run against Qwen/Ollama/etc. without an Anthropic-shaped gateway. It is the change that makes the agentic path genuinely provider-agnostic and completes the swappable-CLI half of the migration.
+
+## What Changes
+
+**`OpencodeStrategy` implements the `opencode` CLI (executor).** A second `CliStrategy` builds `opencode run` invocations: `--model <provider>/<model>` for model selection, an `opencode.json` written into the workspace carrying the MCP `mcp` block (`type: local`, the MCP-child command, env including `ORCH_MCP_ROLE`) and the resolved provider config (base URL + key), and a mapping of a56's sandbox (allowed-tools + deny patterns) onto opencode's permission configuration so read-only roles stay read-only. It runs in capture mode — the streaming-JSON incremental-log path is `claude`-specific, so opencode serves the capture-mode structured-submission roles (advisory audits, reviewer, contradiction check); the executor's streaming implementer path remains on `claude`.
+
+**Registration unblocks non-Anthropic agentic roles.** Once `opencode` is registered, a55's `provider → CLI` rule (`openai_compatible`/`ollama` → `opencode`, or an explicit `cli: opencode`) resolves to a working strategy. The agentic reviewer and contradiction check therefore function for non-Anthropic providers, where they previously errored / failed open on "no registered strategy." This change does NOT flip any role's default transport — `reviewer.kind` stays `oneshot` by default; making agentic the default is a deliberate, separate decision now that the path is provider-agnostic.
+
+**Spike-gated integration unknowns.** Three headless-opencode behaviors are load-bearing for the structured-submission contract and are verified by spike tasks before the strategy is wired in: (1) whether `opencode run` takes its prompt on stdin or as a positional argument; (2) that it surfaces MCP tool calls (so `submit_*` is actually invoked); (3) that a daemon-rejected tool call reaches the model as a correctable error it can retry in-session (the schema-reject → retry loop a56 requires). If any fails, the spike reports it as an integration blocker rather than shipping a broken strategy.
+
+## Impact
+
+- **Affected specs:**
+  - `executor` — ADDED `OpencodeStrategy implements the opencode CLI for agentic roles`.
+- **Affected code:**
+  - `autocoder/src/agentic_run.rs` (or the strategy module from a56) — `struct OpencodeStrategy` implementing `CliStrategy`: `build_command` (`opencode run`, `--model`, `opencode.json` writer), `apply_model_selection` (`provider/model` + provider config, no `ANTHROPIC_*`), sandbox→permission mapping.
+  - Strategy registry/resolver — register `opencode` so a55's `provider → CLI` rule resolves to `OpencodeStrategy`.
+- **Operator prerequisite:** the `opencode` binary must be installed on the daemon host for any role configured to use it. (Anthropic-shaped roles continue to use `claude` and are unaffected.)
+- **Operator-visible behavior:** none by default. Operators who point a role's model at a non-Anthropic provider AND opt that role into agentic mode now get a working agentic run instead of a fail-open/error; the default transports are unchanged.
+- **Acceptance:** spike tasks pass (prompt delivery determined; MCP tool calls + correctable tool errors confirmed under headless `opencode run`); `cargo test` passes; `openspec validate a60-opencode-cli-strategy --strict` passes. Tests: an `opencode`-resolved role builds an `opencode run` invocation (no "no registered strategy" error); `opencode.json` carries the MCP block + provider config and NO `.mcp.json` is written; model selection sets `--model provider/model` and no `ANTHROPIC_*`; a read-only role's Write/Edit/Bash are denied via opencode permissions; an `opencode` role runs in capture mode.
+- **Dependencies:** stacks on **a56** (the `CliStrategy` trait + `agentic_run`) and **a55** (the `provider → CLI` rule + registry `cli` override). Unblocks the non-Anthropic agentic paths of **a58** (reviewer) and **a59** (contradiction check) but does not modify them. The `opencode` spike findings inform whether a streaming-mode opencode path (for the executor) is feasible later; out of scope here.

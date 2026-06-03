@@ -29,7 +29,7 @@
 - [ ] 5.1 The executor path through `agentic_run` yields the same streaming log + `final_answer` + outcome classification as the pre-refactor path for a canned run.
 - [ ] 5.2 An audit path through `agentic_run` (`Capture`, no MCP) yields the same `stdout`/`exit_status` outcome as the pre-refactor audit `run_subprocess`.
 - [ ] 5.3 `ClaudeStrategy::apply_model_selection` sets none of the `ANTHROPIC_*` vars when `model` is `None`, AND sets all three when a `ResolvedModel` is given.
-- [ ] 5.4 A non-`claude` provider resolution returns the "strategy not yet implemented" error (until opencode lands).
+- [ ] 5.4 A provider resolution to a CLI with no registered strategy returns a clear error naming the CLI (only `claude` is registered in this change).
 - [ ] 5.5 `relay_submission` → `record_submission`; `consume_submission` returns the stored payload then clears it.
 
 ## 6. Acceptance gate

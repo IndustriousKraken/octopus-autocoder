@@ -25,7 +25,7 @@ The refactor SHALL be behavior-neutral: the executor retains streaming-JSON + MC
 ### Requirement: CliStrategy trait with the claude implementation
 The agentic-run primitive SHALL select its CLI invocation through a `CliStrategy` trait so a model's provider can determine the CLI without role code changing. The trait SHALL do two jobs: build the invocation (binary, flags, the allowed-tools/sandbox-settings format, AND the MCP-config-file format) AND translate a resolved `(provider, model, api_base_url, api_key)` into that CLI's model-selection mechanism. A role's strategy SHALL be resolved from the model's provider via the model registry's `provider → default CLI` rule.
 
-This change SHALL implement the `claude` strategy AND reproduce today's invocation exactly: `--settings <sandbox-file>`, `--allowedTools <combined>`, `--permission-mode acceptEdits`, AND — in streaming mode — `--verbose --output-format stream-json`, with MCP delivered via `.mcp.json`. The `claude` strategy SHALL select the model via `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` ONLY when a model is configured; when no model is configured it SHALL set none of them, preserving the executor's current CLI-default behavior. A role whose provider resolves to a non-`claude` CLI SHALL return a clear "strategy not yet implemented" error until the opencode strategy lands.
+This change SHALL implement the `claude` strategy AND reproduce today's invocation exactly: `--settings <sandbox-file>`, `--allowedTools <combined>`, `--permission-mode acceptEdits`, AND — in streaming mode — `--verbose --output-format stream-json`, with MCP delivered via `.mcp.json`. The `claude` strategy SHALL select the model via `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` ONLY when a model is configured; when no model is configured it SHALL set none of them, preserving the executor's current CLI-default behavior. A role whose provider resolves to a CLI with no registered strategy SHALL return a clear error naming that CLI; this change registers only the `claude` strategy, so any non-`claude` resolution errors until that CLI's strategy is added (the `opencode` strategy is added by a later change).
 
 #### Scenario: Claude strategy with no model preserves CLI-default behavior
 - **WHEN** the `claude` strategy builds an invocation with `model: None` (the executor's current state)
@@ -36,9 +36,9 @@ This change SHALL implement the `claude` strategy AND reproduce today's invocati
 - **WHEN** the `claude` strategy builds an invocation with a resolved model `(anthropic, claude-opus-4-8, base, key)`
 - **THEN** `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, AND `ANTHROPIC_MODEL` are set from the resolved tuple
 
-#### Scenario: Non-claude provider has no strategy yet
-- **WHEN** a role's model resolves (via the registry rule) to the `opencode` CLI
-- **THEN** strategy resolution returns a "strategy not yet implemented" error naming the CLI
+#### Scenario: A CLI with no registered strategy returns a clear error
+- **WHEN** a role's model resolves (via the registry rule) to a CLI that has no registered strategy (e.g. `opencode`, before its strategy is added)
+- **THEN** strategy resolution returns an error naming the CLI
 - **AND** no subprocess is spawned
 
 ### Requirement: Per-execution MCP child exposes a per-role submission tool via control-socket relay
