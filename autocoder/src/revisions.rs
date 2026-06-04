@@ -1124,15 +1124,42 @@ async fn process_one_pr(
         match outcome {
             Ok(ExecutorOutcome::Completed { final_answer }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
-                if let Err(e) = apply_revision_commit(workspace, repo, push_remote, &commit_subject)
+                // a52: a `Completed` outcome may carry code changes OR be a
+                // deliberate no-change declination (the agent verified the
+                // request's claim against the cited code and concluded it was
+                // wrong, so it made no edit). Branch on the working-tree
+                // state: a dirty tree is an applied change to commit + push;
+                // a clean tree is a reported declination that must NOT be
+                // treated as a commit/push failure.
+                let tree_dirty = match crate::git::status_porcelain(workspace) {
+                    Ok(porcelain) => !porcelain.is_empty(),
+                    Err(e) => {
+                        // Reading the tree state failed; assume dirty so the
+                        // commit path runs (preserving pre-a52 behavior). A
+                        // genuinely empty commit still surfaces via the
+                        // commit/push-failure branch below.
+                        tracing::warn!(
+                            url = %repo.url,
+                            pr_number = pr.number,
+                            "revision: could not read working-tree state; assuming dirty: {e:#}"
+                        );
+                        true
+                    }
+                };
+                // Short-circuit: `apply_revision_commit` is only invoked on a
+                // dirty tree (the clean branch never commits). A genuine
+                // commit/push failure routes to the failure comment + cap
+                // increment, exactly as before a52.
+                if tree_dirty
+                    && let Err(e) =
+                        apply_revision_commit(workspace, repo, push_remote, &commit_subject)
                 {
                     tracing::warn!(
                         url = %repo.url,
                         pr_number = pr.number,
                         "revision commit/push failed; reporting as failed: {e:#}"
                     );
-                    let push_failure_reason =
-                        format!("push to {} failed: {e}", repo.agent_branch);
+                    let push_failure_reason = format!("push to {} failed: {e}", repo.agent_branch);
                     crate::polling_loop::maybe_post_revise_failed_alert(
                         paths,
                         chatops_ctx,
@@ -1147,18 +1174,19 @@ async fn process_one_pr(
                         "✗ Revision attempt failed: commit/push failed: {e}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                         bot_username
                     );
-                    let _ = github::post_issue_comment(
-                        api_base, token, owner, repo_name, pr.number, &body,
-                    )
-                    .await;
+                    let _ =
+                        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body)
+                            .await;
                     if is_automatic {
-                        state.auto_revisions_applied =
-                            state.auto_revisions_applied.saturating_add(1);
+                        state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
                     }
                     advance_seen(&mut latest_seen, comment.created_at);
                     write_state(paths, workspace, &state)?;
                     continue;
                 }
+                // Both branches count the attempt against the cap AND fire the
+                // same chatops success notification — the revision was
+                // processed, whether or not it produced a diff.
                 if is_automatic {
                     state.auto_revisions_applied =
                         state.auto_revisions_applied.saturating_add(1);
@@ -1181,13 +1209,26 @@ async fn process_one_pr(
                     &comment_id_str,
                 )
                 .await;
-                let reply = compose_revision_success_comment(
-                    &commit_subject,
-                    is_automatic,
-                    state.auto_revisions_applied,
-                    state.revision_cap,
-                    final_answer.as_deref(),
-                );
+                // a52: the dirty branch posts `✅ Revision applied:`; the
+                // clean branch posts the distinct `✅ Revision evaluated, no
+                // change made:` line. Both carry the agent's `final_answer`.
+                let reply = if tree_dirty {
+                    compose_revision_success_comment(
+                        &commit_subject,
+                        is_automatic,
+                        state.auto_revisions_applied,
+                        state.revision_cap,
+                        final_answer.as_deref(),
+                    )
+                } else {
+                    compose_revision_no_change_comment(
+                        &commit_subject,
+                        is_automatic,
+                        state.auto_revisions_applied,
+                        state.revision_cap,
+                        final_answer.as_deref(),
+                    )
+                };
                 if let Err(e) = github::post_issue_comment(
                     api_base, token, owner, repo_name, pr.number, &reply,
                 )
@@ -1199,16 +1240,21 @@ async fn process_one_pr(
                         "failed to post success PR comment: {e:#}"
                     );
                 }
-                // a33 task 7.3: maybe-post the re-review suggestion.
-                maybe_post_rereview_suggestion(
-                    workspace,
-                    repo,
-                    reviewer,
-                    pr,
-                    &mut state,
-                    chatops_ctx,
-                )
-                .await;
+                // a33 task 7.3: maybe-post the re-review suggestion. Only the
+                // dirty branch moved the agent-branch head, so the clean
+                // (no-change) branch skips it — there is nothing new to
+                // re-review.
+                if tree_dirty {
+                    maybe_post_rereview_suggestion(
+                        workspace,
+                        repo,
+                        reviewer,
+                        pr,
+                        &mut state,
+                        chatops_ctx,
+                    )
+                    .await;
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
@@ -1429,9 +1475,62 @@ fn advance_seen(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
 /// `polling_loop::truncate_to_fit`.
 const REVISION_COMMENT_MAX: usize = 60_000;
 
-/// Compose the success reply comment body for a `Completed` revision.
+/// First-line marker for a `Completed` revision that produced a committed
+/// diff (the dirty-tree path).
+const REVISION_APPLIED_LEAD: &str = "✅ Revision applied:";
+
+/// a52: first-line marker for a `Completed` revision that made NO code
+/// change (the clean-tree declination path). Deliberately distinct from
+/// [`REVISION_APPLIED_LEAD`] so operators can tell at a glance that the
+/// agent evaluated the request AND chose not to apply it — and distinct
+/// from `✗ Revision attempt failed:` so a reasoned declination never reads
+/// as a failure.
+const REVISION_NO_CHANGE_LEAD: &str = "✅ Revision evaluated, no change made:";
+
+/// Compose the success reply comment body for a `Completed` revision that
+/// committed a diff (the dirty-tree path). See
+/// [`compose_revision_reply_comment`] for the shared formatting contract.
+fn compose_revision_success_comment(
+    commit_subject: &str,
+    is_automatic: bool,
+    auto_revisions_applied: u32,
+    revision_cap: u32,
+    final_answer: Option<&str>,
+) -> String {
+    compose_revision_reply_comment(
+        REVISION_APPLIED_LEAD,
+        commit_subject,
+        is_automatic,
+        auto_revisions_applied,
+        revision_cap,
+        final_answer,
+    )
+}
+
+/// a52: compose the reply comment body for a `Completed` revision that
+/// made NO code change (the clean-tree declination path). Identical shape
+/// to [`compose_revision_success_comment`] but led by
+/// [`REVISION_NO_CHANGE_LEAD`] instead of `✅ Revision applied:`.
+fn compose_revision_no_change_comment(
+    commit_subject: &str,
+    is_automatic: bool,
+    auto_revisions_applied: u32,
+    revision_cap: u32,
+    final_answer: Option<&str>,
+) -> String {
+    compose_revision_reply_comment(
+        REVISION_NO_CHANGE_LEAD,
+        commit_subject,
+        is_automatic,
+        auto_revisions_applied,
+        revision_cap,
+        final_answer,
+    )
+}
+
+/// Compose a `Completed`-revision reply comment body led by `lead`.
 ///
-/// The success line stays at the top so operators scanning for the ✓
+/// The lead line stays at the top so operators scanning for the ✓
 /// confirmation see it immediately. For AUTOMATIC (reviewer-marked)
 /// revisions the line reports the automatic-revision count against the
 /// cap (`Automatic revision count: N of M`) since those are the revisions
@@ -1443,12 +1542,13 @@ const REVISION_COMMENT_MAX: usize = 60_000;
 /// agent's summary follows after a blank line, verbatim — no
 /// transformation, no re-wrapping. When `final_answer` is `None` (legacy
 /// text mode OR no outcome tool was called) OR is empty after trimming,
-/// the body is the single-line success form (no trailing blank section).
+/// the body is the single-line lead form (no trailing blank section).
 /// The composed body is passed through
 /// [`crate::polling_loop::truncate_to_fit`] so it stays under GitHub's
 /// comment-size limit, with a truncation marker appended (naming the
 /// per-change log file) when it would overflow.
-fn compose_revision_success_comment(
+fn compose_revision_reply_comment(
+    lead: &str,
     commit_subject: &str,
     is_automatic: bool,
     auto_revisions_applied: u32,
@@ -1457,11 +1557,11 @@ fn compose_revision_success_comment(
 ) -> String {
     let success_line = if is_automatic {
         format!(
-            "✅ Revision applied: {}. Automatic revision count: {} of {}.",
+            "{lead} {}. Automatic revision count: {} of {}.",
             commit_subject, auto_revisions_applied, revision_cap,
         )
     } else {
-        format!("✅ Revision applied: {commit_subject}.")
+        format!("{lead} {commit_subject}.")
     };
     let body = match final_answer {
         Some(text) if !text.trim().is_empty() => format!("{success_line}\n\n{text}"),
@@ -2435,6 +2535,86 @@ mod tests {
         );
     }
 
+    // -------- a52: no-change declination comment composition --------
+
+    /// The clean-tree declination comment is led by the distinct
+    /// no-change marker (NOT `✅ Revision applied:`) AND carries the
+    /// agent's `final_answer` reasoning after a blank line.
+    #[test]
+    fn no_change_comment_marks_evaluation_and_carries_final_answer() {
+        let subject = "revise: a52-foo: drop the redundant test";
+        let body = compose_revision_no_change_comment(
+            subject,
+            true,
+            1,
+            5,
+            Some("Declined: the cited test is spec-traced; verified it still passes. No change made."),
+        );
+        assert!(
+            body.starts_with("✅ Revision evaluated, no change made:"),
+            "got: {body:?}"
+        );
+        assert!(
+            !body.contains("✅ Revision applied:"),
+            "must not reuse the applied lead: {body:?}"
+        );
+        assert!(
+            !body.contains("Revision attempt failed"),
+            "a declination must not read as a failure: {body:?}"
+        );
+        // Reasoning follows the lead after a single blank line.
+        assert!(
+            body.contains("\n\nDeclined: the cited test is spec-traced;"),
+            "summary must follow a blank line: {body:?}"
+        );
+        // Automatic form carries the cap count.
+        assert!(
+            body.contains("Automatic revision count: 1 of 5."),
+            "got: {body:?}"
+        );
+    }
+
+    /// `final_answer: None` collapses to the single no-change line.
+    #[test]
+    fn no_change_comment_none_is_single_line() {
+        let subject = "revise: a52-foo: drop the redundant test";
+        let body = compose_revision_no_change_comment(subject, true, 2, 5, None);
+        assert_eq!(
+            body,
+            format!(
+                "✅ Revision evaluated, no change made: {subject}. Automatic revision count: 2 of 5."
+            )
+        );
+        assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
+    }
+
+    /// a47 parity: a HUMAN no-change declination omits the cap count.
+    #[test]
+    fn no_change_comment_human_omits_count() {
+        let subject = "revise: a52-foo: drop the redundant test";
+        let body = compose_revision_no_change_comment(
+            subject,
+            false,
+            2,
+            5,
+            Some("Declined: claim was wrong."),
+        );
+        assert!(
+            body.starts_with(&format!(
+                "✅ Revision evaluated, no change made: {subject}."
+            )),
+            "got: {body:?}"
+        );
+        assert!(
+            !body.contains("revision count"),
+            "human form must not show a count: {body:?}"
+        );
+        assert!(
+            body.contains("\n\nDeclined: claim was wrong."),
+            "reasoning must follow: {body:?}"
+        );
+    }
+
     // -------- dispatcher integration (mockito + stub executor) --------
 
     use crate::chatops::{ChatOpsBackend, HumanReply};
@@ -2477,6 +2657,11 @@ mod tests {
     struct StubExecutor {
         scripted: Mutex<Vec<ExecutorOutcome>>,
         calls: AtomicUsize,
+        /// When `true` (the default), a `Completed` outcome writes a
+        /// marker file so the dispatcher's dirty-tree path has something
+        /// to commit. a52: a `false` variant leaves the tree clean so the
+        /// no-change declination path is exercised.
+        write_marker: bool,
     }
 
     impl StubExecutor {
@@ -2484,6 +2669,17 @@ mod tests {
             Self {
                 scripted: Mutex::new(outcomes),
                 calls: AtomicUsize::new(0),
+                write_marker: true,
+            }
+        }
+
+        /// a52: a stub whose `Completed` outcomes leave the working tree
+        /// CLEAN, simulating a deliberate no-change declination.
+        fn new_clean(outcomes: Vec<ExecutorOutcome>) -> Self {
+            Self {
+                scripted: Mutex::new(outcomes),
+                calls: AtomicUsize::new(0),
+                write_marker: false,
             }
         }
     }
@@ -2515,8 +2711,9 @@ mod tests {
             };
             // Simulate the executor writing a file so the `git add -A`
             // path in the dispatcher's Completed branch has something to
-            // commit.
-            if matches!(outcome, ExecutorOutcome::Completed { .. }) {
+            // commit. a52: the `new_clean` variant skips this so the tree
+            // stays clean (the no-change declination path).
+            if self.write_marker && matches!(outcome, ExecutorOutcome::Completed { .. }) {
                 let _ = std::fs::write(workspace.join("rev-marker.txt"), "rev");
             }
             Ok(outcome)
@@ -2781,6 +2978,251 @@ mod tests {
         // a47: the human revise processed (executor ran, reply posted) but
         // the automatic counter is untouched — human requests are uncapped.
         assert_eq!(state.auto_revisions_applied, 0);
+
+        token_env_clear(env_var);
+    }
+
+    /// Read `git rev-parse HEAD` in `ws` (test helper for asserting
+    /// whether a commit was made during dispatch).
+    fn head_sha(ws: &Path) -> String {
+        crate::git::rev_parse(ws, "HEAD").expect("HEAD must resolve in the fixture repo")
+    }
+
+    /// a52 Task 3.1: a `Completed { final_answer: Some(...) }` outcome
+    /// with a CLEAN working tree (the agent declined after verifying the
+    /// request's claim) posts a no-change success comment carrying the
+    /// reasoning, makes NO commit/push, posts NO `✗ Revision attempt
+    /// failed` comment, AND increments the cap counter.
+    #[tokio::test]
+    async fn dispatcher_clean_tree_completed_is_reported_declination() {
+        let env_var = "REVISIONS_TOKEN_CLEAN_DECLINE";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(51, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // Reviewer-marked (automatic) trigger so the AUTOMATIC cap counter
+        // is the one under test.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/51/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // The no-change declination success comment is posted exactly once.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/51/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision evaluated, no change made".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // A `✗ Revision attempt failed` comment must NOT be posted.
+        let no_failure = server
+            .mock("POST", "/repos/owner/repo/issues/51/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision attempt failed".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":43}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let head_before = head_sha(&ws);
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // `new_clean` leaves the working tree clean on Completed.
+        let executor = StubExecutor::new_clean(vec![ExecutorOutcome::Completed {
+            final_answer: Some(
+                "Declined: the cited test does not exist; verified against the current code. No change made."
+                    .to_string(),
+            ),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        post_reply.assert_async().await;
+        no_failure.assert_async().await;
+        // No commit was made: HEAD is unchanged (no empty commit/push).
+        assert_eq!(
+            head_before,
+            head_sha(&ws),
+            "clean-tree declination must not commit",
+        );
+        let state = read_state(&paths, &ws, 51).unwrap().expect("state persisted");
+        // The attempt counts against the automatic cap even with no diff.
+        assert_eq!(state.auto_revisions_applied, 1, "cap counter must increment");
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// a52 Task 3.2: a `Completed { final_answer: Some(...) }` outcome
+    /// with a DIRTY working tree commits + pushes AND posts the
+    /// `✅ Revision applied:` comment carrying the `final_answer` (a45
+    /// behavior preserved).
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_completed_commits_and_carries_final_answer() {
+        let env_var = "REVISIONS_TOKEN_DIRTY_APPLIED";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(53, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/53/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // The applied comment carries the agent's summary text.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/53/comments")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("Revision applied".to_string()),
+                mockito::Matcher::Regex("Did X. Declined Y because Z.".to_string()),
+            ]))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let head_before = head_sha(&ws);
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Default `new` writes a marker file → dirty tree → commit path.
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Did X. Declined Y because Z.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        post_reply.assert_async().await;
+        // A commit WAS made: HEAD advanced.
+        assert_ne!(
+            head_before,
+            head_sha(&ws),
+            "dirty-tree revision must commit the change",
+        );
+        let state = read_state(&paths, &ws, 53).unwrap().expect("state persisted");
+        assert_eq!(state.auto_revisions_applied, 1);
+
+        token_env_clear(env_var);
+    }
+
+    /// a52 Task 3.3: a genuine commit/push failure on the DIRTY path still
+    /// posts the `✗ Revision attempt failed` comment AND increments the
+    /// cap (the clean-tree branch must not regress this failure path).
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_push_failure_still_reports_failure() {
+        let env_var = "REVISIONS_TOKEN_DIRTY_PUSH_FAIL";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(55, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/55/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/55/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision attempt failed".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        // Break the origin remote so the push step of apply_revision_commit
+        // fails (the local commit succeeds; the push does not).
+        let st = std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "/nonexistent/definitely-not-a-repo.git",
+            ])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "breaking origin url should succeed");
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Default `new` dirties the tree → commit path → push fails.
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Applied the fix.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 55).unwrap().expect("state persisted");
+        // A failed attempt still counts against the cap.
+        assert_eq!(state.auto_revisions_applied, 1);
 
         token_env_clear(env_var);
     }
