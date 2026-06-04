@@ -94,8 +94,9 @@ Review-oriented:
   locate the corresponding code in <module/file>. Confirm the
   requirement's scenarios are observable today.
 - [ ] 1.2 Run the existing test suite covering `{{capability_name}}`
-  (`cargo test {{capability_name}}::` OR whatever the project's
-  convention is). Confirm tests pass.
+  using the project's own test command, detected from the build
+  config (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`,
+  etc.). Confirm tests pass.
 - [ ] 1.3 If any scenario does NOT match observable behavior, revise
   the spec (NOT the code) — the goal is descriptive fidelity to
   what exists.
