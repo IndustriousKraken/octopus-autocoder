@@ -3171,14 +3171,21 @@ Each polling iteration, before processing pending changes for a repository, the 
 - **AND** the same reply does not trigger a recursive revision
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
-On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → commit + force-with-lease push + success reply comment; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); `Failed` → failure reply comment + count increment.
+On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); `Failed` → failure reply comment + count increment.
 
-For the `Completed` outcome, the success reply comment SHALL carry the success line followed (when the executor's `final_answer` is non-empty after trimming) by a blank line AND the agent's `final_answer` text verbatim. The success line stays at the top so operators scanning for the ✓ confirmation see it immediately. When `final_answer` is `None` OR is empty after trimming, the comment body is the single-line success form (today's behavior); the change is purely additive.
+For the `Completed` outcome, the daemon SHALL first determine whether the agent produced code changes (a dirty working tree):
+
+- **Dirty tree** — the agent applied a change: the daemon commits + force-with-lease pushes to `repositories[].agent_branch`, then posts the success reply comment. A genuine commit/push failure on this branch is reported via the failure reply comment + count increment (unchanged).
+- **Clean tree** — the agent deliberately made no change (e.g. it declined the request after verifying the claim was wrong, per the executor requirement `Revision prompt instructs critical evaluation of the reviewer's request`): the daemon SHALL NOT attempt a commit (a clean tree is NOT a commit/push failure) AND SHALL NOT post a failure comment. It posts a success reply comment whose first line marks an evaluation with no change made — distinct from the `✅ Revision applied:` line (e.g. `✅ Revision evaluated, no change made:`) — carrying the agent's declination summary.
+
+Both branches count the attempt against the revision cap AND advance the seen-marker.
+
+For a `Completed` success reply comment (either branch), the body SHALL carry its first line followed (when the executor's `final_answer` is non-empty after trimming) by a blank line AND the agent's `final_answer` text verbatim. The first line stays at the top so operators scanning for the ✓ confirmation see it immediately. When `final_answer` is `None` OR is empty after trimming, the dirty-tree branch posts the single-line `✅ Revision applied: <subject>. Revision count: <n> of <cap>.` form (a45 behavior) AND the clean-tree branch posts its no-change line alone.
 
 The combined body SHALL be passed through the existing GitHub-comment-size truncation helper (`truncate_to_fit` OR equivalent) before posting, with a truncation marker appended when the body exceeds the limit. The marker text names the per-change log file path so operators can recover the full summary from disk.
 
 #### Scenario: Completed revision updates the PR with a substantive summary
-- **GIVEN** the executor returns `Completed { final_answer: Some("Did X. Declined Y because Z.") }` for a revision context
+- **GIVEN** the executor returns `Completed { final_answer: Some("Did X. Declined Y because Z.") }` for a revision context AND the agent produced code changes (dirty working tree)
 - **WHEN** the revision dispatcher composes the success comment
 - **THEN** the daemon commits the workspace changes with subject `revise: <change>: <first 60 chars of revision text>`
 - **AND** force-pushes with `--force-with-lease` to `repositories[].agent_branch`
@@ -3187,9 +3194,16 @@ The combined body SHALL be passed through the existing GitHub-comment-size trunc
 - **AND** the PR's diff updates to reflect the revision
 
 #### Scenario: Completed revision without a substantive summary uses the single-line form
-- **GIVEN** the executor returns `Completed { final_answer: None }` OR `Completed { final_answer: Some("   ") }` (empty after trim) for a revision context
+- **GIVEN** the executor returns `Completed { final_answer: None }` OR `Completed { final_answer: Some("   ") }` (empty after trim) for a revision context AND the agent produced code changes (dirty working tree)
 - **WHEN** the revision dispatcher composes the success comment
 - **THEN** the daemon posts a PR issue comment whose body is the single-line `✅ Revision applied: <subject>. Revision count: <n> of <cap>.` (no trailing blank line, no empty summary section)
+
+#### Scenario: Completed with no code change is a reported declination, not a failure
+- **GIVEN** the executor returns `Completed { final_answer: Some("Declined: the cited test does not exist; verified against the current code. No change made.") }` AND the working tree is clean (the agent made no code change)
+- **WHEN** the revision dispatcher processes the outcome
+- **THEN** the daemon does NOT attempt a commit (a clean tree is not a commit/push failure) AND does NOT post a `✗ Revision attempt failed` comment
+- **AND** it posts a success comment whose first line marks an evaluation with no change made (distinct from `✅ Revision applied:`), followed by a blank line AND the agent's `final_answer` declination summary
+- **AND** the attempt counts against the revision cap AND the seen-marker advances
 
 #### Scenario: AskUser during revision escalates without committing
 - **GIVEN** the executor returns `AskUser { question, resume_handle }` during revision execution
@@ -6701,4 +6715,63 @@ The executor's `## Agent implementation notes` section is OUT of scope for this 
 - **WHEN** the daemon composes the executor's `## Agent implementation notes` section
 - **THEN** no model-attribution line is added (the executor has no daemon-known model in this change)
 - **AND** the deferral is documented so the gap is intentional, not an omission
+
+### Requirement: GitHub comment-sourced verbs require an authorized commenter
+Before dispatching ANY verb parsed from a GitHub pull-request or issue comment — including `@<bot> revise` AND `@<bot> code-review`, AND any future comment-sourced verb — the daemon SHALL authorize the commenter. This gate is a precondition on the dispatch of every such verb; a verb whose comment fails authorization SHALL NOT reach its verb-specific handling (the `revise` and `code-review` requirements describe what happens *after* a comment is authorized).
+
+Authorization SHALL pass when EITHER:
+- (a) the comment's GitHub `author_association` is in the configured `github.command_authorization.allowed_associations` set — default `[OWNER, MEMBER, COLLABORATOR]`, which are exactly the associations carrying write/triage permission on the repository; OR
+- (b) the comment author's `login` is in the configured `github.command_authorization.allowed_users` list (for trusted individuals who are not formal collaborators).
+
+A comment that parses as a verb but whose author is NOT authorized SHALL be **dropped before dispatch** (default-deny): no executor, reviewer, or other billed/LLM work is invoked, the seen-marker IS advanced past the comment so it does not re-fire on subsequent polling cycles, AND the drop is logged at INFO with the author `login` AND `author_association`. When `github.command_authorization.decline_comment` is `true`, the daemon SHALL post exactly one decline reply per dropped trigger; when it is `false` (the default), the daemon SHALL NOT reply (avoiding comment spam AND reply/feedback loops).
+
+`author_association` values (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`) come from the GitHub comments API. An absent OR unrecognized association is treated as unauthorized. The bot's own comments are filtered before this check (existing behavior, unchanged). This gate is the GitHub analog of the Slack channel allowlist (`Drop-before-dispatch inbound filters`); the Slack path is unaffected by this requirement.
+
+#### Scenario: Authorized association dispatches the verb
+- **WHEN** an open PR has a comment with `author_association: COLLABORATOR` whose body parses as `@<bot> revise <text>` (OR `@<bot> code-review`)
+- **THEN** the commenter is authorized AND the verb proceeds to its verb-specific handling
+
+#### Scenario: Unauthorized association is dropped before any work
+- **WHEN** an open PR has a comment with `author_association: NONE` whose body parses as `@<bot> revise <text>` (OR `@<bot> code-review`)
+- **THEN** no executor or reviewer run is invoked
+- **AND** the seen-marker is advanced so the comment does not re-fire
+- **AND** the drop is logged with the author `login` AND association
+
+#### Scenario: Configured allowlisted user is authorized regardless of association
+- **WHEN** a comment author's `login` is listed in `github.command_authorization.allowed_users` AND the comment parses as a verb
+- **THEN** the commenter is authorized even when their `author_association` is `NONE` or `CONTRIBUTOR`
+
+#### Scenario: Missing or unknown association is default-denied
+- **WHEN** a verb-parsing comment has no `author_association` OR an unrecognized value, AND the author is not in `allowed_users`
+- **THEN** the commenter is unauthorized AND the trigger is dropped before dispatch
+
+#### Scenario: Decline reply is posted only when configured
+- **WHEN** an unauthorized verb-parsing comment is dropped AND `github.command_authorization.decline_comment: true`
+- **THEN** the daemon posts exactly one decline reply for that comment
+- **AND** when `decline_comment: false` (default), the daemon posts no reply
+
+#### Scenario: Slack verbs are unaffected
+- **WHEN** an operator posts a verb in an allowlisted Slack channel
+- **THEN** dispatch proceeds under the Slack channel-allowlist filters with no `author_association` check (this requirement governs GitHub comment-sourced verbs only)
+
+### Requirement: Human-initiated PR revisions are rate-capped per PR
+The daemon SHALL bound the number of human-initiated `@<bot> revise` triggers it acts on per pull request, to cap cost AND abuse independent of requester. The per-PR limit SHALL read from `executor.max_revise_triggers_per_pr` (default `10`). The count is tracked in the existing per-PR state file. When the cap is reached, a further `@<bot> revise` trigger on that PR SHALL be declined with exactly one notice AND SHALL NOT invoke the executor.
+
+This cap is independent of the existing auto-revision cap (`executor.max_auto_revisions_per_pr`, which bounds reviewer-initiated revisions) AND the re-review cap (`reviewer.max_code_reviews_per_pr`). It applies only to revisions triggered by an authorized human comment (per `GitHub comment-sourced verbs require an authorized commenter`).
+
+#### Scenario: Revision under the cap proceeds
+- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count is below `executor.max_revise_triggers_per_pr`
+- **THEN** the executor is invoked for the revision
+- **AND** the PR's human-revise count increments by one
+
+#### Scenario: Revision at the cap is declined without invoking the executor
+- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count has reached `executor.max_revise_triggers_per_pr`
+- **THEN** the executor is NOT invoked
+- **AND** the daemon posts exactly one notice that the per-PR revise cap is reached
+- **AND** the count does not increment further
+
+#### Scenario: Human and auto revision caps are independent
+- **WHEN** the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
+- **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
+- **AND** exhausting the human cap does not change the auto-revision count
 

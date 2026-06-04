@@ -866,6 +866,14 @@ pub struct IssueComment {
     #[serde(default)]
     pub user: Option<IssueCommentUser>,
     pub created_at: DateTime<Utc>,
+    /// GitHub `author_association` of the comment author relative to the
+    /// repository (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`,
+    /// `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`). a000 uses this to
+    /// authorize comment-sourced verbs. `#[serde(default)]` so a payload
+    /// that omits the field (or a synthetic test fixture) deserializes as
+    /// `None`, which the authorization gate treats as unauthorized.
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -878,6 +886,13 @@ impl IssueComment {
     /// returning an empty string when the field is absent (deleted users).
     pub fn user_login(&self) -> &str {
         self.user.as_ref().map(|u| u.login.as_str()).unwrap_or("")
+    }
+
+    /// Convenience accessor for the comment's `author_association`,
+    /// returning `None` when the field is absent. a000's authorization
+    /// gate treats `None` (and any unrecognized value) as unauthorized.
+    pub fn author_association(&self) -> Option<&str> {
+        self.author_association.as_deref()
     }
 }
 

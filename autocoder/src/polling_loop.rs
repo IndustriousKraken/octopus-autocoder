@@ -79,6 +79,7 @@ pub async fn run(
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -138,6 +139,7 @@ pub async fn run(
         perma_stuck_threshold,
         executor_max_changes_per_pr,
         revision_cap,
+        human_revise_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry,
@@ -205,6 +207,7 @@ pub async fn run_with_hooks(
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -712,6 +715,7 @@ pub async fn run_with_hooks(
             perma_stuck_threshold,
             max_changes_per_pr,
             revision_cap,
+            human_revise_cap,
             audit_registry.as_ref(),
             audits_cfg.as_deref(),
             audit_settings.as_ref(),
@@ -855,6 +859,7 @@ pub async fn execute_one_pass(
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
     revision_cap: u32,
+    human_revise_cap: u32,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
@@ -913,6 +918,7 @@ pub async fn execute_one_pass(
             executor,
             chatops_ctx_for_revisions,
             revision_cap,
+            human_revise_cap,
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -4951,6 +4957,8 @@ fn initial_revision_state_at_pr_open(
         auto_revisions_applied: 0,
         revision_cap,
         cap_decline_posted: false,
+        human_revise_count: 0,
+        human_revise_cap_decline_posted: false,
         code_reviews_applied: 0,
         code_review_cap: reviewer.and_then(|r| r.max_code_reviews_per_pr()),
         cap_decline_posted_for_code_review: false,
@@ -7985,6 +7993,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }
     }
 
@@ -8412,6 +8421,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // Mirror open_pull_request's internal sequence.
@@ -8471,6 +8481,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (owner, repo_name) =
             crate::github::parse_repo_url("git@github.com:upstream-org/repo.git").unwrap();
@@ -8892,6 +8903,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // Use a very high threshold so existing tests' single-fail
         // iterations don't accidentally mark perma-stuck.
@@ -9174,6 +9186,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9279,6 +9292,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9397,6 +9411,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9536,6 +9551,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9653,6 +9669,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9789,6 +9806,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9911,6 +9929,7 @@ mod tests {
                 owner_tokens: None,
                 fork_owner: None,
                 recreate_fork_on_reinit: false,
+                command_authorization: Default::default(),
             };
             let (processed, _) = run_pass_through_commits(
                 &paths,
@@ -10123,6 +10142,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -10146,6 +10166,7 @@ mod tests {
                 u32::MAX,
                 Some(u32::MAX),
                 0, // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -10344,6 +10365,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let cancel = CancellationToken::new();
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);
@@ -10373,6 +10395,7 @@ mod tests {
                 u32::MAX,
                 Some(u32::MAX),
                 0, // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -10503,6 +10526,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }
     }
 
@@ -10660,6 +10684,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -10714,6 +10739,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -10812,6 +10838,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // Iteration 1: pass through commits succeeds, push fails → alert
@@ -10827,6 +10854,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -10912,6 +10940,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let stuck_secs = 2400u64;
 
@@ -10926,6 +10955,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -11305,6 +11335,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             paths,
@@ -11489,6 +11520,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
 
@@ -11582,6 +11614,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
 
@@ -11679,6 +11712,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor; // unused: no pending changes after re-clone
 
@@ -11755,6 +11789,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -11826,6 +11861,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -11933,6 +11969,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -12536,6 +12573,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -12990,6 +13028,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -13066,6 +13105,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -13129,6 +13169,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -13211,6 +13252,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _self_heal) = run_pass_through_commits(
             &paths,
@@ -13260,6 +13302,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -13331,6 +13374,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -13440,6 +13484,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -13491,6 +13536,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -13531,6 +13577,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -13623,6 +13670,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -13708,6 +13756,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // base_branch points at a branch that does NOT exist on origin
         // → `git reset --hard origin/nonexistent-branch` errors →
@@ -13872,6 +13921,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -14454,6 +14504,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repo = fixture_repo(&ws);
 
@@ -14781,6 +14832,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -14936,6 +14988,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }));
         let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(None));
@@ -14956,6 +15009,7 @@ mod tests {
                 u32::MAX,
                 None,
                 0,  // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 60, // startup_jitter_max_secs: large window
                 0,  // inter_iteration_jitter_pct: irrelevant
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -15499,6 +15553,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _self_heal) = run_pass_through_commits(
@@ -15578,6 +15633,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         /// Recording executor: succeeds on `bar`, panics on any other name.
@@ -15674,6 +15730,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         for _ in 0..2 {
@@ -15762,6 +15819,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // No chatops, no preflight alert. The pre-flight check sees no
@@ -15845,6 +15903,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let mut repo = fixture_repo(&ws);
         repo.base_branch = "nonexistent-branch".into();
@@ -16681,6 +16740,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -16771,6 +16831,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -16845,6 +16906,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -17182,6 +17244,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor; // unused: no pending changes
@@ -17197,6 +17260,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -17340,6 +17404,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor; // unused: no pending changes
@@ -17354,6 +17419,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0,
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -17551,6 +17617,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor;
@@ -17564,6 +17631,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0,
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -17642,6 +17710,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::IterationRequested {
             completed_tasks: vec!["1".into(), "2".into()],
@@ -17753,6 +17822,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::Completed { final_answer: None });
         let step =
@@ -17802,6 +17872,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::SpecNeedsRevision {
             unimplementable_tasks: vec![crate::executor::UnimplementableTask {
@@ -17855,6 +17926,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::Failed {
             reason: "timeout".into(),
@@ -17906,6 +17978,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::AskUser {
             question: "what next?".into(),
@@ -17965,6 +18038,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::Aborted {
             reason: "daemon shutdown (SIGTERM cascade)".into(),
@@ -18030,6 +18104,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         for iteration in 0..2u32 {

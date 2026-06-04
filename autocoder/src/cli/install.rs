@@ -1401,6 +1401,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
         owner_tokens: None,
         fork_owner: None,
         recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
     };
 
     cfg.chatops = match answers.chatops_backend {

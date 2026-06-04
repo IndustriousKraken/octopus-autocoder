@@ -478,6 +478,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let task_map_changed = Arc::new(tokio::sync::Notify::new());
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
     let revision_cap = cfg.executor.max_auto_revisions_per_pr_clamped();
+    let human_revise_cap = cfg.executor.max_revise_triggers_per_pr;
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
@@ -490,6 +491,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         perma_stuck_threshold,
         executor_max_changes_per_pr,
         revision_cap,
+        human_revise_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry: audit_registry.clone(),
@@ -760,6 +762,7 @@ struct SpawnDeps {
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -810,6 +813,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
         let revision_cap_for_task = deps.revision_cap;
+        let human_revise_cap_for_task = deps.human_revise_cap;
         let startup_jitter = deps.startup_jitter_max_secs;
         let iter_jitter = deps.inter_iteration_jitter_pct;
         let registry_for_task = deps.audit_registry.clone();
@@ -889,6 +893,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 perma,
                 exec_max,
                 revision_cap_for_task,
+                human_revise_cap_for_task,
                 startup_jitter,
                 iter_jitter,
                 registry_for_task,
@@ -1428,6 +1433,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // No repos to validate; no fork_owner means the function returns Ok
         // without probing anything.
@@ -1447,6 +1453,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
         let err = ensure_forks_exist(&github, &repos)
@@ -1483,6 +1490,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let repos = vec![
@@ -1529,6 +1537,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repos = vec![
             repo("git@github.com:fixture-org/repo.git"),    // owner_tokens hit
@@ -1559,6 +1568,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let repos = vec![
@@ -1593,6 +1603,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (_td, test_paths) = crate::testing::test_daemon_paths();
         assert!(
@@ -1719,6 +1730,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (_td, test_paths) = crate::testing::test_daemon_paths();
         assert!(repo_passes_startup_check(&test_paths, &clean_repo, &direct_push_github),

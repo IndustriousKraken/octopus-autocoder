@@ -787,6 +787,17 @@ pub struct ExecutorConfig {
         alias = "max_revisions_per_pr"
     )]
     pub max_auto_revisions_per_pr: u32,
+    /// a000: per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted
+    /// on. Distinct from `max_auto_revisions_per_pr` (which bounds
+    /// reviewer-initiated automatic revisions) AND from
+    /// `reviewer.max_code_reviews_per_pr` (re-reviews). Closes the
+    /// previously-uncapped human-revise path: past this many authorized
+    /// human revisions on one PR, further `@<bot> revise` triggers are
+    /// declined without invoking the executor. The count is tracked in
+    /// the per-PR state file; the cap is read live from config (so a
+    /// reload applies to subsequent triggers). Default `10`.
+    #[serde(default = "default_max_revise_triggers_per_pr")]
+    pub max_revise_triggers_per_pr: u32,
     /// Seconds the `wipe_workspace` control-socket handler waits for the
     /// in-flight per-repo iteration to drain (release its busy marker)
     /// after firing the per-iteration cancel token. The wipe runs
@@ -1049,6 +1060,11 @@ fn default_max_auto_revisions_per_pr() -> u32 {
     5
 }
 
+/// Default per-PR cap on human-initiated `@<bot> revise` triggers (a000).
+fn default_max_revise_triggers_per_pr() -> u32 {
+    10
+}
+
 impl ExecutorConfig {
     /// Effective perma-stuck threshold. `None` → 2 (the default). Any
     /// configured value is clamped to `>=1` so the agent always gets at
@@ -1255,10 +1271,105 @@ pub struct GithubConfig {
     /// `delete_repo` scope. Defaults to `false`.
     #[serde(default)]
     pub recreate_fork_on_reinit: bool,
+    /// a000: authorization gate for GitHub comment-sourced verbs
+    /// (`@<bot> revise`, `@<bot> code-review`, and any future comment
+    /// verb). When omitted, the default-deny block applies: only
+    /// `OWNER` / `MEMBER` / `COLLABORATOR` associations are authorized.
+    /// See [`CommandAuthorizationConfig`].
+    #[serde(default)]
+    pub command_authorization: CommandAuthorizationConfig,
 }
 
 fn default_github_token_env() -> String {
     "GITHUB_TOKEN".to_string()
+}
+
+/// The full set of GitHub `author_association` values surfaced by the
+/// comments API. `command_authorization.allowed_associations` entries are
+/// validated against this set at config load so a typo'd association
+/// (`OWENR`, `Collaborator`) fails fast rather than silently never
+/// matching. Mirrors the values documented for the GitHub REST API.
+pub const KNOWN_AUTHOR_ASSOCIATIONS: &[&str] = &[
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIME_CONTRIBUTOR",
+    "FIRST_TIMER",
+    "NONE",
+];
+
+/// Default `allowed_associations`: exactly the associations carrying
+/// write/triage permission on a repository. Used both when the operator
+/// omits `command_authorization` entirely AND when they supply the block
+/// but omit `allowed_associations`.
+fn default_allowed_associations() -> Vec<String> {
+    vec![
+        "OWNER".to_string(),
+        "MEMBER".to_string(),
+        "COLLABORATOR".to_string(),
+    ]
+}
+
+/// a000: who may trigger GitHub comment-sourced verbs. A commenter is
+/// authorized when EITHER their `author_association` is in
+/// `allowed_associations` OR their `login` is in `allowed_users`. An
+/// absent or unrecognized association is treated as unauthorized
+/// (default-deny). `decline_comment` controls whether a single polite
+/// decline reply is posted when a trigger is dropped (default `false`, so
+/// unauthorized triggers are silently ignored without comment spam).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandAuthorizationConfig {
+    #[serde(default = "default_allowed_associations")]
+    pub allowed_associations: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub decline_comment: bool,
+}
+
+impl Default for CommandAuthorizationConfig {
+    fn default() -> Self {
+        Self {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: Vec::new(),
+            decline_comment: false,
+        }
+    }
+}
+
+impl CommandAuthorizationConfig {
+    /// Validate that every `allowed_associations` entry is a recognized
+    /// GitHub `author_association` value AND that no `allowed_users` entry
+    /// is empty or whitespace-only. Returns an `Err` naming the first
+    /// offending entry AND (for associations) the accepted set so the
+    /// operator can fix the typo. Called from [`Config::load_from`] so a
+    /// bad config fails at startup rather than silently denying every
+    /// commenter.
+    pub fn validate(&self) -> Result<(), String> {
+        for assoc in &self.allowed_associations {
+            if !KNOWN_AUTHOR_ASSOCIATIONS.contains(&assoc.as_str()) {
+                return Err(format!(
+                    "github.command_authorization.allowed_associations contains unknown value `{assoc}`; \
+                     valid values are: {}",
+                    KNOWN_AUTHOR_ASSOCIATIONS.join(", ")
+                ));
+            }
+        }
+        // a000: reject empty / whitespace-only logins so an operator typo
+        // (e.g. `allowed_users: [" "]` or a stray blank list entry) fails
+        // fast at startup rather than sitting silently in the allowlist as
+        // a login the runtime `!login.is_empty()` guard can never match.
+        if let Some(blank) = self.allowed_users.iter().find(|u| u.trim().is_empty()) {
+            return Err(format!(
+                "github.command_authorization.allowed_users contains an empty or \
+                 whitespace-only entry ({blank:?}); remove it or replace it with a \
+                 valid GitHub login"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2081,6 +2192,13 @@ impl Config {
                 "change_internal_contradiction_check_llm",
             )?;
         }
+        // a000: reject typo'd author_association entries up front so a
+        // misconfigured allowlist fails at startup rather than silently
+        // denying every commenter.
+        cfg.github
+            .command_authorization
+            .validate()
+            .map_err(|e| anyhow!("{e}"))?;
         // OSS-fork support (a26): validate spec_storage AND upstream
         // blocks. Fail-fast at config-load so the daemon never spins
         // up a polling task pointing at a missing/invalid spec store.
@@ -2994,6 +3112,8 @@ github:
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",
             "max_auto_revisions_per_pr",
+            // a000: human-revise per-PR cap.
+            "max_revise_triggers_per_pr",
             "wipe_drain_timeout_secs",
             "output_format",
             "log_retention_days",
@@ -3010,6 +3130,11 @@ github:
             "owner_tokens",
             "fork_owner",
             "recreate_fork_on_reinit",
+            // a000: `GithubConfig.command_authorization`.
+            "command_authorization",
+            "allowed_associations",
+            "allowed_users",
+            "decline_comment",
             // `ReviewerConfig`.
             "enabled",
             "provider",
@@ -3832,6 +3957,215 @@ github: {}
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.github.fork_owner.is_none());
+    }
+
+    // ---------- a000: command_authorization + max_revise_triggers_per_pr ----------
+
+    #[test]
+    fn command_authorization_default_is_default_deny() {
+        let auth = CommandAuthorizationConfig::default();
+        assert_eq!(
+            auth.allowed_associations,
+            vec![
+                "OWNER".to_string(),
+                "MEMBER".to_string(),
+                "COLLABORATOR".to_string()
+            ]
+        );
+        assert!(auth.allowed_users.is_empty());
+        assert!(!auth.decline_comment);
+        assert!(auth.validate().is_ok());
+    }
+
+    #[test]
+    fn command_authorization_validate_rejects_unknown_association() {
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: vec!["OWNER".to_string(), "OWENR".to_string()],
+            allowed_users: Vec::new(),
+            decline_comment: false,
+        };
+        let err = auth.validate().expect_err("typo'd association must be rejected");
+        assert!(err.contains("OWENR"), "error names the offending value: {err}");
+    }
+
+    #[test]
+    fn command_authorization_validate_rejects_blank_allowed_user() {
+        // A whitespace-only login (the classic `allowed_users: [" "]`
+        // typo) must be rejected so it fails fast rather than sitting in
+        // the allowlist as a login the runtime guard can never match.
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec!["trusted-dev".to_string(), "  ".to_string()],
+            decline_comment: false,
+        };
+        let err = auth
+            .validate()
+            .expect_err("whitespace-only allowed_users entry must be rejected");
+        assert!(
+            err.contains("allowed_users"),
+            "error names the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn command_authorization_validate_rejects_empty_allowed_user() {
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec![String::new()],
+            decline_comment: false,
+        };
+        assert!(
+            auth.validate().is_err(),
+            "empty-string allowed_users entry must be rejected"
+        );
+    }
+
+    #[test]
+    fn command_authorization_validate_accepts_nonblank_allowed_users() {
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec!["trusted-dev".to_string(), "another-dev".to_string()],
+            decline_comment: false,
+        };
+        assert!(
+            auth.validate().is_ok(),
+            "non-blank logins must pass validation"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_blank_allowed_user() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  command_authorization:
+    allowed_users: [" "]
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("blank allowed_users entry must fail load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("allowed_users"),
+            "load error must name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn command_authorization_absent_uses_default_deny() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config without the block should parse");
+        let auth = &cfg.github.command_authorization;
+        assert_eq!(
+            auth.allowed_associations,
+            vec![
+                "OWNER".to_string(),
+                "MEMBER".to_string(),
+                "COLLABORATOR".to_string()
+            ]
+        );
+        assert!(auth.allowed_users.is_empty());
+        assert!(!auth.decline_comment);
+    }
+
+    #[test]
+    fn command_authorization_block_parses() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  command_authorization:
+    allowed_associations: [OWNER, MEMBER]
+    allowed_users: [trusted-dev]
+    decline_comment: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("command_authorization block should parse");
+        let auth = &cfg.github.command_authorization;
+        assert_eq!(
+            auth.allowed_associations,
+            vec!["OWNER".to_string(), "MEMBER".to_string()]
+        );
+        assert_eq!(auth.allowed_users, vec!["trusted-dev".to_string()]);
+        assert!(auth.decline_comment);
+    }
+
+    #[test]
+    fn load_from_rejects_unknown_association() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  command_authorization:
+    allowed_associations: [OWNER, BOGUS_VALUE]
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("unknown association must fail load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("BOGUS_VALUE"),
+            "load error must name the offending association: {msg}"
+        );
+    }
+
+    #[test]
+    fn max_revise_triggers_per_pr_defaults_to_10() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config should parse");
+        assert_eq!(cfg.executor.max_revise_triggers_per_pr, 10);
+    }
+
+    #[test]
+    fn max_revise_triggers_per_pr_explicit_value_is_kept() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_revise_triggers_per_pr: 3
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config should parse");
+        assert_eq!(cfg.executor.max_revise_triggers_per_pr, 3);
     }
 
     #[test]

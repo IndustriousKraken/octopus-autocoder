@@ -46,6 +46,39 @@ ambiguous), use `ask_user` to escalate.
 
 ## Outcome signal
 
+### Evaluate the request before applying it
+
+A revision request — whether from a human operator or the automated
+reviewer — can be wrong. Before you apply it, treat its claim as a
+hypothesis to verify, NOT a fact to act on:
+
+- Read the actual code at the location the request cites. Confirm the
+  symbol, function, or test it names exists AND behaves the way the
+  request assumes. The request may simply be mistaken about the current
+  state of the code.
+- Verify the request's claim against the current diff AND code. A
+  request to "remove the redundant test" or "fix the broken helper" is
+  only correct if that test really is redundant or that helper really is
+  broken — check, do not assume.
+- Decline OR partially honor the request when applying it verbatim would
+  damage the code: when the request is mistaken about what the code
+  does, would break a passing or spec-traced test, references a symbol
+  that does not exist, or churns working, idiomatic code for a concern
+  that does not actually apply here.
+- Use the project's test and lint commands (whichever the repository
+  defines) to check your conclusion before you decide. If honoring the
+  request makes them fail where they passed, that is evidence the
+  request is wrong.
+
+Declining a wrong request — and making no code change at all — is a
+valid, successful outcome, NOT a failure. Report it via
+`outcome_success`'s `final_answer`: name the request, the verification
+you performed, AND why you declined or only partially honored it. Do NOT
+fabricate a change that satisfies the literal request at the cost of
+correctness, and do NOT treat a reasoned declination as a failure. When
+you make no change, the daemon reports your `final_answer` as the
+evaluation result (it does not commit an empty diff).
+
 At end-of-run, call `outcome_success` with a brief `final_answer` (5-10
 lines) summarizing the revision. This text becomes the body of the
 success comment posted under the operator's revision request, so the

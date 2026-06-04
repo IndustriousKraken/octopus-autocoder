@@ -506,6 +506,8 @@ async fn process_one_changelog_pr_revision(
             auto_revisions_applied: 0,
             revision_cap: u32::MAX,
             cap_decline_posted: false,
+            human_revise_count: 0,
+            human_revise_cap_decline_posted: false,
             code_reviews_applied: 0,
             code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
