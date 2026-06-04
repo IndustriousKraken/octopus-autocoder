@@ -26,6 +26,7 @@
 //! framework so a62/a63 plug into an established frame.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 /// Where a gate runs relative to the executor. The `[in]` and `[canon]`
 /// gates run BEFORE the executor (fail-open posture — a gate's own failure
@@ -109,9 +110,14 @@ pub enum GateImpl {
 /// in the map is unrealized: resolving it yields "no installed gate" AND the
 /// framework invokes nothing for it (no gate is run speculatively).
 ///
-/// [`GateRegistry::standard`] is the daemon's registry as of a61 — only the
-/// `[in]` gate is installed. a62/a63 [`register`](GateRegistry::register)
-/// their gates onto the same registry.
+/// [`GateRegistry::standard`] is the daemon's shared, build-once singleton
+/// registry as of a61 — only the `[in]` gate is installed. It is constructed
+/// lazily on first access AND handed out by `&'static` reference, so the
+/// polling loop resolves gates without re-allocating the map on every pending
+/// change. a62/a63 extend it by adding their
+/// [`register`](GateRegistry::register) calls to `standard`'s initializer —
+/// registration happens once, at startup (first access), onto the one shared
+/// instance.
 #[derive(Debug, Default, Clone)]
 pub struct GateRegistry {
     installed: BTreeMap<VerifierGate, GateImpl>,
@@ -121,15 +127,25 @@ impl GateRegistry {
     /// The daemon's standard registry as of a61: the `[in]` gate is installed
     /// (mapped to the a59 contradiction check); `[canon]` and `[out]` are in
     /// the vocabulary but unrealized (no installed gate). a62/a63 extend this
-    /// by registering their gates.
-    pub fn standard() -> Self {
-        let mut reg = GateRegistry::default();
-        reg.register(VerifierGate::In, GateImpl::ContradictionCheck);
-        reg
+    /// by registering their gates in the initializer below.
+    ///
+    /// Returns a `&'static` reference to a single, lazily-built instance (via
+    /// [`OnceLock`]): the `BTreeMap` is allocated exactly once for the process
+    /// rather than on every call, so resolving a gate on the polling-loop hot
+    /// path costs no allocation.
+    pub fn standard() -> &'static GateRegistry {
+        static STANDARD: OnceLock<GateRegistry> = OnceLock::new();
+        STANDARD.get_or_init(|| {
+            let mut reg = GateRegistry::default();
+            reg.register(VerifierGate::In, GateImpl::ContradictionCheck);
+            reg
+        })
     }
 
-    /// Install (or replace) the implementation for a gate. a62/a63 call this
-    /// to realize the `[canon]` / `[out]` gates.
+    /// Install (or replace) the implementation for a gate. Called from
+    /// [`standard`](GateRegistry::standard)'s initializer to build the shared
+    /// registry; a62/a63 add their `register` calls there to realize the
+    /// `[canon]` / `[out]` gates (registration done once, at startup).
     pub fn register(&mut self, gate: VerifierGate, gate_impl: GateImpl) {
         self.installed.insert(gate, gate_impl);
     }
@@ -218,15 +234,29 @@ mod tests {
         assert!(!reg.is_installed(VerifierGate::Out));
     }
 
-    /// The registry is extensible: a62/a63 register their gates onto the same
-    /// registry, exactly as `standard()` registers the `[in]` gate.
+    /// The registry is extensible via `register()`: `standard()`'s initializer
+    /// builds the installed set this way (and a62/a63 add their gates there).
+    /// Here we clone the standard set AND realize a previously-inert gate to
+    /// verify the builder mechanism.
     #[test]
     fn register_realizes_a_previously_inert_gate() {
-        let mut reg = GateRegistry::standard();
+        let mut reg = GateRegistry::standard().clone();
         assert!(!reg.is_installed(VerifierGate::Canon));
         reg.register(VerifierGate::Canon, GateImpl::ContradictionCheck);
         assert!(reg.is_installed(VerifierGate::Canon));
         assert_eq!(reg.resolve(VerifierGate::Canon), Some(GateImpl::ContradictionCheck));
+    }
+
+    /// `standard()` hands out one shared, build-once instance: repeated calls
+    /// return the same `&'static` (no per-call allocation on the hot path).
+    #[test]
+    fn standard_returns_the_same_shared_instance() {
+        let a = GateRegistry::standard();
+        let b = GateRegistry::standard();
+        assert!(
+            std::ptr::eq(a, b),
+            "standard() must return the same singleton, not a fresh allocation"
+        );
     }
 
     #[test]
