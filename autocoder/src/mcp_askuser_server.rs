@@ -464,12 +464,13 @@ fn handle_request<W: Write>(
                         }
                     }
                 }
-                // a57 `submit_findings` (advisory audits) AND a58
-                // `submit_review` (agentic reviewer) share the per-role
-                // relay path: the role selects the daemon-side schema, the
-                // tool's full arguments object IS the submission payload, AND
-                // a rejection comes back as a correctable tool error.
-                tool @ ("submit_findings" | "submit_review") => {
+                // a57 `submit_findings` (advisory audits), a58 `submit_review`
+                // (agentic reviewer), AND a59 `submit_contradictions`
+                // (contradiction check) share the per-role relay path: the
+                // role selects the daemon-side schema, the tool's full
+                // arguments object IS the submission payload, AND a rejection
+                // comes back as a correctable tool error.
+                tool @ ("submit_findings" | "submit_review" | "submit_contradictions") => {
                     let role = std::env::var(ENV_ROLE)
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -485,10 +486,16 @@ fn handle_request<W: Write>(
                     let payload = call.arguments.clone();
                     match relay_submission(&role, &payload) {
                         Ok(()) => {
-                            let text = if tool == "submit_review" {
-                                "Review submitted and recorded as this PR's verdict. You may stop now."
-                            } else {
-                                "Findings submitted and recorded as this audit's result. You may stop now."
+                            let text = match tool {
+                                "submit_review" => {
+                                    "Review submitted and recorded as this PR's verdict. You may stop now."
+                                }
+                                "submit_contradictions" => {
+                                    "Contradictions submitted and recorded as this check's result. You may stop now."
+                                }
+                                _ => {
+                                    "Findings submitted and recorded as this audit's result. You may stop now."
+                                }
                             };
                             let result = serde_json::json!({
                                 "content": [
@@ -862,6 +869,10 @@ pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
     } else if role == crate::code_reviewer::REVIEWER_ROLE {
         // a58: the agentic reviewer returns its verdict via `submit_review`.
         Some("submit_review")
+    } else if role == crate::preflight::change_contradiction::CONTRADICTION_CHECK_ROLE {
+        // a59: the contradiction check returns its findings via
+        // `submit_contradictions`.
+        Some("submit_contradictions")
     } else {
         None
     }
@@ -876,6 +887,11 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
     // concerns shape distinct from the advisory audits' `submit_findings`.
     if role == crate::code_reviewer::REVIEWER_ROLE {
         return Some(submit_review_tool());
+    }
+    // a59: the contradiction check's `submit_contradictions` tool has a
+    // requirement-pair shape distinct from the audits AND the reviewer.
+    if role == crate::preflight::change_contradiction::CONTRADICTION_CHECK_ROLE {
+        return Some(submit_contradictions_tool());
     }
     let finding_schema = match role {
         "drift_audit" => serde_json::json!({
@@ -966,6 +982,39 @@ fn submit_review_tool() -> serde_json::Value {
                 }
             },
             "required": ["verdict", "summary", "concerns"]
+        }
+    })
+}
+
+/// The `submit_contradictions` tool definition advertised for the
+/// contradiction-check role (a59). Each entry names the two conflicting
+/// requirements AND a one-line summary of why they cannot both hold; an
+/// empty `contradictions` array means "no contradictions found". The
+/// daemon-side validator
+/// ([`crate::preflight::change_contradiction::payload_to_contradictions`])
+/// deserializes the payload into the finding shape, surfacing a malformed
+/// payload as a correctable tool error.
+fn submit_contradictions_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_contradictions",
+        "description": "Return the change-internal contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Each entry names the two conflicting requirements AND a one-line summary of why they cannot both hold simultaneously. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contradictions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement_a": { "type": "string" },
+                            "requirement_b": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["requirement_a", "requirement_b", "summary"]
+                    }
+                }
+            },
+            "required": ["contradictions"]
         }
     })
 }
@@ -1101,11 +1150,12 @@ mod tests {
     }
 
     // a56: roles with no registered `submit_*` tool resolve to None. (The
-    // `reviewer` role registered `submit_review` in a58, so it is no longer
-    // in this list.)
+    // `reviewer` role registered `submit_review` in a58 AND
+    // `contradiction_check` registered `submit_contradictions` in a59, so
+    // neither is in this list.)
     #[test]
     fn submission_tool_for_role_returns_none_until_a_role_registers() {
-        for role in ["contradiction_check", "scout", "whatever"] {
+        for role in ["scout", "whatever", "implementer"] {
             assert!(
                 submission_tool_for_role(role).is_none(),
                 "role `{role}` must have no registered submit tool yet"
@@ -1257,6 +1307,11 @@ mod tests {
         );
         // a58: the reviewer role gets `submit_review`, not `submit_findings`.
         assert_eq!(submission_tool_name_for_role("reviewer"), Some("submit_review"));
+        // a59: the contradiction check gets `submit_contradictions`.
+        assert_eq!(
+            submission_tool_name_for_role("contradiction_check"),
+            Some("submit_contradictions")
+        );
         assert_eq!(submission_tool_name_for_role("implementer"), None);
         assert_eq!(submission_tool_name_for_role("missing_tests"), None);
         assert_eq!(submission_tool_name_for_role("security_bug"), None);
@@ -1307,6 +1362,73 @@ mod tests {
                     .map(|t| t["name"] != "submit_review")
                     .unwrap_or(true),
                 "role `{role}` must NOT advertise submit_review"
+            );
+        }
+    }
+
+    // a59 (3.6): `submit_contradictions` is advertised ONLY when
+    // `ORCH_MCP_ROLE = contradiction_check`, with the requirement-pair
+    // schema, alongside the common tools — AND NOT for any other role.
+    #[test]
+    fn submit_contradictions_advertised_only_for_contradiction_check_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "contradiction_check");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_contradictions")
+            .expect("contradiction_check role must advertise submit_contradictions");
+        // The advertised schema requires the requirement-pair fields.
+        let item_props =
+            &submit["inputSchema"]["properties"]["contradictions"]["items"]["properties"];
+        for field in ["requirement_a", "requirement_b", "summary"] {
+            assert!(
+                item_props.get(field).is_some(),
+                "contradiction item schema must define `{field}`: {submit}"
+            );
+        }
+        let required: Vec<&str> = submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["contradictions"], "top-level required");
+        // submit_findings AND submit_review are NOT present for this role.
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_findings"),
+            "contradiction_check must not advertise submit_findings"
+        );
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_review"),
+            "contradiction_check must not advertise submit_review"
+        );
+        // Common tools coexist.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+        assert!(
+            names.contains(&"query_canonical_specs"),
+            "common tools present: {names:?}"
+        );
+
+        // Other roles: submit_contradictions is absent.
+        for role in ["implementer", "reviewer", "drift_audit", "missing_tests"] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_contradictions")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_contradictions"
             );
         }
     }

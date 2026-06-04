@@ -2640,15 +2640,14 @@ async fn handle_contradiction_preflight(
     change: &str,
     cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
 ) -> Result<Option<QueueStep>> {
-    let findings =
-        crate::preflight::change_contradiction::check_change_internal_contradictions(
-            workspace,
-            change,
-            cc_ctx.llm.as_ref(),
-            &cc_ctx.prompt_template,
-        )
-        .await
-        .with_context(|| format!("contradiction-check pre-flight for `{change}`"))?;
+    // a59: the check runs agentically through `agentic_run` AND is fail-open
+    // by contract — it returns an empty `Vec` (with a WARN) on any session
+    // error, missing submission, OR re-validation failure, so there is no
+    // `Result` to propagate here.
+    let findings = crate::preflight::change_contradiction::run_agentic_contradiction_check(
+        cc_ctx, workspace, change,
+    )
+    .await;
     if findings.is_empty() {
         return Ok(None);
     }
@@ -12539,32 +12538,25 @@ mod tests {
     // Change-internal contradiction pre-flight (a19)
     // ============================================================
 
-    /// A test LlmClient that returns a fixed body OR a fixed error.
-    struct CcFixedLlm {
-        body: std::sync::Mutex<Option<String>>,
-        error: std::sync::Mutex<Option<String>>,
-    }
-    impl CcFixedLlm {
-        fn ok(body: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
-            std::sync::Arc::new(Self {
-                body: std::sync::Mutex::new(Some(body.into())),
-                error: std::sync::Mutex::new(None),
-            })
-        }
-        fn err(msg: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
-            std::sync::Arc::new(Self {
-                body: std::sync::Mutex::new(None),
-                error: std::sync::Mutex::new(Some(msg.into())),
-            })
-        }
-    }
-    #[async_trait::async_trait]
-    impl crate::llm::LlmClient for CcFixedLlm {
-        async fn complete(&self, _prompt: &str) -> Result<String> {
-            if let Some(msg) = self.error.lock().unwrap().clone() {
-                return Err(anyhow!(msg));
-            }
-            Ok(self.body.lock().unwrap().clone().unwrap_or_default())
+    /// a59: build a contradiction-check context whose agentic session is
+    /// short-circuited by an injected `submit_contradictions` submission
+    /// (`Some(payload)`), a no-submission session (`None`), bypassing the
+    /// CLI subprocess AND the control socket entirely.
+    fn cc_test_ctx(
+        submission: Option<serde_json::Value>,
+        attribution: Option<String>,
+    ) -> crate::preflight::change_contradiction::ContradictionCheckCtx {
+        crate::preflight::change_contradiction::ContradictionCheckCtx {
+            command: "claude".into(),
+            model: crate::agentic_run::ResolvedModel {
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-test".into(),
+                api_base_url: "https://example.invalid".into(),
+                api_key: "sk-test".into(),
+            },
+            prompt_template: "TEST_PROMPT".into(),
+            attribution,
+            test_submission: Some(submission),
         }
     }
 
@@ -12606,14 +12598,10 @@ mod tests {
     /// reached (the check is a no-op outcome-wise).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contradiction_preflight_empty_findings_proceeds_to_executor() {
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::ok(r#"{"contradictions": []}"#),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: None,
-        };
+        let ctx = cc_test_ctx(Some(serde_json::json!({ "contradictions": [] })), None);
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
-        // Change has a spec delta so build_spec_input has something to send,
+        // Change has a spec delta so the session has something to read,
         // but archivability check passes (no canonical to fight with).
         add_committed_change_with_spec(
             &ws,
@@ -12657,21 +12645,17 @@ mod tests {
     /// the executor is NOT invoked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contradiction_preflight_findings_write_marker_and_skip_executor() {
-        let body = r#"{
-          "contradictions": [
-            { "requirement_a": "All secrets in env vars",
-              "requirement_b": "API key in config.yaml",
-              "summary": "A forbids what B requires" },
-            { "requirement_a": "Cap operations at 60s",
-              "requirement_b": "Run the 5-minute workflow",
-              "summary": "B exceeds A's cap" }
-          ]
-        }"#;
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::ok(body),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: Some("anthropic/claude-opus-4-8".into()),
-        };
+        let submission = serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "All secrets in env vars",
+                  "requirement_b": "API key in config.yaml",
+                  "summary": "A forbids what B requires" },
+                { "requirement_a": "Cap operations at 60s",
+                  "requirement_b": "Run the 5-minute workflow",
+                  "summary": "B exceeds A's cap" }
+            ]
+        });
+        let ctx = cc_test_ctx(Some(submission), Some("anthropic/claude-opus-4-8".into()));
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change_with_spec(
@@ -12744,15 +12728,13 @@ mod tests {
         );
     }
 
-    /// Enabled mode + LLM transport error → fail open, executor IS
-    /// invoked, no marker written.
+    /// Enabled mode + a session that records NO submission → fail open,
+    /// executor IS invoked, no marker written (a59).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contradiction_preflight_llm_error_fails_open() {
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::err("simulated transport error"),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: None,
-        };
+    async fn contradiction_preflight_no_submission_fails_open() {
+        // `Some(None)` = the agentic session ran but recorded no
+        // `submit_contradictions` submission.
+        let ctx = cc_test_ctx(None, None);
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change_with_spec(
@@ -12788,7 +12770,7 @@ mod tests {
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "fail-open: executor must be invoked despite the transport error"
+            "fail-open: executor must be invoked when the session records no submission"
         );
         assert!(
             !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")
