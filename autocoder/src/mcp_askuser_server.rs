@@ -464,6 +464,53 @@ fn handle_request<W: Write>(
                         }
                     }
                 }
+                "submit_findings" => {
+                    // The role this MCP child serves selects the daemon-side
+                    // finding schema; the relay carries it so
+                    // `record_submission` validates against the right one.
+                    let role = std::env::var(ENV_ROLE)
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let Some(role) = role else {
+                        emit_error(
+                            writer,
+                            id,
+                            -32601,
+                            "submit_findings: no ORCH_MCP_ROLE set; this MCP child advertises no submission tool",
+                        )?;
+                        return Ok(());
+                    };
+                    // The tool's full arguments object IS the submission
+                    // payload (`{ "findings": [...] }`).
+                    let payload = call.arguments.clone();
+                    match relay_submission(&role, &payload) {
+                        Ok(()) => {
+                            let result = serde_json::json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Findings submitted and recorded as this audit's result. You may stop now.",
+                                    }
+                                ],
+                                "isError": false,
+                                "structuredContent": { "ok": true }
+                            });
+                            emit_result(writer, id, result)?;
+                        }
+                        Err(e) => {
+                            // A schema rejection (or transport failure) is
+                            // surfaced as a correctable tool error so the
+                            // agent can fix its payload AND resubmit in the
+                            // same session.
+                            emit_error(
+                                writer,
+                                id,
+                                -32602,
+                                &format!("submit_findings rejected: {e}"),
+                            )?;
+                        }
+                    }
+                }
                 other => {
                     emit_error(
                         writer,
@@ -765,9 +812,7 @@ fn relay_record_outcome(outcome: &serde_json::Value) -> Result<()> {
 /// so the calling `submit_*` tool can surface it to the agent as a
 /// correctable tool error AND let it retry in the same session.
 ///
-/// Forward-looking: this change adds the relay; the concrete per-role
-/// `submit_*` tools that call it land with their consuming changes.
-#[allow(dead_code)]
+/// a57: the advisory audits' `submit_findings` tool is the first consumer.
 fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
     let socket_path = std::env::var(ENV_CONTROL_SOCKET).map_err(|_| {
         anyhow!("{ENV_CONTROL_SOCKET} not set; submit tools require the daemon's control socket")
@@ -794,14 +839,89 @@ fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The advisory-audit roles whose per-execution MCP child advertises the
+/// `submit_findings` tool (a57). The executor (`implementer`) AND the
+/// specs-writing audits (`missing_tests`, `security_bug`) are deliberately
+/// absent: the executor reports via the `outcome_*` tools AND the
+/// specs-writing audits produce on-disk proposals, not findings.
+pub const ADVISORY_AUDIT_ROLES: &[&str] =
+    &["drift_audit", "architecture_consultative", "documentation_audit"];
+
+/// Name of the per-role structured-submission (`submit_*`) tool a role
+/// advertises, or `None` when the role has no registered submission tool.
+/// Used both by the `tools/list` advertisement AND by the daemon-side
+/// allowed-tools assembly (so the qualified `mcp__ask_user__submit_findings`
+/// name is auto-allowed for the advisory audits). The concrete tools added
+/// by later changes (`submit_review`, `submit_contradictions`, …) extend
+/// this lookup.
+pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
+    if ADVISORY_AUDIT_ROLES.contains(&role) {
+        Some("submit_findings")
+    } else {
+        None
+    }
+}
+
 /// Look up the per-role structured-submission (`submit_*`) tool definition
-/// for the `tools/list` response. The concrete tools (`submit_findings`,
-/// `submit_review`, `submit_contradictions`, `submit_verdict`) AND their
-/// inputSchemas are added by the changes that consume them (4/5/6/8); this
-/// change establishes the advertisement framework, so no role yet has a
-/// registered tool AND every lookup returns `None`.
-fn submission_tool_for_role(_role: &str) -> Option<serde_json::Value> {
-    None
+/// for the `tools/list` response. a57 registers `submit_findings` for the
+/// three advisory-audit roles, each with the role's audit-specific finding
+/// schema; every other role returns `None`.
+fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
+    let finding_schema = match role {
+        "drift_audit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "capability": { "type": "string" },
+                "requirement": { "type": "string" },
+                "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+                "code_anchors": { "type": "array", "items": { "type": "string" } },
+                "divergence": { "type": "string" }
+            },
+            "required": ["capability", "requirement", "severity", "divergence"]
+        }),
+        "architecture_consultative" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string" },
+                "body": { "type": "string" },
+                "anchor": { "type": "string" },
+                "severity": { "type": "string", "enum": ["low", "medium"] }
+            },
+            "required": ["subject", "body", "anchor", "severity"]
+        }),
+        "documentation_audit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "category": { "type": "string", "enum": ["coverage", "stale_reference", "organization"] },
+                "severity": { "type": "string", "enum": ["low", "medium"] },
+                "anchor": { "type": "string" },
+                "body": { "type": "string" }
+            },
+            "required": ["category", "severity", "anchor", "body"]
+        }),
+        _ => return None,
+    };
+    // The architecture audit caps the array at 5 entries; the registered
+    // schema rejects a submission with more, surfacing it to the agent as
+    // a correctable tool error.
+    let mut findings_schema = serde_json::json!({
+        "type": "array",
+        "items": finding_schema,
+    });
+    if role == "architecture_consultative" {
+        findings_schema["maxItems"] = serde_json::json!(5);
+    }
+    Some(serde_json::json!({
+        "name": "submit_findings",
+        "description": "Return this audit's findings to the daemon as the audit result. Call exactly once when your analysis is complete, passing a `findings` array shaped per this tool's schema (an empty array means \"no findings\"). The daemon validates the payload against the audit's finding schema; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "findings": findings_schema
+            },
+            "required": ["findings"]
+        }
+    }))
 }
 
 /// Open a connection to the daemon's control socket, send `request`
@@ -975,6 +1095,216 @@ mod tests {
             !names.iter().any(|n| n.starts_with("submit_")),
             "no submission tool is wired in this change: {names:?}"
         );
+    }
+
+    // a57: `submit_findings` is advertised for each of the three advisory
+    // roles, carrying that role's audit-specific finding schema alongside
+    // the common tools.
+    #[test]
+    fn submit_findings_advertised_for_each_advisory_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (role, required_field) in [
+            ("drift_audit", "capability"),
+            ("architecture_consultative", "subject"),
+            ("documentation_audit", "category"),
+        ] {
+            // SAFETY: env writes are serialized via ENV_LOCK.
+            unsafe {
+                std::env::set_var(ENV_ROLE, role);
+            }
+            let dir = TempDir::new().unwrap();
+            let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+            let resps = run_with(
+                &marker,
+                &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+            );
+            unsafe {
+                std::env::remove_var(ENV_ROLE);
+            }
+            let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+            let submit = tools
+                .iter()
+                .find(|t| t["name"] == "submit_findings")
+                .unwrap_or_else(|| panic!("role `{role}` must advertise submit_findings"));
+            // Common tools coexist with the role's submission tool.
+            let names: Vec<&str> =
+                tools.iter().filter_map(|t| t["name"].as_str()).collect();
+            assert!(names.contains(&"query_canonical_specs"), "role `{role}`: {names:?}");
+            assert!(names.contains(&"ask_user"), "role `{role}`: {names:?}");
+            // The advertised schema requires the role's distinguishing field.
+            let props = &submit["inputSchema"]["properties"]["findings"]["items"]["properties"];
+            assert!(
+                props.get(required_field).is_some(),
+                "role `{role}`: finding schema must define `{required_field}`: {submit}"
+            );
+            let required: Vec<&str> = submit["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(required, vec!["findings"], "role `{role}` top-level required");
+        }
+    }
+
+    // a57: the architecture role's findings schema caps the array at 5.
+    #[test]
+    fn submit_findings_architecture_schema_caps_array_at_five() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "architecture_consultative");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_findings")
+            .unwrap();
+        assert_eq!(submit["inputSchema"]["properties"]["findings"]["maxItems"], 5);
+    }
+
+    // a57: `submit_findings` is NOT advertised for the executor or the
+    // specs-writing audits.
+    #[test]
+    fn submit_findings_absent_for_non_advisory_roles() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for role in ["implementer", "missing_tests", "security_bug"] {
+            unsafe {
+                std::env::set_var(ENV_ROLE, role);
+            }
+            let dir = TempDir::new().unwrap();
+            let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+            let resps = run_with(
+                &marker,
+                &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+            );
+            unsafe {
+                std::env::remove_var(ENV_ROLE);
+            }
+            let tools = resps[0]["result"]["tools"].as_array().unwrap();
+            assert!(
+                !tools.iter().any(|t| t["name"] == "submit_findings"),
+                "role `{role}` must NOT advertise submit_findings"
+            );
+        }
+    }
+
+    #[test]
+    fn submission_tool_name_for_role_covers_only_advisory_roles() {
+        assert_eq!(submission_tool_name_for_role("drift_audit"), Some("submit_findings"));
+        assert_eq!(
+            submission_tool_name_for_role("architecture_consultative"),
+            Some("submit_findings")
+        );
+        assert_eq!(
+            submission_tool_name_for_role("documentation_audit"),
+            Some("submit_findings")
+        );
+        assert_eq!(submission_tool_name_for_role("implementer"), None);
+        assert_eq!(submission_tool_name_for_role("missing_tests"), None);
+        assert_eq!(submission_tool_name_for_role("security_bug"), None);
+    }
+
+    // a57: a `submit_findings` tool call relays the payload to the daemon
+    // via the `record_submission` control-socket action, tagged with the
+    // child's role.
+    #[test]
+    fn submit_findings_relays_via_socket() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let received: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            let req: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            *received_clone.lock().unwrap() = Some(req);
+            let response = serde_json::json!({"ok": true});
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, socket_path.to_string_lossy().to_string());
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "drift_audit");
+            std::env::set_var(ENV_ROLE, "drift_audit");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"submit_findings","arguments":{"findings":[{"capability":"orchestrator-cli","requirement":"Polling loop","severity":"high","code_anchors":["src/x.rs:1"],"divergence":"spec X, code Y"}]}}}"#],
+        );
+        handle.join().unwrap();
+        assert_eq!(resps[0]["result"]["isError"], false, "resp: {:?}", resps[0]);
+        let recv = received.lock().unwrap().take().unwrap();
+        assert_eq!(recv["action"], "record_submission");
+        assert_eq!(recv["workspace_basename"], "test-ws");
+        assert_eq!(recv["change"], "drift_audit");
+        assert_eq!(recv["role"], "drift_audit");
+        assert_eq!(recv["payload"]["findings"][0]["capability"], "orchestrator-cli");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+            std::env::remove_var(ENV_ROLE);
+        }
+    }
+
+    // a57: a schema rejection from the daemon comes back as a correctable
+    // tool error (-32602), not a silent success.
+    #[test]
+    fn submit_findings_schema_rejection_surfaces_as_tool_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            // Daemon rejects (e.g. >5 architecture findings).
+            let response = serde_json::json!({"ok": false, "error": "findings array exceeds the cap of 5"});
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, socket_path.to_string_lossy().to_string());
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "architecture_consultative");
+            std::env::set_var(ENV_ROLE, "architecture_consultative");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"submit_findings","arguments":{"findings":[]}}}"#],
+        );
+        handle.join().unwrap();
+        assert_eq!(resps[0]["error"]["code"], -32602, "resp: {:?}", resps[0]);
+        let msg = resps[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("cap of 5"), "error must carry the daemon's reason: {msg}");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+            std::env::remove_var(ENV_ROLE);
+        }
     }
 
     #[test]

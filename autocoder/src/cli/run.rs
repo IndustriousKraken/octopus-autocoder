@@ -570,6 +570,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         submission_store: crate::submission_store::SubmissionStore::new(),
         paths: daemon_paths.clone(),
     };
+    // a57: register the advisory audits' `submit_findings` payload schemas
+    // on the shared submission store BEFORE the listener starts handling
+    // `record_submission`, so the MCP child's submissions are validated
+    // against the role's finding schema.
+    crate::audits::register_submission_schemas(&control_state.submission_store);
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = control_socket::listen(control_state, listener_cancel).await {

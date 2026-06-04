@@ -1530,15 +1530,18 @@ autocoder SHALL register a `dependency_update_triage` audit in the periodic-audi
   advances normally)
 
 ### Requirement: Drift audit
-autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a drift-detection prompt, then surfaces findings via chatops. The audit is `requires_head_change = true` and `WritePolicy::None`.
+autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a drift-detection prompt, then surfaces findings via chatops. The agent SHALL return its findings by calling the `submit_findings` MCP tool — validated against the drift finding schema and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
 
 #### Scenario: Invokes the CLI with a read-only sandbox
 - **WHEN** the audit runs
 - **THEN** autocoder spawns the configured `executor.command`
   (typically `claude`) with `--settings` pointing at a generated
   sandbox file whose `permissions.deny` excludes `Write` and
-  `Edit` and whose `allowed_tools` contains only
+  `Edit` and whose CLI tool permissions contain only
   `["Read", "Glob", "Grep", "Bash"]`
+- **AND** a generated `.mcp.json` exposes the `submit_findings`
+  MCP tool with `ORCH_MCP_ROLE` set to `drift_audit`, so the agent
+  can return findings but still cannot `Write` or `Edit`
 - **AND** the prompt is the embedded `prompts/drift-audit.md`
   template OR the operator-supplied override at
   `audits.drift_audit.prompt_path`
@@ -1555,10 +1558,10 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
   `openspec/changes/` (in-flight changes) and
   `openspec/changes/archive/` (historical changes)
 
-#### Scenario: Outputs findings in a parseable format
-- **WHEN** the agent completes
-- **THEN** the agent's stdout SHALL be a single JSON object of
-  shape:
+#### Scenario: Returns findings via the submit_findings tool
+- **WHEN** the agent has finished its analysis
+- **THEN** it calls the `submit_findings` MCP tool with a payload
+  of shape:
   ```json
   {
     "findings": [
@@ -1572,7 +1575,11 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
     ]
   }
   ```
-- **AND** autocoder parses this JSON to produce `Finding`
+- **AND** the daemon validates the payload against the drift
+  finding schema (via a56's `record_submission`), surfacing a
+  schema violation to the agent as a correctable tool error
+- **AND** after the audit subprocess exits the daemon
+  `consume_submission`s the stored payload to produce `Finding`
   values for the `AuditOutcome::Reported(...)` return
 
 #### Scenario: Filters out low-severity wording-only differences
@@ -1581,21 +1588,23 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
   whose only divergence is wording, formatting, or phrasing.
   Only report divergences with behavioral consequences."
 - **AND** the agent SHOULD self-filter such findings before
-  emitting the JSON
+  submitting
 
 #### Scenario: Empty findings list produces silent outcome
-- **WHEN** the agent returns an empty `findings` array
+- **WHEN** the agent calls `submit_findings` with an empty
+  `findings` array
 - **THEN** the audit returns `AuditOutcome::Reported(vec![])`
 - **AND** per the framework-level "Reported with no findings"
   scenario, no chatops post is made unless
   `notify_on_clean: true`
 
-#### Scenario: Malformed agent output fails the audit
-- **WHEN** the agent's stdout is not parseable as the expected
-  JSON shape (missing top-level `findings`, non-array value,
-  malformed JSON, etc.)
-- **THEN** the audit returns `Err` with the parse error AND a
-  truncated stdout excerpt
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings`, OR every
+  `submit_findings` call is rejected by the schema (malformed
+  shape, missing top-level `findings`, non-array value) and the
+  session ends with no stored submission
+- **THEN** the audit returns `Err` with a diagnostic AND a
+  truncated stdout/stderr excerpt
 - **AND** the framework treats this as audit failure: state is
   NOT updated, chatops alert posts under the existing
   audit-failure category, the next iteration retries
@@ -1786,7 +1795,7 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
   normally
 
 ### Requirement: Architecture consultative audit
-autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The audit is `requires_head_change = true` and `WritePolicy::None`.
+autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The agent SHALL return those findings by calling the `submit_findings` MCP tool — validated against the architecture finding schema, which caps the array at 5 entries, and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
 
 #### Scenario: Prompt forbids "rewrite at scale" suggestions
 - **WHEN** the prompt is loaded
@@ -1820,7 +1829,8 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
 
 #### Scenario: Returns 0-5 findings per run
 - **WHEN** the audit runs
-- **THEN** the agent's output contains a JSON object of shape:
+- **THEN** the agent calls the `submit_findings` MCP tool with a
+  payload of shape:
   ```json
   {
     "findings": [
@@ -1833,10 +1843,13 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
     ]
   }
   ```
-- **AND** the `findings` array contains AT MOST 5 entries
+- **AND** the `findings` array contains AT MOST 5 entries — the
+  registered schema rejects a submission with more than 5,
+  surfacing it to the agent as a correctable tool error
 - **AND** if the audit produces 0 findings (no observations rise
-  above the prompt's quality bar), the result is
-  `AuditOutcome::Reported(vec![])` and per framework behavior no
+  above the prompt's quality bar), the agent calls
+  `submit_findings` with an empty array, the result is
+  `AuditOutcome::Reported(vec![])`, and per framework behavior no
   chatops post is sent unless `notify_on_clean: true`
 
 #### Scenario: Findings render as questions in chatops
@@ -1848,11 +1861,13 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
 - **AND** the full body text is preserved in the audit-run log
   (chatops only shows the subject + anchor for compactness)
 
-#### Scenario: Malformed agent output fails the audit
-- **WHEN** the agent's stdout cannot be parsed as the expected
-  JSON shape OR includes more than 5 findings
-- **THEN** the audit returns `Err` with the parse error AND a
-  truncated stdout excerpt
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings`, OR every
+  `submit_findings` call is rejected by the schema (malformed
+  shape, or more than 5 findings) and the session ends with no
+  stored submission
+- **THEN** the audit returns `Err` with a diagnostic AND a
+  truncated stdout/stderr excerpt
 - **AND** the framework treats this as audit failure: state is
   NOT updated, chatops alert posts under the existing
   audit-failure category, the next iteration retries
@@ -4749,7 +4764,7 @@ The Cargo.toml `version =` field SHALL be operator-bumped only at semver-meaning
 - **AND** operators installing via `update.sh` see clean semver versions in their `🆙` notifications AND `--version` output
 
 ### Requirement: Documentation audit reports coverage, stale-reference, and organization findings
-autocoder SHALL register a `documentation_audit` audit type in the periodic-audit framework. The audit is LLM-driven, declares `WritePolicy::None`, `requires_head_change = true`, AND a sandbox profile allowing `Read`, `Glob`, `Grep`, AND `Bash` (read-only). It produces `AuditOutcome::Reported(findings)` covering three categories of documentation defect:
+autocoder SHALL register a `documentation_audit` audit type in the periodic-audit framework. The audit is LLM-driven, declares `WritePolicy::None`, `requires_head_change = true`, AND a sandbox profile allowing `Read`, `Glob`, `Grep`, AND `Bash` (read-only) plus the `submit_findings` MCP tool through which the agent returns its findings — validated against the documentation finding schema (`category`, `severity`, `anchor`, `body`) and consumed by the daemon as the audit result, rather than emitted as JSON on stdout. It produces `AuditOutcome::Reported(findings)` covering three categories of documentation defect:
 
 1. **Coverage** — code or canonical-spec features that user-facing docs (`README.md`, `docs/*.md`) don't mention. Heuristic: any canonical-spec requirement whose body mentions operator-visible artifacts (`@<bot>` verbs, config keys, CLI flags, file paths the operator interacts with) is in scope. Pure-internal capabilities are NOT flagged.
 2. **Stale references** — docs references to code symbols (function names in code blocks, CLI verbs, config fields, file paths under `src/`) that don't exist in the current code or canonical specs. Catches dead references from removed features.
@@ -4819,6 +4834,17 @@ When `a21`'s canonical-spec RAG is enabled in the same workspace, the audit's pr
 - **AND** the triage produces a doc-fix PR (changes to `README.md` / `docs/*.md` files)
 - **AND** the triage does NOT produce a spec PR (documentation is not OpenSpec material)
 - **AND** the doc-fix PR participates in the standard `@<bot> revise <text>` revision loop
+
+#### Scenario: Returns findings via the submit_findings tool
+- **WHEN** the agent has finished its analysis
+- **THEN** it calls the `submit_findings` MCP tool with the documentation findings (`category`, `severity` of `low` | `medium`, `anchor`, `body`)
+- **AND** the daemon validates the payload (via a56's `record_submission`) and, after the subprocess exits, `consume_submission`s it to produce the `Reported` findings — a `high` severity in the submission is demoted to `medium` per the existing demotion scenario
+- **AND** a schema-invalid submission is surfaced to the agent as a correctable tool error
+
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings` AND the session ends with no stored submission
+- **THEN** the audit returns `Err`
+- **AND** the framework treats this as audit failure: state is NOT updated, the chatops audit-failure alert posts, the next iteration retries
 
 ### Requirement: `brownfield` chatops verb queues a brownfield-draft executor request
 The chatops listener SHALL submit a `BrownfieldAction` (per the chatops-manager requirement) which the daemon's control-socket handler converts into an entry on the resolved repo's `pending_brownfield_requests: VecDeque<RequestId>` queue. The daemon SHALL persist a per-request state file `<workspace>/.state/brownfield_requests/<request_id>.json` containing the request's `repo_url`, `capability_name`, `guidance: Option<String>`, `channel`, `thread_ts`, AND `status` (`Pending` | `InProgress` | `Acted` | `Failed` | `Aborted`).

@@ -494,7 +494,12 @@ impl ClaudeCliExecutor {
     /// executor itself reports via the `outcome_*` tools (not a `submit_*`
     /// tool), so it passes `None`; the agentic roles added by later changes
     /// pass their role name.
-    fn write_mcp_config(
+    ///
+    /// `pub(crate)` so the advisory audits (a57) can write the same
+    /// `.mcp.json` shape — they pass their audit type as both `change`
+    /// (the submission routing key) AND `role` (the `submit_findings`
+    /// advertisement gate).
+    pub(crate) fn write_mcp_config(
         workspace: &Path,
         change: &str,
         role: Option<&str>,
@@ -546,8 +551,9 @@ impl ClaudeCliExecutor {
         Ok(path)
     }
 
-    /// Idempotently remove the `.mcp.json` we wrote.
-    fn delete_mcp_config(workspace: &Path) {
+    /// Idempotently remove the `.mcp.json` we wrote. `pub(crate)` so the
+    /// advisory audits (a57) can clean up the config they wrote.
+    pub(crate) fn delete_mcp_config(workspace: &Path) {
         let path = workspace.join(MCP_CONFIG_FILENAME);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
