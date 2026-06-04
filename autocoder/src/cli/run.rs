@@ -575,6 +575,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // `record_submission`, so the MCP child's submissions are validated
     // against the role's finding schema.
     crate::audits::register_submission_schemas(&control_state.submission_store);
+    // a58: register the agentic reviewer's `submit_review` payload schema on
+    // the same store so the reviewer MCP child's submissions are validated.
+    crate::code_reviewer::register_reviewer_submission_schema(
+        &control_state.submission_store,
+    );
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = control_socket::listen(control_state, listener_cancel).await {

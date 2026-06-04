@@ -1117,41 +1117,86 @@ pub async fn execute_one_pass(
             None => (None, false, Vec::new()),
             Some(r) => {
                 let _ = guard.set_stage(busy_marker::Stage::Review);
-                let outcome = match r.mode() {
-                    crate::config::ReviewerMode::Bundled => {
+                match r.kind() {
+                    // a58: agentic transport — run the read-only CLI-wrapped
+                    // session(s) and consume the schema-validated verdict. A
+                    // session that records no valid submission DISCARDS the
+                    // review (no verdict written, NOT an implicit Approve) AND
+                    // posts the reviewer-failure operator alert.
+                    crate::config::ReviewerKind::Agentic => {
                         let ctx = build_review_context(workspace, repo, &processed)?;
-                        r.review(&ctx).await
+                        match crate::code_reviewer::run_agentic_review(r, &ctx, workspace).await {
+                            Ok(crate::code_reviewer::AgenticReviewOutcome::Reviewed(result)) => {
+                                let mut report = result.into_review_report();
+                                let draft = matches!(report.verdict, ReviewVerdict::Block);
+                                let taken = if r.auto_revise() {
+                                    partition_and_annotate_reviewer_revisions(
+                                        &mut report,
+                                        revision_cap,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                (Some(report), draft, taken)
+                            }
+                            Ok(crate::code_reviewer::AgenticReviewOutcome::Discarded { reason }) => {
+                                tracing::error!(url = %repo.url, "agentic reviewer discarded: {reason}");
+                                post_reviewer_discarded_alert(chatops_ctx, repo, &reason).await;
+                                (None, false, Vec::new())
+                            }
+                            Err(e) => {
+                                tracing::error!(url = %repo.url, "agentic reviewer failed: {e:#}");
+                                post_reviewer_discarded_alert(
+                                    chatops_ctx,
+                                    repo,
+                                    &format!("agentic reviewer failed: {e}"),
+                                )
+                                .await;
+                                (None, false, Vec::new())
+                            }
+                        }
                     }
-                    crate::config::ReviewerMode::PerChange => {
-                        let contexts =
-                            build_per_change_contexts(workspace, repo, &processed)?;
-                        r.review_per_change(&contexts).await.map(|per_change| {
-                            crate::code_reviewer::synthesize_per_change_report(per_change)
-                        })
-                    }
-                };
-                match outcome {
-                    Ok(mut report) => {
-                        let draft = matches!(report.verdict, ReviewVerdict::Block);
-                        let taken = if r.auto_revise() {
-                            partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
-                        } else {
-                            Vec::new()
+                    crate::config::ReviewerKind::Oneshot => {
+                        let outcome = match r.mode() {
+                            crate::config::ReviewerMode::Bundled => {
+                                let ctx = build_review_context(workspace, repo, &processed)?;
+                                r.review(&ctx).await
+                            }
+                            crate::config::ReviewerMode::PerChange => {
+                                let contexts =
+                                    build_per_change_contexts(workspace, repo, &processed)?;
+                                r.review_per_change(&contexts).await.map(|per_change| {
+                                    crate::code_reviewer::synthesize_per_change_report(per_change)
+                                })
+                            }
                         };
-                        (Some(report), draft, taken)
-                    }
-                    Err(e) => {
-                        tracing::error!("reviewer failed: {e:#}");
-                        let synthetic = ReviewReport {
-                            verdict: ReviewVerdict::Concerns,
-                            markdown: format!("(reviewer failed: {e})"),
-                            concerns: Vec::new(),
-                            per_change_sections: Vec::new(),
-                            // Reviewer failed before producing a verdict; no
-                            // model output to attribute (a49).
-                            attribution: None,
-                        };
-                        (Some(synthetic), false, Vec::new())
+                        match outcome {
+                            Ok(mut report) => {
+                                let draft = matches!(report.verdict, ReviewVerdict::Block);
+                                let taken = if r.auto_revise() {
+                                    partition_and_annotate_reviewer_revisions(
+                                        &mut report,
+                                        revision_cap,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                (Some(report), draft, taken)
+                            }
+                            Err(e) => {
+                                tracing::error!("reviewer failed: {e:#}");
+                                let synthetic = ReviewReport {
+                                    verdict: ReviewVerdict::Concerns,
+                                    markdown: format!("(reviewer failed: {e})"),
+                                    concerns: Vec::new(),
+                                    per_change_sections: Vec::new(),
+                                    // Reviewer failed before producing a verdict;
+                                    // no model output to attribute (a49).
+                                    attribution: None,
+                                };
+                                (Some(synthetic), false, Vec::new())
+                            }
+                        }
                     }
                 }
             }
@@ -3490,6 +3535,33 @@ pub(crate) async fn maybe_post_code_review_complete_alert(
             pr_number = pr_number,
             comment_id = %comment_id,
             "failed to persist code-review-complete notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the reviewer-failure operator alert for the pre-PR INITIAL agentic
+/// review (a58). Unlike [`maybe_post_code_review_failed_alert`] (which is
+/// PR-scoped, for the operator-triggered rerun), the initial review runs
+/// BEFORE the PR exists, so this best-effort notification names only the
+/// repo. Gated on `failure_alerts_enabled`; a missing chatops backend OR a
+/// post error degrades to the ERROR log line the caller already emitted.
+pub(crate) async fn post_reviewer_discarded_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    reason: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let text = format!(
+        "✗ `{repo_url}`: code review discarded (no verdict written): {reason}",
+        repo_url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "reviewer-discarded chatops notification post failed: {e:#}"
         );
     }
 }

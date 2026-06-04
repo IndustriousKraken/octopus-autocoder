@@ -371,6 +371,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let err = match build_from_config(&cfg) {
             Ok(_) => panic!("no key source must error"),
@@ -412,6 +414,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg)
             .expect("inline api_key with no api_key_env should succeed");
@@ -460,6 +464,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg).expect("inline build should succeed");
         let _ = client.complete("hi").await.expect("complete succeeds");
@@ -822,6 +828,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg)
             .expect("ollama reviewer must build without api_key");
