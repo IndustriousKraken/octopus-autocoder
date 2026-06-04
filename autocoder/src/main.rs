@@ -12,6 +12,7 @@ mod changelog_requests;
 mod changelog_triage;
 mod chatops;
 mod cli;
+mod code_implements_spec;
 mod code_review_suggestion;
 mod code_reviewer;
 mod config;

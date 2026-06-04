@@ -1204,6 +1204,17 @@ pub async fn execute_one_pass(
         }
     };
 
+    // a63: the `[out]` gate — code-implements-spec verification. Runs AFTER
+    // the executor implemented the change(s) (the agent branch carries the
+    // implementation), before PR-body assembly, when the operator opted in
+    // (`code_implements_spec::current()` is `Some`) AND there are
+    // implementer-processed changes to verify. Advisory: it renders a
+    // `## Spec Verification` PR-body section AND posts a chatops note ONLY when
+    // gaps are found; it NEVER opens a revision AND NEVER blocks PR creation. A
+    // gate failure WARNs (labeled `[verifier:out]`) AND omits the section.
+    let spec_verification_section =
+        run_spec_verification_gate(workspace, repo, &processed, chatops_ctx).await;
+
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
     } else {
@@ -1239,6 +1250,7 @@ pub async fn execute_one_pass(
         &reviewer_revision_concerns,
         chatops_ctx,
         workspace,
+        spec_verification_section.as_deref(),
     )
     .await?;
     // End-of-pass success: push and PR creation both succeeded. Clear the
@@ -1285,6 +1297,93 @@ async fn post_stuck_alert(
         tracing::warn!(
             url = %repo.url,
             "busy_marker: failed to post stuck-state chatops alert: {e:#}"
+        );
+    }
+}
+
+/// Run the `[out]` gate — code-implements-spec verification (a63) — and return
+/// the advisory `## Spec Verification` PR-body section to splice in, or `None`
+/// to omit it. The gate is a no-op (returns `None`) when the operator did not
+/// opt in (`code_implements_spec::current()` is `None`) OR the iteration has no
+/// implementer-processed changes to verify (audit-only). On an `implemented` or
+/// `gaps_found` verdict it renders the section; a `gaps_found` verdict ALSO
+/// posts an advisory chatops note. On a gate failure the module already WARNed
+/// (labeled `[verifier:out]`); this returns `None` (omit the section). The gate
+/// NEVER opens a revision AND NEVER blocks PR creation — the caller proceeds
+/// with the PR regardless of the verdict.
+async fn run_spec_verification_gate(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    processed: &[String],
+    chatops_ctx: Option<&ChatOpsContext>,
+) -> Option<String> {
+    let ctx = crate::code_implements_spec::current()?;
+    if processed.is_empty() {
+        // Audit-only iteration: no implementer-touched files to verify.
+        return None;
+    }
+    let label = crate::verifier_gate::VerifierGate::Out.label();
+    let diff = match git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "{label} could not compute diff for the code-implements-spec gate; omitting the Spec Verification section (advisory, never blocks): {e:#}"
+            );
+            return None;
+        }
+    };
+    let changed_files =
+        git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)
+            .unwrap_or_default();
+    match crate::code_implements_spec::run_code_implements_spec_check(
+        &ctx,
+        workspace,
+        processed,
+        &diff,
+        &changed_files,
+    )
+    .await
+    {
+        crate::code_implements_spec::SpecVerificationOutcome::Verified(verification) => {
+            // Post the advisory chatops heads-up ONLY when gaps are found.
+            if verification.has_gaps() {
+                post_spec_verification_gaps_alert(chatops_ctx, repo, &verification).await;
+            }
+            Some(crate::code_implements_spec::render_spec_verification_section(
+                &verification,
+            ))
+        }
+        crate::code_implements_spec::SpecVerificationOutcome::Unavailable => {
+            // The module already WARNed (labeled `[verifier:out]`); omit the
+            // section. The gate never blocks PR creation.
+            None
+        }
+    }
+}
+
+/// Post an advisory chatops heads-up when the `[out]` gate's verdict reports
+/// gaps (a63). Best-effort AND gated on `failure_alerts_enabled`: a post
+/// failure is logged at WARN but never propagated, AND the gate never blocks
+/// PR creation. No revision is opened — the operator decides what to do.
+async fn post_spec_verification_gaps_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    verification: &crate::code_implements_spec::SpecVerification,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let text = format!(
+        "⚠ `{repo_url}`: code-implements-spec verification found {n} gap(s) — see the PR's `## Spec Verification` section (advisory: no revision opened, PR not blocked)",
+        repo_url = repo.url,
+        n = verification.gaps.len(),
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "spec-verification gaps chatops notification post failed: {e:#}"
         );
     }
 }
@@ -2554,6 +2653,40 @@ async fn process_one_pending_change(
         }
     }
 
+    // The `[canon]` gate (a62): the change-vs-canonical contradiction
+    // pre-flight, the natural sibling of the `[in]` gate above. Same lifecycle
+    // position (pre-executor) AND disposition (non-empty findings write the
+    // marker + alert + halt the walk). Resolved through the same registry; an
+    // unrealized gate resolves to "no installed gate" AND nothing runs.
+    //
+    // Opt-in via `executor.change_canonical_contradiction_check: enabled`: the
+    // scoped context is `None` until daemon startup installs one, so tests AND
+    // default-off operators short-circuit here without touching the LLM.
+    // Failures inside the gate fail-open (no contradictions reported, executor
+    // proceeds).
+    if let Some(canon_ctx) = crate::preflight::canon_contradiction::current()
+        && let Some(crate::verifier_gate::GateImpl::CanonContradictionCheck) =
+            crate::verifier_gate::GateRegistry::standard()
+                .resolve(crate::verifier_gate::VerifierGate::Canon)
+    {
+        match handle_canon_contradiction_preflight(
+            paths, workspace, repo, chatops_ctx, change, &canon_ctx,
+        )
+        .await
+        {
+            Ok(Some(step)) => return Ok(step),
+            Ok(None) => {}
+            Err(e) => {
+                let label = crate::verifier_gate::VerifierGate::Canon.label();
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "{label} change-vs-canonical pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
+                );
+            }
+        }
+    }
+
     queue::lock(workspace, change)
         .with_context(|| format!("locking change `{change}`"))?;
 
@@ -2840,6 +2973,197 @@ async fn maybe_post_contradiction_findings_alert(
             url = %repo.url,
             change = %change,
             "{label} failed to persist contradiction-findings alert state: {e:#}"
+        );
+    }
+}
+
+/// Run the change-vs-canonical contradiction pre-flight — the `[canon]` gate
+/// (a62) — against `change`. On clean result (the agent returned an empty
+/// array OR the gate failed open): returns `Ok(None)` and the caller proceeds
+/// to the executor. On non-empty findings: writes the
+/// `.needs-spec-revision.json` marker with `revision_suggestion` populated
+/// from the canon-contradiction narrative (empty structural arrays — this
+/// case is semantic), posts the existing `AlertCategory::SpecNeedsRevision`
+/// chatops alert (subject to the 24h throttle), AND returns
+/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the queue
+/// walk without invoking the executor. Disposition is identical to the `[in]`
+/// gate's; the gates differ only in what they read AND what each finding names.
+async fn handle_canon_contradiction_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    canon_ctx: &crate::preflight::canon_contradiction::CanonContradictionCheckCtx,
+) -> Result<Option<QueueStep>> {
+    // a62: the check runs agentically through `agentic_run` AND is fail-open
+    // by contract — it returns an empty `Vec` (with a WARN) on any session
+    // error, missing submission, OR re-validation failure, so there is no
+    // `Result` to propagate here.
+    let findings = crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
+        canon_ctx, workspace, change,
+    )
+    .await;
+    if findings.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_canon_contradiction_revision_suggestion(&findings);
+    // a61: this is the `[canon]` verifier gate; its diagnostics carry the label.
+    let label = crate::verifier_gate::VerifierGate::Canon.label();
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        findings = findings.len(),
+        "{label} change-vs-canonical pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to write spec-needs-revision marker (canon pre-flight): {e:#}"
+        );
+    }
+    maybe_post_canon_contradiction_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        canon_ctx.attribution.as_deref(),
+    )
+    .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into the
+/// marker file when the `[canon]` gate catches one or more findings. Numbers
+/// each finding 1..N, naming the change's requirement AND the conflicting
+/// canonical requirement (by capability + title), AND closes with
+/// operator-action guidance.
+fn build_canon_contradiction_revision_suggestion(
+    findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
+) -> String {
+    let n = findings.len();
+    let mut out = format!(
+        "Pre-flight change-vs-canonical check found {n} issue(s) where this change's\n\
+         requirements appear to contradict the project's existing canonical specs:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!(
+            "{idx}. Change requirement: {cr}\n   \
+             Conflicting canonical requirement: {canon_req} (capability: {cap})\n   {summary}\n\n",
+            idx = i + 1,
+            cr = f.change_requirement,
+            canon_req = f.canonical_requirement,
+            cap = f.canonical_capability,
+            summary = f.summary,
+        ));
+    }
+    out.push_str(
+        "Revise this change so its requirements are consistent with canon (align the\n\
+         delta with the canonical requirement, OR turn it into a coherent MODIFIED\n\
+         delta of that canonical requirement). Push the spec change AND clear this\n\
+         marker via @<bot> clear-revision <repo> <change>.\n",
+    );
+    out
+}
+
+/// Sibling of `maybe_post_contradiction_findings_alert` for the a62 `[canon]`
+/// gate. Same throttle state, channel, and gating flag as the existing alert
+/// so a single stream of `AlertCategory::SpecNeedsRevision` notifications
+/// covers all pre-flight paths. Body framing names "change-vs-canonical
+/// contradictions" AND each finding names the conflicting canonical
+/// requirement.
+async fn maybe_post_canon_contradiction_findings_alert(
+    paths: &DaemonPaths,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
+    revision_suggestion: &str,
+    attribution: Option<&str>,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(paths, repo);
+    let mut state = AlertState::load_or_default(paths, &workspace);
+    let now = Utc::now();
+    let should_alert = state
+        .spec_revision_alerts
+        .get(change)
+        .map(|entry| {
+            now - entry.last_alerted_at
+                >= ChronoDuration::hours(PERMA_STUCK_ALERT_THROTTLE_HOURS)
+        })
+        .unwrap_or(true);
+    if !should_alert {
+        return;
+    }
+    let marker_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join(".needs-spec-revision.json");
+    let mut findings_block = String::new();
+    for (i, f) in findings.iter().enumerate() {
+        findings_block.push_str(&format!(
+            "  {n}. change: \"{cr}\" vs canonical \"{canon_req}\" ({cap}) — {s}\n",
+            n = i + 1,
+            cr = f.change_requirement,
+            canon_req = f.canonical_requirement,
+            cap = f.canonical_capability,
+            s = f.summary,
+        ));
+    }
+    // a49: append the `*Canon-contradiction-check: <provider>/<model>*`
+    // attribution when the daemon knows the configured model.
+    let attribution_suffix = attribution
+        .map(|a| {
+            format!(
+                "\n\n{}",
+                crate::attribution::attribution_line("Canon-contradiction-check", a)
+            )
+        })
+        .unwrap_or_default();
+    // a61: the `[canon]` verifier gate labels the operator surface it writes so
+    // the finding is attributable to the gate that produced it.
+    let label = crate::verifier_gate::VerifierGate::Canon.label();
+    let text = crate::verifier_gate::VerifierGate::Canon.label_line(&format!(
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` contradicts the existing canonical specs (pre-flight)\n\nThis change's requirements conflict with canon:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+        repo_url = repo.url,
+        change = change,
+        findings_block = findings_block,
+        suggestion = revision_suggestion,
+        base = repo.base_branch,
+        marker = marker_path.display(),
+    ));
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} canon-contradiction-findings chatops alert post failed: {e:#}"
+        );
+        return;
+    }
+    state.spec_revision_alerts.insert(
+        change.to_string(),
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: truncate_reason(revision_suggestion),
+        },
+    );
+    if let Err(e) = state.save(paths, &workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to persist canon-contradiction-findings alert state: {e:#}"
         );
     }
 }
@@ -5035,6 +5359,7 @@ async fn open_pull_request(
     reviewer_revision_concerns: &[ReviewConcern],
     chatops_ctx: Option<&ChatOpsContext>,
     workspace: &Path,
+    spec_verification_section: Option<&str>,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
@@ -5045,7 +5370,7 @@ async fn open_pull_request(
     // agent branch carries only the audit's `audit: <type> proposals
     // (N change(s))` commits. Build the PR title + body from those
     // commit subjects so reviewers see which audits fired.
-    let (title, body) = if changes.is_empty() {
+    let (title, mut body) = if changes.is_empty() {
         let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
         let subjects = git::log_subjects(workspace, &range).unwrap_or_default();
         (
@@ -5058,6 +5383,17 @@ async fn open_pull_request(
             build_pr_body(workspace, changes, includes_self_heal),
         )
     };
+    // a63: splice the advisory `## Spec Verification` section (the `[out]`
+    // gate's verdict) into the PR body, parallel to the reviewer's
+    // `## Code Review` block (which is appended downstream from
+    // `review_report`). Absent when the gate is disabled, produced no verdict
+    // (advisory failure), OR the iteration is audit-only.
+    if let Some(section) = spec_verification_section
+        && !section.trim().is_empty()
+    {
+        body.push_str("\n\n");
+        body.push_str(section.trim_end());
+    }
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -8666,6 +9002,229 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
+    }
+
+    // -----------------------------------------------------------------
+    // a63: the `[out]` gate — code-implements-spec verification.
+    // -----------------------------------------------------------------
+
+    /// ChatOps backend that records every `post_notification` for assertion.
+    struct NotifRecordingChatOps {
+        notifications: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatOpsBackend for NotifRecordingChatOps {
+        fn provider_name(&self) -> &'static str {
+            "notif-recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            unreachable!("the [out] gate never posts questions")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            Ok(None)
+        }
+        async fn post_notification(&self, _: &str, text: &str) -> Result<()> {
+            self.notifications.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn post_threaded_reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn notif_ctx(chatops: &std::sync::Arc<NotifRecordingChatOps>) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    /// Build a `[out]` gate ctx whose canned `test_submission` stands in for the
+    /// CLI session: `Some(payload)` is a recorded verdict, `None` simulates
+    /// "agent never submitted".
+    fn out_gate_ctx(
+        submission: Option<serde_json::Value>,
+    ) -> crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+        crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+            command: "claude".into(),
+            model: crate::agentic_run::ResolvedModel {
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-test".into(),
+                api_base_url: "https://example.invalid".into(),
+                api_key: "sk-test".into(),
+            },
+            prompt_template: "T".into(),
+            attribution: Some("anthropic/claude-test".into()),
+            test_submission: Some(submission),
+        }
+    }
+
+    /// Create the agent branch carrying a spec delta + a code change so the gate
+    /// has a non-empty diff AND a spec-delta path to reference.
+    fn seed_agent_branch_with_change(workspace: &Path) {
+        fn run(path: &Path, args: &[&str]) {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        }
+        run(workspace, &["checkout", "-q", "-b", "agent-q"]);
+        let spec = workspace.join("openspec/changes/c1/specs/cap/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(
+            &spec,
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("impl.rs"), "fn a() {}\n").unwrap();
+        run(workspace, &["add", "-A"]);
+        run(workspace, &["commit", "-q", "-m", "c1: implement"]);
+    }
+
+    /// Task 4.1: default-disabled (no `[out]` ctx scoped) → the gate is a no-op,
+    /// returns no section, AND posts no chatops note (PR assembly unchanged).
+    #[tokio::test]
+    async fn out_gate_disabled_produces_no_section() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        // No `code_implements_spec::scope` wrapping → `current()` is None.
+        let section =
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)).await;
+        assert!(section.is_none(), "disabled gate must produce no section");
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "no chatops note when disabled"
+        );
+    }
+
+    /// Task 4.3: an `implemented` verdict renders a clean `## Spec Verification`
+    /// section AND posts NO chatops note.
+    #[tokio::test]
+    async fn out_gate_implemented_renders_section_no_chatops() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "implemented", "summary": "satisfied", "gaps": []
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        let section = section.expect("implemented verdict renders a section");
+        assert!(section.starts_with("## Spec Verification"));
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "implemented must post no chatops note"
+        );
+    }
+
+    /// Task 4.4: a `gaps_found` verdict renders the gaps in the section AND
+    /// posts a chatops note. This function only returns the section AND posts
+    /// the heads-up — it opens NO revision and the caller always proceeds to PR
+    /// creation (no block).
+    #[tokio::test]
+    async fn out_gate_gaps_found_renders_section_and_posts_chatops() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "gaps_found",
+            "summary": "one gap",
+            "gaps": [
+                { "requirement": "A", "scenario": null, "status": "missing", "evidence": "no code realizes it" }
+            ]
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        let section = section.expect("gaps_found verdict renders a section");
+        assert!(section.starts_with("## Spec Verification"));
+        assert!(
+            section.contains("no code realizes it"),
+            "section lists the gap evidence: {section}"
+        );
+        assert_eq!(
+            chatops.notifications.lock().unwrap().len(),
+            1,
+            "gaps_found posts exactly one advisory chatops note"
+        );
+    }
+
+    /// Task 4.5: a session that yields no verdict (advisory failure) → no
+    /// section AND no chatops note. The gate returns None (never errors), so the
+    /// caller still creates the PR.
+    #[tokio::test]
+    async fn out_gate_no_submission_omits_section() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        // `Some(None)` → the canned runner simulates "agent never submitted".
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(None));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        assert!(section.is_none(), "no submission omits the section");
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "no chatops note when the gate is unavailable"
+        );
+    }
+
+    /// Task 4.4 (no-block): an audit-only iteration (empty `processed`) skips
+    /// the gate entirely even when enabled — there are no implementer changes to
+    /// verify — so no section is produced.
+    #[tokio::test]
+    async fn out_gate_skips_audit_only_iteration() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "implemented", "summary": "x", "gaps": []
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            // Empty `processed` → audit-only; the gate is a no-op.
+            run_spec_verification_gate(&ws, &repo, &[], Some(&ctx)),
+        )
+        .await;
+        assert!(section.is_none(), "audit-only iteration produces no section");
     }
 
     // -----------------------------------------------------------------
@@ -12901,6 +13460,290 @@ mod tests {
         assert!(text.contains("   S1"));
         assert!(text.contains("2. Requirement A: A2"));
         assert!(text.contains("   Requirement B: B2"));
+        assert!(text.contains("   S2"));
+        assert!(text.contains("clear-revision"));
+    }
+
+    // ============================================================
+    // Change-vs-canonical contradiction pre-flight — the [canon] gate (a62)
+    // ============================================================
+
+    /// a62: build a `[canon]`-gate context whose agentic session is
+    /// short-circuited by an injected `submit_canon_contradictions` submission
+    /// (`Some(payload)`), a no-submission session (`None`), bypassing the CLI
+    /// subprocess AND the control socket entirely.
+    fn canon_test_ctx(
+        submission: Option<serde_json::Value>,
+        attribution: Option<String>,
+    ) -> crate::preflight::canon_contradiction::CanonContradictionCheckCtx {
+        crate::preflight::canon_contradiction::CanonContradictionCheckCtx {
+            command: "claude".into(),
+            model: crate::agentic_run::ResolvedModel {
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-test".into(),
+                api_base_url: "https://example.invalid".into(),
+                api_key: "sk-test".into(),
+            },
+            prompt_template: "TEST_PROMPT".into(),
+            attribution,
+            test_submission: Some(submission),
+        }
+    }
+
+    /// Task 4.1: disabled mode (no scoped canon context) → no session, executor
+    /// reached normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canon_preflight_disabled_proceeds_to_executor() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_change(&ws, "plain", "fixture");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+        let _ = crate::preflight::canon_contradiction::scope(None, fut).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "executor must be invoked when the [canon] gate is disabled"
+        );
+    }
+
+    /// Task 4.3 (empty): enabled mode + empty submission → executor still
+    /// reached (the check is a no-op outcome-wise), no marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canon_preflight_empty_findings_proceeds_to_executor() {
+        let ctx = canon_test_ctx(Some(serde_json::json!({ "contradictions": [] })), None);
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_change_with_spec(
+            &ws,
+            "clean",
+            "newcap",
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+        let _ = crate::preflight::canon_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "executor must be invoked when the [canon] gate returns empty findings"
+        );
+        assert!(
+            !ws.join("openspec/changes/clean/.needs-spec-revision.json").exists(),
+            "no marker on empty findings"
+        );
+    }
+
+    /// Task 4.3 (non-empty): enabled mode + findings → marker written with
+    /// empty structural arrays, executor NOT invoked, queue walk halts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canon_preflight_findings_write_marker_and_skip_executor() {
+        let submission = serde_json::json!({
+            "contradictions": [
+                {
+                    "change_requirement": "Secrets MAY live in config.yaml",
+                    "canonical_capability": "security",
+                    "canonical_requirement": "All secrets in env vars",
+                    "summary": "the change re-allows what canon forbids"
+                },
+                {
+                    "change_requirement": "Cap operations at 5 minutes",
+                    "canonical_capability": "executor",
+                    "canonical_requirement": "Operations cap at 60 seconds",
+                    "summary": "the change exceeds the canonical cap"
+                }
+            ]
+        });
+        let ctx = canon_test_ctx(Some(submission), Some("anthropic/claude-opus-4-8".into()));
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_canonical_spec(
+            &ws,
+            "security",
+            "## Requirements\n\n### Requirement: All secrets in env vars\nThe system SHALL store secrets only in env vars.\n",
+        );
+        add_committed_change_with_spec(
+            &ws,
+            "a-conflicting",
+            "security",
+            "## MODIFIED Requirements\n\n### Requirement: All secrets in env vars\nSecrets MAY live in config.yaml.\n",
+        );
+        // A clean change that sorts AFTER the conflicting one; it would run if
+        // the gate didn't halt the queue walk on the first flagged change.
+        add_committed_change(&ws, "b-runs-if-not-halted", "fixture");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+        let _ = crate::preflight::canon_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "executor must NOT be invoked when canon contradictions are found (queue walk halts)"
+        );
+
+        let marker_path = ws.join("openspec/changes/a-conflicting/.needs-spec-revision.json");
+        assert!(marker_path.exists(), "marker must be written");
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(
+            raw.contains("Pre-flight change-vs-canonical check found 2 issue(s)"),
+            "revision_suggestion should announce 2 findings; got: {raw}"
+        );
+        assert!(raw.contains("Secrets MAY live in config.yaml"));
+        assert!(raw.contains("All secrets in env vars"));
+        assert!(raw.contains("capability: security"));
+        assert!(raw.contains("the change re-allows what canon forbids"));
+
+        let parsed: crate::spec_revision::SpecNeedsRevisionMarker =
+            serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.unimplementable_tasks.is_empty(),
+            "unimplementable_tasks must be empty (semantic case)"
+        );
+        assert!(
+            parsed.unarchivable_deltas.is_empty(),
+            "unarchivable_deltas must be empty (semantic case)"
+        );
+        assert!(
+            !parsed.revision_suggestion.is_empty(),
+            "revision_suggestion must carry the narrative"
+        );
+    }
+
+    /// Task 4.4: enabled mode + a session that records NO submission → fail
+    /// open, executor IS invoked, no marker written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canon_preflight_no_submission_fails_open() {
+        // `None` = the agentic session ran but recorded no
+        // `submit_canon_contradictions` submission.
+        let ctx = canon_test_ctx(None, None);
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_change_with_spec(
+            &ws,
+            "transport-err",
+            "newcap",
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+        let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+        let _ = crate::preflight::canon_contradiction::scope(
+            Some(std::sync::Arc::new(ctx)),
+            fut,
+        )
+        .await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fail-open: executor must be invoked when the session records no submission"
+        );
+        assert!(
+            !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")
+                .exists(),
+            "no marker on fail-open"
+        );
+    }
+
+    /// Sanity test for the `[canon]` gate marker's `revision_suggestion` text
+    /// shape — uses the `build_canon_contradiction_revision_suggestion` helper
+    /// directly. Each finding names the conflicting canonical requirement.
+    #[test]
+    fn canon_revision_suggestion_text_enumerates_findings() {
+        let findings = vec![
+            crate::preflight::canon_contradiction::CanonContradictionFinding {
+                change_requirement: "CR1".into(),
+                canonical_capability: "cap1".into(),
+                canonical_requirement: "Canon1".into(),
+                summary: "S1".into(),
+            },
+            crate::preflight::canon_contradiction::CanonContradictionFinding {
+                change_requirement: "CR2".into(),
+                canonical_capability: "cap2".into(),
+                canonical_requirement: "Canon2".into(),
+                summary: "S2".into(),
+            },
+        ];
+        let text = build_canon_contradiction_revision_suggestion(&findings);
+        assert!(text.contains("Pre-flight change-vs-canonical check found 2 issue(s)"));
+        assert!(text.contains("1. Change requirement: CR1"));
+        assert!(text.contains("Conflicting canonical requirement: Canon1 (capability: cap1)"));
+        assert!(text.contains("   S1"));
+        assert!(text.contains("2. Change requirement: CR2"));
+        assert!(text.contains("Conflicting canonical requirement: Canon2 (capability: cap2)"));
         assert!(text.contains("   S2"));
         assert!(text.contains("clear-revision"));
     }

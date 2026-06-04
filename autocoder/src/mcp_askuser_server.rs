@@ -465,12 +465,17 @@ fn handle_request<W: Write>(
                     }
                 }
                 // a57 `submit_findings` (advisory audits), a58 `submit_review`
-                // (agentic reviewer), AND a59 `submit_contradictions`
-                // (contradiction check) share the per-role relay path: the
-                // role selects the daemon-side schema, the tool's full
-                // arguments object IS the submission payload, AND a rejection
-                // comes back as a correctable tool error.
-                tool @ ("submit_findings" | "submit_review" | "submit_contradictions") => {
+                // (agentic reviewer), a59 `submit_contradictions` (the [in]
+                // gate), a62 `submit_canon_contradictions` (the [canon] gate),
+                // AND a63 `submit_verdict` (the [out] gate) share the per-role
+                // relay path: the role selects the daemon-side schema, the
+                // tool's full arguments object IS the submission payload, AND a
+                // rejection comes back as a correctable tool error.
+                tool @ ("submit_findings"
+                | "submit_review"
+                | "submit_contradictions"
+                | "submit_canon_contradictions"
+                | "submit_verdict") => {
                     let role = std::env::var(ENV_ROLE)
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -490,8 +495,11 @@ fn handle_request<W: Write>(
                                 "submit_review" => {
                                     "Review submitted and recorded as this PR's verdict. You may stop now."
                                 }
-                                "submit_contradictions" => {
+                                "submit_contradictions" | "submit_canon_contradictions" => {
                                     "Contradictions submitted and recorded as this check's result. You may stop now."
+                                }
+                                "submit_verdict" => {
+                                    "Verdict submitted and recorded as this check's result. You may stop now."
                                 }
                                 _ => {
                                     "Findings submitted and recorded as this audit's result. You may stop now."
@@ -873,6 +881,13 @@ pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
         // a59: the contradiction check returns its findings via
         // `submit_contradictions`.
         Some("submit_contradictions")
+    } else if role == crate::preflight::canon_contradiction::CANON_CONTRADICTION_CHECK_ROLE {
+        // a62: the `[canon]` gate returns its findings via
+        // `submit_canon_contradictions`.
+        Some("submit_canon_contradictions")
+    } else if role == crate::code_implements_spec::CODE_IMPLEMENTS_SPEC_ROLE {
+        // a63: the `[out]` gate returns its verdict via `submit_verdict`.
+        Some("submit_verdict")
     } else {
         None
     }
@@ -892,6 +907,18 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
     // requirement-pair shape distinct from the audits AND the reviewer.
     if role == crate::preflight::change_contradiction::CONTRADICTION_CHECK_ROLE {
         return Some(submit_contradictions_tool());
+    }
+    // a62: the `[canon]` gate's `submit_canon_contradictions` tool names the
+    // conflicting canonical requirement (capability + title), distinct from
+    // the `[in]` gate's within-change requirement pair.
+    if role == crate::preflight::canon_contradiction::CANON_CONTRADICTION_CHECK_ROLE {
+        return Some(submit_canon_contradictions_tool());
+    }
+    // a63: the `[out]` gate's `submit_verdict` tool returns the
+    // code-implements-spec verdict (implemented | gaps_found + per-gap detail),
+    // distinct from every other role's submission shape.
+    if role == crate::code_implements_spec::CODE_IMPLEMENTS_SPEC_ROLE {
+        return Some(submit_verdict_tool());
     }
     let finding_schema = match role {
         "drift_audit" => serde_json::json!({
@@ -1015,6 +1042,77 @@ fn submit_contradictions_tool() -> serde_json::Value {
                 }
             },
             "required": ["contradictions"]
+        }
+    })
+}
+
+/// The `submit_canon_contradictions` tool definition advertised for the
+/// canon-contradiction-check role — the `[canon]` gate (a62). Each entry names
+/// the requirement IN THE CHANGE, the canonical capability AND requirement it
+/// conflicts with, AND a one-line summary; an empty `contradictions` array
+/// means "no contradictions found". The daemon-side validator
+/// ([`crate::preflight::canon_contradiction::payload_to_canon_contradictions`])
+/// deserializes the payload into the finding shape, surfacing a malformed
+/// payload as a correctable tool error.
+fn submit_canon_contradictions_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_canon_contradictions",
+        "description": "Return the change-vs-canonical contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Each entry names the requirement IN THIS CHANGE (`change_requirement`), the canonical capability slug AND requirement title it conflicts with (`canonical_capability`, `canonical_requirement`), AND a one-line `summary` of why the two cannot both hold. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contradictions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "change_requirement": { "type": "string" },
+                            "canonical_capability": { "type": "string" },
+                            "canonical_requirement": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["change_requirement", "canonical_capability", "canonical_requirement", "summary"]
+                    }
+                }
+            },
+            "required": ["contradictions"]
+        }
+    })
+}
+
+/// The `submit_verdict` tool definition advertised for the code-implements-spec
+/// role — the `[out]` gate (a63). The verdict is `implemented` (the change's
+/// requirements AND scenarios are satisfied) or `gaps_found` (one or more are
+/// not). Each gap names the `requirement`, an optional `scenario`, a `status`
+/// of `missing` or `partial`, AND concrete `evidence`. The daemon-side
+/// validator ([`crate::code_implements_spec::payload_to_verification`])
+/// additionally enforces the "non-empty `gaps` when `verdict: gaps_found`"
+/// cross-field rule that basic JSON Schema cannot express, surfacing a
+/// violation as a correctable tool error.
+fn submit_verdict_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_verdict",
+        "description": "Return your code-implements-spec verdict to the daemon as this check's result. Call exactly once when your analysis is complete. Pass `verdict` (implemented | gaps_found), a `summary`, AND a `gaps` array. Use `implemented` with an empty `gaps` array when every requirement AND scenario is satisfied; use `gaps_found` with a NON-EMPTY `gaps` array otherwise. Each gap names the `requirement`, an optional `scenario` (or null), a `status` (missing | partial), AND concrete `evidence`. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verdict": { "type": "string", "enum": ["implemented", "gaps_found"] },
+                "summary": { "type": "string" },
+                "gaps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": { "type": "string" },
+                            "scenario": { "type": ["string", "null"] },
+                            "status": { "type": "string", "enum": ["missing", "partial"] },
+                            "evidence": { "type": "string" }
+                        },
+                        "required": ["requirement", "status", "evidence"]
+                    }
+                }
+            },
+            "required": ["verdict", "summary", "gaps"]
         }
     })
 }
@@ -1312,6 +1410,11 @@ mod tests {
             submission_tool_name_for_role("contradiction_check"),
             Some("submit_contradictions")
         );
+        // a62: the `[canon]` gate gets `submit_canon_contradictions`.
+        assert_eq!(
+            submission_tool_name_for_role("canon_contradiction_check"),
+            Some("submit_canon_contradictions")
+        );
         assert_eq!(submission_tool_name_for_role("implementer"), None);
         assert_eq!(submission_tool_name_for_role("missing_tests"), None);
         assert_eq!(submission_tool_name_for_role("security_bug"), None);
@@ -1429,6 +1532,172 @@ mod tests {
                     .map(|t| t["name"] != "submit_contradictions")
                     .unwrap_or(true),
                 "role `{role}` must NOT advertise submit_contradictions"
+            );
+        }
+    }
+
+    // a62 (4.6): `submit_canon_contradictions` is advertised ONLY when
+    // `ORCH_MCP_ROLE = canon_contradiction_check`, with the change-vs-canonical
+    // schema (each item names the conflicting canonical requirement), alongside
+    // the common tools — AND NOT for any other role.
+    #[test]
+    fn submit_canon_contradictions_advertised_only_for_canon_check_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "canon_contradiction_check");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_canon_contradictions")
+            .expect("canon_contradiction_check role must advertise submit_canon_contradictions");
+        // The advertised schema requires the change-vs-canonical fields — each
+        // finding names the conflicting canonical requirement.
+        let item_props =
+            &submit["inputSchema"]["properties"]["contradictions"]["items"]["properties"];
+        for field in [
+            "change_requirement",
+            "canonical_capability",
+            "canonical_requirement",
+            "summary",
+        ] {
+            assert!(
+                item_props.get(field).is_some(),
+                "canon contradiction item schema must define `{field}`: {submit}"
+            );
+        }
+        let required: Vec<&str> = submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["contradictions"], "top-level required");
+        // The within-change `submit_contradictions`, `submit_findings`, AND
+        // `submit_review` are NOT present for this role.
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_contradictions"),
+            "canon_contradiction_check must not advertise the within-change submit_contradictions"
+        );
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_findings"),
+            "canon_contradiction_check must not advertise submit_findings"
+        );
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_review"),
+            "canon_contradiction_check must not advertise submit_review"
+        );
+        // Common tools coexist — including `query_canonical_specs`, the RAG
+        // retrieval tool the gate uses when a21's canonical_rag is enabled.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+        assert!(
+            names.contains(&"query_canonical_specs"),
+            "query_canonical_specs (a21 RAG) must be advertised as a common tool: {names:?}"
+        );
+
+        // Other roles: submit_canon_contradictions is absent.
+        for role in [
+            "implementer",
+            "reviewer",
+            "contradiction_check",
+            "drift_audit",
+            "missing_tests",
+        ] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_canon_contradictions")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_canon_contradictions"
+            );
+        }
+    }
+
+    // a63 (task 4.6): `submit_verdict` is advertised ONLY when the MCP child
+    // serves the `code_implements_spec` role (the `[out]` gate) — never for any
+    // other role — AND carries the verdict + gaps schema alongside the common
+    // tools.
+    #[test]
+    fn submit_verdict_advertised_only_for_code_implements_spec_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "code_implements_spec");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_verdict")
+            .expect("code_implements_spec role must advertise submit_verdict");
+        // The advertised schema enforces the verdict enum AND the gap shape.
+        let verdict_enum = &submit["inputSchema"]["properties"]["verdict"]["enum"];
+        let variants: Vec<&str> = verdict_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(variants, vec!["implemented", "gaps_found"], "verdict enum");
+        let gap_props = &submit["inputSchema"]["properties"]["gaps"]["items"]["properties"];
+        for field in ["requirement", "scenario", "status", "evidence"] {
+            assert!(
+                gap_props.get(field).is_some(),
+                "gap item schema must define `{field}`: {submit}"
+            );
+        }
+        let required: Vec<&str> = submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["verdict", "summary", "gaps"], "top-level required");
+        // No OTHER role's submission tool leaks into this role.
+        for other in [
+            "submit_findings",
+            "submit_review",
+            "submit_contradictions",
+            "submit_canon_contradictions",
+        ] {
+            assert!(
+                !tools.iter().any(|t| t["name"] == other),
+                "code_implements_spec must not advertise {other}"
+            );
+        }
+        // Common tools coexist.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+
+        // Other roles: submit_verdict is absent.
+        for role in [
+            "implementer",
+            "reviewer",
+            "contradiction_check",
+            "canon_contradiction_check",
+            "drift_audit",
+        ] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_verdict")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_verdict"
             );
         }
     }

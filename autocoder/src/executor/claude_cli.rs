@@ -2241,6 +2241,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2278,6 +2286,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2314,6 +2330,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2364,6 +2388,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2405,6 +2437,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2448,6 +2488,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2490,6 +2538,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2532,6 +2588,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: Some(crate::config::PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
@@ -2579,6 +2643,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: Some(crate::config::PromptOverrideBlock {
