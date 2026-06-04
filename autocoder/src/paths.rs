@@ -208,6 +208,23 @@ impl DaemonPaths {
         self.cache.join("workspaces")
     }
 
+    /// `<state>/workspace-last-used/` — per-workspace last-used timestamp
+    /// markers keyed by workspace basename. Maintained by the
+    /// workspace-cache LRU eviction (a65) to order eviction candidates
+    /// oldest-first. Lives under `<state>/` (NOT inside the workspace) so
+    /// the timestamp is independent of the `remove_dir_all` eviction of
+    /// the workspace itself AND never appears in the managed repo's
+    /// working tree.
+    pub fn workspace_last_used_dir(&self) -> PathBuf {
+        self.state.join("workspace-last-used")
+    }
+
+    /// `<state>/workspace-last-used/<workspace_basename>` — the last-used
+    /// timestamp marker for the named workspace.
+    pub fn workspace_last_used_path(&self, workspace_basename: &str) -> PathBuf {
+        self.workspace_last_used_dir().join(workspace_basename)
+    }
+
     /// `<runtime>/control.sock` — the daemon's control socket.
     pub fn control_socket_path(&self) -> PathBuf {
         self.runtime.join("control.sock")
@@ -487,6 +504,7 @@ mod tests {
             chatops: None,
             audits: None,
             paths,
+            cache: crate::config::CacheConfig::default(),
             features: crate::config::FeaturesConfig::default(),
             canonical_rag: None,
             models: None,
@@ -695,6 +713,14 @@ mod tests {
         assert_eq!(
             p.workspaces_dir(),
             PathBuf::from("/srv/cache/workspaces")
+        );
+        assert_eq!(
+            p.workspace_last_used_dir(),
+            PathBuf::from("/srv/state/workspace-last-used")
+        );
+        assert_eq!(
+            p.workspace_last_used_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/workspace-last-used/github_com_owner_repo")
         );
         assert_eq!(
             p.control_socket_path(),

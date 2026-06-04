@@ -752,6 +752,27 @@ github:
 #   logs_dir: /var/log/autocoder
 #   runtime_dir: /run/autocoder
 
+# Workspace-cache bounding (a65). Optional top-level block. Per-repo
+# workspaces under `<cache>/workspaces/<key>` accumulate a build-artifact
+# tree (a Rust repo's multi-GB `target/debug`, a Node repo's
+# `node_modules/`, …) with no bound. Left unset, the cache is UNBOUNDED
+# (today's behaviour) and a daemon running several repos long enough can
+# fill its disk — the daemon logs a one-time startup notice in this case.
+#
+# When `workspaces_max_gb` is set, at each repo's iteration start the
+# daemon measures the total `<cache>/workspaces/` size; if it exceeds the
+# cap, it evicts whole least-recently-used IDLE workspaces (oldest
+# last-used first) until under the cap. Eviction is language-agnostic
+# (it removes entire clones, not just `target/`/`node_modules/`) AND
+# lossless: an evicted repo re-clones on its next iteration, and per-PR
+# revision + audit state live under `<state>/`, not the workspace. The
+# repo currently iterating AND any workspace holding a busy marker are
+# never evicted. A value of `0` is rejected — omit the field for an
+# unbounded cache.
+#
+# cache:
+#   workspaces_max_gb: 50
+
 # Per-workspace feature flags (a23 + future). Each sub-block is opt-in;
 # absent sub-blocks take their type-default behaviour. Omit the entire
 # `features:` block to take every default.

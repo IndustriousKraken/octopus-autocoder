@@ -73,6 +73,14 @@ pub struct Config {
     /// absent block is equivalent to all fields being `None`.
     #[serde(default, skip_serializing_if = "DaemonPathsConfig::is_empty")]
     pub paths: DaemonPathsConfig,
+    /// Optional workspace-cache bounding (a65). Today this carries only
+    /// `workspaces_max_gb`, the optional cap on the total size of
+    /// `<cache>/workspaces/`. An absent block (the default) is equivalent
+    /// to all fields being `None` — the cache is unbounded, as it has
+    /// always been. Eligible for the hot-reload subset so a reload applies
+    /// a new cap at the next iteration.
+    #[serde(default, skip_serializing_if = "CacheConfig::is_empty")]
+    pub cache: CacheConfig,
     /// Optional per-workspace feature flags. Each sub-block is opt-in;
     /// absent fields take their type-default. Today this block carries
     /// only the `brownfield` toggle (a23); future per-workspace
@@ -742,6 +750,32 @@ impl DaemonPathsConfig {
     }
 }
 
+/// Workspace-cache bounding config (a65). Optional top-level `cache`
+/// block. Today it carries only `workspaces_max_gb`; future cache-tuning
+/// knobs land here so the schema scales without one-off top-level keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Optional cap on the TOTAL size of `<cache>/workspaces/`, in
+    /// gigabytes. `None` (the default) = unbounded — the daemon never
+    /// evicts a workspace, matching pre-a65 behaviour. When set, the
+    /// daemon keeps the cache under the cap by evicting least-recently-
+    /// used IDLE workspaces at each repo's iteration start (see
+    /// `crate::workspace_cache`). A configured `0` is rejected at
+    /// config-load (an unbounded cache is expressed by omitting the
+    /// field, not by a zero cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces_max_gb: Option<u64>,
+}
+
+impl CacheConfig {
+    /// `true` when every field is `None`. Used by the serializer to
+    /// suppress an empty `cache: {}` block from the rendered YAML.
+    pub fn is_empty(&self) -> bool {
+        self.workspaces_max_gb.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryConfig {
@@ -1227,6 +1261,29 @@ pub fn busy_marker_threshold_startup_log(
             timeout_secs,
             busy_marker_stale_threshold_secs: resolved_threshold_secs,
         }
+    }
+}
+
+/// Decide the one-time startup log for the workspace-cache cap (a65).
+/// Pure function — no side effects, no logging — so the decision is
+/// unit-testable. The caller emits the actual `tracing` call.
+///
+/// `workspaces_max_gb` is the resolved `cache.workspaces_max_gb`. When
+/// unset (`None`), the daemon returns a `Some(message)` nudging the
+/// operator that the cache is unbounded AND naming the field that bounds
+/// it. When set, returns `None` — a bounded cache needs no warning.
+pub fn workspace_cache_unbounded_notice(workspaces_max_gb: Option<u64>) -> Option<String> {
+    if workspaces_max_gb.is_none() {
+        Some(
+            "workspace cache is UNBOUNDED — per-repo workspaces under \
+             <cache>/workspaces/ accumulate build artifacts with no size \
+             cap and can fill the disk. Set `cache.workspaces_max_gb` to \
+             bound the cache (least-recently-used idle workspaces are then \
+             evicted to stay under the cap)."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -2397,6 +2454,17 @@ impl Config {
             slack.dedup_cache_capacity = cap;
             let (ttl, _) = clamp_dedup_cache_ttl_secs(slack.dedup_cache_ttl_secs);
             slack.dedup_cache_ttl_secs = ttl;
+        }
+        // a65: the workspace-cache cap is expressed by OMITTING the field
+        // (unbounded) — a zero cap is a misconfiguration (it would demand
+        // evicting every workspace) and is rejected up front.
+        if let Some(max_gb) = cfg.cache.workspaces_max_gb
+            && max_gb == 0
+        {
+            return Err(anyhow!(
+                "cache.workspaces_max_gb must be greater than 0 when set; \
+                 omit the field entirely for an unbounded workspace cache"
+            ));
         }
         // a55: validate every `models:` registry entry's own per-provider
         // auth config up front, regardless of whether any block references
@@ -3670,6 +3738,9 @@ github:
             // a34: spec_storage extensions + reviewer skip-spec-only-prs.
             "push_remote",
             "base_branch",
+            // a65: workspace-cache size cap.
+            "cache",
+            "workspaces_max_gb",
         ];
 
         let path = example_yaml_path();
@@ -3728,6 +3799,89 @@ github:
         assert_eq!(cfg.executor.command, "claude");
         assert_eq!(cfg.executor.timeout_secs, 1800);
         assert_eq!(cfg.github.token_env, "GITHUB_TOKEN");
+    }
+
+    // ----------------------------------------------------------------
+    // a65 workspace-cache config.
+    // ----------------------------------------------------------------
+
+    const MINIMAL_YAML: &str = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 1800
+github:
+  token_env: GITHUB_TOKEN
+"#;
+
+    #[test]
+    fn cache_absent_defaults_to_unbounded() {
+        let (_dir, path) = write_config(MINIMAL_YAML);
+        let cfg = Config::load_from(&path).expect("config without cache block parses");
+        assert!(
+            cfg.cache.workspaces_max_gb.is_none(),
+            "absent cache block must mean unbounded (None)"
+        );
+        assert!(cfg.cache.is_empty());
+    }
+
+    #[test]
+    fn cache_workspaces_max_gb_parses_when_set() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  workspaces_max_gb: 50\n");
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).expect("config with cache cap parses");
+        assert_eq!(cfg.cache.workspaces_max_gb, Some(50));
+        assert!(!cfg.cache.is_empty());
+    }
+
+    #[test]
+    fn cache_workspaces_max_gb_zero_is_rejected() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  workspaces_max_gb: 0\n");
+        let (_dir, path) = write_config(&yaml);
+        let err = Config::load_from(&path)
+            .expect_err("a zero workspace-cache cap must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("workspaces_max_gb"),
+            "error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("greater than 0") || msg.contains("unbounded"),
+            "error must explain the constraint: {msg}"
+        );
+    }
+
+    #[test]
+    fn cache_unknown_field_is_rejected() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  bogus_key: 1\n");
+        let (_dir, path) = write_config(&yaml);
+        Config::load_from(&path)
+            .expect_err("an unknown key under `cache:` must be rejected (deny_unknown_fields)");
+    }
+
+    #[test]
+    fn unbounded_notice_emitted_only_when_cap_unset() {
+        // Unset → a notice naming the bounding field.
+        let notice = workspace_cache_unbounded_notice(None)
+            .expect("unset cap must produce a one-time unbounded notice");
+        assert!(
+            notice.contains("cache.workspaces_max_gb"),
+            "notice must name the bounding field: {notice}"
+        );
+        assert!(
+            notice.to_lowercase().contains("unbounded"),
+            "notice must call out the unbounded failure mode: {notice}"
+        );
+        // Set → no notice.
+        assert!(
+            workspace_cache_unbounded_notice(Some(50)).is_none(),
+            "a bounded cache needs no startup notice"
+        );
     }
 
     /// a64 task 1.1: an unset `reviewer.kind` resolves to `Agentic` (the

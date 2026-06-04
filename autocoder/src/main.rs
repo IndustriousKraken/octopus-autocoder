@@ -51,6 +51,7 @@ mod submission_store;
 mod testing;
 mod verifier_gate;
 mod workspace;
+mod workspace_cache;
 
 #[tokio::main]
 async fn main() -> Result<()> {
