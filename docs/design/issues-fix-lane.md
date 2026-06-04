@@ -1,6 +1,6 @@
 # Issues-fix lane — design
 
-**Status:** converged design, not yet broken into change proposals. Captures the decisions reached while scoping the feature. Implementation is sequenced behind `a000-harden-external-triggers` and `a66-single-pass-prompt-substitution` (see Sequencing).
+**Status:** converged design, not yet broken into change proposals. Captures the decisions reached while scoping the feature. Implementation is sequenced behind `a000-harden-external-triggers` and `a002-single-pass-prompt-substitution` (see Sequencing).
 
 ## Motivation
 
@@ -72,7 +72,7 @@ The "send it" promotion is the authorization gate: the public can **report**, bu
 The issues lane feeds untrusted issue bodies into a **code-writing** executor, unlike scout, which is read-only. Quarantine is therefore load-bearing here and is a required component of this lane (it was considered as a standalone change, "a001", and folded in here where it earns its keep). Defense in depth:
 
 1. **Promotion gate** — untrusted content enters the fix path only after a maintainer approves the candidate.
-2. **Prompt quarantine** — the issue body is delimited as DATA with an explicit untrusted-report framing. The task and scope come from the lane and the maintainer-approved classification, never from the body. The delimiter is robust (not a markdown fence the body can break), and single-pass substitution (`a66`) prevents `{{token}}` expansion of placeholder text inside the body.
+2. **Prompt quarantine** — the issue body is delimited as DATA with an explicit untrusted-report framing. The task and scope come from the lane and the maintainer-approved classification, never from the body. The delimiter is robust (not a markdown fence the body can break), and single-pass substitution (`a002`) prevents `{{token}}` expansion of placeholder text inside the body.
 3. **Human merge** — the PR is the final backstop.
 
 Net effect: an injected issue body can at worst waste compute. It cannot trigger work (promotion gate) and cannot ship code (human merge).
@@ -115,7 +115,7 @@ Each report is classified:
 ## Sequencing and dependencies
 
 1. **`a000-harden-external-triggers`** — first. Closes the live hole where any GitHub commenter can trigger billed work. The issues lane's promotion gate is the same trust posture applied to a new surface.
-2. **`a66-single-pass-prompt-substitution`** — prevents `{{token}}` expansion in injected issue bodies; a prerequisite for safe ingestion (it also fixes scout's existing `{{open_issues}}` path).
+2. **`a002-single-pass-prompt-substitution`** — prevents `{{token}}` expansion in injected issue bodies; a prerequisite for safe ingestion (it also fixes scout's existing `{{open_issues}}` path).
 3. **The issues lane** — carries the prompt-quarantine control described above.
 
 ## Open questions (deferred)

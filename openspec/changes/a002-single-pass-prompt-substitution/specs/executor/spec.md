@@ -1,4 +1,4 @@
-# executor — delta for a66-single-pass-prompt-substitution
+# executor — delta for a002-single-pass-prompt-substitution
 
 ## ADDED Requirements
 

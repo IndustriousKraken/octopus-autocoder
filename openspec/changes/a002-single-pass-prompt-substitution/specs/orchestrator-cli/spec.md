@@ -1,4 +1,4 @@
-# orchestrator-cli — delta for a66-single-pass-prompt-substitution
+# orchestrator-cli — delta for a002-single-pass-prompt-substitution
 
 ## ADDED Requirements
 

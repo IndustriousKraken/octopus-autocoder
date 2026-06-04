@@ -1,4 +1,4 @@
-# git-workflow-manager — delta for a54-nul-delimited-git-status-parsing
+# git-workflow-manager — delta for a001-nul-delimited-git-status-parsing
 
 ## ADDED Requirements
 

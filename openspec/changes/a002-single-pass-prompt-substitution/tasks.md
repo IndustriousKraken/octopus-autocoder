@@ -25,4 +25,4 @@
 
 - [ ] 4.1 `cargo test` passes for the autocoder crate.
 - [ ] 4.2 `cargo clippy --all-targets -- -D warnings` is clean.
-- [ ] 4.3 `openspec validate a66-single-pass-prompt-substitution --strict` passes.
+- [ ] 4.3 `openspec validate a002-single-pass-prompt-substitution --strict` passes.

@@ -25,4 +25,4 @@ This change extracts the one primitive every agentic role will share, abstracts 
   - `autocoder/src/control_socket.rs` — `record_submission` / `consume_submission` actions.
 - **Operator-visible behavior:** none. The executor and audits behave identically; the submission surface is unused until a role adopts it.
 - **Acceptance:** `cargo test` passes; `openspec validate a56-extract-agentic-run-primitive --strict` passes. Tests: the executor path through `agentic_run` produces the same streaming log + outcome as before; an audit path produces the same simple-capture outcome; `ClaudeStrategy` with no model passes no `ANTHROPIC_MODEL` (CLI default) and with a model sets the three env vars; a `submit_*` call relays a payload to `record_submission` and `consume_submission` returns it.
-- **Dependencies:** loosely on **a55** (the `provider → default CLI` rule the strategy resolution reads). Independent of a47–a54. The spine for changes 4–8.
+- **Dependencies:** loosely on **a55** (the `provider → default CLI` rule the strategy resolution reads). Independent of a47–a53. The spine for changes 4–8.

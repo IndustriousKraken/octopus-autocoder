@@ -34,4 +34,4 @@
 
 - [ ] 5.1 `cargo test` passes for the autocoder crate.
 - [ ] 5.2 `cargo clippy --all-targets -- -D warnings` is clean.
-- [ ] 5.3 `openspec validate a54-nul-delimited-git-status-parsing --strict` passes.
+- [ ] 5.3 `openspec validate a001-nul-delimited-git-status-parsing --strict` passes.

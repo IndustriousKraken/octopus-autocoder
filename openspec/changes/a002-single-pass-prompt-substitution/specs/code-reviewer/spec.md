@@ -1,4 +1,4 @@
-# code-reviewer — delta for a66-single-pass-prompt-substitution
+# code-reviewer — delta for a002-single-pass-prompt-substitution
 
 ## ADDED Requirements
 
