@@ -136,6 +136,7 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                // no-url: daemon-global thread-state prune, not scoped to one repo
                 tracing::warn!("audit-threads prune: read_dir entry error: {e}");
                 continue;
             }
@@ -144,6 +145,7 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
+                // no-url: daemon-global thread-state prune, not scoped to one repo
                 tracing::warn!(
                     path = %path.display(),
                     "audit-threads prune: skipping unreadable file: {e}"
@@ -154,6 +156,7 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
         let state: AuditThreadState = match serde_json::from_str(&raw) {
             Ok(s) => s,
             Err(e) => {
+                // no-url: daemon-global thread-state prune, not scoped to one repo
                 tracing::warn!(
                     path = %path.display(),
                     "audit-threads prune: skipping unparseable file: {e}"
@@ -164,6 +167,7 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
         if now - state.posted_at > max_age {
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
+                // no-url: daemon-global thread-state prune, not scoped to one repo
                 Err(e) => tracing::warn!(
                     path = %path.display(),
                     "audit-threads prune: remove failed: {e}"

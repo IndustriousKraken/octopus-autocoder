@@ -33,6 +33,12 @@ use std::sync::Arc;
 pub struct ContradictionCheckCtx {
     pub llm: Arc<dyn LlmClient>,
     pub prompt_template: String,
+    /// Redaction-safe `<provider>/<model>` attribution (a49) for the
+    /// configured contradiction-check LLM. Surfaced as
+    /// `*Contradiction-check: <provider>/<model>*` on the operator-facing
+    /// findings alert. `None` only for test contexts built without a
+    /// resolved config block.
+    pub attribution: Option<String>,
 }
 
 tokio::task_local! {

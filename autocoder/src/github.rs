@@ -697,14 +697,25 @@ fn compose_body(body: &str, review_report: Option<&ReviewReport>) -> String {
         Some(r) => r,
         None => return body.to_string(),
     };
+    // a49: a one-line `*Reviewer: <provider>/<model>*` attribution is
+    // appended to each `## Code Review` section. `attr_suffix` is empty
+    // when the reviewer carried no daemon-known model (e.g. test fixtures).
+    let attr_suffix = report
+        .attribution
+        .as_deref()
+        .map(|a| format!("\n\n{}", crate::attribution::attribution_line("Reviewer", a)))
+        .unwrap_or_default();
     if report.per_change_sections.is_empty() {
-        return format!("{body}\n\n## Code Review\n\n{}", report.markdown);
+        return format!(
+            "{body}\n\n## Code Review\n\n{}{attr_suffix}",
+            report.markdown
+        );
     }
     let sections = &report.per_change_sections;
     let mut out = body.to_string();
     for section in sections.iter() {
         let candidate = format!(
-            "\n\n## Code Review: {}\n\n{}",
+            "\n\n## Code Review: {}\n\n{}{attr_suffix}",
             section.change_slug, section.markdown
         );
         if out.len() + candidate.len() > GITHUB_PR_BODY_MAX_CHARS {
@@ -718,10 +729,14 @@ fn compose_body(body: &str, review_report: Option<&ReviewReport>) -> String {
             let available = GITHUB_PR_BODY_MAX_CHARS
                 .saturating_sub(out.len())
                 .saturating_sub(header.len())
+                .saturating_sub(attr_suffix.len())
                 .saturating_sub(pointer.len());
             let body_slice: String = section.markdown.chars().take(available).collect();
             out.push_str(&header);
             out.push_str(&body_slice);
+            // Keep the attribution line even on the truncated section so the
+            // model behind the (partial) review stays identifiable.
+            out.push_str(&attr_suffix);
             out.push_str(pointer);
             break;
         }
@@ -851,6 +866,14 @@ pub struct IssueComment {
     #[serde(default)]
     pub user: Option<IssueCommentUser>,
     pub created_at: DateTime<Utc>,
+    /// GitHub `author_association` of the comment author relative to the
+    /// repository (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`,
+    /// `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`). a000 uses this to
+    /// authorize comment-sourced verbs. `#[serde(default)]` so a payload
+    /// that omits the field (or a synthetic test fixture) deserializes as
+    /// `None`, which the authorization gate treats as unauthorized.
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -863,6 +886,13 @@ impl IssueComment {
     /// returning an empty string when the field is absent (deleted users).
     pub fn user_login(&self) -> &str {
         self.user.as_ref().map(|u| u.login.as_str()).unwrap_or("")
+    }
+
+    /// Convenience accessor for the comment's `author_association`,
+    /// returning `None` when the field is absent. a000's authorization
+    /// gate treats `None` (and any unrecognized value) as unauthorized.
+    pub fn author_association(&self) -> Option<&str> {
+        self.author_association.as_deref()
     }
 }
 
@@ -1530,6 +1560,7 @@ mod tests {
             markdown: "VERDICT details".to_string(),
             concerns: Vec::new(),
             per_change_sections: Vec::new(),
+            attribution: None,
         };
         create_pull_request_at(
             &server.url(),
@@ -2500,6 +2531,7 @@ mod tests {
                     markdown: "VERDICT: Block\n\nbug here".into(),
                 },
             ],
+            attribution: None,
         };
         let composed = compose_body("base body", Some(&report));
         // Sections appear in change order, all three present.
@@ -2544,6 +2576,7 @@ mod tests {
                     markdown: big.clone(),
                 },
             ],
+            attribution: None,
         };
         let composed = compose_body("base", Some(&report));
         // Body stays under GitHub's cap.
@@ -2569,9 +2602,76 @@ mod tests {
             markdown: "VERDICT details".into(),
             concerns: Vec::new(),
             per_change_sections: Vec::new(),
+            attribution: None,
         };
         let composed = compose_body("base body", Some(&report));
         assert!(composed.contains("\n\n## Code Review\n\nVERDICT details"));
         assert!(!composed.contains("## Code Review: "));
+    }
+
+    /// a49: the bundled `## Code Review` section carries the reviewer's
+    /// `*Reviewer: <provider>/<model>*` attribution line.
+    #[test]
+    fn compose_body_bundled_carries_reviewer_attribution() {
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Pass,
+            markdown: "VERDICT: Pass\n\nlooks good".into(),
+            concerns: Vec::new(),
+            per_change_sections: Vec::new(),
+            attribution: Some("anthropic/claude-opus-4-8".into()),
+        };
+        let composed = compose_body("base body", Some(&report));
+        assert!(
+            composed.contains("*Reviewer: anthropic/claude-opus-4-8*"),
+            "bundled review must carry the attribution line; got: {composed:?}"
+        );
+    }
+
+    /// a49: in per_change mode EACH `## Code Review: <slug>` section carries
+    /// the reviewer attribution line.
+    #[test]
+    fn compose_body_per_change_carries_attribution_per_section() {
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Concerns,
+            markdown: String::new(),
+            concerns: Vec::new(),
+            per_change_sections: vec![
+                PerChangeSection {
+                    change_slug: "a07-foo".into(),
+                    markdown: "VERDICT: Pass\n\nok".into(),
+                },
+                PerChangeSection {
+                    change_slug: "a08-bar".into(),
+                    markdown: "VERDICT: Concerns\n\nnit".into(),
+                },
+            ],
+            attribution: Some("openai_compatible/moonshotai/kimi-latest".into()),
+        };
+        let composed = compose_body("base", Some(&report));
+        let count = composed
+            .matches("*Reviewer: openai_compatible/moonshotai/kimi-latest*")
+            .count();
+        assert_eq!(
+            count, 2,
+            "each per-change section must carry the attribution line; got {count}: {composed:?}"
+        );
+    }
+
+    /// a49: with no configured model (attribution `None`) no attribution
+    /// line is emitted — the line is opt-in on a daemon-known model.
+    #[test]
+    fn compose_body_without_attribution_emits_no_line() {
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Pass,
+            markdown: "VERDICT: Pass\n\nok".into(),
+            concerns: Vec::new(),
+            per_change_sections: Vec::new(),
+            attribution: None,
+        };
+        let composed = compose_body("base body", Some(&report));
+        assert!(
+            !composed.contains("*Reviewer:"),
+            "no attribution line without a configured model; got: {composed:?}"
+        );
     }
 }

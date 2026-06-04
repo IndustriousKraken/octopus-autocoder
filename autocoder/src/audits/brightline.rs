@@ -162,7 +162,11 @@ impl Audit for ArchitectureBrightlineAudit {
         // gated uniformly with every other audit type so the framework
         // contract holds.
         if !workspace_is_valid(ctx.workspace) {
-            return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
+            return Ok(workspace_unavailable_outcome(
+                Self::TYPE,
+                ctx.workspace,
+                &ctx.repo.url,
+            ));
         }
         let findings = self.analyze(ctx.workspace)?;
         let _ = ctx.log_writer.write_section(

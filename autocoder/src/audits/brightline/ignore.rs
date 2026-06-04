@@ -48,6 +48,7 @@ pub fn load(workspace: &Path) -> Vec<IgnoreEntry> {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
+            // no-url: ignore-file loader keyed on workspace path, no repo URL in scope
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
@@ -62,6 +63,7 @@ pub fn load(workspace: &Path) -> Vec<IgnoreEntry> {
     match serde_yml::from_str::<BrightlineIgnoreFile>(&contents) {
         Ok(f) => f.ignore,
         Err(e) => {
+            // no-url: ignore-file loader keyed on workspace path, no repo URL in scope
             tracing::warn!(
                 path = %path.display(),
                 error = %e,

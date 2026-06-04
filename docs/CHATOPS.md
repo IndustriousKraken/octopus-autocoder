@@ -92,7 +92,7 @@ Most operators will not need to touch these. If you're seeing duplicate replies 
 
 ## Chat-driven workflows
 
-These verbs drive entire work flows — chat is the entry point and the bot delivers PRs or threaded replies as the output. All three triage-style verbs (`propose`, `send it`, the implicit triage initiated by certain audits) share the same downstream plumbing: explore the codebase, classify each finding/request as a quick-fix vs spec-worthy, apply both kinds of output, and split the resulting diff into a fixes PR and/or a spec PR.
+These verbs drive entire work flows — chat is the entry point and the bot delivers PRs or threaded replies as the output. All three triage-style verbs (`propose`, `send it`, the implicit triage initiated by certain audits) share the same downstream plumbing: explore the codebase, classify each finding/request as a quick-fix vs spec-worthy, and produce a single **spec-only PR** carrying the new `openspec/changes/<slug>/` proposal. As of a43 the triage agent does NOT touch code — any out-of-scope write is discarded before the spec PR commits, and code fixes flow through the standard implementer pipeline on the next iteration after the operator merges the spec PR.
 
 ### Chat-driven proposals: `propose`
 
@@ -104,7 +104,7 @@ The `propose` verb is the chat entry point for "I want autocoder to look at this
 
 Examples:
 
-- `@<bot> propose myrepo add a /healthz endpoint that returns 200 OK with the daemon's version and uptime` — directive; triage produces a fixes PR (and maybe a spec PR).
+- `@<bot> propose myrepo add a /healthz endpoint that returns 200 OK with the daemon's version and uptime` — directive; triage produces a spec-only PR whose `tasks.md` describes the work; the implementer builds it on the next iteration after merge.
 - `@<bot> propose myrepo what would it take to extract the auth logic into a separate module?` — question; triage replies in the thread, no PR.
 - `@<bot> propose myrepo something something handler logic` — ambiguous; triage emits AskUser, the standard chatops escalation fires, the operator clarifies, the executor resumes.
 
@@ -118,11 +118,13 @@ The ack message's `ts` becomes the proposal-request's lifecycle thread. Subseque
 
 **Three-way classification.** The chat-triage prompt instructs the LLM to classify the operator's text into one of three buckets BEFORE acting:
 
-- **DIRECTIVE** — a specific action a reasonable engineer would know how to build. The LLM proceeds to explore the codebase, classify each work item as quick-fix vs spec-worthy, apply the fixes, and create new `openspec/changes/chat-request-<short-hash>/` proposals for the spec-worthy items. The diff splits into a fixes PR and a spec PR exactly like `send it`.
+- **DIRECTIVE** — a specific action a reasonable engineer would know how to build. The LLM proceeds to explore the codebase, classify each work item as quick-fix vs spec-worthy, and create a new `openspec/changes/chat-request-<short-hash>/` proposal that captures the work as `tasks.md` items (quick fixes included — the agent does NOT apply them itself). The result is a single spec-only PR, exactly like `send it`.
 - **QUESTION** — the operator is asking for analysis or opinion, not asking for code changes. The LLM writes its reply to `<workspace>/.chat-reply.md` and stops. The polling iteration then reads the file, posts the contents (truncated to 35,000 chars with a daemon-log pointer when over) as a threaded reply in the lifecycle thread, deletes the file, and sets the proposal-request's status to `Discussed`. No PRs are created.
 - **AMBIGUOUS** — the request might be a directive but the LLM can't pin down what to build. The LLM calls the `ask_user` MCP tool. The existing chatops escalation posts the clarifying question into the lifecycle thread and resumes the executor once the operator replies.
 
-**Two output paths.** Same shape as the `send it` two-PR mechanic: a fixes PR carrying any code changes and a spec PR carrying any new `openspec/changes/chat-request-<short-hash>/` directory. Both PRs are normal autocoder-opened PRs and participate in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment), so `@<bot> revise <text>` on either gets revisions through the standard channel.
+**Spec-only PR.** Same shape as `send it`: a single spec PR carrying the new `openspec/changes/chat-request-<short-hash>/` directory. Code-path writes the agent made despite the prompt restriction are discarded before the commit (and a chatops warning names what was dropped), so the PR diff is genuinely spec-only. If the diff has only code and no spec, no PR opens and the bot replies that no spec content was produced. The spec PR is a normal autocoder-opened PR and participates in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment), so `@<bot> revise <text>` gets revisions through the standard channel.
+
+**What changed in a43.** Before a43, `propose` directives opened TWO simultaneous PRs — a fixes PR (code already written and pushed) and a spec PR. That gave the operator a spec to review while the code was already committed. a43 collapses this to one spec-only PR: the operator reviews (and can revise) the spec proposal first, and the implementer writes the code through the standard pipeline only after the spec PR merges.
 
 **7-day staleness rule.** Proposal-request state files are pruned after 7 days regardless of terminal status (`Acted`, `Discussed`, `TriageFailed`). The directory stays bounded the same way audit-thread state does.
 
@@ -280,7 +282,7 @@ Tractability: <item.tractability>
 <operator guidance, if any>
 ```
 
-The standard propose lifecycle takes over from there — triage classifies as DIRECTIVE/QUESTION/AMBIGUOUS, the executor runs, the iteration produces a fixes PR AND/OR spec PR per the existing two-PR mechanic, AND `@<bot> revise <text>` works on the resulting PR(s). Status updates from the proposal lifecycle post into the **same scout thread**, so the scout → pick → spec → PR chain stays in one visible conversation.
+The standard propose lifecycle takes over from there — triage classifies as DIRECTIVE/QUESTION/AMBIGUOUS, the executor runs, the iteration produces a single spec-only PR (a43), AND `@<bot> revise <text>` works on it. Status updates from the proposal lifecycle post into the **same scout thread**, so the scout → pick → spec → PR chain stays in one visible conversation.
 
 **Staleness handling.** When the scout's `completed_at` is older than `features.scout.staleness_warn_days` days OR the workspace's current HEAD has drifted from `head_sha_at_run`, the bot posts a single warning before submitting the propose-request:
 
@@ -303,13 +305,15 @@ The `send it` verb has **two** valid posting contexts:
 
 Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names both valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second; whichever matches dictates the action.
 
-**Audit-thread context (canonical).** Inside a tracked, fresh, open audit thread `send it` spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** (apply directly to source) or **spec-worthy** (write a new `openspec/changes/<slug>/` proposal), then applies both kinds of output. The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced PRs within one polling cycle.
+**Audit-thread context (canonical).** Inside a tracked, fresh, open audit thread `send it` spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** or **spec-worthy**, and writes a new `openspec/changes/<slug>/` proposal capturing the work as `tasks.md` items (quick fixes included — the agent does NOT touch source code). The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced spec PR within one polling cycle.
 
 **Brownfield-survey-thread context (a29).** Inside a brownfield-survey thread whose `BrownfieldSurveyState.status` is `Pending`, `send it` submits a `BrownfieldBatchAction` AND the bot replies `✓ Queued <N> capability spec generations. The first will start on the next iteration.` Subsequent iterations drain ONE survey item per iteration, each invoking the canonical brownfield-generation flow from [`brownfield`](#drafting-a-spec-for-existing-behavior-brownfield) for that capability. Per-item status replies (`✅ Spec PR opened for \`<slug>\` (M/N done): <pr-url>` on success; `✗ Spec for \`<slug>\` failed: <reason> (continuing with next)` on failure; `⏭ Skipped \`<slug>\` (M/N done): spec already exists.` when the spec file appears mid-batch) land in the same lifecycle thread. When every item reaches a terminal state, the bot posts the batch-complete summary `✅ Brownfield batch complete. <X> succeeded, <Y> skipped (already specced), <Z> failed.`
 
 The one-item-per-iteration discipline is deliberate: each brownfield run gets its own fresh executor invocation, eliminating mid-batch context compression as a failure mode. If a `send it` lands on a survey whose `status` is already `InProgress` OR `Completed`, the bot rejects with `✗ send it: a brownfield batch is already <in progress | completed> for survey <request_id>.` Only ONE survey may be `InProgress` per workspace at a time — a second `send it` against a different survey gets `✗ send it: a brownfield batch is already in progress for this workspace (survey <prior-request_id>). Wait for it to finish OR run @<bot> clear-survey <repo> to abort.`
 
-**Two-PR output shape.** autocoder splits the executor's diff by path: anything under the new `openspec/changes/<slug>/` directory becomes a separate **spec PR**; everything else becomes a **fixes PR**. Each PR is created on its own branch off `base_branch` and its body cross-links the companion PR (when both are created). If the triage diff has only code, only the fixes PR is created. If it has only a new spec, only the spec PR is created. If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread.
+**Spec-only output shape (a43).** autocoder keeps only the paths under the new `openspec/changes/<slug>/` directory and discards everything else (code, docs, any non-spec write) before committing, so the produced **spec PR** carries spec content only. The PR is created on a branch off `base_branch`; its body has no cross-link (there is no companion fixes PR). If the agent wrote code despite the restriction, the daemon restores those paths, logs a WARN, and posts a chatops warning naming what was dropped — directing the operator to capture load-bearing fixes as `tasks.md` items. If the triage diff has only code and no spec, NO PR is created and the bot replies `no spec content produced; retry with a clearer directive` (status flips to `triage-failed`, so the operator can `send it` again). If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread. After the operator merges the spec PR, the next polling iteration's implementer writes the code fixes through the standard pipeline.
+
+**What changed in a43.** Before a43, `send it` opened TWO simultaneous PRs (a fixes PR and a spec PR, cross-linked). That shipped code before the operator could approve the spec. a43 collapses this to one spec-only PR; the implementer follows on the next iteration once the spec PR merges — the same shape every other spec-producing flow (periodic audits, `brownfield`, `spec-it`) already uses.
 
 **7-day staleness rule.** Audit-thread state files are pruned after 7 days regardless of status. A `send it` against an audit older than 7 days gets a polite refusal:
 
@@ -321,9 +325,9 @@ This is intentional: stale audit findings probably no longer reflect the current
 
 **Already-acted threads.** Once a triage has run on an audit thread, subsequent `send it` replies get a polite refusal naming the current status (`triage-pending`, `acted`). The exception is `triage-failed`: a failed triage resets back to `triage-pending` on retry, so the operator can `send it` again after fixing whatever went wrong.
 
-**Revising the produced PRs.** Both the fixes PR and the spec PR are normal autocoder-opened PRs that participate in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment). If the agent over-promoted findings to specs, ask it to inline the fix via a revision comment on the spec PR; if it under-fixed, point that out via a revision comment on the fixes PR.
+**Revising the produced PR.** The spec PR is a normal autocoder-opened PR that participates in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment). `@<bot> revise <text>` on it re-runs the executor against the spec diff (which by construction is spec-only), so revisions stay scoped to the proposal. If the spec under-specifies the work, revise it to add or sharpen `tasks.md` items before merging — the implementer acts on those tasks on the next iteration.
 
-**Brightline findings can also produce `.brightline-ignore` updates.** When `send it` runs on an `architecture_brightline` thread, the triage LLM classifies each duplicate-signature finding as **Fix**, **Spec-worthy**, or **Mark as intentional**. The third path produces a diff that touches ONLY `.brightline-ignore` (one entry per constituent site of the finding, with the LLM's reasoning recorded in each entry's `reason` field). The triage handler enforces brightline-specific diff scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (only `.brightline-ignore` and `openspec/changes/<slug>/` are permitted in the brightline triage output). See [OPERATIONS.md → `.brightline-ignore`](OPERATIONS.md#brightline-ignore) for the full file format, match-suppression rules, and stale-entry handling.
+**Brightline findings can also produce `.brightline-ignore` updates.** When `send it` runs on an `architecture_brightline` thread, the triage LLM classifies each duplicate-signature finding as **Fix**, **Spec-worthy**, or **Mark as intentional**. The third path produces a diff that touches ONLY `.brightline-ignore` (one entry per constituent site of the finding, with the LLM's reasoning recorded in each entry's `reason` field). `.brightline-ignore` is the one exception to a43's spec-only rule — it is a suppression-config write with no implementer-pipeline equivalent, so it ships directly in a single PR rather than being discarded. The triage handler enforces brightline-specific diff scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (only `.brightline-ignore` and `openspec/changes/<slug>/` are permitted in the brightline triage output). See [OPERATIONS.md → `.brightline-ignore`](OPERATIONS.md#brightline-ignore) for the full file format, match-suppression rules, and stale-entry handling.
 
 ### On-demand audit: `audit`
 
@@ -384,7 +388,7 @@ The ack's `ts` becomes the changelog-request's lifecycle thread. Status updates 
 4. Commits the diff to a `changelog-<short-hash>` branch, pushes, AND opens a single PR.
 5. Posts a threaded reply in the lifecycle thread: `✓ Changelog draft ready at <PR-URL>. Review on GitHub; revise via @<bot> revise <text>.`
 
-**Single-PR shape.** Unlike `propose`'s two-PR mechanic, the changelog flow produces a single PR. The reason: `CHANGELOG.md` is the only output artifact. When the stylist proposes `changelog: skip` frontmatter edits to source proposals, those land in the same PR — they're part of "what this release's changelog work decided," not a separable concern.
+**Single-PR shape.** The changelog flow produces a single PR carrying `CHANGELOG.md` (and any `changelog: skip` frontmatter edits the stylist proposes to source proposals — they're part of "what this release's changelog work decided," not a separable concern). Note this is a code/docs PR, not a spec-only PR: unlike `propose`/`send it` (which since a43 produce a spec-only PR and route implementation through the implementer), the changelog's `CHANGELOG.md` edit IS the deliverable and ships directly.
 
 **Frontmatter propagation.** When an operator's revision implies a durable classification (`@<bot> revise leave out the refactors`), the stylist MAY include `changelog: skip` frontmatter edits to the relevant `openspec/changes/archive/<slug>/proposal.md` files in the same PR. Future invocations of the deterministic extractor honor the frontmatter — the classification persists across releases. Reviewers see both the `CHANGELOG.md` edit AND the proposal.md frontmatter edits in a single diff.
 
@@ -405,7 +409,9 @@ The ack's `ts` becomes the changelog-request's lifecycle thread. Status updates 
 
 When the bot opens a PR (from a normal queue iteration, from a `send it` triage, or from a `propose` directive), an operator comment of the form `@<bot> revise <free-form text>` on that PR triggers an in-place revision: the next polling iteration re-runs the executor with the original change material, the current PR diff, and the operator's text, then force-pushes the updated diff and posts a `✅ Revision applied:` or `✗ Revision attempt failed:` reply comment.
 
-Per-PR cap (default 5; configurable up to 20 via `executor.max_revisions_per_pr`). Reviewer-initiated revisions (when `reviewer.auto_revise_on_block: true`) share the same cap. Full spec in [OPERATIONS.md → Revising an open PR via comment](OPERATIONS.md#revising-an-open-pr-via-comment).
+**Authorization (a000, default-deny).** `@<bot> revise` and `@<bot> code-review` on a GitHub PR are dispatched **only** for authorized commenters — the comment's GitHub `author_association` must be in `github.command_authorization.allowed_associations` (default `OWNER` / `MEMBER` / `COLLABORATOR`) **or** the author's `login` must be in `github.command_authorization.allowed_users`. Unauthorized comments are dropped before any executor/reviewer work (silently by default; set `decline_comment: true` for one polite reply). This is the GitHub analog of the Slack channel allowlist that gates the verbs above — the Slack path is unchanged. See [Authorizing PR-comment triggers](OPERATIONS.md#authorizing-pr-comment-triggers).
+
+**Per-PR caps.** Authorized human `@<bot> revise` requests are bounded by `executor.max_revise_triggers_per_pr` (default `10`, a000) — past the cap, further requests are declined with one notice and do not invoke the executor. This is **separate** from the **automatic** reviewer-initiated revision cap (default 5; up to 20 via `executor.max_auto_revisions_per_pr`, legacy alias `executor.max_revisions_per_pr`) and the re-review cap (`reviewer.max_code_reviews_per_pr`); all three are independent. Full spec in [OPERATIONS.md → Revising an open PR via comment](OPERATIONS.md#revising-an-open-pr-via-comment).
 
 ---
 
@@ -426,6 +432,13 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 | `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
+
+### Argument hygiene for recovery verbs
+
+Two relaxations apply uniformly to every recovery verb's arguments:
+
+- **Surrounding backticks are tolerated.** Alert templates wrap change slugs and repo identifiers in single backticks for chat readability (`` `a37-unify-llm-provider-config` ``); when an operator copies that wrapper verbatim, the parser strips a single pair of leading/trailing backticks before its regex check. Embedded backticks (mid-token) are preserved and still fail validation. Example: `@<bot> clear-revision myrepo \`a37-unify-llm-provider-config\`` parses identically to the unwrapped form.
+- **Leading prefix is sufficient when one change matches.** The four marker-clearing verbs (`clear-perma-stuck`, `clear-revision`, `ignore-and-continue`, `clear-ignore`) resolve a partial slug to the canonical change directory when exactly one change in the repo carries the verb's relevant marker file (`.perma-stuck.json` for `clear-perma-stuck`; `.needs-spec-revision.json` for `clear-revision`; either of the two for `ignore-and-continue`; `.ignore-for-queue.json` for `clear-ignore`). The dispatcher's success reply names the canonical slug it resolved to. When two or more changes carrying the marker share the prefix, the reply lists the candidates and asks for a longer prefix. Example: `@<bot> clear-revision myrepo a37` resolves to `a37-unify-llm-provider-config` when that is the only change in the repo carrying `.needs-spec-revision.json`.
 
 ### Bare `status` — the per-repo menu
 

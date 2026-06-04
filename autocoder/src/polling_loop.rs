@@ -79,6 +79,7 @@ pub async fn run(
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -138,6 +139,7 @@ pub async fn run(
         perma_stuck_threshold,
         executor_max_changes_per_pr,
         revision_cap,
+        human_revise_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry,
@@ -205,6 +207,7 @@ pub async fn run_with_hooks(
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -712,6 +715,7 @@ pub async fn run_with_hooks(
             perma_stuck_threshold,
             max_changes_per_pr,
             revision_cap,
+            human_revise_cap,
             audit_registry.as_ref(),
             audits_cfg.as_deref(),
             audit_settings.as_ref(),
@@ -855,6 +859,7 @@ pub async fn execute_one_pass(
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
     revision_cap: u32,
+    human_revise_cap: u32,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
@@ -913,6 +918,7 @@ pub async fn execute_one_pass(
             executor,
             chatops_ctx_for_revisions,
             revision_cap,
+            human_revise_cap,
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -1059,13 +1065,13 @@ pub async fn execute_one_pass(
     // the push + PR. A failed reviewer is non-fatal: PR still ships with a
     // "(reviewer failed)" note in the body.
     //
-    // When `reviewer.auto_revise_on_block` is enabled AND the verdict is
-    // Block, the per-concern `should_request_revision` records drive the
-    // reviewer-initiated revision pipeline. Concerns are partitioned
-    // against the per-PR cap budget here; the taken set is queued to be
-    // posted as `<!-- reviewer-revision -->` PR comments after the PR is
-    // created, and the dropped set is annotated into the `## Code Review`
-    // PR-body section so the human sees what was skipped.
+    // When `reviewer.auto_revise` is enabled, the per-concern
+    // `should_request_revision` records drive the reviewer-initiated
+    // revision pipeline regardless of the verdict. Concerns are
+    // partitioned against the per-PR cap budget here; the taken set is
+    // queued to be posted as `<!-- reviewer-revision -->` PR comments
+    // after the PR is created, and the dropped set is annotated into the
+    // `## Code Review` PR-body section so the human sees what was skipped.
     // a34 §6: when `reviewer.skip_spec_only_prs: true` AND the PR's
     // diff lives entirely under `openspec/`, skip the reviewer call
     // (cost-optimization knob). The detection mirrors the iteration's
@@ -1127,7 +1133,7 @@ pub async fn execute_one_pass(
                 match outcome {
                     Ok(mut report) => {
                         let draft = matches!(report.verdict, ReviewVerdict::Block);
-                        let taken = if r.auto_revise_on_block() {
+                        let taken = if r.auto_revise() {
                             partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
                         } else {
                             Vec::new()
@@ -1141,6 +1147,9 @@ pub async fn execute_one_pass(
                             markdown: format!("(reviewer failed: {e})"),
                             concerns: Vec::new(),
                             per_change_sections: Vec::new(),
+                            // Reviewer failed before producing a verdict; no
+                            // model output to attribute (a49).
+                            attribution: None,
                         };
                         (Some(synthetic), false, Vec::new())
                     }
@@ -1178,6 +1187,8 @@ pub async fn execute_one_pass(
         &processed,
         includes_self_heal,
         review_report.as_ref(),
+        reviewer,
+        revision_cap,
         draft,
         &reviewer_revision_concerns,
         chatops_ctx,
@@ -1420,6 +1431,12 @@ fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewRepor
     let mut verdict = ReviewVerdict::Pass;
     let mut concerns: Vec<ReviewConcern> = Vec::new();
     let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
+    // Every per-change report comes from the same reviewer, so they share
+    // one attribution (a49); carry it onto the synthesized report so the
+    // PR-body composer can attribute each `## Code Review: <slug>` section.
+    let attribution = per_change
+        .first()
+        .and_then(|pcr| pcr.report.attribution.clone());
     for pcr in per_change {
         verdict = worst_verdict(verdict, pcr.report.verdict);
         for concern in &pcr.report.concerns {
@@ -1439,6 +1456,7 @@ fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewRepor
         markdown: String::new(),
         concerns,
         per_change_sections: sections,
+        attribution,
     }
 }
 
@@ -2114,6 +2132,22 @@ async fn process_one_waiting(
                 ),
             )
         }
+        Ok(ExecutorOutcome::Aborted { reason }) => {
+            // a39: the resume's subprocess was killed by the daemon's
+            // own SIGTERM cascade. The .question.json was deleted
+            // before the resume call (above), so we cannot restore the
+            // pre-resume waiting-on-answer state. The change is back
+            // in pending state for the next iteration to retry from
+            // the agent-q tip. We do NOT increment the failure counter
+            // (operator initiated the shutdown) AND do NOT post a
+            // chatops alert.
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "resume aborted by daemon shutdown: {reason}"
+            );
+            (ResumeDisposition::Aborted, None)
+        }
     };
 
     // Counter book-keeping mirrors the pending path:
@@ -2169,6 +2203,11 @@ enum ResumeDisposition {
     /// the operator alerted; treat as a non-counter-bumping failure-
     /// equivalent (the marker handles exclusion).
     SpecRevisionMarked,
+    /// a39: resume returned `Aborted` (subprocess killed by the daemon's
+    /// own SIGTERM cascade). Treat as a non-counter-bumping failure-
+    /// equivalent — the failure budget is not the right tool for an
+    /// operator-initiated shutdown.
+    Aborted,
 }
 
 impl ResumeDisposition {
@@ -2180,6 +2219,7 @@ impl ResumeDisposition {
             ResumeDisposition::Failed => "failed",
             ResumeDisposition::Errored => "errored",
             ResumeDisposition::SpecRevisionMarked => "spec_needs_revision",
+            ResumeDisposition::Aborted => "aborted",
         }
     }
 }
@@ -2259,6 +2299,7 @@ async fn walk_queue(
             Ok(QueueStep::AskUserExitEarly) => "ask_user_exit_early",
             Ok(QueueStep::SpecRevisionMarked) => "spec_needs_revision",
             Ok(QueueStep::IterationPending) => "iteration_pending",
+            Ok(QueueStep::Aborted) => "aborted",
             Err(_) => "error",
         };
         tracing::info!(
@@ -2379,6 +2420,21 @@ async fn walk_queue(
                     url = %repo.url,
                     change = %change,
                     "change requested another iteration; halting queue walk this iteration"
+                );
+                break;
+            }
+            Ok(QueueStep::Aborted) => {
+                // a39: the executor's subprocess was killed by the
+                // daemon's own SIGTERM cascade. `.in-progress` has been
+                // dropped inside `handle_outcome`. We must NOT bump the
+                // perma-stuck counter (operator-initiated shutdown is
+                // not a repeat-execution-failure) AND we halt the walk
+                // — the daemon is shutting down; later changes belong
+                // to the next process's iteration.
+                tracing::info!(
+                    url = %repo.url,
+                    change = %change,
+                    "change aborted by daemon shutdown; halting queue walk this iteration"
                 );
                 break;
             }
@@ -2628,8 +2684,16 @@ async fn handle_contradiction_preflight(
             "failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
         );
     }
-    maybe_post_contradiction_findings_alert(paths, chatops_ctx, repo, change, &findings, &suggestion)
-        .await;
+    maybe_post_contradiction_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        cc_ctx.attribution.as_deref(),
+    )
+    .await;
     Ok(Some(QueueStep::SpecRevisionMarked))
 }
 
@@ -2676,6 +2740,7 @@ async fn maybe_post_contradiction_findings_alert(
     change: &str,
     findings: &[crate::preflight::change_contradiction::ContradictionFinding],
     revision_suggestion: &str,
+    attribution: Option<&str>,
 ) {
     let Some(ctx) = chatops_ctx else { return };
     if !ctx.failure_alerts_enabled {
@@ -2709,8 +2774,18 @@ async fn maybe_post_contradiction_findings_alert(
             s = f.summary,
         ));
     }
+    // a49: append the `*Contradiction-check: <provider>/<model>*`
+    // attribution when the daemon knows the configured model.
+    let attribution_suffix = attribution
+        .map(|a| {
+            format!(
+                "\n\n{}",
+                crate::attribution::attribution_line("Contradiction-check", a)
+            )
+        })
+        .unwrap_or_default();
     let text = format!(
-        "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
         repo_url = repo.url,
         change = change,
         findings_block = findings_block,
@@ -2915,6 +2990,16 @@ enum QueueStep {
     /// — iteration sequences are part of the normal lifecycle, not a
     /// repeat-execution-failure.
     IterationPending,
+    /// a39: the executor returned `Aborted`. The subprocess was killed
+    /// by the daemon's own SIGTERM cascade (operator-initiated
+    /// shutdown). The `.in-progress` lock has been dropped AND the
+    /// `.iteration-pending.json` marker (if any) has been left
+    /// untouched. The walker halts this iteration; the next polling
+    /// iteration after restart picks the change up fresh. Like
+    /// `IterationPending`, this MUST NOT increment the perma-stuck
+    /// counter — operator-initiated shutdown is not a repeat-execution-
+    /// failure.
+    Aborted,
 }
 
 /// Increment the per-change failure counter, and on threshold transition
@@ -4215,6 +4300,37 @@ async fn handle_outcome(
             tracing::error!("executor reported Failed for `{change}`: {reason}");
             Ok(QueueStep::Failed { reason })
         }
+        Ok(ExecutorOutcome::Aborted { reason }) => {
+            // a39: the executor's subprocess was killed by the
+            // daemon's own SIGTERM cascade. The classifier set this
+            // outcome because `SHUTDOWN_REQUESTED == true` AND the
+            // exit status was 143. Drop the `.in-progress` lock per
+            // the canonical unlock-on-any-outcome rule; do NOT
+            // increment the failure counter, do NOT write
+            // `.perma-stuck.json`, do NOT post a chatops failure
+            // alert (operator initiated the shutdown), AND leave any
+            // `.iteration-pending.json` marker in place (the next
+            // iteration after restart resumes context).
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "executor aborted: {reason}"
+            );
+            // Don't propagate the unlock error to the walker — the
+            // walker would otherwise treat a stale-lock cleanup
+            // hiccup as a post-executor Err AND bump the counter for
+            // an outcome we explicitly chose to exempt. Best-effort
+            // is consistent with how the `IterationRequested` arm
+            // unlocks below.
+            if let Err(e) = queue::unlock(workspace, change) {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "Aborted arm: dropping .in-progress failed (continuing): {e:#}"
+                );
+            }
+            Ok(QueueStep::Aborted)
+        }
         Ok(ExecutorOutcome::SpecNeedsRevision {
             unimplementable_tasks,
             revision_suggestion,
@@ -4815,6 +4931,42 @@ async fn create_pull_request_via_hook(
     .await
 }
 
+/// Build the initial per-PR `RevisionState` written at PR-open time when the
+/// original automatic review ran (a33 §7.2 baseline + the per-PR caps).
+///
+/// The caps are SOURCED — never hardcoded — so this init agrees with the
+/// revision dispatcher's own state init in `revisions::process_one_pr`:
+/// - `revision_cap` is the resolved `executor.max_auto_revisions_per_pr`
+///   (already clamped at config load) — bounds AUTOMATIC revisions only.
+/// - `code_review_cap` is `reviewer.max_code_reviews_per_pr()`, where `None`
+///   means UNLIMITED (the a47 default). Hardcoding `Some(5)` here would
+///   silently re-cap re-reviews on every daemon-opened PR even when the
+///   operator set no cap, defeating a47's default-unlimited re-reviews.
+fn initial_revision_state_at_pr_open(
+    pr_number: u64,
+    agent_branch: String,
+    now: chrono::DateTime<chrono::Utc>,
+    revision_cap: u32,
+    reviewer: Option<&CodeReviewer>,
+    head_sha: String,
+) -> crate::revisions::RevisionState {
+    crate::revisions::RevisionState {
+        pr_number,
+        agent_branch,
+        last_seen_comment_at: now,
+        auto_revisions_applied: 0,
+        revision_cap,
+        cap_decline_posted: false,
+        human_revise_count: 0,
+        human_revise_cap_decline_posted: false,
+        code_reviews_applied: 0,
+        code_review_cap: reviewer.and_then(|r| r.max_code_reviews_per_pr()),
+        cap_decline_posted_for_code_review: false,
+        last_suggested_rereview_at_revisions_count: None,
+        original_review_head_sha: Some(head_sha),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_pull_request(
     paths: &DaemonPaths,
@@ -4823,6 +4975,8 @@ async fn open_pull_request(
     changes: &[String],
     includes_self_heal: bool,
     review_report: Option<&ReviewReport>,
+    reviewer: Option<&CodeReviewer>,
+    revision_cap: u32,
     draft: bool,
     reviewer_revision_concerns: &[ReviewConcern],
     chatops_ctx: Option<&ChatOpsContext>,
@@ -4949,19 +5103,14 @@ async fn open_pull_request(
                     s.original_review_head_sha = Some(head_sha);
                     s
                 }
-                None => crate::revisions::RevisionState {
-                    pr_number: pr.number,
-                    agent_branch: repo.agent_branch.clone(),
-                    last_seen_comment_at: now,
-                    revisions_applied: 0,
-                    revision_cap: 5,
-                    cap_decline_posted: false,
-                    code_reviews_applied: 0,
-                    code_review_cap: 5,
-                    cap_decline_posted_for_code_review: false,
-                    last_suggested_rereview_at_revisions_count: None,
-                    original_review_head_sha: Some(head_sha),
-                },
+                None => initial_revision_state_at_pr_open(
+                    pr.number,
+                    repo.agent_branch.clone(),
+                    now,
+                    revision_cap,
+                    reviewer,
+                    head_sha,
+                ),
             };
             if let Err(e) = crate::revisions::write_state(paths, workspace, &state) {
                 tracing::warn!(
@@ -5084,31 +5233,29 @@ async fn post_reviewer_revision_comments(
 /// Decide which concerns from `report.concerns` get posted as
 /// `<!-- reviewer-revision -->` PR comments and which are dropped due to
 /// the per-PR revision-cap budget. Pre-conditions assume the caller has
-/// already gated on `reviewer.auto_revise_on_block == true`.
+/// already gated on `reviewer.auto_revise == true`.
 ///
 /// Selection rules:
-/// - The verdict gates the entire mechanism: only `Block` produces
-///   reviewer-revision posts. `Pass` and `Concerns` return an empty vec
-///   without scanning the concerns list.
-/// - Within a `Block`-verdict report, a concern is "revisable" when
+/// - The verdict is NOT consulted. The actionability signal lives at the
+///   per-concern granularity: a concern is "revisable" when
 ///   `should_request_revision == true` AND `actionable_request` is
-///   non-empty (whitespace-trimmed). Concerns failing either condition
+///   non-empty (whitespace-trimmed). This fires under any verdict
+///   (`Pass`, `Concerns`, OR `Block`). Concerns failing either condition
 ///   stay as commentary in the `## Code Review` section and do not post.
+///   (`Block` retains its separate effect of marking the PR draft; that
+///   is handled by the caller and no longer gates this function.)
 /// - When the revisable set exceeds `budget`, the first `budget`
 ///   concerns (in reviewer output order — the template instructs
 ///   most-critical-first) are taken; the remainder are annotated into
 ///   `report.markdown` with `(not auto-revised; cap budget exhausted)`
 ///   so the human reader of the PR body sees what was skipped.
-/// - When the revisable set is empty AND the verdict is `Block`, a WARN
-///   is logged surfacing the "you flipped the flag but your template
-///   produced no actionable concerns" misconfiguration.
+/// - When the revisable set is empty, a WARN is logged surfacing the
+///   "you flipped the flag but your template produced no actionable
+///   concerns" misconfiguration.
 fn partition_and_annotate_reviewer_revisions(
     report: &mut ReviewReport,
     budget: u32,
 ) -> Vec<ReviewConcern> {
-    if report.verdict != ReviewVerdict::Block {
-        return Vec::new();
-    }
     let revisable: Vec<ReviewConcern> = report
         .concerns
         .iter()
@@ -5349,7 +5496,14 @@ fn extract_stdout_section(raw: &str) -> &str {
 /// Truncate `body` to fit within GitHub's comment size limit. If `body`
 /// is short enough, returned as-is. Otherwise truncated at the largest
 /// char boundary `<= max` and a marker noting the truncation is appended.
-fn truncate_to_fit(body: String, max: usize) -> String {
+///
+/// `pub(crate)` so the revision success-comment composer
+/// (`revisions::compose_revision_success_comment`) can reuse the same
+/// limit-and-marker behavior. The marker text is generalized (it does
+/// not say "implementer") because it now serves both the implementer
+/// summary AND the revision summary; both recover the full output from
+/// the same per-change run-log path.
+pub(crate) fn truncate_to_fit(body: String, max: usize) -> String {
     if body.len() <= max {
         return body;
     }
@@ -5359,7 +5513,7 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     }
     let mut truncated = body[..cut].to_string();
     truncated.push_str(
-        "\n\n_[implementer summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
+        "\n\n_[summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
     );
     truncated
 }
@@ -5616,14 +5770,35 @@ fn build_audit_only_pr_title_from_categories(
 /// commits actually exist — fixing PR #77's misleading body that named
 /// "audit-produced proposals" with zero audit commits in the diff.
 fn build_audit_only_pr_body(commit_subjects: &[String]) -> String {
+    build_audit_only_pr_body_with_attribution(commit_subjects, None)
+}
+
+/// As [`build_audit_only_pr_body`], but appends a one-line model
+/// attribution (a49) to the `## Audit-produced proposals` section when
+/// `attribution_line` is `Some`. `attribution_line` is the fully-formed
+/// `*Auditor (<audit-type>): <provider>/<model>*` line produced by
+/// [`crate::attribution::audit_attribution_line`].
+///
+/// In-tree audits wrap the Claude CLI and have no daemon-known `(provider,
+/// model)`, so the audit-only-PR path passes `None` today and no line is
+/// emitted. The attributed seam exists for audits that gain a resolvable
+/// model via the planned model-registry work; it is exercised by tests.
+fn build_audit_only_pr_body_with_attribution(
+    commit_subjects: &[String],
+    attribution_line: Option<&str>,
+) -> String {
     let cats = categorize_commit_subjects(commit_subjects);
-    build_audit_only_pr_body_from_categories(&cats)
+    build_audit_only_pr_body_from_categories(&cats, attribution_line)
 }
 
 /// Inner of [`build_audit_only_pr_body`] — works on already-categorized
 /// commits. Pulled out so tests can drive the body content from a
-/// fixture `CommitCategories` directly.
-fn build_audit_only_pr_body_from_categories(cats: &CommitCategories) -> String {
+/// fixture `CommitCategories` directly. `attribution_line` (a49) is
+/// appended to the `## Audit-produced proposals` section when `Some`.
+fn build_audit_only_pr_body_from_categories(
+    cats: &CommitCategories,
+    attribution_line: Option<&str>,
+) -> String {
     let mut s = String::new();
 
     // Lead sentence: framing depends on what's actually present.
@@ -5651,6 +5826,11 @@ fn build_audit_only_pr_body_from_categories(cats: &CommitCategories) -> String {
         s.push_str("## Audit-produced proposals\n\n");
         for subject in &cats.audit {
             s.push_str(&format!("- {subject}\n"));
+        }
+        // a49: attribute the model behind the audit-produced proposals.
+        if let Some(line) = attribution_line {
+            s.push_str(line);
+            s.push('\n');
         }
         s.push('\n');
     }
@@ -5918,7 +6098,7 @@ async fn open_pr_exists_for_agent_branch(
 /// Process every queued audit-triage `thread_ts` for this repo. The
 /// caller passes the per-repo queue snapshot already drained; this
 /// function loads each `AuditThreadState`, runs the executor in triage
-/// mode, splits the resulting diff, and opens one or two PRs.
+/// mode, discards non-spec writes, and opens at most one spec PR (a43).
 ///
 /// Failures inside one triage do NOT abort the others — each entry is
 /// processed independently, errors are logged and the audit-thread
@@ -5996,7 +6176,7 @@ pub async fn process_audit_triages(
 
         let outcome = executor.run_triage(workspace, &ctx).await;
         match outcome {
-            Ok(crate::executor::ExecutorOutcome::Completed { .. }) => {
+            Ok(crate::executor::ExecutorOutcome::Completed { final_answer }) => {
                 if let Err(e) = process_completed_triage(
                     paths,
                     workspace,
@@ -6004,6 +6184,7 @@ pub async fn process_audit_triages(
                     github_cfg,
                     chatops_ctx,
                     &mut state,
+                    final_answer.as_deref(),
                 )
                 .await
                 {
@@ -6071,6 +6252,17 @@ pub async fn process_audit_triages(
                 )
                 .await;
             }
+            Ok(crate::executor::ExecutorOutcome::Aborted { reason }) => {
+                // a39: subprocess killed by the daemon's own SIGTERM
+                // cascade. Leave state at TriagePending so the next
+                // iteration after restart retries the triage; do NOT
+                // mark_triage_failed (operator initiated the shutdown).
+                tracing::info!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor aborted by daemon shutdown: {reason}"
+                );
+            }
             Err(e) => {
                 tracing::error!(
                     url = %repo.url,
@@ -6104,10 +6296,14 @@ pub async fn process_audit_triages(
     Ok(())
 }
 
-/// Inspect the changed paths in `workspace` after a Completed triage,
-/// split into spec vs fixes, and open one or two PRs accordingly. On
-/// the empty-diff path, post the agent's final-summary text into the
-/// audit thread reply chain and flip the state to `Acted`.
+/// Inspect the changed paths in `workspace` after a Completed triage and
+/// open AT MOST ONE PR — the spec PR (a43). Code-path writes outside
+/// `openspec/changes/<derived-slug>/` are discarded before the commit so
+/// the spec PR's diff is genuinely spec-only; the dropped paths are
+/// logged AND surfaced to chatops. On the empty-diff path, post the
+/// agent's final-summary text into the audit thread reply chain and flip
+/// the state to `Acted`. `final_summary` carries the executor's
+/// final-answer text (used for the empty-diff reply).
 async fn process_completed_triage(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -6115,32 +6311,31 @@ async fn process_completed_triage(
     github_cfg: &GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut crate::audits::threads::AuditThreadState,
+    final_summary: Option<&str>,
 ) -> Result<()> {
     use crate::audits::threads::{self, AuditThreadStatus};
     let state_root = threads::default_state_root(paths);
 
-    let porcelain = git::status_porcelain(workspace)
-        .with_context(|| "audit-triage: reading post-Completed git status".to_string())?;
-    let changed: Vec<String> = porcelain
-        .lines()
-        .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
-        .filter(|p| !p.is_empty())
+    let changed: Vec<String> = git::status_entries(workspace)
+        .with_context(|| "audit-triage: reading post-Completed git status".to_string())?
+        .into_iter()
+        .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
         .collect();
 
-    // Derive the slug ahead of partitioning so the path-prefix check is
-    // anchored to a concrete slug. The slug derives from
-    // `<audit_type>-<short_hash>` with collision-suffix.
+    // A stable slug derived from `<audit_type>-<short_hash>`, retained
+    // purely as a diagnostic label for logs (the executor picks its own
+    // change-directory name; the spec/code boundary is the universal
+    // `openspec/changes/` root, NOT this slug).
     let new_slug = derive_unique_triage_slug(workspace, &state.audit_type, &state.findings_excerpt);
-    let slug_prefix = format!("openspec/changes/{new_slug}/");
 
     // Brightline-specific diff-scope validation: the `Mark as
     // intentional` triage output writes ONLY `.brightline-ignore`. The
     // overall brightline-triage diff must therefore be limited to
-    // `.brightline-ignore` plus `openspec/changes/<slug>/`. A diff
-    // touching arbitrary code AND `.brightline-ignore` indicates a
-    // confused LLM run; we refuse rather than ship a half-valid PR.
+    // `.brightline-ignore` plus `openspec/changes/`. A diff touching
+    // arbitrary code AND `.brightline-ignore` indicates a confused LLM
+    // run; we refuse rather than ship a half-valid PR.
     if let Err(violations) =
-        validate_brightline_triage_scope(&state.audit_type, &changed, &slug_prefix)
+        validate_brightline_triage_scope(&state.audit_type, &changed, "openspec/changes/")
     {
         tracing::warn!(
             thread_ts = %state.thread_ts,
@@ -6149,11 +6344,10 @@ async fn process_completed_triage(
         if let Some(ctx) = chatops_ctx {
             let body = format!(
                 "✗ Triage for `{audit_type}` on `{repo_url}` rejected: out-of-scope diff. \
-                Brightline triages may only write `.brightline-ignore` or `openspec/changes/{new_slug}/`. \
+                Brightline triages may only write `.brightline-ignore` or `openspec/changes/<slug>/`. \
                 Offending paths:\n{violations}",
                 audit_type = state.audit_type,
                 repo_url = state.repo_url,
-                new_slug = new_slug,
                 violations = violations.join("\n"),
             );
             let _ = ctx
@@ -6166,20 +6360,126 @@ async fn process_completed_triage(
         return Ok(());
     }
 
-    let (fixes_paths, spec_paths): (Vec<String>, Vec<String>) = changed
-        .into_iter()
-        .partition(|p| !p.starts_with(&slug_prefix));
+    // a43: triage produces a SPEC-ONLY PR. Code-path writes outside
+    // `openspec/changes/<slug>/` are discarded before commit;
+    // implementation flows through the standard implementer pipeline on a
+    // later iteration after the operator merges the spec PR.
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    let agent_branch = &repo.agent_branch;
+    let base_branch = &repo.base_branch;
 
-    if fixes_paths.is_empty() && spec_paths.is_empty() {
-        // No diff. Post the bot's summary reply (placeholder text since
-        // the executor's final-summary stdout isn't structured here) and
-        // flip state to Acted.
+    // Brightline `Mark as intentional` is the one exception to the
+    // spec-only rule: its sole deliverable is the `.brightline-ignore`
+    // suppression file, which has no implementer-pipeline equivalent, so
+    // ship it directly the way the pre-a43 single-PR path did.
+    // `validate_brightline_triage_scope` (run above) already guarantees a
+    // brightline diff carrying `.brightline-ignore` contains nothing but
+    // that file plus `openspec/changes/<slug>/`, so a straight commit is
+    // safe.
+    let brightline_intentional = state.audit_type == "architecture_brightline"
+        && changed.iter().any(|p| p == ".brightline-ignore");
+    if brightline_intentional {
+        git::checkout(workspace, base_branch)
+            .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
+        let branch = format!("{agent_branch}-triage-spec");
+        git::recreate_branch(workspace, &branch)
+            .with_context(|| format!("audit-triage: recreate `{branch}`"))?;
+        git::add_all(workspace)
+            .with_context(|| "audit-triage: staging brightline-intentional diff".to_string())?;
+        let subject = format!("audit-triage intentional-marks from {}", state.audit_type);
+        git::commit(workspace, &subject)
+            .with_context(|| "audit-triage: commit brightline-intentional branch".to_string())?;
+        if let Err(e) = git::push_force_with_lease(workspace, &branch, push_remote) {
+            return Err(anyhow!(
+                "audit-triage: pushing brightline-intentional branch failed: {e:#}"
+            ));
+        }
+        let body = format!(
+            "This PR marks brightline duplicate-signature findings from the `{audit_type}` audit on `{repo_url}` as intentional by adding `.brightline-ignore` entries. No code changes are included.",
+            audit_type = state.audit_type,
+            repo_url = state.repo_url,
+        );
+        let pr_url = match open_triage_pull_request(
+            paths,
+            repo,
+            github_cfg,
+            &branch,
+            base_branch,
+            &format!("audit-triage intentional-marks ({})", state.audit_type),
+            &body,
+        )
+        .await
+        {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::error!(
+                    url = %repo.url,
+                    "audit-triage: brightline-intentional PR creation failed: {e:#}"
+                );
+                None
+            }
+        };
         if let Some(ctx) = chatops_ctx {
-            let body = format!(
-                "ℹ️ Triage for `{audit_type}` on `{repo_url}` completed with no actionable changes.",
-                audit_type = state.audit_type,
-                repo_url = state.repo_url,
-            );
+            let mut reply = format!("✓ Triage for `{}` complete.", state.audit_type);
+            if let Some(u) = &pr_url {
+                reply.push_str(&format!("\nPR: {u}"));
+            }
+            let _ = ctx
+                .chatops
+                .post_threaded_reply(&state.channel, &state.thread_ts, &reply)
+                .await;
+        }
+        state.status = AuditThreadStatus::Acted;
+        let _ = threads::write_state(&state_root, state);
+        return Ok(());
+    }
+
+    // --- Generic a43 spec-only path ---
+    let was_empty = changed.is_empty();
+    let has_spec = changed.iter().any(|p| p.starts_with("openspec/changes/"));
+
+    // Discard every non-spec write so the spec PR's diff is spec-only.
+    let discarded = discard_non_spec_writes(workspace, &new_slug)
+        .with_context(|| "audit-triage: discarding non-spec writes".to_string())?;
+    if !discarded.is_empty() {
+        tracing::warn!(
+            url = %repo.url,
+            audit_type = %state.audit_type,
+            slug = %new_slug,
+            dropped = ?discarded,
+            "audit-triage: discarded non-spec writes (a43 spec-only enforcement)"
+        );
+    }
+
+    if !has_spec {
+        // No spec content survived the discard. Distinguish "nothing was
+        // produced" (empty diff → Acted) from "only code, now dropped"
+        // (code-only → TriageFailed, retryable).
+        if let Some(ctx) = chatops_ctx {
+            let body = if was_empty {
+                match final_summary.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(summary) => format!(
+                        "ℹ️ Triage for `{at}` on `{ru}` completed with no actionable changes.\n\n{summary}",
+                        at = state.audit_type,
+                        ru = state.repo_url,
+                    ),
+                    None => format!(
+                        "ℹ️ Triage for `{at}` on `{ru}` completed with no actionable changes.",
+                        at = state.audit_type,
+                        ru = state.repo_url,
+                    ),
+                }
+            } else {
+                format!(
+                    "ℹ️ Triage for `{at}` on `{ru}` produced no spec content; retry with a clearer directive.",
+                    at = state.audit_type,
+                    ru = state.repo_url,
+                )
+            };
             if let Err(e) = ctx
                 .chatops
                 .post_threaded_reply(&state.channel, &state.thread_ts, &body)
@@ -6187,131 +6487,88 @@ async fn process_completed_triage(
             {
                 tracing::warn!(
                     thread_ts = %state.thread_ts,
-                    "audit-triage: empty-diff thread reply failed: {e:#}"
+                    "audit-triage: no-PR thread reply failed: {e:#}"
                 );
             }
         }
-        state.status = AuditThreadStatus::Acted;
+        state.status = if was_empty {
+            AuditThreadStatus::Acted
+        } else {
+            AuditThreadStatus::TriageFailed
+        };
         let _ = threads::write_state(&state_root, state);
         return Ok(());
     }
 
-    let agent_branch = &repo.agent_branch;
-    let base_branch = &repo.base_branch;
-    // Make sure we have base as the parent for both PR branches.
-    git::checkout(workspace, base_branch)
-        .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
-
-    let mut fixes_pr_url: Option<String> = None;
-    let mut spec_pr_url: Option<String> = None;
-    let push_remote = if github_cfg.fork_owner.is_some() {
-        "fork"
-    } else {
-        "origin"
-    };
-
-    if !fixes_paths.is_empty() {
-        let fixes_branch = format!("{agent_branch}-triage-fixes");
-        git::recreate_branch(workspace, &fixes_branch)
-            .with_context(|| format!("audit-triage: recreate `{fixes_branch}`"))?;
-        for p in &fixes_paths {
-            // best-effort add; deleted paths still need `git add`.
-            let _ = std::process::Command::new("git")
-                .args(["add", "--", p])
-                .current_dir(workspace)
-                .status();
-        }
-        let subject = format!("audit-triage fixes from {}", state.audit_type);
-        git::commit(workspace, &subject)
-            .with_context(|| "audit-triage: commit fixes branch".to_string())?;
-        if let Err(e) = git::push_force_with_lease(workspace, &fixes_branch, push_remote) {
-            return Err(anyhow!("audit-triage: pushing fixes branch failed: {e:#}"));
-        }
-        match open_triage_pull_request(
-            paths,
-            repo,
-            github_cfg,
-            &fixes_branch,
-            base_branch,
-            &format!("audit-triage fixes ({})", state.audit_type),
-            &format!(
-                "This PR carries the code fixes from the `{audit_type}` audit on `{repo_url}`.\n\nA companion spec PR (if any) will cross-link here.",
-                audit_type = state.audit_type,
-                repo_url = state.repo_url,
-            ),
-        )
-        .await
-        {
-            Ok(url) => fixes_pr_url = Some(url),
-            Err(e) => tracing::error!(
-                url = %repo.url,
-                "audit-triage: fixes PR creation failed: {e:#}"
-            ),
-        }
-    }
-
-    if !spec_paths.is_empty() {
-        // Reset to base for the second branch.
-        git::checkout(workspace, base_branch)
-            .with_context(|| "audit-triage: checkout base for spec branch".to_string())?;
-        let spec_branch = format!("{agent_branch}-triage-spec");
-        git::recreate_branch(workspace, &spec_branch)
-            .with_context(|| format!("audit-triage: recreate `{spec_branch}`"))?;
-        // Stage every spec path. The triage already wrote the files in
-        // the working tree (then `git reset --hard HEAD` would have
-        // wiped them; but we only reset AFTER the loop runs). The
-        // calling sequence is: run_triage → run process_completed_triage.
-        // The files are still on disk when we get here.
-        for p in &spec_paths {
-            let _ = std::process::Command::new("git")
-                .args(["add", "--", p])
-                .current_dir(workspace)
-                .status();
-        }
-        let subject = format!("audit-triage spec proposal from {}", state.audit_type);
-        git::commit(workspace, &subject)
-            .with_context(|| "audit-triage: commit spec branch".to_string())?;
-        if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
-            return Err(anyhow!("audit-triage: pushing spec branch failed: {e:#}"));
-        }
-        let cross_link = match &fixes_pr_url {
-            Some(u) => format!("This PR carries the new spec change(s) from the `{audit_type}` audit. See {u} for the companion fixes PR.", audit_type = state.audit_type),
-            None => format!("This PR carries the new spec change(s) from the `{audit_type}` audit on `{repo_url}`.", audit_type = state.audit_type, repo_url = state.repo_url),
-        };
-        match open_triage_pull_request(
-            paths,
-            repo,
-            github_cfg,
-            &spec_branch,
-            base_branch,
-            &format!("audit-triage spec ({})", state.audit_type),
-            &cross_link,
-        )
-        .await
-        {
-            Ok(url) => spec_pr_url = Some(url),
-            Err(e) => tracing::error!(
-                url = %repo.url,
-                "audit-triage: spec PR creation failed: {e:#}"
-            ),
-        }
-    }
-
-    // Best-effort: post a thread reply summarising which PRs landed.
-    if let Some(ctx) = chatops_ctx {
-        let mut body = format!(
-            "✓ Triage for `{}` complete.",
-            state.audit_type
+    // Spec content exists → open exactly one PR (the spec PR). If the
+    // agent also wrote code (now discarded), warn the operator so the
+    // dropped fixes can be captured as tasks.md items if load-bearing.
+    if !discarded.is_empty()
+        && let Some(ctx) = chatops_ctx
+    {
+        let body = format!(
+            "⚠️ The triage agent attempted to write {n} path(s) outside `openspec/changes/`: {list}. \
+            Per a43, code fixes go through the standard implementer pipeline. The spec PR has been opened; \
+            if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items.",
+            n = discarded.len(),
+            list = discarded.join(", "),
         );
-        if let Some(u) = &fixes_pr_url {
-            body.push_str(&format!("\nFixes PR: {u}"));
-        }
-        if let Some(u) = &spec_pr_url {
-            body.push_str(&format!("\nSpec PR: {u}"));
-        }
-        let _ = ctx
+        if let Err(e) = ctx
             .chatops
             .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await
+        {
+            tracing::warn!(
+                thread_ts = %state.thread_ts,
+                "audit-triage: dropped-paths thread reply failed: {e:#}"
+            );
+        }
+    }
+
+    git::checkout(workspace, base_branch)
+        .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
+    let spec_branch = format!("{agent_branch}-triage-spec");
+    git::recreate_branch(workspace, &spec_branch)
+        .with_context(|| format!("audit-triage: recreate `{spec_branch}`"))?;
+    git::add_all(workspace)
+        .with_context(|| "audit-triage: staging spec paths".to_string())?;
+    let subject = format!("audit-triage spec proposal from {}", state.audit_type);
+    git::commit(workspace, &subject)
+        .with_context(|| "audit-triage: commit spec branch".to_string())?;
+    if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
+        return Err(anyhow!("audit-triage: pushing spec branch failed: {e:#}"));
+    }
+    let body = format!(
+        "This PR carries the new spec change(s) from the `{at}` audit on `{ru}`. \
+        After merge, the next polling iteration's implementer will produce the code fixes through the standard pipeline.",
+        at = state.audit_type,
+        ru = state.repo_url,
+    );
+    let spec_pr_url = match open_triage_pull_request(
+        paths,
+        repo,
+        github_cfg,
+        &spec_branch,
+        base_branch,
+        &format!("audit-triage spec ({})", state.audit_type),
+        &body,
+    )
+    .await
+    {
+        Ok(url) => Some(url),
+        Err(e) => {
+            tracing::error!(url = %repo.url, "audit-triage: spec PR creation failed: {e:#}");
+            None
+        }
+    };
+
+    if let Some(ctx) = chatops_ctx
+        && let Some(u) = &spec_pr_url
+    {
+        let reply = format!("✓ Triage for `{}` complete.\nSpec PR: {u}", state.audit_type);
+        let _ = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &reply)
             .await;
     }
 
@@ -6406,17 +6663,198 @@ fn validate_brightline_triage_scope(
     }
 }
 
-/// Pull the path out of a `git status --porcelain` line. Lines look like
-/// `XY <path>`; for renames the format is `R  <from> -> <to>` and we
-/// keep the trailing target.
-fn extract_porcelain_path(line: &str) -> Option<&str> {
-    let trimmed = line.get(3..)?.trim_start();
-    let path = if let Some(idx) = trimmed.rfind(" -> ") {
-        trimmed[idx + 4..].trim()
+/// a43: discard every working-tree change OUTSIDE the OpenSpec change
+/// root (`openspec/changes/`), reverting each non-spec path to its
+/// committed (HEAD) state so the spec-PR commit is genuinely spec-only.
+/// Returns the sorted, de-duplicated list of discarded paths so the caller
+/// can log them AND surface them to chatops.
+///
+/// Revert strategy per non-spec path, chosen by where the path lives:
+///   - **Untracked addition** (`??`): removed from disk — it has no HEAD
+///     blob to restore.
+///   - **Tracked path present in HEAD** (a modification, deletion,
+///     type-change, OR the SOURCE side of a rename): reverted with `git
+///     checkout HEAD -- <path>`, which rewrites BOTH the index AND the
+///     worktree to the committed content — so a code edit the executor
+///     staged with `git add` cannot survive into the spec commit.
+///   - **Tracked path absent from HEAD** (a brand-new file the executor
+///     created AND `git add`ed — porcelain `A ` — OR the DESTINATION of a
+///     rename): unstaged with `git reset HEAD -- <path>` (which demotes it
+///     to untracked) AND then removed from disk. This case is handled
+///     WITHOUT `git checkout HEAD -- <path>` / `git restore --source=HEAD`
+///     on purpose: those reject a pathspec absent from HEAD with a
+///     "pathspec did not match any file(s) known to git" error on some git
+///     versions, which would abort the whole triage flow exactly when the
+///     executor `git add`ed a new code file — the common case.
+///
+/// Triage executor runs are spec-only under a43: any code-path write the
+/// agent made despite the prompt restriction is dropped here BEFORE the
+/// spec-PR commit so the PR diff is genuinely spec-only. Spec content is
+/// kept regardless of the executor's chosen slug — the keep boundary is
+/// the change root rather than a single `openspec/changes/<slug>/` path,
+/// because the executor picks its own (LLM-chosen) slug AND a single
+/// triage may produce several change directories. `spec_slug` is the
+/// handler's derived slug, threaded for diagnostic logging. A clean
+/// working tree (and a spec-only diff) both return an empty list with no
+/// side effects.
+pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<String>> {
+    const KEEP_PREFIX: &str = "openspec/changes/";
+    tracing::debug!(spec_slug = %spec_slug, "discard_non_spec_writes: keeping openspec/changes/ content");
+    let mut discarded: Vec<String> = Vec::new();
+    // `status_entries` yields one record per change with the rename/copy
+    // source in `orig_path`; flatten back to `(is_untracked, path)` pairs
+    // — destination first, then the source as a tracked (never untracked)
+    // change — so both sides of a staged rename are reverted relative to
+    // HEAD.
+    for (is_untracked, path) in git::status_entries(workspace)
+        .with_context(|| "discard_non_spec_writes: reading git status".to_string())?
+        .into_iter()
+        .flat_map(|e| {
+            let is_untracked = e.staged == '?' && e.worktree == '?';
+            std::iter::once((is_untracked, e.path)).chain(e.orig_path.map(|o| (false, o)))
+        })
+    {
+        if path.starts_with(KEEP_PREFIX) {
+            continue;
+        }
+        if is_untracked {
+            // Untracked addition: no HEAD blob to restore, so remove it
+            // from disk.
+            remove_non_spec_path_from_disk(workspace, &path, spec_slug)?;
+        } else if path_exists_in_head(workspace, &path)? {
+            // Tracked change to a path that EXISTS in HEAD (modification,
+            // deletion, type-change, OR a rename source). `git checkout
+            // HEAD -- <path>` rewrites BOTH the index AND the worktree to
+            // the committed content — so a code edit the executor staged
+            // with `git add` cannot survive into the spec commit.
+            run_git_revert(
+                workspace,
+                &["checkout", "-q", "HEAD", "--", path.as_str()],
+                &path,
+                spec_slug,
+            )?;
+        } else {
+            // Tracked change to a path ABSENT from HEAD: a brand-new file
+            // the executor `git add`ed (porcelain `A `) OR a rename
+            // destination. `git checkout HEAD -- <path>` / `git restore
+            // --source=HEAD` reject a not-in-HEAD pathspec on some git
+            // versions, so unstage it (`git reset HEAD -- <path>` demotes
+            // it to untracked) AND remove it from disk.
+            run_git_revert(
+                workspace,
+                &["reset", "-q", "HEAD", "--", path.as_str()],
+                &path,
+                spec_slug,
+            )?;
+            remove_non_spec_path_from_disk(workspace, &path, spec_slug)?;
+        }
+        discarded.push(path);
+    }
+    discarded.sort();
+    discarded.dedup();
+    Ok(discarded)
+}
+
+/// Remove a non-spec working-tree path from disk (symlink-safe), treating
+/// an already-absent path as success. Shared by the untracked-addition
+/// branch AND the not-in-HEAD tracked branch (a staged add OR rename
+/// destination that `git reset` has just demoted to untracked) of
+/// `discard_non_spec_writes`. Any failure other than "already gone" is
+/// fatal: a surviving file would be swept into the spec-only commit by the
+/// caller's subsequent `git add -A`, silently violating the spec-only
+/// invariant, so we fail loudly rather than let the write leak.
+fn remove_non_spec_path_from_disk(workspace: &Path, path: &str, spec_slug: &str) -> Result<()> {
+    let abs = workspace.join(path);
+    // Decide dir-vs-file from the path's OWN metadata (lstat), not
+    // `is_dir()` which follows symlinks: git reports an untracked symlink
+    // as a single entry, AND following it into `remove_dir_all` could
+    // delete the link TARGET's contents. `symlink_metadata` reports a
+    // symlink as a non-dir, so it is unlinked via `remove_file` (dropping
+    // just the link). A real untracked directory still routes to
+    // `remove_dir_all`.
+    let is_real_dir = abs
+        .symlink_metadata()
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let removal = if is_real_dir {
+        std::fs::remove_dir_all(&abs)
     } else {
-        trimmed.trim()
+        std::fs::remove_file(&abs)
     };
-    if path.is_empty() { None } else { Some(path) }
+    if let Err(e) = removal
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            spec_slug = %spec_slug,
+            path = %path,
+            "discard_non_spec_writes: failed to remove non-spec write: {e:#}"
+        );
+        return Err(anyhow!(
+            "discard_non_spec_writes: failed to remove non-spec write `{path}`: {e}; \
+             refusing to proceed so it does not leak into the spec-only PR"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `path` exists as a blob in HEAD — i.e. `git cat-file -e
+/// HEAD:<path>` succeeds. Picks the revert strategy for a tracked non-spec
+/// change in `discard_non_spec_writes`: a path IN HEAD is reverted with
+/// `git checkout HEAD -- <path>`; a path NOT in HEAD (a staged add OR a
+/// rename destination) is unstaged AND deleted instead. A failure to spawn
+/// git propagates; a clean non-zero exit (the blob is absent, with git's
+/// diagnostic captured rather than spilled to stderr) is reported as
+/// `false`.
+fn path_exists_in_head(workspace: &Path, path: &str) -> Result<bool> {
+    let out = std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("HEAD:{path}")])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| {
+            format!("discard_non_spec_writes: spawning git cat-file for `{path}`")
+        })?;
+    Ok(out.status.success())
+}
+
+/// Run a git working-tree revert subprocess (`checkout`/`reset`) for
+/// `discard_non_spec_writes`, capturing diagnostics via `output()` (rather
+/// than letting `status()` spill git's stderr to the daemon's inherited
+/// stderr) AND surfacing them in the error so a failed revert is
+/// debuggable (mirrors the `git::run_git` contract). A non-zero exit is
+/// fatal: we refuse to proceed so the non-spec write cannot leak into the
+/// spec-only PR.
+fn run_git_revert(workspace: &Path, args: &[&str], path: &str, spec_slug: &str) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .with_context(|| {
+            format!(
+                "discard_non_spec_writes: spawning `git {}` for `{path}`",
+                args.join(" ")
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let diag = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, _) => stderr,
+            (true, false) => stdout,
+            (true, true) => format!("(no output; exit {:?})", out.status.code()),
+        };
+        tracing::warn!(
+            spec_slug = %spec_slug,
+            path = %path,
+            "discard_non_spec_writes: `git {}` exited non-zero reverting non-spec write: {diag}",
+            args.join(" ")
+        );
+        return Err(anyhow!(
+            "discard_non_spec_writes: `git {}` exited non-zero ({diag}); \
+             refusing to proceed so the non-spec write does not leak into the spec-only PR",
+            args.join(" ")
+        ));
+    }
+    Ok(())
 }
 
 /// Read the workspace's `openspec/specs/` directory and produce a brief
@@ -6484,9 +6922,11 @@ async fn mark_triage_failed(
     }
 }
 
-/// Open one of the audit-triage PRs. Mirrors the shape of
-/// `polling_loop::open_pull_request` but is purpose-built for the two-PR
-/// triage flow (no reviewer step, no change-list body).
+/// Open the audit-triage / chat-triage spec PR. Mirrors the shape of
+/// `polling_loop::open_pull_request` but is purpose-built for the
+/// spec-only triage flow (no reviewer step, no change-list body). Routes
+/// through `create_pull_request_via_hook` so tests can assert against a
+/// mockito server.
 async fn open_triage_pull_request(
     _paths: &DaemonPaths,
     repo: &RepositoryConfig,
@@ -6504,7 +6944,7 @@ async fn open_triage_pull_request(
     } else {
         head_branch.to_string()
     };
-    let pr = github::create_pull_request(
+    let pr = create_pull_request_via_hook(
         &owner,
         &name,
         &head,
@@ -6525,9 +6965,9 @@ async fn open_triage_pull_request(
 /// the chat-triage executor, and routes the outcome through:
 ///   - QUESTION → post `.chat-reply.md` contents to the lifecycle
 ///     thread, set status to `Discussed`.
-///   - DIRECTIVE → split the diff and open one or two PRs (reusing the
-///     same helper that powers `audit-reply-acts`), set status to
-///     `Acted`.
+///   - DIRECTIVE → discard non-spec writes and open at most one spec PR
+///     (a43; reusing the same helper that powers `audit-reply-acts`),
+///     set status to `Acted`.
 ///   - AskUser → leave status at `TriagePending` (existing chatops
 ///     escalation posts the question into the lifecycle thread).
 ///   - Failed → post a failure reply, set status to `TriageFailed`.
@@ -6609,7 +7049,7 @@ pub async fn process_proposal_requests(
         );
         let outcome = executor.run_chat_triage(workspace, &ctx).await;
         match outcome {
-            Ok(crate::executor::ExecutorOutcome::Completed { .. }) => {
+            Ok(crate::executor::ExecutorOutcome::Completed { final_answer }) => {
                 if let Err(e) = process_completed_proposal(
                     paths,
                     workspace,
@@ -6617,6 +7057,7 @@ pub async fn process_proposal_requests(
                     github_cfg,
                     chatops_ctx,
                     &mut state,
+                    final_answer.as_deref(),
                 )
                 .await
                 {
@@ -6680,6 +7121,18 @@ pub async fn process_proposal_requests(
                 )
                 .await;
             }
+            Ok(crate::executor::ExecutorOutcome::Aborted { reason }) => {
+                // a39: subprocess killed by the daemon's own SIGTERM
+                // cascade. Leave state at TriagePending so the next
+                // iteration after restart retries; do NOT
+                // mark_proposal_failed (operator initiated the
+                // shutdown).
+                tracing::info!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor aborted by daemon shutdown: {reason}"
+                );
+            }
             Err(e) => {
                 tracing::error!(
                     url = %repo.url,
@@ -6712,9 +7165,10 @@ pub async fn process_proposal_requests(
 
 /// Handle a `Completed` chat-triage outcome. Checks for the
 /// `.chat-reply.md` marker FIRST; if present, posts the contents to the
-/// lifecycle thread and flips to `Discussed`. Otherwise runs the
-/// diff-split + two-PR creation, identical in shape to the audit-triage
-/// handler.
+/// lifecycle thread and flips to `Discussed`. Otherwise discards non-spec
+/// writes and opens AT MOST ONE PR — the spec PR (a43) — identical in
+/// shape to the audit-triage handler. `final_summary` carries the
+/// executor's final-answer text (used for the empty-diff reply).
 async fn process_completed_proposal(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -6722,6 +7176,7 @@ async fn process_completed_proposal(
     github_cfg: &GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut crate::proposal_requests::ProposalRequestState,
+    final_summary: Option<&str>,
 ) -> Result<()> {
     use crate::proposal_requests::{self, ProposalRequestStatus};
     let state_root = proposal_requests::default_state_root(paths);
@@ -6766,11 +7221,10 @@ async fn process_completed_proposal(
                 );
             }
             // Detect any OTHER modifications and WARN + revert.
-            let porcelain = git::status_porcelain(workspace)
-                .unwrap_or_default();
-            let unexpected: Vec<String> = porcelain
-                .lines()
-                .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+            let unexpected: Vec<String> = git::status_entries(workspace)
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
                 .filter(|p| !p.is_empty() && p != ".chat-reply.md")
                 .collect();
             if !unexpected.is_empty() {
@@ -6791,31 +7245,67 @@ async fn process_completed_proposal(
         let _ = std::fs::remove_file(&chat_reply_path);
     }
 
-    // 2. No `.chat-reply.md`. Proceed with the diff-split + two-PR
-    //    creation, mirroring `process_completed_triage` for audits.
-    let porcelain = git::status_porcelain(workspace)
-        .with_context(|| "chat-triage: reading post-Completed git status".to_string())?;
-    let changed: Vec<String> = porcelain
-        .lines()
-        .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
-        .filter(|p| !p.is_empty())
+    // 2. No `.chat-reply.md`. a43: produce a SPEC-ONLY PR. Code-path
+    //    writes are discarded before commit; implementation flows through
+    //    the standard implementer pipeline on a later iteration after the
+    //    operator merges the spec PR. Mirrors `process_completed_triage`.
+    let changed: Vec<String> = git::status_entries(workspace)
+        .with_context(|| "chat-triage: reading post-Completed git status".to_string())?
+        .into_iter()
+        .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
         .collect();
 
+    // Stable diagnostic label only; the spec/code boundary is the
+    // universal `openspec/changes/` root, NOT this slug (the executor
+    // picks its own change-directory name).
     let new_slug = derive_unique_chat_request_slug(workspace, &state.request_text);
-    let slug_prefix = format!("openspec/changes/{new_slug}/");
 
-    let (fixes_paths, spec_paths): (Vec<String>, Vec<String>) = changed
-        .into_iter()
-        .partition(|p| !p.starts_with(&slug_prefix));
+    let was_empty = changed.is_empty();
+    let has_spec = changed.iter().any(|p| p.starts_with("openspec/changes/"));
 
-    if fixes_paths.is_empty() && spec_paths.is_empty() {
-        // Empty diff AND no chat-reply.md: post a no-action reply and
-        // flip to Acted (the LLM decided there was nothing to do).
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    let agent_branch = &repo.agent_branch;
+    let base_branch = &repo.base_branch;
+
+    // Discard every non-spec write so the spec PR's diff is spec-only.
+    let discarded = discard_non_spec_writes(workspace, &new_slug)
+        .with_context(|| "chat-triage: discarding non-spec writes".to_string())?;
+    if !discarded.is_empty() {
+        tracing::warn!(
+            url = %repo.url,
+            request_id = %state.request_id,
+            slug = %new_slug,
+            dropped = ?discarded,
+            "chat-triage: discarded non-spec writes (a43 spec-only enforcement)"
+        );
+    }
+
+    if !has_spec {
+        // No spec content survived the discard. Distinguish "nothing was
+        // produced" (empty diff → Acted) from "only code, now dropped"
+        // (code-only → TriageFailed, retryable).
         if let Some(ctx) = chatops_ctx {
-            let body = format!(
-                "ℹ️ Chat-triage for `{repo_url}` completed with no actionable changes.",
-                repo_url = state.repo_url,
-            );
+            let body = if was_empty {
+                match final_summary.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(summary) => format!(
+                        "ℹ️ Chat-triage for `{ru}` completed with no actionable changes.\n\n{summary}",
+                        ru = state.repo_url,
+                    ),
+                    None => format!(
+                        "ℹ️ Chat-triage for `{ru}` completed with no actionable changes.",
+                        ru = state.repo_url,
+                    ),
+                }
+            } else {
+                format!(
+                    "ℹ️ Chat-triage for `{ru}` produced no spec content; retry with a clearer directive.",
+                    ru = state.repo_url,
+                )
+            };
             if let Err(e) = ctx
                 .chatops
                 .post_threaded_reply(&state.channel, &state.thread_ts, &body)
@@ -6823,129 +7313,88 @@ async fn process_completed_proposal(
             {
                 tracing::warn!(
                     request_id = %state.request_id,
-                    "chat-triage: empty-diff thread reply failed: {e:#}"
+                    "chat-triage: no-PR thread reply failed: {e:#}"
                 );
             }
         }
-        state.status = ProposalRequestStatus::Acted;
+        state.status = if was_empty {
+            ProposalRequestStatus::Acted
+        } else {
+            ProposalRequestStatus::TriageFailed
+        };
         let _ = proposal_requests::write_state(&state_root, state);
         return Ok(());
     }
 
-    let agent_branch = &repo.agent_branch;
-    let base_branch = &repo.base_branch;
-    git::checkout(workspace, base_branch)
-        .with_context(|| format!("chat-triage: checkout base branch `{base_branch}`"))?;
-
-    let mut fixes_pr_url: Option<String> = None;
-    let mut spec_pr_url: Option<String> = None;
-    let push_remote = if github_cfg.fork_owner.is_some() {
-        "fork"
-    } else {
-        "origin"
-    };
-
-    if !fixes_paths.is_empty() {
-        let fixes_branch = format!("{agent_branch}-chat-fixes");
-        git::recreate_branch(workspace, &fixes_branch)
-            .with_context(|| format!("chat-triage: recreate `{fixes_branch}`"))?;
-        for p in &fixes_paths {
-            let _ = std::process::Command::new("git")
-                .args(["add", "--", p])
-                .current_dir(workspace)
-                .status();
-        }
-        let subject = format!("chat-triage fixes (request {})", state.request_id);
-        git::commit(workspace, &subject)
-            .with_context(|| "chat-triage: commit fixes branch".to_string())?;
-        if let Err(e) = git::push_force_with_lease(workspace, &fixes_branch, push_remote) {
-            return Err(anyhow!("chat-triage: pushing fixes branch failed: {e:#}"));
-        }
-        match open_triage_pull_request(
-            paths,
-            repo,
-            github_cfg,
-            &fixes_branch,
-            base_branch,
-            &format!("chat-triage fixes ({})", short_request_excerpt(&state.request_text)),
-            &format!(
-                "This PR carries the code fixes for chat-driven request `{request_id}` against `{repo_url}`.\n\nOperator's request:\n\n> {request_excerpt}\n\nA companion spec PR (if any) will cross-link here.",
-                request_id = state.request_id,
-                repo_url = state.repo_url,
-                request_excerpt = short_request_excerpt(&state.request_text),
-            ),
-        )
-        .await
-        {
-            Ok(url) => fixes_pr_url = Some(url),
-            Err(e) => tracing::error!(
-                url = %repo.url,
-                "chat-triage: fixes PR creation failed: {e:#}"
-            ),
-        }
-    }
-
-    if !spec_paths.is_empty() {
-        git::checkout(workspace, base_branch)
-            .with_context(|| "chat-triage: checkout base for spec branch".to_string())?;
-        let spec_branch = format!("{agent_branch}-chat-spec");
-        git::recreate_branch(workspace, &spec_branch)
-            .with_context(|| format!("chat-triage: recreate `{spec_branch}`"))?;
-        for p in &spec_paths {
-            let _ = std::process::Command::new("git")
-                .args(["add", "--", p])
-                .current_dir(workspace)
-                .status();
-        }
-        let subject = format!("chat-triage spec proposal (request {})", state.request_id);
-        git::commit(workspace, &subject)
-            .with_context(|| "chat-triage: commit spec branch".to_string())?;
-        if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
-            return Err(anyhow!("chat-triage: pushing spec branch failed: {e:#}"));
-        }
-        let cross_link = match &fixes_pr_url {
-            Some(u) => format!(
-                "This PR carries the new spec change(s) for chat-driven request `{request_id}`. See {u} for the companion fixes PR.",
-                request_id = state.request_id,
-            ),
-            None => format!(
-                "This PR carries the new spec change(s) for chat-driven request `{request_id}` against `{repo_url}`.\n\nOperator's request:\n\n> {request_excerpt}",
-                request_id = state.request_id,
-                repo_url = state.repo_url,
-                request_excerpt = short_request_excerpt(&state.request_text),
-            ),
-        };
-        match open_triage_pull_request(
-            paths,
-            repo,
-            github_cfg,
-            &spec_branch,
-            base_branch,
-            &format!("chat-triage spec ({})", short_request_excerpt(&state.request_text)),
-            &cross_link,
-        )
-        .await
-        {
-            Ok(url) => spec_pr_url = Some(url),
-            Err(e) => tracing::error!(
-                url = %repo.url,
-                "chat-triage: spec PR creation failed: {e:#}"
-            ),
-        }
-    }
-
-    // Best-effort: post a thread reply summarising which PRs landed.
-    if let Some(ctx) = chatops_ctx {
-        let mut body = "✓ Chat-triage complete.".to_string();
-        if let Some(u) = &fixes_pr_url {
-            body.push_str(&format!("\nFixes PR: {u}"));
-        }
-        if let Some(u) = &spec_pr_url {
-            body.push_str(&format!("\nSpec PR: {u}"));
-        }
-        let _ = ctx
+    // Spec content exists → open exactly one PR (the spec PR). If the
+    // agent also wrote code (now discarded), warn the operator so the
+    // dropped fixes can be captured as tasks.md items if load-bearing.
+    if !discarded.is_empty()
+        && let Some(ctx) = chatops_ctx
+    {
+        let body = format!(
+            "⚠️ The triage agent attempted to write {n} path(s) outside `openspec/changes/`: {list}. \
+            Per a43, code fixes go through the standard implementer pipeline. The spec PR has been opened; \
+            if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items.",
+            n = discarded.len(),
+            list = discarded.join(", "),
+        );
+        if let Err(e) = ctx
             .chatops
             .post_threaded_reply(&state.channel, &state.thread_ts, &body)
+            .await
+        {
+            tracing::warn!(
+                request_id = %state.request_id,
+                "chat-triage: dropped-paths thread reply failed: {e:#}"
+            );
+        }
+    }
+
+    git::checkout(workspace, base_branch)
+        .with_context(|| format!("chat-triage: checkout base branch `{base_branch}`"))?;
+    let spec_branch = format!("{agent_branch}-chat-spec");
+    git::recreate_branch(workspace, &spec_branch)
+        .with_context(|| format!("chat-triage: recreate `{spec_branch}`"))?;
+    git::add_all(workspace)
+        .with_context(|| "chat-triage: staging spec paths".to_string())?;
+    let subject = format!("chat-triage spec proposal (request {})", state.request_id);
+    git::commit(workspace, &subject)
+        .with_context(|| "chat-triage: commit spec branch".to_string())?;
+    if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
+        return Err(anyhow!("chat-triage: pushing spec branch failed: {e:#}"));
+    }
+    let body = format!(
+        "This PR carries the new spec change(s) from the `propose` request on `{repo_url}`. \
+        After merge, the next polling iteration's implementer will produce the code fixes through the standard pipeline.\n\nOperator's request:\n\n> {request_excerpt}",
+        repo_url = state.repo_url,
+        request_excerpt = short_request_excerpt(&state.request_text),
+    );
+    let spec_pr_url = match open_triage_pull_request(
+        paths,
+        repo,
+        github_cfg,
+        &spec_branch,
+        base_branch,
+        &format!("chat-triage spec ({})", short_request_excerpt(&state.request_text)),
+        &body,
+    )
+    .await
+    {
+        Ok(url) => Some(url),
+        Err(e) => {
+            tracing::error!(url = %repo.url, "chat-triage: spec PR creation failed: {e:#}");
+            None
+        }
+    };
+
+    if let Some(ctx) = chatops_ctx
+        && let Some(u) = &spec_pr_url
+    {
+        let reply = format!("✓ Chat-triage complete.\nSpec PR: {u}");
+        let _ = ctx
+            .chatops
+            .post_threaded_reply(&state.channel, &state.thread_ts, &reply)
             .await;
     }
 
@@ -7097,6 +7546,769 @@ mod tests {
         .is_ok());
     }
 
+    // ================================================================
+    // a43: `discard_non_spec_writes` helper unit tests
+    // ================================================================
+
+    /// Init a throwaway git repo with a committed `src/bar.rs`, `README.md`
+    /// at base. Returns the temp-dir guard (drop = cleanup) and workspace.
+    fn dnsw_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/bar.rs"), "orig\n").unwrap();
+        std::fs::write(ws.join("README.md"), "hi\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        (dir, ws)
+    }
+
+    #[test]
+    fn discard_non_spec_writes_spec_only_returns_empty() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(ws.join("openspec/changes/foo/proposal.md"), "## Why\nx\n").unwrap();
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert!(dropped.is_empty(), "spec-only diff drops nothing: {dropped:?}");
+        assert!(
+            ws.join("openspec/changes/foo/proposal.md").exists(),
+            "spec file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn discard_non_spec_writes_code_only_restores_and_removes() {
+        let (_d, ws) = dnsw_repo();
+        // Modify a tracked file AND add an untracked code file.
+        std::fs::write(ws.join("src/bar.rs"), "MUTATED\n").unwrap();
+        std::fs::write(ws.join("newcode.rs"), "junk\n").unwrap();
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(
+            dropped,
+            vec!["newcode.rs".to_string(), "src/bar.rs".to_string()]
+        );
+        // Tracked modification reverted; untracked addition removed.
+        assert_eq!(std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(), "orig\n");
+        assert!(!ws.join("newcode.rs").exists());
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "working tree must be clean after discarding all code writes"
+        );
+    }
+
+    #[test]
+    fn discard_non_spec_writes_mixed_keeps_spec_drops_code() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(ws.join("openspec/changes/foo/proposal.md"), "## Why\nx\n").unwrap();
+        std::fs::write(ws.join("src/bar.rs"), "MUTATED\n").unwrap();
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(dropped, vec!["src/bar.rs".to_string()]);
+        assert!(
+            ws.join("openspec/changes/foo/proposal.md").exists(),
+            "spec file must survive a mixed diff"
+        );
+        assert_eq!(std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(), "orig\n");
+    }
+
+    #[test]
+    fn discard_non_spec_writes_untracked_and_modified_mix() {
+        let (_d, ws) = dnsw_repo();
+        // Untracked spec file (kept) + modified tracked code (restored) +
+        // untracked nested code file (removed).
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(ws.join("openspec/changes/foo/tasks.md"), "- [ ] x\n").unwrap();
+        std::fs::write(ws.join("src/bar.rs"), "MUTATED\n").unwrap();
+        std::fs::create_dir_all(ws.join("src/sub")).unwrap();
+        std::fs::write(ws.join("src/sub/new.rs"), "n\n").unwrap();
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(
+            dropped,
+            vec!["src/bar.rs".to_string(), "src/sub/new.rs".to_string()]
+        );
+        assert!(ws.join("openspec/changes/foo/tasks.md").exists());
+        assert_eq!(std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(), "orig\n");
+        assert!(!ws.join("src/sub/new.rs").exists());
+    }
+
+    #[test]
+    fn discard_non_spec_writes_clean_tree_noop() {
+        let (_d, ws) = dnsw_repo();
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert!(dropped.is_empty());
+        assert_eq!(crate::git::status_porcelain(&ws).unwrap(), "");
+    }
+
+    /// a43 revision: a code edit the executor *staged* with `git add`
+    /// must be fully reverted — index AND worktree. A plain
+    /// `git restore -- <path>` only rewrites the worktree from the index,
+    /// so the staged modification would survive in the index and leak
+    /// into the supposedly spec-only commit. Because the path exists in
+    /// HEAD, the handler reverts it with `git checkout HEAD -- <path>`,
+    /// which unstages AND reverts regardless of the staged state.
+    #[test]
+    fn discard_non_spec_writes_reverts_staged_code_modification() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::write(ws.join("src/bar.rs"), "STAGED MUTATION\n").unwrap();
+        // Stage the code edit the way an LLM bash tool might.
+        let st = std::process::Command::new("git")
+            .args(["add", "src/bar.rs"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "staging src/bar.rs failed");
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(dropped, vec!["src/bar.rs".to_string()]);
+        // Worktree reverted to the committed base content...
+        assert_eq!(std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(), "orig\n");
+        // ...AND nothing staged survives: the index is clean, so the
+        // caller's `git add -A` + commit cannot sweep the code edit into
+        // the spec-only PR.
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged code modification must be fully unstaged and reverted"
+        );
+    }
+
+    /// a43 revision: a brand-new code file the executor created AND staged
+    /// with `git add` (porcelain `A `, NOT present in HEAD) must be cleanly
+    /// discarded — unstaged AND removed from disk — NOT aborted with a
+    /// pathspec error. `git checkout HEAD -- <path>` / `git restore
+    /// --source=HEAD` reject a path absent from HEAD on some git versions;
+    /// the handler routes not-in-HEAD tracked paths through `git reset` +
+    /// disk removal so the common "LLM `git add`ed a new file" case does
+    /// not crash the triage flow.
+    #[test]
+    fn discard_non_spec_writes_discards_staged_new_file() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::write(ws.join("newcode.rs"), "junk\n").unwrap();
+        // Stage the brand-new file the way an LLM bash tool might.
+        let st = std::process::Command::new("git")
+            .args(["add", "newcode.rs"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "staging newcode.rs failed");
+        // Sanity: it is a STAGED ADD (`A `), not untracked (`??`) — so it
+        // takes the tracked, not-in-HEAD branch, the one the old `git
+        // restore --source=HEAD` would have choked on.
+        let porc = crate::git::status_porcelain(&ws).unwrap();
+        assert!(
+            porc.starts_with("A "),
+            "expected a staged addition (A ), got {porc:?}"
+        );
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        assert_eq!(dropped, vec!["newcode.rs".to_string()]);
+        assert!(
+            !ws.join("newcode.rs").exists(),
+            "the staged new file must be removed from disk"
+        );
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged new file must be fully unstaged AND removed — nothing \
+             left for the caller's `git add -A` to sweep into the spec PR"
+        );
+    }
+
+    /// a43 revision: when an untracked non-spec write cannot be removed
+    /// (here: a write-protected parent directory blocks the unlink), the
+    /// helper must fail loudly rather than silently leave the file for
+    /// the caller's `git add -A` to sweep into the spec-only PR.
+    #[test]
+    fn discard_non_spec_writes_errors_when_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, ws) = dnsw_repo();
+        // An untracked code file inside a directory we then strip write
+        // permission from (`r-xr-xr-x`) so `remove_file` fails with
+        // PermissionDenied — the unlink needs write permission on the
+        // parent directory, not on the file itself.
+        let locked = ws.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("leak.rs"), "junk\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = discard_non_spec_writes(&ws, "foo");
+
+        // Restore write permission so the TempDir guard can clean up,
+        // regardless of the assertion outcome below.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        assert!(
+            result.is_err(),
+            "a removal failure must surface as an error, not a silent leak"
+        );
+        assert!(
+            ws.join("locked/leak.rs").exists(),
+            "the un-removable file must still be on disk — the error has to \
+             prevent the spec commit rather than the file being quietly gone"
+        );
+    }
+
+    /// a43 revision: paths git would quote under the default
+    /// `core.quotePath` (a space AND non-ASCII bytes both trigger it) must
+    /// still be parsed AND acted on correctly. `git::status_entries`
+    /// uses `-z`, which disables quoting; the pre-fix default-format parse
+    /// would yield the literal `"f\303\266\303\266.rs"`, so `remove_file`
+    /// would NotFound-no-op AND the real file would survive into the
+    /// spec-only commit. A quoted SPEC path must likewise keep its
+    /// `openspec/changes/` prefix so it is NOT misclassified as non-spec.
+    #[test]
+    fn discard_non_spec_writes_handles_quoted_special_char_paths() {
+        let (_d, ws) = dnsw_repo();
+        // Untracked code files whose names force quoting: a space AND
+        // non-ASCII. Both must be dropped.
+        std::fs::write(ws.join("a b.rs"), "junk\n").unwrap();
+        std::fs::write(ws.join("föö.rs"), "junk\n").unwrap();
+        // A spec file with a quote-forcing name must be KEPT.
+        std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
+        std::fs::write(ws.join("openspec/changes/foo/néw.md"), "## Why\nx\n").unwrap();
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        // Sorted: "a b.rs" (0x61) precedes "föö.rs" (0x66).
+        assert_eq!(
+            dropped,
+            vec!["a b.rs".to_string(), "föö.rs".to_string()],
+            "both quote-forcing untracked code paths must be parsed AND dropped"
+        );
+        assert!(!ws.join("a b.rs").exists(), "the spaced path must be removed");
+        assert!(!ws.join("föö.rs").exists(), "the non-ASCII path must be removed");
+        assert!(
+            ws.join("openspec/changes/foo/néw.md").exists(),
+            "a quote-forcing spec path must be kept, not discarded"
+        );
+    }
+
+    /// a43 revision: a STAGED rename of a tracked code file must be fully
+    /// undone. Under `-z` the rename record is `dest\0source\0`, so the
+    /// parser MUST consume both fields (else the source path leaks back as
+    /// a bogus untracked entry AND the rename half-survives). Both sides
+    /// revert to the committed state.
+    #[test]
+    fn discard_non_spec_writes_reverts_staged_rename() {
+        let (_d, ws) = dnsw_repo();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        // Stage a rename the way an LLM bash tool might.
+        run(&["mv", "src/bar.rs", "src/renamed.rs"]);
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+        assert_eq!(
+            dropped,
+            vec!["src/bar.rs".to_string(), "src/renamed.rs".to_string()],
+            "both the rename destination AND source must be reported AND reverted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(),
+            "orig\n",
+            "the rename source must be restored to its committed content"
+        );
+        assert!(
+            !ws.join("src/renamed.rs").exists(),
+            "the rename destination must be removed"
+        );
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged rename must be fully undone — index AND worktree"
+        );
+    }
+
+    /// a43 revision: an untracked SYMLINK must be unlinked (dropping just
+    /// the link), NOT followed. `is_dir()` follows the link, so a
+    /// symlink-to-directory would route into `remove_dir_all` and could
+    /// wipe the TARGET's contents; `symlink_metadata` routes it to
+    /// `remove_file` instead. The link target must be left intact.
+    #[test]
+    fn discard_non_spec_writes_unlinks_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+        let (_d, ws) = dnsw_repo();
+        // A directory OUTSIDE the repo (its own temp dir, so git status
+        // never sees it) holding a file we must not touch.
+        let target_guard = tempfile::TempDir::new().unwrap();
+        let target = target_guard.path().join("outside-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("precious.txt"), "do not delete\n").unwrap();
+        // An untracked symlink inside the repo pointing at that directory.
+        symlink(&target, ws.join("linkdir")).unwrap();
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        assert_eq!(dropped, vec!["linkdir".to_string()]);
+        assert!(
+            !ws.join("linkdir").exists(),
+            "the untracked symlink must be removed"
+        );
+        assert!(
+            target.join("precious.txt").exists(),
+            "the symlink target's contents must NOT be followed and deleted"
+        );
+    }
+
+    // ================================================================
+    // a43: triage completion-handler tests (spec-only PR shape)
+    // ================================================================
+
+    /// ChatOps backend that records every threaded reply for assertion.
+    struct RecordingChatOps {
+        replies: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatOpsBackend for RecordingChatOps {
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            unreachable!("triage handlers never post_question")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            Ok(None)
+        }
+        async fn post_notification(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn post_threaded_reply(&self, _: &str, _: &str, text: &str) -> Result<()> {
+            self.replies.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    fn recording_ctx(chatops: &Arc<RecordingChatOps>) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    fn triage_github_cfg() -> GithubConfig {
+        GithubConfig {
+            token_env: "X".into(),
+            token: Some(crate::config::SecretSource::Inline {
+                value: "inline-test-token".into(),
+            }),
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        }
+    }
+
+    fn audit_state() -> crate::audits::threads::AuditThreadState {
+        crate::audits::threads::AuditThreadState {
+            thread_ts: "T-audit".into(),
+            channel: "C_TEST".into(),
+            repo_url: "git@github.com:owner/fixture.git".into(),
+            audit_type: "security_bug".into(),
+            findings_excerpt: "FINDINGS".into(),
+            posted_at: chrono::Utc::now(),
+            status: crate::audits::threads::AuditThreadStatus::TriagePending,
+            reason: None,
+        }
+    }
+
+    fn proposal_state() -> crate::proposal_requests::ProposalRequestState {
+        crate::proposal_requests::ProposalRequestState {
+            request_id: "req-1".into(),
+            repo_url: "git@github.com:owner/fixture.git".into(),
+            channel: "C_TEST".into(),
+            thread_ts: "T-chat".into(),
+            ack_message_ts: "T-chat".into(),
+            operator_user: "U_OP".into(),
+            request_text: "add a /healthz endpoint".into(),
+            submitted_at: chrono::Utc::now(),
+            status: crate::proposal_requests::ProposalRequestStatus::TriagePending,
+            reason: None,
+        }
+    }
+
+    /// Write a fake spec change dir (mimics the executor's openspec write).
+    fn write_fake_spec(ws: &Path, slug: &str) {
+        let dir = ws.join("openspec/changes").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), "## Why\nfixture\n## What Changes\n- x\n## Impact\n- y\n").unwrap();
+        std::fs::write(dir.join("tasks.md"), "- [ ] do the thing\n").unwrap();
+    }
+
+    /// 7.1: audit-triage mixed diff → one spec PR, code discarded, chatops
+    /// warning posted, spec branch diff is spec-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_audit_mixed_diff_opens_one_spec_pr_and_warns() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        // Executor's writes: a spec dir + an out-of-scope code file.
+        write_fake_spec(&ws, "audit-fix-x");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/7","number":7}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = audit_state();
+        let res = process_completed_triage(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::audits::threads::AuditThreadStatus::Acted);
+        // Code path discarded from the working tree.
+        assert!(!ws.join("src/foo.rs").exists(), "code write must be discarded");
+        // Spec branch carries ONLY openspec/changes/ paths.
+        let files = crate::git::diff_files_changed(&ws, "main", "agent-q-triage-spec").unwrap();
+        assert!(!files.is_empty(), "spec branch must carry a diff");
+        assert!(
+            files.iter().all(|f| f.starts_with("openspec/changes/")),
+            "spec PR diff must be spec-only, got {files:?}"
+        );
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(
+            replies.iter().any(|r| r.contains("src/foo.rs") && r.contains("outside")),
+            "a dropped-paths warning naming src/foo.rs must be posted, got {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("Spec PR:")),
+            "the spec PR URL must be surfaced, got {replies:?}"
+        );
+    }
+
+    /// 7.2: chat-triage mixed diff → same shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_chat_mixed_diff_opens_one_spec_pr_and_warns() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        write_fake_spec(&ws, "chat-request-y");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/8","number":8}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = proposal_state();
+        let res = process_completed_proposal(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::proposal_requests::ProposalRequestStatus::Acted);
+        assert!(!ws.join("src/foo.rs").exists(), "code write must be discarded");
+        let files = crate::git::diff_files_changed(&ws, "main", "agent-q-chat-spec").unwrap();
+        assert!(
+            !files.is_empty() && files.iter().all(|f| f.starts_with("openspec/changes/")),
+            "spec PR diff must be spec-only, got {files:?}"
+        );
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(
+            replies.iter().any(|r| r.contains("src/foo.rs") && r.contains("outside")),
+            "dropped-paths warning expected, got {replies:?}"
+        );
+    }
+
+    /// 7.3: spec-only outcome → one PR, NO dropped-paths warning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_audit_spec_only_opens_pr_without_warning() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        write_fake_spec(&ws, "audit-fix-z");
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/9","number":9}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = audit_state();
+        let res = process_completed_triage(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::audits::threads::AuditThreadStatus::Acted);
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(
+            !replies.iter().any(|r| r.contains("outside")),
+            "no dropped-paths warning when the agent followed the restriction, got {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("Spec PR:")),
+            "spec PR URL must be surfaced, got {replies:?}"
+        );
+    }
+
+    /// 7.3 (chat): spec-only outcome → one PR, no warning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_chat_spec_only_opens_pr_without_warning() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        write_fake_spec(&ws, "chat-request-z");
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/10","number":10}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = proposal_state();
+        let res = process_completed_proposal(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::proposal_requests::ProposalRequestStatus::Acted);
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(!replies.iter().any(|r| r.contains("outside")), "no warning expected");
+    }
+
+    /// 7.4: code-only outcome → NO PR, "no spec content" reply, tree clean,
+    /// status TriageFailed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_audit_code_only_opens_no_pr() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .expect(0)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = audit_state();
+        let res = process_completed_triage(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await; // expect(0): no PR opened
+        assert_eq!(
+            state.status,
+            crate::audits::threads::AuditThreadStatus::TriageFailed
+        );
+        assert!(!ws.join("src/foo.rs").exists(), "code write must be restored away");
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "working tree must be clean after the handler returns"
+        );
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(
+            replies.iter().any(|r| r.contains("no spec content")),
+            "the no-spec-content reply must be posted, got {replies:?}"
+        );
+    }
+
+    /// 7.4 (chat): code-only → NO PR, TriageFailed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_chat_code_only_opens_no_pr() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .expect(0)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = proposal_state();
+        let res = process_completed_proposal(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(
+            state.status,
+            crate::proposal_requests::ProposalRequestStatus::TriageFailed
+        );
+        assert_eq!(crate::git::status_porcelain(&ws).unwrap(), "", "tree must be clean");
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(replies.iter().any(|r| r.contains("no spec content")), "no-spec reply expected");
+    }
+
+    /// Empty-diff audit outcome → no PR, no-action reply carries the
+    /// executor's final summary, status Acted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_audit_empty_diff_posts_no_action_reply() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .expect(0)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = audit_state();
+        let res = process_completed_triage(
+            &paths,
+            &ws,
+            &fixture_repo(&ws),
+            &triage_github_cfg(),
+            Some(&ctx),
+            &mut state,
+            Some("Nothing actionable in these findings."),
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::audits::threads::AuditThreadStatus::Acted);
+        let replies = chatops.replies.lock().unwrap().clone();
+        assert!(
+            replies.iter().any(|r| r.contains("no actionable changes")
+                && r.contains("Nothing actionable in these findings.")),
+            "no-action reply must carry the executor's summary, got {replies:?}"
+        );
+    }
+
+    /// Brightline "Mark as intentional" carve-out: a brightline triage whose
+    /// only write is `.brightline-ignore` ships it directly in one PR (NOT
+    /// discarded as a non-spec write), since it has no implementer-pipeline
+    /// equivalent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a43_brightline_intentional_ships_ignore_file_in_one_pr() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        std::fs::write(
+            ws.join(".brightline-ignore"),
+            "ignore:\n  - file: a.ts\n    function: f\n    signature_match: \"f(\"\n    reason: intentional\n",
+        )
+        .unwrap();
+
+        let _hook = test_hooks::lock();
+        let mut server = mockito::Server::new_async().await;
+        let pr_mock = server
+            .mock("POST", "/repos/owner/fixture/pulls")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/11","number":11}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        test_hooks::set_github_api_base(Some(server.url()));
+
+        let chatops = Arc::new(RecordingChatOps { replies: std::sync::Mutex::new(Vec::new()) });
+        let ctx = recording_ctx(&chatops);
+        let mut state = audit_state();
+        state.audit_type = "architecture_brightline".into();
+        let res = process_completed_triage(
+            &paths, &ws, &fixture_repo(&ws), &triage_github_cfg(), Some(&ctx), &mut state, None,
+        )
+        .await;
+        test_hooks::set_github_api_base(None);
+        res.expect("handler must succeed");
+
+        pr_mock.assert_async().await;
+        assert_eq!(state.status, crate::audits::threads::AuditThreadStatus::Acted);
+        let files = crate::git::diff_files_changed(&ws, "main", "agent-q-triage-spec").unwrap();
+        assert!(
+            files.iter().any(|f| f == ".brightline-ignore"),
+            "the .brightline-ignore write must ship (not be discarded), got {files:?}"
+        );
+    }
+
     /// Routing test: when `owner_tokens` maps the parsed URL owner to an
     /// env var, the PR-creation HTTP call MUST carry that env var's value
     /// in the `Authorization: Bearer` header — not `token_env`'s value.
@@ -7136,6 +8348,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // Mirror open_pull_request's internal sequence.
@@ -7195,6 +8408,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (owner, repo_name) =
             crate::github::parse_repo_url("git@github.com:upstream-org/repo.git").unwrap();
@@ -7616,6 +8830,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // Use a very high threshold so existing tests' single-fail
         // iterations don't accidentally mark perma-stuck.
@@ -7898,6 +9113,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8003,6 +9219,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8121,6 +9338,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8260,6 +9478,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8377,6 +9596,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8513,6 +9733,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -8635,6 +9856,7 @@ mod tests {
                 owner_tokens: None,
                 fork_owner: None,
                 recreate_fork_on_reinit: false,
+                command_authorization: Default::default(),
             };
             let (processed, _) = run_pass_through_commits(
                 &paths,
@@ -8670,6 +9892,7 @@ mod tests {
                         markdown: format!("(reviewer failed: {e})"),
                         concerns: Vec::new(),
                         per_change_sections: Vec::new(),
+                        attribution: None,
                     }),
                     false,
                 ),
@@ -8846,6 +10069,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -8869,6 +10093,7 @@ mod tests {
                 u32::MAX,
                 Some(u32::MAX),
                 0, // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -9067,6 +10292,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let cancel = CancellationToken::new();
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);
@@ -9096,6 +10322,7 @@ mod tests {
                 u32::MAX,
                 Some(u32::MAX),
                 0, // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -9226,6 +10453,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }
     }
 
@@ -9383,6 +10611,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9437,6 +10666,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -9535,6 +10765,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // Iteration 1: pass through commits succeeds, push fails → alert
@@ -9550,6 +10781,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -9635,6 +10867,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let stuck_secs = 2400u64;
 
@@ -9649,6 +10882,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -9740,6 +10974,35 @@ mod tests {
         assert!(!out.contains("STDERR_LOG_NOISE"));
         assert!(!out.contains("=== PROMPT"));
         assert!(!out.contains("=== STDERR"));
+    }
+
+    /// a49 task 3.4: the executor's `## Agent implementation notes` section
+    /// is OUT of scope for model attribution — the executor wraps the
+    /// Claude CLI and has no daemon-known `(provider, model)` in this
+    /// change. The composed notes must carry NO attribution line.
+    #[test]
+    fn build_implementer_summary_has_no_attribution_line() {
+        let dir = unique_workspace("no-attribution");
+        let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_fixture_run_log(
+            &paths,
+            ws,
+            "alpha",
+            "PROMPT",
+            "implementer narrative output",
+            "",
+        );
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
+        assert!(out.contains("## Agent implementation notes"));
+        // No reviewer/auditor/contradiction-check attribution, and no
+        // generic italic `*<Role>: <provider>/<model>*` line.
+        assert!(!out.contains("*Reviewer:"), "no reviewer attribution: {out}");
+        assert!(!out.contains("*Auditor"), "no auditor attribution: {out}");
+        assert!(
+            !out.contains("*Contradiction-check:"),
+            "no contradiction-check attribution: {out}"
+        );
     }
 
     #[test]
@@ -9879,7 +11142,7 @@ mod tests {
     fn truncate_to_fit_appends_marker_when_exceeded() {
         let body = "x".repeat(100_000);
         let out = truncate_to_fit(body, 60_000);
-        let marker = "_[implementer summary truncated to fit GitHub comment limit;";
+        let marker = "_[summary truncated to fit GitHub comment limit;";
         assert!(out.ends_with("/<change>.log]_"));
         assert!(out.contains(marker), "missing truncation marker");
         // Total length is bounded by max + marker length.
@@ -9999,6 +11262,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             paths,
@@ -10183,6 +11447,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
 
@@ -10276,6 +11541,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
 
@@ -10373,6 +11639,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor; // unused: no pending changes after re-clone
 
@@ -10449,6 +11716,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -10520,6 +11788,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let executor = AlwaysFailingExecutor;
         let _ = run_pass_through_commits(
@@ -10627,6 +11896,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -11230,6 +12500,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -11324,6 +12595,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::ok(r#"{"contradictions": []}"#),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: None,
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -11384,6 +12656,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::ok(body),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: Some("anthropic/claude-opus-4-8".into()),
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -11464,6 +12737,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::err("simulated transport error"),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: None,
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -11681,6 +12955,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -11757,6 +13032,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -11820,6 +13096,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, includes_self_heal) =
             run_pass_through_commits(&paths, &ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
@@ -11902,6 +13179,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _self_heal) = run_pass_through_commits(
             &paths,
@@ -11951,6 +13229,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -12022,6 +13301,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -12131,6 +13411,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -12182,6 +13463,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -12222,6 +13504,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let _ = run_pass_through_commits(
             &paths,
@@ -12314,6 +13597,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -12399,6 +13683,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // base_branch points at a branch that does NOT exist on origin
         // → `git reset --hard origin/nonexistent-branch` errors →
@@ -12563,6 +13848,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         struct UnreachableExecutor;
         #[async_trait::async_trait]
@@ -13145,6 +14431,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repo = fixture_repo(&ws);
 
@@ -13472,6 +14759,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (processed, _) = run_pass_through_commits(
             &paths,
@@ -13627,6 +14915,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }));
         let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(None));
@@ -13647,6 +14936,7 @@ mod tests {
                 u32::MAX,
                 None,
                 0,  // revision_cap: disabled in tests
+                10, // human_revise_cap: irrelevant (dispatcher disabled)
                 60, // startup_jitter_max_secs: large window
                 0,  // inter_iteration_jitter_pct: irrelevant
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -14190,6 +15480,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _self_heal) = run_pass_through_commits(
@@ -14269,6 +15560,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         /// Recording executor: succeeds on `bar`, panics on any other name.
@@ -14365,6 +15657,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         for _ in 0..2 {
@@ -14453,6 +15746,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         // No chatops, no preflight alert. The pre-flight check sees no
@@ -14536,6 +15830,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let mut repo = fixture_repo(&ws);
         repo.base_branch = "nonexistent-branch".into();
@@ -14698,7 +15993,7 @@ mod tests {
     }
 
     // ============================================================
-    // partition_and_annotate_reviewer_revisions (cap-budget + verdict gating)
+    // partition_and_annotate_reviewer_revisions (cap-budget; verdict-agnostic)
     // ============================================================
 
     fn make_report(verdict: ReviewVerdict, concerns: Vec<ReviewConcern>) -> ReviewReport {
@@ -14707,6 +16002,7 @@ mod tests {
             markdown: "## Summary\nbase markdown.\n".to_string(),
             concerns,
             per_change_sections: Vec::new(),
+            attribution: None,
         }
     }
 
@@ -14739,6 +16035,7 @@ mod tests {
                     markdown: "ok".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -14748,6 +16045,7 @@ mod tests {
                     markdown: "minor".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -14757,6 +16055,7 @@ mod tests {
                     markdown: "bad".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
         ];
@@ -14785,6 +16084,7 @@ mod tests {
                     markdown: String::new(),
                     concerns: vec![c1.clone()],
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -14794,6 +16094,7 @@ mod tests {
                     markdown: String::new(),
                     concerns: vec![c2.clone()],
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
         ];
@@ -14803,28 +16104,34 @@ mod tests {
         assert_eq!(synth.concerns[1].change_slug.as_deref(), Some("beta"));
     }
 
+    // a46 task 3.3: the verdict is fully decoupled from auto-revise. A
+    // `Pass` verdict carrying one actionable concern returns that concern.
     #[test]
-    fn partition_returns_empty_on_pass_verdict() {
+    fn partition_pass_verdict_with_actionable_concern_returns_it() {
         let mut r = make_report(
             ReviewVerdict::Pass,
             vec![revisable_concern("a", "fix a")],
         );
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
-        assert!(taken.is_empty(), "Pass must never post revision comments");
+        assert_eq!(taken.len(), 1, "Pass + actionable concern must post");
+        assert_eq!(taken[0].summary, "a");
         assert!(
             !r.markdown.contains("cap budget exhausted"),
-            "no dropped-concern annotation on Pass"
+            "nothing dropped: no annotation"
         );
     }
 
+    // a46 task 3.1: inverted from the old "Concerns posts nothing" test. A
+    // `Concerns` verdict with one actionable concern now returns it.
     #[test]
-    fn partition_returns_empty_on_concerns_verdict() {
+    fn partition_concerns_verdict_with_actionable_concern_returns_it() {
         let mut r = make_report(
             ReviewVerdict::Concerns,
             vec![revisable_concern("a", "fix a")],
         );
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
-        assert!(taken.is_empty(), "Concerns must never post revision comments");
+        assert_eq!(taken.len(), 1, "Concerns + actionable concern must post");
+        assert_eq!(taken[0].summary, "a");
         assert!(!r.markdown.contains("cap budget exhausted"));
     }
 
@@ -14888,7 +16195,7 @@ mod tests {
     }
 
     /// 3-change per-change pass with 2 revision requests per change AND
-    /// `max_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
+    /// `max_auto_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
     /// "(not auto-revised; cap budget exhausted)" inside its OWN per-
     /// change section (not the bundled markdown).
     #[test]
@@ -14927,6 +16234,7 @@ mod tests {
                     markdown: "VERDICT: Block\n\n## Summary\nchange c notes.\n".into(),
                 },
             ],
+            attribution: None,
         };
         let taken = partition_and_annotate_reviewer_revisions(&mut report, 5);
         // 5 of 6 revisable concerns posted.
@@ -14998,6 +16306,121 @@ mod tests {
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].summary, "ok");
+    }
+
+    // a46 task 3.2: the Block path is preserved, not regressed — a `Block`
+    // verdict with actionable concerns still returns them.
+    #[test]
+    fn partition_block_verdict_with_actionable_concerns_still_returns_them() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                revisable_concern("a", "fix a"),
+                revisable_concern("b", "fix b"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert_eq!(taken.len(), 2, "Block + actionable concerns must post");
+        assert_eq!(taken[0].summary, "a");
+        assert_eq!(taken[1].summary, "b");
+    }
+
+    // a46 task 3.4: any verdict + zero actionable concerns returns empty.
+    // Complements `partition_block_with_no_revisable_concerns_returns_empty`
+    // (the Block case) by exercising a non-Block verdict — proving the
+    // "no actionable concerns" gate is itself verdict-agnostic. The WARN is
+    // logged inside the function on this path (not asserted here, matching
+    // the existing no-revisable test's pattern).
+    #[test]
+    fn partition_concerns_verdict_with_no_actionable_concerns_returns_empty() {
+        let mut r = make_report(
+            ReviewVerdict::Concerns,
+            vec![commentary_concern("style nit"), commentary_concern("preference")],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert!(taken.is_empty(), "no actionable concerns => no posts under Concerns");
+        assert!(!r.markdown.contains("cap budget exhausted"));
+    }
+
+    // ============================================================
+    // initial_revision_state_at_pr_open (caps are SOURCED, not hardcoded)
+    // ============================================================
+
+    /// Build a minimal `CodeReviewer` whose `max_code_reviews_per_pr` is the
+    /// given value, for the PR-open state-init tests below.
+    fn reviewer_with_review_cap(cap: Option<u32>) -> CodeReviewer {
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        struct NoopClient;
+        #[async_trait]
+        impl LlmClient for NoopClient {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        CodeReviewer::new(Box::new(NoopClient), "t".to_string())
+            .with_max_code_reviews_per_pr(cap)
+    }
+
+    /// Regression guard: the PR-open state init must SOURCE the re-review cap
+    /// from the reviewer (NOT hardcode `Some(5)`). With the a47 default
+    /// (`reviewer.max_code_reviews_per_pr` unset → `None`), a freshly-opened
+    /// PR's state must carry `code_review_cap: None` (unlimited) — otherwise
+    /// every daemon-opened PR is silently re-capped at 5 reruns.
+    #[test]
+    fn pr_open_state_init_sources_unlimited_review_cap_from_reviewer() {
+        let reviewer = reviewer_with_review_cap(None);
+        let now = chrono::Utc::now();
+        let state = initial_revision_state_at_pr_open(
+            42,
+            "agent-q".to_string(),
+            now,
+            5,
+            Some(&reviewer),
+            "deadbeef".to_string(),
+        );
+        assert_eq!(
+            state.code_review_cap, None,
+            "unset reviewer cap must yield None (unlimited), not the old hardcoded Some(5)"
+        );
+        assert_eq!(state.revision_cap, 5, "auto-revision cap is sourced from the passed value");
+        assert_eq!(state.auto_revisions_applied, 0);
+        assert_eq!(state.code_reviews_applied, 0);
+        assert_eq!(state.original_review_head_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(state.last_seen_comment_at, now);
+    }
+
+    /// When the operator set an opt-in re-review ceiling, the PR-open init
+    /// carries it through as `Some(n)`.
+    #[test]
+    fn pr_open_state_init_sources_set_review_cap_from_reviewer() {
+        let reviewer = reviewer_with_review_cap(Some(3));
+        let state = initial_revision_state_at_pr_open(
+            7,
+            "agent-q".to_string(),
+            chrono::Utc::now(),
+            12,
+            Some(&reviewer),
+            "cafe".to_string(),
+        );
+        assert_eq!(state.code_review_cap, Some(3));
+        // The auto-revision cap reflects the configured value, not a hardcoded 5.
+        assert_eq!(state.revision_cap, 12);
+    }
+
+    /// No reviewer configured → the re-review cap is `None` (unlimited).
+    #[test]
+    fn pr_open_state_init_no_reviewer_yields_unlimited_review_cap() {
+        let state = initial_revision_state_at_pr_open(
+            9,
+            "agent-q".to_string(),
+            chrono::Utc::now(),
+            0,
+            None,
+            "f00d".to_string(),
+        );
+        assert_eq!(state.code_review_cap, None);
+        assert_eq!(state.revision_cap, 0);
     }
 
     // ============================================================
@@ -15244,6 +16667,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -15334,6 +16758,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -15408,6 +16833,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let (processed, _) = run_pass_through_commits(
@@ -15491,6 +16917,39 @@ mod tests {
             body.contains("next polling iteration will pick"),
             "body must explain next-iteration pickup: {body}"
         );
+        // a49: default (no model) audit-only body carries no attribution.
+        assert!(
+            !body.contains("*Auditor"),
+            "un-attributed audit-only body must have no attribution line: {body}"
+        );
+    }
+
+    /// a49: when an audit IS configured with a daemon-known model, the
+    /// audit-produced PR section carries the
+    /// `*Auditor (<type>): <provider>/<model>*` attribution line.
+    #[test]
+    fn build_audit_only_pr_body_carries_attribution_when_provided() {
+        let subjects = vec![
+            "audit: security_bug proposals (1 change(s))".to_string(),
+            "audit: missing_tests proposals (2 change(s))".to_string(),
+        ];
+        let attribution = crate::attribution::audit_attribution_line(
+            "security_bug_audit",
+            "anthropic/claude-opus-4-8",
+        );
+        let body = build_audit_only_pr_body_with_attribution(&subjects, Some(&attribution));
+        assert!(
+            body.contains("*Auditor (security_bug_audit): anthropic/claude-opus-4-8*"),
+            "audit-produced PR section must carry the attribution line: {body}"
+        );
+        // The line lands inside the audit-produced-proposals section.
+        let section_idx = body
+            .find("## Audit-produced proposals")
+            .expect("audit section present");
+        let attr_idx = body
+            .find("*Auditor (security_bug_audit):")
+            .expect("attribution present");
+        assert!(attr_idx > section_idx, "attribution follows the section header");
     }
 
     // ================================================================
@@ -15712,6 +17171,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor; // unused: no pending changes
@@ -15727,6 +17187,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0, // revision_cap: disabled in tests
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -15870,6 +17331,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor; // unused: no pending changes
@@ -15884,6 +17346,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0,
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -16081,6 +17544,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let executor = AlwaysFailingExecutor;
@@ -16094,6 +17558,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
             0,
+            10, // human_revise_cap: irrelevant (dispatcher disabled)
             &registry,
             None,
             &std::collections::HashMap::new(),
@@ -16172,6 +17637,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::IterationRequested {
             completed_tasks: vec!["1".into(), "2".into()],
@@ -16283,6 +17749,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::Completed { final_answer: None });
         let step =
@@ -16332,6 +17799,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::SpecNeedsRevision {
             unimplementable_tasks: vec![crate::executor::UnimplementableTask {
@@ -16385,6 +17853,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::Failed {
             reason: "timeout".into(),
@@ -16436,6 +17905,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let outcome = Ok(ExecutorOutcome::AskUser {
             question: "what next?".into(),
@@ -16455,5 +17925,149 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(still, marker, "AskUser must NOT touch the marker");
+    }
+
+    // ================================================================
+    // a39: polling-loop Aborted arm tests
+    // ================================================================
+
+    /// Task 4.3: `handle_outcome` receiving `Aborted` from the stub
+    /// executor returns `QueueStep::Aborted` AND:
+    /// - drops `.in-progress`
+    /// - does NOT increment the failure counter
+    /// - does NOT write `.perma-stuck.json`
+    /// - leaves `.iteration-pending.json` (if any) untouched
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_arm_drops_lock_and_skips_counter() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        // Establish .in-progress so the arm has something to unlock.
+        queue::lock(&ws, "a31-bar").unwrap();
+        // Plant an iteration-pending marker — the Aborted arm must
+        // leave it in place (mirrors the Failed-arm preservation
+        // requirement so the next iteration's continuation context
+        // survives a daemon restart mid-iteration).
+        let basename = ws.file_name().and_then(|s| s.to_str()).unwrap().to_string();
+        let marker = crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec!["1".into()],
+            remaining_tasks: vec!["2".into()],
+            reason: "prior".into(),
+            iteration_number: 2,
+        };
+        crate::iteration_pending::write_marker(&paths, &basename, "a31-bar", &marker)
+            .unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        };
+        let outcome = Ok(ExecutorOutcome::Aborted {
+            reason: "daemon shutdown (SIGTERM cascade)".into(),
+        });
+        let step = handle_outcome(
+            &paths,
+            &ws,
+            &repo,
+            &github_cfg,
+            None,
+            "a31-bar",
+            outcome,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(step, QueueStep::Aborted),
+            "expected QueueStep::Aborted; got {step:?}"
+        );
+
+        // (a) .in-progress dropped.
+        assert!(
+            !ws.join("openspec/changes/a31-bar/.in-progress").exists(),
+            ".in-progress must be dropped by the Aborted arm"
+        );
+
+        // (b) The failure counter for the change is NOT recorded.
+        let state = crate::failure_state::load(&paths, &ws).unwrap();
+        assert!(
+            !state.entries.contains_key("a31-bar"),
+            "Aborted must NOT increment the failure counter; got {state:?}"
+        );
+
+        // (c) .perma-stuck.json is NOT written.
+        assert!(
+            !crate::perma_stuck::marker_exists(&ws, "a31-bar"),
+            ".perma-stuck.json must NOT be written for Aborted"
+        );
+
+        // (d) The iteration-pending marker is preserved.
+        let still = crate::iteration_pending::read_marker(&paths, &basename, "a31-bar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(still, marker, "Aborted must NOT touch the iteration-pending marker");
+    }
+
+    /// Task 4.4 (integration): two consecutive `Aborted` outcomes for
+    /// the same change do NOT trigger perma-stuck (counter stays at 0;
+    /// marker absent). This is the regression assertion for the
+    /// production scenario: operator restarts the daemon twice in a
+    /// row mid-iteration, each restart triggers the SIGTERM cascade,
+    /// AND the change must not perma-stuck on either occurrence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_consecutive_aborted_outcomes_do_not_perma_stuck() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        };
+
+        for iteration in 0..2u32 {
+            // Re-establish the .in-progress lock each pass; production
+            // re-locks per pending iteration.
+            queue::lock(&ws, "a31-bar").unwrap();
+            let outcome = Ok(ExecutorOutcome::Aborted {
+                reason: "daemon shutdown (SIGTERM cascade)".into(),
+            });
+            let step = handle_outcome(
+                &paths,
+                &ws,
+                &repo,
+                &github_cfg,
+                None,
+                "a31-bar",
+                outcome,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Aborted arm errored on pass {iteration}: {e:#}")
+            });
+            assert!(
+                matches!(step, QueueStep::Aborted),
+                "pass {iteration}: expected QueueStep::Aborted; got {step:?}"
+            );
+
+            let state = crate::failure_state::load(&paths, &ws).unwrap();
+            assert!(
+                !state.entries.contains_key("a31-bar"),
+                "pass {iteration}: counter must remain absent after Aborted; got {state:?}"
+            );
+            assert!(
+                !crate::perma_stuck::marker_exists(&ws, "a31-bar"),
+                "pass {iteration}: .perma-stuck.json must NOT be written"
+            );
+        }
     }
 }

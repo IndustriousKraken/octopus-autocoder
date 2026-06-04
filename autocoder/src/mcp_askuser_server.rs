@@ -63,6 +63,39 @@ pub fn qualified_tool_name(tool: &str) -> String {
     format!("mcp__{SERVER_NAME}__{tool}")
 }
 
+// ---------------------------------------------------------------------------
+// Outcome-tool `description` text (a44).
+//
+// These three constants are the single source of truth for the `description`
+// field of each outcome tool in the `tools/list` response below. They are the
+// PRIMARY surface for shaping agent behaviour: the agent reads them to decide
+// how to use each tool, so they SHALL stay operationally focused (what to do,
+// what content to produce) and SHALL NOT carry narrative history about prior
+// failure modes or legacy mechanisms.
+//
+// The canonical executor requirement "MCP outcome-tool description fields
+// encourage substantive content AND drop narrative history" governs this
+// content as design intent: each description directs the agent what to do AND
+// what content to produce, and carries no narrative history about prior failure
+// modes or superseded mechanisms. That fitness is verified by review AND the
+// drift audit's semantic judgment — NOT by a unit test asserting substrings of
+// the prose (per the project-documentation requirement "Tests assert behavior
+// or derivation, never message wording"). The only test over these descriptions
+// is structural: `each_outcome_tool_advertised_with_nonempty_description`
+// asserts the served `tools/list` carries a non-empty description per tool.
+
+/// `description` for the `outcome_success` tool. Content intent is governed by
+/// the executor requirement above (review + drift audit), not a substring test.
+pub(crate) const OUTCOME_SUCCESS_DESCRIPTION: &str = "Signal successful completion of the implementation run. Pass `final_answer` with a substantive end-of-run summary (10-20 lines: what you implemented, test counts, clippy + `openspec validate` results, judgment calls, follow-ups). This text becomes the per-change body of the PR's `## Agent implementation notes` section AND is the reviewer's primary surface. Call once on the success path before exiting.";
+
+/// `description` for the `outcome_request_iteration` tool. Content intent is
+/// governed by the executor requirement above (review + drift audit).
+pub(crate) const OUTCOME_REQUEST_ITERATION_DESCRIPTION: &str = "Signal that you completed some tasks but want another iteration to finish the rest. NOT for unimplementable tasks (use `outcome_spec_needs_revision` for those). The cumulative completed/remaining lists carry forward across iterations; the reason field documents the concrete blocker. Input is schema-validated at the MCP layer; empty arrays AND placeholder-shaped strings (e.g. `<concrete blocker>`) are rejected with a tool error you can correct AND retry in the same session.";
+
+/// `description` for the `outcome_spec_needs_revision` tool. Content intent is
+/// governed by the executor requirement above (review + drift audit).
+pub(crate) const OUTCOME_SPEC_NEEDS_REVISION_DESCRIPTION: &str = "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error you can correct AND retry in the same session.";
+
 /// 10-second timeout for the control-socket round trip (read + write).
 const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -167,7 +200,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_success",
-                        "description": "Signal explicit successful completion of the implementation run. Call once at end-of-run on the success path; the optional `final_answer` carries the agent's end-of-run summary for log capture AND PR-comment rendering. Calling this tool IS the signal; no result inspection is required.",
+                        "description": OUTCOME_SUCCESS_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -180,7 +213,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_request_iteration",
-                        "description": "Signal that you completed some tasks but want another iteration to finish the rest. Use this when you started implementation honestly but ran out of capacity in this iteration — NOT for unimplementable tasks (use `outcome_spec_needs_revision` for those). The cumulative completed/remaining lists carry forward across iterations; the reason field documents the concrete blocker. Input is schema-validated at the MCP layer; empty arrays and placeholder-shaped strings (e.g. `<concrete blocker>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "description": OUTCOME_REQUEST_ITERATION_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -206,7 +239,7 @@ fn handle_request<W: Write>(
                     },
                     {
                         "name": "outcome_spec_needs_revision",
-                        "description": "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Use this INSTEAD OF emitting the legacy `=== AUTOCODER-OUTCOME ===` stdout block. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "description": OUTCOME_SPEC_NEEDS_REVISION_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -1646,4 +1679,47 @@ mod tests {
             std::env::remove_var(ENV_WORKSPACE_BASENAME);
         }
     }
+
+    // ----- a48: outcome-tool descriptions are served, non-empty -----
+
+    /// Structural behavior test (a48, replacing the a44 substring-marker
+    /// contract): drive the server's `tools/list` response in-process and
+    /// assert each outcome tool is advertised with a non-empty
+    /// `description`. This checks the served structure — that the
+    /// descriptions exist and are populated — not any hand-authored
+    /// wording of their prose. The descriptions' operational fitness is
+    /// design intent verified by the drift audit (per the executor
+    /// requirement "MCP outcome-tool description fields encourage
+    /// substantive content..." AND the project-documentation requirement
+    /// "Tests assert behavior or derivation, never message wording").
+    #[test]
+    fn each_outcome_tool_advertised_with_nonempty_description() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":300,"method":"tools/list"}"#],
+        );
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+
+        for tool in [
+            "outcome_success",
+            "outcome_request_iteration",
+            "outcome_spec_needs_revision",
+        ] {
+            let tool_obj = tools
+                .iter()
+                .find(|t| t["name"] == tool)
+                .unwrap_or_else(|| panic!("tools/list missing tool `{tool}`"));
+            let description = tool_obj["description"].as_str().unwrap_or_else(|| {
+                panic!("tool `{tool}` description is not a string in tools/list")
+            });
+            assert!(
+                !description.trim().is_empty(),
+                "tool `{tool}` must be advertised with a non-empty description"
+            );
+        }
+    }
+
+    // ----- end a48 -----
 }

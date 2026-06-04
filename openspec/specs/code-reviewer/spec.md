@@ -95,18 +95,13 @@ The code-reviewer SHALL accept a structured `ReviewContext` containing the archi
 ### Requirement: Default prompt template enforces code-quality scope
 The code-reviewer SHALL ship a default prompt template that explicitly limits the review to code-quality concerns and instructs the LLM not to assess spec compliance. The template SHALL use the `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders.
 
-#### Scenario: Default template is shipped with the binary
-- **WHEN** autocoder binary is built
-- **THEN** a file named `prompts/code-review-default.md` is included
-  in the project repository at the relative path
-  `prompts/code-review-default.md`
-- **AND** the template's text contains the literal scope statement:
-  `"You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."`
-- **AND** the template specifies the required response format: a
-  verdict line followed by markdown bullets
-- **AND** the template references all three placeholders
-  (`{{change_context}}`, `{{changed_files}}`, `{{diff}}`) at least
-  once
+The scope-limiting intent — that the default template confines the review to code quality and instructs the model not to assess spec compliance — is design intent captured by this requirement and verified by the drift audit's semantic judgment. It SHALL NOT be verified by a unit test asserting a verbatim substring of the template's instruction prose (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`). The placeholder references, being behavior-relevant (the substitution code fills them), SHALL be verified by rendering the real default with sentinel inputs and asserting the substituted values appear — never by asserting the surrounding wording.
+
+#### Scenario: Default template is shipped and substitutes every placeholder
+- **WHEN** the autocoder binary is built AND the default template is rendered with a distinct sentinel value supplied for each of `{{change_context}}`, `{{changed_files}}`, AND `{{diff}}`
+- **THEN** a file named `prompts/code-review-default.md` is included in the project repository at the relative path `prompts/code-review-default.md`
+- **AND** the rendered output contains each placeholder's sentinel value, proving the shipped default references all three placeholders at least once
+- **AND** the test asserts only the substituted sentinel values, NOT any hand-authored instruction wording of the template (the scope-limiting intent is verified by the drift audit, not a substring check)
 
 #### Scenario: User-provided template overrides default
 - **WHEN** `reviewer.prompt_template_path` is set in config
@@ -140,32 +135,8 @@ The code-reviewer's LLM-client layer (`AnthropicClient`, `OpenAiCompatibleClient
 - **WHEN** an `OpenAiCompatibleClient::complete` call gets a `200` whose body is not valid JSON of shape `OpenAiResponse`
 - **THEN** the call returns `Err(_)` whose message contains a substring naming the decode failure (e.g. `decode failed`)
 
-### Requirement: Reviewer-initiated revision comments on Block verdicts
-When `reviewer.auto_revise_on_block` is `true` AND the reviewer returns a `Block` verdict, the daemon SHALL post one PR issue comment per concern where the reviewer marked `should_request_revision: true`, subject to the per-PR revision-cap budget. Each comment's body SHALL begin with the marker line `<!-- reviewer-revision -->` followed by a newline, then the trigger pattern `@<bot-username> revise <actionable_request>`. The marker enables the revision dispatcher's self-author-filter bypass; without it the dispatcher would (correctly) filter the comment as bot-authored noise. The feature is off by default; the config flag must be explicitly enabled.
-
-#### Scenario: Off-by-default has no behavioural change
-- **WHEN** `reviewer.auto_revise_on_block` is absent OR `false` AND the reviewer returns any verdict
-- **THEN** no reviewer-revision comments are posted
-- **AND** the existing PR-body `## Code Review` section is the only reviewer output channel
-
-#### Scenario: Block verdict with should-revise concerns posts comments
-- **WHEN** `auto_revise_on_block: true` AND the reviewer returns `Block` AND the response contains two concerns with `should_request_revision: true` and non-empty `actionable_request` AND the per-PR remaining cap budget is at least 2
-- **THEN** exactly two PR issue comments are posted
-- **AND** each comment's body starts with `<!-- reviewer-revision -->\n`
-- **AND** each comment's body's second non-whitespace line matches `@<bot-username> revise <actionable_request>` for that concern
-
-#### Scenario: Pass and Concerns verdicts post no revision comments
-- **WHEN** `auto_revise_on_block: true` AND the reviewer returns `Pass` OR `Concerns`
-- **THEN** no reviewer-revision comments are posted
-- **AND** the existing PR-body section behaviour is unchanged
-
-#### Scenario: Concerns without should_request_revision post no comments
-- **WHEN** `auto_revise_on_block: true` AND the reviewer returns `Block` AND every concern has `should_request_revision: false`
-- **THEN** no reviewer-revision comments are posted
-- **AND** the daemon logs a WARN noting that auto-revise is enabled but the reviewer produced no actionable-revision concerns (signals operator that the reviewer template may need updating)
-
 ### Requirement: Cap-budget interaction with reviewer-posted comments
-The reviewer-posting step SHALL respect the per-PR `executor.max_revisions_per_pr` cap. When the reviewer would generate more should-revise concerns than the remaining cap budget allows, the daemon SHALL post only the first N concerns (where N = remaining budget; concerns are taken in the reviewer's output order, which the reviewer's prompt template instructs to be most-critical-first) AND SHALL annotate the dropped concerns in the PR-body `## Code Review` section so the human sees what was skipped.
+The reviewer-posting step SHALL respect the per-PR `executor.max_auto_revisions_per_pr` cap (legacy alias `executor.max_revisions_per_pr`). Reviewer-revision comments are automatic revisions AND count against this cap. When the reviewer would generate more should-revise concerns than the remaining cap budget allows, the daemon SHALL post only the first N concerns (where N = remaining budget; concerns are taken in the reviewer's output order, which the reviewer's prompt template instructs to be most-critical-first) AND SHALL annotate the dropped concerns in the PR-body `## Code Review` section so the human sees what was skipped.
 
 #### Scenario: Cap budget exhausted truncates posts and annotates drops
 - **WHEN** the reviewer returns Block with 3 should-revise concerns AND the per-PR remaining cap budget is 2
@@ -197,10 +168,10 @@ The revision dispatcher from `a01-pr-comment-revision-loop` SHALL permit bot-aut
 - **AND** the comment proceeds to `parse_revision_trigger` regardless of whether the body contains the marker
 
 ### Requirement: Backwards compatibility for unaware reviewer templates
-Operators with customized reviewer templates that have NOT been updated to emit the new `actionable_request` and `should_request_revision` per-concern fields SHALL see no behavioural change: the response parser defaults missing fields to `actionable_request: None` and `should_request_revision: false`, the posting step finds zero should-revise concerns, and posts zero reviewer-revision comments. The daemon SHALL log a one-shot WARN on the first reviewer-pass in such a session when `auto_revise_on_block` is enabled, naming the gap so operators see the actionable diagnostic.
+Operators with customized reviewer templates that have NOT been updated to emit the new `actionable_request` and `should_request_revision` per-concern fields SHALL see no behavioural change: the response parser defaults missing fields to `actionable_request: None` and `should_request_revision: false`, the posting step finds zero should-revise concerns, and posts zero reviewer-revision comments. The daemon SHALL log a one-shot WARN on the first reviewer-pass in such a session when `reviewer.auto_revise` is enabled, naming the gap so operators see the actionable diagnostic.
 
 #### Scenario: Customized template missing the new fields produces no comments
-- **WHEN** the reviewer's response (from an operator-customized template that pre-dates this change) contains concerns without `should_request_revision` fields AND `auto_revise_on_block: true` AND the verdict is Block
+- **WHEN** the reviewer's response (from an operator-customized template that pre-dates this change) contains concerns without `should_request_revision` fields AND `reviewer.auto_revise: true`
 - **THEN** the parser defaults `should_request_revision: false` for every concern
 - **AND** zero reviewer-revision comments are posted
 - **AND** the daemon logs a WARN naming the gap and pointing at the prompt-template documentation
@@ -330,11 +301,11 @@ When `reviewer.enabled` is `false` OR no usable `api_key` is present, the verb S
 
 ### Requirement: Re-review cap (`reviewer.max_code_reviews_per_pr`) is independent of revision cap
 
-The `reviewer.max_code_reviews_per_pr` config field (default `5`, ceiling `20` with WARN-and-clamp at startup) SHALL bound operator-initiated re-reviews per PR. The cap is independent of the existing `executor.max_revisions_per_pr` cap — re-reviews AND revisions consume separate counters in the same per-PR state file.
+The `reviewer.max_code_reviews_per_pr` config field SHALL bound operator-initiated re-reviews per PR ONLY when the operator sets it; its default SHALL be UNLIMITED (unset). Re-reviews are uncapped by default because every re-review is a deliberate operator action triggered via `@<bot> code-review`, AND there is no automatic-re-review path (per the canonical "No reviewer re-run after a reviewer-initiated revision lands" requirement), so there is no runaway to bound. When set to a positive integer (ceiling `20`, WARN-and-clamp at startup), it acts as an opt-in ceiling.
 
-The cap counts ONLY operator-initiated re-reviews triggered via the `@<bot> code-review` verb. The original automatic review at PR-open time does NOT count against the cap.
+The cap is independent of the `executor.max_auto_revisions_per_pr` cap — re-reviews AND automatic revisions consume separate counters in the same per-PR state file. The original automatic review at PR-open time does NOT count against the cap (it is not a re-review).
 
-On cap exceeded, the daemon SHALL post a one-time PR decline comment whose body starts with:
+When the cap is set AND exceeded, the daemon SHALL post a one-time PR decline comment whose body starts with:
 
 ```
 🛑 Code review cap reached (N reruns). Further @<bot> code-review requests will be ignored. Close + re-open the PR or merge as-is.
@@ -346,15 +317,24 @@ AND a one-time chatops notification:
 🛑 <repo>: PR #<num> hit the code-review cap of N. Further @<bot> code-review requests ignored.
 ```
 
-After posting the decline, the daemon SHALL silently ignore subsequent `code-review` verbs on the same PR (seen-marker still advances; no PR reply; no chatops notification beyond the one-time decline).
+After posting the decline, the daemon SHALL silently ignore subsequent `code-review` verbs on the same PR (seen-marker still advances; no PR reply; no chatops notification beyond the one-time decline). When the cap is UNSET (the default), no decline is ever posted AND re-reviews always process.
 
-#### Scenario: First over-cap trigger posts the decline once
+#### Scenario: Default (unset) cap means unlimited re-reviews
+- **GIVEN** `reviewer.max_code_reviews_per_pr` is unset (the default)
+- **WHEN** an operator posts `@<bot> code-review` for the Nth time on a PR, for any N
+- **THEN** the re-review IS dispatched
+- **AND** no cap-decline comment is ever posted
+- **AND** `state.code_reviews_applied` increments (tracked for display) but is never compared against a ceiling
+
+#### Scenario: First over-cap trigger posts the decline once (cap set)
+- **GIVEN** the operator has set `reviewer.max_code_reviews_per_pr`
 - **WHEN** an open PR has had `max_code_reviews_per_pr` re-reviews applied AND a new `@<bot> code-review` comment arrives
 - **THEN** the daemon posts a PR comment whose body starts with `🛑 Code review cap reached`
 - **AND** a chatops notification fires whose text starts with `🛑 <repo>: PR #<num> hit the code-review cap`
 - **AND** `state.cap_decline_posted_for_code_review` is set to `true`
 
-#### Scenario: Subsequent over-cap triggers are silently ignored
+#### Scenario: Subsequent over-cap triggers are silently ignored (cap set)
+- **GIVEN** the operator has set `reviewer.max_code_reviews_per_pr`
 - **WHEN** a PR already has `cap_decline_posted_for_code_review: true` AND a new `@<bot> code-review` comment arrives
 - **THEN** the daemon advances `last_seen_comment_at` to the new comment's `created_at`
 - **AND** no PR reply is posted
@@ -362,9 +342,9 @@ After posting the decline, the daemon SHALL silently ignore subsequent `code-rev
 - **AND** the reviewer pipeline is NOT invoked
 
 #### Scenario: Revision cap AND re-review cap are independent
-- **WHEN** a PR has `revisions_applied: 5` (at the revision cap) AND `code_reviews_applied: 2` (below the re-review cap)
+- **WHEN** a PR has `auto_revisions_applied: 5` (at the automatic-revision cap) AND `code_reviews_applied: 2`
 - **AND** an operator posts `@<bot> code-review`
-- **THEN** the re-review IS dispatched (the revision cap does NOT block re-reviews)
+- **THEN** the re-review IS dispatched (the automatic-revision cap does NOT block re-reviews)
 - **AND** `state.code_reviews_applied` increments to 3
 
 ### Requirement: Reviewer entry point is reusable across polling-loop AND operator-trigger callers
@@ -434,4 +414,57 @@ Operators using Ollama for the reviewer SHALL configure the bare Ollama host URL
 - **AND** review invocations POST to `http://10.42.11.10:11434/v1/chat/completions` (Ollama's OpenAI-compat shim)
 - **AND** Ollama returns a successful response (the shim is functional)
 - **AND** the operator can migrate to `provider: ollama` + bare base URL + no api_key at their discretion without behavioral regression
+
+### Requirement: Reviewer-initiated revision comments on actionable concerns
+When `reviewer.auto_revise` is `true`, the daemon SHALL post one PR issue comment per concern where the reviewer marked `should_request_revision: true` AND supplied a non-empty `actionable_request`, REGARDLESS of the review's verdict (`Pass`, `Concerns`, OR `Block`), subject to the per-PR revision-cap budget. Each comment's body SHALL begin with the marker line `<!-- reviewer-revision -->` followed by a newline, then the trigger pattern `@<bot-username> revise <actionable_request>`. The marker enables the revision dispatcher's self-author-filter bypass; without it the dispatcher would (correctly) filter the comment as bot-authored noise. The feature is off by default; the config flag must be explicitly enabled.
+
+The verdict is no longer consulted when deciding whether to post reviewer-revision comments. The `Block` verdict retains its separate effect of marking the PR as draft (per the existing draft-on-Block behavior); it simply no longer gates auto-revise. The actionability signal is the per-concern `should_request_revision` + `actionable_request` pair.
+
+The config flag is `reviewer.auto_revise`. The legacy name `reviewer.auto_revise_on_block` SHALL continue to be accepted as an alias so existing config files load unchanged.
+
+The per-PR revision-cap budget that bounds this posting (currently `executor.max_revisions_per_pr`) is unchanged by this requirement; it bounds all reviewer-revision posts the same as today. (Refining that cap to bound only automatic chains while uncapping human-initiated revisions is a separate change.)
+
+#### Scenario: Off-by-default has no behavioural change
+- **WHEN** `reviewer.auto_revise` is absent OR `false` AND the reviewer returns any verdict
+- **THEN** no reviewer-revision comments are posted
+- **AND** the existing PR-body `## Code Review` section is the only reviewer output channel
+
+#### Scenario: Concerns verdict with actionable concerns posts comments
+- **WHEN** `auto_revise: true` AND the reviewer returns `Concerns` AND the response contains two concerns with `should_request_revision: true` and non-empty `actionable_request` AND the per-PR remaining cap budget is at least 2
+- **THEN** exactly two PR issue comments are posted
+- **AND** each comment's body starts with `<!-- reviewer-revision -->\n`
+- **AND** each comment's body's second non-whitespace line matches `@<bot-username> revise <actionable_request>` for that concern
+
+#### Scenario: Pass verdict with an actionable concern posts a comment
+- **WHEN** `auto_revise: true` AND the reviewer returns `Pass` AND one concern has `should_request_revision: true` with a non-empty `actionable_request` AND the remaining cap budget is at least 1
+- **THEN** exactly one reviewer-revision comment is posted (the verdict does NOT gate posting)
+
+#### Scenario: Block verdict with actionable concerns still posts comments
+- **WHEN** `auto_revise: true` AND the reviewer returns `Block` AND the response contains concerns with `should_request_revision: true` and non-empty `actionable_request` within the remaining cap budget
+- **THEN** one reviewer-revision comment per such concern is posted (the Block path is preserved, not regressed)
+- **AND** the PR is also marked draft per the existing draft-on-Block behavior
+
+#### Scenario: No actionable concerns posts nothing under any verdict
+- **WHEN** `auto_revise: true` AND the reviewer returns any verdict AND every concern has `should_request_revision: false` OR an empty `actionable_request`
+- **THEN** no reviewer-revision comments are posted
+- **AND** the daemon logs a WARN noting that auto-revise is enabled but the reviewer produced no actionable-revision concerns (signals operator that the reviewer template may need updating)
+
+#### Scenario: Legacy `auto_revise_on_block` config key still works
+- **WHEN** a config file sets `reviewer.auto_revise_on_block: true` (the legacy key)
+- **THEN** it loads identically to `reviewer.auto_revise: true` via the serde alias
+- **AND** no deprecation warning is emitted (the alias is a silent compatibility path)
+
+### Requirement: Reviewer renders its prompt with single-pass substitution
+The reviewer SHALL assemble its prompt using the single-pass substitution helper (per the orchestrator-cli `Prompt-template substitution is single-pass` requirement), so a `{{cross_change_preamble}}` / `{{change_context}}` / `{{changed_files}}` / `{{diff}}` token appearing inside a substituted value is NOT re-expanded. This matters most for the `{{changed_files}}` value: a changed file's contents are arbitrary, and when the change under review is a template, documentation, OR the reviewer's own code/specs, those contents contain the very placeholder tokens the reviewer substitutes. Re-expanding them corrupts the review AND can multiply the prompt past the model's context limit.
+
+#### Scenario: A `{{diff}}` literal in a changed file is not expanded
+- **WHEN** a `ReviewContext` whose changed files include a file whose contents contain the literal `{{diff}}` AND `{{changed_files}}` is rendered (e.g. the change under review edits the reviewer's own spec, which documents those tokens)
+- **THEN** those literals appear verbatim in the rendered changed-files section
+- **AND** the diff AND the changed-files block are each inserted exactly once, at the template's own placeholders
+- **AND** the rendered prompt's size is bounded by `change_context + changed_files + diff + template` — it does NOT grow by the number of placeholder literals present in the changed files
+
+#### Scenario: Ordinary reviews are unchanged
+- **WHEN** a `ReviewContext` whose values contain no placeholder tokens is rendered
+- **THEN** each of the four placeholders is substituted exactly once
+- **AND** the rendered prompt is byte-identical to the prior chained-`.replace` rendering
 

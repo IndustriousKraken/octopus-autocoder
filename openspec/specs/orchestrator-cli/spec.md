@@ -1706,22 +1706,25 @@ autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit fra
 ### Requirement: Security & bug audit
 autocoder SHALL register a `security_bug_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with an OpenSpec-only sandbox and a security-and-bug-detection prompt; it creates new OpenSpec change directories under `openspec/changes/` describing proposed fixes, commits them, and returns the change names so the same iteration implements them. The audit is `requires_head_change = true` and `WritePolicy::OpenSpecOnly`.
 
-#### Scenario: Prompt instructs confidence-filtered output
-- **WHEN** the prompt is loaded
-- **THEN** the prompt explicitly states:
-  - "Only report findings you are reasonably confident about. A
-    false positive becomes wasted implementer work downstream;
-    err strongly on the side of NOT reporting if you're uncertain."
-  - "Do NOT propose stylistic 'best-practice' changes that don't
-    address a concrete security issue or bug."
-- **AND** the prompt provides categorical guidance: which
-  categories are in-scope (injection, auth/authz mistakes,
-  hard-coded secrets, unsafe deserialization, missing input
-  validation at trust boundaries, race conditions, resource
-  leaks, off-by-one, wrong operator, mishandled None/null,
-  missing error propagation) and which are out-of-scope (code
-  style, naming, architectural opinions, performance unless
-  measurable, anything the project has explicitly accepted)
+The prompt's confidence-filtering and scope guidance below is design intent verified by the drift audit's semantic judgment; it SHALL NOT be pinned by a unit test asserting verbatim substrings of the prompt (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
+
+#### Scenario: Prompt steers the agent toward high-confidence, in-scope findings
+- **WHEN** the security-bug audit prompt is loaded
+- **THEN** it instructs the agent to report only findings it is
+  reasonably confident about and to err toward NOT reporting when
+  uncertain, because a false positive becomes wasted implementer
+  work downstream
+- **AND** it instructs the agent not to propose stylistic
+  "best-practice" changes that do not address a concrete security
+  issue or bug
+- **AND** it scopes findings to concrete in-scope categories
+  (injection, auth/authz mistakes, hard-coded secrets, unsafe
+  deserialization, missing input validation at trust boundaries,
+  race conditions, resource leaks, off-by-one, wrong operator,
+  mishandled None/null, missing error propagation) and excludes
+  out-of-scope categories (code style, naming, architectural
+  opinions, performance unless measurable, anything the project
+  has explicitly accepted)
 
 #### Scenario: Created changes use fix- or secure- prefix
 - **WHEN** the audit creates a change for a proposed fix
@@ -3168,17 +3171,43 @@ Each polling iteration, before processing pending changes for a repository, the 
 - **AND** the same reply does not trigger a recursive revision
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
-On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, and the revision text). The executor's outcome drives the next step: `Completed` → commit + force-with-lease push + success reply comment; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision is treated as in-progress); `Failed` → failure reply comment + count increment.
+On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); `Failed` → failure reply comment + count increment.
 
-#### Scenario: Completed revision updates the PR
-- **WHEN** the executor returns `Completed` for a revision context
+For the `Completed` outcome, the daemon SHALL first determine whether the agent produced code changes (a dirty working tree):
+
+- **Dirty tree** — the agent applied a change: the daemon commits + force-with-lease pushes to `repositories[].agent_branch`, then posts the success reply comment. A genuine commit/push failure on this branch is reported via the failure reply comment + count increment (unchanged).
+- **Clean tree** — the agent deliberately made no change (e.g. it declined the request after verifying the claim was wrong, per the executor requirement `Revision prompt instructs critical evaluation of the reviewer's request`): the daemon SHALL NOT attempt a commit (a clean tree is NOT a commit/push failure) AND SHALL NOT post a failure comment. It posts a success reply comment whose first line marks an evaluation with no change made — distinct from the `✅ Revision applied:` line (e.g. `✅ Revision evaluated, no change made:`) — carrying the agent's declination summary.
+
+Both branches count the attempt against the revision cap AND advance the seen-marker.
+
+For a `Completed` success reply comment (either branch), the body SHALL carry its first line followed (when the executor's `final_answer` is non-empty after trimming) by a blank line AND the agent's `final_answer` text verbatim. The first line stays at the top so operators scanning for the ✓ confirmation see it immediately. When `final_answer` is `None` OR is empty after trimming, the dirty-tree branch posts the single-line `✅ Revision applied: <subject>. Revision count: <n> of <cap>.` form (a45 behavior) AND the clean-tree branch posts its no-change line alone.
+
+The combined body SHALL be passed through the existing GitHub-comment-size truncation helper (`truncate_to_fit` OR equivalent) before posting, with a truncation marker appended when the body exceeds the limit. The marker text names the per-change log file path so operators can recover the full summary from disk.
+
+#### Scenario: Completed revision updates the PR with a substantive summary
+- **GIVEN** the executor returns `Completed { final_answer: Some("Did X. Declined Y because Z.") }` for a revision context AND the agent produced code changes (dirty working tree)
+- **WHEN** the revision dispatcher composes the success comment
 - **THEN** the daemon commits the workspace changes with subject `revise: <change>: <first 60 chars of revision text>`
 - **AND** force-pushes with `--force-with-lease` to `repositories[].agent_branch`
 - **AND** posts a PR issue comment whose body starts with `✅ Revision applied:`
+- **AND** the comment body contains the agent's summary text `Did X. Declined Y because Z.` on the line(s) following a blank line after the success line
 - **AND** the PR's diff updates to reflect the revision
 
+#### Scenario: Completed revision without a substantive summary uses the single-line form
+- **GIVEN** the executor returns `Completed { final_answer: None }` OR `Completed { final_answer: Some("   ") }` (empty after trim) for a revision context AND the agent produced code changes (dirty working tree)
+- **WHEN** the revision dispatcher composes the success comment
+- **THEN** the daemon posts a PR issue comment whose body is the single-line `✅ Revision applied: <subject>. Revision count: <n> of <cap>.` (no trailing blank line, no empty summary section)
+
+#### Scenario: Completed with no code change is a reported declination, not a failure
+- **GIVEN** the executor returns `Completed { final_answer: Some("Declined: the cited test does not exist; verified against the current code. No change made.") }` AND the working tree is clean (the agent made no code change)
+- **WHEN** the revision dispatcher processes the outcome
+- **THEN** the daemon does NOT attempt a commit (a clean tree is not a commit/push failure) AND does NOT post a `✗ Revision attempt failed` comment
+- **AND** it posts a success comment whose first line marks an evaluation with no change made (distinct from `✅ Revision applied:`), followed by a blank line AND the agent's `final_answer` declination summary
+- **AND** the attempt counts against the revision cap AND the seen-marker advances
+
 #### Scenario: AskUser during revision escalates without committing
-- **WHEN** the executor returns `AskUser { question, resume_handle }` during revision execution
+- **GIVEN** the executor returns `AskUser { question, resume_handle }` during revision execution
+- **WHEN** the revision dispatcher processes the outcome
 - **THEN** the existing chatops escalation path fires (the question is posted to the configured channel)
 - **AND** no commit is made on the agent branch
 - **AND** no PR reply comment is posted
@@ -3186,26 +3215,48 @@ On a triggering comment for an open PR, the daemon SHALL re-invoke the executor 
 - **AND** the comment's `created_at` is NOT marked as processed (so the next iteration after the human answer can resume against the same trigger comment)
 
 #### Scenario: Failed revision posts a failure comment
-- **WHEN** the executor returns `Failed { reason }` for a revision context
-- **THEN** the daemon posts a PR issue comment whose body starts with `✗ Revision attempt failed:` and includes the reason
+- **GIVEN** the executor returns `Failed { reason }` for a revision context
+- **WHEN** the revision dispatcher processes the outcome
+- **THEN** the daemon posts a PR issue comment whose body starts with `✗ Revision attempt failed:` AND includes the reason
 - **AND** the revision-count counter IS incremented (a failed attempt counts toward the cap)
 - **AND** no commit or push is made
 
-### Requirement: Revision cap per PR, with one-time decline
-The `executor.max_revisions_per_pr` config (default `5`, capped at `20` with WARN-and-clamp at startup) bounds revisions per PR. When the cap is reached, the daemon SHALL post a one-time decline comment on the PR AND a chatops notification, then silently ignore subsequent triggering comments on that PR (timestamps still advance so processed comments are not re-evaluated).
+#### Scenario: Oversize summary is truncated with a marker pointing at the log file
+- **GIVEN** the executor returns `Completed { final_answer: Some(very_long_text) }` where the composed body exceeds the GitHub comment-size limit
+- **WHEN** the revision dispatcher composes the success comment
+- **THEN** the body is truncated at the largest char boundary fitting under the limit
+- **AND** a truncation marker is appended naming the per-change log file path on disk
+- **AND** the operator can recover the full summary from `<logs_dir>/runs/<workspace-basename>/<change>.log`
 
-#### Scenario: First over-cap trigger posts the decline once
-- **WHEN** an open PR has had `max_revisions_per_pr` revisions applied AND a new triggering comment arrives
+### Requirement: Revision cap per PR, with one-time decline
+The `executor.max_auto_revisions_per_pr` config (default `5`, capped at `20` with WARN-and-clamp at startup; the legacy name `executor.max_revisions_per_pr` is accepted as a serde alias so existing config files load unchanged) SHALL bound only AUTOMATIC revisions per PR — those triggered by reviewer-marked comments carrying the `<!-- reviewer-revision -->` marker (the code-reviewer auto-revise path). Human-initiated `@<bot> revise` comments SHALL NOT be counted against this cap AND SHALL NOT be declined for cap reasons; an operator's deliberate revision request always processes.
+
+The per-PR state file tracks the automatic-revision count separately from human revisions. When a reviewer-marked (automatic) revision would exceed the cap, the daemon SHALL post a one-time decline comment on the PR AND a chatops notification, then silently ignore subsequent AUTOMATIC triggering comments on that PR (their timestamps still advance so processed comments are not re-evaluated). Human `@<bot> revise` comments continue to process normally regardless of the automatic-cap state.
+
+#### Scenario: First over-cap automatic trigger posts the decline once
+- **WHEN** an open PR has had `max_auto_revisions_per_pr` automatic (reviewer-marked) revisions applied AND a new reviewer-marked (`<!-- reviewer-revision -->`) triggering comment arrives
 - **THEN** the daemon posts a PR comment whose body starts with `🛑 Revision cap reached`
 - **AND** a chatops notification fires whose text starts with `🛑 <repo>: PR #<num> hit the revision cap`
 - **AND** `cap_decline_posted` in the per-PR state file is set to `true`
 
-#### Scenario: Subsequent over-cap triggers are silently ignored
-- **WHEN** a PR already has `cap_decline_posted: true` AND a new triggering comment arrives
+#### Scenario: Subsequent over-cap automatic triggers are silently ignored
+- **WHEN** a PR already has `cap_decline_posted: true` AND a new reviewer-marked triggering comment arrives
 - **THEN** the daemon advances `last_seen_comment_at` to the new comment's `created_at`
 - **AND** no PR reply is posted
 - **AND** no chatops notification fires
 - **AND** no executor invocation is performed
+
+#### Scenario: Human-initiated revisions are never capped
+- **GIVEN** an open PR has reached `max_auto_revisions_per_pr` automatic revisions AND `cap_decline_posted: true`
+- **WHEN** an operator posts a human `@<bot> revise <text>` comment (no `<!-- reviewer-revision -->` marker)
+- **THEN** the daemon processes the revision normally (executor invoked; commit/push or reported declination; reply comment posted)
+- **AND** the automatic-revision counter is NOT incremented
+- **AND** no cap-decline comment is posted for the human request
+
+#### Scenario: Legacy `max_revisions_per_pr` config key still works
+- **WHEN** a config file sets `executor.max_revisions_per_pr: 8` (the legacy key)
+- **THEN** it loads identically to `executor.max_auto_revisions_per_pr: 8` via the serde alias
+- **AND** no deprecation warning is emitted (the alias is a silent compatibility path)
 
 ### Requirement: Revisions block per-repo queue, take priority over pending changes
 The revision dispatcher SHALL run synchronously inside the polling iteration, AFTER waiting-change processing AND BEFORE pending-change processing. Revisions on different repos SHALL run independently (cross-repo polling tasks SHALL NOT be affected by another repo's in-flight revision). On a same-repo iteration, all open-PR revision requests SHALL be processed in PR-number order before the pending-change walk begins.
@@ -3331,35 +3382,59 @@ The polling iteration SHALL drain its per-repo triage queue (alongside the exist
 - **AND** no PRs are created
 
 ### Requirement: Completed triage splits into one or two PRs by content path
-After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths and split them by whether each path is inside `openspec/changes/<derived-slug>/`. Paths inside that subtree go to the spec PR; all other paths go to the fixes PR. Each PR is created on its own branch off the same base, with the existing PR-creation helpers. PR bodies cross-link each other when both are created.
+After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths AND keep ONLY paths inside `openspec/changes/<derived-slug>/`. Each path outside that subtree (code fixes, doc edits, ANY non-spec content) SHALL be reverted to its committed (HEAD) state BEFORE the spec-PR commit, by a strategy chosen by where the path lives: a tracked path PRESENT in HEAD (a modification, deletion, type-change, OR the source side of a rename) is restored — BOTH the index AND the worktree — via `git checkout HEAD -- <path>`, so a code edit the executor staged with `git add` cannot survive; a tracked path ABSENT from HEAD (a brand-new file the executor created AND staged — porcelain `A ` — OR a rename destination) is unstaged via `git reset HEAD -- <path>` AND removed from disk; an untracked addition is removed from disk via `std::fs::remove_file` / `remove_dir_all`. The not-in-HEAD case SHALL NOT be reverted with `git checkout HEAD` / `git restore --source=HEAD`, which abort with a "pathspec did not match any file(s) known to git" error for a path absent from HEAD on some git versions — exactly the common case where the executor `git add`ed a new code file. If any non-spec write cannot be reverted or removed, the daemon SHALL abort before the spec-PR commit rather than allow the write to leak into the spec PR. At most ONE PR is created per triage run — the spec PR. The fixes-PR path is removed entirely; code fixes flow through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR.
 
-#### Scenario: Mixed diff produces two PRs that cross-link
-- **WHEN** the triage executor's Completed diff contains code changes outside `openspec/changes/<new_slug>/` AND new files inside `openspec/changes/<new_slug>/`
-- **THEN** the daemon creates a fixes branch + PR with the code paths
-- **AND** the daemon creates a spec branch + PR with the openspec paths
-- **AND** each PR body contains a link to the other ("This PR carries the code fixes; see #<other_pr> for the new spec change." and vice versa)
-- **AND** the audit-thread state's `status` flips to `Acted`
+When the discard step drops non-empty paths (the agent wrote code despite the prompt's restriction), the daemon SHALL emit a WARN log naming the dropped paths AND post a chatops reply in the audit-thread naming the dropped paths AND directing the operator to capture the dropped fixes as `tasks.md` items in the spec if they were load-bearing.
 
-#### Scenario: Code-only triage produces only a fixes PR
-- **WHEN** the triage diff has only code paths (no new `openspec/changes/<new_slug>/`)
-- **THEN** only the fixes PR is created
-- **AND** no spec PR is created
-- **AND** the audit-thread state's `status` flips to `Acted`
+When the discard step leaves NO spec content in `openspec/changes/<derived-slug>/` (the agent wrote only code AND no spec), NO PR is created AND the daemon posts a chatops reply in the audit-thread naming `no spec content produced; retry with a clearer directive`. The audit-thread's `status` flips to `TriageFailed`.
 
-#### Scenario: Spec-only triage produces only a spec PR
-- **WHEN** the triage diff has only new `openspec/changes/<new_slug>/` paths
-- **THEN** only the spec PR is created
-- **AND** no fixes PR is created
-- **AND** the audit-thread state's `status` flips to `Acted`
+When the discard step leaves spec content, the daemon SHALL create the spec branch off the same base, commit the spec paths with subject `audit-triage spec proposal from <audit_type>`, push the branch, AND open the spec PR via the existing PR-creation helpers. PR-body text describes the spec content AND does NOT cross-link to any fixes PR (there is no fixes PR).
+
+#### Scenario: Mixed diff produces one spec PR; code paths are discarded with chatops warning
+- **GIVEN** the triage executor's Completed working tree contains BOTH new files in `openspec/changes/audit-fix-x/` AND modifications to `src/foo.rs`
+- **WHEN** the audit-triage completion handler runs
+- **THEN** `src/foo.rs` is reverted to its base-branch (HEAD) state — BOTH the index AND the worktree — BEFORE the commit (via `git checkout HEAD -- src/foo.rs`, since it exists in HEAD; a not-in-HEAD addition would instead be unstaged via `git reset HEAD --` AND removed from disk), so a code edit the executor staged with `git add` cannot survive into the spec commit
+- **AND** the working tree's `src/foo.rs` reverts to the base-branch state
+- **AND** a WARN log fires naming the audit type, the derived slug, AND `src/foo.rs` as the dropped path
+- **AND** the daemon creates a spec branch + PR with ONLY `openspec/changes/audit-fix-x/` paths
+- **AND** the PR body does NOT mention a companion fixes PR
+- **AND** the daemon posts a chatops reply in the audit-thread naming `src/foo.rs` as dropped AND explaining `Per a43, code fixes go through the standard implementer pipeline. The spec PR has been opened; if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items.`
+- **AND** the audit-thread's `status` flips to `Acted`
+
+#### Scenario: A staged brand-new code file is discarded without a pathspec error
+- **GIVEN** the triage executor's Completed working tree contains new files in `openspec/changes/audit-fix-x/` AND a brand-new file `src/new.rs` the executor created AND staged with `git add` (porcelain `A `, absent from HEAD)
+- **WHEN** the audit-triage completion handler runs
+- **THEN** `src/new.rs` is unstaged via `git reset HEAD -- src/new.rs` AND removed from disk, NOT reverted with `git checkout HEAD` / `git restore --source=HEAD` (which would abort with a pathspec error for a path absent from HEAD)
+- **AND** the discard step does NOT error AND the triage flow proceeds to open the spec PR
+- **AND** `src/new.rs` is named among the dropped paths in both the WARN log AND the chatops reply
+- **AND** the spec PR's diff contains ONLY `openspec/changes/audit-fix-x/` paths
+
+#### Scenario: Spec-only triage produces one spec PR with no warning
+- **GIVEN** the triage executor's Completed working tree contains ONLY new files in `openspec/changes/audit-fix-x/`
+- **WHEN** the audit-triage completion handler runs
+- **THEN** the discard step finds no paths to drop AND emits NO WARN log
+- **AND** the spec branch + PR is created with the spec content
+- **AND** NO chatops warning is posted (the agent followed the restriction)
+- **AND** the audit-thread's `status` flips to `Acted`
+
+#### Scenario: Code-only triage produces NO PR; chatops reply explains no spec content
+- **GIVEN** the triage executor's Completed working tree contains ONLY modifications to `src/foo.rs` (no `openspec/changes/<derived-slug>/` content)
+- **WHEN** the audit-triage completion handler runs
+- **THEN** the discard step restores `src/foo.rs` to the base-branch state
+- **AND** no spec branch is created AND no PR is opened
+- **AND** the daemon posts a chatops reply in the audit-thread naming `no spec content produced; retry with a clearer directive`
+- **AND** the audit-thread's `status` flips to `TriageFailed`
 
 #### Scenario: Empty-diff triage posts a no-action reply
-- **WHEN** the triage executor returns Completed but the diff is empty (the LLM decided nothing was actionable)
+- **GIVEN** the triage executor returns `Completed` but the working tree's diff is empty (the LLM decided nothing was actionable)
+- **WHEN** the audit-triage completion handler runs
 - **THEN** no PRs are created
 - **AND** the bot posts a reply in the audit thread containing the LLM's final-summary text explaining the decision
-- **AND** the audit-thread state's `status` flips to `Acted`
+- **AND** the audit-thread's `status` flips to `Acted`
 
 #### Scenario: Slug collision is suffixed
-- **WHEN** the derived slug `<audit-type>-<hash>` already exists as `openspec/changes/<slug>/`
+- **GIVEN** the derived slug `<audit-type>-<hash>` already exists as `openspec/changes/<slug>/`
+- **WHEN** the audit-triage completion handler builds the spec dir
 - **THEN** the daemon increments a suffix (`-2`, `-3`, ...) until it finds a free path
 - **AND** the resulting spec directory uses the suffixed slug
 
@@ -3872,35 +3947,45 @@ After the triage executor returns `Completed`, the polling iteration SHALL check
 - **AND** ends with `… [truncated; full reply at journalctl -u autocoder | grep request_id=<request_id>]`
 
 ### Requirement: Directive triage uses the existing two-PR mechanic; PRs participate in the revision-loop
-When the executor returns Completed without a `.chat-reply.md` marker, the polling iteration SHALL run the diff-split + two-PR creation logic from `a01-audit-reply-acts` (using the shared `split_diff_by_spec_dir` helper). The resulting fixes PR and spec PR are structurally identical to PRs spawned by `send it` and by polling-loop processing. Operators commenting `@<bot> revise <text>` on either get revisions through `a01-pr-comment-revision-loop`.
+When the executor returns `Completed` without a `.chat-reply.md` marker, the polling iteration SHALL discard non-spec writes from the working tree (via the same helper used by the audit-triage path) AND open AT MOST ONE PR — the spec PR — when spec content exists. Code-path writes are dropped before commit; a WARN log AND a chatops reply name the dropped paths when applicable. The two-PR shape from prior canonical text is removed; implementation flows through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR. Operators commenting `@<bot> revise <text>` on the spec PR continue to get revisions through `a01-pr-comment-revision-loop` per the unchanged revision-loop semantics.
 
-#### Scenario: Mixed diff produces two PRs that cross-link
-- **WHEN** the directive's executor returns Completed with both code changes AND a new `openspec/changes/<chat-derived-slug>/`
-- **THEN** the daemon creates a fixes branch + PR with the code paths
-- **AND** the daemon creates a spec branch + PR with the openspec paths
-- **AND** each PR body contains a link to the other
-- **AND** the state's `status` is `Acted`
+#### Scenario: Mixed-diff directive produces one spec PR; code paths discarded with chatops warning
+- **GIVEN** the directive's executor returns `Completed` with BOTH code changes in `src/foo.rs` AND new files in `openspec/changes/<chat-derived-slug>/`
+- **WHEN** the chat-triage completion handler runs
+- **THEN** the discard step restores `src/foo.rs`
+- **AND** the daemon creates a spec branch + PR with ONLY the openspec paths
+- **AND** the PR body does NOT mention a companion fixes PR
+- **AND** the daemon posts a chatops reply in the proposal-thread naming `src/foo.rs` as dropped
+- **AND** the proposal-request state's `status` flips to `Acted`
 
-#### Scenario: Code-only directive produces only a fixes PR
-- **WHEN** the directive's diff has only code paths
-- **THEN** only the fixes PR is created
-- **AND** the state's `status` is `Acted`
+#### Scenario: Spec-only directive produces one spec PR
+- **GIVEN** the directive's diff has only new `openspec/changes/<chat-derived-slug>/` paths
+- **WHEN** the chat-triage completion handler runs
+- **THEN** the spec PR is created
+- **AND** no chatops warning is posted
+- **AND** the proposal-request state's `status` flips to `Acted`
 
-#### Scenario: Spec-only directive produces only a spec PR
-- **WHEN** the directive's diff has only new `openspec/changes/<chat-derived-slug>/` paths
-- **THEN** only the spec PR is created
-- **AND** the state's `status` is `Acted`
+#### Scenario: Code-only directive produces NO PR
+- **GIVEN** the directive's diff has only code paths (no new `openspec/changes/<chat-derived-slug>/`)
+- **WHEN** the chat-triage completion handler runs
+- **THEN** the discard step restores the code paths
+- **AND** no PR is opened
+- **AND** the daemon posts a chatops reply in the proposal-thread naming `no spec content produced; retry with a clearer directive`
+- **AND** the proposal-request state's `status` flips to `TriageFailed`
 
 #### Scenario: Empty-diff directive posts a no-action reply
-- **WHEN** the directive's executor returns Completed with an empty diff AND no `.chat-reply.md`
+- **GIVEN** the directive's executor returns `Completed` with an empty diff AND no `.chat-reply.md`
+- **WHEN** the chat-triage completion handler runs
 - **THEN** no PRs are created
 - **AND** the bot posts a reply in the request's thread explaining no action was taken
-- **AND** the state's `status` is `Acted`
+- **AND** the proposal-request state's `status` flips to `Acted`
 
 #### Scenario: Revision comments on a triage PR are processed normally
-- **WHEN** a chat-request-spawned PR has an operator comment `@<bot> revise <text>`
-- **THEN** the existing revision-loop dispatcher picks up the comment AND processes the revision against the PR's branch
+- **GIVEN** a chat-request-spawned PR has an operator comment `@<bot> revise <text>`
+- **WHEN** the revision-loop dispatcher polls for new PR comments
+- **THEN** the existing dispatcher (per `a01-pr-comment-revision-loop`) picks up the comment AND processes the revision against the PR's branch
 - **AND** the proposal-request state file is not consulted (the revision is its own scope)
+- **AND** the revision agent's writes remain scoped to the PR's diff (which by construction now contains only spec files)
 
 ### Requirement: Proposal-request state files are pruned after 7 days
 The daemon SHALL prune `ProposalRequestState` files whose `submitted_at` is older than 7 days. The prune runs periodically (at iteration start or once per day per the existing housekeeping pattern). Stale entries are removed regardless of `status`.
@@ -6457,4 +6542,263 @@ The test SHALL also assert that the iteration_request commit IS present on the a
 - **WHEN** the integration test is designed
 - **THEN** both postconditions are asserted in the SAME test against the SAME fixture (NOT split across two tests)
 - **AND** the rationale: a single test that runs the full arm once AND asserts both effects catches the "implementation does the commit + push but neither filesystem effect" failure mode cleanly. Splitting into two tests can let the second test pass against a fixture that the first test mutated, masking the same-arm failure
+
+### Requirement: Partial change-slug resolution in marker-clearing control-socket actions
+The four marker-clearing control-socket actions — `clear_perma_stuck_marker`, `clear_revision_marker`, `ignore_for_queue_marker`, `clear_ignore_for_queue_marker` — SHALL resolve the operator-supplied `change` field as either an exact change-directory name OR a case-sensitive leading prefix, scoped to the directories carrying the action's relevant marker file. Resolution happens before any marker-removal or marker-writing filesystem call.
+
+The per-action marker scope is:
+
+| Action | Scope (directories carrying any of) |
+| --- | --- |
+| `clear_revision_marker` | `.needs-spec-revision.json` |
+| `clear_perma_stuck_marker` | `.perma-stuck.json` |
+| `ignore_for_queue_marker` | `.perma-stuck.json` OR `.needs-spec-revision.json` |
+| `clear_ignore_for_queue_marker` | `.ignore-for-queue.json` |
+
+Resolution algorithm:
+
+1. **Exact-name path.** When the supplied `change` value names an existing directory under `<workspace>/openspec/changes/`, the resolution is bound to THAT directory and SHALL NOT fall through to prefix enumeration. If the named directory carries a scope-required marker, the resolved value is the supplied value verbatim (fast-path success). If it does NOT carry a scope-required marker, the resolver SHALL return `NoMatch` immediately. Falling through to prefix enumeration in this case is forbidden — doing so would let a longer prefix-extended sibling directory (e.g., `a37-foo-bar` when the operator typed exact `a37-foo`) silently hijack the operator-named slug.
+2. **Prefix-enumeration path.** Reached ONLY when the supplied value does NOT name an existing change directory. The handler enumerates the change-root directory (skipping the archive subdirectory AND dotfile entries, matching the canonical `list_pending` skip rules), filters to directories carrying any scope-required marker, AND collects entries whose name `str::starts_with` the supplied value (case-sensitive). A unique candidate is the resolved value. Zero candidates produce a `NoMatch` error. Two or more candidates produce a `MultiMatch` error with the candidate list sorted ascending.
+
+Error messages SHALL name the marker scope explicitly so the operator can act without consulting documentation: `no change matching prefix '<prefix>' has a .needs-spec-revision.json marker` for `clear_revision_marker`'s no-match path, AND analogous messages per action. The multi-match message SHALL list the candidates AND end with `Retype with a longer prefix or the full slug.`
+
+The handler's success response JSON SHALL carry the resolved canonical slug in the `change` field, NOT the operator-supplied prefix, so downstream consumers (chatops formatter, journalctl, audit log) see the authoritative name.
+
+When the supplied value exactly equals the canonical slug (the common case for operators who paste the full slug from an alert), the resolver SHALL return the value WITHOUT logging the resolution. A non-trivial resolution (prefix → canonical) SHALL log `INFO control_socket: resolved partial change '<prefix>' → '<canonical>' for action <action>` so operators reading journalctl can confirm the disambiguation.
+
+#### Scenario: Exact slug match unchanged
+- **GIVEN** `<workspace>/openspec/changes/a37-unify-llm-provider-config/.needs-spec-revision.json` exists
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a37-unify-llm-provider-config"`
+- **THEN** the resolver returns `Ok("a37-unify-llm-provider-config")` via the exact-match fast path
+- **AND** the marker file is removed
+- **AND** the response is `{"ok": true, "change": "a37-unify-llm-provider-config", "url": "<repo-url>"}`
+- **AND** NO `resolved partial change` INFO log is emitted (the value was already canonical)
+
+#### Scenario: Unique prefix match resolves to canonical slug
+- **GIVEN** the workspace contains exactly one change directory matching the prefix `a37` AND carrying `.needs-spec-revision.json` (`a37-unify-llm-provider-config`)
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a37"`
+- **THEN** the resolver returns `Ok("a37-unify-llm-provider-config")`
+- **AND** the marker file under the canonical directory is removed
+- **AND** the response is `{"ok": true, "change": "a37-unify-llm-provider-config", "url": "<repo-url>"}` (the resolved canonical slug, NOT the supplied prefix)
+- **AND** the daemon log contains `INFO control_socket: resolved partial change 'a37' → 'a37-unify-llm-provider-config' for action clear_revision_marker`
+
+#### Scenario: Zero candidates with no matching marker produce a scope-naming error
+- **GIVEN** no change directory has both the prefix match for `a99` AND a `.needs-spec-revision.json` marker
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a99"`
+- **THEN** the resolver returns `Err(NoMatch { scope: NeedsRevision })`
+- **AND** the response is `{"ok": false, "error": "no change matching prefix 'a99' has a .needs-spec-revision.json marker"}`
+- **AND** no marker file is read or modified
+
+#### Scenario: Multiple candidates produce a candidate-listing error
+- **GIVEN** the workspace contains both `a37-foo/.needs-spec-revision.json` AND `a38-bar/.needs-spec-revision.json`
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a3"`
+- **THEN** the resolver returns `Err(MultiMatch { candidates: ["a37-foo", "a38-bar"] })`
+- **AND** the response is `{"ok": false, "error": "multiple changes match prefix 'a3': a37-foo, a38-bar. Retype with a longer prefix or the full slug."}`
+- **AND** no marker file is read or modified
+
+#### Scenario: Exact-named directory without scope marker is NoMatch (never a prefix-extension)
+- **GIVEN** the workspace contains `a37-foo/` (no `.needs-spec-revision.json` marker) AND `a37-foo-bar/.needs-spec-revision.json`
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a37-foo"` (an exact directory name)
+- **THEN** the resolver returns `Err(NoMatch { scope: NeedsRevision })` against the operator-named directory
+- **AND** the resolver does NOT fall through to prefix enumeration
+- **AND** the resolver does NOT return `Ok("a37-foo-bar")` — the prefix-extended sibling MUST NOT silently substitute for the operator-named slug
+- **AND** the response is `{"ok": false, "error": "no change matching prefix 'a37-foo' has a .needs-spec-revision.json marker"}`
+- **AND** no marker file is read or modified
+
+#### Scenario: Per-action scope isolates markers correctly
+- **GIVEN** the workspace contains `a37-foo/.perma-stuck.json` AND `a37-foo` carries no `.needs-spec-revision.json`
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a37"`
+- **THEN** the resolver returns `Err(NoMatch { scope: NeedsRevision })` (the wrong marker for this action's scope)
+- **AND** the response error names the `.needs-spec-revision.json` scope
+- **AND** the same workspace responds to `clear_perma_stuck_marker` with `change: "a37"` by resolving to `a37-foo` (the perma-stuck scope DOES include the directory)
+
+#### Scenario: `ignore_for_queue_marker` accepts either blocking marker
+- **GIVEN** the workspace contains `a37-foo/.needs-spec-revision.json` AND `a38-bar/.perma-stuck.json` AND `a39-baz` carrying neither marker
+- **WHEN** the operator submits `ignore_for_queue_marker` with `change: "a37"`
+- **THEN** the resolver returns `Ok("a37-foo")` (the `EitherBlocking` scope accepts `.needs-spec-revision.json`)
+- **AND** submitting `change: "a38"` to the same action resolves to `a38-bar` (the `EitherBlocking` scope also accepts `.perma-stuck.json`)
+- **AND** submitting `change: "a39"` returns `Err(NoMatch { scope: EitherBlocking })` with the message naming both marker files
+
+#### Scenario: End-to-end happy path — backtick-wrapped prefix from a marker alert
+- **GIVEN** the chatops alert template has fired `⚠️ \`a37-unify-llm-provider-config\` has unarchivable spec deltas (pre-flight)...`
+- **AND** the workspace contains exactly one change (`a37-unify-llm-provider-config`) carrying `.needs-spec-revision.json`
+- **WHEN** the operator copies the alert's wrapped slug verbatim AND submits `@<bot> clear-revision myrepo \`a37\`` (a shortened prefix wrapped in backticks)
+- **THEN** the parser strips the surrounding backticks AND extracts `change: "a37"` after regex validation
+- **AND** the dispatcher submits a `clear_revision_marker` control-socket action carrying `change: "a37"`
+- **AND** the control-socket handler resolves the prefix to `a37-unify-llm-provider-config` via `ChangePrefixMarkerScope::NeedsRevision`
+- **AND** the `.needs-spec-revision.json` marker file under `a37-unify-llm-provider-config/` is removed
+- **AND** the control-socket response is `{"ok": true, "change": "a37-unify-llm-provider-config", "url": "<repo-url>"}` (the canonical slug, NOT the supplied prefix)
+- **AND** the chatops dispatcher's reply text names `a37-unify-llm-provider-config`
+- **AND** the daemon log records `INFO control_socket: resolved partial change 'a37' → 'a37-unify-llm-provider-config' for action clear_revision_marker`
+
+#### Scenario: Archive directory AND dotfile entries are skipped during enumeration
+- **GIVEN** the workspace contains `archive/a01-something/.needs-spec-revision.json` (under the archive subdirectory) AND `.scratch/.needs-spec-revision.json` (a dotfile dir) AND `a37-foo/.needs-spec-revision.json`
+- **WHEN** the operator submits `clear_revision_marker` with `change: "a"`
+- **THEN** the resolver enumerates only `a37-foo` as a candidate
+- **AND** archive entries AND dotfile entries are not considered for prefix matching even when their leading characters match the prefix
+
+### Requirement: Audit-module tracing carries the repository URL as a structured field
+Every `tracing::warn!`, `tracing::info!`, AND `tracing::error!` call site under `autocoder/src/audits/` that fires DURING OR AFTER a per-repository audit context is established SHALL include a structured field named `url` whose value is the repository URL the audit is running against (typically `url = %ctx.repo.url` when the function has access to an `&AuditContext`, OR `url = %repo_url` when the function takes the URL as a parameter). The field name SHALL be exactly `url` — matching the convention used by `polling_loop.rs` informational log lines — so operators filtering by repository see a uniform attribution key across audit AND polling code paths.
+
+Truly repository-agnostic tracing calls (e.g., audit-registry initialization at daemon startup, scheduler top-line `no audits configured for any repo` messages) MAY omit `url` ONLY when annotated with a `// no-url: <reason>` comment on the line immediately preceding the macro invocation. The annotation makes the attribution choice explicit AND keeps the regression test self-enforcing for future contributors.
+
+A regression test SHALL scan every `.rs` file under `autocoder/src/audits/` via `std::fs::read_to_string` AND verify every `tracing::(warn|info|error)!` site either contains `url =` in its structured-field set OR is preceded by a `// no-url:` annotation. The test SHALL produce a combined failure listing (NOT first-failure-only) so an operator fixing many sites at once sees every offender in one run.
+
+This requirement applies ONLY to the audit modules (`autocoder/src/audits/*.rs`) AND ONLY to the three log levels named. Other modules (`polling_loop.rs`, `chatops/`, `executor/`) follow their own tracing conventions AND are out of scope for this requirement.
+
+#### Scenario: Validation-failure WARN carries the repo URL
+- **GIVEN** a daemon configured with two repositories AND an active `missing_tests_audit` run on the first repository (`https://example.invalid/repo-alpha`)
+- **WHEN** the audit produces an invalid proposal AND the validation-rejection WARN fires from `audits/specs_writing.rs`
+- **THEN** the log line's structured-field set contains `url=https://example.invalid/repo-alpha`
+- **AND** the operator filtering with `journalctl -u autocoder | grep repo-alpha` sees the WARN line
+- **AND** the operator filtering with `journalctl -u autocoder | grep repo-beta` does NOT see the WARN line (the second repo's audit run, if any, has its own `url` field)
+
+#### Scenario: Chatops-post-failed WARN carries the repo URL
+- **GIVEN** an audit's `ValidationExhausted` chatops notification post errors out
+- **WHEN** the WARN at `audits/specs_writing.rs::run_specs_writing_audit` (the chatops-post-failed branch) fires
+- **THEN** the log line's structured-field set contains `url=<repo-url>` where the URL is the same one the failed chatops post would have named in its message body
+
+#### Scenario: Shared helper threads the URL through
+- **GIVEN** a helper in `audits/mod.rs` that takes `repo_url: &str` as a parameter (e.g., `post_validation_exhausted_notification`)
+- **WHEN** that helper's internal tracing call fires
+- **THEN** the log line's structured-field set contains `url=<repo_url>` (the helper's parameter, threaded into the tracing call's field set)
+
+#### Scenario: Scheduler-startup tracing without per-repo context is annotated
+- **GIVEN** the audit scheduler's startup phase logs `audit registry initialized with N audit types` before any per-repository context exists
+- **WHEN** that INFO line fires
+- **THEN** the line on the preceding row in source contains `// no-url: registry init runs once at startup, no repo context yet` (OR equivalent reason text)
+- **AND** the regression test treats this site as acceptable (the annotation is the escape hatch)
+
+#### Scenario: Regression test catches a new tracing call added without attribution
+- **GIVEN** a hypothetical future change adds a `tracing::warn!("something went wrong")` to `autocoder/src/audits/drift.rs` without `url =` AND without a `// no-url:` annotation
+- **WHEN** the regression test runs in CI
+- **THEN** the test fails with a diagnostic naming `autocoder/src/audits/drift.rs:<lineno>: tracing call missing 'url' field AND no '// no-url:' annotation`
+- **AND** the change cannot merge until the contributor either adds the `url` field OR explicitly annotates the call as repo-agnostic
+- **AND** the test reports EVERY offending site in one run, not just the first
+
+### Requirement: Redaction-safe model-attribution accessor
+The resolved configuration SHALL expose a redaction-safe accessor that, given an LLM-driven surface (reviewer, contradiction-check, or a named audit), returns a stable attribution string of the form `<provider>/<model>`, where `<provider>` is the `LlmProvider` canonical name (`anthropic`, `openai_compatible`, `ollama`) AND `<model>` is the configured model identifier. The accessor SHALL read only an explicit positive allowlist of non-secret fields (provider AND model) AND SHALL NEVER return, embed, or derive its output from `api_key`, `api_key_env`-resolved values, `api_base_url`, or any other secret- or endpoint-bearing field.
+
+The displayed `<provider>` is the configured provider KIND, not the upstream brand — a model served via an OpenAI-compatible gateway renders as `openai_compatible/<model>` (e.g. `openai_compatible/moonshotai/kimi-latest`), not the gateway's name.
+
+#### Scenario: Accessor returns provider/model without secrets
+- **GIVEN** a reviewer config with `provider: openai_compatible`, `model: moonshotai/kimi-latest`, a non-empty `api_base_url`, AND an inline `api_key`
+- **WHEN** the attribution accessor is called for the reviewer surface
+- **THEN** it returns `openai_compatible/moonshotai/kimi-latest`
+- **AND** the returned string contains neither the `api_key` value NOR the `api_base_url`
+
+#### Scenario: Allowlist is positive — a new secret-bearing field cannot leak
+- **GIVEN** a future config field is added to an LLM-surface config block
+- **WHEN** the attribution accessor runs
+- **THEN** it returns only the allowlisted provider AND model fields
+- **AND** the new field is NOT included in the output unless it is explicitly added to the safe allowlist
+
+### Requirement: Operator-facing LLM-driven output carries a model-attribution line
+Each operator-facing output the daemon composes from an LLM-driven surface with a configured `(provider, model)` SHALL carry a one-line model attribution produced by the redaction-safe accessor, so operators can associate output quality with the model that produced it. The attribution line SHALL have the form `*<Role>: <provider>/<model>*` (e.g. `*Reviewer: openai_compatible/moonshotai/kimi-latest*`). The covered surfaces are:
+
+- the initial-review `## Code Review` PR-body section AND the `## Code Review (rerun N of M)` re-review comment — role `Reviewer` (in per_change mode each per-change section carries the reviewer attribution).
+- each audit's operator-facing PR-body section AND chatops finding notification — role `Auditor (<audit-type>)`.
+- the change-internal contradiction-check findings — role `Contradiction-check`.
+
+The executor's `## Agent implementation notes` section is OUT of scope for this requirement: the executor wraps the Claude CLI AND has no daemon-known `(provider, model)` (it uses the CLI's configured model). Its attribution is deferred to the model-registry work that gives the executor a resolvable model; this change SHALL NOT add a false or placeholder attribution to it.
+
+#### Scenario: Reviewer output carries attribution
+- **WHEN** the daemon composes a `## Code Review` section (initial OR rerun) from a reviewer configured with `provider: anthropic`, `model: claude-opus-4-8`
+- **THEN** the composed output contains the line `*Reviewer: anthropic/claude-opus-4-8*`
+- **AND** the line is produced via the redaction-safe accessor (no secret material)
+
+#### Scenario: Audit finding carries attribution
+- **WHEN** the daemon composes an audit's operator-facing PR section OR chatops finding notification from an audit configured with a `(provider, model)`
+- **THEN** the output carries `*Auditor (<audit-type>): <provider>/<model>*`
+
+#### Scenario: A surface without a daemon-known model is not falsely attributed
+- **WHEN** the daemon composes the executor's `## Agent implementation notes` section
+- **THEN** no model-attribution line is added (the executor has no daemon-known model in this change)
+- **AND** the deferral is documented so the gap is intentional, not an omission
+
+### Requirement: GitHub comment-sourced verbs require an authorized commenter
+Before dispatching ANY verb parsed from a GitHub pull-request or issue comment — including `@<bot> revise` AND `@<bot> code-review`, AND any future comment-sourced verb — the daemon SHALL authorize the commenter. This gate is a precondition on the dispatch of every such verb; a verb whose comment fails authorization SHALL NOT reach its verb-specific handling (the `revise` and `code-review` requirements describe what happens *after* a comment is authorized).
+
+Authorization SHALL pass when EITHER:
+- (a) the comment's GitHub `author_association` is in the configured `github.command_authorization.allowed_associations` set — default `[OWNER, MEMBER, COLLABORATOR]`, which are exactly the associations carrying write/triage permission on the repository; OR
+- (b) the comment author's `login` is in the configured `github.command_authorization.allowed_users` list (for trusted individuals who are not formal collaborators).
+
+A comment that parses as a verb but whose author is NOT authorized SHALL be **dropped before dispatch** (default-deny): no executor, reviewer, or other billed/LLM work is invoked, the seen-marker IS advanced past the comment so it does not re-fire on subsequent polling cycles, AND the drop is logged at INFO with the author `login` AND `author_association`. When `github.command_authorization.decline_comment` is `true`, the daemon SHALL post exactly one decline reply per dropped trigger; when it is `false` (the default), the daemon SHALL NOT reply (avoiding comment spam AND reply/feedback loops).
+
+`author_association` values (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`) come from the GitHub comments API. An absent OR unrecognized association is treated as unauthorized. The bot's own comments are filtered before this check (existing behavior, unchanged). This gate is the GitHub analog of the Slack channel allowlist (`Drop-before-dispatch inbound filters`); the Slack path is unaffected by this requirement.
+
+#### Scenario: Authorized association dispatches the verb
+- **WHEN** an open PR has a comment with `author_association: COLLABORATOR` whose body parses as `@<bot> revise <text>` (OR `@<bot> code-review`)
+- **THEN** the commenter is authorized AND the verb proceeds to its verb-specific handling
+
+#### Scenario: Unauthorized association is dropped before any work
+- **WHEN** an open PR has a comment with `author_association: NONE` whose body parses as `@<bot> revise <text>` (OR `@<bot> code-review`)
+- **THEN** no executor or reviewer run is invoked
+- **AND** the seen-marker is advanced so the comment does not re-fire
+- **AND** the drop is logged with the author `login` AND association
+
+#### Scenario: Configured allowlisted user is authorized regardless of association
+- **WHEN** a comment author's `login` is listed in `github.command_authorization.allowed_users` AND the comment parses as a verb
+- **THEN** the commenter is authorized even when their `author_association` is `NONE` or `CONTRIBUTOR`
+
+#### Scenario: Missing or unknown association is default-denied
+- **WHEN** a verb-parsing comment has no `author_association` OR an unrecognized value, AND the author is not in `allowed_users`
+- **THEN** the commenter is unauthorized AND the trigger is dropped before dispatch
+
+#### Scenario: Decline reply is posted only when configured
+- **WHEN** an unauthorized verb-parsing comment is dropped AND `github.command_authorization.decline_comment: true`
+- **THEN** the daemon posts exactly one decline reply for that comment
+- **AND** when `decline_comment: false` (default), the daemon posts no reply
+
+#### Scenario: Slack verbs are unaffected
+- **WHEN** an operator posts a verb in an allowlisted Slack channel
+- **THEN** dispatch proceeds under the Slack channel-allowlist filters with no `author_association` check (this requirement governs GitHub comment-sourced verbs only)
+
+### Requirement: Human-initiated PR revisions are rate-capped per PR
+The daemon SHALL bound the number of human-initiated `@<bot> revise` triggers it acts on per pull request, to cap cost AND abuse independent of requester. The per-PR limit SHALL read from `executor.max_revise_triggers_per_pr` (default `10`). The count is tracked in the existing per-PR state file. When the cap is reached, a further `@<bot> revise` trigger on that PR SHALL be declined with exactly one notice AND SHALL NOT invoke the executor.
+
+This cap is independent of the existing auto-revision cap (`executor.max_auto_revisions_per_pr`, which bounds reviewer-initiated revisions) AND the re-review cap (`reviewer.max_code_reviews_per_pr`). It applies only to revisions triggered by an authorized human comment (per `GitHub comment-sourced verbs require an authorized commenter`).
+
+#### Scenario: Revision under the cap proceeds
+- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count is below `executor.max_revise_triggers_per_pr`
+- **THEN** the executor is invoked for the revision
+- **AND** the PR's human-revise count increments by one
+
+#### Scenario: Revision at the cap is declined without invoking the executor
+- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count has reached `executor.max_revise_triggers_per_pr`
+- **THEN** the executor is NOT invoked
+- **AND** the daemon posts exactly one notice that the per-PR revise cap is reached
+- **AND** the count does not increment further
+
+#### Scenario: Human and auto revision caps are independent
+- **WHEN** the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
+- **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
+- **AND** exhausting the human cap does not change the auto-revision count
+
+### Requirement: Prompt-template substitution is single-pass (no placeholder re-expansion)
+autocoder SHALL render `{{placeholder}}` prompt templates by substituting all placeholders in a SINGLE pass, such that a placeholder token appearing inside a substituted value is NEVER re-expanded. A shared substitution helper SHALL perform this; every prompt-assembly site that injects dynamic content into a `{{placeholder}}` template SHALL use it. The polling-iteration prompts — `scout`, `brownfield-draft`, AND `brownfield-survey` — SHALL use the helper (the reviewer adopts the same helper per the code-reviewer requirement).
+
+Naive chained `String::replace` re-scans already-substituted content, so a value (a repo `README`, a docs listing, a symbols overview, operator `guidance`, a changed file's contents) that itself contains a `{{…}}` token has that token expanded by a later substitution pass — corrupting the prompt AND, when the injected token's value is large, multiplying the prompt's size. The single-pass helper makes rendering linear in input size: it cannot multiply, and unrecognized `{{tokens}}` (in the template OR inside a value) are emitted verbatim.
+
+#### Scenario: A placeholder token inside a substituted value is not re-expanded
+- **WHEN** a template containing `{{readme}}` AND `{{symbols_overview}}` is rendered
+- **AND** the `readme` value's text itself contains the literal `{{symbols_overview}}`
+- **THEN** the `{{symbols_overview}}` literal carried in the README appears verbatim in the output (it is NOT replaced by the symbols-overview value)
+- **AND** the template's own `{{symbols_overview}}` placeholder is substituted exactly once
+- **AND** this holds regardless of the order in which the placeholder/value pairs are supplied
+
+#### Scenario: Rendering is linear, never multiplicative
+- **WHEN** a substituted value contains K occurrences of another placeholder token `{{x}}`
+- **THEN** the rendered output grows by `K × len("{{x}}")` (the literal tokens are preserved)
+- **AND** NOT by `K × len(value_of_x)` (the pre-fix re-expansion blowup)
+
+#### Scenario: Normal inputs render unchanged
+- **WHEN** a template is rendered with values that contain no placeholder tokens
+- **THEN** every placeholder is replaced by its value exactly once
+- **AND** the output is byte-identical to the prior chained-`.replace` rendering
+
+#### Scenario: The polling prompts use the helper
+- **WHEN** the `scout`, `brownfield-draft`, OR `brownfield-survey` prompt is assembled
+- **THEN** it renders via the single-pass helper
+- **AND** an injected `README` / docs listing / symbols overview / operator `guidance` value that contains a `{{…}}` token does not corrupt the prompt
 

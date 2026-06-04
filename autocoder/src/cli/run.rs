@@ -226,10 +226,13 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             model = llm_cfg.model.as_str(),
             "change-internal contradiction pre-flight enabled (a19)"
         );
+        let attribution =
+            crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::preflight::change_contradiction::ContradictionCheckCtx {
                 llm,
                 prompt_template,
+                attribution: Some(attribution),
             },
         ))
     } else {
@@ -401,14 +404,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // Per-PR revision cap. Values above the ceiling are clamped down in
-    // `max_revisions_per_pr_clamped()`; we WARN once here so the operator
-    // notices the bogus value.
-    if cfg.executor.max_revisions_per_pr > crate::config::MAX_REVISIONS_PER_PR_CEILING {
+    // Per-PR automatic-revision cap. Values above the ceiling are clamped
+    // down in `max_auto_revisions_per_pr_clamped()`; we WARN once here so
+    // the operator notices the bogus value.
+    if cfg.executor.max_auto_revisions_per_pr > crate::config::MAX_AUTO_REVISIONS_PER_PR_CEILING {
         tracing::warn!(
-            configured = cfg.executor.max_revisions_per_pr,
-            ceiling = crate::config::MAX_REVISIONS_PER_PR_CEILING,
-            "executor.max_revisions_per_pr is set above the ceiling; clamping (a runaway revision loop would otherwise burn tokens — fix your config)"
+            configured = cfg.executor.max_auto_revisions_per_pr,
+            ceiling = crate::config::MAX_AUTO_REVISIONS_PER_PR_CEILING,
+            "executor.max_auto_revisions_per_pr is set above the ceiling; clamping (a runaway reviewer-driven revision chain would otherwise burn tokens — fix your config)"
         );
     }
 
@@ -474,7 +477,8 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
     let task_map_changed = Arc::new(tokio::sync::Notify::new());
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
-    let revision_cap = cfg.executor.max_revisions_per_pr_clamped();
+    let revision_cap = cfg.executor.max_auto_revisions_per_pr_clamped();
+    let human_revise_cap = cfg.executor.max_revise_triggers_per_pr;
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
@@ -487,6 +491,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         perma_stuck_threshold,
         executor_max_changes_per_pr,
         revision_cap,
+        human_revise_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry: audit_registry.clone(),
@@ -757,6 +762,7 @@ struct SpawnDeps {
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
+    human_revise_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -807,6 +813,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
         let revision_cap_for_task = deps.revision_cap;
+        let human_revise_cap_for_task = deps.human_revise_cap;
         let startup_jitter = deps.startup_jitter_max_secs;
         let iter_jitter = deps.inter_iteration_jitter_pct;
         let registry_for_task = deps.audit_registry.clone();
@@ -886,6 +893,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 perma,
                 exec_max,
                 revision_cap_for_task,
+                human_revise_cap_for_task,
                 startup_jitter,
                 iter_jitter,
                 registry_for_task,
@@ -1425,6 +1433,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         // No repos to validate; no fork_owner means the function returns Ok
         // without probing anything.
@@ -1444,6 +1453,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: Some("machine-user".into()),
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
         let err = ensure_forks_exist(&github, &repos)
@@ -1480,6 +1490,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let repos = vec![
@@ -1526,6 +1537,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let repos = vec![
             repo("git@github.com:fixture-org/repo.git"),    // owner_tokens hit
@@ -1556,6 +1568,7 @@ mod tests {
             owner_tokens: Some(map),
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let repos = vec![
@@ -1590,6 +1603,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (_td, test_paths) = crate::testing::test_daemon_paths();
         assert!(
@@ -1716,6 +1730,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
         let (_td, test_paths) = crate::testing::test_daemon_paths();
         assert!(repo_passes_startup_check(&test_paths, &clean_repo, &direct_push_github),
@@ -1746,8 +1761,22 @@ fn spawn_signal_handler(cancel: CancellationToken) {
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            () = ctrl_c => tracing::info!("received SIGINT; shutting down"),
-            () = terminate => tracing::info!("received SIGTERM; shutting down"),
+            () = ctrl_c => {
+                // a39: flag the daemon-shutdown path BEFORE cancelling
+                // child tasks. The shutdown SIGTERM cascade reaches the
+                // executor subprocess (systemd cgroup kill / the
+                // process-group setup), killing it by signal 15, AND the
+                // classifier's SIGTERM check (`signal() == Some(15)`)
+                // must observe the flag as `true` so the resulting
+                // outcome is `Aborted` (no counter bump) rather than
+                // `Failed`. Order is load-bearing per the spec.
+                crate::daemon::request_shutdown();
+                tracing::info!("received SIGINT; shutting down");
+            }
+            () = terminate => {
+                crate::daemon::request_shutdown();
+                tracing::info!("received SIGTERM; shutting down");
+            }
         }
         cancel.cancel();
     });

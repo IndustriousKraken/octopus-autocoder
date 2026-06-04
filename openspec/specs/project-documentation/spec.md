@@ -1069,3 +1069,53 @@ The order matters: empty-path first (resolution failure precedes any path-based 
 - **THEN** the script's stderr does NOT contain the pre-spec generic text `cannot find config; pass --config-dir <path> if your install is non-standard`
 - **AND** instead emits one of the three specific messages above
 
+### Requirement: Tests assert behavior or derivation, never message wording
+The test suite SHALL assert what the code DOES (behavior) or that mechanically-derived output matches its source of truth (derivation). A test SHALL NOT read a real shipped prompt, message, or other human-authored content artifact and assert a hand-authored substring of its prose.
+
+Design intent about a prompt's content — for example "the security-bug audit prompt steers the agent toward high-confidence findings" — SHALL be captured as requirement prose and verified by the drift audit's semantic judgment, NOT by a unit test that pins verbatim wording. A unit test that reads a real embedded prompt (via `include_str!`, a named default-prompt constant, or the prompt loader resolving to a default) and asserts a hand-authored sentence or phrase is present is prohibited: it encodes no independent truth, breaks on meaning-preserving rewrites, and catches nothing code review and the drift audit do not.
+
+Behavior tests that exercise prompt- or message-handling code SHALL supply their own synthetic fixture (a template or input the test defines) and assert on the transformed output; they SHALL NOT depend on the content of the real shipped artifact. When a property of a real shipped prompt is genuinely behavior-relevant — for example it must reference a placeholder the substitution code fills — the test SHALL render the real prompt with a distinct sentinel value per placeholder and assert the sentinels appear in the output, asserting the substituted values and never the surrounding instruction prose.
+
+Coarse "tripwire" content checks — asserting a URL or keyword is merely present in a real artifact — are the same prohibited category, not an exception; they guarantee nothing review and the drift audit do not.
+
+This requirement is the source of truth the drift audit enforces against: a unit test that asserts prompt or message wording is a drift-audit finding, with the disposition to delete it (or, when it guards a behavior-relevant property, refactor it to a sentinel-substitution test) — never to substitute a less-brittle token check.
+
+#### Scenario: Behavior test uses a synthetic fixture rather than the real prompt
+- **GIVEN** a test that verifies prompt-placeholder substitution
+- **WHEN** the test is written per this requirement
+- **THEN** it constructs a synthetic template the test itself defines (e.g. `"ctx={{change_context}}"`) AND asserts the substituted value appears in the rendered output
+- **AND** it does NOT read the real shipped prompt to assert any substring of its instruction prose
+
+#### Scenario: Verifying a behavior-relevant property of a real prompt via sentinels
+- **GIVEN** a real shipped default template that must reference `{{change_context}}`, `{{changed_files}}`, AND `{{diff}}` because the substitution code fills them
+- **WHEN** a test verifies the template references all three
+- **THEN** it renders the real default with a distinct sentinel value per placeholder AND asserts each sentinel appears in the rendered output
+- **AND** it asserts the substituted sentinel values, NOT the template's hand-authored instruction wording
+
+#### Scenario: A wording-assertion test is a drift-audit finding
+- **GIVEN** a unit test that reads a real embedded prompt AND asserts a hand-authored sentence is present as a substring
+- **WHEN** the drift audit reads this requirement against the test code
+- **THEN** the test is reported as a finding for asserting message wording rather than behavior or derivation
+- **AND** the recommended disposition is to delete the test, or refactor it to a sentinel-substitution test when it guards a behavior-relevant property — NOT to add a less-brittle token check
+
+### Requirement: Default prompts are language- and project-neutral
+The default prompts shipped under `prompts/` run against any managed repository, which may be written in any language with any build toolchain. They SHALL NOT instruct the agent to run a specific language's build, lint, format, or test command (e.g. `cargo clippy`, `cargo test`, `npm test`, `pytest`, `go test`). Instead they SHALL direct the agent to run the project's own build / lint / format / test tooling, detected from the repository's build configuration (e.g. `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`).
+
+`openspec validate --strict` is the one tool every managed repository shares — every managed repo uses OpenSpec — AND MAY be named directly. Worked examples in prompts SHALL use language-neutral phrasing (e.g. "the project's test command") rather than a concrete toolchain invocation. Multi-language enumerations (e.g. a list of source-file extensions across many languages) are already neutral AND are permitted.
+
+This is design intent for prompt content, verified by review AND the drift audit's semantic judgment — NOT by a unit test asserting prompt wording (per the requirement `Tests assert behavior or derivation, never message wording`). A negative "no prompt contains `cargo`" scanner would be both unenumerable across all languages AND the prohibited wording-assertion category; the drift audit makes the judgment instead.
+
+A future change MAY add a per-repository tooling-config block that injects the exact lint/test/format commands into prompts via placeholders. This requirement establishes the language-neutral default in the meantime.
+
+#### Scenario: Default prompts name no language-specific build tooling
+- **WHEN** the default prompts under `prompts/` are reviewed against this requirement (by a human reviewer OR the drift audit)
+- **THEN** none instructs the agent to run a specific language's build, lint, format, or test command (e.g. `cargo`, `npm`, `pytest`, `go test`)
+- **AND** each prompt that asks the agent to lint or test directs it to the project's own tooling, detected from the repository's build configuration
+- **AND** `openspec validate --strict` MAY still be named directly
+
+#### Scenario: A language-specific command in a default prompt is a drift-audit finding
+- **GIVEN** a default prompt instructs `cargo clippy --all-targets -- -D warnings` (a Rust-specific command)
+- **WHEN** the drift audit reads this requirement against the prompt
+- **THEN** the command is reported as a finding: the prompt assumes a specific toolchain that does not apply to all managed repositories
+- **AND** the disposition is to replace it with language-neutral guidance, NOT to special-case the prompt per language
+

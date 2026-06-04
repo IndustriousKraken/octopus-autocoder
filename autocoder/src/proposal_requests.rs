@@ -53,11 +53,12 @@ pub struct ProposalRequestState {
 ///   - Initial: `Pending` (written by the chatops dispatcher).
 ///   - `Pending` → `TriagePending` when the polling loop picks it up.
 ///   - `TriagePending` → `Acted` when the executor returns Completed AND
-///     the iteration creates one-or-two PRs (or posts the empty-diff
-///     reply).
+///     the iteration opens the spec PR (a43; or posts the empty-diff
+///     reply with no PR).
 ///   - `TriagePending` → `Discussed` when the executor classified the
 ///     request as a QUESTION (wrote `.chat-reply.md`).
-///   - `TriagePending` → `TriageFailed` when the executor errors out.
+///   - `TriagePending` → `TriageFailed` when the executor errors out OR
+///     produced only code and no spec content (a43).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalRequestStatus {

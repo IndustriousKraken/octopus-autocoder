@@ -1401,6 +1401,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
         owner_tokens: None,
         fork_owner: None,
         recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
     };
 
     cfg.chatops = match answers.chatops_backend {
@@ -1465,10 +1466,10 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 api_base_url: answers.reviewer_api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
-                auto_revise_on_block: false,
+                auto_revise: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
-                max_code_reviews_per_pr: 5,
+                max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
             })
@@ -2253,10 +2254,10 @@ pub(crate) async fn reconfigure_reviewer(
                 api_base_url: api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
-                auto_revise_on_block: false,
+                auto_revise: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
-                max_code_reviews_per_pr: 5,
+                max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
             });

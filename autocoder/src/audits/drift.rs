@@ -126,7 +126,11 @@ impl Audit for DriftAudit {
         // Skip immediately if the workspace is missing or has no
         // `.git/` — no LLM call, no file IO, no `create_dir_all`.
         if !workspace_is_valid(ctx.workspace) {
-            return Ok(workspace_unavailable_outcome(Self::TYPE, ctx.workspace));
+            return Ok(workspace_unavailable_outcome(
+                Self::TYPE,
+                ctx.workspace,
+                &ctx.repo.url,
+            ));
         }
 
         let prompt = self.resolve_prompt(Some(ctx.workspace))?;
@@ -295,6 +299,7 @@ fn parse_severity(raw: &str) -> Severity {
         "medium" => Severity::Medium,
         "low" => Severity::Low,
         other => {
+            // no-url: pure severity parser, no AuditContext in scope
             tracing::warn!(
                 severity = other,
                 "drift_audit: unknown severity `{other}`; defaulting to Low"
@@ -452,7 +457,8 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
-            max_revisions_per_pr: 5,
+            max_auto_revisions_per_pr: 5,
+            max_revise_triggers_per_pr: 10,
             wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
             output_format: crate::config::default_output_format(),
             log_retention_days: crate::config::default_log_retention_days(),

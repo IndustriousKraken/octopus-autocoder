@@ -49,6 +49,14 @@ pub struct ReviewReport {
     /// per element INSTEAD OF a single combined `## Code Review` block.
     /// Empty for bundled-mode reports.
     pub per_change_sections: Vec<PerChangeSection>,
+    /// Redaction-safe `<provider>/<model>` model attribution for the
+    /// reviewer that produced this report (a49). `Some` when the reviewer
+    /// was built from a config carrying a `(provider, model)`; the PR-body
+    /// composer renders it as `*Reviewer: <provider>/<model>*`. `None` for
+    /// reports built without a configured reviewer (e.g. test fixtures or
+    /// the reviewer-failed synthetic report), in which case no attribution
+    /// line is emitted.
+    pub attribution: Option<String>,
 }
 
 /// One per-change reviewer section, surfaced into the PR body under a
@@ -141,15 +149,23 @@ pub struct PerChangeReview {
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
-    auto_revise_on_block: bool,
+    auto_revise: bool,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
-    max_code_reviews_per_pr: u32,
+    /// Per-PR cap on operator-initiated re-reviews. `None` means UNLIMITED
+    /// (the default) — re-reviews are deliberate operator actions with no
+    /// runaway path, so the cap is opt-in only.
+    max_code_reviews_per_pr: Option<u32>,
     suggest_rereview_threshold: Option<f32>,
     /// a34 §6: cost-optimization knob. When `true`, the polling
     /// iteration skips the reviewer call for any PR whose diff lives
     /// entirely under `openspec/`. Defaults to `false`.
     skip_spec_only_prs: bool,
+    /// Redaction-safe `<provider>/<model>` attribution (a49), stamped onto
+    /// every [`ReviewReport`] this reviewer produces. `Some` when built via
+    /// [`CodeReviewer::from_config`]; `None` for the test-only
+    /// [`CodeReviewer::new`] path (no config, no model to attribute).
+    attribution: Option<String>,
 }
 
 impl CodeReviewer {
@@ -157,17 +173,29 @@ impl CodeReviewer {
         Self {
             client,
             template,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
+            max_code_reviews_per_pr: None,
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            attribution: None,
         }
     }
 
-    /// Builder-style setter for the per-PR re-review cap.
-    pub fn with_max_code_reviews_per_pr(mut self, cap: u32) -> Self {
+    /// Builder-style setter for the redaction-safe model attribution (a49).
+    /// `from_config` sets this from the reviewer config's `(provider,
+    /// model)`. The attribution is stamped onto every [`ReviewReport`] this
+    /// reviewer produces and carried into [`ReviewResult`], from which the
+    /// initial-review and rerun composers render the `*Reviewer: …*` line.
+    pub fn with_attribution(mut self, attribution: Option<String>) -> Self {
+        self.attribution = attribution;
+        self
+    }
+
+    /// Builder-style setter for the per-PR re-review cap. `None` means
+    /// unlimited (the default).
+    pub fn with_max_code_reviews_per_pr(mut self, cap: Option<u32>) -> Self {
         self.max_code_reviews_per_pr = cap;
         self
     }
@@ -178,8 +206,9 @@ impl CodeReviewer {
         self
     }
 
-    /// Per-PR cap on operator-initiated re-reviews (a33).
-    pub fn max_code_reviews_per_pr(&self) -> u32 {
+    /// Per-PR cap on operator-initiated re-reviews (a33/a47). `None` means
+    /// unlimited (the default).
+    pub fn max_code_reviews_per_pr(&self) -> Option<u32> {
         self.max_code_reviews_per_pr
     }
 
@@ -226,23 +255,25 @@ impl CodeReviewer {
     }
 
     /// Builder-style setter mirroring the config flag of the same name.
-    /// The flag controls whether `Block`-verdict concerns get forwarded
-    /// to the revision dispatcher as `<!-- reviewer-revision -->` PR
-    /// comments. Default `false` (no behavioural change). Used by
-    /// `from_config` to propagate `ReviewerConfig::auto_revise_on_block`
-    /// onto the constructed reviewer; tests use it directly when they
-    /// need the flag flipped without round-tripping a full config.
-    pub fn with_auto_revise_on_block(mut self, enabled: bool) -> Self {
-        self.auto_revise_on_block = enabled;
+    /// The flag controls whether concerns marked `should_request_revision`
+    /// (with a non-empty `actionable_request`) get forwarded to the
+    /// revision dispatcher as `<!-- reviewer-revision -->` PR comments,
+    /// regardless of the review's verdict. Default `false` (no behavioural
+    /// change). Used by `from_config` to propagate
+    /// `ReviewerConfig::auto_revise` onto the constructed reviewer; tests
+    /// use it directly when they need the flag flipped without
+    /// round-tripping a full config.
+    pub fn with_auto_revise(mut self, enabled: bool) -> Self {
+        self.auto_revise = enabled;
         self
     }
 
     /// Whether reviewer-initiated revisions are enabled for this
     /// reviewer instance. Read by the polling-loop posting step that
-    /// turns `Block`-verdict concerns into `<!-- reviewer-revision -->`
-    /// PR comments.
-    pub fn auto_revise_on_block(&self) -> bool {
-        self.auto_revise_on_block
+    /// turns actionable concerns into `<!-- reviewer-revision -->` PR
+    /// comments (regardless of verdict).
+    pub fn auto_revise(&self) -> bool {
+        self.auto_revise
     }
 
     /// Wire a reviewer from config: build the LLM client, load the
@@ -260,12 +291,13 @@ impl CodeReviewer {
             None,
         );
         Ok(Self::new(client, template)
-            .with_auto_revise_on_block(cfg.auto_revise_on_block)
+            .with_auto_revise(cfg.auto_revise)
             .with_prompt_budget(cfg.prompt_budget_chars)
             .with_mode(cfg.mode)
             .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
             .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold)
-            .with_skip_spec_only_prs(cfg.skip_spec_only_prs))
+            .with_skip_spec_only_prs(cfg.skip_spec_only_prs)
+            .with_attribution(Some(crate::attribution::AttributionSurface::attribution(cfg))))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
@@ -307,15 +339,29 @@ impl CodeReviewer {
         preamble: &str,
     ) -> Result<ReviewReport> {
         let rendered = render_sections(context, self.prompt_budget);
-        let body = self
-            .template
-            .replace("{{cross_change_preamble}}", preamble)
-            .replace("{{change_context}}", &rendered.change_context)
-            .replace("{{changed_files}}", &rendered.changed_files)
-            .replace("{{diff}}", &rendered.diff_or_explanation);
+        // Single-pass substitution (a002): a `{{...}}` token appearing
+        // inside a substituted value — most importantly inside the
+        // `{{changed_files}}` value when the change under review touches a
+        // template, docs, OR the reviewer's own code/specs — is emitted
+        // verbatim, never re-expanded. Chained `.replace` re-scanned
+        // injected content and could multiply the prompt past the model's
+        // context limit.
+        let body = crate::prompts::render_template(
+            &self.template,
+            &[
+                ("cross_change_preamble", preamble),
+                ("change_context", &rendered.change_context),
+                ("changed_files", &rendered.changed_files),
+                ("diff", &rendered.diff_or_explanation),
+            ],
+        );
         log_prompt_stats(context, &rendered, body.len(), self.prompt_budget);
         let raw = self.client.complete(&body).await?;
-        Ok(parse_response(&raw))
+        let mut report = parse_response(&raw);
+        // Stamp the reviewer's redaction-safe attribution (a49) so the
+        // PR-body composer can render `*Reviewer: <provider>/<model>*`.
+        report.attribution = self.attribution.clone();
+        Ok(report)
     }
 }
 
@@ -382,6 +428,11 @@ pub struct ReviewResult {
     pub markdown: String,
     pub per_change_sections: Vec<PerChangeSection>,
     pub concerns: Vec<ReviewConcern>,
+    /// Redaction-safe `<provider>/<model>` attribution (a49), carried from
+    /// the underlying [`ReviewReport`]. The rerun composer renders it as
+    /// `*Reviewer: <provider>/<model>*` on the `## Code Review (rerun N of
+    /// M)` comment. `None` when the reviewer carried no configured model.
+    pub attribution: Option<String>,
 }
 
 /// Reusable reviewer entry point (a33 task 5). The polling-loop AND the
@@ -422,6 +473,7 @@ pub async fn review_pr_at_state_with(
         raw_output: report.markdown.clone(),
         markdown: report.markdown.clone(),
         per_change_sections: report.per_change_sections.clone(),
+        attribution: report.attribution.clone(),
         concerns: report.concerns,
     })
 }
@@ -670,6 +722,7 @@ fn parse_response(raw: &str) -> ReviewReport {
                 markdown,
                 concerns,
                 per_change_sections: Vec::new(),
+                attribution: None,
             }
         }
         _ => ReviewReport {
@@ -679,6 +732,7 @@ fn parse_response(raw: &str) -> ReviewReport {
             ),
             concerns,
             per_change_sections: Vec::new(),
+            attribution: None,
         },
     }
 }
@@ -1081,10 +1135,10 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1107,10 +1161,10 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: true,
         };
@@ -1177,10 +1231,10 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1213,24 +1267,26 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(template_path),
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
 
-        // The override must not match the default template's scope statement.
-        assert!(
-            !reviewer.template.contains("You are reviewing code quality only"),
-            "user template should NOT contain the default's scope statement"
+        // Template identity, not wording: the loaded value is exactly the
+        // synthetic custom template this test wrote, AND is distinct from
+        // the embedded default (symbol comparison, no prose substring).
+        assert_eq!(
+            reviewer.template, "CUSTOM TEMPLATE: {{diff}}",
+            "loaded template must equal the synthetic custom template the test wrote"
         );
-        assert!(
-            reviewer.template.contains("CUSTOM TEMPLATE:"),
-            "user template should be the loaded file's contents"
+        assert_ne!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "loaded custom template must not equal the embedded default"
         );
     }
 
@@ -1252,21 +1308,19 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("missing template must fall back to embedded default");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_MISSING_TMPL") };
-        assert!(
-            reviewer
-                .template
-                .contains("You are reviewing code quality only"),
-            "fallback must use embedded default"
+        assert_eq!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "fallback must use the embedded default template (symbol identity)"
         );
     }
 
@@ -1296,10 +1350,10 @@ this is not yaml: at all: ::: {{{ broken
             code_review: Some(PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1323,44 +1377,18 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
-        assert!(
-            reviewer
-                .template
-                .contains("You are reviewing code quality only"),
-            "default template must be used when prompt_template_path is None"
-        );
-    }
-
-    #[test]
-    fn default_template_describes_revision_requests_block() {
-        // Operators who flip `reviewer.auto_revise_on_block` rely on the
-        // default template producing the structured `revision-requests`
-        // block. The template must instruct the LLM on it.
-        assert!(
-            DEFAULT_TEMPLATE.contains("revision-requests"),
-            "default template must mention the `revision-requests` block name"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("should_request_revision"),
-            "default template must document the `should_request_revision` field"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("actionable_request"),
-            "default template must document the `actionable_request` field"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.to_lowercase().contains("most-critical-first")
-                || DEFAULT_TEMPLATE.to_lowercase().contains("most critical first"),
-            "default template must instruct on ordering for cap-budget truncation"
+        assert_eq!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "default template must be used when prompt_template_path is None (symbol identity)"
         );
     }
 
@@ -1716,27 +1744,94 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(Verdict::from(report.verdict), result.verdict);
     }
 
+    /// Behavior test (a48): the shipped default template must reference
+    /// all three substitution placeholders, because the production render
+    /// path (`review_with_preamble`) fills them. Rendering the real
+    /// default with a distinct sentinel per placeholder and asserting each
+    /// sentinel survives proves the references exist — without pinning any
+    /// of the template's hand-authored instruction prose (per the
+    /// project-documentation requirement "Tests assert behavior or
+    /// derivation, never message wording").
     #[test]
-    fn default_template_contains_scope_statement_and_format() {
-        // Architecture-baseline scenario: default template must contain the
-        // literal scope statement AND specify the verdict format.
+    fn default_template_references_all_placeholders() {
+        let rendered = DEFAULT_TEMPLATE
+            .replace("{{change_context}}", "SENTINEL_CHANGE_CONTEXT_a48")
+            .replace("{{changed_files}}", "SENTINEL_CHANGED_FILES_a48")
+            .replace("{{diff}}", "SENTINEL_DIFF_a48");
         assert!(
-            DEFAULT_TEMPLATE.contains("You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."),
-            "default template must contain the exact scope statement"
+            rendered.contains("SENTINEL_CHANGE_CONTEXT_a48"),
+            "default template must reference the {{change_context}} placeholder"
         );
         assert!(
-            DEFAULT_TEMPLATE.contains("VERDICT:"),
-            "default template must instruct on verdict format"
+            rendered.contains("SENTINEL_CHANGED_FILES_a48"),
+            "default template must reference the {{changed_files}} placeholder"
         );
-        // Rubric points enumerated.
-        for rubric in &[
-            "Security", "Error handling", "Naming", "style", "idioms",
-            "Dead code", "bugs",
-        ] {
-            assert!(
-                DEFAULT_TEMPLATE.to_lowercase().contains(&rubric.to_lowercase()),
-                "default template missing rubric point `{rubric}`"
-            );
-        }
+        assert!(
+            rendered.contains("SENTINEL_DIFF_a48"),
+            "default template must reference the {{diff}} placeholder"
+        );
+    }
+
+    /// a002 regression (task 3.4): a `ReviewContext` whose changed files
+    /// contain the literal `{{diff}}` AND `{{changed_files}}` tokens — the
+    /// self-hosting case where the change under review edits the reviewer's
+    /// own spec/code/docs — renders a prompt that does NOT re-expand those
+    /// literals. Under the old chained `.replace`, the final
+    /// `.replace("{{diff}}", …)` stamped the whole diff into every literal
+    /// `{{diff}}` carried in the changed files, exploding the prompt.
+    #[tokio::test]
+    async fn changed_file_placeholder_literals_are_not_re_expanded() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        // A realistic template wraps each section in delimiters.
+        let template =
+            "CTX<<<{{change_context}}>>>\nFILES<<<{{changed_files}}>>>\nDIFF<<<{{diff}}>>>"
+                .to_string();
+        let reviewer = CodeReviewer::new(client, template.clone());
+
+        // The changed file's contents carry MANY literal placeholder tokens
+        // (as the reviewer's own spec docs do). The diff itself is large so
+        // that re-expansion would be conspicuous.
+        let file_contents = "documents {{diff}} and {{changed_files}} tokens\n".repeat(50);
+        let diff = "D".repeat(10_000);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "openspec/specs/code-reviewer/spec.md".into(),
+                contents: file_contents.clone(),
+            }],
+            diff: diff.clone(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+
+        // The literal tokens survive verbatim in the changed-files section.
+        assert!(
+            prompt.contains("documents {{diff}} and {{changed_files}} tokens"),
+            "literal placeholder tokens must survive verbatim in the changed-files section"
+        );
+        // The big diff is inserted exactly once (at the template's own
+        // `{{diff}}`), NOT once per literal carried in the file.
+        assert_eq!(
+            prompt.matches(&diff).count(),
+            1,
+            "the diff must be inserted exactly once, not re-stamped into every literal"
+        );
+
+        // Size bound: the rendered prompt cannot exceed the sum of the
+        // section values plus the template scaffolding. (`render_sections`
+        // builds the changed-files section with `## File:` headers, so we
+        // bound by file_contents + a small per-file header allowance rather
+        // than by the bare contents.)
+        let rendered = render_sections(&ctx, reviewer.prompt_budget());
+        let bound = rendered.change_context.len()
+            + rendered.changed_files.len()
+            + rendered.diff_or_explanation.len()
+            + template.len();
+        assert!(
+            prompt.len() <= bound,
+            "prompt size {} must be bounded by section sizes + template = {bound} \
+             (no multiplicative blowup)",
+            prompt.len()
+        );
     }
 }

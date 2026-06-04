@@ -227,6 +227,18 @@ async fn process_one_request(
         ExecutorOutcome::IterationRequested { .. } => Err(anyhow!(
             "executor returned IterationRequested during changelog run (iteration sequences not applicable)"
         )),
+        ExecutorOutcome::Aborted { reason } => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. Return Ok(()) so the changelog request is not
+            // marked as a failure; the next iteration after restart
+            // will retry from a clean state.
+            tracing::info!(
+                url = %repo.url,
+                request_id = %state.request_id,
+                "changelog-stylist: executor aborted by daemon shutdown: {reason}"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -239,13 +251,12 @@ async fn commit_and_open_pr(
     state: &mut ChangelogRequestState,
 ) -> Result<()> {
     // Read the workspace's git status to discover what the stylist
-    // changed.
-    let porcelain = git::status_porcelain(workspace)
-        .with_context(|| "changelog-stylist: reading post-Completed git status".to_string())?;
-    let changed: Vec<String> = porcelain
-        .lines()
-        .filter_map(extract_porcelain_path)
-        .filter(|p| !p.is_empty())
+    // changed. `status_entries` is the single NUL-delimited parser, so a
+    // worktree-modified path arrives intact (no leading-char drop).
+    let changed: Vec<String> = git::status_entries(workspace)
+        .with_context(|| "changelog-stylist: reading post-Completed git status".to_string())?
+        .into_iter()
+        .map(|e| e.path)
         .collect();
 
     if changed.is_empty() {
@@ -379,23 +390,6 @@ async fn mark_failed(
     }
 }
 
-/// Helper: extract the post-status path from a `git status --porcelain`
-/// line. Mirrors the existing helper in `polling_loop` but kept local so
-/// `changelog_triage` is self-contained.
-fn extract_porcelain_path(line: &str) -> Option<String> {
-    // Porcelain v1 lines: `XY <path>` where XY is two status chars.
-    // Renames look like `R  old -> new`; we return the new path.
-    if line.len() < 4 {
-        return None;
-    }
-    let body = &line[3..];
-    if let Some(idx) = body.find(" -> ") {
-        Some(body[idx + 4..].to_string())
-    } else {
-        Some(body.to_string())
-    }
-}
-
 /// 8-char hex hash of `request_id`. Stable + URL-safe.
 fn short_id_hash(request_id: &str) -> String {
     let mut state: u64 = 0xcbf29ce484222325;
@@ -491,11 +485,13 @@ async fn process_one_changelog_pr_revision(
             pr_number: pr.number,
             agent_branch: pr.head.ref_.clone(),
             last_seen_comment_at: pr.created_at,
-            revisions_applied: 0,
+            auto_revisions_applied: 0,
             revision_cap: u32::MAX,
             cap_decline_posted: false,
+            human_revise_count: 0,
+            human_revise_cap_decline_posted: false,
             code_reviews_applied: 0,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
@@ -567,10 +563,10 @@ async fn process_one_changelog_pr_revision(
             )
             .await;
         } else {
-            state.revisions_applied = state.revisions_applied.saturating_add(1);
+            state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
             let body = format!(
                 "✅ Changelog revision applied. Total revisions on this PR: {}.",
-                state.revisions_applied
+                state.auto_revisions_applied
             );
             let _ = github::post_issue_comment(
                 github::DEFAULT_API_BASE,
@@ -638,13 +634,21 @@ async fn re_run_stylist_and_force_push(
                 "executor returned IterationRequested; not supported here"
             ));
         }
+        ExecutorOutcome::Aborted { reason } => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. Return Ok(()) — the revise loop will retry on
+            // the next iteration after restart.
+            tracing::info!(
+                url = %repo.url,
+                "changelog-revision: executor aborted by daemon shutdown: {reason}"
+            );
+            return Ok(());
+        }
     }
-    let porcelain = git::status_porcelain(workspace)
-        .with_context(|| "changelog-revision: post-Completed git status")?;
-    let changed: Vec<String> = porcelain
-        .lines()
-        .filter_map(extract_porcelain_path)
-        .filter(|p| !p.is_empty())
+    let changed: Vec<String> = git::status_entries(workspace)
+        .with_context(|| "changelog-revision: post-Completed git status")?
+        .into_iter()
+        .map(|e| e.path)
         .collect();
     let out_of_scope: Vec<String> = changed
         .iter()
@@ -764,15 +768,56 @@ mod tests {
         assert_eq!(a.len(), 8);
     }
 
+    /// 3.5 — end-to-end: a worktree-modified archive `proposal.md` (a
+    /// legitimate `changelog:` frontmatter edit) reaches `is_in_scope`
+    /// with its path intact via `status_entries`, so the out-of-scope
+    /// check does NOT reject it. This pins the regression the change
+    /// fixes: a whole-blob `.trim()` used to chop the leading `o` off
+    /// `openspec/...`, making `is_in_scope` return false and aborting the
+    /// changelog run.
     #[test]
-    fn extract_porcelain_path_handles_rename_and_simple() {
-        assert_eq!(
-            extract_porcelain_path(" M CHANGELOG.md"),
-            Some("CHANGELOG.md".to_string())
+    fn out_of_scope_check_accepts_modified_archive_proposal() {
+        use std::process::Command;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        let rel = "openspec/changes/archive/2026-05-22-foo/proposal.md";
+        let abs = ws.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "# Proposal\n\nbody\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "seed archive"]);
+        // The stylist stamps `changelog:` frontmatter — a worktree edit
+        // with a BLANK staged column, so its record begins with a space.
+        std::fs::write(&abs, "---\nchangelog: skip\n---\n# Proposal\n\nbody\n").unwrap();
+
+        // Mirror the production out-of-scope check.
+        let changed: Vec<String> = git::status_entries(ws)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(changed, vec![rel.to_string()], "path must arrive intact");
+
+        let out_of_scope: Vec<String> =
+            changed.iter().filter(|p| !is_in_scope(p)).cloned().collect();
+        assert!(
+            out_of_scope.is_empty(),
+            "the modified archive proposal must NOT be rejected; got {out_of_scope:?}"
         );
-        assert_eq!(
-            extract_porcelain_path("R  old.md -> new.md"),
-            Some("new.md".to_string())
+        assert!(
+            is_in_scope(&changed[0]),
+            "is_in_scope must accept the intact path"
         );
     }
 }

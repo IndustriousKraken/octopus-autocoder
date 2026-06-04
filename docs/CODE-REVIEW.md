@@ -82,7 +82,7 @@ Trade-offs:
 - **LLM cost** scales linearly under `per_change`: an N-change PR costs N× the bundled-mode price. Pick `per_change` only if you specifically want per-change attention and are willing to pay for it.
 - **Per-change budget** — each per-change call independently respects `prompt_budget_chars`. One change touching a huge file gets its own truncation footer without affecting the other changes' reviews.
 - **Cross-change context preserved** — each per-change prompt includes a short preamble naming the OTHER changes in the same PR (slug + first paragraph of `## Why`, truncated to 200 chars each), so the reviewer sees that change A introduced a symbol change B consumes.
-- **Reviewer-initiated revisions still aggregate** — the union of revision requests across all per-change reviews shares the same `executor.max_revisions_per_pr` cap. Dropped requests are annotated inside their own `## Code Review: <change-slug>` section.
+- **Reviewer-initiated revisions still aggregate** — the union of revision requests across all per-change reviews shares the same `executor.max_auto_revisions_per_pr` cap (reviewer-initiated revisions are automatic). Dropped requests are annotated inside their own `## Code Review: <change-slug>` section.
 
 ```yaml
 reviewer:
@@ -91,11 +91,13 @@ reviewer:
 
 The mode is hot-applicable via `autocoder reload`; flipping it between iterations causes the next PR to use the new mode.
 
-## Reviewer-initiated revisions on `Block` verdicts
+## Reviewer-initiated revisions on actionable concerns
 
-When `reviewer.auto_revise_on_block: true` is set, every `Block` verdict additionally forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The flow:
+When `reviewer.auto_revise: true` is set, autocoder forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The trigger is the per-concern actionability signal, **not** the verdict: it fires on actionable concerns regardless of whether the review's verdict is `Pass`, `Concerns`, or `Block`. (`Block` retains its separate effect of marking the PR draft; it just no longer gates auto-revise.)
 
-1. Reviewer returns a `Block` verdict with one or more per-concern records marked `should_request_revision: true`.
+The legacy config key `auto_revise_on_block` is still accepted as a silent alias, so existing config files load unchanged. The flow:
+
+1. Reviewer returns any verdict with one or more per-concern records marked `should_request_revision: true` and a non-empty `actionable_request`.
 2. Autocoder posts one PR issue comment per such concern, with body:
 
    ```
@@ -114,9 +116,9 @@ The reviewer makes the per-concern decision: only concerns with a concrete, exec
 
 ### Cap-budget interaction
 
-Reviewer-initiated revisions count toward the same per-PR `executor.max_revisions_per_pr` cap as human-initiated ones (default 5; see [CONFIG.md](CONFIG.md#max_revisions_per_pr)). When the reviewer would post more comments than the remaining cap allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
+Reviewer-initiated revisions are **automatic** and count toward the per-PR `executor.max_auto_revisions_per_pr` cap (default 5; see [CONFIG.md](CONFIG.md#executormax_auto_revisions_per_pr)). Human `@<bot> revise` requests are **not** counted against this cap — only reviewer-marked automatic revisions are. When the reviewer would post more comments than the remaining cap budget allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
 
-The cap budget at posting time is a forward-looking estimate; the actual `revisions_applied` counter only increments when the dispatcher processes a comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
+The cap budget at posting time is a forward-looking estimate; the actual `auto_revisions_applied` counter only increments when the dispatcher processes an automatic comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
 
 ### Operator-customized reviewer templates
 
@@ -160,4 +162,23 @@ Every PR autocoder opens carries the change list in its body, plus the optional 
 The comment is best-effort: if the POST fails, the PR still ships and the failure is logged at ERROR. Source for each section is `<system-temp>/autocoder/logs/<workspace-basename>/<change>.log` (the same per-change log file written by the executor); a missing or unreadable log is logged at WARN and that change's section is omitted. If every change's log is missing, no comment is posted.
 
 The total comment body is capped at 60,000 characters (under GitHub's 65,535 limit, with headroom for wrapper text). When truncated, the tail is replaced with a marker pointing back at `/tmp/autocoder/logs/<basename>/<change>.log` so reviewers can fetch the full output server-side.
+
+## Model attribution
+
+Operator-facing output the daemon composes from an LLM-driven surface carries a one-line model attribution so you can associate a comment's quality with the model behind it:
+
+```
+*Reviewer: anthropic/claude-opus-4-8*
+```
+
+The line has the form `*<Role>: <provider>/<model>*` and is appended to:
+
+- the initial-review `## Code Review` PR-body section, and each per-change `## Code Review: <slug>` section in `per_change` mode — role `Reviewer`;
+- the `## Code Review (rerun N of M)` re-review comment — role `Reviewer`;
+- each audit's chatops finding and audit-produced PR section — role `Auditor (<audit-type>)`;
+- the change-internal contradiction-check findings alert — role `Contradiction-check`.
+
+`<provider>` is the configured provider **KIND** (`anthropic`, `openai_compatible`, or `ollama`), **not** the upstream brand. A model served through an OpenAI-compatible gateway renders as `openai_compatible/moonshotai/kimi-latest`, not the gateway's name. The attribution is produced by a redaction-safe accessor that reads only the `provider` and `model` fields; it can never embed an `api_key`, an `api_key_env`-resolved value, or an `api_base_url`.
+
+**Not yet attributed:** the executor's `## Agent implementation notes` section carries no attribution line. The executor wraps the Claude CLI and uses the CLI's configured model, which the daemon does not know — so a clean attribution is deferred to the model-registry work that gives the executor a resolvable model rather than emitting a placeholder. The in-tree audits likewise wrap the CLI today, so an audit attribution line appears only once an audit is configured with a daemon-known `(provider, model)`.
 

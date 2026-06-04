@@ -1260,6 +1260,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: Some(fork_owner.into()),
             recreate_fork_on_reinit: true,
+            command_authorization: Default::default(),
         }
     }
 

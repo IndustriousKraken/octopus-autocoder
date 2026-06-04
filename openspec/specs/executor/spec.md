@@ -1159,3 +1159,160 @@ Operator-customizable override prompts MAY remove OR rewrite this section — th
 - **WHEN** an automated test extracts the "Anti-narrative-deferral discipline" section from `prompts/implementer.md`
 - **THEN** the extracted text matches the canonical text specified above (the structural elements: warning + tool list + acceptance-scan description + recovery-turn description)
 
+### Requirement: `ExecutorOutcome::Aborted` distinguishes operator-shutdown-initiated subprocess kills from real failures
+
+The `ExecutorOutcome` enum SHALL gain a new variant `Aborted { reason: String }`. This variant represents an executor subprocess that exited because the daemon itself was being shut down (the SIGTERM the daemon received cascaded to the executor's process group, killing the wrapped CLI child by signal — the reaped `ExitStatus` reports `signal() == Some(15)`, i.e. killed by SIGTERM/signal 15). The variant is structurally distinct from `Failed` so the polling-loop AND the failure-counter mechanism can treat it differently — specifically, `Aborted` SHALL NOT count against `executor.perma_stuck_threshold`.
+
+The polling-loop's outcome dispatcher SHALL handle `Aborted` by:
+
+1. Logging INFO `executor aborted: {reason}` naming the change.
+2. Dropping `.in-progress` per the canonical openspec-queue-engine "Unlocking after any executor outcome" requirement.
+3. NOT incrementing the per-change failure counter.
+4. NOT writing `.perma-stuck.json`.
+5. NOT posting a chatops failure alert (operator initiated the shutdown; they don't need notification).
+6. Leaving `.iteration-pending.json` untouched (mirrors the `Failed` arm's preservation of continuation context).
+7. Returning `Ok(())` from the per-change processing function. The polling loop continues its shutdown sequence normally; the change remains pending AND retries on the next polling cycle after restart.
+
+#### Scenario: `Aborted` does NOT increment failure counter
+- **WHEN** the polling-loop's outcome dispatcher receives `Ok(ExecutorOutcome::Aborted { reason: "daemon shutdown (SIGTERM cascade)" })` for change `a35-foo`
+- **THEN** the `consecutive_failures` counter for `a35-foo` is NOT incremented
+- **AND** `.perma-stuck.json` is NOT written for `a35-foo`
+- **AND** no `❌ Failed` OR `:no_entry: perma-stuck` chatops alert fires
+- **AND** the `.in-progress` lock is dropped
+- **AND** `.iteration-pending.json` (if present) is preserved
+
+#### Scenario: Two consecutive `Aborted` outcomes do NOT perma-stuck
+- **WHEN** the same change receives `Aborted` outcomes in two consecutive polling iterations (e.g., operator restarts the daemon twice in a row while the change is mid-iteration)
+- **THEN** the change is NOT perma-stuck
+- **AND** the failure counter remains at 0 throughout
+- **AND** the third polling iteration picks up the change fresh AND attempts implementation normally
+
+### Requirement: Classifier returns `Aborted` for a SIGTERM-killed subprocess during daemon shutdown; preserves `Failed` for external-source SIGTERMs
+
+The `classify_outcome` path in `claude_cli.rs` SHALL inspect a process-wide shutdown flag (`crate::daemon::SHUTDOWN_REQUESTED: AtomicBool`) when the wrapped CLI was killed by SIGTERM. Because the daemon spawns the wrapped CLI directly in its own process group, a SIGTERM cascade reaps the child *by signal*, so the reaped `ExitStatus` reports `signal() == Some(15)` (`code()` returns `None` for any signal-killed process). The classifier SHALL detect the SIGTERM kill as `status.signal() == Some(15) || status.code() == Some(143)` — the former is the production shape; the latter is accepted defensively for the shell "128 + 15" convention that surfaces only if a wrapper OR the CLI itself catches SIGTERM and `exit(143)`s. The flag SHALL be set to `true` by the daemon's SIGTERM handler BEFORE the daemon initiates shutdown of child tasks (so classifier checks happening during the shutdown cascade observe the flag as true). The flag is one-way per process lifetime (false → true; never reset).
+
+Classification rules for a SIGTERM-killed subprocess (`signal() == Some(15)` OR `code() == Some(143)`):
+
+- `SHUTDOWN_REQUESTED == true` → return `ExecutorOutcome::Aborted { reason: "daemon shutdown (SIGTERM cascade)" }`. The subprocess was killed by the cascade from the daemon's own SIGTERM; not the change's fault.
+- `SHUTDOWN_REQUESTED == false` → return `ExecutorOutcome::Failed { reason: <stderr excerpt, OR the Display of the status — e.g. "executor exited with signal: 15 (SIGTERM)"> }` (today's behavior, preserved). An external source (OOM killer, manual `kill -TERM <pid>`, container orchestrator) sent the executor a SIGTERM; this is treated as a real failure AND counts against the failure budget.
+
+Classification rules for subprocesses NOT killed by SIGTERM are UNCHANGED by this requirement. The shutdown flag SHALL NOT affect:
+
+- Exit status `0` paths (still classified as `Completed` per the diff-presence heuristic OR existing happy-path rules).
+- Other non-zero exit codes / other signals (still classified as `Failed` with the stderr-derived reason).
+- Timeout cases (still classified per the canonical timeout-precedence requirement).
+- Tool-recorded outcomes (still classified per the canonical "Tool-recorded outcomes take precedence" requirement from `a27a0`).
+
+The flag's purpose is narrow: distinguish the one specific case where the daemon's own shutdown caused the executor's death. Every other classification path is preserved.
+
+#### Scenario: SIGTERM-killed subprocess during daemon shutdown classifies as Aborted
+- **WHEN** `classify_outcome` is called with `outcome.exit_status` reporting `signal() == Some(15)` (a SIGTERM-killed child) AND `SHUTDOWN_REQUESTED.load(SeqCst) == true`
+- **THEN** the classifier returns `Ok(ExecutorOutcome::Aborted { reason: "daemon shutdown (SIGTERM cascade)" })`
+- **AND** the same result holds for the defensive `code() == Some(143)` form (a wrapper/CLI catching SIGTERM and exiting 143)
+- **AND** no failure-counter increment OR alert fires downstream
+
+#### Scenario: SIGTERM-killed subprocess without daemon shutdown classifies as Failed (today's behavior)
+- **WHEN** `classify_outcome` is called with `outcome.exit_status` reporting `signal() == Some(15)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == false`
+- **THEN** the classifier returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is the stderr excerpt (or the Display of the signal-killed status when stderr is empty, naming `signal: 15`)
+- **AND** the existing failure-counter + perma-stuck protections fire normally (external SIGTERMs from OOM killer, manual kill, etc., remain protected against loop)
+
+#### Scenario: Exit-1 with shutdown flag set still classifies as Failed
+- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 1)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true` (e.g., the executor genuinely failed with a non-SIGTERM exit code during the shutdown window)
+- **THEN** the classifier returns `Ok(ExecutorOutcome::Failed { reason: <stderr excerpt> })` per the existing behavior
+- **AND** the shutdown flag does NOT override non-SIGTERM exit codes (the flag's gate is specifically on signal-15 / exit-143 deaths, not all exit codes during shutdown)
+
+#### Scenario: Exit-0 with shutdown flag set still classifies via existing happy-path rules
+- **WHEN** `classify_outcome` is called with `outcome.exit_status: ExitStatus(code: 0)` AND `SHUTDOWN_REQUESTED.load(SeqCst) == true` (e.g., the executor completed cleanly just before the daemon's shutdown timing)
+- **THEN** the classifier proceeds through the existing exit-0 path (Completed-via-tool-outcome, OR Completed-via-diff, OR the canonical Layer-2 heuristic)
+- **AND** the shutdown flag does NOT mask a legitimate Completed outcome
+
+### Requirement: Daemon's SIGTERM handler sets the shutdown flag as its first action
+
+The daemon's SIGTERM signal handler SHALL set `SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst)` as its FIRST action, BEFORE initiating the shutdown of child tasks (polling-loop futures, chatops listener, control-socket listener, etc.). This ordering is load-bearing: the SIGTERM cascade to executor subprocesses happens AFTER the daemon's children begin shutting down, AND those subprocesses' classifier checks must observe `SHUTDOWN_REQUESTED == true`.
+
+The flag SHALL NOT be reset during the process's lifetime (one-way false → true). A subsequent daemon restart starts a new process with the flag at its `AtomicBool::new(false)` default.
+
+#### Scenario: SIGTERM handler sets flag before cascading
+- **WHEN** the daemon receives SIGTERM
+- **THEN** the SIGTERM handler's first action is `SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst)`
+- **AND** subsequent shutdown actions (graceful child cancellation, socket close, etc.) happen AFTER the flag store
+
+#### Scenario: Flag persists for the rest of the process lifetime
+- **WHEN** the flag has been set to `true` AND the daemon's shutdown sequence proceeds
+- **THEN** the flag remains `true` until the process exits
+- **AND** any classifier call happening during the shutdown cascade observes the flag as `true`
+
+#### Scenario: Fresh daemon process starts with flag false
+- **WHEN** a new daemon process spawns (e.g., post-restart)
+- **THEN** `SHUTDOWN_REQUESTED.load(Ordering::SeqCst)` returns `false`
+- **AND** the next iteration's classifier calls classify exit codes per the non-shutdown path
+
+### Requirement: MCP outcome-tool description fields encourage substantive content AND drop narrative history
+The `description` field of each outcome tool advertised by the per-execution MCP child (currently `autocoder/src/mcp_askuser_server.rs`) SHALL be operationally focused — directing the agent what to do AND what content to produce — without narrative history about prior failure modes OR legacy mechanisms. The agent reads the `description` field from the MCP `tools/list` response to decide how to use the tool; that text is the primary surface for shaping agent behavior, so it SHALL carry the load-bearing operational guidance:
+
+- `outcome_success` — names the `final_answer` field AND its reviewer-facing destination (the PR's implementation-notes section), AND directs the agent to pass a substantive end-of-run summary rather than treating the bare call as sufficient.
+- `outcome_request_iteration` — names the cumulative completed/remaining state AND the blocker-naming `reason` field, AND distinguishes the tool from `outcome_spec_needs_revision`.
+- `outcome_spec_needs_revision` — names the file the agent reads (`tasks.md`), the placeholder-rejection rule, AND where input validation runs (the MCP layer).
+
+This is design intent for human-authored message content. It is verified by review AND the drift audit's semantic judgment — NOT by a unit test asserting substrings of the descriptions (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`). A test that read the descriptions and asserted hand-authored wording is a change-detector that breaks on meaning-preserving rewrites; the descriptions' fitness is a judgment the drift audit makes against this requirement. The required/forbidden-substring contract AND the substring regression test mandated by the prior version of this requirement are removed.
+
+This requirement covers description CONTENT ONLY. The tool schemas (`inputSchema`), behaviors (control-socket relay), AND output shapes are governed by the existing canonical "Per-execution MCP child exposes outcome tools via control-socket relay" AND "Per-execution MCP child exposes `outcome_request_iteration` tool" requirements AND are unchanged by this requirement.
+
+#### Scenario: Descriptions carry operational guidance and omit narrative history
+- **WHEN** the outcome-tool descriptions are reviewed against this requirement (by a human reviewer OR the drift audit)
+- **THEN** each description directs the agent how to use the tool AND what content to produce
+- **AND** `outcome_success`'s description directs the agent to pass a substantive `final_answer` summary AND names its reviewer-facing destination
+- **AND** no description carries narrative history about prior failure modes OR superseded mechanisms (e.g. a stdout-block predecessor)
+
+#### Scenario: Each outcome tool is advertised with a non-empty description
+- **WHEN** the per-execution MCP child serves its `tools/list` response
+- **THEN** each of `outcome_success`, `outcome_request_iteration`, AND `outcome_spec_needs_revision` is advertised with a non-empty `description` field
+- **AND** this structural property is verified by a behavior test against the served `tools/list` output, independent of the description wording
+
+#### Scenario: Description content intent is independent of tool schema
+- **GIVEN** a future change rewrites a description AND inadvertently breaks the tool's `inputSchema` shape
+- **WHEN** the change is evaluated
+- **THEN** the schema violation surfaces via the existing canonical "Per-execution MCP child exposes outcome tools via control-socket relay" requirement's scenarios
+- **AND** the description-content intent is governed by this requirement (review AND drift audit), independently of the schema
+
+### Requirement: Revision prompt instructs critical evaluation of the reviewer's request
+`prompts/implementer-revision.md` SHALL instruct the revision agent to evaluate the triggering request critically rather than assume it is correct. Before applying a requested change, the agent reads the actual code at the cited location, verifies the request's claim against the current state, and — when the claim is wrong (mistaken about the code, would break a passing or spec-traced test, references a symbol that does not exist, or churns working idiomatic code for protection that does not apply) — declines OR partially honors the request AND reports what it declined and why via the `outcome_success` `final_answer` summary.
+
+Declining a wrong request is a valid, successful outcome the agent reports; it is NOT a failure AND NOT grounds to fabricate a change that satisfies the literal request at the cost of correctness. The agent reports its evaluation through the existing `final_answer` surface (no new outcome tool); the no-change declination path is handled by the orchestrator-cli `Revision execution updates the agent branch and posts a reply comment` requirement.
+
+The guidance SHALL be language-neutral — it references "the project's test and lint commands" rather than a specific toolchain, so it applies to any managed repository.
+
+This is design intent for the revision prompt's content. It is verified by review AND the drift audit's semantic judgment — NOT by a unit test asserting the prompt's wording (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
+
+#### Scenario: Revision prompt instructs claim verification before applying
+- **WHEN** the revision prompt is reviewed against this requirement (by a human reviewer OR the drift audit)
+- **THEN** it instructs the agent to read the cited code AND verify the request's claim against the current state before applying any change
+- **AND** it states that declining or partially honoring a wrong request is a valid outcome the agent SHALL report via `final_answer`, not a failure and not grounds to fabricate a change
+
+#### Scenario: A reasoned declination is reported, not engineered around
+- **GIVEN** a request whose claim is mistaken (e.g. it references a test or symbol that does not exist, or asks to remove a spec-traced test)
+- **WHEN** the agent evaluates it per the prompt's guidance
+- **THEN** the prompt directs the agent NOT to make a change that satisfies the literal request at the cost of correctness
+- **AND** to call `outcome_success` with a `final_answer` naming the request, the verification it performed, AND why it declined or partially honored the request
+
+### Requirement: Executor prompt builders use single-pass substitution
+The executor's multi-placeholder prompt builders — `build_revision_prompt`, `build_triage_prompt`, `build_chat_triage_prompt`, AND `build_changelog_prompt` — SHALL render their templates with the single-pass substitution helper (per the orchestrator-cli `Prompt-template substitution is single-pass` requirement), so a `{{…}}` token appearing inside an injected value (a PR body, a PR diff, an operator's revision/request text, audit findings, a canonical-specs index, OR changelog JSON) is NOT re-expanded by a later substitution. Single-replace builders (`build_prompt`, which substitutes only `{{change_body}}`) AND append-based builders (`build_recovery_prompt`) are unaffected — a single replace cannot re-expand.
+
+This closes a self-hosting hazard: `prompts/implementer-revision.md` itself contains `{{pr_diff}}`, `{{revision_request}}`, AND `{{pr_body}}`, so revising a PR whose diff touches that template would, under chained `.replace`, re-expand those tokens inside the injected diff.
+
+#### Scenario: A placeholder token in the PR diff is not re-expanded
+- **WHEN** `build_revision_prompt` renders with a `pr_diff` whose text contains the literal `{{revision_request}}` AND `{{pr_body}}` (e.g. the PR under revision edits `prompts/implementer-revision.md`)
+- **THEN** those literals appear verbatim in the rendered diff section
+- **AND** the operator's revision request AND the PR body are each inserted exactly once, at the template's own placeholders
+- **AND** the rendered prompt size does not grow by the number of placeholder literals carried in the diff
+
+#### Scenario: Operator request text is not re-expanded
+- **WHEN** `build_chat_triage_prompt` renders with a `request_text` that contains the literal `{{repo_url}}` OR `{{canonical_specs_index}}`
+- **THEN** those literals appear verbatim
+- **AND** the real `{{repo_url}}` / `{{canonical_specs_index}}` placeholders are each substituted exactly once
+
+#### Scenario: Ordinary executor prompts are unchanged
+- **WHEN** any of the four builders renders with injected values that contain no placeholder tokens
+- **THEN** each placeholder is substituted exactly once
+- **AND** the rendered prompt is byte-identical to the prior chained-`.replace` output
+

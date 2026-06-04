@@ -86,45 +86,102 @@ pub fn fetch_remote_with_timeout(
     remote: &str,
     timeout_secs: u64,
 ) -> Result<()> {
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .args(["fetch", remote])
         .current_dir(workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning `git fetch {remote}` in {}", workspace.display()))?;
+
+    let output = wait_capture_with_timeout(child, &format!("git fetch {remote}"), timeout_secs)?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr_s = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(anyhow!("git fetch {remote} failed: {stderr_s}"))
+}
+
+/// Wait for `child` to exit within `timeout_secs`, draining its stdout
+/// AND stderr concurrently so the captured output is bounded only by
+/// memory — NOT by the OS pipe buffer (~64 KiB on Linux).
+///
+/// The caller spawns `child` with both stdout and stderr set to
+/// `Stdio::piped()`; this helper immediately moves each pipe into its own
+/// reader thread that `read_to_end`s into a `Vec<u8>`. It then polls
+/// `try_wait()` on a 100 ms cadence against a deadline of
+/// `Instant::now() + timeout_secs`, WITHOUT touching the pipes in the
+/// loop. Reading concurrently is the whole point: if we instead read only
+/// after the child exits (as the previous inline loop did), a child that
+/// writes more than one pipe buffer before exiting blocks on `write()`
+/// while we block on `try_wait()` — a reader/writer deadlock that escapes
+/// only when the deadline fires, misreporting a healthy-but-large fetch
+/// as a timeout.
+///
+/// On clean exit the reader threads are joined and an `Output` is
+/// returned. On deadline the child is killed AND reaped (which closes the
+/// pipe write ends so the readers reach EOF), the readers are joined to
+/// avoid leaks, and a timeout `Err` is returned. A `try_wait()` error is
+/// surfaced after likewise joining the readers.
+fn wait_capture_with_timeout(
+    mut child: std::process::Child,
+    op_label: &str,
+    timeout_secs: u64,
+) -> Result<Output> {
+    // Start one reader thread per pipe. A read error yields empty bytes
+    // (the child's exit status is still authoritative).
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                match s.read_to_end(&mut buf) {
+                    Ok(_) => buf,
+                    Err(_) => Vec::new(),
+                }
+            })
+        })
+    }
+
+    // Join a reader thread, treating a join error (panicked thread) as
+    // empty bytes so a reader can never block the caller's return.
+    fn collect(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+        handle.and_then(|h| h.join().ok()).unwrap_or_default()
+    }
+
+    let stdout_handle = drain(child.stdout.take());
+    let stderr_handle = drain(child.stderr.take());
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut s) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_end(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_end(&mut stderr);
-                }
-                if status.success() {
-                    return Ok(());
-                }
-                let stderr_s = String::from_utf8_lossy(&stderr).trim().to_string();
-                return Err(anyhow!("git fetch {remote} failed: {stderr_s}"));
+                let stdout = collect(stdout_handle);
+                let stderr = collect(stderr_handle);
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(anyhow!(
-                        "git fetch {remote} timed out after {timeout_secs}s"
-                    ));
+                    // The killed child closed its pipe write ends, so both
+                    // readers reach EOF; join them so neither is leaked.
+                    let _ = collect(stdout_handle);
+                    let _ = collect(stderr_handle);
+                    return Err(anyhow!("{op_label} timed out after {timeout_secs}s"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                return Err(anyhow!("waiting on `git fetch {remote}`: {e}"));
+                let _ = collect(stdout_handle);
+                let _ = collect(stderr_handle);
+                return Err(anyhow!("waiting on `{op_label}`: {e}"));
             }
         }
     }
@@ -418,17 +475,25 @@ pub fn delete_branch_remote(workspace: &Path, branch: &str, remote: &str) -> Res
     Ok(())
 }
 
-/// Return the trimmed stdout of `git status --porcelain`. Empty string ⇒
-/// clean working tree.
+/// Return the stdout of `git status --porcelain`, trailing-trimmed only.
+/// Empty string ⇒ clean working tree.
+///
+/// The whole blob is `.trim_end()`-ed rather than `.trim()`-ed on purpose:
+/// a worktree-modified-but-not-staged file's record has a blank staged
+/// column, so it begins with a leading space (` M <path>`). A whole-string
+/// `.trim()` would strip that leading space off the FIRST record,
+/// collapsing its `XY␣` prefix to two chars and decapitating that record's
+/// path for any caller that slices by fixed offset.
 pub fn status_porcelain(workspace: &Path) -> Result<String> {
     let output = run_git(workspace, "status --porcelain", &["status", "--porcelain"])?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
 
-/// Return the trimmed stdout of `git status --porcelain -uall`. Unlike
-/// `status_porcelain`, this expands untracked directories to every
-/// individual file path inside them, so callers doing per-path policy
-/// checks (e.g. the audit framework's `WritePolicy::OpenSpecOnly`
+/// Return the stdout of `git status --porcelain -uall`, trailing-trimmed
+/// only (see [`status_porcelain`] for why the leading status-space must
+/// survive). Unlike `status_porcelain`, this expands untracked directories
+/// to every individual file path inside them, so callers doing per-path
+/// policy checks (e.g. the audit framework's `WritePolicy::OpenSpecOnly`
 /// enforcement) see the actual paths, not just the parent dir.
 pub fn status_porcelain_untracked_all(workspace: &Path) -> Result<String> {
     let output = run_git(
@@ -436,7 +501,82 @@ pub fn status_porcelain_untracked_all(workspace: &Path) -> Result<String> {
         "status --porcelain -uall",
         &["status", "--porcelain", "-uall"],
     )?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+}
+
+/// One parsed record from `git status -z --porcelain`. `staged` is the
+/// index (X) status code, `worktree` is the worktree (Y) status code,
+/// `path` is the (verbatim, unquoted) path, AND `orig_path` is the
+/// rename/copy source path when the record is a rename or copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub staged: char,
+    pub worktree: char,
+    pub path: String,
+    pub orig_path: Option<String>,
+}
+
+/// Parse the working tree's status into structured [`StatusEntry`] records
+/// via `git status -z --porcelain --untracked-files=all`. This is the
+/// single source of truth for working-tree status parsing in the daemon —
+/// every caller that needs the changed paths (and/or their status codes)
+/// goes through here rather than hand-slicing porcelain lines.
+///
+/// `-z` is load-bearing. It emits NUL-terminated records with paths
+/// VERBATIM — no `core.quotePath` C-escaping and no surrounding quotes —
+/// so a path containing a space or non-ASCII bytes parses correctly with
+/// no unquoting step. The raw output is split on the NUL byte rather than
+/// trimmed as a whole: a whole-blob trim would strip the leading
+/// staged-status space of the first record (a worktree-modified file's
+/// blank X column), decapitating that record's path.
+///
+/// Within a record the first two chars are the staged (X) AND worktree (Y)
+/// status codes, the third char is a space, AND the remainder is the path.
+/// A rename/copy record (X or Y is `R` or `C`) is immediately followed by
+/// a second NUL-terminated token carrying the original path, captured as
+/// `orig_path`; that token is consumed so the record stream stays aligned.
+pub fn status_entries(workspace: &Path) -> Result<Vec<StatusEntry>> {
+    let output = run_git(
+        workspace,
+        "status -z --porcelain --untracked-files=all",
+        &["status", "-z", "--porcelain", "--untracked-files=all"],
+    )?;
+    let mut records = output.stdout.split(|&b| b == 0u8);
+    let mut entries = Vec::new();
+    while let Some(record) = records.next() {
+        // A valid record is `XY <path>`: two status chars + a space + at
+        // least one path byte (>= 4 bytes). The split's trailing element
+        // after the final NUL is empty; skip it AND any stray short
+        // record. The path bytes are NOT trimmed — under `-z` they are
+        // exact, so a leading/trailing space in a filename survives.
+        if record.len() < 4 {
+            continue;
+        }
+        let staged = record[0] as char;
+        let worktree = record[1] as char;
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        if path.is_empty() {
+            continue;
+        }
+        // A rename (`R`) or copy (`C`) in either status column carries the
+        // original path in the immediately-following NUL token; consume it
+        // to keep the record stream aligned with the status records.
+        let orig_path = if matches!(staged, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
+            records
+                .next()
+                .map(|src| String::from_utf8_lossy(src).into_owned())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        entries.push(StatusEntry {
+            staged,
+            worktree,
+            path,
+            orig_path,
+        });
+    }
+    Ok(entries)
 }
 
 /// Return the 40-character commit SHA pointed to by `rev`.
@@ -782,6 +922,100 @@ mod tests {
         commit(&path, "add note").unwrap();
         let s = status_porcelain(&path).unwrap();
         assert_eq!(s, "");
+    }
+
+    #[test]
+    fn status_entries_empty_on_clean_tree() {
+        let (_dir, path) = fixture_repo();
+        assert!(
+            status_entries(&path).unwrap().is_empty(),
+            "a clean tree must yield no entries"
+        );
+    }
+
+    /// 3.1 — pins the changelog regression: a worktree-modified tracked
+    /// file whose record is the FIRST (and only) record keeps its full
+    /// path. A whole-blob `.trim()` used to drop the leading status-space,
+    /// decapitating `openspec/...` to `penspec/...`.
+    #[test]
+    fn status_entries_worktree_modified_first_record_keeps_full_path() {
+        let (_dir, path) = fixture_repo();
+        let rel = "openspec/changes/archive/a001-slug/proposal.md";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "before\n").unwrap();
+        run_init(&path, &["add", rel]);
+        run_init(&path, &["commit", "-q", "-m", "add proposal"]);
+        // Worktree-modify it WITHOUT staging — the staged column is blank.
+        std::fs::write(&abs, "after\n").unwrap();
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "expected one entry, got {entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, rel, "no leading character may be dropped");
+        assert_eq!(e.staged, ' ', "staged code must be a blank space");
+        assert_eq!(e.worktree, 'M', "worktree code must be M");
+        assert_eq!(e.orig_path, None);
+    }
+
+    /// 3.2 — a path containing a space parses to the literal path, with no
+    /// surrounding quote characters and no truncation (`-z` disables
+    /// `core.quotePath`).
+    #[test]
+    fn status_entries_path_with_spaces_parses_literally() {
+        let (_dir, path) = fixture_repo();
+        let rel = "dir with spaces/note.md";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "x\n").unwrap();
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, rel, "spaced path must parse literally");
+        assert_eq!((e.staged, e.worktree), ('?', '?'), "untracked file is ??");
+    }
+
+    /// 3.3 — a staged rename yields the destination path AND the original
+    /// path captured from the trailing `-z` token.
+    #[test]
+    fn status_entries_staged_rename_captures_orig_path() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("old.md"), "content\n").unwrap();
+        run_init(&path, &["add", "old.md"]);
+        run_init(&path, &["commit", "-q", "-m", "add old.md"]);
+        // `git mv` stages the rename old.md -> new.md.
+        run_init(&path, &["mv", "old.md", "new.md"]);
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "a rename is one entry, got {entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, "new.md");
+        assert_eq!(e.orig_path, Some("old.md".to_string()));
+        assert_eq!(e.staged, 'R', "staged rename index code must be R");
+    }
+
+    /// 3.4 — a staged new file is distinguishable from an untracked one:
+    /// its index (staged) code is `A`, not `?`.
+    #[test]
+    fn status_entries_staged_new_file_is_added_not_untracked() {
+        let (_dir, path) = fixture_repo();
+        let rel = "src/new.rs";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "fn main() {}\n").unwrap();
+        run_init(&path, &["add", rel]);
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.staged, 'A', "a staged add's index code must be A");
+        assert_eq!(e.path, "src/new.rs");
+        assert_ne!(
+            (e.staged, e.worktree),
+            ('?', '?'),
+            "a staged add must be distinguishable from an untracked file"
+        );
     }
 
     #[test]
@@ -1391,5 +1625,54 @@ mod tests {
             !msg.ends_with("failed: "),
             "error must NOT end in a bare colon-space: {msg:?}"
         );
+    }
+
+    /// Regression test for the pipe deadlock: a child that writes far more
+    /// than the OS pipe buffer (~64 KiB) before exiting must complete and
+    /// surface its captured output, NOT escape only via the timeout. If
+    /// the concurrent drain regressed to read-after-exit, the child would
+    /// block on the full stderr pipe, `try_wait()` would never report
+    /// exit, and this would fail closed with a timeout `Err`.
+    #[test]
+    fn wait_capture_drains_more_than_pipe_buffer_without_timeout() {
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 5000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' 1>&2; i=$((i+1)); done; exit 1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_capture_with_timeout(child, "test fetch", 30)
+            .expect("large-output child must complete, not time out");
+        assert!(
+            !output.status.success(),
+            "child exits non-zero; status was {:?}",
+            output.status
+        );
+        assert!(
+            output.stderr.len() > 64 * 1024,
+            "expected >64 KiB of captured stderr, got {} bytes",
+            output.stderr.len()
+        );
+    }
+
+    /// The genuine-timeout path still kills the child and reports a
+    /// timeout when the process never exits within the window.
+    #[test]
+    fn wait_capture_reports_timeout_when_child_never_exits() {
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = wait_capture_with_timeout(child, "test sleep", 1)
+            .expect_err("a child that never exits must time out");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed out after 1s"), "got: {msg}");
     }
 }

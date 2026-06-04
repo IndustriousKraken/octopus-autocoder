@@ -2154,6 +2154,24 @@ mod tests {
         assert_eq!(d, FilterDecision::Dispatch(MentionForm::UserId));
     }
 
+    /// a000 §4.5 regression guard: the GitHub `author_association`
+    /// authorization gate is scoped to GitHub PR/issue comments and must
+    /// NOT leak into the Slack inbound path. A verb in an allowlisted
+    /// channel from an ordinary human dispatches purely on channel
+    /// allowlist + leading-mention grounds — `AppMentionEvent` carries no
+    /// association field and `classify_app_mention` consults none, so the
+    /// GitHub gate cannot regress the Slack path.
+    #[test]
+    fn a000_slack_verb_in_allowlisted_channel_dispatches_without_association_check() {
+        let e = evt("<@UBOT> status myrepo", "C_OPS", Some("U_RANDO"));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
+        assert_eq!(
+            d,
+            FilterDecision::Dispatch(MentionForm::UserId),
+            "Slack dispatch must not require any author_association (a000 GitHub gate is GitHub-only)"
+        );
+    }
+
     #[test]
     fn filter_passes_with_bot_id_mention_when_cached() {
         // Mobile-client form: `<@B...>`. When `bot_id` is cached the
