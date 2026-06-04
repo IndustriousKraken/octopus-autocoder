@@ -453,13 +453,20 @@ fn render_brownfield_prompt(
     docs_listing: &str,
     symbols_overview: &str,
 ) -> String {
-    template
-        .replace("{{capability_name}}", capability_name)
-        .replace("{{guidance}}", guidance)
-        .replace("{{repo_url}}", repo_url)
-        .replace("{{readme}}", readme)
-        .replace("{{docs_listing}}", docs_listing)
-        .replace("{{symbols_overview}}", symbols_overview)
+    // Single-pass substitution (a002): an injected README / docs listing /
+    // symbols overview / operator-guidance value that itself contains a
+    // `{{...}}` token is emitted verbatim, never re-expanded.
+    crate::prompts::render_template(
+        template,
+        &[
+            ("capability_name", capability_name),
+            ("guidance", guidance),
+            ("repo_url", repo_url),
+            ("readme", readme),
+            ("docs_listing", docs_listing),
+            ("symbols_overview", symbols_overview),
+        ],
+    )
 }
 
 /// Read the workspace's `README.md`. Returns a placeholder when the
