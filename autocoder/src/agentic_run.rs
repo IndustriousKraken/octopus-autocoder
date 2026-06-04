@@ -12,18 +12,20 @@
 //! at exit.
 //!
 //! CLI selection is abstracted behind the [`CliStrategy`] trait so a
-//! model's provider can pick the `claude` CLI today and `opencode` later
-//! without role code changing. This change registers only the
-//! [`ClaudeStrategy`]; a provider that resolves to any other CLI returns
-//! a clear "strategy not yet implemented" error
+//! model's provider can pick the `claude` CLI or the provider-agnostic
+//! `opencode` CLI without role code changing. Two strategies are
+//! registered: [`ClaudeStrategy`] (Anthropic-shaped, streaming-capable)
+//! and [`OpencodeStrategy`] (a60 — any OpenAI-compatible / Ollama
+//! endpoint, capture-mode only). A provider that resolves to any other
+//! CLI returns a clear "strategy not yet implemented" error
 //! ([`strategy_for_provider`]).
 //!
 //! The refactor is behavior-neutral: the executor keeps streaming-JSON +
 //! MCP + the recovery/session-reuse path; each audit keeps simple-capture
 //! + no-MCP + its read-only tool list + its ETXTBSY retry.
 
-use anyhow::{Context, Result, anyhow};
-use std::path::Path;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,10 +73,10 @@ pub enum OutputMode {
 /// the model registry's resolution of a role's model (a55); `None` at a
 /// call site preserves the CLI's own default-model behavior.
 pub struct ResolvedModel {
-    /// Carried for completeness of the resolved tuple AND for strategy
-    /// dispatch (the strategy is selected from the provider before this is
-    /// constructed); `apply_model_selection` itself does not read it.
-    #[allow(dead_code)]
+    /// The model's provider. The `claude` strategy carries it only for
+    /// dispatch (its `apply_model_selection` keys off env, not provider);
+    /// the `opencode` strategy reads it to build `--model <provider>/<model>`
+    /// AND the `opencode.json` provider id.
     pub provider: crate::config::LlmProvider,
     pub model: String,
     pub api_base_url: String,
@@ -93,8 +95,10 @@ pub struct SandboxConfig {
 }
 
 /// Context a [`CliStrategy`] reads when building the invocation. The
-/// settings file has already been written by [`agentic_run`]; the strategy
-/// only assembles argv.
+/// claude-format settings file has already been written by [`agentic_run`];
+/// the `claude` strategy references it and only assembles argv. The
+/// `opencode` strategy ignores `settings_path` (opencode uses its own
+/// `opencode.json` permission config, which it writes from this context).
 pub struct BuildContext<'a> {
     pub settings_path: &'a Path,
     pub allowed_tools: &'a [String],
@@ -104,8 +108,25 @@ pub struct BuildContext<'a> {
     pub include_autocoder_tools: bool,
     /// Emit `--verbose --output-format stream-json` on the command.
     pub emit_stream_json: bool,
-    /// `--resume <session_id>` for the recovery turn.
+    /// `--resume <session_id>` for the recovery turn (claude only).
     pub resume_session_id: Option<&'a str>,
+    /// The run's workspace. The `opencode` strategy writes `opencode.json`
+    /// here (MCP block + provider config + permissions); the `claude`
+    /// strategy does not read it (its caller writes `.mcp.json`).
+    pub workspace: &'a Path,
+    /// The MCP role this run serves (a56): the value written as
+    /// `ORCH_MCP_ROLE` (and the submission-store key) into the `opencode`
+    /// strategy's `opencode.json` `mcp` block so the role's `submit_*` tool
+    /// is reachable. `None` → no submission tool is advertised. The
+    /// `claude` strategy ignores it (its caller writes the MCP env via
+    /// `write_mcp_config`).
+    pub mcp_role: Option<&'a str>,
+    /// The resolved model, so the `opencode` strategy can write the
+    /// provider config (base URL + key) into `opencode.json`. `None`
+    /// preserves the CLI's own default-model behavior. The `claude`
+    /// strategy ignores it here (it sets `ANTHROPIC_*` env in
+    /// `apply_model_selection` instead).
+    pub model: Option<&'a ResolvedModel>,
 }
 
 /// Abstracts CLI invocation so a model's provider can determine the CLI
@@ -189,6 +210,228 @@ impl CliStrategy for ClaudeStrategy {
     }
 }
 
+/// Filename of the opencode config the [`OpencodeStrategy`] writes into the
+/// workspace. opencode auto-discovers `opencode.json` from the project root
+/// (the run's working directory, set by [`agentic_run`]).
+const OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
+
+/// The `opencode` CLI strategy (a60). Builds `opencode run` invocations for
+/// the provider-agnostic `opencode` CLI so a role whose model resolves to
+/// `opencode` (a55's `provider → CLI` rule for `openai_compatible`/`ollama`,
+/// OR an explicit `cli: opencode`) runs agentically instead of erroring.
+///
+/// Unlike [`ClaudeStrategy`], opencode carries everything in one workspace
+/// config file, `opencode.json`: the MCP `mcp` block (`type: local`, the
+/// MCP-child command, env including `ORCH_MCP_ROLE`), the resolved provider
+/// config (base URL + key), AND a `permission` block mapped from a56's
+/// sandbox. [`OpencodeStrategy::build_command`] writes that file; model
+/// selection is `--model <provider>/<model>` (NOT `ANTHROPIC_*` env). It
+/// writes NO `.mcp.json` (the `claude` MCP format). The prompt is delivered
+/// on stdin — [`agentic_run`] already pipes it, AND headless `opencode run`
+/// reads its message from piped stdin — so `build_command` appends no
+/// positional message (which would also risk `ARG_MAX` on large review
+/// prompts; see the integration spike notes).
+///
+/// opencode is capture-mode only; the streaming-JSON event path
+/// (`final_answer` / `session_id` / incremental log) stays claude-specific.
+pub struct OpencodeStrategy {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl OpencodeStrategy {
+    pub fn new(command: String, args: Vec<String>) -> Self {
+        Self { command, args }
+    }
+
+    /// The MCP child's env map for `opencode.json` (`mcp.<server>.environment`).
+    /// Mirrors `ClaudeCliExecutor::write_mcp_config`: always the workspace;
+    /// the role (as both `ORCH_MCP_CHANGE` submission key AND `ORCH_MCP_ROLE`)
+    /// when a role is set; the daemon control-socket vars when the parent
+    /// process carries them (canonical_rag configured).
+    fn mcp_environment(ctx: &BuildContext<'_>) -> serde_json::Value {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            crate::mcp_askuser_server::ENV_WORKSPACE.to_string(),
+            serde_json::Value::String(ctx.workspace.to_string_lossy().into_owned()),
+        );
+        if let Some(role) = ctx.mcp_role {
+            // For the submission roles the change name AND the role name are
+            // the same value (the reviewer/contradiction call sites pass
+            // their role as both); see `write_mcp_config`.
+            env.insert(
+                crate::mcp_askuser_server::ENV_CHANGE.to_string(),
+                serde_json::Value::String(role.to_string()),
+            );
+            env.insert(
+                crate::mcp_askuser_server::ENV_ROLE.to_string(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
+        if let Ok(socket) = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET) {
+            env.insert(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET.to_string(),
+                serde_json::Value::String(socket),
+            );
+            let basename = std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME)
+                .unwrap_or_else(|_| {
+                    ctx.workspace
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown_workspace")
+                        .to_string()
+                });
+            env.insert(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME.to_string(),
+                serde_json::Value::String(basename),
+            );
+        }
+        serde_json::Value::Object(env)
+    }
+
+    /// Map a56's allowed-tools list onto opencode's `permission` block. Each
+    /// permission opencode gates is `"allow"` when the equivalent tool is in
+    /// the allowed list, else `"deny"`. A read-only sandbox
+    /// (`["Read","Glob","Grep"]`) therefore denies `edit` (file mutation —
+    /// opencode's `edit` permission governs both its `write` and `edit`
+    /// tools), `bash`, AND `webfetch`. The always-available read tools
+    /// (read/grep/glob) are not permission-gated; the role's `submit_*` tool
+    /// is exposed via the `mcp` block.
+    fn permission_block(allowed_tools: &[String]) -> serde_json::Value {
+        let allows = |name: &str| allowed_tools.iter().any(|t| t.eq_ignore_ascii_case(name));
+        let verdict = |allowed: bool| if allowed { "allow" } else { "deny" };
+        serde_json::json!({
+            "edit": verdict(allows("Edit") || allows("Write")),
+            "bash": verdict(allows("Bash")),
+            "webfetch": verdict(allows("WebFetch")),
+        })
+    }
+
+    /// The `provider` block for the resolved model, keyed by the provider's
+    /// id (`openai_compatible` / `ollama`) so it matches the `--model
+    /// <provider>/<model>` selection. `None` when no model is configured
+    /// (opencode uses its own default). The api key is omitted when empty
+    /// (Ollama does not authenticate).
+    fn provider_block(model: Option<&ResolvedModel>) -> Option<serde_json::Value> {
+        let m = model?;
+        let provider_id = m.provider.as_str();
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "baseURL".to_string(),
+            serde_json::Value::String(m.api_base_url.clone()),
+        );
+        if !m.api_key.is_empty() {
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String(m.api_key.clone()),
+            );
+        }
+        let mut models = serde_json::Map::new();
+        models.insert(m.model.clone(), serde_json::json!({}));
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "npm".to_string(),
+            serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
+        );
+        entry.insert(
+            "name".to_string(),
+            serde_json::Value::String(provider_id.to_string()),
+        );
+        entry.insert("options".to_string(), serde_json::Value::Object(options));
+        entry.insert("models".to_string(), serde_json::Value::Object(models));
+        let mut provider = serde_json::Map::new();
+        provider.insert(provider_id.to_string(), serde_json::Value::Object(entry));
+        Some(serde_json::Value::Object(provider))
+    }
+
+    /// Assemble the full `opencode.json` value: the `mcp` block, the
+    /// `permission` block, AND (when a model is resolved) the `provider`
+    /// block.
+    fn config_value(ctx: &BuildContext<'_>) -> Result<serde_json::Value> {
+        // We may be running from a non-autocoder binary (e.g. cargo test).
+        // `current_exe` is the actual running binary; in production the
+        // `autocoder` binary, whose `mcp-ask-user-server` subcommand the MCP
+        // child runs.
+        let exe = std::env::current_exe()
+            .context("resolving current autocoder binary path for opencode MCP config")?;
+        let mut server = serde_json::Map::new();
+        server.insert(
+            "type".to_string(),
+            serde_json::Value::String("local".to_string()),
+        );
+        server.insert(
+            "command".to_string(),
+            serde_json::json!([exe.to_string_lossy(), "mcp-ask-user-server"]),
+        );
+        server.insert("environment".to_string(), Self::mcp_environment(ctx));
+        server.insert("enabled".to_string(), serde_json::Value::Bool(true));
+
+        let mut mcp = serde_json::Map::new();
+        mcp.insert(
+            crate::mcp_askuser_server::SERVER_NAME.to_string(),
+            serde_json::Value::Object(server),
+        );
+
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "$schema".to_string(),
+            serde_json::Value::String("https://opencode.ai/config.json".to_string()),
+        );
+        config.insert("mcp".to_string(), serde_json::Value::Object(mcp));
+        config.insert(
+            "permission".to_string(),
+            Self::permission_block(ctx.allowed_tools),
+        );
+        if let Some(provider) = Self::provider_block(ctx.model) {
+            config.insert("provider".to_string(), provider);
+        }
+        Ok(serde_json::Value::Object(config))
+    }
+
+    /// Write `<workspace>/opencode.json`. `pub(crate)` so callers that wire
+    /// opencode end-to-end can reuse the exact shape; returns the path.
+    pub(crate) fn write_config(ctx: &BuildContext<'_>) -> Result<PathBuf> {
+        let value = Self::config_value(ctx)?;
+        let path = ctx.workspace.join(OPENCODE_CONFIG_FILENAME);
+        let raw = serde_json::to_string_pretty(&value)?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("writing opencode config {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+impl CliStrategy for OpencodeStrategy {
+    fn build_command(&self, ctx: &BuildContext<'_>) -> Command {
+        // Write the workspace `opencode.json` (MCP + permissions + provider).
+        // Best-effort: a write failure is logged but does not abort argv
+        // assembly (the run will surface the missing-config error itself).
+        if let Err(e) = Self::write_config(ctx) {
+            tracing::warn!(
+                workspace = %ctx.workspace.display(),
+                "failed to write opencode.json (run continues): {e:#}"
+            );
+        }
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args).arg("run");
+        // The prompt is delivered on stdin by `agentic_run`; `opencode run`
+        // reads its message from piped stdin, so no positional message is
+        // appended here. `resume_session_id` is the claude recovery
+        // mechanism (streaming) and is not used by the capture-mode opencode
+        // roles, so it is intentionally ignored.
+        cmd
+    }
+
+    fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>) {
+        if let Some(m) = model {
+            cmd.arg("--model")
+                .arg(format!("{}/{}", m.provider.as_str(), m.model));
+        }
+        // No `ANTHROPIC_*` env — that is the claude strategy's mechanism;
+        // opencode reads the provider config from `opencode.json` (written in
+        // `build_command`) AND the `--model <provider>/<model>` selection.
+    }
+}
+
 /// Resolve a role's strategy from the model's provider via a55's
 /// `provider → default CLI` rule ([`crate::config::default_cli_for`]).
 ///
@@ -204,9 +447,10 @@ pub fn strategy_for_provider(
     strategy_for_cli(crate::config::default_cli_for(provider), command, args)
 }
 
-/// Resolve the strategy for a specific CLI. This change registers only
-/// `claude`; any other CLI returns a clear error naming the CLI (its
-/// strategy lands with a later change) AND no subprocess is spawned.
+/// Resolve the strategy for a specific CLI. `claude` (a56) AND `opencode`
+/// (a60) are registered; both map to a real strategy with no subprocess
+/// spawned at resolution time. The `Result` is retained so a future CLI can
+/// land an error arm without changing call sites.
 #[allow(dead_code)]
 pub fn strategy_for_cli(
     cli: crate::config::CliKind,
@@ -215,10 +459,7 @@ pub fn strategy_for_cli(
 ) -> Result<Box<dyn CliStrategy>> {
     match cli {
         crate::config::CliKind::Claude => Ok(Box::new(ClaudeStrategy::new(command, args))),
-        other => Err(anyhow!(
-            "agentic-run strategy not yet implemented for CLI `{}`; only `claude` is registered in this change",
-            other.as_str()
-        )),
+        crate::config::CliKind::Opencode => Ok(Box::new(OpencodeStrategy::new(command, args))),
     }
 }
 
@@ -289,6 +530,17 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
             include_autocoder_tools: opts.include_autocoder_tools,
             emit_stream_json,
             resume_session_id: opts.resume_session_id,
+            workspace: opts.workspace,
+            model: opts.model,
+            // The submission roles that drive opencode (reviewer a58,
+            // contradiction check a59) currently write their own `.mcp.json`
+            // via `write_mcp_config` and key the role there; threading the
+            // role through to the opencode strategy's `opencode.json` writer
+            // is the call-site change those roles make when they opt into
+            // opencode end-to-end. This change registers the strategy AND
+            // exposes the seam (`BuildContext::mcp_role`); it does not modify
+            // a58/a59, so the production build leaves it `None`.
+            mcp_role: None,
         };
         let mut cmd = opts.strategy.build_command(&ctx);
         opts.strategy.apply_model_selection(&mut cmd, opts.model);
@@ -754,6 +1006,9 @@ mod tests {
             include_autocoder_tools,
             emit_stream_json,
             resume_session_id: resume,
+            workspace: Path::new("/tmp"),
+            mcp_role: None,
+            model: None,
         }
     }
 
@@ -857,32 +1112,38 @@ mod tests {
         assert_eq!(a[pos("--allowedTools") + 1], "Read");
     }
 
-    // 5.4: a provider resolving to a CLI with no registered strategy errors,
-    // naming the CLI; the only registered strategy is `claude`.
+    // Anthropic resolves to the claude strategy.
     #[test]
     fn strategy_for_provider_anthropic_resolves_claude() {
         assert!(strategy_for_provider(LlmProvider::Anthropic, "claude".into(), Vec::new()).is_ok());
     }
 
+    // a60 / task 4.1: the non-Anthropic providers resolve (via a55's
+    // `provider → CLI` rule) to a working `OpencodeStrategy` — NOT the
+    // pre-a60 "no registered strategy" error — AND it builds an `opencode
+    // run` invocation.
     #[test]
-    fn strategy_for_provider_non_claude_errors_naming_cli() {
+    fn strategy_for_provider_non_claude_resolves_opencode() {
         for p in [LlmProvider::OpenAiCompatible, LlmProvider::Ollama] {
-            let err = strategy_for_provider(p, "opencode".into(), Vec::new())
-                .err()
-                .expect("non-claude provider has no registered strategy yet");
-            assert!(
-                format!("{err:#}").contains("opencode"),
-                "error must name the CLI: {err:#}"
-            );
+            let strat = strategy_for_provider(p, "opencode".into(), Vec::new())
+                .expect("non-anthropic provider resolves to the opencode strategy (a60)");
+            let allowed = vec!["Read".to_string()];
+            let tmp = tempfile::tempdir().unwrap();
+            let bctx = BuildContext {
+                workspace: tmp.path(),
+                ..ctx(Path::new("/tmp/s.json"), &allowed, false, false, None)
+            };
+            let cmd = strat.build_command(&bctx);
+            assert_eq!(cmd.as_std().get_program().to_string_lossy(), "opencode");
+            assert_eq!(args(&cmd), vec!["run".to_string()]);
         }
     }
 
+    // a60 / task 4.1: explicit `cli: opencode` (registry override) resolves
+    // to the opencode strategy.
     #[test]
-    fn strategy_for_cli_opencode_errors_naming_cli() {
-        let err = strategy_for_cli(CliKind::Opencode, "opencode".into(), Vec::new())
-            .err()
-            .expect("opencode strategy is not registered in this change");
-        assert!(format!("{err:#}").contains("opencode"));
+    fn strategy_for_cli_opencode_resolves() {
+        assert!(strategy_for_cli(CliKind::Opencode, "opencode".into(), Vec::new()).is_ok());
     }
 
     #[test]
@@ -898,5 +1159,261 @@ mod tests {
                 "{tool} must be auto-appended: {with_mcp}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // a60: OpencodeStrategy.
+    // -----------------------------------------------------------------------
+
+    fn read_opencode_json(workspace: &Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(workspace.join("opencode.json"))
+            .expect("opencode.json was written");
+        serde_json::from_str(&raw).expect("opencode.json is valid JSON")
+    }
+
+    // a60 / task 4.2: the strategy writes `opencode.json` with the `mcp`
+    // block (`type: local`, the MCP-child command, env incl. ORCH_MCP_ROLE)
+    // AND writes NO `.mcp.json`.
+    #[test]
+    fn opencode_strategy_writes_opencode_json_with_mcp_block_and_no_dot_mcp_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        assert!(
+            tmp.path().join("opencode.json").exists(),
+            "opencode.json must be written into the workspace"
+        );
+        assert!(
+            !tmp.path().join(".mcp.json").exists(),
+            "the opencode strategy must NOT write .mcp.json (that is the claude format)"
+        );
+
+        let v = read_opencode_json(tmp.path());
+        let server = &v["mcp"][crate::mcp_askuser_server::SERVER_NAME];
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["enabled"], true);
+        let command = server["command"].as_array().expect("command is an array");
+        assert_eq!(
+            command.last().and_then(|v| v.as_str()),
+            Some("mcp-ask-user-server"),
+            "MCP child launches the autocoder mcp-ask-user-server subcommand"
+        );
+        let env = &server["environment"];
+        assert_eq!(env[crate::mcp_askuser_server::ENV_ROLE], "reviewer");
+        assert_eq!(env[crate::mcp_askuser_server::ENV_CHANGE], "reviewer");
+        assert!(
+            env[crate::mcp_askuser_server::ENV_WORKSPACE].is_string(),
+            "the workspace env var is always written"
+        );
+    }
+
+    // a60 / task 4.2: with no role, no submission env is advertised (no
+    // ORCH_MCP_ROLE / ORCH_MCP_CHANGE).
+    #[test]
+    fn opencode_strategy_omits_role_env_when_no_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: None,
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        let v = read_opencode_json(tmp.path());
+        let env = &v["mcp"][crate::mcp_askuser_server::SERVER_NAME]["environment"];
+        assert!(env.get(crate::mcp_askuser_server::ENV_ROLE).is_none());
+        assert!(env.get(crate::mcp_askuser_server::ENV_CHANGE).is_none());
+    }
+
+    // a60 / task 4.3: model selection targets the configured provider —
+    // `--model <provider>/<model>` + the opencode.json provider entry — AND
+    // sets none of the ANTHROPIC_* env vars.
+    #[test]
+    fn opencode_strategy_model_selection_sets_model_flag_and_provider_no_anthropic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let model = ResolvedModel {
+            provider: LlmProvider::OpenAiCompatible,
+            model: "gpt-4o-mini".into(),
+            api_base_url: "https://api.example.invalid/v1".into(),
+            api_key: "sk-secret".into(),
+        };
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            model: Some(&model),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let mut cmd = strat.build_command(&bctx);
+        strat.apply_model_selection(&mut cmd, Some(&model));
+
+        let a = args(&cmd);
+        let pos = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[pos + 1], "openai_compatible/gpt-4o-mini");
+
+        let v = read_opencode_json(tmp.path());
+        let provider = &v["provider"]["openai_compatible"];
+        assert_eq!(provider["options"]["baseURL"], "https://api.example.invalid/v1");
+        assert_eq!(provider["options"]["apiKey"], "sk-secret");
+        assert!(
+            provider["models"]["gpt-4o-mini"].is_object(),
+            "the resolved model is registered under the provider"
+        );
+
+        let e = envs(&cmd);
+        assert!(!e.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!e.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!e.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    // a60 / task 4.3: an Ollama model (no api key) omits the apiKey option.
+    #[test]
+    fn opencode_strategy_ollama_provider_omits_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let model = ResolvedModel {
+            provider: LlmProvider::Ollama,
+            model: "qwen2.5-coder".into(),
+            api_base_url: "http://localhost:11434".into(),
+            api_key: String::new(),
+        };
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            model: Some(&model),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let mut cmd = strat.build_command(&bctx);
+        strat.apply_model_selection(&mut cmd, Some(&model));
+
+        let a = args(&cmd);
+        let pos = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[pos + 1], "ollama/qwen2.5-coder");
+
+        let v = read_opencode_json(tmp.path());
+        let options = &v["provider"]["ollama"]["options"];
+        assert_eq!(options["baseURL"], "http://localhost:11434");
+        assert!(
+            options.get("apiKey").is_none(),
+            "ollama does not authenticate; apiKey must be omitted"
+        );
+    }
+
+    // a60 / task 4.4: a read-only role's Write/Edit/Bash are denied via the
+    // generated permission config; the role's MCP tool is still exposed.
+    #[test]
+    fn opencode_strategy_readonly_denies_write_edit_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        let v = read_opencode_json(tmp.path());
+        let perm = &v["permission"];
+        assert_eq!(perm["edit"], "deny", "Write/Edit denied for a read-only role");
+        assert_eq!(perm["bash"], "deny", "Bash denied for a read-only role");
+        assert_eq!(perm["webfetch"], "deny");
+        // The role's submission tool stays reachable via the mcp block.
+        assert_eq!(
+            v["mcp"][crate::mcp_askuser_server::SERVER_NAME]["environment"]
+                [crate::mcp_askuser_server::ENV_ROLE],
+            "reviewer"
+        );
+    }
+
+    // a60 / task 4.4 (converse): a write-enabled sandbox allows edit + bash.
+    #[test]
+    fn opencode_strategy_write_sandbox_allows_edit_and_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = crate::config::default_allowed_tools();
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = OpencodeStrategy::new("opencode".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        let v = read_opencode_json(tmp.path());
+        assert_eq!(v["permission"]["edit"], "allow");
+        assert_eq!(v["permission"]["bash"], "allow");
+    }
+
+    // a60 / task 4.5: an opencode role runs through `agentic_run` in capture
+    // mode — stdout/stderr read at exit, NO streaming-JSON parse (no
+    // final_answer / session_id / structured log).
+    #[tokio::test]
+    async fn opencode_role_runs_through_agentic_run_in_capture_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // Stub `opencode`: drain stdin (the piped prompt), print a line,
+        // exit 0. Stands in for the real binary so the capture path runs.
+        let stub = tmp.path().join("opencode_stub.sh");
+        std::fs::write(&stub, "#!/bin/sh\ncat >/dev/null\necho 'opencode stub done'\n").unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let strat = OpencodeStrategy::new(stub.to_string_lossy().into_owned(), Vec::new());
+        let outcome = agentic_run(AgenticRunOpts {
+            workspace: tmp.path(),
+            change: "reviewer",
+            strategy: &strat,
+            prompt: "review this change",
+            sandbox: SandboxConfig {
+                allowed_tools: vec!["Read".to_string()],
+                disallowed_bash_patterns: Vec::new(),
+                disallowed_read_paths: Vec::new(),
+                deny_writes: true,
+            },
+            model: None,
+            output_mode: OutputMode::Capture,
+            timeout: std::time::Duration::from_secs(30),
+            paths: None,
+            settings_dir: Some(tmp.path()),
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: false,
+            etxtbsy_retry_spawn: false,
+        })
+        .await
+        .expect("agentic_run completes for the opencode stub");
+
+        assert!(!outcome.timed_out);
+        assert!(
+            outcome.stdout.contains("opencode stub done"),
+            "capture mode reads stdout at exit: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.final_answer.is_none(),
+            "capture mode does NOT parse a streaming-JSON final_answer"
+        );
+        assert!(
+            outcome.session_id.is_none(),
+            "capture mode does NOT parse a streaming-JSON session_id"
+        );
+        assert!(
+            !outcome.streamed_log,
+            "capture mode does NOT write the streaming structured log"
+        );
+        // The strategy wrote opencode.json (not .mcp.json) for the run.
+        assert!(tmp.path().join("opencode.json").exists());
+        assert!(!tmp.path().join(".mcp.json").exists());
     }
 }
