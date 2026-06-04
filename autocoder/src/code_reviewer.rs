@@ -1229,7 +1229,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_DEFAULT", "k") };
         let cfg_default = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_DEFAULT".into()),
             api_key: None,
@@ -1255,7 +1255,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_TRUE", "k") };
         let cfg_true = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_TRUE".into()),
             api_key: None,
@@ -1325,7 +1325,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_FALSE_GATE", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_FALSE_GATE".into()),
             api_key: None,
@@ -1361,7 +1361,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_KEY_OVERRIDE", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_OVERRIDE".into()),
             api_key: None,
@@ -1402,7 +1402,7 @@ this is not yaml: at all: ::: {{{ broken
         let bogus = std::path::PathBuf::from("/nonexistent/orchestrator-test-template.md");
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_MISSING_TMPL".into()),
             api_key: None,
@@ -1442,7 +1442,7 @@ this is not yaml: at all: ::: {{{ broken
         std::fs::write(&legacy, "LEGACY REVIEW TEMPLATE").unwrap();
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_NESTED".into()),
             api_key: None,
@@ -1471,7 +1471,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_KEY_DEFAULT", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_DEFAULT".into()),
             api_key: None,
