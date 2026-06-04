@@ -237,6 +237,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         }
     }
 

@@ -4510,6 +4510,7 @@ github:
             owner_tokens: None,
             fork_owner: Some("fork-acc".to_string()),
             recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
         };
 
         let pr = super::fetch_latest_pr_at(&server.url(), &repo, &gh).await;

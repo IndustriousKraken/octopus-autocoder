@@ -199,24 +199,62 @@ next polling iteration, the daemon:
 The trigger pattern is strict: the comment body's first non-whitespace
 token must be `@<bot>` (case-insensitive on the username) and the next
 token must be `revise` (case-insensitive). Comments like `@<bot> looks
-good` are conversational and are ignored. Anyone with GitHub write access
-to the repo can post a revision — the trust boundary matches the existing
-ChatOps channel.
+good` are conversational and are ignored.
 
-**Revision cap (automatic only).** Each PR has a per-PR cap on
-**automatic** revisions (default `5`; configurable via
+### Authorizing PR-comment triggers
+
+Before dispatching **any** comment-sourced verb (`@<bot> revise`,
+`@<bot> code-review`, and any future comment verb), the daemon authorizes
+the commenter — this is the GitHub analog of the Slack channel allowlist,
+and it is **default-deny**. A trigger is authorized when **either** the
+comment's GitHub `author_association` is in
+`github.command_authorization.allowed_associations` (default
+`OWNER` / `MEMBER` / `COLLABORATOR` — exactly the associations with
+write/triage permission) **or** the author's `login` is in
+`github.command_authorization.allowed_users`.
+
+An unauthorized verb-comment is **dropped before any work**: no executor or
+reviewer runs, the seen-marker is advanced so the comment does not re-fire,
+and the drop is logged at INFO with the author `login` and
+`author_association`. An absent or unrecognized association is treated as
+unauthorized (it can still pass via `allowed_users`). By default no reply
+is posted (avoiding comment spam and reply loops); set
+`github.command_authorization.decline_comment: true` to post exactly one
+polite decline reply per dropped trigger.
+
+This closes the public-trigger hole on shared/public repositories: only
+repo owners/members/collaborators (plus any configured `allowed_users`)
+can drive `revise` / `code-review`. Reviewer-initiated automatic revisions
+(the `<!-- reviewer-revision -->` comments the bot posts on its own behalf)
+are trusted internal triggers and bypass this gate. See
+[`github.command_authorization`](CONFIG.md#githubcommand_authorization) for
+the config reference. The Slack chatops path is unaffected — it remains
+gated by the channel allowlist with no `author_association` check.
+
+**Revision cap (automatic).** Each PR has a per-PR cap on **automatic**
+revisions (default `5`; configurable via
 `executor.max_auto_revisions_per_pr`, hard-clamped at `20`; the legacy
 key `executor.max_revisions_per_pr` is still accepted as an alias). The
 cap counts ONLY reviewer-marked automatic revisions (the
-`<!-- reviewer-revision -->` comments) — **human `@<bot> revise` requests
-are never capped and always process.** When an automatic revision would
+`<!-- reviewer-revision -->` comments). When an automatic revision would
 exceed the cap, the daemon posts a one-time decline comment starting with
 `🛑 Revision cap reached` AND a ChatOps notification, then silently
-ignores subsequent automatic triggers on that PR (human triggers continue
-to process). Close + re-open or merge as-is to reset the cap.
+ignores subsequent automatic triggers on that PR. Close + re-open or merge
+as-is to reset the cap.
+
+**Revision cap (human, a000).** Authorized human `@<bot> revise` triggers
+are bounded by a **separate** per-PR cap, `executor.max_revise_triggers_per_pr`
+(default `10`), tracked with a distinct counter. This closes the
+previously-uncapped human-revise path. Past the cap, further `@<bot> revise`
+triggers on that PR are declined with exactly one
+`🛑 Human-revision cap reached` notice and do **not** invoke the executor.
+The human cap, the automatic cap, and the re-review cap
+(`reviewer.max_code_reviews_per_pr`) are fully independent — exhausting one
+does not affect the others. See
+[`executor.max_revise_triggers_per_pr`](CONFIG.md#executormax_revise_triggers_per_pr).
 
 **State persistence.** Per-PR state (last-seen-timestamp,
-automatic-revision count, cap-decline flag) lives at
+automatic-revision count, human-revise count, cap-decline flags) lives at
 `<workspace>/.autocoder/revisions/<pr-number>.json`. Files for
 closed/merged PRs are pruned automatically at iteration start.
 

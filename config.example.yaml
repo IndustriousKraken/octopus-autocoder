@@ -170,14 +170,23 @@ executor:
   # Maximum number of AUTOMATIC (reviewer-marked) revision rounds applied
   # to a single open PR before further automatic triggers are silently
   # ignored. Only revisions the code-reviewer auto-revise path posts (the
-  # `<!-- reviewer-revision -->` comments) count against this cap — human
-  # `@<bot> revise` requests are deliberate and ALWAYS process (never
-  # capped, never declined). Default `5`. `0` disables the PR-comment
-  # revision channel entirely. Values above `20` are clamped to `20` with
-  # a WARN log at startup.
+  # `<!-- reviewer-revision -->` comments) count against this cap. Human
+  # `@<bot> revise` requests are bounded SEPARATELY by
+  # `max_revise_triggers_per_pr` below (a000). Default `5`. `0` disables
+  # the PR-comment revision channel entirely. Values above `20` are clamped
+  # to `20` with a WARN log at startup.
   # The legacy key `max_revisions_per_pr` is still accepted as a silent
   # alias (existing configs load unchanged).
   # max_auto_revisions_per_pr: 5
+
+  # a000: per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted on.
+  # Distinct from `max_auto_revisions_per_pr` (reviewer-initiated
+  # revisions) AND `reviewer.max_code_reviews_per_pr` (re-reviews). Closes
+  # the previously-uncapped human-revise path: past this many authorized
+  # human revisions on one PR, further `@<bot> revise` triggers are
+  # declined (one notice) without invoking the executor. The count lives in
+  # the per-PR state file; the cap is read live from config. Default `10`.
+  # max_revise_triggers_per_pr: 10
 
   # Seconds the `@<bot> wipe-workspace` flow waits for the in-flight
   # per-repo polling iteration to drain (release its busy marker) after
@@ -310,6 +319,30 @@ github:
   # section before enabling.
   #
   # recreate_fork_on_reinit: false
+
+  # a000: authorize who may trigger GitHub comment-sourced verbs
+  # (`@<bot> revise`, `@<bot> code-review`, and any future comment verb).
+  # Before dispatching such a verb, the daemon checks the commenter:
+  # authorization passes when EITHER the comment's GitHub
+  # `author_association` is in `allowed_associations` OR the author's
+  # `login` is in `allowed_users`. Unauthorized comments are dropped before
+  # any executor/reviewer work (default-deny) and the seen-marker is
+  # advanced so they do not re-fire. This is the GitHub analog of the Slack
+  # channel allowlist; the Slack path is unaffected.
+  #
+  # When omitted entirely, the default-deny block below applies:
+  #   allowed_associations: [OWNER, MEMBER, COLLABORATOR]  # write/triage
+  #   allowed_users: []                                    # extra trusted logins
+  #   decline_comment: false   # true posts ONE polite decline reply per drop
+  #
+  # `allowed_associations` entries are validated at startup against the
+  # GitHub set (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR,
+  # FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE); an unknown value fails load.
+  #
+  # command_authorization:
+  #   allowed_associations: [OWNER, MEMBER, COLLABORATOR]
+  #   allowed_users: [trusted-maintainer-handle]
+  #   decline_comment: false
 
 # -------------------------------------------------------------------------
 # Optional capabilities — disabled by default. Uncomment to enable.

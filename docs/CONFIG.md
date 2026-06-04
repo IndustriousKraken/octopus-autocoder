@@ -120,6 +120,41 @@ Cross-link:
 | `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name **or** inline `{ value: "..." }`. See [Multiple GitHub Tokens](CONFIG.md#multiple-github-tokens). |
 | `fork_owner`   | no       | _absent_         | Enables fork-and-PR mode. Names the GitHub handle that owns the forks. See [Fork-and-PR workflow](SECURITY.md#7-fork-and-pr-workflow-recommended-for-org-repos). |
 | `recreate_fork_on_reinit` | no | `false` | When `true` AND fork-PR mode is active AND the workspace directory was absent at iteration start (fresh clone), autocoder deletes the existing fork on GitHub and re-forks upstream before initializing the workspace. Recovers cleanly when the fork has accumulated stale branches no one cares about. **Destructive**: any open PRs whose head branch lives on the deleted fork are closed by GitHub when the head ref disappears. Requires the operator's PAT to include the `delete_repo` scope (without it, the DELETE returns 403, autocoder logs ERROR, and falls back to the conservative non-recreating init path). See [Operating notes — fork recreation on workspace reinitialization](OPERATIONS.md#fork-recreation-on-workspace-reinitialization). |
+| `command_authorization` | no | _default-deny_ | Authorizes who may trigger GitHub comment-sourced verbs (`@<bot> revise`, `@<bot> code-review`). See [`github.command_authorization`](#githubcommand_authorization) below. |
+
+### `github.command_authorization`
+
+Before dispatching **any** verb parsed from a GitHub PR/issue comment
+(`@<bot> revise`, `@<bot> code-review`, and any future comment verb), the
+daemon authorizes the commenter. This is the GitHub analog of the Slack
+channel allowlist; the Slack path is unaffected. Authorization passes when
+**either**:
+
+- the comment's GitHub `author_association` is in `allowed_associations`; **or**
+- the comment author's `login` is in `allowed_users`.
+
+A comment that parses as a verb but whose author is **not** authorized is
+**dropped before dispatch** (default-deny): no executor, reviewer, or other
+billed/LLM work runs, the seen-marker is advanced so it does not re-fire,
+and the drop is logged at INFO with the `login` and `author_association`.
+An absent or unrecognized association is treated as unauthorized (it can
+still pass via `allowed_users`).
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `allowed_associations` | no | `[OWNER, MEMBER, COLLABORATOR]` | GitHub `author_association` values that authorize a commenter — by default exactly those carrying write/triage permission. Each entry is validated at startup against the GitHub set (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`); an unknown value fails config load with a clear error. |
+| `allowed_users` | no | `[]` | Additional trusted GitHub logins authorized regardless of association (for individuals who are not formal collaborators). |
+| `decline_comment` | no | `false` | When `true`, the daemon posts exactly one polite decline reply per dropped trigger. When `false` (the default), unauthorized triggers are silently ignored (no comment spam, no reply/feedback loops). |
+
+```yaml
+github:
+  command_authorization:
+    allowed_associations: [OWNER, MEMBER, COLLABORATOR]   # default
+    allowed_users: [trusted-maintainer-handle]            # default []
+    decline_comment: false                                # default
+```
+
+See [Operating notes — authorizing PR-comment triggers](OPERATIONS.md#authorizing-pr-comment-triggers).
 
 ## `reviewer:` (optional)
 
@@ -338,10 +373,11 @@ Maximum number of **automatic** revision rounds applied to a single open
 PR before further automatic triggers are silently ignored. Only revisions
 the code-reviewer auto-revise path posts — the comments carrying the
 `<!-- reviewer-revision -->` marker — count against this cap. Human
-`@<bot> revise <text>` requests are deliberate and **always process**:
-they are never counted against the cap and are never declined for cap
-reasons. Default `5`. A value of `0` disables the PR-comment revision
-channel entirely (the dispatcher becomes a no-op).
+`@<bot> revise <text>` requests are **not** counted against this cap; they
+are bounded separately by
+[`executor.max_revise_triggers_per_pr`](#executormax_revise_triggers_per_pr).
+Default `5`. A value of `0` disables the PR-comment revision channel
+entirely (the dispatcher becomes a no-op).
 
 > **Renamed (was `executor.max_revisions_per_pr`).** The legacy key is
 > still accepted as a silent serde alias, so existing config files load
@@ -365,6 +401,28 @@ tracks its own automatic-revision count under
 `<state_dir>/revisions/<repo-sanitized>/<pr-number>.json`. When a PR is closed
 or merged, its state file is pruned automatically — the cap resets if the
 PR is re-opened.
+
+## `executor.max_revise_triggers_per_pr`
+
+Per-PR cap on **human-initiated** `@<bot> revise` triggers the daemon acts
+on (a000). This closes the previously-uncapped human-revise path and
+complements [`executor.max_auto_revisions_per_pr`](#executormax_auto_revisions_per_pr)
+(reviewer-initiated revisions) and `reviewer.max_code_reviews_per_pr`
+(re-reviews) — all three caps are independent. Past this many **authorized**
+human revisions on one PR, further `@<bot> revise` triggers are declined
+with exactly one notice and **do not** invoke the executor. Default `10`.
+
+The human-revise count is tracked in the per-PR state file (distinct from
+the automatic-revision and re-review counters); the cap itself is read live
+from config, so a `reload` applies to subsequent triggers. Only triggers
+from an **authorized** commenter (see
+[`github.command_authorization`](#githubcommand_authorization)) count.
+
+```yaml
+executor:
+  kind: claude_cli
+  max_revise_triggers_per_pr: 10   # default
+```
 
 ## `paths:` (optional)
 
