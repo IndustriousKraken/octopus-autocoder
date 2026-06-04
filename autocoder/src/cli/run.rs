@@ -567,6 +567,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
         outcome_store: crate::outcome_store::OutcomeStore::new(),
+        submission_store: crate::submission_store::SubmissionStore::new(),
         paths: daemon_paths.clone(),
     };
     let listener_cancel = cancel.clone();

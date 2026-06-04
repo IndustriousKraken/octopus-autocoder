@@ -15,14 +15,11 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
-    workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
+    workspace_is_valid, workspace_unavailable_outcome,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -207,14 +204,10 @@ impl Audit for DocumentationAudit {
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
 
-        let (settings_path, _settings_guard) =
-            write_sandbox_settings(&sandbox, self.settings_dir.as_deref())
-                .context("generating documentation-audit sandbox settings file")?;
-
         let _ = ctx.log_writer.write_section(
             "documentation_audit_preamble",
             &format!(
-                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nsettings_file: {}\nallowed_tools: {}\nreadme_max_lines: {}\npage_max_lines_without_toc: {}",
+                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nallowed_tools: {}\nreadme_max_lines: {}\npage_max_lines_without_toc: {}",
                 self.executor_command,
                 self.executor_timeout_secs,
                 self.settings
@@ -222,7 +215,6 @@ impl Audit for DocumentationAudit {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<embedded default>".to_string()),
-                settings_path.display(),
                 sandbox.allowed_tools.join(","),
                 self.readme_max_lines(),
                 self.page_max_lines_without_toc(),
@@ -232,13 +224,13 @@ impl Audit for DocumentationAudit {
             .log_writer
             .write_section("documentation_audit_prompt", &prompt);
 
-        let outcome = run_subprocess(
+        let outcome = super::run_audit_cli(
             &self.executor_command,
-            &settings_path,
-            &sandbox.allowed_tools,
+            &sandbox,
             ctx.workspace,
             &prompt,
             Duration::from_secs(self.executor_timeout_secs),
+            self.settings_dir.as_deref(),
         )
         .await
         .context("spawning documentation-audit CLI subprocess")?;
@@ -485,15 +477,8 @@ fn excerpt(s: &str) -> String {
     out
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-}
-
 fn outcome_to_terminal_err(
-    outcome: &SubprocessOutcome,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
     audit_type: &str,
     timeout_secs: u64,
@@ -520,78 +505,6 @@ fn outcome_to_terminal_err(
         ));
     }
     None
-}
-
-async fn run_subprocess(
-    command: &str,
-    settings_path: &std::path::Path,
-    allowed_tools: &[String],
-    workspace: &std::path::Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<SubprocessOutcome> {
-    let mut child = super::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(command);
-        cmd.arg("--settings")
-            .arg(settings_path)
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        cmd
-    })
-    .await
-    .with_context(|| format!("spawning documentation-audit command `{command}`"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let sleeper = tokio::time::sleep(timeout);
-    tokio::pin!(sleeper);
-
-    let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-        biased;
-        () = &mut sleeper => None,
-        res = child.wait() => Some(res),
-    };
-
-    match exit_status {
-        None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Ok(SubprocessOutcome {
-                timed_out: true,
-                exit_status: None,
-                stdout: String::new(),
-                stderr: "timeout".to_string(),
-            })
-        }
-        Some(Err(e)) => Err(e).context("waiting on documentation-audit child process"),
-        Some(Ok(status)) => {
-            let mut stdout_text = String::new();
-            if let Some(ref mut p) = stdout_pipe {
-                let _ = p.read_to_string(&mut stdout_text).await;
-            }
-            let mut stderr_text = String::new();
-            if let Some(ref mut p) = stderr_pipe {
-                let _ = p.read_to_string(&mut stderr_text).await;
-            }
-            Ok(SubprocessOutcome {
-                timed_out: false,
-                exit_status: Some(status),
-                stdout: stdout_text,
-                stderr: stderr_text,
-            })
-        }
-    }
 }
 
 #[cfg(test)]

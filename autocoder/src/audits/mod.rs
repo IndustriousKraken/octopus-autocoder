@@ -425,11 +425,17 @@ impl Drop for SandboxSettingsGuard {
 }
 
 /// Write a one-shot Claude Code `--settings` file mirroring the same
-/// `permissions.deny` structure used by [`crate::executor::claude_cli`].
-/// The deny list is built from the sandbox's `disallowed_bash_patterns`
-/// and `disallowed_read_paths` plus explicit `Write(*)` and `Edit(*)`
-/// entries so audits whose `WritePolicy` is `None` have a defense-in-
-/// depth backstop ahead of the post-hoc diff check.
+/// `permissions.deny` structure shared by the agentic-run primitive AND
+/// every audit. The deny list is built from the sandbox's
+/// `disallowed_bash_patterns` and `disallowed_read_paths`, plus — when
+/// `deny_writes` is set — explicit `Write(*)` and `Edit(*)` entries so
+/// read-only audits (`WritePolicy::None`) have a defense-in-depth backstop
+/// ahead of the post-hoc diff check.
+///
+/// `deny_writes` MUST be `true` for the audits (preserving today's
+/// read-only settings) AND `false` for the executor path through
+/// [`crate::agentic_run::agentic_run`] (which allows `Write`/`Edit` so the
+/// agent can implement code — preserving the executor's current settings).
 ///
 /// `settings_dir` selects the directory the file is written to. Pass
 /// `None` to use `std::env::temp_dir()`; tests pass a per-test
@@ -440,10 +446,13 @@ impl Drop for SandboxSettingsGuard {
 pub fn write_sandbox_settings(
     sandbox: &ResolvedSandbox,
     settings_dir: Option<&Path>,
+    deny_writes: bool,
 ) -> Result<(PathBuf, SandboxSettingsGuard)> {
     let mut deny: Vec<String> = Vec::new();
-    deny.push("Write(*)".to_string());
-    deny.push("Edit(*)".to_string());
+    if deny_writes {
+        deny.push("Write(*)".to_string());
+        deny.push("Edit(*)".to_string());
+    }
     for pat in &sandbox.disallowed_bash_patterns {
         deny.push(format!("Bash({pat})"));
     }
@@ -950,6 +959,49 @@ where
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Run the wrapped agent CLI for an audit through the shared agentic-run
+/// primitive ([`crate::agentic_run::agentic_run`]). Encodes the audit
+/// profile: simple-capture (no streaming-JSON), NO MCP, the audit's
+/// `sandbox.allowed_tools` list, `Write`/`Edit` denied in the settings
+/// file, the ETXTBSY-retry spawn, AND no busy-marker sidecar. This is the
+/// single seam through which every audit reaches the primitive; the
+/// per-module `run_subprocess` copies are gone.
+pub(crate) async fn run_audit_cli(
+    command: &str,
+    sandbox: &ResolvedSandbox,
+    workspace: &Path,
+    prompt: &str,
+    timeout: std::time::Duration,
+    settings_dir: Option<&Path>,
+) -> Result<crate::agentic_run::AgenticRunOutcome> {
+    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
+    crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        workspace,
+        // Capture mode never consults `change` (it is only used for the
+        // streaming structured-log path); a stable placeholder is fine.
+        change: "audit",
+        strategy: &strategy,
+        prompt,
+        sandbox: crate::agentic_run::SandboxConfig {
+            allowed_tools: sandbox.allowed_tools.clone(),
+            disallowed_bash_patterns: sandbox.disallowed_bash_patterns.clone(),
+            disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
+            deny_writes: true,
+        },
+        model: None,
+        output_mode: crate::agentic_run::OutputMode::Capture,
+        timeout,
+        paths: None,
+        settings_dir,
+        include_autocoder_tools: false,
+        emit_stream_json_in_capture: false,
+        resume_session_id: None,
+        track_subprocess_marker: false,
+        etxtbsy_retry_spawn: true,
+    })
+    .await
 }
 
 /// Cheap precondition every audit runs at the top of its `run` method.

@@ -17,14 +17,11 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
-    workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
+    workspace_is_valid, workspace_unavailable_outcome,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -131,14 +128,10 @@ impl Audit for ArchitectureConsultativeAudit {
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
 
-        let (settings_path, _settings_guard) =
-            write_sandbox_settings(&sandbox, self.settings_dir.as_deref())
-                .context("generating architecture-consultative sandbox settings file")?;
-
         let _ = ctx.log_writer.write_section(
             "architecture_consultative_preamble",
             &format!(
-                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nsettings_file: {}\nallowed_tools: {}",
+                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nallowed_tools: {}",
                 self.executor_command,
                 self.executor_timeout_secs,
                 self.settings
@@ -146,7 +139,6 @@ impl Audit for ArchitectureConsultativeAudit {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<embedded default>".to_string()),
-                settings_path.display(),
                 sandbox.allowed_tools.join(","),
             ),
         );
@@ -154,13 +146,13 @@ impl Audit for ArchitectureConsultativeAudit {
             .log_writer
             .write_section("architecture_consultative_prompt", &prompt);
 
-        let outcome = run_subprocess(
+        let outcome = super::run_audit_cli(
             &self.executor_command,
-            &settings_path,
-            &sandbox.allowed_tools,
+            &sandbox,
             ctx.workspace,
             &prompt,
             Duration::from_secs(self.executor_timeout_secs),
+            self.settings_dir.as_deref(),
         )
         .await
         .context("spawning architecture-consultative CLI subprocess")?;
@@ -309,23 +301,16 @@ fn excerpt(s: &str) -> String {
     out
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-}
-
-/// Pure transformation: given a SubprocessOutcome, return Some(error) if
-/// the outcome is terminal (timed out OR non-zero exit). Returns None when
-/// the caller should continue processing (parse stdout into findings).
+/// Pure transformation: given an [`crate::agentic_run::AgenticRunOutcome`],
+/// return Some(error) if the outcome is terminal (timed out OR non-zero
+/// exit). Returns None when the caller should continue processing (parse
+/// stdout into findings).
 ///
 /// Extracted from `run()` so tests can exercise the timeout/exit error
-/// shapes by constructing synthetic SubprocessOutcome values directly,
-/// avoiding real subprocesses, timers, and the race condition that
-/// comes with them.
+/// shapes by constructing synthetic outcome values directly, avoiding real
+/// subprocesses, timers, and the race condition that comes with them.
 fn outcome_to_terminal_err(
-    outcome: &SubprocessOutcome,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
     audit_type: &str,
     timeout_secs: u64,
@@ -352,87 +337,6 @@ fn outcome_to_terminal_err(
         ));
     }
     None
-}
-
-/// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
-/// configured timeout, return captured stdout + stderr. Mirrors the
-/// drift audit's run_subprocess.
-async fn run_subprocess(
-    command: &str,
-    settings_path: &std::path::Path,
-    allowed_tools: &[String],
-    workspace: &std::path::Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<SubprocessOutcome> {
-    // ETXTBSY retry: see docs/test-reliability.md
-    // "ETXTBSY from concurrent audit-CLI fixtures".
-    let mut child = super::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(command);
-        cmd.arg("--settings")
-            .arg(settings_path)
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        cmd
-    })
-    .await
-    .with_context(|| {
-        format!("spawning architecture-consultative command `{command}`")
-    })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let sleeper = tokio::time::sleep(timeout);
-    tokio::pin!(sleeper);
-
-    let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-        biased;
-        () = &mut sleeper => None,
-        res = child.wait() => Some(res),
-    };
-
-    match exit_status {
-        None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Ok(SubprocessOutcome {
-                timed_out: true,
-                exit_status: None,
-                stdout: String::new(),
-                stderr: "timeout".to_string(),
-            })
-        }
-        Some(Err(e)) => {
-            Err(e).context("waiting on architecture-consultative child process")
-        }
-        Some(Ok(status)) => {
-            let mut stdout_text = String::new();
-            if let Some(ref mut p) = stdout_pipe {
-                let _ = p.read_to_string(&mut stdout_text).await;
-            }
-            let mut stderr_text = String::new();
-            if let Some(ref mut p) = stderr_pipe {
-                let _ = p.read_to_string(&mut stderr_text).await;
-            }
-            Ok(SubprocessOutcome {
-                timed_out: false,
-                exit_status: Some(status),
-                stdout: stdout_text,
-                stderr: stderr_text,
-            })
-        }
-    }
 }
 
 #[cfg(test)]
@@ -821,7 +725,7 @@ mod tests {
         }
     }
 
-    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// Pure-data test: feed a synthesized `AgenticRunOutcome` with
     /// `timed_out: true` directly into `outcome_to_terminal_err` and
     /// assert the resulting error + log entries. No subprocess, no
     /// timer, no race — verifies the audit's translation logic, which
@@ -835,11 +739,12 @@ mod tests {
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
         let log_path = log_writer.path().to_path_buf();
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
             stderr: "timeout".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(
             &outcome,
@@ -875,11 +780,12 @@ mod tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(7 << 8)),
             stdout: String::new(),
             stderr: "boom".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(
             &outcome,
@@ -901,11 +807,12 @@ mod tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: r#"{"findings":[]}"#.into(),
             stderr: String::new(),
+            ..Default::default()
         };
         assert!(
             outcome_to_terminal_err(&outcome, &mut log_writer, "architecture_consultative", 30)
