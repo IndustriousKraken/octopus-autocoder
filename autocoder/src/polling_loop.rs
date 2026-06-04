@@ -346,12 +346,35 @@ pub async fn run_with_hooks(
         // never evicted; eviction is best-effort and never blocks work.
         // The cap is read from the hot-swappable holder here so a reload's
         // new value takes effect from this iteration onward.
+        //
+        // The pass is heavy synchronous filesystem work: `enforce_cap`'s
+        // recursive `dir_size` walk and `evict_workspace`'s
+        // `remove_dir_all` can each touch hundreds of thousands of files
+        // for a large workspace (a Rust `target/`, a JS `node_modules/`)
+        // and block for seconds. Run it on the blocking thread pool via
+        // `spawn_blocking` so it never stalls the tokio worker thread —
+        // and with it the other repos' polling tasks, the control socket,
+        // and the chatops listener sharing the runtime. Awaiting keeps the
+        // original "before any work" ordering; the worker thread is parked
+        // at the await, not blocked.
         if let Some(current_basename) =
             workspace.file_name().and_then(|n| n.to_str())
         {
-            crate::workspace_cache::record_last_used(&paths, current_basename);
             let cap_gb = cache_holder.load().workspaces_max_gb;
-            crate::workspace_cache::enforce_cap(&paths, cap_gb, current_basename);
+            let paths_for_cache = paths.clone();
+            let basename = current_basename.to_string();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::workspace_cache::record_last_used(&paths_for_cache, &basename);
+                crate::workspace_cache::enforce_cap(&paths_for_cache, cap_gb, &basename);
+            })
+            .await
+            {
+                // A join error means the blocking closure panicked; the
+                // pass is best-effort, so log and continue the iteration.
+                tracing::warn!(
+                    "workspace-cache: eviction pass did not complete (iteration continues): {e}"
+                );
+            }
         }
 
         // Check whether this iteration is a rebuild iteration. We
