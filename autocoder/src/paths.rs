@@ -225,6 +225,25 @@ impl DaemonPaths {
         self.workspace_last_used_dir().join(workspace_basename)
     }
 
+    /// `<state>/workspace-sizes/` — per-workspace cached measured size (in
+    /// bytes) keyed by workspace basename. Maintained by the workspace-cache
+    /// LRU eviction (a65) so the cap-enforcement pass does NOT recursively
+    /// re-walk every idle workspace on every poll tick: an idle workspace's
+    /// size cannot change (nothing writes to it between the iterations that
+    /// use it), so its last measured size is reused from this cache. Lives
+    /// under `<state>/` (NOT inside the workspace) for the same reasons as
+    /// the last-used markers — independent of the workspace's eviction AND
+    /// never visible in the managed repo's working tree.
+    pub fn workspace_sizes_dir(&self) -> PathBuf {
+        self.state.join("workspace-sizes")
+    }
+
+    /// `<state>/workspace-sizes/<workspace_basename>` — the cached measured
+    /// size (decimal bytes) for the named workspace.
+    pub fn workspace_size_path(&self, workspace_basename: &str) -> PathBuf {
+        self.workspace_sizes_dir().join(workspace_basename)
+    }
+
     /// `<runtime>/control.sock` — the daemon's control socket.
     pub fn control_socket_path(&self) -> PathBuf {
         self.runtime.join("control.sock")
@@ -721,6 +740,14 @@ mod tests {
         assert_eq!(
             p.workspace_last_used_path("github_com_owner_repo"),
             PathBuf::from("/srv/state/workspace-last-used/github_com_owner_repo")
+        );
+        assert_eq!(
+            p.workspace_sizes_dir(),
+            PathBuf::from("/srv/state/workspace-sizes")
+        );
+        assert_eq!(
+            p.workspace_size_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/workspace-sizes/github_com_owner_repo")
         );
         assert_eq!(
             p.control_socket_path(),

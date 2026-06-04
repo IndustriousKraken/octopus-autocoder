@@ -7,11 +7,28 @@
 //!
 //! - measures the total size of `<cache>/workspaces/` AND each
 //!   workspace's size (a symlink-safe directory walk);
+//! - caches each workspace's measured size under `<state>/` so the
+//!   per-iteration cap check does NOT re-walk every idle workspace on
+//!   every poll tick (see below);
 //! - maintains a per-workspace last-used timestamp under `<state>/`
 //!   (recorded at each iteration that uses the workspace), read to order
 //!   eviction candidates oldest-first;
 //! - evicts whole least-recently-used IDLE workspaces
 //!   (`remove_dir_all`) when an operator-set cap is exceeded.
+//!
+//! Per-workspace size cache: a naive cap check would recursively walk
+//! every workspace on every iteration of every repo — with N repos that
+//! is ~N² full `target/`-sized walks per poll cycle, a real I/O storm
+//! even when the cache is far under the cap. Instead, the enforcement
+//! pass re-measures ONLY the workspace whose repo is currently iterating
+//! (the only one whose size can have changed — an idle workspace is not
+//! being written to between the iterations that use it) and reuses each
+//! other workspace's last measured size from `<state>/workspace-sizes/`.
+//! Steady-state per-tick I/O drops from "walk all N workspaces" to "walk
+//! the one current workspace + read N-1 tiny size files". A workspace
+//! with no cached size yet (first pass after a cap is set, or a clone
+//! predating this feature) is measured once and cached, so the full walk
+//! happens at most once per workspace, never every tick.
 //!
 //! Whole-workspace eviction is deliberately language-agnostic: it makes
 //! NO assumption about which subdirectories are build artifacts; it
@@ -130,6 +147,39 @@ pub fn read_last_used(paths: &DaemonPaths, basename: &str) -> Option<DateTime<Ut
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Read the cached measured size (bytes) for `basename`, or `None` when
+/// the marker is absent OR unparseable. A `None` means "size unknown" —
+/// the caller measures the workspace fresh and caches the result. The
+/// cache is only ever trusted for an IDLE workspace (whose size cannot
+/// have changed since it was recorded); the currently-iterating
+/// workspace is always re-measured.
+pub fn read_cached_size(paths: &DaemonPaths, basename: &str) -> Option<u64> {
+    let path = paths.workspace_size_path(basename);
+    std::fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Cache `size` (bytes) as `basename`'s last measured size under
+/// `<state>/workspace-sizes/<basename>`. Best-effort — a failure is
+/// logged at DEBUG and never propagates, because a missing cache entry
+/// only costs a fresh re-measure on the next pass, never correctness.
+pub fn write_cached_size(paths: &DaemonPaths, basename: &str, size: u64) {
+    let dir = paths.workspace_sizes_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::debug!(
+            dir = %dir.display(),
+            "workspace-cache: could not create sizes dir (cap check will re-walk): {e}"
+        );
+        return;
+    }
+    let path = paths.workspace_size_path(basename);
+    if let Err(e) = std::fs::write(&path, size.to_string()) {
+        tracing::debug!(
+            path = %path.display(),
+            "workspace-cache: could not cache measured size: {e}"
+        );
+    }
+}
+
 /// Remove a whole workspace clone (`<cache>/workspaces/<basename>`) AND
 /// its last-used marker, returning the bytes reclaimed. Symlink-safe: if
 /// the workspace path is itself a symlink, the link is removed (never its
@@ -146,14 +196,16 @@ pub fn evict_workspace(paths: &DaemonPaths, basename: &str) -> std::io::Result<u
         // itself (not its target) and report zero reclaimed.
         std::fs::remove_file(&dir)?;
         let _ = std::fs::remove_file(paths.workspace_last_used_path(basename));
+        let _ = std::fs::remove_file(paths.workspace_size_path(basename));
         return Ok(0);
     }
     let reclaimed = dir_size(&dir);
     std::fs::remove_dir_all(&dir)?;
-    // The last-used marker is now orphaned (its workspace is gone). Remove
-    // it so the state dir does not accumulate stale markers; a re-clone
-    // records a fresh one.
+    // The last-used + size markers are now orphaned (their workspace is
+    // gone). Remove them so the state dir does not accumulate stale
+    // markers; a re-clone records fresh ones.
     let _ = std::fs::remove_file(paths.workspace_last_used_path(basename));
+    let _ = std::fs::remove_file(paths.workspace_size_path(basename));
     Ok(reclaimed)
 }
 
@@ -214,6 +266,13 @@ pub fn enforce_cap(
 /// Byte-granular core of [`enforce_cap`]. Split out so the gigabyte-unit
 /// public API stays operator-facing while tests can drive a small,
 /// byte-precise cap without multi-gigabyte fixtures.
+///
+/// To avoid an I/O storm, this does NOT recursively re-walk every
+/// workspace on every call: only `current_basename` (the workspace whose
+/// repo is iterating — the only one that can have changed size) is
+/// measured fresh; every other workspace's size is read from the
+/// `<state>/workspace-sizes/` cache, falling back to a one-time fresh
+/// measurement (and caching the result) when no cached size exists.
 pub(crate) fn enforce_cap_bytes(
     paths: &DaemonPaths,
     cap_bytes: Option<u64>,
@@ -249,7 +308,26 @@ pub(crate) fn enforce_cap_bytes(
         if !meta.file_type().is_dir() {
             continue;
         }
-        let size = dir_size(&entry.path());
+        // Re-measure the currently-iterating workspace fresh (its build
+        // may have grown it) and refresh its cached size. For every other
+        // (idle) workspace, reuse the cached size — its size cannot have
+        // changed since it was recorded — and only fall back to a fresh
+        // walk when no cached size exists yet (then cache it, so the walk
+        // happens at most once per workspace, not every tick).
+        let size = if name == current_basename {
+            let measured = dir_size(&entry.path());
+            write_cached_size(paths, &name, measured);
+            measured
+        } else {
+            match read_cached_size(paths, &name) {
+                Some(cached) => cached,
+                None => {
+                    let measured = dir_size(&entry.path());
+                    write_cached_size(paths, &name, measured);
+                    measured
+                }
+            }
+        };
         total = total.saturating_add(size);
         sizes.push((name, size));
     }
@@ -592,10 +670,103 @@ mod tests {
         let (_td, paths) = test_daemon_paths();
         make_workspace(&paths, "doomed", 4_096);
         record_last_used(&paths, "doomed");
+        write_cached_size(&paths, "doomed", 4_096);
         let reclaimed = evict_workspace(&paths, "doomed").unwrap();
         assert!(reclaimed >= 4_096, "reclaimed must cover the blob: {reclaimed}");
         assert!(!paths.workspaces_dir().join("doomed").exists());
         assert!(!paths.workspace_last_used_path("doomed").exists());
+        // The cached-size marker is cleaned up alongside the last-used one.
+        assert!(!paths.workspace_size_path("doomed").exists());
+    }
+
+    #[test]
+    fn cached_size_roundtrips_and_missing_is_none() {
+        let (_td, paths) = test_daemon_paths();
+        assert!(
+            read_cached_size(&paths, "ws").is_none(),
+            "absent cache entry reads as None (caller measures fresh)"
+        );
+        write_cached_size(&paths, "ws", 123_456);
+        assert_eq!(read_cached_size(&paths, "ws"), Some(123_456));
+    }
+
+    /// The cap check reuses an IDLE workspace's cached size instead of
+    /// recursively re-walking it on every pass. A deliberately stale-small
+    /// cached size keeps an over-budget-on-disk idle workspace from being
+    /// evicted — proof the pass read the cache rather than re-measuring
+    /// (a fresh walk would have measured it large and evicted it).
+    #[test]
+    fn idle_workspace_size_is_read_from_cache_not_rewalked() {
+        let (_td, paths) = test_daemon_paths();
+        // A large idle workspace on disk, but cached as tiny.
+        make_workspace(&paths, "idle", 8_000);
+        write_cached_size(&paths, "idle", 10);
+        set_last_used_ago(&paths, "idle", 500);
+        // The currently-iterating workspace (always measured fresh).
+        make_workspace(&paths, "current", 10);
+        set_last_used_ago(&paths, "current", 50);
+
+        // Cap 1000 bytes. A fresh walk of "idle" would see 8000, pushing
+        // the total to ~8010 > 1000 and evicting it. With the cache, the
+        // total is current(10, fresh) + idle(10, cached) = 20 → no evict.
+        let report = enforce_cap_bytes(&paths, 1_000, "current");
+        assert!(
+            report.evicted.is_empty(),
+            "idle workspace must be sized from the cache, not re-walked: {report:?}"
+        );
+        assert!(paths.workspaces_dir().join("idle").is_dir());
+    }
+
+    /// Each pass measures the current workspace fresh (refreshing its
+    /// cached size) AND seeds a cached size for any uncached workspace it
+    /// had to measure, so later passes skip the recursive walk.
+    #[test]
+    fn pass_caches_current_and_seeds_idle_sizes() {
+        let (_td, paths) = test_daemon_paths();
+        make_workspace(&paths, "current", 1_000);
+        make_workspace(&paths, "idle", 1_000);
+        // No cached sizes yet.
+        assert!(read_cached_size(&paths, "current").is_none());
+        assert!(read_cached_size(&paths, "idle").is_none());
+
+        // Generous cap → no eviction, but the pass still measures + caches.
+        let report = enforce_cap_bytes(&paths, 1_000_000, "current");
+        assert!(report.evicted.is_empty());
+        assert_eq!(
+            read_cached_size(&paths, "current"),
+            Some(1_000),
+            "current workspace's size is measured fresh AND cached"
+        );
+        assert_eq!(
+            read_cached_size(&paths, "idle"),
+            Some(1_000),
+            "an uncached idle workspace is measured once AND its size seeded"
+        );
+    }
+
+    /// The current workspace is re-measured fresh every pass even when a
+    /// (now-stale) cached size exists: a build that grew it since the last
+    /// pass is reflected, so the cap decision is never made on a stale
+    /// self-size.
+    #[test]
+    fn current_workspace_is_remeasured_over_stale_cache() {
+        let (_td, paths) = test_daemon_paths();
+        // On disk the current workspace is large; the cache claims tiny.
+        make_workspace(&paths, "current", 5_000);
+        write_cached_size(&paths, "current", 1);
+        set_last_used_ago(&paths, "current", 10);
+
+        // Cap 1000 bytes. The stale cache (1) would read under cap, but a
+        // fresh measure (5000) is over cap. There is nothing evictable
+        // (only the protected current workspace), so the pass flags
+        // over-cap — which can only happen if it measured 5000 fresh.
+        let report = enforce_cap_bytes(&paths, 1_000, "current");
+        assert!(
+            report.over_cap_after,
+            "current workspace must be measured fresh (over cap), not read from stale cache"
+        );
+        // And its cache was refreshed to the true size.
+        assert_eq!(read_cached_size(&paths, "current"), Some(5_000));
     }
 
     // ---- test seam -----------------------------------------------------

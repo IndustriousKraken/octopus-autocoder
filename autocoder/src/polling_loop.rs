@@ -347,16 +347,18 @@ pub async fn run_with_hooks(
         // The cap is read from the hot-swappable holder here so a reload's
         // new value takes effect from this iteration onward.
         //
-        // The pass is heavy synchronous filesystem work: `enforce_cap`'s
-        // recursive `dir_size` walk and `evict_workspace`'s
-        // `remove_dir_all` can each touch hundreds of thousands of files
-        // for a large workspace (a Rust `target/`, a JS `node_modules/`)
-        // and block for seconds. Run it on the blocking thread pool via
-        // `spawn_blocking` so it never stalls the tokio worker thread —
-        // and with it the other repos' polling tasks, the control socket,
-        // and the chatops listener sharing the runtime. Awaiting keeps the
-        // original "before any work" ordering; the worker thread is parked
-        // at the await, not blocked.
+        // The pass can still do heavy synchronous filesystem work:
+        // `enforce_cap` measures THIS repo's workspace fresh (an idle
+        // workspace's size is reused from the `<state>/workspace-sizes/`
+        // cache, so the pass does not re-walk every workspace every tick),
+        // and an over-cap eviction's `remove_dir_all` can touch hundreds
+        // of thousands of files for a large workspace (a Rust `target/`, a
+        // JS `node_modules/`) and block for seconds. Run it on the
+        // blocking thread pool via `spawn_blocking` so it never stalls the
+        // tokio worker thread — and with it the other repos' polling
+        // tasks, the control socket, and the chatops listener sharing the
+        // runtime. Awaiting keeps the original "before any work" ordering;
+        // the worker thread is parked at the await, not blocked.
         if let Some(current_basename) =
             workspace.file_name().and_then(|n| n.to_str())
         {
