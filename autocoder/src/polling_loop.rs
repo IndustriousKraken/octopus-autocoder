@@ -2521,23 +2521,34 @@ async fn process_one_pending_change(
         }
     }
 
-    // Change-internal contradiction pre-flight (a19). Opt-in via
-    // `executor.change_internal_contradiction_check: enabled`. The
-    // global is `None` until daemon startup installs a context, so
-    // tests AND default-off operators short-circuit here without
-    // touching the LLM. Failures inside the check fail-open (no
-    // contradictions reported, executor proceeds).
-    if let Some(cc_ctx) = crate::preflight::change_contradiction::current() {
+    // Verifier-gate framework (a61): the change-lifecycle consistency checks
+    // are organized as named gates positioned around the executor. The `[in]`
+    // gate IS the change-internal contradiction pre-flight (a19; agentic a59);
+    // it is resolved through the registry so a62/a63 register `[canon]`/`[out]`
+    // the same way. An unrealized gate resolves to "no installed gate" AND the
+    // framework invokes nothing for it.
+    //
+    // Opt-in via `executor.change_internal_contradiction_check: enabled`: the
+    // scoped context is `None` until daemon startup installs one, so tests AND
+    // default-off operators short-circuit here without touching the LLM.
+    // Failures inside the gate fail-open (no contradictions reported, executor
+    // proceeds).
+    if let Some(cc_ctx) = crate::preflight::change_contradiction::current()
+        && let Some(crate::verifier_gate::GateImpl::ContradictionCheck) =
+            crate::verifier_gate::GateRegistry::standard()
+                .resolve(crate::verifier_gate::VerifierGate::In)
+    {
         match handle_contradiction_preflight(paths, workspace, repo, chatops_ctx, change, &cc_ctx)
             .await
         {
             Ok(Some(step)) => return Ok(step),
             Ok(None) => {}
             Err(e) => {
+                let label = crate::verifier_gate::VerifierGate::In.label();
                 tracing::warn!(
                     url = %repo.url,
                     change = %change,
-                    "change-contradiction pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
+                    "{label} change-contradiction pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
                 );
             }
         }
@@ -2677,11 +2688,13 @@ async fn handle_contradiction_preflight(
         return Ok(None);
     }
     let suggestion = build_contradiction_revision_suggestion(&findings);
+    // a61: this is the `[in]` verifier gate; its diagnostics carry the label.
+    let label = crate::verifier_gate::VerifierGate::In.label();
     tracing::warn!(
         url = %repo.url,
         change = %change,
         findings = findings.len(),
-        "change-contradiction pre-flight FAILED; skipping executor and writing marker"
+        "{label} change-contradiction pre-flight FAILED; skipping executor and writing marker"
     );
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
@@ -2692,7 +2705,7 @@ async fn handle_contradiction_preflight(
         tracing::warn!(
             url = %repo.url,
             change = %change,
-            "failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
+            "{label} failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
         );
     }
     maybe_post_contradiction_findings_alert(
@@ -2795,7 +2808,10 @@ async fn maybe_post_contradiction_findings_alert(
             )
         })
         .unwrap_or_default();
-    let text = format!(
+    // a61: the `[in]` verifier gate labels the operator surface it writes so
+    // the finding is attributable to the gate that produced it.
+    let label = crate::verifier_gate::VerifierGate::In.label();
+    let text = crate::verifier_gate::VerifierGate::In.label_line(&format!(
         "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
         repo_url = repo.url,
         change = change,
@@ -2803,12 +2819,12 @@ async fn maybe_post_contradiction_findings_alert(
         suggestion = revision_suggestion,
         base = repo.base_branch,
         marker = marker_path.display(),
-    );
+    ));
     if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
         tracing::warn!(
             url = %repo.url,
             change = %change,
-            "contradiction-findings chatops alert post failed: {e:#}"
+            "{label} contradiction-findings chatops alert post failed: {e:#}"
         );
         return;
     }
@@ -2823,7 +2839,7 @@ async fn maybe_post_contradiction_findings_alert(
         tracing::warn!(
             url = %repo.url,
             change = %change,
-            "failed to persist contradiction-findings alert state: {e:#}"
+            "{label} failed to persist contradiction-findings alert state: {e:#}"
         );
     }
 }
