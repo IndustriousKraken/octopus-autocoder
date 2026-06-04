@@ -862,9 +862,10 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
 }
 
 /// Resolve the agentic reviewer's CLI strategy from its provider via the
-/// a55/a56 `provider → CLI` rule. Anthropic → the `claude` strategy; any
-/// other provider resolves to a CLI with no registered strategy yet (a60)
-/// AND returns a clear error naming it, with no session spawned.
+/// a55/a56 `provider → CLI` rule. Anthropic → the `claude` strategy;
+/// non-Anthropic providers → the `opencode` strategy (a60). No session is
+/// spawned at resolution time. (A future provider whose CLI has no
+/// registered strategy would still return a clear error here.)
 fn resolve_reviewer_strategy(
     reviewer: &CodeReviewer,
 ) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
@@ -877,9 +878,10 @@ fn resolve_reviewer_strategy(
 
 /// Run the agentic reviewer against `ctx` (a58). Production entry point for
 /// both the polling-loop initial review AND the operator-triggered rerun
-/// composer. Resolves the CLI strategy (erroring before any spawn when the
-/// reviewer command has no registered strategy), then dispatches one
-/// session per `reviewer.mode()`.
+/// composer. Resolves the CLI strategy (`claude` for Anthropic, `opencode`
+/// for non-Anthropic providers — a60; erroring before any spawn only for a
+/// CLI with no registered strategy), then dispatches one session per
+/// `reviewer.mode()`.
 pub async fn run_agentic_review(
     reviewer: &CodeReviewer,
     ctx: &ReviewContext,
@@ -2960,21 +2962,19 @@ this is not yaml: at all: ::: {{{ broken
         assert!(matches!(outcome, AgenticReviewOutcome::Discarded { .. }));
     }
 
-    /// A reviewer command resolving (via the a55 provider→CLI rule) to a CLI
-    /// with no registered strategy returns a clear error naming it; an
-    /// Anthropic reviewer resolves the `claude` strategy.
+    /// A reviewer whose provider resolves (via the a55 provider→CLI rule) to
+    /// the `opencode` CLI now resolves to a working strategy (a60 registered
+    /// it); an Anthropic reviewer resolves the `claude` strategy. Neither
+    /// spawns a subprocess at resolution time.
     #[test]
-    fn agentic_strategy_resolution_errors_for_unregistered_cli() {
+    fn agentic_strategy_resolution_resolves_registered_clis() {
         let (c1, _) = stub_with_capture("");
         let opencode_reviewer = CodeReviewer::new(c1, "t".to_string())
             .with_provider(LlmProvider::OpenAiCompatible)
             .with_command("opencode".to_string());
-        let err = resolve_reviewer_strategy(&opencode_reviewer)
-            .err()
-            .expect("opencode has no registered strategy yet");
         assert!(
-            format!("{err:#}").contains("opencode"),
-            "error must name the CLI: {err:#}"
+            resolve_reviewer_strategy(&opencode_reviewer).is_ok(),
+            "openai_compatible reviewer resolves the opencode strategy (a60)"
         );
 
         let (c2, _) = stub_with_capture("");

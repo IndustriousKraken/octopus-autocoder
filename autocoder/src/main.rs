@@ -48,6 +48,7 @@ mod state;
 mod submission_store;
 #[cfg(test)]
 mod testing;
+mod verifier_gate;
 mod workspace;
 
 #[tokio::main]
