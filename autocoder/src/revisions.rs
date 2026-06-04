@@ -1679,7 +1679,12 @@ async fn execute_code_review(
     // contents reflect the CURRENT PR state. The change_list drives
     // archived-change brief lookup; unfound briefs are best-effort.
     let processed: Vec<String> = change_list.to_vec();
-    let ctx = match crate::polling_loop::build_review_context(workspace, repo, &processed) {
+    let ctx = match crate::polling_loop::build_review_context(
+        workspace,
+        repo,
+        &processed,
+        reviewer.kind(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             return Ok(CodeReviewOutcome::Failed {

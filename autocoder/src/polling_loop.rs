@@ -1124,7 +1124,7 @@ pub async fn execute_one_pass(
                     // review (no verdict written, NOT an implicit Approve) AND
                     // posts the reviewer-failure operator alert.
                     crate::config::ReviewerKind::Agentic => {
-                        let ctx = build_review_context(workspace, repo, &processed)?;
+                        let ctx = build_review_context(workspace, repo, &processed, r.kind())?;
                         match crate::code_reviewer::run_agentic_review(r, &ctx, workspace).await {
                             Ok(crate::code_reviewer::AgenticReviewOutcome::Reviewed(result)) => {
                                 let mut report = result.into_review_report();
@@ -1159,7 +1159,8 @@ pub async fn execute_one_pass(
                     crate::config::ReviewerKind::Oneshot => {
                         let outcome = match r.mode() {
                             crate::config::ReviewerMode::Bundled => {
-                                let ctx = build_review_context(workspace, repo, &processed)?;
+                                let ctx =
+                                    build_review_context(workspace, repo, &processed, r.kind())?;
                                 r.review(&ctx).await
                             }
                             crate::config::ReviewerMode::PerChange => {
@@ -1297,29 +1298,53 @@ pub(crate) fn build_review_context(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
+    reviewer_kind: crate::config::ReviewerKind,
 ) -> Result<crate::code_reviewer::ReviewContext> {
     let diff = git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)?;
     let file_list =
         git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)?;
 
+    // a58 revision: the agentic reviewer reads files on demand through its
+    // read-only sandbox — `render_agentic_review_prompt` lists only the
+    // changed-file PATHS and never inlines contents. So for the agentic
+    // transport, skip the eager full-file `read_to_string` of every touched
+    // file: those reads are wasted I/O AND the dominant memory allocation on
+    // large passes, partially defeating the agentic reviewer's whole point.
+    // The oneshot path still pre-dumps contents into its prompt, so it keeps
+    // reading them. Deleted files (absent on disk) stay excluded from the
+    // path list in BOTH transports, matching the prior behavior.
+    let include_file_contents =
+        matches!(reviewer_kind, crate::config::ReviewerKind::Oneshot);
+
     let mut changed_files = Vec::with_capacity(file_list.len());
     for path in &file_list {
         let abs = workspace.join(path);
-        match std::fs::read_to_string(&abs) {
-            Ok(contents) => changed_files.push(crate::code_reviewer::ChangedFile {
-                path: path.clone(),
-                contents,
-            }),
-            // Deleted files appear in the diff but have no current
-            // content. Their removal is captured by the diff itself.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    "skipping changed-file read for reviewer: {e}"
-                );
-                continue;
+        if include_file_contents {
+            match std::fs::read_to_string(&abs) {
+                Ok(contents) => changed_files.push(crate::code_reviewer::ChangedFile {
+                    path: path.clone(),
+                    contents,
+                }),
+                // Deleted files appear in the diff but have no current
+                // content. Their removal is captured by the diff itself.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        "skipping changed-file read for reviewer: {e}"
+                    );
+                    continue;
+                }
             }
+        } else if abs.exists() {
+            // Agentic transport: list the path with empty contents (the agent
+            // reads on demand). A cheap existence check still excludes deleted
+            // files so the agent is not pointed at a path that no longer
+            // exists — but no file body is read into memory.
+            changed_files.push(crate::code_reviewer::ChangedFile {
+                path: path.clone(),
+                contents: String::new(),
+            });
         }
     }
 
@@ -9892,7 +9917,7 @@ mod tests {
             // Now exercise the reviewer step's compose path manually,
             // mirroring what execute_one_pass does between
             // `run_pass_through_commits` and `open_pull_request`.
-            let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed)
+            let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed, reviewer.kind())
                 .expect("build_review_context succeeds");
             let (report, draft) = match reviewer.review(&ctx).await {
                 Ok(report) => {
@@ -9968,6 +9993,63 @@ mod tests {
             "reviewer failed",
         )
         .await;
+    }
+
+    /// a58 revision: `build_review_context` reads full file contents only for
+    /// the `Oneshot` transport (which pre-dumps them into its prompt). For the
+    /// `Agentic` transport it lists the same changed-file paths but leaves
+    /// `contents` empty — the agent reads on demand — avoiding the wasted I/O
+    /// and memory the reviewer flagged. The unified diff is produced in both.
+    #[test]
+    fn build_review_context_skips_file_reads_for_agentic_transport() {
+        use crate::config::ReviewerKind;
+        fn git(ws: &Path, args: &[&str]) {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        }
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Branch off `main` and add a changed file with a known body.
+        git(&ws, &["checkout", "-q", "-b", "agent-q"]);
+        let body = "fn demo() { /* BUILD_CTX_FIXTURE_BODY */ }\n";
+        std::fs::write(ws.join("demo_changed.rs"), body).unwrap();
+        git(&ws, &["add", "-A"]);
+        git(&ws, &["commit", "-q", "-m", "demo: add changed file"]);
+
+        let repo = fixture_repo(&ws);
+        let processed: Vec<String> = Vec::new();
+
+        // Oneshot: the full file body is read into `ChangedFile.contents`.
+        let oneshot = build_review_context(&ws, &repo, &processed, ReviewerKind::Oneshot)
+            .expect("oneshot context builds");
+        let f = oneshot
+            .changed_files
+            .iter()
+            .find(|f| f.path == "demo_changed.rs")
+            .expect("changed file listed in oneshot context");
+        assert_eq!(f.contents, body, "oneshot reads the full file contents");
+
+        // Agentic: the same path is listed, but no contents are read from disk.
+        let agentic = build_review_context(&ws, &repo, &processed, ReviewerKind::Agentic)
+            .expect("agentic context builds");
+        let f = agentic
+            .changed_files
+            .iter()
+            .find(|f| f.path == "demo_changed.rs")
+            .expect("changed file still listed in agentic context");
+        assert!(
+            f.contents.is_empty(),
+            "agentic skips the eager file read (contents left empty): {:?}",
+            f.contents
+        );
+        // The unified diff is still produced in both transports.
+        assert!(
+            agentic.diff.contains("demo_changed.rs"),
+            "diff includes the changed file"
+        );
     }
 
     /// 13.4.7 / git-workflow-manager baseline: empty pass produces no
