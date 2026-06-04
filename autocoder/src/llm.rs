@@ -303,9 +303,22 @@ pub fn resolve_contradiction_check_model(
             .api_base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
-        LlmProvider::OpenAiCompatible | LlmProvider::Ollama => {
-            cfg.api_base_url.clone().unwrap_or_default()
-        }
+        // Defense-in-depth: config-load validation already requires
+        // `api_base_url` for these providers, but resolve it through an
+        // explicit error rather than silently defaulting to `""` — so a
+        // bypassed OR buggy validator surfaces a clear message here instead
+        // of an opaque CLI spawn failure downstream. Mirrors the reviewer's
+        // `build_from_config` AND the pre-a59 `build_from_contradiction_check_config`.
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
+            )
+        })?,
     };
     let api_key = match provider {
         LlmProvider::Ollama => String::new(),
