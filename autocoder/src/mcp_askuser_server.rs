@@ -464,10 +464,13 @@ fn handle_request<W: Write>(
                         }
                     }
                 }
-                "submit_findings" => {
-                    // The role this MCP child serves selects the daemon-side
-                    // finding schema; the relay carries it so
-                    // `record_submission` validates against the right one.
+                // a57 `submit_findings` (advisory audits), a58 `submit_review`
+                // (agentic reviewer), AND a59 `submit_contradictions`
+                // (contradiction check) share the per-role relay path: the
+                // role selects the daemon-side schema, the tool's full
+                // arguments object IS the submission payload, AND a rejection
+                // comes back as a correctable tool error.
+                tool @ ("submit_findings" | "submit_review" | "submit_contradictions") => {
                     let role = std::env::var(ENV_ROLE)
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -476,21 +479,27 @@ fn handle_request<W: Write>(
                             writer,
                             id,
                             -32601,
-                            "submit_findings: no ORCH_MCP_ROLE set; this MCP child advertises no submission tool",
+                            &format!("{tool}: no ORCH_MCP_ROLE set; this MCP child advertises no submission tool"),
                         )?;
                         return Ok(());
                     };
-                    // The tool's full arguments object IS the submission
-                    // payload (`{ "findings": [...] }`).
                     let payload = call.arguments.clone();
                     match relay_submission(&role, &payload) {
                         Ok(()) => {
+                            let text = match tool {
+                                "submit_review" => {
+                                    "Review submitted and recorded as this PR's verdict. You may stop now."
+                                }
+                                "submit_contradictions" => {
+                                    "Contradictions submitted and recorded as this check's result. You may stop now."
+                                }
+                                _ => {
+                                    "Findings submitted and recorded as this audit's result. You may stop now."
+                                }
+                            };
                             let result = serde_json::json!({
                                 "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Findings submitted and recorded as this audit's result. You may stop now.",
-                                    }
+                                    { "type": "text", "text": text }
                                 ],
                                 "isError": false,
                                 "structuredContent": { "ok": true }
@@ -506,7 +515,7 @@ fn handle_request<W: Write>(
                                 writer,
                                 id,
                                 -32602,
-                                &format!("submit_findings rejected: {e}"),
+                                &format!("{tool} rejected: {e}"),
                             )?;
                         }
                     }
@@ -857,6 +866,13 @@ pub const ADVISORY_AUDIT_ROLES: &[&str] =
 pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
     if ADVISORY_AUDIT_ROLES.contains(&role) {
         Some("submit_findings")
+    } else if role == crate::code_reviewer::REVIEWER_ROLE {
+        // a58: the agentic reviewer returns its verdict via `submit_review`.
+        Some("submit_review")
+    } else if role == crate::preflight::change_contradiction::CONTRADICTION_CHECK_ROLE {
+        // a59: the contradiction check returns its findings via
+        // `submit_contradictions`.
+        Some("submit_contradictions")
     } else {
         None
     }
@@ -867,6 +883,16 @@ pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
 /// three advisory-audit roles, each with the role's audit-specific finding
 /// schema; every other role returns `None`.
 fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
+    // a58: the agentic reviewer's `submit_review` tool has a verdict +
+    // concerns shape distinct from the advisory audits' `submit_findings`.
+    if role == crate::code_reviewer::REVIEWER_ROLE {
+        return Some(submit_review_tool());
+    }
+    // a59: the contradiction check's `submit_contradictions` tool has a
+    // requirement-pair shape distinct from the audits AND the reviewer.
+    if role == crate::preflight::change_contradiction::CONTRADICTION_CHECK_ROLE {
+        return Some(submit_contradictions_tool());
+    }
     let finding_schema = match role {
         "drift_audit" => serde_json::json!({
             "type": "object",
@@ -922,6 +948,75 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
             "required": ["findings"]
         }
     }))
+}
+
+/// The `submit_review` tool definition advertised for the reviewer role
+/// (a58). The `verdict` enum AND `concerns` shape are the operator-visible
+/// schema; the daemon-side validator
+/// ([`crate::code_reviewer::payload_to_review_result`]) additionally
+/// enforces the "non-empty `actionable_request` when `should_request_revision`"
+/// cross-field rule that basic JSON Schema cannot express, surfacing a
+/// violation as a correctable tool error.
+fn submit_review_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_review",
+        "description": "Return this code review's verdict to the daemon as the review result. Call exactly once when your analysis is complete. Pass `verdict` (Approve | Block), a `summary`, AND a `concerns` array (empty means \"no concerns\"). Each concern that should drive a revision MUST set `should_request_revision: true` with a non-empty `actionable_request`. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verdict": { "type": "string", "enum": ["Approve", "Block"] },
+                "summary": { "type": "string" },
+                "concerns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "detail": { "type": "string" },
+                            "anchor": { "type": "string" },
+                            "should_request_revision": { "type": "boolean" },
+                            "actionable_request": { "type": ["string", "null"] }
+                        },
+                        "required": ["title", "detail", "anchor", "should_request_revision"]
+                    }
+                }
+            },
+            "required": ["verdict", "summary", "concerns"]
+        }
+    })
+}
+
+/// The `submit_contradictions` tool definition advertised for the
+/// contradiction-check role (a59). Each entry names the two conflicting
+/// requirements AND a one-line summary of why they cannot both hold; an
+/// empty `contradictions` array means "no contradictions found". The
+/// daemon-side validator
+/// ([`crate::preflight::change_contradiction::payload_to_contradictions`])
+/// deserializes the payload into the finding shape, surfacing a malformed
+/// payload as a correctable tool error.
+fn submit_contradictions_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_contradictions",
+        "description": "Return the change-internal contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Each entry names the two conflicting requirements AND a one-line summary of why they cannot both hold simultaneously. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contradictions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement_a": { "type": "string" },
+                            "requirement_b": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["requirement_a", "requirement_b", "summary"]
+                    }
+                }
+            },
+            "required": ["contradictions"]
+        }
+    })
 }
 
 /// Open a connection to the daemon's control socket, send `request`
@@ -1054,11 +1149,13 @@ mod tests {
             .collect()
     }
 
-    // a56: framework-only — no concrete `submit_*` tool is registered for
-    // any role in this change, so every lookup returns None.
+    // a56: roles with no registered `submit_*` tool resolve to None. (The
+    // `reviewer` role registered `submit_review` in a58 AND
+    // `contradiction_check` registered `submit_contradictions` in a59, so
+    // neither is in this list.)
     #[test]
     fn submission_tool_for_role_returns_none_until_a_role_registers() {
-        for role in ["reviewer", "contradiction_check", "scout", "whatever"] {
+        for role in ["scout", "whatever", "implementer"] {
             assert!(
                 submission_tool_for_role(role).is_none(),
                 "role `{role}` must have no registered submit tool yet"
@@ -1066,15 +1163,15 @@ mod tests {
         }
     }
 
-    // a56: with `ORCH_MCP_ROLE` set, `tools/list` still advertises the
-    // common tools AND — because no role has a registered `submit_*` tool
-    // in this change — advertises no submission tool.
+    // a56: with `ORCH_MCP_ROLE` set to a role with no registered `submit_*`
+    // tool (the `implementer`), `tools/list` still advertises the common
+    // tools AND advertises no submission tool.
     #[test]
     fn tools_list_with_role_env_advertises_common_tools_and_no_submission_tool() {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: env writes are serialized via ENV_LOCK.
         unsafe {
-            std::env::set_var(ENV_ROLE, "reviewer");
+            std::env::set_var(ENV_ROLE, "implementer");
         }
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
@@ -1208,9 +1305,132 @@ mod tests {
             submission_tool_name_for_role("documentation_audit"),
             Some("submit_findings")
         );
+        // a58: the reviewer role gets `submit_review`, not `submit_findings`.
+        assert_eq!(submission_tool_name_for_role("reviewer"), Some("submit_review"));
+        // a59: the contradiction check gets `submit_contradictions`.
+        assert_eq!(
+            submission_tool_name_for_role("contradiction_check"),
+            Some("submit_contradictions")
+        );
         assert_eq!(submission_tool_name_for_role("implementer"), None);
         assert_eq!(submission_tool_name_for_role("missing_tests"), None);
         assert_eq!(submission_tool_name_for_role("security_bug"), None);
+    }
+
+    // a58 (4.6): `submit_review` is advertised ONLY when
+    // `ORCH_MCP_ROLE = reviewer`, with the verdict enum + concerns schema,
+    // alongside the common tools — AND NOT for any other role.
+    #[test]
+    fn submit_review_advertised_only_for_reviewer_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Reviewer role: submit_review present with the verdict enum.
+        unsafe {
+            std::env::set_var(ENV_ROLE, "reviewer");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_review")
+            .expect("reviewer role must advertise submit_review");
+        let verdict_enum = submit["inputSchema"]["properties"]["verdict"]["enum"]
+            .as_array()
+            .expect("verdict enum present");
+        let labels: Vec<&str> = verdict_enum.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(labels, vec!["Approve", "Block"], "verdict enum is Approve|Block");
+        // submit_findings is NOT present for the reviewer.
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_findings"),
+            "reviewer must not advertise submit_findings"
+        );
+        // Common tools coexist.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+
+        // Other roles: submit_review is absent.
+        for role in ["implementer", "drift_audit", "missing_tests", "security_bug"] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_review")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_review"
+            );
+        }
+    }
+
+    // a59 (3.6): `submit_contradictions` is advertised ONLY when
+    // `ORCH_MCP_ROLE = contradiction_check`, with the requirement-pair
+    // schema, alongside the common tools — AND NOT for any other role.
+    #[test]
+    fn submit_contradictions_advertised_only_for_contradiction_check_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "contradiction_check");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_contradictions")
+            .expect("contradiction_check role must advertise submit_contradictions");
+        // The advertised schema requires the requirement-pair fields.
+        let item_props =
+            &submit["inputSchema"]["properties"]["contradictions"]["items"]["properties"];
+        for field in ["requirement_a", "requirement_b", "summary"] {
+            assert!(
+                item_props.get(field).is_some(),
+                "contradiction item schema must define `{field}`: {submit}"
+            );
+        }
+        let required: Vec<&str> = submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["contradictions"], "top-level required");
+        // submit_findings AND submit_review are NOT present for this role.
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_findings"),
+            "contradiction_check must not advertise submit_findings"
+        );
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_review"),
+            "contradiction_check must not advertise submit_review"
+        );
+        // Common tools coexist.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+        assert!(
+            names.contains(&"query_canonical_specs"),
+            "common tools present: {names:?}"
+        );
+
+        // Other roles: submit_contradictions is absent.
+        for role in ["implementer", "reviewer", "drift_audit", "missing_tests"] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_contradictions")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_contradictions"
+            );
+        }
     }
 
     // a57: a `submit_findings` tool call relays the payload to the daemon
