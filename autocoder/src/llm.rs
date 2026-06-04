@@ -432,6 +432,77 @@ fn resolve_canon_contradiction_check_api_key(
     }
 }
 
+/// Resolve the code-implements-spec `[out]` gate's LLM config (a63) into a
+/// [`crate::agentic_run::ResolvedModel`] (a56) for the agentic transport.
+/// Parallel to [`resolve_canon_contradiction_check_model`]; the only
+/// differences are the config-label strings in error messages. The `claude`
+/// CLI strategy reads the resulting tuple to set `ANTHROPIC_*`; its `provider`
+/// selects which CLI strategy runs (a provider whose CLI has no registered
+/// strategy makes the gate advisory-unavailable at strategy-resolution time,
+/// never spawning a process).
+pub fn resolve_code_implements_spec_check_model(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<crate::agentic_run::ResolvedModel> {
+    let provider = cfg
+        .provider
+        .expect("code_implements_spec_check_llm.provider resolved at config-load");
+    let model = cfg.model.clone();
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.code_implements_spec_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.code_implements_spec_check_llm.api_base_url is required when provider=ollama"
+            )
+        })?,
+    };
+    let api_key = match provider {
+        LlmProvider::Ollama => String::new(),
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            resolve_code_implements_spec_check_api_key(cfg)?
+        }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
+}
+
+fn resolve_code_implements_spec_check_api_key(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("executor.code_implements_spec_check_llm.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "executor.code_implements_spec_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
+                );
+            }
+            Ok(key)
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!(
+                "executor.code_implements_spec_check_llm.api_key_env={env_name}"
+            )),
+        (None, None) => Err(anyhow!(
+            "executor.code_implements_spec_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

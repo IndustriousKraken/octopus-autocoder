@@ -1204,6 +1204,17 @@ pub async fn execute_one_pass(
         }
     };
 
+    // a63: the `[out]` gate — code-implements-spec verification. Runs AFTER
+    // the executor implemented the change(s) (the agent branch carries the
+    // implementation), before PR-body assembly, when the operator opted in
+    // (`code_implements_spec::current()` is `Some`) AND there are
+    // implementer-processed changes to verify. Advisory: it renders a
+    // `## Spec Verification` PR-body section AND posts a chatops note ONLY when
+    // gaps are found; it NEVER opens a revision AND NEVER blocks PR creation. A
+    // gate failure WARNs (labeled `[verifier:out]`) AND omits the section.
+    let spec_verification_section =
+        run_spec_verification_gate(workspace, repo, &processed, chatops_ctx).await;
+
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
     } else {
@@ -1239,6 +1250,7 @@ pub async fn execute_one_pass(
         &reviewer_revision_concerns,
         chatops_ctx,
         workspace,
+        spec_verification_section.as_deref(),
     )
     .await?;
     // End-of-pass success: push and PR creation both succeeded. Clear the
@@ -1285,6 +1297,93 @@ async fn post_stuck_alert(
         tracing::warn!(
             url = %repo.url,
             "busy_marker: failed to post stuck-state chatops alert: {e:#}"
+        );
+    }
+}
+
+/// Run the `[out]` gate — code-implements-spec verification (a63) — and return
+/// the advisory `## Spec Verification` PR-body section to splice in, or `None`
+/// to omit it. The gate is a no-op (returns `None`) when the operator did not
+/// opt in (`code_implements_spec::current()` is `None`) OR the iteration has no
+/// implementer-processed changes to verify (audit-only). On an `implemented` or
+/// `gaps_found` verdict it renders the section; a `gaps_found` verdict ALSO
+/// posts an advisory chatops note. On a gate failure the module already WARNed
+/// (labeled `[verifier:out]`); this returns `None` (omit the section). The gate
+/// NEVER opens a revision AND NEVER blocks PR creation — the caller proceeds
+/// with the PR regardless of the verdict.
+async fn run_spec_verification_gate(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    processed: &[String],
+    chatops_ctx: Option<&ChatOpsContext>,
+) -> Option<String> {
+    let ctx = crate::code_implements_spec::current()?;
+    if processed.is_empty() {
+        // Audit-only iteration: no implementer-touched files to verify.
+        return None;
+    }
+    let label = crate::verifier_gate::VerifierGate::Out.label();
+    let diff = match git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "{label} could not compute diff for the code-implements-spec gate; omitting the Spec Verification section (advisory, never blocks): {e:#}"
+            );
+            return None;
+        }
+    };
+    let changed_files =
+        git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)
+            .unwrap_or_default();
+    match crate::code_implements_spec::run_code_implements_spec_check(
+        &ctx,
+        workspace,
+        processed,
+        &diff,
+        &changed_files,
+    )
+    .await
+    {
+        crate::code_implements_spec::SpecVerificationOutcome::Verified(verification) => {
+            // Post the advisory chatops heads-up ONLY when gaps are found.
+            if verification.has_gaps() {
+                post_spec_verification_gaps_alert(chatops_ctx, repo, &verification).await;
+            }
+            Some(crate::code_implements_spec::render_spec_verification_section(
+                &verification,
+            ))
+        }
+        crate::code_implements_spec::SpecVerificationOutcome::Unavailable => {
+            // The module already WARNed (labeled `[verifier:out]`); omit the
+            // section. The gate never blocks PR creation.
+            None
+        }
+    }
+}
+
+/// Post an advisory chatops heads-up when the `[out]` gate's verdict reports
+/// gaps (a63). Best-effort AND gated on `failure_alerts_enabled`: a post
+/// failure is logged at WARN but never propagated, AND the gate never blocks
+/// PR creation. No revision is opened — the operator decides what to do.
+async fn post_spec_verification_gaps_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    verification: &crate::code_implements_spec::SpecVerification,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let text = format!(
+        "⚠ `{repo_url}`: code-implements-spec verification found {n} gap(s) — see the PR's `## Spec Verification` section (advisory: no revision opened, PR not blocked)",
+        repo_url = repo.url,
+        n = verification.gaps.len(),
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "spec-verification gaps chatops notification post failed: {e:#}"
         );
     }
 }
@@ -5260,6 +5359,7 @@ async fn open_pull_request(
     reviewer_revision_concerns: &[ReviewConcern],
     chatops_ctx: Option<&ChatOpsContext>,
     workspace: &Path,
+    spec_verification_section: Option<&str>,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
@@ -5270,7 +5370,7 @@ async fn open_pull_request(
     // agent branch carries only the audit's `audit: <type> proposals
     // (N change(s))` commits. Build the PR title + body from those
     // commit subjects so reviewers see which audits fired.
-    let (title, body) = if changes.is_empty() {
+    let (title, mut body) = if changes.is_empty() {
         let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
         let subjects = git::log_subjects(workspace, &range).unwrap_or_default();
         (
@@ -5283,6 +5383,17 @@ async fn open_pull_request(
             build_pr_body(workspace, changes, includes_self_heal),
         )
     };
+    // a63: splice the advisory `## Spec Verification` section (the `[out]`
+    // gate's verdict) into the PR body, parallel to the reviewer's
+    // `## Code Review` block (which is appended downstream from
+    // `review_report`). Absent when the gate is disabled, produced no verdict
+    // (advisory failure), OR the iteration is audit-only.
+    if let Some(section) = spec_verification_section
+        && !section.trim().is_empty()
+    {
+        body.push_str("\n\n");
+        body.push_str(section.trim_end());
+    }
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -8891,6 +9002,229 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
+    }
+
+    // -----------------------------------------------------------------
+    // a63: the `[out]` gate — code-implements-spec verification.
+    // -----------------------------------------------------------------
+
+    /// ChatOps backend that records every `post_notification` for assertion.
+    struct NotifRecordingChatOps {
+        notifications: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatOpsBackend for NotifRecordingChatOps {
+        fn provider_name(&self) -> &'static str {
+            "notif-recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            unreachable!("the [out] gate never posts questions")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            Ok(None)
+        }
+        async fn post_notification(&self, _: &str, text: &str) -> Result<()> {
+            self.notifications.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn post_threaded_reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn notif_ctx(chatops: &std::sync::Arc<NotifRecordingChatOps>) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    /// Build a `[out]` gate ctx whose canned `test_submission` stands in for the
+    /// CLI session: `Some(payload)` is a recorded verdict, `None` simulates
+    /// "agent never submitted".
+    fn out_gate_ctx(
+        submission: Option<serde_json::Value>,
+    ) -> crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+        crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+            command: "claude".into(),
+            model: crate::agentic_run::ResolvedModel {
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-test".into(),
+                api_base_url: "https://example.invalid".into(),
+                api_key: "sk-test".into(),
+            },
+            prompt_template: "T".into(),
+            attribution: Some("anthropic/claude-test".into()),
+            test_submission: Some(submission),
+        }
+    }
+
+    /// Create the agent branch carrying a spec delta + a code change so the gate
+    /// has a non-empty diff AND a spec-delta path to reference.
+    fn seed_agent_branch_with_change(workspace: &Path) {
+        fn run(path: &Path, args: &[&str]) {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        }
+        run(workspace, &["checkout", "-q", "-b", "agent-q"]);
+        let spec = workspace.join("openspec/changes/c1/specs/cap/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(
+            &spec,
+            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("impl.rs"), "fn a() {}\n").unwrap();
+        run(workspace, &["add", "-A"]);
+        run(workspace, &["commit", "-q", "-m", "c1: implement"]);
+    }
+
+    /// Task 4.1: default-disabled (no `[out]` ctx scoped) → the gate is a no-op,
+    /// returns no section, AND posts no chatops note (PR assembly unchanged).
+    #[tokio::test]
+    async fn out_gate_disabled_produces_no_section() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        // No `code_implements_spec::scope` wrapping → `current()` is None.
+        let section =
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)).await;
+        assert!(section.is_none(), "disabled gate must produce no section");
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "no chatops note when disabled"
+        );
+    }
+
+    /// Task 4.3: an `implemented` verdict renders a clean `## Spec Verification`
+    /// section AND posts NO chatops note.
+    #[tokio::test]
+    async fn out_gate_implemented_renders_section_no_chatops() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "implemented", "summary": "satisfied", "gaps": []
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        let section = section.expect("implemented verdict renders a section");
+        assert!(section.starts_with("## Spec Verification"));
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "implemented must post no chatops note"
+        );
+    }
+
+    /// Task 4.4: a `gaps_found` verdict renders the gaps in the section AND
+    /// posts a chatops note. This function only returns the section AND posts
+    /// the heads-up — it opens NO revision and the caller always proceeds to PR
+    /// creation (no block).
+    #[tokio::test]
+    async fn out_gate_gaps_found_renders_section_and_posts_chatops() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "gaps_found",
+            "summary": "one gap",
+            "gaps": [
+                { "requirement": "A", "scenario": null, "status": "missing", "evidence": "no code realizes it" }
+            ]
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        let section = section.expect("gaps_found verdict renders a section");
+        assert!(section.starts_with("## Spec Verification"));
+        assert!(
+            section.contains("no code realizes it"),
+            "section lists the gap evidence: {section}"
+        );
+        assert_eq!(
+            chatops.notifications.lock().unwrap().len(),
+            1,
+            "gaps_found posts exactly one advisory chatops note"
+        );
+    }
+
+    /// Task 4.5: a session that yields no verdict (advisory failure) → no
+    /// section AND no chatops note. The gate returns None (never errors), so the
+    /// caller still creates the PR.
+    #[tokio::test]
+    async fn out_gate_no_submission_omits_section() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        seed_agent_branch_with_change(&ws);
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        // `Some(None)` → the canned runner simulates "agent never submitted".
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(None));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
+        )
+        .await;
+        assert!(section.is_none(), "no submission omits the section");
+        assert!(
+            chatops.notifications.lock().unwrap().is_empty(),
+            "no chatops note when the gate is unavailable"
+        );
+    }
+
+    /// Task 4.4 (no-block): an audit-only iteration (empty `processed`) skips
+    /// the gate entirely even when enabled — there are no implementer changes to
+    /// verify — so no section is produced.
+    #[tokio::test]
+    async fn out_gate_skips_audit_only_iteration() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let repo = fixture_repo(&ws);
+        let chatops = std::sync::Arc::new(NotifRecordingChatOps {
+            notifications: Default::default(),
+        });
+        let ctx = notif_ctx(&chatops);
+        let gate_ctx = std::sync::Arc::new(out_gate_ctx(Some(serde_json::json!({
+            "verdict": "implemented", "summary": "x", "gaps": []
+        }))));
+        let section = crate::code_implements_spec::scope(
+            Some(gate_ctx),
+            // Empty `processed` → audit-only; the gate is a no-op.
+            run_spec_verification_gate(&ws, &repo, &[], Some(&ctx)),
+        )
+        .await;
+        assert!(section.is_none(), "audit-only iteration produces no section");
     }
 
     // -----------------------------------------------------------------

@@ -293,6 +293,52 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         None
     };
 
+    // Build the code-implements-spec verification context — the `[out]` gate
+    // (a63). Disabled by default → no context produced; the polling loop
+    // short-circuits at the `code_implements_spec::current()` read post-
+    // executor. Enabled-without-LLM-config already failed validation above.
+    let code_implements_spec_ctx: Option<
+        Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>,
+    > = if matches!(
+        cfg.executor.code_implements_spec_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        let llm_cfg = cfg
+            .executor
+            .code_implements_spec_check_llm
+            .as_ref()
+            .expect("validate_config guarantees the llm block is set when enabled");
+        let model = crate::llm::resolve_code_implements_spec_check_model(llm_cfg)
+            .context("resolving code-implements-spec-check model from config")?;
+        let prompt_template = crate::code_implements_spec::load_prompt_template(
+            cfg.executor
+                .code_implements_spec_check_prompt_path
+                .as_deref(),
+        )
+        .context("loading code-implements-spec-check prompt template")?;
+        tracing::info!(
+            provider = ?llm_cfg.provider,
+            model = llm_cfg.model.as_str(),
+            "code-implements-spec verification enabled (the [out] gate, a63)"
+        );
+        let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
+        Some(Arc::new(
+            crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+                command: cfg.executor.command.clone(),
+                model,
+                prompt_template,
+                attribution: Some(attribution),
+                #[cfg(test)]
+                test_submission: None,
+            },
+        ))
+    } else {
+        tracing::info!(
+            "code-implements-spec verification disabled (the [out] gate, a63; opt-in via executor.code_implements_spec_check)"
+        );
+        None
+    };
+
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
@@ -550,6 +596,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audit_settings: audit_settings_arc.clone(),
         contradiction_ctx: contradiction_ctx.clone(),
         canon_contradiction_ctx: canon_contradiction_ctx.clone(),
+        code_implements_spec_ctx: code_implements_spec_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -640,6 +687,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // a62: register the `[canon]` gate's `submit_canon_contradictions` payload
     // schema on the same store so its MCP child's submissions are validated.
     crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
+    // a63: register the `[out]` gate's `submit_verdict` payload schema on the
+    // same store so its MCP child's submissions are validated.
+    crate::code_implements_spec::register_code_implements_spec_submission_schema(
         &control_state.submission_store,
     );
     let listener_cancel = cancel.clone();
@@ -845,6 +897,8 @@ struct SpawnDeps {
         Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
     canon_contradiction_ctx:
         Option<Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>>,
+    code_implements_spec_ctx:
+        Option<Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -956,6 +1010,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
         let canon_contradiction_ctx_for_task = deps.canon_contradiction_ctx.clone();
+        let code_implements_spec_ctx_for_task = deps.code_implements_spec_ctx.clone();
         let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
@@ -990,14 +1045,20 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_drained_for_task,
                 cancel_for_task,
             );
-            // Nest the two pre-executor gate scopes (a59 `[in]`, a62 `[canon]`)
-            // around the polling future; each gate reads its own task-local via
-            // `current()`. Either may be `None` (disabled) independently.
+            // Nest the verifier-gate scopes around the polling future: the two
+            // pre-executor gates (a59 `[in]`, a62 `[canon]`) AND the
+            // post-executor gate (a63 `[out]`). Each gate reads its own
+            // task-local via `current()`; any may be `None` (disabled)
+            // independently.
             let in_scoped =
                 crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut);
-            crate::preflight::canon_contradiction::scope(
+            let canon_scoped = crate::preflight::canon_contradiction::scope(
                 canon_contradiction_ctx_for_task,
                 in_scoped,
+            );
+            crate::code_implements_spec::scope(
+                code_implements_spec_ctx_for_task,
+                canon_scoped,
             )
             .await;
             {

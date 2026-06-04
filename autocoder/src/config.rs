@@ -279,6 +279,10 @@ pub enum SubsystemKind {
     /// (`executor.change_canonical_contradiction_check_llm:`, a62). All three
     /// providers valid.
     CanonContradictionCheck,
+    /// Code-implements-spec verification — the `[out]` gate
+    /// (`executor.code_implements_spec_check_llm:`, a63). All three providers
+    /// valid.
+    CodeImplementsSpecCheck,
 }
 
 impl SubsystemKind {
@@ -288,12 +292,16 @@ impl SubsystemKind {
             Self::CanonicalRag => "canonical_rag",
             Self::ContradictionCheck => "change_internal_contradiction_check_llm",
             Self::CanonContradictionCheck => "change_canonical_contradiction_check_llm",
+            Self::CodeImplementsSpecCheck => "code_implements_spec_check_llm",
         }
     }
 
     fn valid_providers(self) -> &'static [LlmProvider] {
         match self {
-            Self::Reviewer | Self::ContradictionCheck | Self::CanonContradictionCheck => &[
+            Self::Reviewer
+            | Self::ContradictionCheck
+            | Self::CanonContradictionCheck
+            | Self::CodeImplementsSpecCheck => &[
                 LlmProvider::Anthropic,
                 LlmProvider::OpenAiCompatible,
                 LlmProvider::Ollama,
@@ -1047,6 +1055,28 @@ pub struct ExecutorConfig {
     /// operators can pick a model independently.
     #[serde(default)]
     pub change_canonical_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Opt-in gate for the code-implements-spec verification — the `[out]`
+    /// gate of the verifier framework (a63). `Disabled` (the default) skips
+    /// the LLM call entirely AND spawns no post-executor session. `Enabled`
+    /// runs the check AFTER the executor implements a change, in a read-only
+    /// sandbox, AND renders an advisory `## Spec Verification` PR-body section.
+    /// The gate NEVER opens a revision AND NEVER blocks PR creation. Enabling
+    /// without configuring `code_implements_spec_check_llm` is a fail-fast
+    /// startup error.
+    #[serde(default)]
+    pub code_implements_spec_check: ContradictionCheckMode,
+    /// Optional path to a custom code-implements-spec-check prompt template.
+    /// When unset, the binary uses the template embedded at compile time from
+    /// `prompts/code-implements-spec-check.md`. An empty override file is
+    /// rejected at use time so the daemon does not feed an empty prompt to the
+    /// session.
+    #[serde(default)]
+    pub code_implements_spec_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the code-implements-spec check. Required when
+    /// `code_implements_spec_check` is `Enabled`. Parallel to the pre-executor
+    /// gates' `*_llm` blocks so operators can pick a model independently.
+    #[serde(default)]
+    pub code_implements_spec_check_llm: Option<ContradictionCheckLlmConfig>,
 }
 
 /// Opt-in gate for the change-internal contradiction pre-flight (a19).
@@ -2512,6 +2542,33 @@ impl Config {
                 "change_canonical_contradiction_check_llm",
             )?;
         }
+        if let Some(llm) = cfg.executor.code_implements_spec_check_llm.as_mut() {
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "code_implements_spec_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("code_implements_spec_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::CodeImplementsSpecCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            validate_llm_provider_config(
+                provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "code_implements_spec_check_llm",
+            )?;
+        }
         // a000: reject typo'd author_association entries up front so a
         // misconfigured allowlist fails at startup rather than silently
         // denying every commenter.
@@ -2926,6 +2983,21 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some("executor/change_canonical_contradiction_check_llm".into()),
         );
     }
+    // a63: opting into the code-implements-spec check (the `[out]` gate)
+    // requires configuring its LLM block, exactly as the pre-executor gates
+    // do. Fail fast at startup so the misconfig surfaces before the first
+    // polling iteration.
+    if matches!(
+        config.executor.code_implements_spec_check,
+        ContradictionCheckMode::Enabled
+    ) && config.executor.code_implements_spec_check_llm.is_none()
+    {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.code_implements_spec_check is enabled but executor.code_implements_spec_check_llm is not configured",
+            Some("executor/code_implements_spec_check_llm".into()),
+        );
+    }
     // a25: features.scout.max_items must be within 1..=50.
     if let Err(msg) = config.features.scout.validate() {
         report.push_error(
@@ -3278,6 +3350,36 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(cis_llm) = config.executor.code_implements_spec_check_llm.as_ref() {
+        let has_inline = cis_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = cis_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.code_implements_spec_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/code_implements_spec_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = cis_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.code_implements_spec_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/code_implements_spec_check_llm/api_key".into()),
+            );
+        }
+    }
     if let Some(chatops) = config.chatops.as_ref() {
         if let Some(slack) = chatops.slack.as_ref() {
             let bot_inline = slack
@@ -3496,6 +3598,9 @@ github:
             "change_canonical_contradiction_check",
             "change_canonical_contradiction_check_prompt_path",
             "change_canonical_contradiction_check_llm",
+            "code_implements_spec_check",
+            "code_implements_spec_check_prompt_path",
+            "code_implements_spec_check_llm",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -3953,6 +4058,91 @@ github:
         let llm = cfg
             .executor
             .change_internal_contradiction_check_llm
+            .as_ref()
+            .expect("llm block present");
+        assert_eq!(llm.provider, Some(ReviewerProvider::Anthropic));
+        assert_eq!(llm.model, "claude-haiku-4-5-20251001");
+    }
+
+    // a63 (task 1.2): enabling the `[out]` gate without configuring its LLM
+    // block is a fail-fast startup error, exactly as the pre-executor gates.
+    #[test]
+    fn code_implements_spec_check_enabled_without_llm_config_fails_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  code_implements_spec_check: enabled
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses even when llm is missing");
+        let report = validate_config(&cfg);
+        let msg = report
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains(
+                "executor.code_implements_spec_check is enabled but executor.code_implements_spec_check_llm is not configured"
+            ),
+            "expected fail-fast error message; got: {msg}"
+        );
+    }
+
+    // a63 (task 1.1/1.2): the `[out]` gate config parses (mode + llm +
+    // prompt-path override) AND passes validation when the LLM block is set.
+    #[test]
+    fn code_implements_spec_check_enabled_with_llm_config_passes_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  code_implements_spec_check: enabled
+  code_implements_spec_check_prompt_path: /tmp/custom-out-gate.md
+  code_implements_spec_check_llm:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    api_key:
+      value: sk-ant-inline
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let report = validate_config(&cfg);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.message.contains("code_implements_spec_check")),
+            "expected no code-implements-spec validation error; got: {:#?}",
+            report.errors
+        );
+        assert_eq!(
+            cfg.executor.code_implements_spec_check,
+            ContradictionCheckMode::Enabled
+        );
+        assert_eq!(
+            cfg.executor.code_implements_spec_check_prompt_path.as_deref(),
+            Some(std::path::Path::new("/tmp/custom-out-gate.md"))
+        );
+        let llm = cfg
+            .executor
+            .code_implements_spec_check_llm
             .as_ref()
             .expect("llm block present");
         assert_eq!(llm.provider, Some(ReviewerProvider::Anthropic));

@@ -304,6 +304,33 @@ executor:
   #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
   #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
   #                                     # FORBIDDEN for ollama (rejected at config-load).
+  #
+  # Code-implements-spec verification — the `[out]` gate of the verifier
+  # framework (a63). Runs AFTER the executor implements a change, in a
+  # read-only sandbox, AND judges — requirement by requirement, scenario by
+  # scenario — whether the implementation satisfies the change's spec delta.
+  # ADVISORY: it renders a `## Spec Verification` section into the PR body
+  # (parallel to the reviewer's `## Code Review` block) AND posts a chatops
+  # note ONLY when gaps are found. It NEVER opens a revision AND NEVER blocks
+  # PR creation — the operator reads the verification and decides.
+  #
+  # Disabled by default. To enable, set the mode below AND configure the
+  # LLM block. Enabling without configuring the LLM block is a fail-fast
+  # startup error.
+  # code_implements_spec_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the prompt
+  # compiled into the binary from `prompts/code-implements-spec-check.md` is
+  # used. An empty override file is rejected at use time.
+  # code_implements_spec_check_prompt_path: /etc/autocoder/prompts/code-implements-spec-check.md
+  #
+  # Required when the check is enabled. Same surface as the pre-executor
+  # gates' LLM block (provider | model | api_key_env | api_key | api_base_url).
+  # code_implements_spec_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
+  #                                     # FORBIDDEN for ollama (rejected at config-load).
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once

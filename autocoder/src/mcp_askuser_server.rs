@@ -466,15 +466,16 @@ fn handle_request<W: Write>(
                 }
                 // a57 `submit_findings` (advisory audits), a58 `submit_review`
                 // (agentic reviewer), a59 `submit_contradictions` (the [in]
-                // gate), AND a62 `submit_canon_contradictions` (the [canon]
-                // gate) share the per-role relay path: the role selects the
-                // daemon-side schema, the tool's full arguments object IS the
-                // submission payload, AND a rejection comes back as a
-                // correctable tool error.
+                // gate), a62 `submit_canon_contradictions` (the [canon] gate),
+                // AND a63 `submit_verdict` (the [out] gate) share the per-role
+                // relay path: the role selects the daemon-side schema, the
+                // tool's full arguments object IS the submission payload, AND a
+                // rejection comes back as a correctable tool error.
                 tool @ ("submit_findings"
                 | "submit_review"
                 | "submit_contradictions"
-                | "submit_canon_contradictions") => {
+                | "submit_canon_contradictions"
+                | "submit_verdict") => {
                     let role = std::env::var(ENV_ROLE)
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -496,6 +497,9 @@ fn handle_request<W: Write>(
                                 }
                                 "submit_contradictions" | "submit_canon_contradictions" => {
                                     "Contradictions submitted and recorded as this check's result. You may stop now."
+                                }
+                                "submit_verdict" => {
+                                    "Verdict submitted and recorded as this check's result. You may stop now."
                                 }
                                 _ => {
                                     "Findings submitted and recorded as this audit's result. You may stop now."
@@ -881,6 +885,9 @@ pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
         // a62: the `[canon]` gate returns its findings via
         // `submit_canon_contradictions`.
         Some("submit_canon_contradictions")
+    } else if role == crate::code_implements_spec::CODE_IMPLEMENTS_SPEC_ROLE {
+        // a63: the `[out]` gate returns its verdict via `submit_verdict`.
+        Some("submit_verdict")
     } else {
         None
     }
@@ -906,6 +913,12 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
     // the `[in]` gate's within-change requirement pair.
     if role == crate::preflight::canon_contradiction::CANON_CONTRADICTION_CHECK_ROLE {
         return Some(submit_canon_contradictions_tool());
+    }
+    // a63: the `[out]` gate's `submit_verdict` tool returns the
+    // code-implements-spec verdict (implemented | gaps_found + per-gap detail),
+    // distinct from every other role's submission shape.
+    if role == crate::code_implements_spec::CODE_IMPLEMENTS_SPEC_ROLE {
+        return Some(submit_verdict_tool());
     }
     let finding_schema = match role {
         "drift_audit" => serde_json::json!({
@@ -1063,6 +1076,43 @@ fn submit_canon_contradictions_tool() -> serde_json::Value {
                 }
             },
             "required": ["contradictions"]
+        }
+    })
+}
+
+/// The `submit_verdict` tool definition advertised for the code-implements-spec
+/// role — the `[out]` gate (a63). The verdict is `implemented` (the change's
+/// requirements AND scenarios are satisfied) or `gaps_found` (one or more are
+/// not). Each gap names the `requirement`, an optional `scenario`, a `status`
+/// of `missing` or `partial`, AND concrete `evidence`. The daemon-side
+/// validator ([`crate::code_implements_spec::payload_to_verification`])
+/// additionally enforces the "non-empty `gaps` when `verdict: gaps_found`"
+/// cross-field rule that basic JSON Schema cannot express, surfacing a
+/// violation as a correctable tool error.
+fn submit_verdict_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_verdict",
+        "description": "Return your code-implements-spec verdict to the daemon as this check's result. Call exactly once when your analysis is complete. Pass `verdict` (implemented | gaps_found), a `summary`, AND a `gaps` array. Use `implemented` with an empty `gaps` array when every requirement AND scenario is satisfied; use `gaps_found` with a NON-EMPTY `gaps` array otherwise. Each gap names the `requirement`, an optional `scenario` (or null), a `status` (missing | partial), AND concrete `evidence`. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verdict": { "type": "string", "enum": ["implemented", "gaps_found"] },
+                "summary": { "type": "string" },
+                "gaps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": { "type": "string" },
+                            "scenario": { "type": ["string", "null"] },
+                            "status": { "type": "string", "enum": ["missing", "partial"] },
+                            "evidence": { "type": "string" }
+                        },
+                        "required": ["requirement", "status", "evidence"]
+                    }
+                }
+            },
+            "required": ["verdict", "summary", "gaps"]
         }
     })
 }
@@ -1568,6 +1618,86 @@ mod tests {
                     .map(|t| t["name"] != "submit_canon_contradictions")
                     .unwrap_or(true),
                 "role `{role}` must NOT advertise submit_canon_contradictions"
+            );
+        }
+    }
+
+    // a63 (task 4.6): `submit_verdict` is advertised ONLY when the MCP child
+    // serves the `code_implements_spec` role (the `[out]` gate) — never for any
+    // other role — AND carries the verdict + gaps schema alongside the common
+    // tools.
+    #[test]
+    fn submit_verdict_advertised_only_for_code_implements_spec_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "code_implements_spec");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_verdict")
+            .expect("code_implements_spec role must advertise submit_verdict");
+        // The advertised schema enforces the verdict enum AND the gap shape.
+        let verdict_enum = &submit["inputSchema"]["properties"]["verdict"]["enum"];
+        let variants: Vec<&str> = verdict_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(variants, vec!["implemented", "gaps_found"], "verdict enum");
+        let gap_props = &submit["inputSchema"]["properties"]["gaps"]["items"]["properties"];
+        for field in ["requirement", "scenario", "status", "evidence"] {
+            assert!(
+                gap_props.get(field).is_some(),
+                "gap item schema must define `{field}`: {submit}"
+            );
+        }
+        let required: Vec<&str> = submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["verdict", "summary", "gaps"], "top-level required");
+        // No OTHER role's submission tool leaks into this role.
+        for other in [
+            "submit_findings",
+            "submit_review",
+            "submit_contradictions",
+            "submit_canon_contradictions",
+        ] {
+            assert!(
+                !tools.iter().any(|t| t["name"] == other),
+                "code_implements_spec must not advertise {other}"
+            );
+        }
+        // Common tools coexist.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"ask_user"), "common tools present: {names:?}");
+
+        // Other roles: submit_verdict is absent.
+        for role in [
+            "implementer",
+            "reviewer",
+            "contradiction_check",
+            "canon_contradiction_check",
+            "drift_audit",
+        ] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_verdict")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_verdict"
             );
         }
     }
