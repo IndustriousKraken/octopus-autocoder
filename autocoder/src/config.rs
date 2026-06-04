@@ -1341,10 +1341,12 @@ impl Default for CommandAuthorizationConfig {
 
 impl CommandAuthorizationConfig {
     /// Validate that every `allowed_associations` entry is a recognized
-    /// GitHub `author_association` value. Returns an `Err` naming the
-    /// first offending entry AND the accepted set so the operator can fix
-    /// the typo. Called from [`Config::load_from`] so a bad config fails
-    /// at startup rather than silently denying every commenter.
+    /// GitHub `author_association` value AND that no `allowed_users` entry
+    /// is empty or whitespace-only. Returns an `Err` naming the first
+    /// offending entry AND (for associations) the accepted set so the
+    /// operator can fix the typo. Called from [`Config::load_from`] so a
+    /// bad config fails at startup rather than silently denying every
+    /// commenter.
     pub fn validate(&self) -> Result<(), String> {
         for assoc in &self.allowed_associations {
             if !KNOWN_AUTHOR_ASSOCIATIONS.contains(&assoc.as_str()) {
@@ -1354,6 +1356,17 @@ impl CommandAuthorizationConfig {
                     KNOWN_AUTHOR_ASSOCIATIONS.join(", ")
                 ));
             }
+        }
+        // a000: reject empty / whitespace-only logins so an operator typo
+        // (e.g. `allowed_users: [" "]` or a stray blank list entry) fails
+        // fast at startup rather than sitting silently in the allowlist as
+        // a login the runtime `!login.is_empty()` guard can never match.
+        if let Some(blank) = self.allowed_users.iter().find(|u| u.trim().is_empty()) {
+            return Err(format!(
+                "github.command_authorization.allowed_users contains an empty or \
+                 whitespace-only entry ({blank:?}); remove it or replace it with a \
+                 valid GitHub login"
+            ));
         }
         Ok(())
     }
@@ -3973,6 +3986,74 @@ github: {}
         };
         let err = auth.validate().expect_err("typo'd association must be rejected");
         assert!(err.contains("OWENR"), "error names the offending value: {err}");
+    }
+
+    #[test]
+    fn command_authorization_validate_rejects_blank_allowed_user() {
+        // A whitespace-only login (the classic `allowed_users: [" "]`
+        // typo) must be rejected so it fails fast rather than sitting in
+        // the allowlist as a login the runtime guard can never match.
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec!["trusted-dev".to_string(), "  ".to_string()],
+            decline_comment: false,
+        };
+        let err = auth
+            .validate()
+            .expect_err("whitespace-only allowed_users entry must be rejected");
+        assert!(
+            err.contains("allowed_users"),
+            "error names the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn command_authorization_validate_rejects_empty_allowed_user() {
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec![String::new()],
+            decline_comment: false,
+        };
+        assert!(
+            auth.validate().is_err(),
+            "empty-string allowed_users entry must be rejected"
+        );
+    }
+
+    #[test]
+    fn command_authorization_validate_accepts_nonblank_allowed_users() {
+        let auth = CommandAuthorizationConfig {
+            allowed_associations: default_allowed_associations(),
+            allowed_users: vec!["trusted-dev".to_string(), "another-dev".to_string()],
+            decline_comment: false,
+        };
+        assert!(
+            auth.validate().is_ok(),
+            "non-blank logins must pass validation"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_blank_allowed_user() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  command_authorization:
+    allowed_users: [" "]
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("blank allowed_users entry must fail load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("allowed_users"),
+            "load error must name the offending field: {msg}"
+        );
     }
 
     #[test]

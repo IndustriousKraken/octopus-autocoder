@@ -143,7 +143,7 @@ still pass via `allowed_users`).
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `allowed_associations` | no | `[OWNER, MEMBER, COLLABORATOR]` | GitHub `author_association` values that authorize a commenter — by default exactly those carrying write/triage permission. Each entry is validated at startup against the GitHub set (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`); an unknown value fails config load with a clear error. |
-| `allowed_users` | no | `[]` | Additional trusted GitHub logins authorized regardless of association (for individuals who are not formal collaborators). |
+| `allowed_users` | no | `[]` | Additional trusted GitHub logins authorized regardless of association (for individuals who are not formal collaborators). Empty or whitespace-only entries are rejected at startup so an operator typo fails config load with a clear error rather than sitting silently in the allowlist. |
 | `decline_comment` | no | `false` | When `true`, the daemon posts exactly one polite decline reply per dropped trigger. When `false` (the default), unauthorized triggers are silently ignored (no comment spam, no reply/feedback loops). |
 
 ```yaml
