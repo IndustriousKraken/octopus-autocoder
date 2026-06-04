@@ -13,7 +13,9 @@ use crate::code_reviewer::{
     build_cross_change_preamble,
 };
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
-use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
+use crate::control_socket::{
+    CacheHolder, ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder,
+};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
 use crate::paths::DaemonPaths;
 use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
@@ -75,6 +77,7 @@ pub async fn run(
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
     chatops_holder: ChatOpsHolder,
+    cache_holder: CacheHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
@@ -135,6 +138,7 @@ pub async fn run(
         github_holder,
         reviewer_holder,
         chatops_holder,
+        cache_holder,
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
@@ -203,6 +207,7 @@ pub async fn run_with_hooks(
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
     chatops_holder: ChatOpsHolder,
+    cache_holder: CacheHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
@@ -331,6 +336,48 @@ pub async fn run_with_hooks(
             snapshot_ref.max_changes_per_pr,
             executor_max_changes_per_pr,
         );
+
+        // Workspace-cache bookkeeping + LRU eviction (a65). This repo is
+        // about to do work, so (1) record its workspace as used-now (the
+        // freshest timestamp, so it is never the oldest candidate) and
+        // (2) if `cache.workspaces_max_gb` is set AND the cache is over
+        // budget, evict least-recently-used IDLE workspaces to stay under
+        // the cap. The current workspace AND any busy-marked workspace are
+        // never evicted; eviction is best-effort and never blocks work.
+        // The cap is read from the hot-swappable holder here so a reload's
+        // new value takes effect from this iteration onward.
+        //
+        // The pass can still do heavy synchronous filesystem work:
+        // `enforce_cap` measures THIS repo's workspace fresh (an idle
+        // workspace's size is reused from the `<state>/workspace-sizes/`
+        // cache, so the pass does not re-walk every workspace every tick),
+        // and an over-cap eviction's `remove_dir_all` can touch hundreds
+        // of thousands of files for a large workspace (a Rust `target/`, a
+        // JS `node_modules/`) and block for seconds. Run it on the
+        // blocking thread pool via `spawn_blocking` so it never stalls the
+        // tokio worker thread — and with it the other repos' polling
+        // tasks, the control socket, and the chatops listener sharing the
+        // runtime. Awaiting keeps the original "before any work" ordering;
+        // the worker thread is parked at the await, not blocked.
+        if let Some(current_basename) =
+            workspace.file_name().and_then(|n| n.to_str())
+        {
+            let cap_gb = cache_holder.load().workspaces_max_gb;
+            let paths_for_cache = paths.clone();
+            let basename = current_basename.to_string();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::workspace_cache::record_last_used(&paths_for_cache, &basename);
+                crate::workspace_cache::enforce_cap(&paths_for_cache, cap_gb, &basename);
+            })
+            .await
+            {
+                // A join error means the blocking closure panicked; the
+                // pass is best-effort, so log and continue the iteration.
+                tracing::warn!(
+                    "workspace-cache: eviction pass did not complete (iteration continues): {e}"
+                );
+            }
+        }
 
         // Check whether this iteration is a rebuild iteration. We
         // take-and-clear so the chatops-triggered flag does not
@@ -10748,6 +10795,10 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder =
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let cache_holder: CacheHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::CacheConfig::default(),
+            ));
         let repo_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
         let paths_for_run = std::sync::Arc::new(crate::testing::test_daemon_paths().1);
@@ -10759,6 +10810,7 @@ mod tests {
                 github_holder,
                 reviewer_holder,
                 chatops_holder,
+                cache_holder,
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
@@ -10973,6 +11025,10 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder =
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let cache_holder: CacheHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::CacheConfig::default(),
+            ));
         let repo_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
         let iteration_sleep = Arc::new(tokio::sync::Notify::new());
@@ -10988,6 +11044,7 @@ mod tests {
                 github_holder,
                 reviewer_holder,
                 chatops_holder,
+                cache_holder,
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
@@ -15856,6 +15913,8 @@ mod tests {
         }));
         let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(None));
+        let cache_holder: CacheHolder =
+            Arc::new(ArcSwap::from_pointee(crate::config::CacheConfig::default()));
         let cancel = CancellationToken::new();
 
         let task_cancel = cancel.clone();
@@ -15869,6 +15928,7 @@ mod tests {
                 github_holder,
                 reviewer_holder,
                 chatops_holder,
+                cache_holder,
                 1_000_000,
                 u32::MAX,
                 None,

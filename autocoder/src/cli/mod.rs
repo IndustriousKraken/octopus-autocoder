@@ -60,6 +60,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         chatops: None,
         audits: None,
         paths: config::DaemonPathsConfig::default(),
+        cache: config::CacheConfig::default(),
         features: config::FeaturesConfig::default(),
         canonical_rag: None,
         models: None,

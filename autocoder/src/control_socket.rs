@@ -51,6 +51,11 @@ pub type GithubHolder = Arc<ArcSwap<GithubConfig>>;
 pub type ReviewerHolder = Arc<ArcSwap<Option<Arc<CodeReviewer>>>>;
 pub type ChatOpsHolder = Arc<ArcSwap<Option<ChatOpsSlot>>>;
 pub type ConfigHolder = Arc<ArcSwap<Config>>;
+/// Hot-swappable holder for the workspace-cache config (a65). The reload
+/// handler swaps a new `CacheConfig` in; each polling loop reads a
+/// snapshot at iteration start so a reload applies the new cap at the
+/// next iteration (per the orchestrator-cli hot-reload subset).
+pub type CacheHolder = Arc<ArcSwap<crate::config::CacheConfig>>;
 
 /// One in-flight chat-driven proposal-request awaiting triage. The
 /// chatops dispatcher's `propose` verb appends to
@@ -347,6 +352,11 @@ pub struct ControlState {
     pub github: GithubHolder,
     pub reviewer: ReviewerHolder,
     pub chatops: ChatOpsHolder,
+    /// Hot-swappable workspace-cache config (a65). The reload handler
+    /// swaps a new `CacheConfig` in here; the same holder is shared with
+    /// every polling task so a reload's new `workspaces_max_gb` cap takes
+    /// effect at the next iteration.
+    pub cache: CacheHolder,
     /// The most recently parsed-and-applied `Config`. Reload diffs
     /// against this snapshot; on a successful reload, the snapshot is
     /// swapped to the new value.
@@ -2505,6 +2515,16 @@ pub async fn handle_reload(state: &ControlState) -> Value {
         unchanged.push("chatops".to_string());
     }
 
+    // --- cache (hot-applied) ---
+    // a65: swap the workspace-cache config so the new `workspaces_max_gb`
+    // cap takes effect at the next iteration of every polling task.
+    if yaml_repr(&current.cache) != yaml_repr(&new_cfg.cache) {
+        state.cache.store(Arc::new(new_cfg.cache.clone()));
+        applied.push("cache".to_string());
+    } else {
+        unchanged.push("cache".to_string());
+    }
+
     // --- repositories (hot-applied) ---
     // Diff by URL: added/removed are computed from the URL sets; for URLs
     // present in both, compare the full RepositoryConfig (URLs already
@@ -2700,6 +2720,10 @@ fn build_reviewer(cfg: Option<&ReviewerConfig>) -> Result<Option<Arc<CodeReviewe
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from new config")?;
+            // a64: re-evaluate agentic-CLI availability on reload via the
+            // existing `reviewer:` hot-reload path; an unavailable CLI
+            // degrades to `oneshot` for this boot with one loud WARN.
+            let r = crate::code_reviewer::apply_startup_cli_fallback(r);
             Ok(Some(Arc::new(r)))
         }
         _ => Ok(None),
@@ -2824,6 +2848,7 @@ mod tests {
             github: Arc::new(ArcSwap::from_pointee(cfg.github.clone())),
             reviewer: Arc::new(ArcSwap::from_pointee(None)),
             chatops: Arc::new(ArcSwap::from_pointee(None)),
+            cache: Arc::new(ArcSwap::from_pointee(cfg.cache.clone())),
             last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
             config_path,
             repo_tasks: task_map,
@@ -2919,12 +2944,39 @@ github:
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        for section in ["github", "reviewer", "chatops", "repositories", "executor"] {
+        for section in ["github", "reviewer", "chatops", "cache", "repositories", "executor"] {
             assert!(
                 unchanged.contains(&section.to_string()),
                 "section `{section}` missing from unchanged: {unchanged:?}"
             );
         }
+        cancel.cancel();
+    }
+
+    /// a65: a reload that adds (or changes) `cache.workspaces_max_gb`
+    /// hot-applies the new cap into the shared `cache` holder so polling
+    /// tasks pick it up at their next iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_applies_cache_cap_change() {
+        let (_dir, socket, state, cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        // Initially unbounded.
+        assert!(state.cache.load().workspaces_max_gb.is_none());
+        let new_yaml = format!("{BASE_YAML}cache:\n  workspaces_max_gb: 25\n");
+        std::fs::write(&cfg_path, new_yaml).unwrap();
+        let resp = send_request(&socket, r#"{"action":"reload"}"#).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let applied: Vec<String> = resp["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            applied.contains(&"cache".to_string()),
+            "cache must be in applied: {applied:?}"
+        );
+        // The shared holder now carries the new cap.
+        assert_eq!(state.cache.load().workspaces_max_gb, Some(25));
         cancel.cancel();
     }
 

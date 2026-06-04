@@ -477,6 +477,22 @@ github:
 #   #   prompt_budget_chars: 300000
 #   #   mode: per_change
 #   #
+#   # Reviewer transport. `agentic` (the default since a64) runs the
+#   # reviewer as a read-only CLI-wrapped session (via the `command`
+#   # CLI below) that reads files on demand and returns its verdict
+#   # through the `submit_review` MCP tool — no 2M-char prompt-budget
+#   # truncation, schema-validated verdict, discard-and-alert instead of
+#   # default-approve. `oneshot` is the legacy single-shot HTTP path that
+#   # pre-dumps every touched file into one prompt. When the effective
+#   # kind is `agentic` but the resolved reviewer CLI (`command`, resolved
+#   # per provider: anthropic → `claude`, others → `opencode`) is not
+#   # installed on the daemon host, the reviewer logs one startup WARN and
+#   # degrades to the `oneshot` HTTP path for that boot — review is never
+#   # disabled. Set `kind: oneshot` to opt out of agentic and silence the
+#   # warning. Re-evaluated on restart / `autocoder reload`.
+#   # kind: agentic
+#   # command: claude        # the agentic CLI binary; default `claude`
+#   #
 #   # Reviewer-initiated revisions on actionable concerns. When `true`,
 #   # every concern the reviewer marked `should_request_revision: true`
 #   # (with a non-empty `actionable_request`) posts a
@@ -735,6 +751,27 @@ github:
 #   cache_dir: /var/cache/autocoder
 #   logs_dir: /var/log/autocoder
 #   runtime_dir: /run/autocoder
+
+# Workspace-cache bounding (a65). Optional top-level block. Per-repo
+# workspaces under `<cache>/workspaces/<key>` accumulate a build-artifact
+# tree (a Rust repo's multi-GB `target/debug`, a Node repo's
+# `node_modules/`, …) with no bound. Left unset, the cache is UNBOUNDED
+# (today's behaviour) and a daemon running several repos long enough can
+# fill its disk — the daemon logs a one-time startup notice in this case.
+#
+# When `workspaces_max_gb` is set, at each repo's iteration start the
+# daemon measures the total `<cache>/workspaces/` size; if it exceeds the
+# cap, it evicts whole least-recently-used IDLE workspaces (oldest
+# last-used first) until under the cap. Eviction is language-agnostic
+# (it removes entire clones, not just `target/`/`node_modules/`) AND
+# lossless: an evicted repo re-clones on its next iteration, and per-PR
+# revision + audit state live under `<state>/`, not the workspace. The
+# repo currently iterating AND any workspace holding a busy marker are
+# never evicted. A value of `0` is rejected — omit the field for an
+# unbounded cache.
+#
+# cache:
+#   workspaces_max_gb: 50
 
 # Per-workspace feature flags (a23 + future). Each sub-block is opt-in;
 # absent sub-blocks take their type-default behaviour. Omit the entire

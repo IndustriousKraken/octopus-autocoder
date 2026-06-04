@@ -18,8 +18,8 @@ use crate::config::{
     validate_audit_type_names,
 };
 use crate::control_socket::{
-    self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
-    ReviewerHolder, SpawnOutcome, SpawnRepoFn,
+    self, CacheHolder, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle,
+    RepoTaskMap, ReviewerHolder, SpawnOutcome, SpawnRepoFn,
 };
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
@@ -343,9 +343,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from config")?;
+            // a64: when the effective kind is `agentic` but the resolved
+            // reviewer CLI is unavailable on this host, degrade to the
+            // `oneshot` HTTP path for the boot (one loud WARN logged inside).
+            let r = crate::code_reviewer::apply_startup_cli_fallback(r);
             tracing::info!(
                 provider = ?rcfg.provider,
                 model = rcfg.model.as_str(),
+                kind = ?r.kind(),
                 "code reviewer enabled"
             );
             Some(Arc::new(r))
@@ -387,6 +392,18 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
     let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(reviewer_initial));
     let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
+    let cache_holder: CacheHolder = Arc::new(ArcSwap::from_pointee(cfg.cache.clone()));
+
+    // a65: one-time startup notice when the workspace cache is unbounded
+    // (`cache.workspaces_max_gb` unset, the default). Surfaces the
+    // unbounded-growth failure mode — and the field that bounds it —
+    // before it can wedge a disk. `execute` runs exactly once per daemon
+    // boot, so this WARN is emitted at most once per process lifetime.
+    if let Some(notice) =
+        crate::config::workspace_cache_unbounded_notice(cfg.cache.workspaces_max_gb)
+    {
+        tracing::warn!("{notice}");
+    }
 
     for repo in &cfg.repositories {
         let derived = workspace::resolve_path(&daemon_paths, repo);
@@ -584,6 +601,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         github_holder: github_holder.clone(),
         reviewer_holder: reviewer_holder.clone(),
         chatops_holder: chatops_holder.clone(),
+        cache_holder: cache_holder.clone(),
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
@@ -659,6 +677,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
         chatops: chatops_holder.clone(),
+        cache: cache_holder.clone(),
         last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
         config_path,
         repo_tasks: task_map.clone(),
@@ -883,6 +902,7 @@ struct SpawnDeps {
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
     chatops_holder: ChatOpsHolder,
+    cache_holder: CacheHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
@@ -938,6 +958,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let github_for_task = deps.github_holder.clone();
         let reviewer_for_task = deps.reviewer_holder.clone();
         let chatops_for_task = deps.chatops_holder.clone();
+        let cache_for_task = deps.cache_holder.clone();
         let stuck = deps.stuck_threshold_secs;
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
@@ -1020,6 +1041,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 github_for_task,
                 reviewer_for_task,
                 chatops_for_task,
+                cache_for_task,
                 stuck,
                 perma,
                 exec_max,
