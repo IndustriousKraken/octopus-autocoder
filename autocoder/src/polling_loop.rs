@@ -1141,6 +1141,9 @@ pub async fn execute_one_pass(
                             markdown: format!("(reviewer failed: {e})"),
                             concerns: Vec::new(),
                             per_change_sections: Vec::new(),
+                            // Reviewer failed before producing a verdict; no
+                            // model output to attribute (a49).
+                            attribution: None,
                         };
                         (Some(synthetic), false, Vec::new())
                     }
@@ -1422,6 +1425,12 @@ fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewRepor
     let mut verdict = ReviewVerdict::Pass;
     let mut concerns: Vec<ReviewConcern> = Vec::new();
     let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
+    // Every per-change report comes from the same reviewer, so they share
+    // one attribution (a49); carry it onto the synthesized report so the
+    // PR-body composer can attribute each `## Code Review: <slug>` section.
+    let attribution = per_change
+        .first()
+        .and_then(|pcr| pcr.report.attribution.clone());
     for pcr in per_change {
         verdict = worst_verdict(verdict, pcr.report.verdict);
         for concern in &pcr.report.concerns {
@@ -1441,6 +1450,7 @@ fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewRepor
         markdown: String::new(),
         concerns,
         per_change_sections: sections,
+        attribution,
     }
 }
 
@@ -2668,8 +2678,16 @@ async fn handle_contradiction_preflight(
             "failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
         );
     }
-    maybe_post_contradiction_findings_alert(paths, chatops_ctx, repo, change, &findings, &suggestion)
-        .await;
+    maybe_post_contradiction_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        cc_ctx.attribution.as_deref(),
+    )
+    .await;
     Ok(Some(QueueStep::SpecRevisionMarked))
 }
 
@@ -2716,6 +2734,7 @@ async fn maybe_post_contradiction_findings_alert(
     change: &str,
     findings: &[crate::preflight::change_contradiction::ContradictionFinding],
     revision_suggestion: &str,
+    attribution: Option<&str>,
 ) {
     let Some(ctx) = chatops_ctx else { return };
     if !ctx.failure_alerts_enabled {
@@ -2749,8 +2768,18 @@ async fn maybe_post_contradiction_findings_alert(
             s = f.summary,
         ));
     }
+    // a49: append the `*Contradiction-check: <provider>/<model>*`
+    // attribution when the daemon knows the configured model.
+    let attribution_suffix = attribution
+        .map(|a| {
+            format!(
+                "\n\n{}",
+                crate::attribution::attribution_line("Contradiction-check", a)
+            )
+        })
+        .unwrap_or_default();
     let text = format!(
-        "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
         repo_url = repo.url,
         change = change,
         findings_block = findings_block,
@@ -5733,14 +5762,35 @@ fn build_audit_only_pr_title_from_categories(
 /// commits actually exist — fixing PR #77's misleading body that named
 /// "audit-produced proposals" with zero audit commits in the diff.
 fn build_audit_only_pr_body(commit_subjects: &[String]) -> String {
+    build_audit_only_pr_body_with_attribution(commit_subjects, None)
+}
+
+/// As [`build_audit_only_pr_body`], but appends a one-line model
+/// attribution (a49) to the `## Audit-produced proposals` section when
+/// `attribution_line` is `Some`. `attribution_line` is the fully-formed
+/// `*Auditor (<audit-type>): <provider>/<model>*` line produced by
+/// [`crate::attribution::audit_attribution_line`].
+///
+/// In-tree audits wrap the Claude CLI and have no daemon-known `(provider,
+/// model)`, so the audit-only-PR path passes `None` today and no line is
+/// emitted. The attributed seam exists for audits that gain a resolvable
+/// model via the planned model-registry work; it is exercised by tests.
+fn build_audit_only_pr_body_with_attribution(
+    commit_subjects: &[String],
+    attribution_line: Option<&str>,
+) -> String {
     let cats = categorize_commit_subjects(commit_subjects);
-    build_audit_only_pr_body_from_categories(&cats)
+    build_audit_only_pr_body_from_categories(&cats, attribution_line)
 }
 
 /// Inner of [`build_audit_only_pr_body`] — works on already-categorized
 /// commits. Pulled out so tests can drive the body content from a
-/// fixture `CommitCategories` directly.
-fn build_audit_only_pr_body_from_categories(cats: &CommitCategories) -> String {
+/// fixture `CommitCategories` directly. `attribution_line` (a49) is
+/// appended to the `## Audit-produced proposals` section when `Some`.
+fn build_audit_only_pr_body_from_categories(
+    cats: &CommitCategories,
+    attribution_line: Option<&str>,
+) -> String {
     let mut s = String::new();
 
     // Lead sentence: framing depends on what's actually present.
@@ -5768,6 +5818,11 @@ fn build_audit_only_pr_body_from_categories(cats: &CommitCategories) -> String {
         s.push_str("## Audit-produced proposals\n\n");
         for subject in &cats.audit {
             s.push_str(&format!("- {subject}\n"));
+        }
+        // a49: attribute the model behind the audit-produced proposals.
+        if let Some(line) = attribution_line {
+            s.push_str(line);
+            s.push('\n');
         }
         s.push('\n');
     }
@@ -9891,6 +9946,7 @@ mod tests {
                         markdown: format!("(reviewer failed: {e})"),
                         concerns: Vec::new(),
                         per_change_sections: Vec::new(),
+                        attribution: None,
                     }),
                     false,
                 ),
@@ -10961,6 +11017,35 @@ mod tests {
         assert!(!out.contains("STDERR_LOG_NOISE"));
         assert!(!out.contains("=== PROMPT"));
         assert!(!out.contains("=== STDERR"));
+    }
+
+    /// a49 task 3.4: the executor's `## Agent implementation notes` section
+    /// is OUT of scope for model attribution — the executor wraps the
+    /// Claude CLI and has no daemon-known `(provider, model)` in this
+    /// change. The composed notes must carry NO attribution line.
+    #[test]
+    fn build_implementer_summary_has_no_attribution_line() {
+        let dir = unique_workspace("no-attribution");
+        let ws = dir.path();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        write_fixture_run_log(
+            &paths,
+            ws,
+            "alpha",
+            "PROMPT",
+            "implementer narrative output",
+            "",
+        );
+        let out = build_implementer_summary(&paths, ws, &["alpha".to_string()]);
+        assert!(out.contains("## Agent implementation notes"));
+        // No reviewer/auditor/contradiction-check attribution, and no
+        // generic italic `*<Role>: <provider>/<model>*` line.
+        assert!(!out.contains("*Reviewer:"), "no reviewer attribution: {out}");
+        assert!(!out.contains("*Auditor"), "no auditor attribution: {out}");
+        assert!(
+            !out.contains("*Contradiction-check:"),
+            "no contradiction-check attribution: {out}"
+        );
     }
 
     #[test]
@@ -12545,6 +12630,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::ok(r#"{"contradictions": []}"#),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: None,
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -12605,6 +12691,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::ok(body),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: Some("anthropic/claude-opus-4-8".into()),
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -12685,6 +12772,7 @@ mod tests {
         let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
             llm: CcFixedLlm::err("simulated transport error"),
             prompt_template: "TEST_PROMPT".into(),
+            attribution: None,
         };
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
@@ -15928,6 +16016,7 @@ mod tests {
             markdown: "## Summary\nbase markdown.\n".to_string(),
             concerns,
             per_change_sections: Vec::new(),
+            attribution: None,
         }
     }
 
@@ -15960,6 +16049,7 @@ mod tests {
                     markdown: "ok".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -15969,6 +16059,7 @@ mod tests {
                     markdown: "minor".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -15978,6 +16069,7 @@ mod tests {
                     markdown: "bad".into(),
                     concerns: Vec::new(),
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
         ];
@@ -16006,6 +16098,7 @@ mod tests {
                     markdown: String::new(),
                     concerns: vec![c1.clone()],
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
             PerChangeReview {
@@ -16015,6 +16108,7 @@ mod tests {
                     markdown: String::new(),
                     concerns: vec![c2.clone()],
                     per_change_sections: Vec::new(),
+                    attribution: None,
                 },
             },
         ];
@@ -16154,6 +16248,7 @@ mod tests {
                     markdown: "VERDICT: Block\n\n## Summary\nchange c notes.\n".into(),
                 },
             ],
+            attribution: None,
         };
         let taken = partition_and_annotate_reviewer_revisions(&mut report, 5);
         // 5 of 6 revisable concerns posted.
@@ -16833,6 +16928,39 @@ mod tests {
             body.contains("next polling iteration will pick"),
             "body must explain next-iteration pickup: {body}"
         );
+        // a49: default (no model) audit-only body carries no attribution.
+        assert!(
+            !body.contains("*Auditor"),
+            "un-attributed audit-only body must have no attribution line: {body}"
+        );
+    }
+
+    /// a49: when an audit IS configured with a daemon-known model, the
+    /// audit-produced PR section carries the
+    /// `*Auditor (<type>): <provider>/<model>*` attribution line.
+    #[test]
+    fn build_audit_only_pr_body_carries_attribution_when_provided() {
+        let subjects = vec![
+            "audit: security_bug proposals (1 change(s))".to_string(),
+            "audit: missing_tests proposals (2 change(s))".to_string(),
+        ];
+        let attribution = crate::attribution::audit_attribution_line(
+            "security_bug_audit",
+            "anthropic/claude-opus-4-8",
+        );
+        let body = build_audit_only_pr_body_with_attribution(&subjects, Some(&attribution));
+        assert!(
+            body.contains("*Auditor (security_bug_audit): anthropic/claude-opus-4-8*"),
+            "audit-produced PR section must carry the attribution line: {body}"
+        );
+        // The line lands inside the audit-produced-proposals section.
+        let section_idx = body
+            .find("## Audit-produced proposals")
+            .expect("audit section present");
+        let attr_idx = body
+            .find("*Auditor (security_bug_audit):")
+            .expect("attribution present");
+        assert!(attr_idx > section_idx, "attribution follows the section header");
     }
 
     // ================================================================

@@ -1301,6 +1301,25 @@ pub enum CodeReviewOutcome {
     Completed { verdict: crate::code_reviewer::Verdict },
 }
 
+/// Compose the `## Code Review (rerun N of M)` re-review comment body.
+/// When `attribution` is `Some`, a one-line
+/// `*Reviewer: <provider>/<model>*` model attribution (a49) is appended;
+/// `None` (reviewer carried no daemon-known model) emits no such line.
+fn compose_rerun_review_comment(
+    rerun_label: &str,
+    verdict_label: &str,
+    markdown: &str,
+    attribution: Option<&str>,
+) -> String {
+    let mut body =
+        format!("## Code Review ({rerun_label})\n\nVERDICT: {verdict_label}\n\n{markdown}");
+    if let Some(attr) = attribution {
+        body.push_str("\n\n");
+        body.push_str(&crate::attribution::attribution_line("Reviewer", attr));
+    }
+    body
+}
+
 /// Execute an operator-initiated code re-review (a33). Sibling to
 /// [`execute_revision`]. Fetches the PR's current state, invokes
 /// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
@@ -1362,10 +1381,11 @@ async fn execute_code_review(
         Some(m) => format!("rerun {n} of {m}"),
         None => format!("rerun {n}"),
     };
-    let body = format!(
-        "## Code Review ({rerun_label})\n\nVERDICT: {verdict}\n\n{markdown}",
-        verdict = result.verdict.label(),
-        markdown = result.markdown,
+    let body = compose_rerun_review_comment(
+        &rerun_label,
+        result.verdict.label(),
+        &result.markdown,
+        result.attribution.as_deref(),
     );
     if let Err(e) =
         github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body).await
@@ -1565,6 +1585,36 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// a49: the `## Code Review (rerun N of M)` comment carries the
+    /// reviewer's `*Reviewer: <provider>/<model>*` attribution line when a
+    /// model is configured.
+    #[test]
+    fn rerun_comment_carries_reviewer_attribution() {
+        let body = compose_rerun_review_comment(
+            "rerun 2 of 5",
+            "Approve",
+            "VERDICT: Pass\n\nlooks good",
+            Some("anthropic/claude-opus-4-8"),
+        );
+        assert!(body.contains("## Code Review (rerun 2 of 5)"));
+        assert!(
+            body.contains("*Reviewer: anthropic/claude-opus-4-8*"),
+            "rerun comment must carry the attribution line; got: {body:?}"
+        );
+    }
+
+    /// a49: with no configured model the rerun comment emits no attribution
+    /// line.
+    #[test]
+    fn rerun_comment_without_model_has_no_attribution() {
+        let body =
+            compose_rerun_review_comment("rerun 1", "Block", "VERDICT: Block\n\nbug", None);
+        assert!(
+            !body.contains("*Reviewer:"),
+            "no attribution line without a configured model; got: {body:?}"
+        );
     }
 
     fn sample_state(pr: u64) -> RevisionState {

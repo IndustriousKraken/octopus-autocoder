@@ -226,10 +226,13 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             model = llm_cfg.model.as_str(),
             "change-internal contradiction pre-flight enabled (a19)"
         );
+        let attribution =
+            crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::preflight::change_contradiction::ContradictionCheckCtx {
                 llm,
                 prompt_template,
+                attribution: Some(attribution),
             },
         ))
     } else {

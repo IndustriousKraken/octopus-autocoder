@@ -4,6 +4,7 @@ use clap::Parser;
 mod alert_state;
 mod alert_state_migration;
 mod alerts;
+mod attribution;
 mod audits;
 mod busy_marker;
 mod changelog_requests;

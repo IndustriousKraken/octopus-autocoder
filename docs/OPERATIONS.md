@@ -13,6 +13,8 @@ Beyond the OpenSpec change queue, autocoder runs a periodic-audit framework: a s
 
 The framework is **default-off**. With no `audits:` block in the config, every registered audit's effective cadence resolves to `disabled` and the daemon behaves exactly as it did before the framework existed. Operators opt in explicitly per audit.
 
+**Model attribution.** Operator-facing reviewer, audit, and contradiction-check output carries a one-line `*<Role>: <provider>/<model>*` attribution (e.g. `*Auditor (drift_audit): anthropic/claude-opus-4-8*`); `<provider>` is the configured provider KIND, not the upstream brand. The in-tree audits above wrap the agent CLI and have no daemon-known model, so an audit attribution line only appears once an audit is configured with a resolvable `(provider, model)`; the executor's `## Agent implementation notes` are likewise not yet attributed. See [Model attribution](CODE-REVIEW.md#model-attribution).
+
 **Registered audit type names:**
 
 | Slug | What it does | LLM | Default cadence | WritePolicy |

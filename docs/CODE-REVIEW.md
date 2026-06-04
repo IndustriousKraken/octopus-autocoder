@@ -163,3 +163,22 @@ The comment is best-effort: if the POST fails, the PR still ships and the failur
 
 The total comment body is capped at 60,000 characters (under GitHub's 65,535 limit, with headroom for wrapper text). When truncated, the tail is replaced with a marker pointing back at `/tmp/autocoder/logs/<basename>/<change>.log` so reviewers can fetch the full output server-side.
 
+## Model attribution
+
+Operator-facing output the daemon composes from an LLM-driven surface carries a one-line model attribution so you can associate a comment's quality with the model behind it:
+
+```
+*Reviewer: anthropic/claude-opus-4-8*
+```
+
+The line has the form `*<Role>: <provider>/<model>*` and is appended to:
+
+- the initial-review `## Code Review` PR-body section, and each per-change `## Code Review: <slug>` section in `per_change` mode — role `Reviewer`;
+- the `## Code Review (rerun N of M)` re-review comment — role `Reviewer`;
+- each audit's chatops finding and audit-produced PR section — role `Auditor (<audit-type>)`;
+- the change-internal contradiction-check findings alert — role `Contradiction-check`.
+
+`<provider>` is the configured provider **KIND** (`anthropic`, `openai_compatible`, or `ollama`), **not** the upstream brand. A model served through an OpenAI-compatible gateway renders as `openai_compatible/moonshotai/kimi-latest`, not the gateway's name. The attribution is produced by a redaction-safe accessor that reads only the `provider` and `model` fields; it can never embed an `api_key`, an `api_key_env`-resolved value, or an `api_base_url`.
+
+**Not yet attributed:** the executor's `## Agent implementation notes` section carries no attribution line. The executor wraps the Claude CLI and uses the CLI's configured model, which the daemon does not know — so a clean attribution is deferred to the model-registry work that gives the executor a resolvable model rather than emitting a placeholder. The in-tree audits likewise wrap the CLI today, so an audit attribution line appears only once an audit is configured with a daemon-known `(provider, model)`.
+
