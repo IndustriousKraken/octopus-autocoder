@@ -275,6 +275,10 @@ pub enum SubsystemKind {
     /// Change-internal contradiction check (`executor.change_internal_contradiction_check_llm:`).
     /// All three providers valid.
     ContradictionCheck,
+    /// Change-vs-canonical contradiction check — the `[canon]` gate
+    /// (`executor.change_canonical_contradiction_check_llm:`, a62). All three
+    /// providers valid.
+    CanonContradictionCheck,
 }
 
 impl SubsystemKind {
@@ -283,12 +287,13 @@ impl SubsystemKind {
             Self::Reviewer => "reviewer",
             Self::CanonicalRag => "canonical_rag",
             Self::ContradictionCheck => "change_internal_contradiction_check_llm",
+            Self::CanonContradictionCheck => "change_canonical_contradiction_check_llm",
         }
     }
 
     fn valid_providers(self) -> &'static [LlmProvider] {
         match self {
-            Self::Reviewer | Self::ContradictionCheck => &[
+            Self::Reviewer | Self::ContradictionCheck | Self::CanonContradictionCheck => &[
                 LlmProvider::Anthropic,
                 LlmProvider::OpenAiCompatible,
                 LlmProvider::Ollama,
@@ -1020,6 +1025,28 @@ pub struct ExecutorConfig {
     /// failure mode is fail-open).
     #[serde(default)]
     pub change_internal_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Opt-in gate for the change-vs-canonical contradiction pre-flight —
+    /// the `[canon]` gate of the verifier framework (a62). `Disabled` (the
+    /// default) skips the LLM call entirely. `Enabled` runs the check
+    /// alongside the `[in]` gate, BEFORE the executor; non-empty findings
+    /// write `.needs-spec-revision.json` and halt the queue walk. Enabling
+    /// without configuring `change_canonical_contradiction_check_llm` is a
+    /// fail-fast startup error.
+    #[serde(default)]
+    pub change_canonical_contradiction_check: ContradictionCheckMode,
+    /// Optional path to a custom change-vs-canonical-check prompt template.
+    /// When unset, the binary uses the template embedded at compile time
+    /// from `prompts/change-vs-canonical-check.md`. An empty override file
+    /// is rejected at use time so the daemon does not feed an empty prompt
+    /// to the session.
+    #[serde(default)]
+    pub change_canonical_contradiction_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the change-vs-canonical check. Required when
+    /// `change_canonical_contradiction_check` is `Enabled`. Parallel to the
+    /// `[in]` gate's `change_internal_contradiction_check_llm` block so
+    /// operators can pick a model independently.
+    #[serde(default)]
+    pub change_canonical_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
 }
 
 /// Opt-in gate for the change-internal contradiction pre-flight (a19).
@@ -2454,6 +2481,37 @@ impl Config {
                 "change_internal_contradiction_check_llm",
             )?;
         }
+        if let Some(llm) = cfg
+            .executor
+            .change_canonical_contradiction_check_llm
+            .as_mut()
+        {
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "change_canonical_contradiction_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("change_canonical_contradiction_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::CanonContradictionCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            validate_llm_provider_config(
+                provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "change_canonical_contradiction_check_llm",
+            )?;
+        }
         // a000: reject typo'd author_association entries up front so a
         // misconfigured allowlist fails at startup rather than silently
         // denying every commenter.
@@ -2850,6 +2908,24 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some("executor/change_internal_contradiction_check_llm".into()),
         );
     }
+    // a62: opting into the change-vs-canonical check (the `[canon]` gate)
+    // requires configuring its LLM block, exactly as the `[in]` gate does.
+    // Fail fast at startup so the misconfig surfaces before the first
+    // polling iteration.
+    if matches!(
+        config.executor.change_canonical_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) && config
+        .executor
+        .change_canonical_contradiction_check_llm
+        .is_none()
+    {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.change_canonical_contradiction_check is enabled but executor.change_canonical_contradiction_check_llm is not configured",
+            Some("executor/change_canonical_contradiction_check_llm".into()),
+        );
+    }
     // a25: features.scout.max_items must be within 1..=50.
     if let Err(msg) = config.features.scout.validate() {
         report.push_error(
@@ -3168,6 +3244,40 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(canon_llm) = config
+        .executor
+        .change_canonical_contradiction_check_llm
+        .as_ref()
+    {
+        let has_inline = canon_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = canon_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_canonical_contradiction_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/change_canonical_contradiction_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = canon_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_canonical_contradiction_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/change_canonical_contradiction_check_llm/api_key".into()),
+            );
+        }
+    }
     if let Some(chatops) = config.chatops.as_ref() {
         if let Some(slack) = chatops.slack.as_ref() {
             let bot_inline = slack
@@ -3383,6 +3493,9 @@ github:
             "change_internal_contradiction_check",
             "change_internal_contradiction_check_prompt_path",
             "change_internal_contradiction_check_llm",
+            "change_canonical_contradiction_check",
+            "change_canonical_contradiction_check_prompt_path",
+            "change_canonical_contradiction_check_llm",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",

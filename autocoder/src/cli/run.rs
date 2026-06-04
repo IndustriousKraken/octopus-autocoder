@@ -247,6 +247,52 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         None
     };
 
+    // Build the change-vs-canonical contradiction pre-flight context — the
+    // `[canon]` gate (a62). Disabled by default → no context produced; the
+    // polling loop short-circuits at the `canon_contradiction::current()`
+    // read. Enabled-without-LLM-config already failed validation above.
+    let canon_contradiction_ctx: Option<
+        Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>,
+    > = if matches!(
+        cfg.executor.change_canonical_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        let llm_cfg = cfg
+            .executor
+            .change_canonical_contradiction_check_llm
+            .as_ref()
+            .expect("validate_config guarantees the llm block is set when enabled");
+        let model = crate::llm::resolve_canon_contradiction_check_model(llm_cfg)
+            .context("resolving canon-contradiction-check model from config")?;
+        let prompt_template = crate::preflight::canon_contradiction::load_prompt_template(
+            cfg.executor
+                .change_canonical_contradiction_check_prompt_path
+                .as_deref(),
+        )
+        .context("loading change-vs-canonical-check prompt template")?;
+        tracing::info!(
+            provider = ?llm_cfg.provider,
+            model = llm_cfg.model.as_str(),
+            "change-vs-canonical contradiction pre-flight enabled (the [canon] gate, a62)"
+        );
+        let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
+        Some(Arc::new(
+            crate::preflight::canon_contradiction::CanonContradictionCheckCtx {
+                command: cfg.executor.command.clone(),
+                model,
+                prompt_template,
+                attribution: Some(attribution),
+                #[cfg(test)]
+                test_submission: None,
+            },
+        ))
+    } else {
+        tracing::info!(
+            "change-vs-canonical contradiction pre-flight disabled (the [canon] gate, a62; opt-in via executor.change_canonical_contradiction_check)"
+        );
+        None
+    };
+
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
@@ -503,6 +549,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audits_cfg: audits_cfg_arc.clone(),
         audit_settings: audit_settings_arc.clone(),
         contradiction_ctx: contradiction_ctx.clone(),
+        canon_contradiction_ctx: canon_contradiction_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -588,6 +635,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // a59: register the contradiction check's `submit_contradictions` payload
     // schema on the same store so its MCP child's submissions are validated.
     crate::preflight::change_contradiction::register_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
+    // a62: register the `[canon]` gate's `submit_canon_contradictions` payload
+    // schema on the same store so its MCP child's submissions are validated.
+    crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(
         &control_state.submission_store,
     );
     let listener_cancel = cancel.clone();
@@ -791,6 +843,8 @@ struct SpawnDeps {
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     contradiction_ctx:
         Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
+    canon_contradiction_ctx:
+        Option<Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -901,6 +955,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
+        let canon_contradiction_ctx_for_task = deps.canon_contradiction_ctx.clone();
         let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
@@ -935,8 +990,16 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_drained_for_task,
                 cancel_for_task,
             );
-            crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut)
-                .await;
+            // Nest the two pre-executor gate scopes (a59 `[in]`, a62 `[canon]`)
+            // around the polling future; each gate reads its own task-local via
+            // `current()`. Either may be `None` (disabled) independently.
+            let in_scoped =
+                crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut);
+            crate::preflight::canon_contradiction::scope(
+                canon_contradiction_ctx_for_task,
+                in_scoped,
+            )
+            .await;
             {
                 let mut guard = map_for_task.lock().unwrap();
                 guard.remove(&url_for_task);

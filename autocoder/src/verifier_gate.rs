@@ -101,15 +101,21 @@ impl VerifierGate {
     }
 }
 
-/// The concrete check an installed gate runs. a61 realizes ONLY
+/// The concrete check an installed gate runs. a61 realized
 /// [`GateImpl::ContradictionCheck`] (the a59 change-internal contradiction
-/// pre-flight, reframed as the `[in]` gate). a62/a63 add variants as they
-/// realize the `[canon]` / `[out]` gates.
+/// pre-flight, reframed as the `[in]` gate); a62 adds
+/// [`GateImpl::CanonContradictionCheck`] (the change-vs-canonical pre-flight,
+/// the `[canon]` gate). a63 adds the `[out]` variant when it realizes that
+/// gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateImpl {
     /// The change-internal contradiction pre-flight check (a59). Entry point:
     /// [`crate::preflight::change_contradiction::run_agentic_contradiction_check`].
     ContradictionCheck,
+    /// The change-vs-canonical contradiction pre-flight check (a62). Entry
+    /// point:
+    /// [`crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check`].
+    CanonContradictionCheck,
 }
 
 /// Maps a [`VerifierGate`] to its installed [`GateImpl`]. A gate that is NOT
@@ -130,10 +136,11 @@ pub struct GateRegistry {
 }
 
 impl GateRegistry {
-    /// The daemon's standard registry as of a61: the `[in]` gate is installed
-    /// (mapped to the a59 contradiction check); `[canon]` and `[out]` are in
-    /// the vocabulary but unrealized (no installed gate). a62/a63 extend this
-    /// by registering their gates in the initializer below.
+    /// The daemon's standard registry as of a62: the `[in]` gate (mapped to
+    /// the a59 contradiction check) AND the `[canon]` gate (mapped to the a62
+    /// change-vs-canonical check) are installed; `[out]` is in the vocabulary
+    /// but unrealized (no installed gate) until a63. a63 extends this by
+    /// registering its gate in the initializer below.
     ///
     /// Returns a `&'static` reference to a single, lazily-built instance (via
     /// [`OnceLock`]): the `BTreeMap` is allocated exactly once for the process
@@ -144,6 +151,7 @@ impl GateRegistry {
         STANDARD.get_or_init(|| {
             let mut reg = GateRegistry::default();
             reg.register(VerifierGate::In, GateImpl::ContradictionCheck);
+            reg.register(VerifierGate::Canon, GateImpl::CanonContradictionCheck);
             reg
         })
     }
@@ -216,10 +224,11 @@ mod tests {
 
     // ---- registry: the [in] gate is installed; [canon]/[out] are inert ----
 
-    /// Task 2.2: the `[in]` gate is resolvable by name to the contradiction
-    /// check entry point.
+    /// Task 2.2 (a61) / a62: the `[in]` gate is resolvable by name to the
+    /// change-internal contradiction check, AND (as of a62) the `[canon]` gate
+    /// is resolvable to the change-vs-canonical check.
     #[test]
-    fn standard_registry_installs_only_the_in_gate() {
+    fn standard_registry_installs_the_pre_executor_gates() {
         let reg = GateRegistry::standard();
         assert_eq!(
             reg.resolve(VerifierGate::In),
@@ -227,30 +236,36 @@ mod tests {
             "the [in] gate must map to the a59 contradiction check"
         );
         assert!(reg.is_installed(VerifierGate::In));
+        assert_eq!(
+            reg.resolve(VerifierGate::Canon),
+            Some(GateImpl::CanonContradictionCheck),
+            "the [canon] gate must map to the a62 change-vs-canonical check"
+        );
+        assert!(reg.is_installed(VerifierGate::Canon));
     }
 
-    /// Task 3.1 / 4.2: an unrealized gate resolves to "no installed gate" and
-    /// the framework invokes nothing for it.
+    /// An unrealized gate resolves to "no installed gate" and the framework
+    /// invokes nothing for it. As of a62 only `[out]` (realized by a63)
+    /// remains unrealized.
     #[test]
     fn unrealized_gates_resolve_to_no_installed_gate() {
         let reg = GateRegistry::standard();
-        assert_eq!(reg.resolve(VerifierGate::Canon), None, "[canon] is unrealized in a61");
-        assert_eq!(reg.resolve(VerifierGate::Out), None, "[out] is unrealized in a61");
-        assert!(!reg.is_installed(VerifierGate::Canon));
+        assert_eq!(reg.resolve(VerifierGate::Out), None, "[out] is unrealized until a63");
         assert!(!reg.is_installed(VerifierGate::Out));
     }
 
     /// The registry is extensible via `register()`: `standard()`'s initializer
-    /// builds the installed set this way (and a62/a63 add their gates there).
-    /// Here we clone the standard set AND realize a previously-inert gate to
-    /// verify the builder mechanism.
+    /// builds the installed set this way (and a63 adds its gate there). Here
+    /// we clone the standard set AND realize a previously-inert gate (`[out]`,
+    /// the only remaining unrealized gate as of a62) to verify the builder
+    /// mechanism.
     #[test]
     fn register_realizes_a_previously_inert_gate() {
         let mut reg = GateRegistry::standard().clone();
-        assert!(!reg.is_installed(VerifierGate::Canon));
-        reg.register(VerifierGate::Canon, GateImpl::ContradictionCheck);
-        assert!(reg.is_installed(VerifierGate::Canon));
-        assert_eq!(reg.resolve(VerifierGate::Canon), Some(GateImpl::ContradictionCheck));
+        assert!(!reg.is_installed(VerifierGate::Out));
+        reg.register(VerifierGate::Out, GateImpl::ContradictionCheck);
+        assert!(reg.is_installed(VerifierGate::Out));
+        assert_eq!(reg.resolve(VerifierGate::Out), Some(GateImpl::ContradictionCheck));
     }
 
     /// `standard()` hands out one shared, build-once instance: repeated calls

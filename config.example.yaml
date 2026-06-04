@@ -276,6 +276,34 @@ executor:
   #   #                                 # (`/v1/messages` for anthropic,
   #   #                                 # `/chat/completions` for openai_compatible,
   #   #                                 # `/api/chat` for ollama).
+  #
+  # --- The [canon] gate: change-vs-canonical contradiction pre-flight ---
+  #
+  # The sibling of the check above (the [in] gate). Where the [in] gate
+  # catches a change that contradicts ITSELF, the [canon] gate catches a
+  # change that contradicts an ALREADY-canonical requirement (a delta that
+  # re-specifies a behavior the project has locked elsewhere). Same
+  # lifecycle position (pre-executor), same opt-in + fail-open posture.
+  # Reads the change's spec-deltas AND `openspec/specs/*/spec.md` (and uses
+  # `query_canonical_specs` when canonical_rag is enabled).
+  #
+  # Disabled by default. To enable, set the mode below AND configure the
+  # LLM block. Enabling without configuring the LLM block is a fail-fast
+  # startup error.
+  # change_canonical_contradiction_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the prompt
+  # compiled into the binary from `prompts/change-vs-canonical-check.md` is
+  # used. An empty override file is rejected at use time.
+  # change_canonical_contradiction_check_prompt_path: /etc/autocoder/prompts/change-vs-canonical-check.md
+  #
+  # Required when the check is enabled. Same surface as the [in] gate's LLM
+  # block (provider | model | api_key_env | api_key | api_base_url).
+  # change_canonical_contradiction_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
+  #                                     # FORBIDDEN for ollama (rejected at config-load).
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once

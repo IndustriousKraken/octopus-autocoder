@@ -214,6 +214,10 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
             crate::config::ContradictionCheckMode::Disabled,
         change_internal_contradiction_check_prompt_path: None,
         change_internal_contradiction_check_llm: None,
+        change_canonical_contradiction_check:
+            crate::config::ContradictionCheckMode::Disabled,
+        change_canonical_contradiction_check_prompt_path: None,
+        change_canonical_contradiction_check_llm: None,
         implementer: None,
         changelog_stylist: None,
         implementer_revision: None,

@@ -34,6 +34,10 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
             change_internal_contradiction_check: config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,

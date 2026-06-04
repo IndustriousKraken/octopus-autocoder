@@ -79,6 +79,15 @@ pub enum PromptId {
     /// Wired through the loader by a future change.
     #[allow(dead_code)]
     ChangeContradictionCheck,
+    /// `prompts/change-vs-canonical-check.md` — the `[canon]` gate's
+    /// change-vs-canonical pre-flight (a62).
+    ///
+    /// Registered for registry-completeness only; the `[canon]`-gate call
+    /// site resolves its own prompt directly via
+    /// `crate::preflight::canon_contradiction::load_prompt_template`.
+    /// Wired through the loader by a future change.
+    #[allow(dead_code)]
+    ChangeVsCanonicalCheck,
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
@@ -103,6 +112,8 @@ const PROMPT_BROWNFIELD_SURVEY: &str = include_str!("../../../prompts/brownfield
 const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
 const PROMPT_CHANGE_CONTRADICTION_CHECK: &str =
     include_str!("../../../prompts/change-contradiction-check.md");
+const PROMPT_CHANGE_VS_CANONICAL_CHECK: &str =
+    include_str!("../../../prompts/change-vs-canonical-check.md");
 
 impl PromptId {
     /// Embedded default template content, loaded at compile time.
@@ -123,6 +134,7 @@ impl PromptId {
             Self::BrownfieldSurvey => PROMPT_BROWNFIELD_SURVEY,
             Self::Scout => PROMPT_SCOUT,
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
+            Self::ChangeVsCanonicalCheck => PROMPT_CHANGE_VS_CANONICAL_CHECK,
         }
     }
 
@@ -146,6 +158,7 @@ impl PromptId {
             Self::BrownfieldSurvey => "brownfield-survey.md",
             Self::Scout => "scout.md",
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
+            Self::ChangeVsCanonicalCheck => "change-vs-canonical-check.md",
         }
     }
 
@@ -167,6 +180,7 @@ impl PromptId {
             Self::BrownfieldSurvey => "BrownfieldSurvey",
             Self::Scout => "Scout",
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
+            Self::ChangeVsCanonicalCheck => "ChangeVsCanonicalCheck",
         }
     }
 
@@ -189,6 +203,7 @@ impl PromptId {
             Self::BrownfieldSurvey,
             Self::Scout,
             Self::ChangeContradictionCheck,
+            Self::ChangeVsCanonicalCheck,
         ]
     }
 }
