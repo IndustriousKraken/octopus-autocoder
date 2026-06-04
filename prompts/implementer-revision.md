@@ -60,7 +60,9 @@ operator sees what you did without opening the diff. Cover:
   outcome; report it explicitly — it is NOT a failure.
 - Test counts: new tests added (if any), AND pass/fail from the final
   run.
-- `cargo clippy --all-targets -- -D warnings` AND
+- The project's linter / formatter / test suite (detected from the
+  repository's build configuration — `Cargo.toml`, `package.json`,
+  `pyproject.toml`, `go.mod`, etc.) AND
   `openspec validate <change> --strict` results when applicable.
 
 Worked example:
@@ -73,7 +75,7 @@ Worked example:
 > intent. No code changed.
 >
 > Tests: 0 added (declined revision).
-> `cargo clippy --all-targets -- -D warnings`: clean.
+> Project linter / formatter: clean.
 > `openspec validate a40-chatops-tolerant-change-args --strict`: pass.
 
 --- BEGIN CHANGES IN THIS PR ---

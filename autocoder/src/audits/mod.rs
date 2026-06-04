@@ -1058,6 +1058,35 @@ pub fn format_audit_notification(
     notify_on_clean: bool,
     now: chrono::DateTime<Utc>,
 ) -> AuditNotification {
+    format_audit_notification_with_attribution(
+        audit_type,
+        repo_url,
+        findings,
+        notify_on_clean,
+        now,
+        None,
+    )
+}
+
+/// As [`format_audit_notification`], but appends a one-line model
+/// attribution (a49) to the thread body when `attribution` is `Some`.
+/// `attribution` is the redaction-safe `<provider>/<model>` string from
+/// [`crate::attribution::AttributionSurface::attribution`]; the rendered
+/// line is `*Auditor (<audit-type>): <provider>/<model>*`.
+///
+/// In-tree audits wrap the Claude CLI and therefore have no daemon-known
+/// `(provider, model)`, so the scheduler currently calls the un-attributed
+/// [`format_audit_notification`] (`attribution: None`) and no line is
+/// emitted. This attributed seam exists for audits that gain a resolvable
+/// model via the planned model-registry work; it is exercised by tests.
+pub fn format_audit_notification_with_attribution(
+    audit_type: &str,
+    repo_url: &str,
+    findings: &[Finding],
+    notify_on_clean: bool,
+    now: chrono::DateTime<Utc>,
+    attribution: Option<&str>,
+) -> AuditNotification {
     let top_line =
         format_audit_top_line(audit_type, repo_url, findings, notify_on_clean);
     let mut thread_body = if findings.is_empty() {
@@ -1079,6 +1108,18 @@ pub fn format_audit_notification(
         thread_body = format!(
             "{truncated}\n\n… [truncated; full findings at journalctl -u autocoder | grep audit_id={audit_id}]"
         );
+    }
+
+    // a49: append the attribution line AFTER the truncation cap so it is
+    // never the part that gets cut — it is short and operator-critical.
+    if let Some(attribution) = attribution {
+        let line = crate::attribution::audit_attribution_line(audit_type, attribution);
+        if thread_body.is_empty() {
+            thread_body = line;
+        } else {
+            thread_body.push('\n');
+            thread_body.push_str(&line);
+        }
     }
 
     let should_thread = thread_body.lines().count() > AUDIT_THREAD_LINE_THRESHOLD
@@ -2148,6 +2189,47 @@ mod tests {
             !n.top_line.contains("stale ignore"),
             "no stale entries → no clause: {}",
             n.top_line
+        );
+    }
+
+    /// a49: when an audit IS configured with a daemon-known model, the
+    /// chatops finding carries the `*Auditor (<type>): <provider>/<model>*`
+    /// attribution line in its thread body.
+    #[test]
+    fn format_audit_notification_with_attribution_carries_auditor_line() {
+        let findings = vec![drift_finding("spec X says A; code says B.")];
+        let n = format_audit_notification_with_attribution(
+            "drift_audit",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+            Some("anthropic/claude-opus-4-8"),
+        );
+        assert!(
+            n.thread_body
+                .contains("*Auditor (drift_audit): anthropic/claude-opus-4-8*"),
+            "audit finding must carry the attribution line; got: {}",
+            n.thread_body
+        );
+    }
+
+    /// a49: the default (un-attributed) notification — what in-tree
+    /// CLI-wrapped audits use — emits no `Auditor` attribution line.
+    #[test]
+    fn format_audit_notification_without_attribution_has_no_auditor_line() {
+        let findings = vec![drift_finding("spec X says A; code says B.")];
+        let n = format_audit_notification(
+            "drift_audit",
+            "u",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            !n.thread_body.contains("*Auditor"),
+            "no attribution line without a configured model; got: {}",
+            n.thread_body
         );
     }
 

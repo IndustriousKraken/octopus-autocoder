@@ -37,7 +37,9 @@ implementation notes` section. Roughly 10-20 lines covering:
 
 - What you implemented — name the modules / functions touched.
 - Test counts: added or modified, AND pass/fail from the final run.
-- `cargo clippy --all-targets -- -D warnings` AND
+- The project's linter / formatter / test suite (detected from the
+  repository's build configuration — `Cargo.toml`, `package.json`,
+  `pyproject.toml`, `go.mod`, etc.) AND
   `openspec validate <change> --strict` results.
 - Judgment calls the spec didn't fully prescribe.
 - Recommended follow-ups, OR an explicit "Follow-ups: none" line.
@@ -51,7 +53,7 @@ Worked example:
 > before marker removal.
 >
 > Tests: 18 new (14 unit + 4 integration); 327/327 pass.
-> `cargo clippy --all-targets -- -D warnings`: clean.
+> Project linter / formatter: clean.
 > `openspec validate a40-chatops-tolerant-change-args --strict`: pass.
 > Judgment call: case-sensitive prefix match (slugs are lowercase by
 > convention).

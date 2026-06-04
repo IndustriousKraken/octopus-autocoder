@@ -49,6 +49,14 @@ pub struct ReviewReport {
     /// per element INSTEAD OF a single combined `## Code Review` block.
     /// Empty for bundled-mode reports.
     pub per_change_sections: Vec<PerChangeSection>,
+    /// Redaction-safe `<provider>/<model>` model attribution for the
+    /// reviewer that produced this report (a49). `Some` when the reviewer
+    /// was built from a config carrying a `(provider, model)`; the PR-body
+    /// composer renders it as `*Reviewer: <provider>/<model>*`. `None` for
+    /// reports built without a configured reviewer (e.g. test fixtures or
+    /// the reviewer-failed synthetic report), in which case no attribution
+    /// line is emitted.
+    pub attribution: Option<String>,
 }
 
 /// One per-change reviewer section, surfaced into the PR body under a
@@ -153,6 +161,11 @@ pub struct CodeReviewer {
     /// iteration skips the reviewer call for any PR whose diff lives
     /// entirely under `openspec/`. Defaults to `false`.
     skip_spec_only_prs: bool,
+    /// Redaction-safe `<provider>/<model>` attribution (a49), stamped onto
+    /// every [`ReviewReport`] this reviewer produces. `Some` when built via
+    /// [`CodeReviewer::from_config`]; `None` for the test-only
+    /// [`CodeReviewer::new`] path (no config, no model to attribute).
+    attribution: Option<String>,
 }
 
 impl CodeReviewer {
@@ -166,7 +179,18 @@ impl CodeReviewer {
             max_code_reviews_per_pr: None,
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            attribution: None,
         }
+    }
+
+    /// Builder-style setter for the redaction-safe model attribution (a49).
+    /// `from_config` sets this from the reviewer config's `(provider,
+    /// model)`. The attribution is stamped onto every [`ReviewReport`] this
+    /// reviewer produces and carried into [`ReviewResult`], from which the
+    /// initial-review and rerun composers render the `*Reviewer: …*` line.
+    pub fn with_attribution(mut self, attribution: Option<String>) -> Self {
+        self.attribution = attribution;
+        self
     }
 
     /// Builder-style setter for the per-PR re-review cap. `None` means
@@ -272,7 +296,8 @@ impl CodeReviewer {
             .with_mode(cfg.mode)
             .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
             .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold)
-            .with_skip_spec_only_prs(cfg.skip_spec_only_prs))
+            .with_skip_spec_only_prs(cfg.skip_spec_only_prs)
+            .with_attribution(Some(crate::attribution::AttributionSurface::attribution(cfg))))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
@@ -322,7 +347,11 @@ impl CodeReviewer {
             .replace("{{diff}}", &rendered.diff_or_explanation);
         log_prompt_stats(context, &rendered, body.len(), self.prompt_budget);
         let raw = self.client.complete(&body).await?;
-        Ok(parse_response(&raw))
+        let mut report = parse_response(&raw);
+        // Stamp the reviewer's redaction-safe attribution (a49) so the
+        // PR-body composer can render `*Reviewer: <provider>/<model>*`.
+        report.attribution = self.attribution.clone();
+        Ok(report)
     }
 }
 
@@ -389,6 +418,11 @@ pub struct ReviewResult {
     pub markdown: String,
     pub per_change_sections: Vec<PerChangeSection>,
     pub concerns: Vec<ReviewConcern>,
+    /// Redaction-safe `<provider>/<model>` attribution (a49), carried from
+    /// the underlying [`ReviewReport`]. The rerun composer renders it as
+    /// `*Reviewer: <provider>/<model>*` on the `## Code Review (rerun N of
+    /// M)` comment. `None` when the reviewer carried no configured model.
+    pub attribution: Option<String>,
 }
 
 /// Reusable reviewer entry point (a33 task 5). The polling-loop AND the
@@ -429,6 +463,7 @@ pub async fn review_pr_at_state_with(
         raw_output: report.markdown.clone(),
         markdown: report.markdown.clone(),
         per_change_sections: report.per_change_sections.clone(),
+        attribution: report.attribution.clone(),
         concerns: report.concerns,
     })
 }
@@ -677,6 +712,7 @@ fn parse_response(raw: &str) -> ReviewReport {
                 markdown,
                 concerns,
                 per_change_sections: Vec::new(),
+                attribution: None,
             }
         }
         _ => ReviewReport {
@@ -686,6 +722,7 @@ fn parse_response(raw: &str) -> ReviewReport {
             ),
             concerns,
             per_change_sections: Vec::new(),
+            attribution: None,
         },
     }
 }
