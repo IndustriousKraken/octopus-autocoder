@@ -3299,7 +3299,7 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
 /// trouble only when none of those produces a usable secret.
 fn check_token_routes(config: &Config, report: &mut ValidationReport) {
     for (idx, repo) in config.repositories.iter().enumerate() {
-        let owner = match crate::github::parse_repo_url(&repo.url) {
+        let owner = match crate::forge::parse_repo(&repo.url) {
             Ok((o, _r)) => o,
             Err(e) => {
                 report.push_error(

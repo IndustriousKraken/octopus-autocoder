@@ -22,6 +22,7 @@ use crate::chatops::ChatOpsBackend;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{CommandAuthorizationConfig, GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome};
+use crate::forge::{AuthLevel, Forge, GithubForge};
 use crate::github;
 
 /// HTML-comment marker the reviewer-initiated revision flow writes at the
@@ -419,23 +420,16 @@ fn strip_leading_html_comment_lines(body: &str) -> &str {
 /// trusted internal triggers and bypass this check, just as they bypass
 /// the bot-self-author filter — the caller passes only non-automatic
 /// comments here.
+///
+/// a007: the `author_association`/`allowed_users` decision now lives behind
+/// the forge — `GithubForge::authorize` owns the gate. This thin wrapper
+/// keeps the dispatcher's call sites unchanged while routing the decision
+/// through the `Forge` trait (the selected forge decides authorization).
 fn is_comment_authorized(
     comment: &github::IssueComment,
     auth: &CommandAuthorizationConfig,
 ) -> bool {
-    let login = comment.user_login();
-    if !login.is_empty()
-        && auth
-            .allowed_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(login))
-    {
-        return true;
-    }
-    match comment.author_association() {
-        Some(assoc) => auth.allowed_associations.iter().any(|a| a == assoc),
-        None => false,
-    }
+    GithubForge::new().authorize(comment, auth) == AuthLevel::Authorized
 }
 
 /// Best-effort: extract the list of change names from the PR body's
@@ -551,6 +545,9 @@ pub async fn process_revision_requests_at(
     }
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    // a007: forge-trait handle for this repository's REST operations. GitHub
+    // is the only provider; `with_api_base` threads the (test-injected) base.
+    let forge = GithubForge::with_api_base(api_base);
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -566,9 +563,7 @@ pub async fn process_revision_requests_at(
     // fork-headed PR, leaving fork-PR-mode operators without working
     // `@<bot> revise <text>` since fork-PR mode shipped.
     let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
-    let open_prs = github::list_open_prs_for_head(
-        api_base,
-        &token,
+    let open_prs = forge.find_pr_by_head(&token,
         &owner,
         &repo_name,
         head_owner,
@@ -646,6 +641,8 @@ async fn process_one_pr(
     cancel: CancellationToken,
 ) -> Result<()> {
     let _ = reviewer; // wired through; consumed by the code-review branch (task 4)
+    // a007: forge-trait handle for this PR's comment fetches + reply posting.
+    let forge = GithubForge::with_api_base(api_base);
     // Load or initialize per-PR state. The revision_cap stored in state
     // reflects the cap in effect when the PR was first observed; callers
     // that change `executor.max_auto_revisions_per_pr` mid-PR live with
@@ -680,9 +677,7 @@ async fn process_one_pr(
     // over-cap automatic trigger is silently advanced while a human
     // trigger interleaved on the same PR is dispatched normally.
 
-    let comments = github::list_issue_comments_since(
-        api_base,
-        token,
+    let comments = forge.list_comments_since(token,
         owner,
         repo_name,
         pr.number,
@@ -780,8 +775,7 @@ async fn process_one_pr(
                 let body = format!(
                     "🚫 This `@{bot_username}` command was ignored: only repository owners, members, and collaborators (or configured allowed users) can trigger it. (author_association: {assoc})"
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await
                 {
@@ -826,8 +820,7 @@ async fn process_one_pr(
                                 "🛑 Code review cap reached ({} reruns). Further @{} code-review requests will be ignored. Close + re-open the PR or merge as-is.",
                                 cap, bot_username,
                             );
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &pr_text,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &pr_text,
                             )
                             .await
                             {
@@ -887,8 +880,7 @@ async fn process_one_pr(
                     match outcome {
                         Ok(CodeReviewOutcome::ReviewerDisabled) => {
                             let body = "✗ Code review not available: reviewer is disabled in config".to_string();
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &body,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                             )
                             .await
                             {
@@ -934,8 +926,7 @@ async fn process_one_pr(
                             let body = format!(
                                 "✗ Code review failed: {reason}. The PR is unchanged. Reply with another `@{bot_username} code-review` to retry."
                             );
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &body,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                             )
                             .await
                             {
@@ -999,9 +990,7 @@ async fn process_one_pr(
                     "🛑 Revision cap reached ({} automatic revisions). Further reviewer-initiated revisions on this PR will be ignored; human `@{} revise` requests still process. Close + re-open or merge as-is.",
                     state.revision_cap, bot_username,
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base,
-                    token,
+                if let Err(e) = forge.post_comment(token,
                     owner,
                     repo_name,
                     pr.number,
@@ -1050,8 +1039,7 @@ async fn process_one_pr(
                     "🛑 Human-revision cap reached ({} `@{} revise` requests on this PR). Further revise requests will be ignored. Close + re-open or merge as-is.",
                     human_revise_cap, bot_username,
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &pr_text,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &pr_text,
                 )
                 .await
                 {
@@ -1097,9 +1085,7 @@ async fn process_one_pr(
         // advance the comment-seen marker — the next iteration's
         // dispatcher pass re-attempts the assembly so transient API
         // errors don't lose the operator's revise comment.
-        let all_comments = match github::list_issue_comments_since(
-            api_base,
-            token,
+        let all_comments = match forge.list_comments_since(token,
             owner,
             repo_name,
             pr.number,
@@ -1119,8 +1105,7 @@ async fn process_one_pr(
                 let body = format!(
                     "✗ Cannot revise: failed to fetch PR context: {truncated_err}. The daemon will retry on the next polling iteration. If this persists, check journalctl for the daemon's GitHub API errors AND verify the bot's token has Read access on this repo."
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 // CRITICAL: do NOT advance latest_seen — re-attempt
@@ -1226,7 +1211,7 @@ async fn process_one_pr(
                         bot_username
                     );
                     let _ =
-                        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body)
+                        forge.post_comment(token, owner, repo_name, pr.number, &body)
                             .await;
                     if is_automatic {
                         state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
@@ -1280,8 +1265,7 @@ async fn process_one_pr(
                         final_answer.as_deref(),
                     )
                 };
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &reply,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &reply,
                 )
                 .await
                 {
@@ -1351,8 +1335,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     reason, bot_username
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await
                 {
@@ -1394,8 +1377,7 @@ async fn process_one_pr(
                 .await;
                 let body = "✗ Revision attempt failed: executor reported the original change spec is unimplementable. The PR is unchanged."
                     .to_string();
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1430,8 +1412,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
                     bot_username
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1486,8 +1467,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     e, bot_username
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1721,6 +1701,8 @@ async fn execute_code_review(
     let Some(reviewer) = reviewer else {
         return Ok(CodeReviewOutcome::ReviewerDisabled);
     };
+    // a007: forge-trait handle for this re-review's PR-comment posting.
+    let forge = GithubForge::with_api_base(api_base);
     // Cap check. `None` means unlimited (a47 default) — no ceiling.
     if let Some(cap) = state.code_review_cap
         && state.code_reviews_applied >= cap
@@ -1791,7 +1773,7 @@ async fn execute_code_review(
         result.attribution.as_deref(),
     );
     if let Err(e) =
-        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body).await
+        forge.post_comment(token, owner, repo_name, pr.number, &body).await
     {
         tracing::warn!(
             url = %repo.url,
@@ -1818,8 +1800,7 @@ async fn execute_code_review(
             .collect();
         if let Some(comment_body) =
             build_aggregated_reviewer_revision_comment(bot_username, &revisable)
-            && let Err(e) = github::post_issue_comment(
-                api_base, token, owner, repo_name, pr.number, &comment_body,
+            && let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &comment_body,
             )
             .await
         {

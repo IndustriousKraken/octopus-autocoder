@@ -448,11 +448,16 @@ async fn recreate_fork_inner(
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    github::create_fork_at(api_base, &upstream_owner, &repo_name, &token)
-        .await
-        .with_context(|| {
-            format!("re-forking `{upstream_owner}/{repo_name}` under `{fork_owner}`")
-        })?;
+    {
+        // a007: fork creation routes through the `Forge` trait.
+        use crate::forge::Forge;
+        crate::forge::GithubForge::with_api_base(api_base)
+            .create_fork(&upstream_owner, &repo_name, &token)
+            .await
+            .with_context(|| {
+                format!("re-forking `{upstream_owner}/{repo_name}` under `{fork_owner}`")
+            })?;
+    }
 
     if poll_reachable {
         let fork_url = github::derive_fork_url(&repo.url, fork_owner)?;

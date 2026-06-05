@@ -17,7 +17,7 @@ pub(crate) async fn open_rebuild_pull_request(
         Some(fork_owner) => format!("{fork_owner}:{}", repo.agent_branch),
         None => repo.agent_branch.clone(),
     };
-    let pr = github::create_pull_request(
+    let pr = create_pull_request_via_hook(
         &owner,
         &repo_name,
         &head,
@@ -55,36 +55,30 @@ async fn create_pull_request_via_hook(
     review_report: Option<&ReviewReport>,
     draft: bool,
 ) -> Result<github::CreatedPr> {
+    use crate::forge::Forge;
+    // a007: PR creation routes through the `Forge` trait. The provider is
+    // GitHub; `with_api_base` threads the (test-injected) API base so the
+    // mockito-driven tests exercise the trait path unchanged.
     #[cfg(test)]
-    {
-        if let Some(api_base) = test_hooks::github_api_base() {
-            return github::create_pull_request_at_for_test(
-                &api_base,
-                owner,
-                repo,
-                head,
-                base,
-                title,
-                body,
-                token,
-                review_report,
-                draft,
-            )
-            .await;
-        }
-    }
-    github::create_pull_request(
-        owner,
-        repo,
-        head,
-        base,
-        title,
-        body,
-        token,
-        review_report,
-        draft,
-    )
-    .await
+    let forge = match test_hooks::github_api_base() {
+        Some(api_base) => crate::forge::GithubForge::with_api_base(api_base),
+        None => crate::forge::GithubForge::new(),
+    };
+    #[cfg(not(test))]
+    let forge = crate::forge::GithubForge::new();
+    forge
+        .open_pr(
+            owner,
+            repo,
+            head,
+            base,
+            title,
+            body,
+            token,
+            review_report,
+            draft,
+        )
+        .await
 }
 
 /// Build the initial per-PR `RevisionState` written at PR-open time when the
@@ -406,34 +400,19 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
         }
     };
 
-    let result = if api_base == github::DEFAULT_API_BASE {
-        github::list_open_prs(
+    // a007: the open-PR check routes through the `Forge` trait. `api_base` is
+    // `DEFAULT_API_BASE` in production and a mockito URL in tests; the GitHub
+    // provider threads it via `with_api_base`.
+    use crate::forge::Forge;
+    let result = crate::forge::GithubForge::with_api_base(api_base)
+        .list_open_prs(
             &upstream_owner,
             &upstream_repo,
             &head,
             &repo.base_branch,
             &token,
         )
-        .await
-    } else {
-        // Test path: explicit base.
-        #[cfg(test)]
-        {
-            github::list_open_prs_at_for_test(
-                api_base,
-                &upstream_owner,
-                &upstream_repo,
-                &head,
-                &repo.base_branch,
-                &token,
-            )
-            .await
-        }
-        #[cfg(not(test))]
-        {
-            unreachable!("non-default api_base is test-only");
-        }
-    };
+        .await;
 
     match result {
         Ok(prs) if !prs.is_empty() => {

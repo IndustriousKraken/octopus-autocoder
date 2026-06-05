@@ -29,38 +29,19 @@ pub struct CreatedPr {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenPr {
     pub number: u64,
+    /// Deserialized from the API payload AND asserted in tests, but the
+    /// open-PR-existence check consults only `number` in production.
+    #[allow(dead_code)]
     pub html_url: String,
 }
 
-/// Production wrapper for `list_open_prs_at` against the live GitHub API.
-/// Returns the list of open PRs whose head and base match the given
-/// qualifiers. Used by the polling loop to skip iterations when a PR is
-/// already pending review.
-pub async fn list_open_prs(
-    owner: &str,
-    repo: &str,
-    head: &str,
-    base: &str,
-    token: &str,
-) -> Result<Vec<OpenPr>> {
-    list_open_prs_at(DEFAULT_API_BASE, owner, repo, head, base, token).await
-}
-
-/// Test-only re-export of the internal `list_open_prs_at`. Lets
-/// sibling-module tests exercise the HTTP path against mockito.
-#[cfg(test)]
-pub(crate) async fn list_open_prs_at_for_test(
-    api_base: &str,
-    owner: &str,
-    repo: &str,
-    head: &str,
-    base: &str,
-    token: &str,
-) -> Result<Vec<OpenPr>> {
-    list_open_prs_at(api_base, owner, repo, head, base, token).await
-}
-
-async fn list_open_prs_at(
+// a007: the live `list_open_prs` wrapper AND its `*_at_for_test` re-export
+// were removed when the polling loop's open-PR check moved onto the `Forge`
+// trait (`GithubForge::list_open_prs`, which threads the API base through
+// `with_api_base`). The underlying `list_open_prs_at` remains — it is the
+// implementation the trait delegates to AND the one this module's own tests
+// exercise directly.
+pub(crate) async fn list_open_prs_at(
     api_base: &str,
     owner: &str,
     repo: &str,
@@ -512,7 +493,7 @@ pub(crate) async fn create_pull_request_at_for_test(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_pull_request_at(
+pub(crate) async fn create_pull_request_at(
     api_base: &str,
     owner: &str,
     repo: &str,
@@ -647,7 +628,7 @@ pub(crate) async fn create_issue_comment_at_for_test(
     create_issue_comment_at(api_base, owner, repo, issue_number, body, token).await
 }
 
-async fn create_issue_comment_at(
+pub(crate) async fn create_issue_comment_at(
     api_base: &str,
     owner: &str,
     repo: &str,
@@ -975,7 +956,7 @@ pub async fn list_open_prs_all(
 /// List open PRs whose head is `<owner>:<head_branch>`. Used by the
 /// revision dispatcher to find the set of bot-opened PRs to poll for
 /// comment triggers. Pagination beyond 100 is out of scope — a repo with
-/// >100 open PRs from a single agent branch is unrealistic.
+/// more than 100 open PRs from a single agent branch is unrealistic.
 /// List open PRs on `owner/repo` whose head matches
 /// `{head_owner}:{head_branch}`.
 ///

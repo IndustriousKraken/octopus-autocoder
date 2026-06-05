@@ -20,9 +20,16 @@ mod control_socket;
 mod daemon;
 mod executor;
 mod failure_state;
+mod forge;
 mod git;
-mod github;
 mod github_credentials;
+// a007: `github.rs` moved into the `forge` module (`forge::github`) as the
+// `GithubForge` REST layer. This crate-root alias preserves every existing
+// `crate::github::*` path so the extraction stays behavior-preserving — the
+// REST code now physically lives inside `src/forge/`, the single source of
+// truth, while call sites that have not yet been routed through the `Forge`
+// trait keep compiling unchanged.
+pub(crate) use forge::github;
 mod ignore_for_queue;
 mod iteration_pending;
 mod llm;

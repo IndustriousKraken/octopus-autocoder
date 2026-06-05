@@ -226,7 +226,10 @@ pub(crate) async fn maybe_post_branch_pushed_no_pr(
 /// the `auto_submit_pr: false` path so the chatops notification
 /// links to the pushed branch the operator can review locally.
 pub(crate) fn compose_branch_url(owner: &str, repo: &str, branch: &str) -> String {
-    format!("https://github.com/{owner}/{repo}/tree/{branch}")
+    use crate::forge::Forge;
+    // a007: the push-only branch hint is a forge operation — delegate to the
+    // selected provider's `branch_url`. GitHub is the only provider today.
+    crate::forge::GithubForge::new().branch_url(owner, repo, branch)
 }
 
 /// Post a one-line ChatOps notification announcing a fork recreation.
