@@ -1665,16 +1665,22 @@ pub struct ReviewerConfig {
     /// Modernized form of `prompt_template_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<PromptOverrideBlock>,
-    /// Opt-in flag: when `true`, reviewer-authored revision-request PR
-    /// comments are posted for each concern the reviewer marked
-    /// `should_request_revision: true` with a non-empty `actionable_request`,
-    /// REGARDLESS of the review's verdict (`Pass`, `Concerns`, OR `Block`).
-    /// The dispatcher from the PR-comment revision loop picks these up on
-    /// the next polling iteration. Default `false` (no behavioural change).
-    /// The legacy key `auto_revise_on_block` is accepted as a silent alias
-    /// so existing config files load unchanged.
-    #[serde(default, alias = "auto_revise_on_block")]
-    pub auto_revise: bool,
+    /// a005: tri-state reviewer auto-revision gate. Accepts `block`,
+    /// `actionable`, or `off` and defaults to `block` (see [`AutoRevise`]).
+    /// When it fires, the review's actionable concerns
+    /// (`should_request_revision: true` with a non-empty `actionable_request`)
+    /// are forwarded — AGGREGATED into a single revision run — to the
+    /// PR-comment revision dispatcher, which picks them up on the next
+    /// polling iteration. The legacy boolean is mapped for backward
+    /// compatibility (`true` → `actionable`, `false` → `off`); the legacy key
+    /// `auto_revise_on_block` is accepted as a silent alias so existing
+    /// config files load unchanged.
+    #[serde(
+        default,
+        alias = "auto_revise_on_block",
+        deserialize_with = "deserialize_auto_revise"
+    )]
+    pub auto_revise: AutoRevise,
     /// Maximum size (in chars) of the rendered reviewer prompt body —
     /// change context + changed files + diff combined. Default
     /// `2_000_000` preserves the historical hard-coded value. No clamping:
@@ -1800,6 +1806,80 @@ pub enum ReviewerKind {
     Oneshot,
     #[default]
     Agentic,
+}
+
+/// a005: tri-state reviewer auto-revision gate (`reviewer.auto_revise`).
+///
+/// Governs whether — AND under which verdict — a review's actionable
+/// concerns are forwarded (aggregated into a SINGLE revision run per the
+/// orchestrator-cli `Reviewer-initiated revisions from one review dispatch
+/// as a single run` requirement) to the revision dispatcher.
+///
+/// - [`AutoRevise::Block`] (default): auto-revise fires only when the
+///   review's effective verdict is `Block`. Combined with a004
+///   (security-critical findings escalate the verdict to `Block`),
+///   security-critical findings still auto-fix while non-`Block` `Concerns`
+///   stay advisory — surfaced to the operator, not silently rewritten.
+/// - [`AutoRevise::Actionable`]: fires on any actionable concern regardless
+///   of verdict (the pre-a005 fire-regardless-of-verdict behavior).
+/// - [`AutoRevise::Off`]: never auto-revise.
+///
+/// Deserializes from the canonical lowercase strings (`block`, `actionable`,
+/// `off`) OR, for backward compatibility, from the legacy boolean: `true` →
+/// [`AutoRevise::Actionable`], `false` → [`AutoRevise::Off`]. An absent field
+/// defaults to [`AutoRevise::Block`] (the a005 default change, from the prior
+/// `false`/off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoRevise {
+    #[default]
+    Block,
+    Actionable,
+    Off,
+}
+
+impl AutoRevise {
+    /// Whether auto-revise should fire for a review whose effective verdict
+    /// is (or is not) `Block`. `verdict_is_block` is computed from the final
+    /// [`crate::code_reviewer::ReviewReport`] verdict, so it already includes
+    /// the a004 security escalation.
+    pub fn fires(self, verdict_is_block: bool) -> bool {
+        match self {
+            AutoRevise::Off => false,
+            AutoRevise::Actionable => true,
+            AutoRevise::Block => verdict_is_block,
+        }
+    }
+}
+
+/// Deserialize [`AutoRevise`] from either the canonical lowercase string
+/// (`block`/`actionable`/`off`) or the legacy boolean (`true` → `actionable`,
+/// `false` → `off`). Used by `ReviewerConfig::auto_revise`'s
+/// `deserialize_with`, composing with `#[serde(default)]` (absent → `Block`)
+/// and the `auto_revise_on_block` legacy-key alias.
+fn deserialize_auto_revise<'de, D>(deserializer: D) -> Result<AutoRevise, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match BoolOrStr::deserialize(deserializer)? {
+        BoolOrStr::Bool(true) => Ok(AutoRevise::Actionable),
+        BoolOrStr::Bool(false) => Ok(AutoRevise::Off),
+        BoolOrStr::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "block" => Ok(AutoRevise::Block),
+            "actionable" => Ok(AutoRevise::Actionable),
+            "off" => Ok(AutoRevise::Off),
+            other => Err(D::Error::custom(format!(
+                "invalid auto_revise value {other:?}: expected one of `block`, `actionable`, `off` (or legacy `true`/`false`)"
+            ))),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4000,14 +4080,14 @@ reviewer:
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
-        // Default (field omitted) → false.
-        assert!(!rv.auto_revise);
+        // a005: default (field omitted) → `block` (was `false`/off pre-a005).
+        assert_eq!(rv.auto_revise, AutoRevise::Block);
     }
 
     #[test]
     fn reviewer_auto_revise_legacy_alias_explicit_true() {
         // The legacy key `auto_revise_on_block` is still accepted via the
-        // serde alias and deserializes to `auto_revise == true`.
+        // serde alias; a005 maps the legacy boolean `true` → `actionable`.
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4028,12 +4108,13 @@ reviewer:
         let cfg =
             Config::load_from(&path).expect("config with legacy auto_revise_on_block should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
     }
 
     #[test]
     fn reviewer_auto_revise_explicit_true() {
-        // The canonical key `auto_revise` deserializes identically.
+        // The canonical key `auto_revise` with a legacy boolean deserializes
+        // identically (`true` → `actionable`).
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4053,7 +4134,92 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config with auto_revise should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
+    }
+
+    /// a005: the canonical tri-state string values deserialize as expected.
+    #[test]
+    fn reviewer_auto_revise_tristate_strings() {
+        for (value, expected) in [
+            ("block", AutoRevise::Block),
+            ("actionable", AutoRevise::Actionable),
+            ("off", AutoRevise::Off),
+        ] {
+            let yaml = format!(
+                r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {{}}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: {value}
+"#
+            );
+            let (_dir, path) = write_config(&yaml);
+            let cfg = Config::load_from(&path)
+                .unwrap_or_else(|e| panic!("config with auto_revise: {value} should parse: {e}"));
+            let rv = cfg.reviewer.expect("reviewer block should be present");
+            assert_eq!(rv.auto_revise, expected, "auto_revise: {value}");
+        }
+    }
+
+    /// a005: the legacy boolean `false` maps to `off`.
+    #[test]
+    fn reviewer_auto_revise_legacy_false_maps_off() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with auto_revise: false should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert_eq!(rv.auto_revise, AutoRevise::Off);
+    }
+
+    /// a005: an unrecognized string value is a hard config-load error.
+    #[test]
+    fn reviewer_auto_revise_invalid_string_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: sometimes
+"#;
+        let (_dir, path) = write_config(yaml);
+        assert!(
+            Config::load_from(&path).is_err(),
+            "an invalid auto_revise string must fail config-load"
+        );
     }
 
     #[test]

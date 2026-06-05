@@ -93,22 +93,32 @@ The mode is hot-applicable via `autocoder reload`; flipping it between iteration
 
 ## Reviewer-initiated revisions on actionable concerns
 
-When `reviewer.auto_revise: true` is set, autocoder forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The trigger is the per-concern actionability signal, **not** the verdict: it fires on actionable concerns regardless of whether the review's verdict is `Pass`, `Concerns`, or `Block`. (`Block` retains its separate effect of marking the PR draft; it just no longer gates auto-revise.)
+`reviewer.auto_revise` is a **tri-state** — `block` (default), `actionable`, or `off` — that decides whether, and under which verdict, autocoder forwards a review's actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments:
 
-The legacy config key `auto_revise_on_block` is still accepted as a silent alias, so existing config files load unchanged. The flow:
+| Value | Fires when | Notes |
+| --- | --- | --- |
+| `block` (default) | the review's effective verdict is `Block` | Because security-critical findings escalate the verdict to `Block`, this still auto-fixes the security-critical findings while non-`Block` `Concerns` stay advisory — surfaced for the operator to act on with `@<bot> revise`, not silently rewritten. |
+| `actionable` | any actionable concern, regardless of verdict (`Pass`, `Concerns`, or `Block`) | The prior fire-regardless-of-verdict behavior. |
+| `off` | never | Disables reviewer-initiated revisions. |
 
-1. Reviewer returns any verdict with one or more per-concern records marked `should_request_revision: true` and a non-empty `actionable_request`.
-2. Autocoder posts one PR issue comment per such concern, with body:
+For backward compatibility the legacy boolean is mapped: `true` → `actionable`, `false` → `off`. The legacy config key `auto_revise_on_block` is still accepted as a silent alias for `auto_revise`. **The default changed to `block`** (it was previously off), so a daemon that runs the reviewer now auto-revises on a `Block` verdict unless you set `auto_revise: off` or `auto_revise: actionable`.
+
+The flow:
+
+1. Reviewer returns a verdict the tri-state fires on, with one or more per-concern records marked `should_request_revision: true` and a non-empty `actionable_request`.
+2. Autocoder collects **all** of that review's actionable concerns and posts **one** aggregated PR issue comment carrying every concern as a numbered list:
 
    ```
    <!-- reviewer-revision -->
-   @<bot-username> revise <actionable_request>
+   @<bot-username> revise Address the following 2 code-review concerns together in a single pass. …
+   1. <actionable_request>
+   2. <actionable_request>
    ```
 
-   The leading HTML-comment marker (`<!-- reviewer-revision -->`) is the dispatcher's self-author-filter bypass — without it, the dispatcher would (correctly) treat the comment as bot-authored noise and drop it.
-3. On the next polling iteration, the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks up each comment, runs the executor in revision mode, commits + force-pushes, and posts the standard `✅ Revision applied:` / `✗ Revision attempt failed:` reply.
+   (A single concern keeps the one-line `@<bot> revise <actionable_request>` shape.) The leading HTML-comment marker (`<!-- reviewer-revision -->`) is the dispatcher's self-author-filter bypass — without it, the dispatcher would (correctly) treat the comment as bot-authored noise and drop it.
+3. On the next polling iteration, the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks up the single comment, runs the executor **once** in revision mode against all the concerns at once, commits + force-pushes, and posts the standard `✅ Revision applied:` / `✗ Revision attempt failed:` reply.
 
-The feature is **off by default**. A reviewer template that has not been updated to emit the structured `revision-requests` YAML block (see below) silently produces no comments; a daemon `WARN` log surfaces this case on first reviewer run when the flag is enabled but no actionable concerns appear.
+Aggregating into one run (rather than one run per concern) means the cap is spent once per review, related fixes are reasoned about together in one warm pass, and a concern already satisfied by an earlier fix in the same batch does not become a separate no-op run. A reviewer template that has not been updated to emit the structured `revision-requests` YAML block (see below) silently produces no comment; a daemon `WARN` log surfaces this case on first reviewer run when the gate fires but no actionable concerns appear.
 
 ### Per-concern revision decision
 
@@ -116,9 +126,7 @@ The reviewer makes the per-concern decision: only concerns with a concrete, exec
 
 ### Cap-budget interaction
 
-Reviewer-initiated revisions are **automatic** and count toward the per-PR `executor.max_auto_revisions_per_pr` cap (default 5; see [CONFIG.md](CONFIG.md#executormax_auto_revisions_per_pr)). Human `@<bot> revise` requests are **not** counted against this cap — only reviewer-marked automatic revisions are. When the reviewer would post more comments than the remaining cap budget allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
-
-The cap budget at posting time is a forward-looking estimate; the actual `auto_revisions_applied` counter only increments when the dispatcher processes an automatic comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
+Reviewer-initiated revisions are **automatic** and count toward the per-PR `executor.max_auto_revisions_per_pr` cap (default 5; see [CONFIG.md](CONFIG.md#executormax_auto_revisions_per_pr)). Human `@<bot> revise` requests are **not** counted against this cap — only reviewer-marked automatic revisions are. Because a review's concerns are aggregated into **one** revision run, that whole run consumes exactly **one** of the cap's slots, regardless of how many concerns it carries (so a 3-concern review no longer eats 3 of the 5 default slots). Setting `executor.max_auto_revisions_per_pr: 0` disables reviewer-initiated revisions entirely. The `auto_revisions_applied` counter increments when the dispatcher processes the aggregated comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` and do not abort the iteration — the PR is still created/updated, just without that comment.
 
 ### Operator-customized reviewer templates
 
@@ -138,12 +146,13 @@ The fenced block tag is the literal string `revision-requests`; the body is a YA
 
 ### Verdict gating
 
-Only `Block` verdicts trigger reviewer-initiated revisions. `Pass` and `Concerns` verdicts deliberately do not auto-revise:
+The `auto_revise` tri-state decides which verdicts trigger reviewer-initiated revisions (see the table above):
 
-- `Concerns` flags issues that warrant discussion but are mergeable as-is. Auto-revising every one of those would generate constant churn for cosmetic preferences.
-- `Pass` has nothing to revise.
+- `block` (default): only a `Block` verdict auto-revises. Security-critical findings escalate the verdict to `Block`, so they auto-fix; non-`Block` `Concerns` stay advisory — they flag issues that warrant discussion but are mergeable as-is, and auto-revising every one of those would generate constant churn for cosmetic preferences.
+- `actionable`: any actionable concern auto-revises, regardless of verdict.
+- `off`: never auto-revises.
 
-The operator can still manually trigger revisions on any verdict by posting `@<bot> revise <text>` as a regular PR comment.
+The operator can still manually trigger revisions on any verdict by posting `@<bot> revise <text>` as a regular PR comment, independent of `auto_revise`.
 
 ### No reviewer re-run
 

@@ -32,6 +32,56 @@ use crate::github;
 /// though their author is `bot_username`.
 pub const REVIEWER_REVISION_MARKER: &str = "<!-- reviewer-revision -->";
 
+/// a005: build the body of the SINGLE aggregated `<!-- reviewer-revision -->`
+/// PR comment for a review's actionable concerns. All concerns produced by
+/// one review are collected into ONE revision instruction — a numbered list
+/// of the per-concern `actionable_request`s — so the dispatcher issues
+/// exactly one executor run (one `max_auto_revisions_per_pr` increment) for
+/// the whole batch rather than one run per concern. The aggregated run sees
+/// every concern in one warm pass, so related fixes are reasoned about
+/// together AND a concern already satisfied by an earlier fix in the same
+/// batch does not become a separate no-op run.
+///
+/// `concerns` should already be the revisable set (see
+/// [`crate::code_reviewer::ReviewConcern::is_revisable`]); any concern whose
+/// trimmed `actionable_request` is empty is skipped defensively. Returns
+/// `None` when nothing actionable remains (the caller posts no comment).
+///
+/// A single concern renders the historical one-line shape
+/// (`@<bot> revise <request>`); two-or-more render the numbered list with a
+/// short preamble instructing the implementer to fix the related concerns
+/// together and skip redundant edits.
+pub fn build_aggregated_reviewer_revision_comment(
+    bot_username: &str,
+    concerns: &[crate::code_reviewer::ReviewConcern],
+) -> Option<String> {
+    let requests: Vec<&str> = concerns
+        .iter()
+        .filter_map(|c| match c.actionable_request.as_deref() {
+            Some(s) if !s.trim().is_empty() => Some(s.trim()),
+            _ => None,
+        })
+        .collect();
+    if requests.is_empty() {
+        return None;
+    }
+    let instruction = if requests.len() == 1 {
+        requests[0].to_string()
+    } else {
+        let mut s = format!(
+            "Address the following {} code-review concerns together in a single pass. They come from one review and are usually related — make them as one coherent change. If an earlier item in this list already satisfies a later one, do not make a redundant edit.\n",
+            requests.len()
+        );
+        for (i, request) in requests.iter().enumerate() {
+            s.push_str(&format!("\n{}. {}", i + 1, request));
+        }
+        s
+    };
+    Some(format!(
+        "{REVIEWER_REVISION_MARKER}\n@{bot_username} revise {instruction}"
+    ))
+}
+
 /// Per-PR state file persisted under
 /// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`. The
 /// dispatcher reads it on each iteration to know which comments are
@@ -831,6 +881,7 @@ async fn process_one_pr(
                         token,
                         owner,
                         repo_name,
+                        bot_username,
                     )
                     .await;
                     match outcome {
@@ -1648,9 +1699,10 @@ fn compose_rerun_review_comment(
 /// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
 /// reviewer's output as a fresh PR comment with the canonical
 /// `## Code Review (rerun N of M)` heading. When the reviewer's
-/// `auto_revise` flag is set, also posts per-concern
-/// `<!-- reviewer-revision -->`-marked comments for every actionable
-/// concern, regardless of the verdict.
+/// `auto_revise` tri-state fires for the rerun's verdict (a005), also posts
+/// ONE aggregated `<!-- reviewer-revision -->`-marked comment carrying every
+/// actionable concern from the rerun (one dispatcher run, one auto-revision
+/// increment), rather than one comment per concern.
 #[allow(clippy::too_many_arguments)]
 async fn execute_code_review(
     workspace: &Path,
@@ -1663,6 +1715,7 @@ async fn execute_code_review(
     token: &str,
     owner: &str,
     repo_name: &str,
+    bot_username: &str,
 ) -> Result<CodeReviewOutcome> {
     // Reviewer-not-available short-circuit.
     let Some(reviewer) = reviewer else {
@@ -1749,35 +1802,32 @@ async fn execute_code_review(
             reason: format!("PR comment post failed: {e}"),
         });
     }
-    // When `reviewer.auto_revise` is enabled, post one
-    // `<!-- reviewer-revision -->`-marked PR comment per actionable
-    // concern — REGARDLESS of the verdict, mirroring the initial-review
-    // partition logic. A concern is actionable when it carries
-    // `should_request_revision: true` AND a non-empty `actionable_request`.
-    if reviewer.auto_revise() {
-        for concern in &result.concerns {
-            if !concern.should_request_revision {
-                continue;
-            }
-            let request = match concern.actionable_request.as_deref() {
-                Some(s) if !s.trim().is_empty() => s.trim(),
-                _ => continue,
-            };
-            let comment_body = format!(
-                "{REVIEWER_REVISION_MARKER}\n@{bot_label} revise {request}",
-                bot_label = "<bot>", // dispatcher rewrites mention upstream
-            );
-            if let Err(e) = github::post_issue_comment(
+    // a005: when the reviewer's `auto_revise` tri-state fires for this
+    // rerun's verdict, post ONE aggregated `<!-- reviewer-revision -->`
+    // comment carrying every actionable concern — the dispatcher then issues
+    // a single revision run (one auto-revision increment) for the batch,
+    // mirroring the initial-review path. `block` fires only on a `Block`
+    // verdict; `actionable` fires regardless of verdict; `off` never fires.
+    let is_block = matches!(result.verdict, crate::code_reviewer::Verdict::Block);
+    if reviewer.auto_revise().fires(is_block) {
+        let revisable: Vec<crate::code_reviewer::ReviewConcern> = result
+            .concerns
+            .iter()
+            .filter(|c| c.is_revisable())
+            .cloned()
+            .collect();
+        if let Some(comment_body) =
+            build_aggregated_reviewer_revision_comment(bot_username, &revisable)
+            && let Err(e) = github::post_issue_comment(
                 api_base, token, owner, repo_name, pr.number, &comment_body,
             )
             .await
-            {
-                tracing::warn!(
-                    url = %repo.url,
-                    pr_number = pr.number,
-                    "failed to post reviewer-revision PR comment: {e:#}"
-                );
-            }
+        {
+            tracing::warn!(
+                url = %repo.url,
+                pr_number = pr.number,
+                "failed to post aggregated reviewer-revision PR comment: {e:#}"
+            );
         }
     }
     // Increment the counter; caller writes the state file.
@@ -3262,6 +3312,199 @@ mod tests {
         token_env_clear(env_var);
     }
 
+    // ============================================================
+    // a005: aggregated reviewer-initiated revisions (one run per review)
+    // ============================================================
+
+    /// a005 unit: `build_aggregated_reviewer_revision_comment` collapses a
+    /// single concern to the historical one-line shape, and two-or-more into
+    /// one numbered-list instruction under a single marker + mention.
+    #[test]
+    fn build_aggregated_comment_single_and_multi_shape() {
+        let one = vec![crate::code_reviewer::ReviewConcern {
+            summary: "s".into(),
+            actionable_request: Some("fix the thing".into()),
+            should_request_revision: true,
+            ..Default::default()
+        }];
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &one).unwrap();
+        assert_eq!(body, "<!-- reviewer-revision -->\n@my-bot revise fix the thing");
+
+        let two = vec![
+            crate::code_reviewer::ReviewConcern {
+                summary: "s1".into(),
+                actionable_request: Some("fix the GateRegistry".into()),
+                should_request_revision: true,
+                ..Default::default()
+            },
+            crate::code_reviewer::ReviewConcern {
+                summary: "s2".into(),
+                actionable_request: Some("update its two callers".into()),
+                should_request_revision: true,
+                ..Default::default()
+            },
+        ];
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &two).unwrap();
+        // One marker, one mention, both requests as a numbered list.
+        assert_eq!(body.matches(REVIEWER_REVISION_MARKER).count(), 1);
+        assert_eq!(body.matches("@my-bot revise").count(), 1);
+        assert!(body.contains("1. fix the GateRegistry"));
+        assert!(body.contains("2. update its two callers"));
+    }
+
+    /// a005: an empty / all-non-actionable concern set yields no comment.
+    #[test]
+    fn build_aggregated_comment_empty_is_none() {
+        assert!(build_aggregated_reviewer_revision_comment("my-bot", &[]).is_none());
+        let blank = vec![crate::code_reviewer::ReviewConcern {
+            summary: "s".into(),
+            actionable_request: Some("   ".into()),
+            should_request_revision: true,
+            ..Default::default()
+        }];
+        assert!(build_aggregated_reviewer_revision_comment("my-bot", &blank).is_none());
+    }
+
+    /// a005 task 3.1: a single review's N≥2 reviewer-revision requests arrive
+    /// as ONE aggregated comment; the dispatcher issues exactly ONE executor
+    /// run AND increments the auto-revision cap by exactly one (not N).
+    #[tokio::test]
+    async fn dispatcher_aggregated_review_is_one_run_one_increment() {
+        let env_var = "REVISIONS_TOKEN_AGG_ONE_RUN";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(71, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // ONE aggregated comment carrying THREE concerns.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/71/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(aggregated_reviewer_marked_comment_body(
+                "2026-05-25T11:00:00Z",
+                &["fix the GateRegistry", "update its two callers", "add a test"],
+            ))
+            .create_async()
+            .await;
+        // The dispatcher posts exactly one success reply for the one run.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/71/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Fixed all three together.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        // Exactly one run for the whole batch — NOT one per concern.
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "a 3-concern review must dispatch exactly one aggregated run"
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 71).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 1,
+            "the whole batch increments the auto-revision cap by exactly one"
+        );
+
+        token_env_clear(env_var);
+    }
+
+    /// a005 task 3.2: duplicate-targeting concerns in one review do NOT
+    /// produce a second no-op run — they ride the single aggregated run.
+    #[tokio::test]
+    async fn dispatcher_aggregated_duplicate_concerns_one_run() {
+        let env_var = "REVISIONS_TOKEN_AGG_DUP";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(72, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // Two requests targeting the SAME refactor, worded twice (the #95
+        // duplicate case) — both ride one aggregated comment.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/72/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(aggregated_reviewer_marked_comment_body(
+                "2026-05-25T11:00:00Z",
+                &[
+                    "use GateRegistry::standard() in the constructor",
+                    "construct gates via GateRegistry::standard()",
+                ],
+            ))
+            .create_async()
+            .await;
+        let _post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/72/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Applied the GateRegistry::standard() refactor once.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "duplicate concerns must NOT spawn a second no-op run"
+        );
+        let state = read_state(&paths, &ws, 72).unwrap().expect("state persisted");
+        assert_eq!(state.auto_revisions_applied, 1);
+
+        token_env_clear(env_var);
+    }
+
     /// a52 Task 3.3: a genuine commit/push failure on the DIRTY path still
     /// posts the `✗ Revision attempt failed` comment AND increments the
     /// cap (the clean-tree branch must not regress this failure path).
@@ -3921,6 +4164,38 @@ mod tests {
             r#"[{{
                 "id": 1,
                 "body": "<!-- reviewer-revision -->\n@my-bot revise tweak the helper",
+                "user": {{"login": "my-bot"}},
+                "created_at": "{comment_created_at}"
+            }}]"#,
+        )
+    }
+
+    /// a005: build a single GitHub-issue-comments JSON payload containing
+    /// ONE bot-authored, reviewer-marked comment whose body is the AGGREGATED
+    /// revision instruction the source posts for `requests` (built by the
+    /// real [`build_aggregated_reviewer_revision_comment`], JSON-encoded so
+    /// the dispatcher parses exactly what production would write). Used to
+    /// prove a multi-concern review dispatches one run, not N.
+    fn aggregated_reviewer_marked_comment_body(
+        comment_created_at: &str,
+        requests: &[&str],
+    ) -> String {
+        let concerns: Vec<crate::code_reviewer::ReviewConcern> = requests
+            .iter()
+            .map(|r| crate::code_reviewer::ReviewConcern {
+                summary: (*r).to_string(),
+                actionable_request: Some((*r).to_string()),
+                should_request_revision: true,
+                ..Default::default()
+            })
+            .collect();
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &concerns)
+            .expect("aggregated body must be non-empty");
+        let body_json = serde_json::to_string(&body).expect("encode comment body");
+        format!(
+            r#"[{{
+                "id": 1,
+                "body": {body_json},
                 "user": {{"login": "my-bot"}},
                 "created_at": "{comment_created_at}"
             }}]"#,
@@ -5333,7 +5608,7 @@ mod tests {
             }),
             "review the code".to_string(),
         )
-        .with_auto_revise(true);
+        .with_auto_revise(crate::config::AutoRevise::Actionable);
 
         let (_dir, ws) = init_git_workspace();
         let mut repo = make_repo("git@github.com:owner/repo.git");
@@ -5391,6 +5666,7 @@ mod tests {
             "test-token",
             "owner",
             "repo",
+            "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5472,7 +5748,7 @@ mod tests {
         state.code_reviews_applied = 100;
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5501,7 +5777,7 @@ mod tests {
         state.code_reviews_applied = 3;
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5541,7 +5817,7 @@ mod tests {
         state.code_review_cap = Some(5);
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");

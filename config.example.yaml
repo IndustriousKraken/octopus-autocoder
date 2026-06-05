@@ -493,17 +493,23 @@ github:
 #   # kind: agentic
 #   # command: claude        # the agentic CLI binary; default `claude`
 #   #
-#   # Reviewer-initiated revisions on actionable concerns. When `true`,
-#   # every concern the reviewer marked `should_request_revision: true`
-#   # (with a non-empty `actionable_request`) posts a
-#   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
-#   # picks up on the next polling iteration — REGARDLESS of the verdict
-#   # (`Pass`, `Concerns`, OR `Block`). Defaults to `false`. Requires
-#   # `executor.max_auto_revisions_per_pr > 0` (the dispatcher); operator-
-#   # customized reviewer templates must be updated to emit the new
-#   # per-concern fields. See README's "Reviewer-initiated revisions" section.
-#   # The legacy key `auto_revise_on_block` is still accepted as an alias.
-#   # auto_revise: false
+#   # Reviewer-initiated revisions on actionable concerns. Tri-state:
+#   #   block      (default) fire only when the verdict is `Block`
+#   #              (security-critical findings escalate to `Block`, so they
+#   #              auto-fix; non-`Block` `Concerns` stay advisory).
+#   #   actionable fire on any actionable concern regardless of verdict.
+#   #   off        never fire.
+#   # When it fires, ALL of a review's concerns marked
+#   # `should_request_revision: true` (with a non-empty `actionable_request`)
+#   # are AGGREGATED into ONE `<!-- reviewer-revision -->` PR comment that
+#   # the dispatcher picks up as a SINGLE revision run on the next polling
+#   # iteration — one `executor.max_auto_revisions_per_pr` slot per review,
+#   # not per concern. Requires `executor.max_auto_revisions_per_pr > 0`;
+#   # operator-customized reviewer templates must emit the per-concern
+#   # `revision-requests` fields. The legacy boolean is mapped
+#   # (`true` -> `actionable`, `false` -> `off`) and the legacy key
+#   # `auto_revise_on_block` is still accepted as an alias.
+#   # auto_revise: block
 #   #
 #   # Maximum size (in chars) of the rendered reviewer prompt body —
 #   # change context + changed files + diff combined. Default 2000000
