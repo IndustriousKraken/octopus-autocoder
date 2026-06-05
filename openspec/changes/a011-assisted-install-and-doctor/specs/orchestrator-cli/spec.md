@@ -51,11 +51,11 @@ The installer SHALL detect the host platform AND its package manager, AND offer 
 - **THEN** the command is shown AND consent obtained before it runs
 
 ### Requirement: Config path is discovered from the systemd unit
-When a config path is not provided explicitly, `update.sh` AND the daemon CLI SHALL discover it from the installed systemd service unit — reading the config path from the unit's `ExecStart` (the `--config` argument) — so the operator does not retype a path that is already recorded. When no unit or no recorded config path is found, the existing default-path resolution applies. An explicitly provided config path SHALL always win and SHALL NOT consult the unit.
+When a config path is not provided explicitly, `update.sh` AND the daemon CLI SHALL discover it from the installed systemd service unit — parsing the daemon's config argument out of the unit's `ExecStart`, matching the flag the daemon is actually launched with: the run command's `--config-dir <dir>` (from which the config file is `<dir>/config.yaml`), AND accepting a `--config <file>` form as well — so the operator does not retype a path that is already recorded. When no unit or no recorded config path is found, the existing default-path resolution applies. An explicitly provided config path SHALL always win and SHALL NOT consult the unit.
 
 #### Scenario: Discovered from the unit
-- **WHEN** no config path is provided AND a systemd unit records one in its `ExecStart`
-- **THEN** that recorded path is used
+- **WHEN** no config path is provided AND the systemd unit's `ExecStart` launches the daemon with `--config-dir <dir>` (or `--config <file>`)
+- **THEN** the resolver uses `<dir>/config.yaml` (or `<file>`)
 
 #### Scenario: Falls back to default resolution
 - **WHEN** no config path is provided AND no systemd unit records one
