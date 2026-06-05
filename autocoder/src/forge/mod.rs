@@ -24,6 +24,7 @@
 //! until a later change registers an additional provider.
 
 pub mod github;
+pub mod gitlab;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -32,6 +33,28 @@ use chrono::{DateTime, Utc};
 use crate::code_reviewer::ReviewReport;
 use crate::config::CommandAuthorizationConfig;
 use github::{CreatedPr, IssueComment, OpenPr, PrSummary};
+
+/// How a posted review maps onto the forge (a008). The reviewer's verdict is
+/// provider-agnostic; each provider lowers it onto its own primitives.
+/// `GithubForge` posts all three as a PR comment (GitHub's reviewer flow has
+/// always been comment-based); `GitlabForge` maps `Approve` onto an MR
+/// approval AND the other two onto an MR note (GitLab has no distinct
+/// request-changes review state).
+///
+/// `#[allow(dead_code)]`: today's daily loop posts only the `RequestChanges`
+/// reviewer-revision comment; `Approve` AND `Comment` complete the
+/// provider-agnostic verdict mapping (exercised by the GitLab tests) AND are
+/// wired by the Phase-3 GitLab reviewer integration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// The review approves the change.
+    Approve,
+    /// The review asks for changes before merge.
+    RequestChanges,
+    /// The review is an informational comment (no verdict).
+    Comment,
+}
 
 /// The authorization decision a forge assigns to a commenter for a
 /// comment-sourced command (e.g. `@<bot> revise`). Default-deny: anything
@@ -116,15 +139,18 @@ pub trait Forge: Send + Sync {
         body: &str,
     ) -> Result<()>;
 
-    /// Post a review as a PR comment (the reviewer/implementer-notes path).
-    /// Distinct from [`Forge::post_comment`] only in the GitHub auth-header
-    /// shape the two existing call paths use; both hit the comments endpoint.
+    /// Post a review, lowering `decision` onto the provider's review
+    /// primitives (see [`ReviewDecision`]). `GithubForge` posts the body as a
+    /// PR comment regardless of `decision` (preserving the comment-based
+    /// reviewer flow); `GitlabForge` maps `Approve` onto an MR approval AND
+    /// the other verdicts onto an MR note.
     async fn post_review(
         &self,
         owner: &str,
         repo: &str,
         pr_number: u64,
         body: &str,
+        decision: ReviewDecision,
         token: &str,
     ) -> Result<()>;
 
@@ -256,8 +282,11 @@ impl Forge for GithubForge {
         repo: &str,
         pr_number: u64,
         body: &str,
+        _decision: ReviewDecision,
         token: &str,
     ) -> Result<()> {
+        // GitHub's reviewer flow is comment-based: every verdict is posted as
+        // a PR comment, so `decision` does not change the request shape.
         github::create_issue_comment_at(&self.api_base, owner, repo, pr_number, body, token).await
     }
 
@@ -344,28 +373,66 @@ fn is_github_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("github.com")
 }
 
-/// Resolve the forge provider for a repository URL by its host. A GitHub host
-/// resolves to [`GithubForge`]; a host with no registered provider returns a
-/// clear error naming the host AND no forge operation proceeds for that
-/// repository (preserving today's rejection of non-GitHub URLs until a later
-/// change registers an additional provider).
-pub(crate) fn resolve(url: &str) -> Result<Box<dyn Forge>> {
+/// Resolve the forge provider for a repository, applying the a008 selection
+/// precedence:
+///
+/// 1. An explicit per-repo `forge:` block is **authoritative** — `kind:
+///    gitlab` selects [`gitlab::GitlabForge`]; `kind: github` selects
+///    [`GithubForge`] (against the block's `api_base` when set, enabling
+///    GitHub Enterprise).
+/// 2. Absent a block, a `github.com` host resolves to [`GithubForge`].
+/// 3. Otherwise no provider is registered for the host AND a clear
+///    no-provider error is returned, directing the operator to declare a
+///    `forge:` block.
+///
+/// GitLab is reachable ONLY via an explicit `forge: { kind: gitlab }` — there
+/// is no host-sniffing fallback, so a GitLab-host URL with no block returns
+/// the no-provider error rather than silently selecting GitLab.
+pub(crate) fn resolve_forge(
+    forge: Option<&crate::config::ForgeConfig>,
+    url: &str,
+) -> Result<Box<dyn Forge>> {
+    use crate::config::ForgeKind;
+    if let Some(cfg) = forge {
+        return Ok(match cfg.kind {
+            ForgeKind::Gitlab => Box::new(gitlab::GitlabForge::from_config(
+                cfg.host.as_deref(),
+                cfg.api_base.as_deref(),
+                url,
+            )),
+            ForgeKind::Github => match cfg.api_base.as_deref() {
+                Some(base) => Box::new(GithubForge::with_api_base(base.to_string())),
+                None => Box::new(GithubForge::new()),
+            },
+        });
+    }
     let host = forge_host(url)?;
     if is_github_host(&host) {
         Ok(Box::new(GithubForge::new()))
     } else {
-        Err(anyhow!(
-            "no forge provider is registered for host `{host}` (from `{url}`): only GitHub \
-             repositories are supported in this build"
-        ))
+        Err(no_provider_error(&host, url))
     }
+}
+
+/// The clear no-provider error for an unregistered host. Names the host AND
+/// directs the operator to declare a per-repo `forge:` block.
+fn no_provider_error(host: &str, url: &str) -> anyhow::Error {
+    anyhow!(
+        "no forge provider is registered for host `{host}` (from `{url}`): declare a per-repo \
+         `forge:` block to select a provider (e.g. `forge: {{ kind: gitlab, host: {host} }}`)"
+    )
 }
 
 /// Resolve the forge for `url` and parse its `(owner, repo)`. The single
 /// entry point for repo-owner resolution: it validates the host (rejecting
-/// unsupported hosts by name) before parsing the project path.
-pub(crate) fn parse_repo(url: &str) -> Result<(String, String)> {
-    resolve(url)?.parse_repo(url)
+/// unsupported hosts by name) before parsing the project path. Threads an
+/// optional per-repo `forge:` block so GitLab / GHE repositories parse via
+/// the configured provider.
+pub(crate) fn parse_repo_with(
+    forge: Option<&crate::config::ForgeConfig>,
+    url: &str,
+) -> Result<(String, String)> {
+    resolve_forge(forge, url)?.parse_repo(url)
 }
 
 #[cfg(test)]
@@ -404,7 +471,7 @@ mod tests {
             "https://github.com/owner/repo.git",
             "https://github.com/owner/repo",
         ] {
-            let forge = resolve(url).expect("github URL must resolve");
+            let forge = resolve_forge(None, url).expect("github URL must resolve");
             let (owner, repo) = forge.parse_repo(url).expect("github URL must parse");
             assert_eq!((owner.as_str(), repo.as_str()), ("owner", "repo"), "{url}");
         }
@@ -413,7 +480,7 @@ mod tests {
     #[test]
     fn unsupported_host_errors_naming_the_host() {
         // `Box<dyn Forge>` is not `Debug`, so match rather than `expect_err`.
-        let err = match resolve("https://gitlab.example.com/owner/repo.git") {
+        let err = match resolve_forge(None, "https://gitlab.example.com/owner/repo.git") {
             Ok(_) => panic!("non-github host must not resolve"),
             Err(e) => e,
         };
@@ -425,10 +492,107 @@ mod tests {
     }
 
     #[test]
-    fn parse_repo_free_fn_rejects_unsupported_host_by_name() {
-        let err = parse_repo("https://gitlab.example.com/owner/repo.git")
+    fn parse_repo_with_rejects_unsupported_host_by_name() {
+        let err = parse_repo_with(None, "https://gitlab.example.com/owner/repo.git")
             .expect_err("non-github host must not parse");
         assert!(format!("{err:#}").contains("gitlab.example.com"));
+    }
+
+    // ---- a008 §4.1: per-repo forge-block selection precedence ----
+
+    fn gitlab_block(api_base: Option<&str>) -> crate::config::ForgeConfig {
+        crate::config::ForgeConfig {
+            kind: crate::config::ForgeKind::Gitlab,
+            host: Some("gitlab.example.com".into()),
+            api_base: api_base.map(|s| s.to_string()),
+            token: None,
+            token_env: None,
+        }
+    }
+
+    fn github_block(api_base: Option<&str>) -> crate::config::ForgeConfig {
+        crate::config::ForgeConfig {
+            kind: crate::config::ForgeKind::Github,
+            host: None,
+            api_base: api_base.map(|s| s.to_string()),
+            token: None,
+            token_env: None,
+        }
+    }
+
+    #[test]
+    fn explicit_gitlab_block_selects_gitlab_forge() {
+        // A `forge: { kind: gitlab }` block makes a non-github host resolve,
+        // AND parsing uses GitLab's namespace/project semantics (a nested
+        // path that GithubForge would reject).
+        let url = "https://gitlab.example.com/group/subgroup/project.git";
+        let cfg = gitlab_block(None);
+        let forge = resolve_forge(Some(&cfg), url).expect("gitlab block must resolve");
+        let (owner, repo) = forge.parse_repo(url).expect("gitlab URL must parse");
+        assert_eq!((owner.as_str(), repo.as_str()), ("group/subgroup", "project"));
+    }
+
+    #[test]
+    fn github_com_without_block_selects_github_forge() {
+        let url = "https://github.com/owner/repo";
+        let forge = resolve_forge(None, url).expect("github.com must resolve without a block");
+        let (owner, repo) = forge.parse_repo(url).expect("github URL must parse");
+        assert_eq!((owner.as_str(), repo.as_str()), ("owner", "repo"));
+    }
+
+    #[test]
+    fn gitlab_host_without_block_returns_no_provider_error() {
+        // No host-sniffing: a GitLab-host URL with no block does NOT select
+        // GitLab; it returns the no-provider error directing the operator to
+        // declare a `forge:` block.
+        let err = match resolve_forge(None, "https://gitlab.example.com/owner/repo.git") {
+            Ok(_) => panic!("gitlab host without a block must not resolve"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gitlab.example.com"), "must name host; got: {msg}");
+        assert!(msg.contains("forge:"), "must direct to a forge block; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn github_block_with_api_base_drives_github_against_ghe() {
+        // `kind: github` + a self-hosted `api_base` selects GithubForge and
+        // hits the GitHub REST shape against that endpoint.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/owner/repo/pulls")
+            .with_status(201)
+            .with_body(r#"{"html_url":"https://ghe.example.com/owner/repo/pull/1","number":1}"#)
+            .create_async()
+            .await;
+        let cfg = github_block(Some(&server.url()));
+        let forge = resolve_forge(Some(&cfg), "https://ghe.example.com/owner/repo")
+            .expect("github GHE block must resolve");
+        let pr = forge
+            .open_pr("owner", "repo", "agent-q", "main", "t", "b", "tok", None, false)
+            .await
+            .expect("GHE PR create should succeed");
+        assert_eq!(pr.number, 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gitlab_block_open_pr_uses_gitlab_api_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/projects/group%2Fproj/merge_requests")
+            .with_status(201)
+            .with_body(r#"{"iid":1,"web_url":"u"}"#)
+            .create_async()
+            .await;
+        let cfg = gitlab_block(Some(&server.url()));
+        let forge = resolve_forge(Some(&cfg), "https://gitlab.example.com/group/proj.git")
+            .expect("gitlab block must resolve");
+        forge
+            .open_pr("group", "proj", "agent-q", "main", "t", "b", "tok", None, false)
+            .await
+            .expect("gitlab MR create should succeed");
+        mock.assert_async().await;
     }
 
     #[test]
@@ -619,7 +783,14 @@ mod tests {
             .await;
         let forge = GithubForge::with_api_base(server.url());
         forge
-            .post_review("owner", "repo", 9, "review body", "testtoken")
+            .post_review(
+                "owner",
+                "repo",
+                9,
+                "review body",
+                ReviewDecision::RequestChanges,
+                "testtoken",
+            )
             .await
             .expect("post_review through trait should succeed");
         mock.assert_async().await;

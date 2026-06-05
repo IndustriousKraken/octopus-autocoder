@@ -164,13 +164,19 @@ pub(crate) async fn open_pull_request(
     // templated `gh pr create` command to chatops so the operator can
     // open the PR manually after local review.
     if !repo.auto_submit_pr {
-        let branch_url = compose_branch_url(&owner, &repo_name, &repo.agent_branch);
+        let branch_url = compose_branch_url(
+            repo.forge.as_ref(),
+            &repo.url,
+            &owner,
+            &repo_name,
+            &repo.agent_branch,
+        );
         let pr_base = repo
             .upstream
             .as_ref()
             .map(|u| u.branch.as_str())
             .unwrap_or(&repo.base_branch);
-        let suggested = format!("gh pr create --base {pr_base} --head {}", repo.agent_branch);
+        let suggested = push_only_command(repo.forge.as_ref(), pr_base, &repo.agent_branch);
         maybe_post_branch_pushed_no_pr(repo, chatops_ctx, &branch_url, &suggested, changes.len())
             .await;
         tracing::info!(

@@ -231,7 +231,7 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
 }
 
 fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
-    RepositoryConfig {
+    RepositoryConfig { forge: None,
         url: "standalone://audit-run".to_string(),
         local_path: Some(workspace.to_path_buf()),
         base_branch: "main".to_string(),

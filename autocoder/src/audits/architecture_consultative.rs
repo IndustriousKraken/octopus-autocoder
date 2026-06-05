@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn fixture_repo() -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),

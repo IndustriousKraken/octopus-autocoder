@@ -836,10 +836,96 @@ pub struct RepositoryConfig {
     /// logged at startup. See [`RepositoryConfig::resolved_sandbox_toggles`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<RepoSandboxConfig>,
+    /// a008: optional per-repo forge-provider selection + configuration.
+    /// When present, this block is authoritative for provider selection (see
+    /// [`ForgeConfig`] AND `crate::forge::resolve_forge`). Absent → the
+    /// provider defaults to GitHub against `github.com`; existing GitHub
+    /// configurations need no block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeConfig>,
 }
 
 fn default_auto_submit_pr() -> bool {
     true
+}
+
+/// a008: which forge-provider implementation serves a repository's forge
+/// operations. Selected by the per-repo [`ForgeConfig::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeKind {
+    /// GitHub (`github.com`) OR a GitHub-Enterprise endpoint (via `api_base`).
+    Github,
+    /// GitLab SaaS (`gitlab.com`) OR a self-hosted GitLab endpoint.
+    Gitlab,
+}
+
+/// a008: per-repo `forge:` block. Declares AND configures the forge provider
+/// for a repository. When present it is **authoritative** for provider
+/// selection (see `crate::forge::resolve_forge`); when absent the provider
+/// defaults to GitHub against `github.com`, so existing GitHub configurations
+/// need no block. The `api_base` additionally enables GitHub Enterprise
+/// (`kind: github` against a self-hosted endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeConfig {
+    /// The provider implementation (`github` | `gitlab`).
+    pub kind: ForgeKind,
+    /// The forge host (e.g. `gitlab.example.com`). Optional: when omitted the
+    /// host is inferred from the repository URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Explicit REST API base (e.g. `https://gitlab.example.com/api/v4`, or a
+    /// GitHub-Enterprise `https://ghe.example.com/api/v3`). Optional: when
+    /// omitted it is derived from `host`/`kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    /// The provider token, sourced through the existing [`SecretSource`]
+    /// mechanism (an inline value OR an env-var name). Optional: when omitted,
+    /// `token_env` is consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<SecretSource>,
+    /// Fallback env-var name holding the provider token, used when `token` is
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+}
+
+impl ForgeConfig {
+    /// Resolve the provider token through the forge block's token route: the
+    /// inline/env `token` [`SecretSource`] when present, else the `token_env`
+    /// env var. Errors (naming the field AND, for env-var sources, the env
+    /// var) when neither route yields a value. `#[allow(dead_code)]`: the
+    /// token-fetch entry point for the Phase-3 GitLab API call path
+    /// (validation uses [`ForgeConfig::token_route_resolves`]).
+    #[allow(dead_code)]
+    pub fn resolve_token(&self) -> Result<String> {
+        if let Some(src) = self.token.as_ref() {
+            return src.resolve("forge.token");
+        }
+        if let Some(env) = self.token_env.as_ref() {
+            return SecretSource::EnvVar(env.clone())
+                .resolve(&format!("forge.token_env={env}"));
+        }
+        Err(anyhow!(
+            "forge block declares no token route: set `forge.token` (an inline value or env-var \
+             name) or `forge.token_env`"
+        ))
+    }
+
+    /// `true` when the forge block's token route can produce a value right
+    /// now (inline always resolves; an env-var source resolves iff the env
+    /// var is set). Used by config-load token-route validation.
+    pub fn token_route_resolves(&self) -> bool {
+        if let Some(src) = self.token.as_ref() {
+            return matches!(src, SecretSource::Inline { .. })
+                || matches!(src, SecretSource::EnvVar(name) if std::env::var(name).is_ok());
+        }
+        if let Some(env) = self.token_env.as_ref() {
+            return std::env::var(env).is_ok();
+        }
+        false
+    }
 }
 
 /// OSS-fork support (a26): per-repo spec-storage config. When set,
@@ -3299,7 +3385,27 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
 /// trouble only when none of those produces a usable secret.
 fn check_token_routes(config: &Config, report: &mut ValidationReport) {
     for (idx, repo) in config.repositories.iter().enumerate() {
-        let owner = match crate::forge::parse_repo(&repo.url) {
+        // a008: a repo with an explicit `forge:` block sources its token from
+        // that block's token route, NOT the global `github` config. The check
+        // is independent of URL parsing (the block carries its own token), so
+        // it runs first — a non-`github.com` host (GitLab / GHE) is the whole
+        // point of the block AND must not be rejected as "unparsable github".
+        if let Some(forge) = repo.forge.as_ref() {
+            if forge.token_route_resolves() {
+                continue;
+            }
+            report.push_error(
+                FindingCategory::TokenRoute,
+                format!(
+                    "repositories[{idx}].url declares a `forge:` block whose token route does not \
+                     resolve: set `forge.token` (inline or env-var name) or `forge.token_env`"
+                ),
+                Some(format!("repositories/{idx}/forge")),
+            );
+            continue;
+        }
+        // No `forge:` block → the GitHub/`github.com` default path.
+        let owner = match crate::forge::parse_repo_with(None, &repo.url) {
             Ok((o, _r)) => o,
             Err(e) => {
                 report.push_error(
@@ -4822,7 +4928,7 @@ chatops:
 
     #[test]
     fn repo_overrides_channel() {
-        let repo_with_override = RepositoryConfig {
+        let repo_with_override = RepositoryConfig { forge: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -4838,7 +4944,7 @@ chatops:
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
-        let repo_default = RepositoryConfig {
+        let repo_default = RepositoryConfig { forge: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -6826,7 +6932,7 @@ github: {}
     // -----------------------------------------------------------------
 
     fn make_repo(url: &str, audits: Option<HashMap<String, Cadence>>) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),
@@ -7608,6 +7714,89 @@ github:
         assert_eq!(
             route_errs[0].config_pointer.as_deref(),
             Some("repositories/0/url")
+        );
+    }
+
+    #[test]
+    fn validate_config_gitlab_forge_block_with_inline_token_routes() {
+        // a008: a `forge: { kind: gitlab }` block with an inline token parses
+        // AND its token route resolves — a non-github.com host is NOT rejected
+        // as "unparsable github", AND the global github token route is not
+        // consulted for this repo.
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let unset = "AUTOCODER_TEST_VALIDATE_GITLAB_FALLBACK_UNSET";
+        unsafe { std::env::remove_var(unset) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "https://gitlab.example.com/group/subgroup/project.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    forge:
+      kind: gitlab
+      host: gitlab.example.com
+      token: {{ value: "glpat-xxx" }}
+executor:
+  kind: claude_cli
+github:
+  token_env: {unset}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        // The block parsed into the typed config.
+        let forge = cfg.repositories[0].forge.as_ref().expect("forge block");
+        assert_eq!(forge.kind, ForgeKind::Gitlab);
+        assert_eq!(forge.host.as_deref(), Some("gitlab.example.com"));
+        assert!(forge.token_route_resolves());
+        // No token-route error despite the (unset) global github fallback.
+        let report = validate_config(&cfg);
+        let route_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::TokenRoute)
+            .collect();
+        assert!(
+            route_errs.is_empty(),
+            "gitlab forge block with inline token must route cleanly; got: {route_errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_gitlab_forge_block_without_token_route_errors() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let unset = "AUTOCODER_TEST_VALIDATE_GITLAB_TOKEN_ENV_UNSET";
+        unsafe { std::env::remove_var(unset) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "https://gitlab.example.com/group/project.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    forge:
+      kind: gitlab
+      host: gitlab.example.com
+      token_env: {unset}
+executor:
+  kind: claude_cli
+github:
+  token: {{ value: "ignored-for-this-repo" }}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let route_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::TokenRoute)
+            .collect();
+        assert_eq!(route_errs.len(), 1, "expected one forge token-route error");
+        assert_eq!(
+            route_errs[0].config_pointer.as_deref(),
+            Some("repositories/0/forge")
         );
     }
 

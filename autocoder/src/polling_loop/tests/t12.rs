@@ -490,7 +490,7 @@ fn pr_body_includes_renames_section_before_canonical_specs() {
 /// the helper is a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr_opened_notification_noop_without_chatops() {
-    let repo = RepositoryConfig {
+    let repo = RepositoryConfig { forge: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),

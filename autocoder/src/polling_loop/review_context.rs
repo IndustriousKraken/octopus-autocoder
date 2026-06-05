@@ -268,8 +268,17 @@ pub(crate) async fn post_reviewer_revision_comments(
     // `api_base` is `DEFAULT_API_BASE` in production and a mockito URL in
     // tests; the GitHub provider threads it via `with_api_base`.
     use crate::forge::Forge;
+    // The aggregated reviewer-revision comment is a request-changes verdict;
+    // GithubForge posts it as a PR comment regardless (see `post_review`).
     let post_result = crate::forge::GithubForge::with_api_base(api_base)
-        .post_review(upstream_owner, upstream_repo, pr_number, &body, token)
+        .post_review(
+            upstream_owner,
+            upstream_repo,
+            pr_number,
+            &body,
+            crate::forge::ReviewDecision::RequestChanges,
+            token,
+        )
         .await;
     if let Err(e) = post_result {
         tracing::warn!(

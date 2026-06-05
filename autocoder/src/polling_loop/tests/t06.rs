@@ -527,7 +527,7 @@ async fn transient_error_does_not_increment_counter() {
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("placeholder.txt"), "x").unwrap();
 
-    let repo = RepositoryConfig {
+    let repo = RepositoryConfig { forge: None,
         url: "git@github.com:owner/missing.git".into(),
         local_path: Some(ws.clone()),
         base_branch: "main".into(),

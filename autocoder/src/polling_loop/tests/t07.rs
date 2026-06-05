@@ -40,7 +40,7 @@ async fn audit_scheduler_not_invoked_when_ensure_initialized_fails() {
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("placeholder.txt"), "x").unwrap();
 
-    let repo = RepositoryConfig {
+    let repo = RepositoryConfig { forge: None,
         url: "git@github.com:owner/missing.git".into(),
         local_path: Some(ws.clone()),
         base_branch: "main".into(),
@@ -138,7 +138,7 @@ async fn iteration_auto_recovers_partial_clone_without_failure() {
     std::fs::write(ws.join("openspec/changes/foo/proposal.md"), "## proposal\n").unwrap();
 
     let remote_url = remote.to_string_lossy().to_string();
-    let repo = RepositoryConfig {
+    let repo = RepositoryConfig { forge: None,
         url: remote_url,
         local_path: Some(ws.clone()),
         base_branch: "main".into(),

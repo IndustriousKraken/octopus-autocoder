@@ -209,7 +209,7 @@ mod tests {
     use crate::config::UpstreamConfig;
 
     fn fixture_repo() -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: "git@github.com:owner/repo.git".to_string(),
             local_path: None,
             base_branch: "main".to_string(),
