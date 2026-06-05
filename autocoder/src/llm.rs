@@ -577,6 +577,51 @@ mod tests {
         mock.assert_async().await;
     }
 
+    /// a003 / task 3.4: the in-process HTTP `oneshot` reviewer still receives
+    /// the resolved key for its call. The key stays in the daemon's process —
+    /// it is placed in the request's auth header by the in-process `LlmClient`,
+    /// never handed to a subprocess. The mock asserts the request carried the
+    /// configured key; if `build_from_config` dropped the key (regressing the
+    /// HTTP path) the header would not match and `complete` would error.
+    #[tokio::test]
+    async fn oneshot_reviewer_in_process_client_still_receives_the_key() {
+        use crate::config::{ReviewerConfig, ReviewerProvider, SecretSource};
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("x-api-key", "sk-oneshot-a003")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"content":[{"type":"text","text":"ok"}]}"#)
+            .create_async()
+            .await;
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: Some(ReviewerProvider::Anthropic),
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: None,
+            api_key: Some(SecretSource::Inline {
+                value: "sk-oneshot-a003".into(),
+            }),
+            api_base_url: Some(server.url()),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: Some(5),
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
+        };
+        let client = build_from_config(&cfg).expect("oneshot client builds");
+        let out = client.complete("review this").await.expect("complete succeeds");
+        assert_eq!(out, "ok");
+        // The mock only matches when the in-process client sent the key.
+        mock.assert_async().await;
+    }
+
     /// `build_from_config` MUST use `reviewer.api_key` (inline) verbatim and
     /// SHOULD NOT touch `reviewer.api_key_env`'s env var even if it happens
     /// to be set. Asserted by checking the bearer/api-key header on the
