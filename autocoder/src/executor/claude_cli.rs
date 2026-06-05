@@ -682,6 +682,10 @@ impl ClaudeCliExecutor {
             resume_session_id: None,
             track_subprocess_marker: true,
             etxtbsy_retry_spawn: false,
+            // a006: the executor implements code, so its workspace is mounted
+            // read-write. It drives the `claude` CLI, so its own store is
+            // `~/.claude` (admitted read-only for auth).
+            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, true),
         })
         .await
     }
@@ -949,6 +953,9 @@ impl ClaudeCliExecutor {
             resume_session_id: session_id,
             track_subprocess_marker: true,
             etxtbsy_retry_spawn: false,
+            // a006: recovery turns are the executor too — read-write workspace,
+            // `claude` self-store.
+            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, true),
         })
         .await
     }

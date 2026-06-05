@@ -410,6 +410,12 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
+            // a006: read-only verdict role — read-only workspace; self-store
+            // derived from the resolved model's provider (task 2.5).
+            os_sandbox: crate::sandbox::current_run_sandbox(
+                crate::config::default_cli_for(self.model.provider),
+                false,
+            ),
         })
         .await;
 

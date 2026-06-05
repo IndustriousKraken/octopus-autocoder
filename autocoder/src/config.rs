@@ -156,6 +156,11 @@ pub enum CliKind {
 }
 
 impl CliKind {
+    /// Every registered CLI kind. The OS-sandbox credential layers (a006)
+    /// iterate this so the protected config-store set grows automatically as
+    /// strategies are added — never a hardcoded literal list (task 5.2).
+    pub const ALL: [CliKind; 2] = [CliKind::Claude, CliKind::Opencode];
+
     /// Operator-facing YAML string. Matches the `#[serde]` rename rules.
     /// Consumed by the agentic-run primitive (a later change) for
     /// diagnostics; no production call site exists in this change.
@@ -824,6 +829,13 @@ pub struct RepositoryConfig {
     /// (preserves existing auto-submit behavior).
     #[serde(default = "default_auto_submit_pr")]
     pub auto_submit_pr: bool,
+    /// a006: per-repository override of the credential-protection toggles
+    /// (`os_hide`, `engine_deny`). Each set field overrides the global
+    /// `executor.sandbox` value for this repository only; unset fields inherit
+    /// global, then the secure default (ON). Loosening either is explicit and
+    /// logged at startup. See [`RepositoryConfig::resolved_sandbox_toggles`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<RepoSandboxConfig>,
 }
 
 fn default_auto_submit_pr() -> bool {
@@ -1419,6 +1431,68 @@ pub struct ExecutorSandboxConfig {
     pub disallowed_bash_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub disallowed_read_paths: Option<Vec<String>>,
+    /// a006: hide every CLI strategy's config store EXCEPT the running role's
+    /// own from the OS-level sandbox namespace (the filesystem allowlist).
+    /// Defaults ON. A per-repository value overrides this global one. See
+    /// [`crate::sandbox`].
+    #[serde(default)]
+    pub os_hide: Option<bool>,
+    /// a006: extend the per-invocation tool-use denylist to deny the agent's
+    /// `Read`/`Bash` tools on EVERY registered CLI store (the self-store
+    /// included). Defaults ON. A per-repository value overrides this global
+    /// one.
+    #[serde(default)]
+    pub engine_deny: Option<bool>,
+    /// a006: when NO OS sandbox mechanism (`systemd-run` / `bwrap`) can apply
+    /// the sandbox, agentic runs fail closed UNLESS this is `true` — the
+    /// operator's explicit opt-in to running subprocesses unsandboxed (logged
+    /// loudly at startup). Daemon-wide; not a per-repository toggle.
+    #[serde(default)]
+    pub allow_unsandboxed: bool,
+}
+
+/// Per-repository override of the a006 credential-protection toggles. Each
+/// field, when set, overrides the global `executor.sandbox` value for that
+/// repository; absent fields inherit global, then the secure default (ON).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoSandboxConfig {
+    #[serde(default)]
+    pub os_hide: Option<bool>,
+    #[serde(default)]
+    pub engine_deny: Option<bool>,
+}
+
+/// The fully-resolved a006 credential-protection toggles for one repository.
+/// Both default ON (the secure default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxToggles {
+    pub os_hide: bool,
+    pub engine_deny: bool,
+}
+
+impl Default for SandboxToggles {
+    fn default() -> Self {
+        Self {
+            os_hide: true,
+            engine_deny: true,
+        }
+    }
+}
+
+impl SandboxToggles {
+    /// Apply a per-repository override on top of these (global) toggles: each
+    /// set field of `repo` wins; unset fields keep `self`'s value. Used at
+    /// runtime to resolve the active repository's effective posture against
+    /// the daemon-global default (equivalent to
+    /// [`RepositoryConfig::resolved_sandbox_toggles`] when `self` is the
+    /// global resolution).
+    pub fn with_repo_override(self, repo: Option<&RepoSandboxConfig>) -> SandboxToggles {
+        SandboxToggles {
+            os_hide: repo.and_then(|r| r.os_hide).unwrap_or(self.os_hide),
+            engine_deny: repo.and_then(|r| r.engine_deny).unwrap_or(self.engine_deny),
+        }
+    }
 }
 
 /// The fully-resolved sandbox after per-field defaulting. Used by the
@@ -1665,16 +1739,22 @@ pub struct ReviewerConfig {
     /// Modernized form of `prompt_template_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<PromptOverrideBlock>,
-    /// Opt-in flag: when `true`, reviewer-authored revision-request PR
-    /// comments are posted for each concern the reviewer marked
-    /// `should_request_revision: true` with a non-empty `actionable_request`,
-    /// REGARDLESS of the review's verdict (`Pass`, `Concerns`, OR `Block`).
-    /// The dispatcher from the PR-comment revision loop picks these up on
-    /// the next polling iteration. Default `false` (no behavioural change).
-    /// The legacy key `auto_revise_on_block` is accepted as a silent alias
-    /// so existing config files load unchanged.
-    #[serde(default, alias = "auto_revise_on_block")]
-    pub auto_revise: bool,
+    /// a005: tri-state reviewer auto-revision gate. Accepts `block`,
+    /// `actionable`, or `off` and defaults to `block` (see [`AutoRevise`]).
+    /// When it fires, the review's actionable concerns
+    /// (`should_request_revision: true` with a non-empty `actionable_request`)
+    /// are forwarded — AGGREGATED into a single revision run — to the
+    /// PR-comment revision dispatcher, which picks them up on the next
+    /// polling iteration. The legacy boolean is mapped for backward
+    /// compatibility (`true` → `actionable`, `false` → `off`); the legacy key
+    /// `auto_revise_on_block` is accepted as a silent alias so existing
+    /// config files load unchanged.
+    #[serde(
+        default,
+        alias = "auto_revise_on_block",
+        deserialize_with = "deserialize_auto_revise"
+    )]
+    pub auto_revise: AutoRevise,
     /// Maximum size (in chars) of the rendered reviewer prompt body —
     /// change context + changed files + diff combined. Default
     /// `2_000_000` preserves the historical hard-coded value. No clamping:
@@ -1800,6 +1880,80 @@ pub enum ReviewerKind {
     Oneshot,
     #[default]
     Agentic,
+}
+
+/// a005: tri-state reviewer auto-revision gate (`reviewer.auto_revise`).
+///
+/// Governs whether — AND under which verdict — a review's actionable
+/// concerns are forwarded (aggregated into a SINGLE revision run per the
+/// orchestrator-cli `Reviewer-initiated revisions from one review dispatch
+/// as a single run` requirement) to the revision dispatcher.
+///
+/// - [`AutoRevise::Block`] (default): auto-revise fires only when the
+///   review's effective verdict is `Block`. Combined with a004
+///   (security-critical findings escalate the verdict to `Block`),
+///   security-critical findings still auto-fix while non-`Block` `Concerns`
+///   stay advisory — surfaced to the operator, not silently rewritten.
+/// - [`AutoRevise::Actionable`]: fires on any actionable concern regardless
+///   of verdict (the pre-a005 fire-regardless-of-verdict behavior).
+/// - [`AutoRevise::Off`]: never auto-revise.
+///
+/// Deserializes from the canonical lowercase strings (`block`, `actionable`,
+/// `off`) OR, for backward compatibility, from the legacy boolean: `true` →
+/// [`AutoRevise::Actionable`], `false` → [`AutoRevise::Off`]. An absent field
+/// defaults to [`AutoRevise::Block`] (the a005 default change, from the prior
+/// `false`/off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoRevise {
+    #[default]
+    Block,
+    Actionable,
+    Off,
+}
+
+impl AutoRevise {
+    /// Whether auto-revise should fire for a review whose effective verdict
+    /// is (or is not) `Block`. `verdict_is_block` is computed from the final
+    /// [`crate::code_reviewer::ReviewReport`] verdict, so it already includes
+    /// the a004 security escalation.
+    pub fn fires(self, verdict_is_block: bool) -> bool {
+        match self {
+            AutoRevise::Off => false,
+            AutoRevise::Actionable => true,
+            AutoRevise::Block => verdict_is_block,
+        }
+    }
+}
+
+/// Deserialize [`AutoRevise`] from either the canonical lowercase string
+/// (`block`/`actionable`/`off`) or the legacy boolean (`true` → `actionable`,
+/// `false` → `off`). Used by `ReviewerConfig::auto_revise`'s
+/// `deserialize_with`, composing with `#[serde(default)]` (absent → `Block`)
+/// and the `auto_revise_on_block` legacy-key alias.
+fn deserialize_auto_revise<'de, D>(deserializer: D) -> Result<AutoRevise, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match BoolOrStr::deserialize(deserializer)? {
+        BoolOrStr::Bool(true) => Ok(AutoRevise::Actionable),
+        BoolOrStr::Bool(false) => Ok(AutoRevise::Off),
+        BoolOrStr::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "block" => Ok(AutoRevise::Block),
+            "actionable" => Ok(AutoRevise::Actionable),
+            "off" => Ok(AutoRevise::Off),
+            other => Err(D::Error::custom(format!(
+                "invalid auto_revise value {other:?}: expected one of `block`, `actionable`, `off` (or legacy `true`/`false`)"
+            ))),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2417,6 +2571,51 @@ impl RepositoryConfig {
             .or(executor.max_changes_per_pr)
             .unwrap_or(DEFAULT);
         chosen.max(1)
+    }
+
+    /// a006: resolve the effective credential-protection toggles for this
+    /// repository. Lookup order, per toggle: per-repo override → global
+    /// `executor.sandbox` → the secure default (ON). There is no implicit
+    /// downgrade — both are ON unless an operator explicitly set one off.
+    pub fn resolved_sandbox_toggles(&self, global: Option<&ExecutorSandboxConfig>) -> SandboxToggles {
+        let repo = self.sandbox.as_ref();
+        let os_hide = repo
+            .and_then(|r| r.os_hide)
+            .or_else(|| global.and_then(|g| g.os_hide))
+            .unwrap_or(true);
+        let engine_deny = repo
+            .and_then(|r| r.engine_deny)
+            .or_else(|| global.and_then(|g| g.engine_deny))
+            .unwrap_or(true);
+        SandboxToggles {
+            os_hide,
+            engine_deny,
+        }
+    }
+
+    /// a006: the per-repository startup WARN naming each credential-protection
+    /// toggle that is OFF for this repository, or `None` when both are ON (the
+    /// secure default — no WARN). Separated from the logging site so the
+    /// disposition can be asserted without a daemon (task 8.6).
+    pub fn relaxed_sandbox_warning(&self, global: Option<&ExecutorSandboxConfig>) -> Option<String> {
+        let toggles = self.resolved_sandbox_toggles(global);
+        let mut off: Vec<&str> = Vec::new();
+        if !toggles.os_hide {
+            off.push("os_hide");
+        }
+        if !toggles.engine_deny {
+            off.push("engine_deny");
+        }
+        if off.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "repository `{}` runs with relaxed sandbox credential protection: \
+             {} OFF. Other CLIs' credential stores may be reachable by the \
+             wrapped model. This is an explicit, non-default posture.",
+            self.url,
+            off.join(" + ")
+        ))
     }
 }
 
@@ -3680,6 +3879,10 @@ github:
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
+            // a006 `ExecutorSandboxConfig` + per-repo `RepoSandboxConfig`.
+            "os_hide",
+            "engine_deny",
+            "allow_unsandboxed",
             // `GithubConfig`.
             "token_env",
             "token",
@@ -4000,14 +4203,14 @@ reviewer:
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
-        // Default (field omitted) → false.
-        assert!(!rv.auto_revise);
+        // a005: default (field omitted) → `block` (was `false`/off pre-a005).
+        assert_eq!(rv.auto_revise, AutoRevise::Block);
     }
 
     #[test]
     fn reviewer_auto_revise_legacy_alias_explicit_true() {
         // The legacy key `auto_revise_on_block` is still accepted via the
-        // serde alias and deserializes to `auto_revise == true`.
+        // serde alias; a005 maps the legacy boolean `true` → `actionable`.
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4028,12 +4231,13 @@ reviewer:
         let cfg =
             Config::load_from(&path).expect("config with legacy auto_revise_on_block should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
     }
 
     #[test]
     fn reviewer_auto_revise_explicit_true() {
-        // The canonical key `auto_revise` deserializes identically.
+        // The canonical key `auto_revise` with a legacy boolean deserializes
+        // identically (`true` → `actionable`).
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4053,7 +4257,92 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config with auto_revise should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
+    }
+
+    /// a005: the canonical tri-state string values deserialize as expected.
+    #[test]
+    fn reviewer_auto_revise_tristate_strings() {
+        for (value, expected) in [
+            ("block", AutoRevise::Block),
+            ("actionable", AutoRevise::Actionable),
+            ("off", AutoRevise::Off),
+        ] {
+            let yaml = format!(
+                r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {{}}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: {value}
+"#
+            );
+            let (_dir, path) = write_config(&yaml);
+            let cfg = Config::load_from(&path)
+                .unwrap_or_else(|e| panic!("config with auto_revise: {value} should parse: {e}"));
+            let rv = cfg.reviewer.expect("reviewer block should be present");
+            assert_eq!(rv.auto_revise, expected, "auto_revise: {value}");
+        }
+    }
+
+    /// a005: the legacy boolean `false` maps to `off`.
+    #[test]
+    fn reviewer_auto_revise_legacy_false_maps_off() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with auto_revise: false should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert_eq!(rv.auto_revise, AutoRevise::Off);
+    }
+
+    /// a005: an unrecognized string value is a hard config-load error.
+    #[test]
+    fn reviewer_auto_revise_invalid_string_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: sometimes
+"#;
+        let (_dir, path) = write_config(yaml);
+        assert!(
+            Config::load_from(&path).is_err(),
+            "an invalid auto_revise string must fail config-load"
+        );
     }
 
     #[test]
@@ -4545,6 +4834,7 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
@@ -4560,6 +4850,7 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
@@ -4679,6 +4970,160 @@ github: {}
             resolved.disallowed_read_paths,
             vec!["/custom/path/**".to_string()]
         );
+    }
+
+    // a006 / task 8.5: the secure default applies when neither global nor
+    // per-repo sets a toggle — both ON, and no relaxed-posture WARN.
+    #[test]
+    fn sandbox_toggles_secure_default_when_unset() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let repo = &cfg.repositories[0];
+        let toggles = repo.resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(toggles.os_hide, "os_hide defaults ON");
+        assert!(toggles.engine_deny, "engine_deny defaults ON");
+        assert!(
+            repo.relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+                .is_none(),
+            "the secure default emits no relaxed-posture WARN"
+        );
+    }
+
+    // a006 / task 8.5: per-repo overrides global; repos without a per-repo
+    // value keep the global value.
+    #[test]
+    fn sandbox_toggles_per_repo_overrides_global() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/relaxed.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      os_hide: false
+  - url: "git@github.com:owner/strict.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    os_hide: true
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let global = cfg.executor.sandbox.as_ref();
+        // The repo that overrides → os_hide off; engine_deny still defaults on.
+        let relaxed = cfg.repositories[0].resolved_sandbox_toggles(global);
+        assert!(!relaxed.os_hide, "per-repo os_hide off wins over global on");
+        assert!(relaxed.engine_deny, "unset engine_deny falls back to default ON");
+        // The repo without an override → global os_hide on.
+        let strict = cfg.repositories[1].resolved_sandbox_toggles(global);
+        assert!(strict.os_hide, "repo without override keeps global os_hide on");
+    }
+
+    // a006 / task 8.6: a repo running with a toggle off emits a relaxed-posture
+    // WARN naming that toggle (assert a WARN fires, not exact wording).
+    #[test]
+    fn sandbox_relaxed_posture_warns_naming_the_off_toggle() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      os_hide: false
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+            .expect("a repo with os_hide off must emit a relaxed-posture WARN");
+        assert!(warn.contains("os_hide"), "the WARN names the off toggle: {warn}");
+        // engine_deny still on → it is NOT named.
+        assert!(!warn.contains("engine_deny"), "an ON toggle is not named: {warn}");
+    }
+
+    // a006: a global toggle off with no per-repo value resolves off (and warns).
+    #[test]
+    fn sandbox_global_off_flows_to_repo_without_override() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    engine_deny: false
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let toggles = cfg.repositories[0].resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(toggles.os_hide, "os_hide still defaults on");
+        assert!(!toggles.engine_deny, "global engine_deny off flows to the repo");
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+            .expect("engine_deny off must warn");
+        assert!(warn.contains("engine_deny"), "{warn}");
+    }
+
+    // a006: the `allow_unsandboxed` opt-in parses and defaults false.
+    #[test]
+    fn sandbox_allow_unsandboxed_parses_and_defaults_false() {
+        let default_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_d, p) = write_config(default_yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        assert!(
+            !cfg.executor
+                .sandbox
+                .as_ref()
+                .map(|s| s.allow_unsandboxed)
+                .unwrap_or(false),
+            "allow_unsandboxed defaults false"
+        );
+
+        let opt_in = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    allow_unsandboxed: true
+github: {}
+"#;
+        let (_d2, p2) = write_config(opt_in);
+        let cfg2 = Config::load_from(&p2).expect("parses");
+        assert!(cfg2.executor.sandbox.as_ref().unwrap().allow_unsandboxed);
     }
 
     #[test]
@@ -6393,6 +6838,7 @@ github: {}
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 

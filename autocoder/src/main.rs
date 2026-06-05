@@ -42,6 +42,7 @@ mod queue;
 mod rag;
 mod recovery_classification;
 mod revisions;
+mod sandbox;
 mod spec_revision;
 mod spec_root;
 mod spec_storage_routing;

@@ -36,6 +36,13 @@ repositories:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
     #   architecture_brightline: weekly
+    #
+    # a006 per-repo OS-sandbox credential toggles (override executor.sandbox;
+    # both default ON). A repo that develops CLI wrappers needs `os_hide` off
+    # so a nested CLI can authenticate live — loosening is logged at startup.
+    # sandbox:
+    #   os_hide: false
+    #   engine_deny: true
 
     # ----------------------------------------------------------------
     # OSS-fork support (a26). See `docs/OPERATIONS.md`'s
@@ -103,6 +110,26 @@ executor:
   #   disallowed_read_paths:
   #     - "/home/*/.ssh/**"
   #     - "/home/*/.claude/**"
+  #
+  #   # --- a006 OS-level sandbox credential protection ---
+  #   # Every agentic subprocess is wrapped in a kernel-enforced sandbox
+  #   # (systemd-run service mode, or bwrap on non-systemd/unprivileged
+  #   # hosts). Two credential-protection layers, each a toggle, BOTH default
+  #   # ON. Per-repository values (repositories[].sandbox) override these.
+  #   #
+  #   # os_hide: filesystem allowlist — every CLI store OTHER than the running
+  #   #   role's own is absent from the subprocess namespace (fail-closed). A
+  #   #   repository that DEVELOPS CLI wrappers and needs a nested CLI to
+  #   #   authenticate live must set this OFF (the `os_hide off / engine_deny
+  #   #   on` preset); see docs/CONFIG.md.
+  #   os_hide: true
+  #   # engine_deny: extend the per-invocation tool-use denylist so the agent's
+  #   #   Read/Bash tools are denied EVERY registered CLI store (self included).
+  #   engine_deny: true
+  #   # allow_unsandboxed: when NO sandbox mechanism (systemd-run / bwrap) is
+  #   #   available, agentic runs FAIL CLOSED unless this opt-in is true (a loud
+  #   #   startup WARN is emitted when it is). Daemon-wide; NOT recommended.
+  #   allow_unsandboxed: false
 
   # Path to a file overriding the built-in implementer prompt template.
   # The template must contain the literal `{{change_body}}` placeholder
@@ -493,17 +520,23 @@ github:
 #   # kind: agentic
 #   # command: claude        # the agentic CLI binary; default `claude`
 #   #
-#   # Reviewer-initiated revisions on actionable concerns. When `true`,
-#   # every concern the reviewer marked `should_request_revision: true`
-#   # (with a non-empty `actionable_request`) posts a
-#   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
-#   # picks up on the next polling iteration — REGARDLESS of the verdict
-#   # (`Pass`, `Concerns`, OR `Block`). Defaults to `false`. Requires
-#   # `executor.max_auto_revisions_per_pr > 0` (the dispatcher); operator-
-#   # customized reviewer templates must be updated to emit the new
-#   # per-concern fields. See README's "Reviewer-initiated revisions" section.
-#   # The legacy key `auto_revise_on_block` is still accepted as an alias.
-#   # auto_revise: false
+#   # Reviewer-initiated revisions on actionable concerns. Tri-state:
+#   #   block      (default) fire only when the verdict is `Block`
+#   #              (security-critical findings escalate to `Block`, so they
+#   #              auto-fix; non-`Block` `Concerns` stay advisory).
+#   #   actionable fire on any actionable concern regardless of verdict.
+#   #   off        never fire.
+#   # When it fires, ALL of a review's concerns marked
+#   # `should_request_revision: true` (with a non-empty `actionable_request`)
+#   # are AGGREGATED into ONE `<!-- reviewer-revision -->` PR comment that
+#   # the dispatcher picks up as a SINGLE revision run on the next polling
+#   # iteration — one `executor.max_auto_revisions_per_pr` slot per review,
+#   # not per concern. Requires `executor.max_auto_revisions_per_pr > 0`;
+#   # operator-customized reviewer templates must emit the per-concern
+#   # `revision-requests` fields. The legacy boolean is mapped
+#   # (`true` -> `actionable`, `false` -> `off`) and the legacy key
+#   # `auto_revise_on_block` is still accepted as an alias.
+#   # auto_revise: block
 #   #
 #   # Maximum size (in chars) of the rendered reviewer prompt body —
 #   # change context + changed files + diff combined. Default 2000000

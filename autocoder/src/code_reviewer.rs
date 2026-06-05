@@ -150,6 +150,23 @@ pub struct PerChangeContext {
     pub cross_change_preamble: String,
 }
 
+impl ReviewConcern {
+    /// Whether this concern is an actionable reviewer-initiated revision
+    /// request: it carries `should_request_revision: true` AND a non-empty
+    /// (whitespace-trimmed) `actionable_request`. The auto-revise aggregation
+    /// (a005) collects every revisable concern from one review into a single
+    /// revision run. The verdict is NOT consulted here — verdict gating is
+    /// the caller's `auto_revise` tri-state decision.
+    pub fn is_revisable(&self) -> bool {
+        self.should_request_revision
+            && self
+                .actionable_request
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+    }
+}
+
 /// One per-change reviewer result. Returned by `run_per_change_review`
 /// for each change in the pass; the PR-body composer turns each one
 /// into a `## Code Review: <change-slug>` section.
@@ -162,7 +179,7 @@ pub struct PerChangeReview {
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
-    auto_revise: bool,
+    auto_revise: crate::config::AutoRevise,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
     /// Per-PR cap on operator-initiated re-reviews. `None` means UNLIMITED
@@ -202,7 +219,11 @@ impl CodeReviewer {
         Self {
             client,
             template,
-            auto_revise: false,
+            // Test-only constructor: default to `Off` so a reviewer built via
+            // `new()` does not auto-revise unless a test opts in with
+            // `with_auto_revise`. (The config-driven default is `Block`; see
+            // `AutoRevise::default`.)
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: None,
@@ -325,25 +346,25 @@ impl CodeReviewer {
         self.mode
     }
 
-    /// Builder-style setter mirroring the config flag of the same name.
-    /// The flag controls whether concerns marked `should_request_revision`
-    /// (with a non-empty `actionable_request`) get forwarded to the
-    /// revision dispatcher as `<!-- reviewer-revision -->` PR comments,
-    /// regardless of the review's verdict. Default `false` (no behavioural
-    /// change). Used by `from_config` to propagate
-    /// `ReviewerConfig::auto_revise` onto the constructed reviewer; tests
-    /// use it directly when they need the flag flipped without
-    /// round-tripping a full config.
-    pub fn with_auto_revise(mut self, enabled: bool) -> Self {
-        self.auto_revise = enabled;
+    /// Builder-style setter mirroring the tri-state config field of the
+    /// same name (a005). It controls whether — AND under which verdict —
+    /// concerns marked `should_request_revision` (with a non-empty
+    /// `actionable_request`) get forwarded (aggregated into a single
+    /// revision run) to the revision dispatcher. Used by `from_config` to
+    /// propagate `ReviewerConfig::auto_revise` onto the constructed
+    /// reviewer; tests use it directly when they need a specific mode
+    /// without round-tripping a full config.
+    pub fn with_auto_revise(mut self, mode: crate::config::AutoRevise) -> Self {
+        self.auto_revise = mode;
         self
     }
 
-    /// Whether reviewer-initiated revisions are enabled for this
-    /// reviewer instance. Read by the polling-loop posting step that
-    /// turns actionable concerns into `<!-- reviewer-revision -->` PR
-    /// comments (regardless of verdict).
-    pub fn auto_revise(&self) -> bool {
+    /// The reviewer-initiated revision mode for this reviewer instance
+    /// (a005 tri-state). Read by the posting step that turns actionable
+    /// concerns into the single aggregated `<!-- reviewer-revision -->` PR
+    /// comment; the caller combines it with the review's verdict via
+    /// [`crate::config::AutoRevise::fires`].
+    pub fn auto_revise(&self) -> crate::config::AutoRevise {
         self.auto_revise
     }
 
@@ -1144,6 +1165,9 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
+            // a006: the agentic reviewer is a read-only role — read-only
+            // workspace. It drives `claude` (no per-run model override here).
+            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
         })
         .await;
 
@@ -2461,7 +2485,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2489,7 +2513,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2561,7 +2585,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2599,7 +2623,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(template_path),
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2642,7 +2666,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2686,7 +2710,7 @@ this is not yaml: at all: ::: {{{ broken
             code_review: Some(PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2715,7 +2739,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),

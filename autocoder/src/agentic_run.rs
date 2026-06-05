@@ -550,16 +550,47 @@ pub struct AgenticRunOpts<'a> {
     /// test fixtures writing sibling scripts). The executor uses a plain
     /// spawn.
     pub etxtbsy_retry_spawn: bool,
+    /// a006: the OS-level sandbox to wrap this spawn in. `enforce == false`
+    /// (the default) skips the OS layer entirely (test fixtures); production
+    /// call sites set an enforced [`crate::sandbox::RunSandbox`] so EVERY role
+    /// is wrapped and no role can opt out. When enforced with no available
+    /// mechanism AND no operator opt-in, the spawn fails closed.
+    pub os_sandbox: crate::sandbox::RunSandbox,
 }
 
 /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
 /// configured timeout, AND return the unified outcome. See the module
 /// docs for the behavior contract.
 pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> {
+    // a006 fail-closed gate (task 4.1): when the OS sandbox is enforced but no
+    // mechanism is available AND the operator has not opted into unsandboxed
+    // operation, refuse to spawn — BEFORE writing any settings or building the
+    // command. `None` here means the OS layer is not enforced for this run.
+    let spawn_plan = if opts.os_sandbox.enforce {
+        Some(
+            crate::sandbox::decide_spawn(
+                opts.os_sandbox.mechanism,
+                opts.os_sandbox.allow_unsandboxed,
+            )
+            .context("OS-level sandbox mechanism gate")?,
+        )
+    } else {
+        None
+    };
+
+    // a006 engine_deny (task 5.2): extend the per-invocation read-deny set to
+    // every registered CLI store (self included) so the agent's `Read`/`Bash`
+    // tools are denied those paths at the CLI permission layer. Supplied
+    // per-invocation through the settings file below — never by mutating the
+    // operator's global CLI config.
+    let mut disallowed_read_paths = opts.sandbox.disallowed_read_paths.clone();
+    if opts.os_sandbox.enforce {
+        disallowed_read_paths.extend(opts.os_sandbox.engine_deny_paths());
+    }
     let resolved_sandbox = crate::config::ResolvedSandbox {
         allowed_tools: opts.sandbox.allowed_tools.clone(),
         disallowed_bash_patterns: opts.sandbox.disallowed_bash_patterns.clone(),
-        disallowed_read_paths: opts.sandbox.disallowed_read_paths.clone(),
+        disallowed_read_paths,
     };
     let (settings_path, _settings_guard) = crate::audits::write_sandbox_settings(
         &resolved_sandbox,
@@ -593,8 +624,23 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
             // a58/a59, so the production build leaves it `None`.
             mcp_role: None,
         };
-        let mut cmd = opts.strategy.build_command(&ctx);
-        opts.strategy.apply_model_selection(&mut cmd, opts.model);
+        let mut inner_cmd = opts.strategy.build_command(&ctx);
+        opts.strategy.apply_model_selection(&mut inner_cmd, opts.model);
+
+        // a006 (tasks 2.1–2.5, 3.1): wrap the strategy command in the OS-level
+        // sandbox via the resolved mechanism. The wrapper preserves stdio +
+        // process-group + timeout/kill behavior unchanged — the `--pipe` /
+        // bwrap pass-through keeps streaming-JSON and capture modes intact.
+        // `Unsandboxed` (operator opt-in) and the not-enforced path spawn the
+        // strategy command directly.
+        let mut cmd = match spawn_plan {
+            Some(crate::sandbox::SpawnPlan::Wrap(mechanism)) => {
+                let inner = crate::sandbox::InnerCommand::from_command(&inner_cmd);
+                let plan = opts.os_sandbox.build_plan(opts.workspace);
+                crate::sandbox::wrap_command(mechanism, &plan, &inner)
+            }
+            _ => inner_cmd,
+        };
         cmd.current_dir(opts.workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1469,6 +1515,9 @@ mod tests {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: false,
+            // Unenforced: this test exercises the inner capture path, not the
+            // OS layer (no mechanism is runnable in CI).
+            os_sandbox: crate::sandbox::RunSandbox::default(),
         })
         .await
         .expect("agentic_run completes for the opencode stub");

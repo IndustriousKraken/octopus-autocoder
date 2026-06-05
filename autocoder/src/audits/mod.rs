@@ -1000,6 +1000,9 @@ pub(crate) async fn run_audit_cli(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
+        // a006: audits are read-only roles — workspace mounted read-only. They
+        // drive the `claude` CLI (self-store `~/.claude`, admitted ro for auth).
+        os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
     })
     .await
 }
@@ -1065,6 +1068,9 @@ pub(crate) async fn run_audit_cli_with_submit(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
+        // a006: advisory audits are read-only roles too — read-only workspace,
+        // `claude` self-store.
+        os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
     })
     .await;
 
