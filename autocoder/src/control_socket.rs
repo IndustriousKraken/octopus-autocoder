@@ -4370,6 +4370,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         {
             let mut guard = state.repo_tasks.lock().unwrap();
@@ -4628,6 +4629,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let gh = GithubConfig {
             token_env: env_var.to_string(),

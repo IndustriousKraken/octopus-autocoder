@@ -2640,6 +2640,13 @@ async fn process_one_pending_change(
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
 ) -> Result<QueueStep> {
+    // a006: set this repository's effective OS-sandbox credential toggles for
+    // the duration of the whole change pipeline (pre-flight contradiction
+    // checks, the executor, AND the in-iteration review). The guard resets the
+    // override on every return path so the next iteration starts from the
+    // daemon-global default.
+    let _sandbox_repo_guard = crate::sandbox::enter_repo(repo.sandbox.as_ref());
+
     // Spec-delta archivability pre-flight (a17). Catches the a07-style
     // class of failures — a `## MODIFIED Requirements` block whose
     // `### Requirement:` header doesn't exist in canonical, etc. —
@@ -9341,6 +9348,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -10705,6 +10713,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -10933,6 +10942,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -11092,6 +11102,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -12093,6 +12104,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -12187,6 +12199,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -12285,6 +12298,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let github_cfg = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -14870,6 +14884,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         maybe_post_pr_opened(
             &repo,
@@ -14911,6 +14926,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         maybe_post_pr_opened(
             &repo,
@@ -14953,6 +14969,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         // Should not panic; should return Ok-equivalent (it's an async fn
         // returning unit, so "doesn't panic" is the assertion).
@@ -15003,6 +15020,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -15039,6 +15057,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -15057,6 +15076,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -15652,6 +15672,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         maybe_post_pr_opened(
             &repo,

@@ -194,6 +194,36 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         ),
     };
 
+    // a006: detect the OS-level sandbox mechanism once at startup AND seed the
+    // daemon-global sandbox context. After this, every `agentic_run` spawn is
+    // gated + wrapped (the executor, every audit, the agentic reviewer, the
+    // contradiction checks). With no mechanism AND no opt-in, agentic runs
+    // fail closed at the spawn seam; with the explicit opt-in, they proceed
+    // unsandboxed and the loud WARN below fires.
+    let sandbox_mechanism = crate::sandbox::detect_mechanism();
+    let sandbox_global = cfg.executor.sandbox.as_ref();
+    let allow_unsandboxed = sandbox_global.map(|s| s.allow_unsandboxed).unwrap_or(false);
+    let global_sandbox_toggles = crate::config::SandboxToggles {
+        os_hide: sandbox_global.and_then(|s| s.os_hide).unwrap_or(true),
+        engine_deny: sandbox_global.and_then(|s| s.engine_deny).unwrap_or(true),
+    };
+    match sandbox_mechanism {
+        Some(m) => tracing::info!(
+            mechanism = m.as_str(),
+            "OS-level agentic sandbox active (every agentic subprocess is kernel-wrapped)"
+        ),
+        None if allow_unsandboxed => {}
+        None => tracing::info!(
+            "no OS sandbox mechanism (systemd-run / bwrap) detected; agentic runs will fail closed unless executor.sandbox.allow_unsandboxed is set"
+        ),
+    }
+    if let Some(warn) =
+        crate::sandbox::startup_unsandboxed_warning(sandbox_mechanism, allow_unsandboxed)
+    {
+        tracing::warn!("{warn}");
+    }
+    crate::sandbox::init_global(sandbox_mechanism, allow_unsandboxed, global_sandbox_toggles);
+
     // Build the change-internal contradiction pre-flight context
     // (a19). Disabled by default → no LLM client built, no context
     // produced; the polling loop short-circuits at the
@@ -540,6 +570,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 url = %repo.url,
                 "repositories[{idx}].max_changes_per_pr is set to 0; clamping to 1"
             );
+        }
+    }
+
+    // a006: per-repository relaxed-sandbox-posture WARN. Naming each
+    // credential-protection toggle that is OFF for the repo (per-repo override
+    // or global). Both ON (the secure default) emits nothing — loosening is
+    // explicit and logged so the operator notices.
+    for repo in &cfg.repositories {
+        if let Some(warn) = repo.relaxed_sandbox_warning(cfg.executor.sandbox.as_ref()) {
+            tracing::warn!(url = %repo.url, "{warn}");
         }
     }
 
@@ -1591,6 +1631,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -1614,6 +1655,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 

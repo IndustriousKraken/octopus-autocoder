@@ -1364,6 +1364,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let mut ctx = AuditContext {
             workspace: &workspace,
@@ -1424,6 +1425,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let mut ctx = AuditContext {
             workspace: &workspace,
@@ -1706,6 +1708,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         let paths = crate::paths::DaemonPaths::under_root(ws);
         let log_writer =

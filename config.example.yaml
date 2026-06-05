@@ -36,6 +36,13 @@ repositories:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
     #   architecture_brightline: weekly
+    #
+    # a006 per-repo OS-sandbox credential toggles (override executor.sandbox;
+    # both default ON). A repo that develops CLI wrappers needs `os_hide` off
+    # so a nested CLI can authenticate live — loosening is logged at startup.
+    # sandbox:
+    #   os_hide: false
+    #   engine_deny: true
 
     # ----------------------------------------------------------------
     # OSS-fork support (a26). See `docs/OPERATIONS.md`'s
@@ -103,6 +110,26 @@ executor:
   #   disallowed_read_paths:
   #     - "/home/*/.ssh/**"
   #     - "/home/*/.claude/**"
+  #
+  #   # --- a006 OS-level sandbox credential protection ---
+  #   # Every agentic subprocess is wrapped in a kernel-enforced sandbox
+  #   # (systemd-run service mode, or bwrap on non-systemd/unprivileged
+  #   # hosts). Two credential-protection layers, each a toggle, BOTH default
+  #   # ON. Per-repository values (repositories[].sandbox) override these.
+  #   #
+  #   # os_hide: filesystem allowlist — every CLI store OTHER than the running
+  #   #   role's own is absent from the subprocess namespace (fail-closed). A
+  #   #   repository that DEVELOPS CLI wrappers and needs a nested CLI to
+  #   #   authenticate live must set this OFF (the `os_hide off / engine_deny
+  #   #   on` preset); see docs/CONFIG.md.
+  #   os_hide: true
+  #   # engine_deny: extend the per-invocation tool-use denylist so the agent's
+  #   #   Read/Bash tools are denied EVERY registered CLI store (self included).
+  #   engine_deny: true
+  #   # allow_unsandboxed: when NO sandbox mechanism (systemd-run / bwrap) is
+  #   #   available, agentic runs FAIL CLOSED unless this opt-in is true (a loud
+  #   #   startup WARN is emitted when it is). Daemon-wide; NOT recommended.
+  #   allow_unsandboxed: false
 
   # Path to a file overriding the built-in implementer prompt template.
   # The template must contain the literal `{{change_body}}` placeholder

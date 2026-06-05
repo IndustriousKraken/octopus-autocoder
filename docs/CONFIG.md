@@ -20,6 +20,7 @@ A list of one or more repositories to manage. Each entry:
 | `spec_storage`       | no       | unset (workspace-internal specs) | OSS-fork support (a26): see [`spec_storage`](#repositoriesspec_storage). |
 | `upstream`           | no       | unset (no upstream remote management) | OSS-fork support (a26): see [`upstream`](#repositoriesupstream). |
 | `auto_submit_pr`     | no       | `true`  | OSS-fork support (a26): see [`auto_submit_pr`](#repositoriesauto_submit_pr). |
+| `sandbox`            | no       | inherits global, then ON | a006 per-repo override of the OS-level sandbox credential toggles (`os_hide`, `engine_deny`). Each set field overrides `executor.sandbox`; loosening is logged at startup. See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 
 ### `repositories[].spec_storage` {#repositoriesspec_storage}
 
@@ -97,7 +98,7 @@ Cross-link:
 | `kind`                      | yes      | —             | Currently only `claude_cli` is supported. |
 | `command`                   | no       | `claude`      | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
 | `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
-| `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox). |
+| `sandbox`                   | no       | safe defaults | Tool-use restrictions (`allowed_tools`, `disallowed_bash_patterns`, `disallowed_read_paths`) applied to every executor invocation — see [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox) — **plus** the a006 OS-level sandbox credential toggles `os_hide` / `engine_deny` (both default ON) and the `allow_unsandboxed` no-mechanism opt-in (default `false`, daemon-wide). See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. Operators with override templates MAY mention `query_canonical_specs` (a21 — see `canonical_rag:`) in their prompt OR ignore the new tool entirely; the tool stays registered regardless. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
 | `max_changes_per_pr`        | no       | `3`           | Default cap on archived changes committed in one iteration's PR; per-repo `max_changes_per_pr` overrides. Operators with long queues see them ship across multiple iterations instead of one large PR. A value of `0` is clamped to `1` with a WARN log at startup. |

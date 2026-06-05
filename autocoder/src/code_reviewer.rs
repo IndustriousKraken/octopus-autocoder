@@ -1165,6 +1165,9 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
+            // a006: the agentic reviewer is a read-only role — read-only
+            // workspace. It drives `claude` (no per-run model override here).
+            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
         })
         .await;
 
