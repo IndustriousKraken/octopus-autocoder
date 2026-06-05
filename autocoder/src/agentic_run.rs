@@ -80,6 +80,15 @@ pub struct ResolvedModel {
     pub provider: crate::config::LlmProvider,
     pub model: String,
     pub api_base_url: String,
+    /// The resolved LLM credential. a003: NO `CliStrategy` propagates this to
+    /// the wrapped subprocess — neither into a workspace config file
+    /// (`opencode.json`) nor into the subprocess env (`ANTHROPIC_AUTH_TOKEN`).
+    /// The CLI authenticates itself; the model is tunneled across that
+    /// connection. The key is consumed only by autocoder's in-process HTTP
+    /// clients (the `oneshot` reviewer's `LlmClient`), which resolve their key
+    /// directly and never spawn a subprocess. A strategy that receives a model
+    /// carrying a non-empty key ignores the key (see
+    /// [`cli_role_unused_key_warning`] for the startup notice).
     pub api_key: String,
 }
 
@@ -122,9 +131,10 @@ pub struct BuildContext<'a> {
     /// `write_mcp_config`).
     pub mcp_role: Option<&'a str>,
     /// The resolved model, so the `opencode` strategy can write the
-    /// provider config (base URL + key) into `opencode.json`. `None`
-    /// preserves the CLI's own default-model behavior. The `claude`
-    /// strategy ignores it here (it sets `ANTHROPIC_*` env in
+    /// provider config (model + base URL, NEVER the `api_key` — a003) into
+    /// `opencode.json`. `None` preserves the CLI's own default-model
+    /// behavior. The `claude` strategy ignores it here (it sets the
+    /// non-credential `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` env in
     /// `apply_model_selection` instead).
     pub model: Option<&'a ResolvedModel>,
 }
@@ -159,9 +169,18 @@ pub(crate) fn build_allowed_tools_value(
 /// exactly: `--settings <file>`, `--allowedTools <combined>`,
 /// `--permission-mode acceptEdits`, optional `--resume`, and — in
 /// streaming mode — `--verbose --output-format stream-json`. Model
-/// selection sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
-/// `ANTHROPIC_MODEL` ONLY when a model is configured; with no model it
-/// sets none of them (the executor's current CLI-default behavior).
+/// selection sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` ONLY when a
+/// model is configured; with no model it sets neither (the executor's
+/// current CLI-default behavior).
+///
+/// a003: model selection sets NO `ANTHROPIC_AUTH_TOKEN`. The resolved
+/// `api_key` is a credential and never reaches the subprocess — claude
+/// authenticates from its own login / credential store (`claude login`),
+/// and the model is tunneled across that connection. An env-set auth token
+/// would be readable from the agent's Bash AND (for Anthropic) would force
+/// pay-per-token off the operator's subscription. `ANTHROPIC_BASE_URL` /
+/// `ANTHROPIC_MODEL` are endpoint/model selection, NOT credentials, so they
+/// remain.
 pub struct ClaudeStrategy {
     pub command: String,
     pub args: Vec<String>,
@@ -202,8 +221,11 @@ impl CliStrategy for ClaudeStrategy {
 
     fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>) {
         if let Some(m) = model {
+            // Endpoint + model selection only. a003: NO `ANTHROPIC_AUTH_TOKEN`
+            // — the resolved `m.api_key` is a credential the model never needs,
+            // so it is never placed in the subprocess env. claude authenticates
+            // from its own login / credential store.
             cmd.env("ANTHROPIC_BASE_URL", &m.api_base_url);
-            cmd.env("ANTHROPIC_AUTH_TOKEN", &m.api_key);
             cmd.env("ANTHROPIC_MODEL", &m.model);
         }
         // model: None → set nothing; the CLI uses its own default model.
@@ -223,8 +245,10 @@ const OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 /// Unlike [`ClaudeStrategy`], opencode carries everything in one workspace
 /// config file, `opencode.json`: the MCP `mcp` block (`type: local`, the
 /// MCP-child command, env including `ORCH_MCP_ROLE`), the resolved provider
-/// config (base URL + key), AND a `permission` block mapped from a56's
-/// sandbox. [`OpencodeStrategy::build_command`] writes that file; model
+/// config (model + base URL, NEVER the `api_key` — a003: a credential in a
+/// workspace file could be committed, AND the model never needs it), AND a
+/// `permission` block mapped from a56's sandbox.
+/// [`OpencodeStrategy::build_command`] writes that file; model
 /// selection is `--model <provider>/<model>` (NOT `ANTHROPIC_*` env). It
 /// writes NO `.mcp.json` (the `claude` MCP format). The prompt is delivered
 /// on stdin — [`agentic_run`] already pipes it, AND headless `opencode run`
@@ -310,8 +334,14 @@ impl OpencodeStrategy {
     /// The `provider` block for the resolved model, keyed by the provider's
     /// id (`openai_compatible` / `ollama`) so it matches the `--model
     /// <provider>/<model>` selection. `None` when no model is configured
-    /// (opencode uses its own default). The api key is omitted when empty
-    /// (Ollama does not authenticate).
+    /// (opencode uses its own default).
+    ///
+    /// a003: the resolved `api_key` is NEVER written here. `opencode.json`
+    /// lives at the workspace root and is not git-excluded, so a key in it
+    /// could be committed; more fundamentally the model never needs the
+    /// credential. opencode authenticates from its own out-of-band provider
+    /// config / login (e.g. opencode → OpenRouter), so only the provider's
+    /// model + base URL are written. (Ollama never authenticated anyway.)
     fn provider_block(model: Option<&ResolvedModel>) -> Option<serde_json::Value> {
         let m = model?;
         let provider_id = m.provider.as_str();
@@ -320,12 +350,7 @@ impl OpencodeStrategy {
             "baseURL".to_string(),
             serde_json::Value::String(m.api_base_url.clone()),
         );
-        if !m.api_key.is_empty() {
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String(m.api_key.clone()),
-            );
-        }
+        // No `apiKey` — see the doc comment above (a003).
         let mut models = serde_json::Map::new();
         models.insert(m.model.clone(), serde_json::json!({}));
         let mut entry = serde_json::Map::new();
@@ -461,6 +486,32 @@ pub fn strategy_for_cli(
         crate::config::CliKind::Claude => Ok(Box::new(ClaudeStrategy::new(command, args))),
         crate::config::CliKind::Opencode => Ok(Box::new(OpencodeStrategy::new(command, args))),
     }
+}
+
+/// Startup WARN for a role that resolves to a [`CliStrategy`] but carries a
+/// configured `api_key` (a003). A CLI role authenticates from the wrapped
+/// CLI's own login / credential store, so the resolved key is NEVER passed to
+/// the subprocess — the strategy ignores it. That makes the configured key
+/// dead config; this returns the one-line WARN the daemon logs exactly once at
+/// startup so the operator can remove it. Returns `None` when no key is
+/// configured (`has_key == false`).
+///
+/// Roles that use autocoder's in-process HTTP path (e.g. the `oneshot`
+/// reviewer's `LlmClient`) resolve and use their key directly and must NOT
+/// call this — their key is genuinely consumed, not dead. Separated from the
+/// logging site (`cli::run` startup) as a pure decision so tests assert the
+/// disposition without a daemon, mirroring
+/// [`crate::code_reviewer::startup_reviewer_kind_decision`].
+pub fn cli_role_unused_key_warning(role_label: &str, has_key: bool) -> Option<String> {
+    has_key.then(|| {
+        format!(
+            "role `{role_label}` has a configured `api_key`, but it resolves to a CLI \
+             strategy whose wrapped CLI authenticates from its own login / credential \
+             store — the key is UNUSED for CLI roles and is never passed to the \
+             subprocess (neither a workspace config file nor the env). Remove the \
+             `api_key` from this role's config to silence this warning."
+        )
+    })
 }
 
 /// Everything [`agentic_run`] needs for one run. Most call sites set only
@@ -1031,15 +1082,19 @@ mod tests {
         assert!(!e.contains_key("ANTHROPIC_MODEL"));
     }
 
-    // 5.3: a resolved model → all three ANTHROPIC_* vars set from the tuple.
+    // a003 / task 3.2: a resolved model sets the endpoint + model env
+    // (ANTHROPIC_BASE_URL / ANTHROPIC_MODEL) but NO ANTHROPIC_AUTH_TOKEN —
+    // the api_key is a credential the subprocess never receives. claude
+    // authenticates from its own login. (Supersedes a56's 5.3, which set all
+    // three.)
     #[test]
-    fn claude_strategy_with_model_sets_all_three_anthropic_env() {
+    fn claude_strategy_with_model_sets_endpoint_and_model_but_no_auth_token() {
         let strat = ClaudeStrategy::new("claude".into(), Vec::new());
         let model = ResolvedModel {
             provider: LlmProvider::Anthropic,
             model: "claude-opus-4-8".into(),
             api_base_url: "https://example.invalid/api".into(),
-            api_key: "sk-test".into(),
+            api_key: "sk-test-sentinel".into(),
         };
         let allowed: Vec<String> = vec![];
         let mut cmd = strat.build_command(&ctx(
@@ -1055,8 +1110,17 @@ mod tests {
             e.get("ANTHROPIC_BASE_URL").map(String::as_str),
             Some("https://example.invalid/api")
         );
-        assert_eq!(e.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("sk-test"));
         assert_eq!(e.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8"));
+        // The credential is NEVER set in the subprocess env.
+        assert!(
+            !e.contains_key("ANTHROPIC_AUTH_TOKEN"),
+            "a003: the claude strategy must set no ANTHROPIC_AUTH_TOKEN"
+        );
+        // Belt-and-braces: the key value appears in NO env entry at all.
+        assert!(
+            !e.values().any(|v| v.contains("sk-test-sentinel")),
+            "a003: the resolved api_key must not appear in any env entry"
+        );
     }
 
     // The claude strategy reproduces the pre-refactor executor streaming
@@ -1234,18 +1298,21 @@ mod tests {
         assert!(env.get(crate::mcp_askuser_server::ENV_CHANGE).is_none());
     }
 
-    // a60 / task 4.3: model selection targets the configured provider —
-    // `--model <provider>/<model>` + the opencode.json provider entry — AND
-    // sets none of the ANTHROPIC_* env vars.
+    // a60 / task 4.3 + a003 / task 3.1: model selection targets the configured
+    // provider — `--model <provider>/<model>` + the opencode.json provider
+    // entry (model + base URL) — AND sets none of the ANTHROPIC_* env vars.
+    // a003: the keyed model's `api_key` is NEVER written into opencode.json
+    // (the provider `options` carry the base URL but no `apiKey`), and the key
+    // value appears nowhere in the file.
     #[test]
-    fn opencode_strategy_model_selection_sets_model_flag_and_provider_no_anthropic() {
+    fn opencode_strategy_model_selection_sets_model_flag_and_provider_no_api_key() {
         let tmp = tempfile::tempdir().unwrap();
         let allowed = vec!["Read".to_string()];
         let model = ResolvedModel {
             provider: LlmProvider::OpenAiCompatible,
             model: "gpt-4o-mini".into(),
             api_base_url: "https://api.example.invalid/v1".into(),
-            api_key: "sk-secret".into(),
+            api_key: "sk-secret-sentinel".into(),
         };
         let bctx = BuildContext {
             workspace: tmp.path(),
@@ -1262,12 +1329,24 @@ mod tests {
         assert_eq!(a[pos + 1], "openai_compatible/gpt-4o-mini");
 
         let v = read_opencode_json(tmp.path());
+        // The MCP, permission, and provider-base-URL blocks are all present.
+        assert!(v["mcp"][crate::mcp_askuser_server::SERVER_NAME].is_object());
+        assert!(v["permission"].is_object());
         let provider = &v["provider"]["openai_compatible"];
         assert_eq!(provider["options"]["baseURL"], "https://api.example.invalid/v1");
-        assert_eq!(provider["options"]["apiKey"], "sk-secret");
+        assert!(
+            provider["options"].get("apiKey").is_none(),
+            "a003: the resolved api_key must NOT be written into opencode.json"
+        );
         assert!(
             provider["models"]["gpt-4o-mini"].is_object(),
             "the resolved model is registered under the provider"
+        );
+        // The key value appears nowhere in the serialized config.
+        let raw = std::fs::read_to_string(tmp.path().join("opencode.json")).unwrap();
+        assert!(
+            !raw.contains("sk-secret-sentinel"),
+            "a003: the resolved api_key must not appear anywhere in opencode.json"
         );
 
         let e = envs(&cmd);
@@ -1415,5 +1494,108 @@ mod tests {
         // The strategy wrote opencode.json (not .mcp.json) for the run.
         assert!(tmp.path().join("opencode.json").exists());
         assert!(!tmp.path().join(".mcp.json").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // a003: credentials never reach the model.
+    // -----------------------------------------------------------------------
+
+    /// The sentinel a strategy has no legitimate reason to ever emit.
+    const KEY_SENTINEL: &str = "SENTINEL-API-KEY-MUST-NOT-LEAK-9f3c";
+
+    /// Build a keyed [`ResolvedModel`] for `provider` carrying [`KEY_SENTINEL`].
+    fn sentinel_model(provider: LlmProvider) -> ResolvedModel {
+        ResolvedModel {
+            provider,
+            model: "the-model".into(),
+            api_base_url: "https://api.example.invalid/v1".into(),
+            api_key: KEY_SENTINEL.into(),
+        }
+    }
+
+    /// Drive one strategy with the keyed model AND assert the sentinel appears
+    /// in NO subprocess env entry AND in NO file the strategy wrote into the
+    /// workspace.
+    fn assert_strategy_leaks_no_key(strat: &dyn CliStrategy, provider: LlmProvider) {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = sentinel_model(provider);
+        let allowed = vec!["Read".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            model: Some(&model),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let mut cmd = strat.build_command(&bctx);
+        strat.apply_model_selection(&mut cmd, Some(&model));
+
+        // No subprocess env entry carries the key.
+        for (k, v) in envs(&cmd) {
+            assert!(
+                !v.contains(KEY_SENTINEL),
+                "env `{k}` leaked the api_key for provider {provider:?}"
+            );
+        }
+        // No file the strategy wrote into the workspace carries the key.
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    !raw.contains(KEY_SENTINEL),
+                    "workspace file {} leaked the api_key for provider {provider:?}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // a003 / task 3.3: across EVERY registered CliStrategy, no file written into
+    // the workspace AND no subprocess env entry contains the resolved api_key.
+    #[test]
+    fn no_strategy_leaks_api_key_to_file_or_env() {
+        assert_strategy_leaks_no_key(
+            &ClaudeStrategy::new("claude".into(), Vec::new()),
+            LlmProvider::Anthropic,
+        );
+        assert_strategy_leaks_no_key(
+            &OpencodeStrategy::new("opencode".into(), Vec::new()),
+            LlmProvider::OpenAiCompatible,
+        );
+    }
+
+    // a003 / task 3.5: a CLI role configured with an api_key produces exactly
+    // one startup WARN (the key is unused for CLI roles) AND the strategy
+    // ignores the key. A role with no key produces no WARN.
+    #[test]
+    fn cli_role_with_key_warns_once_and_strategy_ignores_it() {
+        // With a key: exactly one WARN, naming the role AND the unused-key reason.
+        let role = "executor.change_internal_contradiction_check_llm";
+        let msg = cli_role_unused_key_warning(role, true)
+            .expect("a keyed CLI role must produce exactly one WARN");
+        assert!(msg.contains(role), "the WARN names the role: {msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("unused"),
+            "the WARN explains the key is unused: {msg}"
+        );
+        assert!(msg.contains("api_key"), "the WARN names the field: {msg}");
+
+        // With no key: no WARN.
+        assert!(
+            cli_role_unused_key_warning(role, false).is_none(),
+            "a role with no configured key must not warn"
+        );
+
+        // The strategy ignores the key even when the model carries one: the
+        // claude strategy sets no ANTHROPIC_AUTH_TOKEN and leaks nothing.
+        let strat = ClaudeStrategy::new("claude".into(), Vec::new());
+        let model = sentinel_model(LlmProvider::Anthropic);
+        let allowed: Vec<String> = vec![];
+        let mut cmd =
+            strat.build_command(&ctx(Path::new("/tmp/s.json"), &allowed, false, false, None));
+        strat.apply_model_selection(&mut cmd, Some(&model));
+        let e = envs(&cmd);
+        assert!(!e.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!e.values().any(|v| v.contains(KEY_SENTINEL)));
     }
 }

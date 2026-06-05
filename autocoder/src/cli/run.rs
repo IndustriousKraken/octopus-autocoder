@@ -217,6 +217,15 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         // rather than over HTTP, so no `LlmClient` is built.
         let model = crate::llm::resolve_contradiction_check_model(llm_cfg)
             .context("resolving contradiction-check model from config")?;
+        // a003: the contradiction check runs agentically (a59) through a CLI
+        // strategy, which authenticates from its own login — so a configured
+        // `api_key` is unused. Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.change_internal_contradiction_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
         let prompt_template = crate::preflight::change_contradiction::load_prompt_template(
             cfg.executor
                 .change_internal_contradiction_check_prompt_path
@@ -264,6 +273,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .expect("validate_config guarantees the llm block is set when enabled");
         let model = crate::llm::resolve_canon_contradiction_check_model(llm_cfg)
             .context("resolving canon-contradiction-check model from config")?;
+        // a003: agentic CLI gate (a62) — a configured `api_key` is unused (the
+        // CLI authenticates itself). Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.change_canonical_contradiction_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
         let prompt_template = crate::preflight::canon_contradiction::load_prompt_template(
             cfg.executor
                 .change_canonical_contradiction_check_prompt_path
@@ -310,6 +327,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .expect("validate_config guarantees the llm block is set when enabled");
         let model = crate::llm::resolve_code_implements_spec_check_model(llm_cfg)
             .context("resolving code-implements-spec-check model from config")?;
+        // a003: agentic CLI gate (a63) — a configured `api_key` is unused (the
+        // CLI authenticates itself). Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.code_implements_spec_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
         let prompt_template = crate::code_implements_spec::load_prompt_template(
             cfg.executor
                 .code_implements_spec_check_prompt_path

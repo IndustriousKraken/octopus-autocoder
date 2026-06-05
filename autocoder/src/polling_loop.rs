@@ -17009,6 +17009,7 @@ mod tests {
             actionable_request: Some(request.to_string()),
             should_request_revision: true,
             change_slug: None,
+            ..Default::default()
         }
     }
 
@@ -17018,6 +17019,7 @@ mod tests {
             actionable_request: None,
             should_request_revision: false,
             change_slug: None,
+            ..Default::default()
         }
     }
 
@@ -17296,6 +17298,7 @@ mod tests {
                     actionable_request: Some("   ".into()),
                     should_request_revision: true,
                     change_slug: None,
+                    ..Default::default()
                 },
                 revisable_concern("ok", "fix this"),
             ],
