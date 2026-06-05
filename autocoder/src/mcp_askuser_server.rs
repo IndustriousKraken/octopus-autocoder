@@ -987,7 +987,7 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
 fn submit_review_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "submit_review",
-        "description": "Return this code review's verdict to the daemon as the review result. Call exactly once when your analysis is complete. Pass `verdict` (Approve | Block), a `summary`, AND a `concerns` array (empty means \"no concerns\"). Each concern that should drive a revision MUST set `should_request_revision: true` with a non-empty `actionable_request`. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "description": "Return this code review's verdict to the daemon as the review result. Call exactly once when your analysis is complete. Pass `verdict` (Approve | Block), a `summary`, AND a `concerns` array (empty means \"no concerns\"). Each concern that should drive a revision MUST set `should_request_revision: true` with a non-empty `actionable_request`. Set `security_critical: true` on any finding that is a credential/secret/key exposure (a key, token, or secret written where it could be committed or exposed), a hardcoded secret, OR an injection vulnerability — these are Block-class; the daemon escalates the verdict to `Block` from that signal even if you returned `Approve`. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1002,7 +1002,8 @@ fn submit_review_tool() -> serde_json::Value {
                             "detail": { "type": "string" },
                             "anchor": { "type": "string" },
                             "should_request_revision": { "type": "boolean" },
-                            "actionable_request": { "type": ["string", "null"] }
+                            "actionable_request": { "type": ["string", "null"] },
+                            "security_critical": { "type": "boolean" }
                         },
                         "required": ["title", "detail", "anchor", "should_request_revision"]
                     }

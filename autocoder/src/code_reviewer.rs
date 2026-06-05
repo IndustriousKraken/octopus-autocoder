@@ -84,6 +84,15 @@ pub struct ReviewConcern {
     pub actionable_request: Option<String>,
     #[serde(default)]
     pub should_request_revision: bool,
+    /// The reviewer's own structured security signal (a004). `true` when the
+    /// reviewer classified this finding as a credential/secret/key exposure
+    /// or an injection vulnerability. The verdict-handling path escalates the
+    /// effective verdict to `Block` when any concern carries this flag (see
+    /// [`concerns_flag_security_critical`]) — keyed on this signal, NEVER on a
+    /// substring scan of `summary`. `#[serde(default)]` keeps older
+    /// reviewer templates (which omit the field) parsing as `false`.
+    #[serde(default)]
+    pub security_critical: bool,
     /// Per-change attribution: in per_change reviewer mode, set to the
     /// change slug whose review surfaced this concern. Used by the
     /// dropped-cap annotator to write the "(not auto-revised; cap
@@ -853,6 +862,13 @@ struct RawReviewConcern {
     should_request_revision: bool,
     #[serde(default)]
     actionable_request: Option<String>,
+    /// The reviewer's own security signal (a004): `true` when this finding
+    /// is a credential/secret/key exposure or an injection vulnerability.
+    /// Drives the verdict-escalation safety net the same way the oneshot
+    /// `revision-requests` block's `security_critical` does. Defaults to
+    /// `false` when the reviewer omits it.
+    #[serde(default)]
+    security_critical: bool,
 }
 
 /// The `submit_review` payload shape.
@@ -917,8 +933,19 @@ pub(crate) fn payload_to_review_result(
             actionable_request: c.actionable_request.clone(),
             should_request_revision: c.should_request_revision,
             change_slug: None,
+            security_critical: c.security_critical,
         });
     }
+    // a004 safety net (agentic path): a payload flagging a credential/secret/
+    // key exposure or injection via its own `security_critical` finding signal
+    // but returning a non-`Block` verdict is escalated to `Block` before the
+    // result reaches the PR-draft / auto-revise handling. Keyed on the
+    // structured signal, never on the prose of the finding.
+    let verdict = if verdict != Verdict::Block && concerns_flag_security_critical(&concerns) {
+        Verdict::Block
+    } else {
+        verdict
+    };
     let raw_output = render_review_submission_markdown(&sub.summary, &sub.concerns);
     let per_concern = concerns.iter().map(ConcernEntry::from).collect();
     Ok(ReviewResult {
@@ -1029,10 +1056,20 @@ pub fn render_agentic_review_prompt(ctx: &ReviewContext, preamble: &str) -> Stri
     }
 
     out.push_str(
+        "Security-critical findings are always Block. Credential or secret leakage (a key, \
+         token, or secret written where it could be committed or otherwise exposed), hardcoded \
+         secrets, AND injection vulnerabilities (SQL, command, path) are stop-the-line: return \
+         `Block`, never a soft verdict, AND set `security_critical: true` on that concern. The \
+         daemon escalates the verdict to `Block` from the `security_critical` signal even if you \
+         returned `Approve`.\n\n",
+    );
+
+    out.push_str(
         "When your analysis is complete, call the `submit_review` MCP tool exactly once with \
          your verdict (Approve | Block), a summary, AND any concerns. Each concern that should \
          drive a revision MUST set `should_request_revision: true` with a non-empty \
-         `actionable_request`. Do NOT print the verdict to stdout — the daemon reads it ONLY \
+         `actionable_request`. Mark any credential/secret/key-exposure or injection finding with \
+         `security_critical: true`. Do NOT print the verdict to stdout — the daemon reads it ONLY \
          from `submit_review`.\n",
     );
     out
@@ -1688,6 +1725,18 @@ fn render_sections(ctx: &ReviewContext, budget: usize) -> RenderedSections {
     }
 }
 
+/// Whether the reviewer's own structured findings flag a security-critical
+/// issue — a credential/secret/key exposure or an injection vulnerability —
+/// via the per-concern `security_critical` signal (a004). This drives the
+/// verdict-escalation safety net: such a finding forces a `Block` even when
+/// the reviewer returned a softer verdict. It keys on the structured signal
+/// the reviewer emitted, NEVER on the prose of the finding, so a
+/// mis-classifying model cannot downgrade a credential leak to advisory and
+/// a finding that merely mentions "credential" in passing does not escalate.
+fn concerns_flag_security_critical(concerns: &[ReviewConcern]) -> bool {
+    concerns.iter().any(|c| c.security_critical)
+}
+
 /// Parse the LLM response into a `ReviewReport`. Per spec, the first
 /// non-empty line MUST match `(?i)^VERDICT:\s*(Pass|Concerns|Block)\s*$`.
 /// If matched, the rest of the response (after that line) is the
@@ -1717,7 +1766,7 @@ fn parse_response(raw: &str) -> ReviewReport {
 
     let concerns = extract_revision_requests(raw);
 
-    match (first_nonempty, found_idx) {
+    let mut report = match (first_nonempty, found_idx) {
         (Some(line), Some(idx)) if re.is_match(line) => {
             let caps = re.captures(line).unwrap();
             let verdict = match caps.get(1).unwrap().as_str().to_ascii_lowercase().as_str() {
@@ -1747,7 +1796,19 @@ fn parse_response(raw: &str) -> ReviewReport {
             per_change_sections: Vec::new(),
             attribution: None,
         },
+    };
+    // a004 safety net: a review that flagged a credential/secret/key exposure
+    // or injection (via the reviewer's own `security_critical` finding signal)
+    // but returned a softer verdict is escalated to `Block` here — before the
+    // PR-draft / auto-revise handling runs — so a mis-classifying model cannot
+    // ship a security-critical finding through as advisory. Non-security
+    // findings are untouched.
+    if report.verdict != ReviewVerdict::Block
+        && concerns_flag_security_critical(&report.concerns)
+    {
+        report.verdict = ReviewVerdict::Block;
     }
+    report
 }
 
 /// Extract the `revision-requests` fenced YAML block from `raw` (if any)
@@ -1933,6 +1994,153 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(r.verdict, ReviewVerdict::Concerns);
         assert_eq!(r.concerns.len(), 1);
         assert!(r.concerns[0].should_request_revision);
+    }
+
+    // =================================================================
+    // a004: security-critical findings escalate the verdict to Block.
+    // The escalation keys ONLY on the reviewer's own structured
+    // `security_critical` signal, never on the prose of the finding.
+    // =================================================================
+
+    /// 3.1: a credential/secret-leak finding (`security_critical: true`)
+    /// returned with a `Concerns` verdict is escalated to `Block`.
+    #[test]
+    fn security_finding_escalates_concerns_to_block() {
+        let raw = r#"VERDICT: Concerns
+
+## Security
+- API key persisted to a committable config file.
+
+```revision-requests
+- summary: "API key written to committable opencode.json"
+  actionable_request: "read the key from an env var instead of persisting it"
+  should_request_revision: true
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Block,
+            "a security_critical finding must force Block even when the reviewer wrote Concerns"
+        );
+    }
+
+    /// 3.1: the same escalation applies when the reviewer wrote `Pass`.
+    #[test]
+    fn security_finding_escalates_pass_to_block() {
+        let raw = r#"VERDICT: Pass
+
+## Security
+- Token leaked into the workspace.
+
+```revision-requests
+- summary: "auth token written to a tracked file"
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+    }
+
+    /// 3.2: an injection finding (also carried by `security_critical`) with
+    /// a non-`Block` verdict escalates to `Block`.
+    #[test]
+    fn injection_finding_escalates_to_block() {
+        let raw = r#"VERDICT: Concerns
+
+## Security
+- User input concatenated into a shell command.
+
+```revision-requests
+- summary: "command injection in run_hook"
+  actionable_request: "pass arguments as a vector instead of building a shell string"
+  should_request_revision: true
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+    }
+
+    /// 3.3: a `Concerns` verdict whose findings are all non-security
+    /// (`security_critical` omitted → `false`) stays `Concerns` — no
+    /// escalation.
+    #[test]
+    fn non_security_concerns_are_not_escalated() {
+        let raw = r#"VERDICT: Concerns
+
+## Naming, style, idioms
+- `tmp` is an unclear name.
+
+```revision-requests
+- summary: "rename tmp to something descriptive"
+  should_request_revision: false
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Concerns,
+            "non-security findings must keep their verdict"
+        );
+        assert!(
+            !r.concerns[0].security_critical,
+            "omitted security_critical defaults to false"
+        );
+    }
+
+    /// 3.4: the escalation is driven by the structured `security_critical`
+    /// signal, NOT by message wording. A finding whose prose screams
+    /// "credential leak" but is NOT flagged stays `Concerns`; an innocuous-
+    /// worded finding that IS flagged escalates to `Block`.
+    #[test]
+    fn escalation_keys_on_signal_not_wording() {
+        // Prose mentions a credential leak, but the structured signal is
+        // absent (defaults to false) → no escalation.
+        let worded_but_unflagged = r#"VERDICT: Concerns
+
+```revision-requests
+- summary: "possible credential leak / secret / api key exposure here"
+  should_request_revision: false
+```
+"#;
+        let r = parse_response(worded_but_unflagged);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Concerns,
+            "wording alone must NOT escalate — only the structured signal does"
+        );
+
+        // Innocuous wording, but the structured signal is set → escalates.
+        let flagged_but_innocuous = r#"VERDICT: Concerns
+
+```revision-requests
+- summary: "tidy up helper foo"
+  security_critical: true
+```
+"#;
+        let r = parse_response(flagged_but_innocuous);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Block,
+            "the structured signal escalates regardless of innocuous wording"
+        );
+    }
+
+    /// A `security_critical` finding that ALSO carries a `Block` verdict is
+    /// a no-op for the escalation (already Block) — the verdict is unchanged.
+    #[test]
+    fn security_finding_already_block_is_unchanged() {
+        let raw = r#"VERDICT: Block
+
+```revision-requests
+- summary: "hardcoded secret"
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
     }
 
     #[test]
@@ -3401,6 +3609,91 @@ this is not yaml: at all: ::: {{{ broken
         assert!(result.raw_output.contains("sql injection"));
         // Drained: a second consume returns nothing.
         assert!(store.consume("repo", REVIEWER_ROLE).is_none());
+    }
+
+    /// a004 (agentic path, tasks 3.1/3.2): a `submit_review` payload that
+    /// flags a finding `security_critical: true` but returns `Approve` is
+    /// escalated to `Block` by `payload_to_review_result`, keyed on the
+    /// structured signal.
+    #[test]
+    fn agentic_security_finding_escalates_approve_to_block() {
+        let payload = json!({
+            "verdict": "Approve",
+            "summary": "mostly fine",
+            "concerns": [{
+                "title": "api key written to opencode.json",
+                "detail": "the key lands in a committable workspace file",
+                "anchor": "src/config.rs:10",
+                "should_request_revision": true,
+                "actionable_request": "read the key from an env var at runtime",
+                "security_critical": true
+            }]
+        });
+        let result = payload_to_review_result(&payload).expect("maps to ReviewResult");
+        assert_eq!(
+            result.verdict,
+            Verdict::Block,
+            "a security_critical concern must escalate Approve to Block"
+        );
+        assert!(result.concerns[0].security_critical);
+    }
+
+    /// a004 (agentic path, task 3.3): a payload with only non-security
+    /// concerns (`security_critical` omitted → false) keeps its `Approve`
+    /// verdict — no escalation.
+    #[test]
+    fn agentic_non_security_concern_is_not_escalated() {
+        let payload = json!({
+            "verdict": "Approve",
+            "summary": "minor nits",
+            "concerns": [{
+                "title": "rename tmp",
+                "detail": "unclear name",
+                "anchor": "src/x.rs:3",
+                "should_request_revision": false
+            }]
+        });
+        let result = payload_to_review_result(&payload).expect("maps to ReviewResult");
+        assert_eq!(result.verdict, Verdict::Approve);
+        assert!(!result.concerns[0].security_critical);
+    }
+
+    /// a004 (agentic path, task 3.4): the escalation keys on the structured
+    /// signal, not the wording. A credential-leak-worded but unflagged
+    /// concern stays `Approve`; an innocuous-worded but flagged concern
+    /// escalates to `Block`.
+    #[test]
+    fn agentic_escalation_keys_on_signal_not_wording() {
+        let worded_but_unflagged = json!({
+            "verdict": "Approve",
+            "summary": "s",
+            "concerns": [{
+                "title": "possible credential leak / secret / api key exposure",
+                "detail": "d",
+                "anchor": "a",
+                "should_request_revision": false
+            }]
+        });
+        let r = payload_to_review_result(&worded_but_unflagged).expect("maps");
+        assert_eq!(
+            r.verdict,
+            Verdict::Approve,
+            "wording alone must not escalate the agentic verdict"
+        );
+
+        let flagged_but_innocuous = json!({
+            "verdict": "Approve",
+            "summary": "s",
+            "concerns": [{
+                "title": "tidy up helper foo",
+                "detail": "d",
+                "anchor": "a",
+                "should_request_revision": false,
+                "security_critical": true
+            }]
+        });
+        let r = payload_to_review_result(&flagged_but_innocuous).expect("maps");
+        assert_eq!(r.verdict, Verdict::Block);
     }
 
     /// 4.4: a non-enum verdict AND a `should_request_revision` concern with
