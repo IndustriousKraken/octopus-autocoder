@@ -1,6 +1,6 @@
 # Issues-fix lane — design
 
-**Status:** converged design, not yet broken into change proposals. Captures the decisions reached while scoping the feature. Implementation is sequenced behind `a000-harden-external-triggers` and `a002-single-pass-prompt-substitution` (see Sequencing).
+**Status:** specced as `a009-issues-lane-curated` (the lane mechanism + curated path) and `a010-issues-lane-hybrid-ingestion` (public-issue ingestion + the prompt-quarantine trust boundary, stacked on a009). Prerequisites `a000-harden-external-triggers` and `a002-single-pass-prompt-substitution` are archived. The forge-side issues ingestion (GitLab) remains Phase 3 of the forge work.
 
 ## Motivation
 
@@ -116,7 +116,7 @@ Each report is classified:
 
 1. **`a000-harden-external-triggers`** — first. Closes the live hole where any GitHub commenter can trigger billed work. The issues lane's promotion gate is the same trust posture applied to a new surface.
 2. **`a002-single-pass-prompt-substitution`** — prevents `{{token}}` expansion in injected issue bodies; a prerequisite for safe ingestion (it also fixes scout's existing `{{open_issues}}` path).
-3. **The issues lane** — carries the prompt-quarantine control described above.
+3. **The issues lane** — `a009` (lane + curated) then `a010` (hybrid ingestion + the prompt-quarantine control described above, stacked on a009).
 
 ## Open questions (deferred)
 
