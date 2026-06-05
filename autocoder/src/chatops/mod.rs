@@ -736,7 +736,7 @@ mod tests {
     // ====================================================================
 
     fn fixture_repo_config(url: &str) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.to_string(),
             local_path: Some(PathBuf::from("/tmp/ws/fixture")),
             base_branch: "main".into(),

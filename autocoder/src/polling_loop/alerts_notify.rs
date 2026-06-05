@@ -221,12 +221,43 @@ pub(crate) async fn maybe_post_branch_pushed_no_pr(
     }
 }
 
-/// OSS-fork support (a26): compose a GitHub branch tree URL of the
-/// shape `https://github.com/<owner>/<repo>/tree/<branch>`. Used by
-/// the `auto_submit_pr: false` path so the chatops notification
-/// links to the pushed branch the operator can review locally.
-pub(crate) fn compose_branch_url(owner: &str, repo: &str, branch: &str) -> String {
-    format!("https://github.com/{owner}/{repo}/tree/{branch}")
+/// OSS-fork support (a26): compose the push-only branch hint URL for the
+/// `auto_submit_pr: false` path so the chatops notification links to the
+/// pushed branch the operator can review locally.
+///
+/// a008: the hint is forge-specific — GitHub produces a branch tree URL
+/// (`https://github.com/<owner>/<repo>/tree/<branch>`) while GitLab produces
+/// an MR-create web URL. The provider is selected via the repo's `forge:`
+/// block (see `crate::forge::resolve_forge`), falling back to GitHub's shape
+/// when the forge cannot be resolved.
+pub(crate) fn compose_branch_url(
+    forge: Option<&crate::config::ForgeConfig>,
+    url: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> String {
+    use crate::forge::Forge;
+    match crate::forge::resolve_forge(forge, url) {
+        Ok(f) => f.branch_url(owner, repo, branch),
+        Err(_) => crate::forge::GithubForge::new().branch_url(owner, repo, branch),
+    }
+}
+
+/// a008: the push-only manual command hint, forge-specific: `gh pr create`
+/// for GitHub (the default) versus `glab mr create` for GitLab.
+pub(crate) fn push_only_command(
+    forge: Option<&crate::config::ForgeConfig>,
+    base: &str,
+    branch: &str,
+) -> String {
+    use crate::config::ForgeKind;
+    match forge.map(|f| f.kind) {
+        Some(ForgeKind::Gitlab) => {
+            format!("glab mr create --target-branch {base} --source-branch {branch}")
+        }
+        _ => format!("gh pr create --base {base} --head {branch}"),
+    }
 }
 
 /// Post a one-line ChatOps notification announcing a fork recreation.

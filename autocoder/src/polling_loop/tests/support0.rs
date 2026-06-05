@@ -248,7 +248,7 @@ pub(crate) fn remote_url(workspace: &Path, name: &str) -> Option<String> {
 /// non-existent token env var so any attempt to open a PR errors fast
 /// rather than reaching a live API.
 pub(crate) fn fixture_repo(workspace: &Path) -> RepositoryConfig {
-    RepositoryConfig {
+    RepositoryConfig { forge: None,
         url: "git@github.com:owner/fixture.git".into(),
         local_path: Some(workspace.to_path_buf()),
         base_branch: "main".into(),
@@ -317,7 +317,7 @@ pub(crate) async fn fixture_chatops_for(server: &mut mockito::Server) -> Arc<dyn
 }
 
 pub(crate) fn open_pr_test_repo() -> RepositoryConfig {
-    RepositoryConfig {
+    RepositoryConfig { forge: None,
         url: "git@github.com:upstream-owner/upstream-repo.git".into(),
         local_path: None,
         base_branch: "main".into(),

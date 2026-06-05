@@ -1352,7 +1352,7 @@ mod tests {
         let log_writer = AuditLogWriter::open(&paths, tmp.path(), ArchitectureBrightlineAudit::TYPE)
             .expect("log writer opens");
         let log_path = log_writer.path().to_path_buf();
-        let repo = RepositoryConfig {
+        let repo = RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -1413,7 +1413,7 @@ mod tests {
         let log_writer = AuditLogWriter::open(&paths, tmp.path(), ArchitectureBrightlineAudit::TYPE)
             .expect("log writer opens");
         let log_path = log_writer.path().to_path_buf();
-        let repo = RepositoryConfig {
+        let repo = RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -1696,7 +1696,7 @@ mod tests {
         let chatops = make_recording_ctx(backend.clone());
 
         let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
-        let repo = RepositoryConfig {
+        let repo = RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),

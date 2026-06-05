@@ -47,7 +47,7 @@ pub(crate) fn add_committed_self_heal_change(
 }
 
 pub(crate) fn fixture_repo_for_rebuild_test() -> RepositoryConfig {
-    RepositoryConfig {
+    RepositoryConfig { forge: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),

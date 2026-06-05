@@ -28,7 +28,7 @@ async fn cancellation_during_sleep_exits() {
     let ws = dir.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let repo = RepositoryConfig {
+    let repo = RepositoryConfig { forge: None,
         url: "git@github.com:owner/empty.git".into(),
         local_path: Some(ws.clone()),
         base_branch: "main".into(),
@@ -122,9 +122,57 @@ async fn cancellation_during_sleep_exits() {
 
 #[test]
 fn compose_branch_url_formats_github_tree_url() {
+    // No `forge:` block + a github.com URL → GitHub branch tree URL.
     assert_eq!(
-        compose_branch_url("upstream-owner", "upstream-repo", "agent-q"),
+        compose_branch_url(
+            None,
+            "https://github.com/upstream-owner/upstream-repo.git",
+            "upstream-owner",
+            "upstream-repo",
+            "agent-q"
+        ),
         "https://github.com/upstream-owner/upstream-repo/tree/agent-q"
+    );
+}
+
+#[test]
+fn compose_branch_url_uses_gitlab_mr_hint_under_gitlab_block() {
+    let forge = crate::config::ForgeConfig {
+        kind: crate::config::ForgeKind::Gitlab,
+        host: Some("gitlab.example.com".into()),
+        api_base: None,
+        token: None,
+        token_env: None,
+    };
+    assert_eq!(
+        compose_branch_url(
+            Some(&forge),
+            "https://gitlab.example.com/group/proj.git",
+            "group",
+            "proj",
+            "agent-q"
+        ),
+        "https://gitlab.example.com/group/proj/-/merge_requests/new?merge_request%5Bsource_branch%5D=agent-q"
+    );
+}
+
+#[test]
+fn push_only_command_is_forge_specific() {
+    use crate::polling_loop::alerts_notify::push_only_command;
+    assert_eq!(
+        push_only_command(None, "main", "agent-q"),
+        "gh pr create --base main --head agent-q"
+    );
+    let gitlab = crate::config::ForgeConfig {
+        kind: crate::config::ForgeKind::Gitlab,
+        host: None,
+        api_base: None,
+        token: None,
+        token_env: None,
+    };
+    assert_eq!(
+        push_only_command(Some(&gitlab), "main", "agent-q"),
+        "glab mr create --target-branch main --source-branch agent-q"
     );
 }
 

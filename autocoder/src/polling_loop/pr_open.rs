@@ -17,7 +17,7 @@ pub(crate) async fn open_rebuild_pull_request(
         Some(fork_owner) => format!("{fork_owner}:{}", repo.agent_branch),
         None => repo.agent_branch.clone(),
     };
-    let pr = github::create_pull_request(
+    let pr = create_pull_request_via_hook(
         &owner,
         &repo_name,
         &head,
@@ -55,36 +55,30 @@ async fn create_pull_request_via_hook(
     review_report: Option<&ReviewReport>,
     draft: bool,
 ) -> Result<github::CreatedPr> {
+    use crate::forge::Forge;
+    // a007: PR creation routes through the `Forge` trait. The provider is
+    // GitHub; `with_api_base` threads the (test-injected) API base so the
+    // mockito-driven tests exercise the trait path unchanged.
     #[cfg(test)]
-    {
-        if let Some(api_base) = test_hooks::github_api_base() {
-            return github::create_pull_request_at_for_test(
-                &api_base,
-                owner,
-                repo,
-                head,
-                base,
-                title,
-                body,
-                token,
-                review_report,
-                draft,
-            )
-            .await;
-        }
-    }
-    github::create_pull_request(
-        owner,
-        repo,
-        head,
-        base,
-        title,
-        body,
-        token,
-        review_report,
-        draft,
-    )
-    .await
+    let forge = match test_hooks::github_api_base() {
+        Some(api_base) => crate::forge::GithubForge::with_api_base(api_base),
+        None => crate::forge::GithubForge::new(),
+    };
+    #[cfg(not(test))]
+    let forge = crate::forge::GithubForge::new();
+    forge
+        .open_pr(
+            owner,
+            repo,
+            head,
+            base,
+            title,
+            body,
+            token,
+            review_report,
+            draft,
+        )
+        .await
 }
 
 /// Build the initial per-PR `RevisionState` written at PR-open time when the
@@ -170,13 +164,19 @@ pub(crate) async fn open_pull_request(
     // templated `gh pr create` command to chatops so the operator can
     // open the PR manually after local review.
     if !repo.auto_submit_pr {
-        let branch_url = compose_branch_url(&owner, &repo_name, &repo.agent_branch);
+        let branch_url = compose_branch_url(
+            repo.forge.as_ref(),
+            &repo.url,
+            &owner,
+            &repo_name,
+            &repo.agent_branch,
+        );
         let pr_base = repo
             .upstream
             .as_ref()
             .map(|u| u.branch.as_str())
             .unwrap_or(&repo.base_branch);
-        let suggested = format!("gh pr create --base {pr_base} --head {}", repo.agent_branch);
+        let suggested = push_only_command(repo.forge.as_ref(), pr_base, &repo.agent_branch);
         maybe_post_branch_pushed_no_pr(repo, chatops_ctx, &branch_url, &suggested, changes.len())
             .await;
         tracing::info!(
@@ -406,34 +406,19 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
         }
     };
 
-    let result = if api_base == github::DEFAULT_API_BASE {
-        github::list_open_prs(
+    // a007: the open-PR check routes through the `Forge` trait. `api_base` is
+    // `DEFAULT_API_BASE` in production and a mockito URL in tests; the GitHub
+    // provider threads it via `with_api_base`.
+    use crate::forge::Forge;
+    let result = crate::forge::GithubForge::with_api_base(api_base)
+        .list_open_prs(
             &upstream_owner,
             &upstream_repo,
             &head,
             &repo.base_branch,
             &token,
         )
-        .await
-    } else {
-        // Test path: explicit base.
-        #[cfg(test)]
-        {
-            github::list_open_prs_at_for_test(
-                api_base,
-                &upstream_owner,
-                &upstream_repo,
-                &head,
-                &repo.base_branch,
-                &token,
-            )
-            .await
-        }
-        #[cfg(not(test))]
-        {
-            unreachable!("non-default api_base is test-only");
-        }
-    };
+        .await;
 
     match result {
         Ok(prs) if !prs.is_empty() => {

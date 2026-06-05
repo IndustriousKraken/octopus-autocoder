@@ -263,26 +263,23 @@ pub(crate) async fn post_reviewer_revision_comments(
         // filters to the revisable set). Nothing to post.
         return;
     };
-    let post_result = if api_base == github::DEFAULT_API_BASE {
-        github::create_issue_comment(upstream_owner, upstream_repo, pr_number, &body, token).await
-    } else {
-        #[cfg(test)]
-        {
-            github::create_issue_comment_at_for_test(
-                api_base,
-                upstream_owner,
-                upstream_repo,
-                pr_number,
-                &body,
-                token,
-            )
-            .await
-        }
-        #[cfg(not(test))]
-        {
-            unreachable!("non-default api_base is test-only");
-        }
-    };
+    // a007: review/comment posting routes through the `Forge` trait's
+    // `post_review` (the `Bearer`-auth comments path that the reviewer uses).
+    // `api_base` is `DEFAULT_API_BASE` in production and a mockito URL in
+    // tests; the GitHub provider threads it via `with_api_base`.
+    use crate::forge::Forge;
+    // The aggregated reviewer-revision comment is a request-changes verdict;
+    // GithubForge posts it as a PR comment regardless (see `post_review`).
+    let post_result = crate::forge::GithubForge::with_api_base(api_base)
+        .post_review(
+            upstream_owner,
+            upstream_repo,
+            pr_number,
+            &body,
+            crate::forge::ReviewDecision::RequestChanges,
+            token,
+        )
+        .await;
     if let Err(e) = post_result {
         tracing::warn!(
             pr_number,
