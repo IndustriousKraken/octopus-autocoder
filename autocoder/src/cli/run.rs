@@ -117,7 +117,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    openspec_preflight()?;
+    // a011: comprehensive dependency preflight — extends the historical
+    // openspec-only check to the full set (openspec, git, a usable sandbox
+    // mechanism, every configured strategy's CLI, scout/RAG backends),
+    // reporting ALL missing dependencies together and aborting startup only
+    // when a required one is missing or unusable.
+    crate::dependency_preflight::run_startup_preflight(&cfg)?;
 
     // Shared startup-time validation: schema, token-route, workspace
     // collision, audit slug, path collision, secret source. Errors block
@@ -206,6 +211,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let global_sandbox_toggles = crate::config::SandboxToggles {
         os_hide: sandbox_global.and_then(|s| s.os_hide).unwrap_or(true),
         engine_deny: sandbox_global.and_then(|s| s.engine_deny).unwrap_or(true),
+        strict_mode: sandbox_global.and_then(|s| s.strict_mode).unwrap_or(false),
+        mask_add: sandbox_global.and_then(|s| s.mask_add.clone()).unwrap_or_default(),
+        mask_remove: sandbox_global.and_then(|s| s.mask_remove.clone()).unwrap_or_default(),
     };
     match sandbox_mechanism {
         Some(m) => tracing::info!(
@@ -1275,40 +1283,114 @@ pub fn emit_chatops_startup_log(provider: &str, experimental: bool) {
     }
 }
 
-/// Verify the `openspec` binary is reachable before the polling loop
-/// starts. A failed preflight aborts daemon startup so misconfigured
-/// deployments fail loudly instead of looping forever producing nothing.
-pub fn openspec_preflight() -> Result<()> {
-    openspec_preflight_with("openspec")
+/// Resolve the daemon's config-file path when `autocoder run` is invoked
+/// without an explicit `--config` (a011 task 3). An explicit path always wins
+/// AND skips the systemd-unit lookup. Otherwise the installed
+/// `autocoder.service` unit's `ExecStart` is parsed for the config argument
+/// the daemon is launched with; absent a unit (or a recorded path), the
+/// existing default-path resolution applies.
+pub fn resolve_run_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_run_config_path_inner(
+        explicit,
+        probe_unit_exec_start().as_deref(),
+        &default_config_candidates(),
+        &|p| p.exists(),
+    )
 }
 
-/// Internal preflight that takes the binary name as an argument so tests
-/// can target a name guaranteed to be absent.
-fn openspec_preflight_with(bin: &str) -> Result<()> {
-    match std::process::Command::new(bin).arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            tracing::info!(
-                version = %String::from_utf8_lossy(&out.stdout).trim(),
-                "openspec preflight passed"
-            );
-            Ok(())
-        }
-        Ok(out) => {
-            let stderr_tail: String =
-                String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
-            Err(anyhow!(
-                "openspec preflight failed: `{bin} --version` exited {code:?}. stderr: {stderr_tail}",
-                code = out.status.code(),
-            ))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-            "openspec preflight failed: `{bin}` binary not found on PATH. \
-             Install openspec and ensure the systemd unit's PATH covers its install directory."
-        )),
-        Err(e) => Err(anyhow!(
-            "openspec preflight failed: spawning `{bin} --version` errored: {e}"
-        )),
+/// Pure resolver behind [`resolve_run_config_path`]: every environment fact is
+/// injected so the precedence (explicit → unit → defaults) is unit-testable.
+fn resolve_run_config_path_inner(
+    explicit: Option<PathBuf>,
+    exec_start: Option<&str>,
+    default_candidates: &[PathBuf],
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> Result<PathBuf> {
+    // 1. An explicitly provided path always wins and never consults the unit.
+    if let Some(p) = explicit {
+        return Ok(p);
     }
+    // 2. Discover the path the unit launches the daemon with.
+    if let Some(es) = exec_start
+        && let Some(p) = config_path_from_exec_start(es)
+    {
+        tracing::info!(path = %p.display(), "config path discovered from systemd unit ExecStart");
+        return Ok(p);
+    }
+    // 3. Fall back to the existing default-path resolution.
+    for cand in default_candidates {
+        if exists(cand) {
+            return Ok(cand.clone());
+        }
+    }
+    Err(anyhow!(
+        "no config path provided, none recorded in the systemd unit's ExecStart, \
+         and no config file at the default locations ({}). \
+         Pass `autocoder run --config <path>`.",
+        default_candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The default config-file locations, checked in order: the server-mode path,
+/// then the dev-mode XDG path.
+fn default_config_candidates() -> Vec<PathBuf> {
+    let mut cands = vec![PathBuf::from(crate::cli::install::DEFAULT_SERVER_CONFIG_PATH)];
+    if let Some(home) = std::env::var_os("HOME") {
+        cands.push(PathBuf::from(home).join(".config/autocoder/config.yaml"));
+    }
+    cands
+}
+
+/// Parse a systemd `ExecStart=` value for the daemon's config path. Matches
+/// both `--config <file>` / `--config=<file>` AND `--config-dir <dir>` /
+/// `--config-dir=<dir>` (from which the file is `<dir>/config.yaml`). Returns
+/// `None` when neither flag carries a value.
+pub fn config_path_from_exec_start(exec_start: &str) -> Option<PathBuf> {
+    let tokens: Vec<&str> = exec_start.split_whitespace().collect();
+    let mut iter = tokens.iter().peekable();
+    while let Some(tok) = iter.next() {
+        // `--config-dir <dir>` → `<dir>/config.yaml`.
+        if *tok == "--config-dir" {
+            if let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                return Some(PathBuf::from(next).join("config.yaml"));
+            }
+        } else if let Some(rest) = tok.strip_prefix("--config-dir=") {
+            return Some(PathBuf::from(rest).join("config.yaml"));
+        // `--config <file>` → `<file>` (checked after `--config-dir` so the
+        // longer flag is not shadowed).
+        } else if *tok == "--config" {
+            if let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                return Some(PathBuf::from(next));
+            }
+        } else if let Some(rest) = tok.strip_prefix("--config=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
+}
+
+/// Probe the installed `autocoder.service` unit for its `ExecStart=` line.
+/// Returns `None` on any failure (no systemd, unit not found) — the resolver
+/// then falls through to the default-path resolution.
+fn probe_unit_exec_start() -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["show", "autocoder.service", "-p", "ExecStart"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart=").map(|r| r.to_string()))
 }
 
 /// Resolve a GitHub PAT route for every configured repository before any
@@ -1580,30 +1662,83 @@ mod tests {
     }
 
     #[test]
-    fn preflight_errors_when_openspec_binary_missing() {
-        let err = openspec_preflight_with("openspec-definitely-not-installed-on-this-host")
-            .expect_err("missing binary must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("openspec"), "error must name openspec: {msg}");
-        assert!(
-            msg.contains("PATH") || msg.contains("not found"),
-            "error must hint at PATH/install: {msg}"
+    fn config_path_from_exec_start_parses_config_file() {
+        let es = "{ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config /etc/autocoder/config.yaml ; ignore_errors=no }";
+        assert_eq!(
+            config_path_from_exec_start(es),
+            Some(PathBuf::from("/etc/autocoder/config.yaml"))
         );
     }
 
     #[test]
-    fn preflight_errors_when_binary_exits_nonzero() {
-        // `false` always exits 1. Path differs by platform (/bin/false on
-        // Linux, /usr/bin/false on macOS) — pick whichever exists so the
-        // test runs on both.
-        let false_bin = ["/bin/false", "/usr/bin/false"]
-            .iter()
-            .copied()
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("a `false` binary must exist for this test");
-        let err = openspec_preflight_with(false_bin).expect_err("nonzero exit must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("exited"), "error must mention exit code: {msg}");
+    fn config_path_from_exec_start_parses_config_dir() {
+        let es = "argv[]=/usr/local/bin/autocoder run --config-dir /home/ac/conf";
+        assert_eq!(
+            config_path_from_exec_start(es),
+            Some(PathBuf::from("/home/ac/conf/config.yaml"))
+        );
+        // `=`-joined form too.
+        assert_eq!(
+            config_path_from_exec_start("autocoder run --config-dir=/srv/ac"),
+            Some(PathBuf::from("/srv/ac/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn config_path_from_exec_start_none_without_flag() {
+        assert_eq!(config_path_from_exec_start("autocoder run"), None);
+        // `--config` with no value falls through to None.
+        assert_eq!(config_path_from_exec_start("autocoder run --config --verbose"), None);
+    }
+
+    #[test]
+    fn resolve_config_explicit_path_wins_and_skips_unit() {
+        // Even with a unit recording a different path, an explicit path wins
+        // AND the unit is not consulted (the explicit branch returns first).
+        let got = resolve_run_config_path_inner(
+            Some(PathBuf::from("/explicit/config.yaml")),
+            Some("autocoder run --config /unit/config.yaml"),
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/explicit/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_discovered_from_unit() {
+        let got = resolve_run_config_path_inner(
+            None,
+            Some("autocoder run --config /unit/config.yaml"),
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/unit/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_falls_back_to_default_without_unit() {
+        let got = resolve_run_config_path_inner(
+            None,
+            None,
+            &[PathBuf::from("/default/config.yaml")],
+            &|p| p == std::path::Path::new("/default/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/default/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_errors_when_nothing_resolves() {
+        let err = resolve_run_config_path_inner(
+            None,
+            None,
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| false,
+        )
+        .expect_err("no config anywhere must error");
+        assert!(format!("{err}").contains("--config"), "{err}");
     }
 
     /// Build a remote + workspace clone pair. The workspace has `origin`

@@ -636,7 +636,9 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
         let mut cmd = match spawn_plan {
             Some(crate::sandbox::SpawnPlan::Wrap(mechanism)) => {
                 let inner = crate::sandbox::InnerCommand::from_command(&inner_cmd);
-                let plan = opts.os_sandbox.build_plan(opts.workspace);
+                // a013: the program (resolved + bound under an allowlist policy
+                // so the wrapped CLI execs under a masked home) drives the plan.
+                let plan = opts.os_sandbox.build_plan(opts.workspace, &inner.program);
                 crate::sandbox::wrap_command(mechanism, &plan, &inner)
             }
             _ => inner_cmd,

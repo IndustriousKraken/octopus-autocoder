@@ -18,6 +18,7 @@ mod code_reviewer;
 mod config;
 mod control_socket;
 mod daemon;
+mod dependency_preflight;
 mod executor;
 mod failure_state;
 mod forge;

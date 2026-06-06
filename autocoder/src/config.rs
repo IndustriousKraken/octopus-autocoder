@@ -1559,12 +1559,32 @@ pub struct ExecutorSandboxConfig {
     /// one.
     #[serde(default)]
     pub engine_deny: Option<bool>,
-    /// a006: when NO OS sandbox mechanism (`systemd-run` / `bwrap`) can apply
-    /// the sandbox, agentic runs fail closed UNLESS this is `true` — the
-    /// operator's explicit opt-in to running subprocesses unsandboxed (logged
-    /// loudly at startup). Daemon-wide; not a per-repository toggle.
+    /// a006: when NO OS sandbox mechanism (`systemd-run` / `bwrap` /
+    /// `sandbox-exec`) can apply the sandbox, agentic runs fail closed UNLESS
+    /// this is `true` — the operator's explicit opt-in to running subprocesses
+    /// unsandboxed (logged loudly at startup). Daemon-wide; not a
+    /// per-repository toggle.
     #[serde(default)]
     pub allow_unsandboxed: bool,
+    /// a013: additional filesystem paths to MASK for the executor under its
+    /// exposed-home denylist policy, on top of the default mask-list. A leading
+    /// `~/` or `$HOME/` expands to the home directory. Per-repository
+    /// `mask_add` entries are appended to these.
+    #[serde(default)]
+    pub mask_add: Option<Vec<String>>,
+    /// a013: default mask-list entries to REMOVE (expose) for the executor —
+    /// e.g. `~/.ssh` to develop an SSH tool. Removing a default is an explicit
+    /// relaxed posture, logged at startup. Per-repository `mask_remove` entries
+    /// are appended to these.
+    #[serde(default)]
+    pub mask_remove: Option<Vec<String>>,
+    /// a013: run the executor under the read-only-role allowlist (home masked;
+    /// only the workspace read-write, the role's own store, the resolved CLI
+    /// binary + toolchain, and the minimal runtime bound) for high-compliance
+    /// hosts. Defaults OFF — the executor uses the exposed-home denylist.
+    /// A per-repository value overrides this global one.
+    #[serde(default)]
+    pub strict_mode: Option<bool>,
 }
 
 /// Per-repository override of the a006 credential-protection toggles. Each
@@ -1577,14 +1597,38 @@ pub struct RepoSandboxConfig {
     pub os_hide: Option<bool>,
     #[serde(default)]
     pub engine_deny: Option<bool>,
+    /// a013: per-repository additions to the executor's filesystem mask-list,
+    /// appended to the global `executor.sandbox.mask_add`.
+    #[serde(default)]
+    pub mask_add: Option<Vec<String>>,
+    /// a013: per-repository default mask-list entries to remove (expose),
+    /// appended to the global `executor.sandbox.mask_remove`. Removing a
+    /// default is an explicit relaxed posture, logged at startup.
+    #[serde(default)]
+    pub mask_remove: Option<Vec<String>>,
+    /// a013: per-repository override of the executor strict-mode flag.
+    #[serde(default)]
+    pub strict_mode: Option<bool>,
 }
 
-/// The fully-resolved a006 credential-protection toggles for one repository.
-/// Both default ON (the secure default).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The fully-resolved per-repository sandbox posture (a006 credential
+/// toggles + a013 mask-list edits + strict mode). The `os_hide`/`engine_deny`
+/// toggles default ON (the secure default); `strict_mode` defaults OFF (the
+/// executor uses the exposed-home denylist); the mask edit lists default empty.
+///
+/// Not `Copy` because of the `Vec` mask-edit fields — cloned where it was
+/// previously copied (the runtime threading in [`crate::sandbox`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxToggles {
     pub os_hide: bool,
     pub engine_deny: bool,
+    /// a013: run the executor under the allowlist (home masked). Read-only
+    /// roles always use the allowlist regardless of this flag.
+    pub strict_mode: bool,
+    /// a013: operator additions to the executor's filesystem mask-list.
+    pub mask_add: Vec<String>,
+    /// a013: default mask-list entries the operator removed (exposed).
+    pub mask_remove: Vec<String>,
 }
 
 impl Default for SandboxToggles {
@@ -1592,21 +1636,39 @@ impl Default for SandboxToggles {
         Self {
             os_hide: true,
             engine_deny: true,
+            strict_mode: false,
+            mask_add: Vec::new(),
+            mask_remove: Vec::new(),
         }
     }
 }
 
 impl SandboxToggles {
     /// Apply a per-repository override on top of these (global) toggles: each
-    /// set field of `repo` wins; unset fields keep `self`'s value. Used at
-    /// runtime to resolve the active repository's effective posture against
-    /// the daemon-global default (equivalent to
-    /// [`RepositoryConfig::resolved_sandbox_toggles`] when `self` is the
-    /// global resolution).
-    pub fn with_repo_override(self, repo: Option<&RepoSandboxConfig>) -> SandboxToggles {
+    /// set boolean field of `repo` wins; unset booleans keep `self`'s value.
+    /// The mask-edit lists are ADDITIVE — the repo's `mask_add`/`mask_remove`
+    /// are appended to the global ones (a repo can mask more or expose more,
+    /// never silently drop a global edit). Used at runtime to resolve the
+    /// active repository's effective posture against the daemon-global default
+    /// (equivalent to [`RepositoryConfig::resolved_sandbox_toggles`] when
+    /// `self` is the global resolution).
+    pub fn with_repo_override(&self, repo: Option<&RepoSandboxConfig>) -> SandboxToggles {
+        let mut mask_add = self.mask_add.clone();
+        let mut mask_remove = self.mask_remove.clone();
+        if let Some(r) = repo {
+            if let Some(a) = r.mask_add.as_ref() {
+                mask_add.extend(a.iter().cloned());
+            }
+            if let Some(rm) = r.mask_remove.as_ref() {
+                mask_remove.extend(rm.iter().cloned());
+            }
+        }
         SandboxToggles {
             os_hide: repo.and_then(|r| r.os_hide).unwrap_or(self.os_hide),
             engine_deny: repo.and_then(|r| r.engine_deny).unwrap_or(self.engine_deny),
+            strict_mode: repo.and_then(|r| r.strict_mode).unwrap_or(self.strict_mode),
+            mask_add,
+            mask_remove,
         }
     }
 }
@@ -2703,9 +2765,30 @@ impl RepositoryConfig {
             .and_then(|r| r.engine_deny)
             .or_else(|| global.and_then(|g| g.engine_deny))
             .unwrap_or(true);
+        // a013: strict mode — per-repo → global → default OFF.
+        let strict_mode = repo
+            .and_then(|r| r.strict_mode)
+            .or_else(|| global.and_then(|g| g.strict_mode))
+            .unwrap_or(false);
+        // a013: mask edits are additive — global first, then this repo's.
+        let mut mask_add: Vec<String> = global
+            .and_then(|g| g.mask_add.clone())
+            .unwrap_or_default();
+        if let Some(a) = repo.and_then(|r| r.mask_add.as_ref()) {
+            mask_add.extend(a.iter().cloned());
+        }
+        let mut mask_remove: Vec<String> = global
+            .and_then(|g| g.mask_remove.clone())
+            .unwrap_or_default();
+        if let Some(rm) = repo.and_then(|r| r.mask_remove.as_ref()) {
+            mask_remove.extend(rm.iter().cloned());
+        }
         SandboxToggles {
             os_hide,
             engine_deny,
+            strict_mode,
+            mask_add,
+            mask_remove,
         }
     }
 
@@ -2722,15 +2805,25 @@ impl RepositoryConfig {
         if !toggles.engine_deny {
             off.push("engine_deny");
         }
-        if off.is_empty() {
+        // a013: removing a default mask-list entry exposes a sensitive path —
+        // an explicit relaxed posture that SHALL be logged, naming each entry.
+        let exposed = crate::sandbox::removed_default_mask_entries(&toggles.mask_remove);
+        if off.is_empty() && exposed.is_empty() {
             return None;
+        }
+        let mut clauses: Vec<String> = Vec::new();
+        if !off.is_empty() {
+            clauses.push(format!("{} OFF", off.join(" + ")));
+        }
+        if !exposed.is_empty() {
+            clauses.push(format!("default mask entries exposed: {}", exposed.join(", ")));
         }
         Some(format!(
             "repository `{}` runs with relaxed sandbox credential protection: \
-             {} OFF. Other CLIs' credential stores may be reachable by the \
-             wrapped model. This is an explicit, non-default posture.",
+             {}. Sensitive paths may be reachable by the wrapped model, and \
+             egress is unrestricted. This is an explicit, non-default posture.",
             self.url,
-            off.join(" + ")
+            clauses.join("; ")
         ))
     }
 }
@@ -4019,6 +4112,10 @@ github:
             "os_hide",
             "engine_deny",
             "allow_unsandboxed",
+            // a013 mask-list edits + strict mode.
+            "mask_add",
+            "mask_remove",
+            "strict_mode",
             // `GithubConfig`.
             "token_env",
             "token",
@@ -5260,6 +5357,113 @@ github: {}
         let (_d2, p2) = write_config(opt_in);
         let cfg2 = Config::load_from(&p2).expect("parses");
         assert!(cfg2.executor.sandbox.as_ref().unwrap().allow_unsandboxed);
+    }
+
+    // a013: strict_mode resolves per-repo → global → default OFF.
+    #[test]
+    fn sandbox_strict_mode_resolves_per_repo_over_global() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/strict.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      strict_mode: true
+  - url: "git@github.com:owner/normal.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    strict_mode: false
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let global = cfg.executor.sandbox.as_ref();
+        assert!(
+            cfg.repositories[0].resolved_sandbox_toggles(global).strict_mode,
+            "per-repo strict_mode on wins over global off"
+        );
+        assert!(
+            !cfg.repositories[1].resolved_sandbox_toggles(global).strict_mode,
+            "a repo without an override keeps the global strict_mode off"
+        );
+        // strict mode is MORE secure → no relaxed-posture WARN.
+        assert!(
+            cfg.repositories[0]
+                .relaxed_sandbox_warning(global)
+                .is_none(),
+            "strict mode does not emit a relaxed-posture WARN"
+        );
+    }
+
+    // a013: mask edits are additive — the global list, then the per-repo list.
+    #[test]
+    fn sandbox_mask_edits_are_additive_global_then_repo() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_add: ["~/repo-extra"]
+      mask_remove: ["~/.netrc"]
+executor:
+  kind: claude_cli
+  sandbox:
+    mask_add: ["~/global-extra"]
+    mask_remove: ["~/.aws"]
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let t = cfg.repositories[0].resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(t.mask_add.contains(&"~/global-extra".to_string()));
+        assert!(t.mask_add.contains(&"~/repo-extra".to_string()));
+        assert!(t.mask_remove.contains(&"~/.aws".to_string()));
+        assert!(t.mask_remove.contains(&"~/.netrc".to_string()));
+    }
+
+    // a013: removing a DEFAULT mask entry is a relaxed posture, logged and
+    // named at startup; adding a path (or removing a non-default) is not.
+    #[test]
+    fn sandbox_removing_default_mask_entry_warns_naming_it() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/exposed.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_remove: ["~/.ssh"]
+      mask_add: ["~/custom"]
+  - url: "git@github.com:owner/quiet.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_add: ["~/custom"]
+      mask_remove: ["~/not-a-default"]
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let global = cfg.executor.sandbox.as_ref();
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(global)
+            .expect("removing a default mask entry must warn");
+        assert!(warn.contains(".ssh"), "the WARN names the exposed default: {warn}");
+        // Adding a path / removing a non-default path is NOT a relaxed posture.
+        assert!(
+            cfg.repositories[1].relaxed_sandbox_warning(global).is_none(),
+            "mask_add and removing a non-default entry emit no WARN"
+        );
     }
 
     #[test]

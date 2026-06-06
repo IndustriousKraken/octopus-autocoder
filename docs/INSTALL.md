@@ -23,6 +23,7 @@ On the machine where the daemon will run:
 
   Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon, or use the inline form in `config.yaml` (see [Secrets in `config.yaml`](SECURITY.md#5-secrets-in-configyaml-inline-vs-env-var)).
 - **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
+- **A usable platform sandbox mechanism.** Every agentic subprocess is kernel-wrapped before it runs. On Linux this is **bubblewrap** (`bwrap`, e.g. `apt-get install bubblewrap`) — which needs *unprivileged user namespaces enabled* — or, when the daemon runs under systemd, transient `systemd-run` service mode. On macOS it is **`sandbox-exec`** (ships with the OS). Without a usable mechanism the daemon fails its startup preflight (and agentic runs fail closed unless you set `executor.sandbox.allow_unsandboxed`). Run `autocoder doctor` (below) to confirm the mechanism is not just present but *usable* on your host.
 
 ## 2. Clone and configure
 
@@ -72,5 +73,21 @@ To stop the daemon: `Ctrl-C` (SIGINT). It drains the current iteration and exits
 ## 5. (Optional) Verify against a sandbox
 
 [`docs/foundation-smoke-test.md`](docs/foundation-smoke-test.md) walks through scaffolding two throwaway GitHub repos with trivial OpenSpec changes and confirming the full clone → execute → commit → push → PR cycle works against them. Recommended for first-time deploys.
+
+## 6. Check dependencies with `autocoder doctor`
+
+Before (or any time after) starting the daemon, run the dependency preflight on demand:
+
+```bash
+autocoder doctor                       # uses the systemd-unit / default config if present
+autocoder doctor --config ~/autocoder/config.yaml
+```
+
+`doctor` runs the **same comprehensive preflight the daemon runs at startup** and prints one report covering every dependency at once — it never stops at the first failure:
+
+- **Required** — `openspec`, `git`, and a *usable* platform sandbox mechanism. A missing or unusable required dependency makes `doctor` exit non-zero (and aborts daemon startup) with a message naming it and how to install it. The sandbox check verifies the mechanism actually **applies** the sandbox — e.g. `bwrap` present but with unprivileged user namespaces disabled is reported **unusable**, not satisfied.
+- **Configuration-implied** — the agent-CLI binary for each configured strategy (e.g. `claude`/`opencode`), the `gh` CLI when the scout feature is on, and the embedding backend when canonical-specs RAG is on. These are reported and warned when missing, but do not abort startup.
+
+The same checks run automatically at `autocoder run` startup, so a misconfigured host fails loudly instead of looping. The assisted installer (`install.sh` → `autocoder install`, see [DEPLOYMENT.md](DEPLOYMENT.md)) offers to install the OS-package dependencies for you with per-step consent.
 
 ---

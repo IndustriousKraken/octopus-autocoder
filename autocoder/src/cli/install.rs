@@ -408,7 +408,6 @@ pub trait SystemActions: Send + Sync {
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()>;
     async fn chown(&self, path: &Path, owner: &str, group: &str) -> Result<()>;
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()>;
-    async fn apt_install(&self, packages: &[&str]) -> Result<()>;
     async fn daemon_reload(&self) -> Result<()>;
     async fn enable_systemd_unit(&self, name: &str) -> Result<()>;
     async fn start_systemd_unit(&self, name: &str) -> Result<()>;
@@ -499,23 +498,6 @@ impl SystemActions for RealSystemActions {
             .context("failed to spawn chmod")?;
         if !status.success() {
             bail!("chmod failed for {}", path.display());
-        }
-        Ok(())
-    }
-
-    async fn apt_install(&self, packages: &[&str]) -> Result<()> {
-        if !Path::new("/etc/debian_version").exists() {
-            return Ok(());
-        }
-        let mut args = vec!["install", "-y"];
-        args.extend_from_slice(packages);
-        let status = tokio::process::Command::new("apt-get")
-            .args(&args)
-            .status()
-            .await
-            .context("failed to spawn apt-get")?;
-        if !status.success() {
-            bail!("apt-get install failed for {packages:?}");
         }
         Ok(())
     }
@@ -655,7 +637,6 @@ pub enum RecordedCall {
     CreateUser { name: String, home_dir: PathBuf, shell: String },
     Chown { path: PathBuf, owner: String, group: String },
     Chmod { path: PathBuf, mode: u32 },
-    AptInstall(Vec<String>),
     DaemonReload,
     EnableSystemdUnit(String),
     StartSystemdUnit(String),
@@ -741,12 +722,6 @@ impl SystemActions for RecordingActions {
     }
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()> {
         self.record(RecordedCall::Chmod { path: path.to_path_buf(), mode });
-        Ok(())
-    }
-    async fn apt_install(&self, packages: &[&str]) -> Result<()> {
-        self.record(RecordedCall::AptInstall(
-            packages.iter().map(|s| s.to_string()).collect(),
-        ));
         Ok(())
     }
     async fn daemon_reload(&self) -> Result<()> {
@@ -1551,6 +1526,118 @@ pub fn assemble_secrets_env(answers: &WizardAnswers) -> String {
 }
 
 // ----------------------------------------------------------------------------
+// a011: assisted dependency installation with per-step consent.
+// ----------------------------------------------------------------------------
+
+/// Offer to install each MISSING OS-package dependency with its own consent
+/// step, showing the exact command first. Dependencies that cannot be reliably
+/// auto-installed (the agent CLIs, the optional embedding backend) get printed
+/// install + auth instructions instead of an install attempt. Never runs a
+/// privileged install without first showing the command AND obtaining consent
+/// for that step (in non-interactive mode the `--non-interactive` flag is the
+/// consent, but the command is still shown).
+pub(crate) async fn assisted_dependency_install(
+    io: &mut dyn WizardIo,
+    actions: &dyn SystemActions,
+    non_interactive: bool,
+) -> Result<()> {
+    use super::pkg_manager::{self, OS_PACKAGE_DEPS};
+
+    let pm = pkg_manager::detect(actions).await;
+
+    for dep in OS_PACKAGE_DEPS {
+        if actions.which(dep.check_bin).await.is_some() {
+            continue; // already satisfied
+        }
+        match pm.and_then(|m| (dep.pkg_name)(m).map(|p| (m, p))) {
+            Some((m, pkg)) => {
+                let cmd = m.install_argv(pkg).join(" ");
+                let priv_note = if m.needs_privilege() {
+                    "  (requires elevated privileges)"
+                } else {
+                    ""
+                };
+                io.print(&format!(
+                    "\nMissing dependency: {} (binary `{}`).\n  Install command: {cmd}{priv_note}\n",
+                    dep.label, dep.check_bin,
+                ));
+                let consent = if non_interactive {
+                    true
+                } else {
+                    io.confirm(&format!("Install {} now?", dep.label), true).await?
+                };
+                if consent {
+                    // A failed optional install is non-fatal: warn and move on
+                    // so one unavailable package can't abort the whole setup.
+                    match run_consented_install(actions, m, pkg).await {
+                        Ok(()) => io.print(&format!("  Installed {}.\n", dep.label)),
+                        Err(e) => io.print(&format!(
+                            "  Install failed: {e}. Run the command above manually.\n"
+                        )),
+                    }
+                } else {
+                    io.print("  Skipped. Run the command above to install it later.\n");
+                }
+            }
+            None => {
+                io.print(&format!(
+                    "\nMissing dependency: {} (binary `{}`). No supported package manager \
+                     can auto-install it here — install it manually.\n",
+                    dep.label, dep.check_bin,
+                ));
+            }
+        }
+    }
+
+    print_manual_dependency_instructions(io, actions).await;
+    Ok(())
+}
+
+/// Run a consented OS-package install through the detected manager. The manager
+/// binary is invoked directly (the installer runs with the privilege the
+/// operator granted via `install.sh`/sudo, matching the historical
+/// `apt_install` behaviour).
+async fn run_consented_install(
+    actions: &dyn SystemActions,
+    pm: super::pkg_manager::PackageManager,
+    pkg: &str,
+) -> Result<()> {
+    let argv = pm.install_argv(pkg);
+    let arg_refs: Vec<&str> = argv[1..].iter().map(|s| s.as_str()).collect();
+    let out = actions.run_install_command(&argv[0], &arg_refs).await?;
+    if out.status != 0 {
+        bail!(
+            "install of `{pkg}` via {} exited {}: {}",
+            pm.binary(),
+            out.status,
+            out.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Print install + auth instructions for the dependencies the installer does
+/// NOT auto-install: the agent CLIs (own installers + interactive login) and
+/// the optional Ollama embedding backend.
+async fn print_manual_dependency_instructions(io: &mut dyn WizardIo, actions: &dyn SystemActions) {
+    if actions.which("claude").await.is_none() {
+        io.print(&format!(
+            "\nAgent CLI `claude` is not installed (install + authenticate it yourself):\n  \
+             curl -fsSL {CLAUDE_INSTALL_URL} | bash\n  \
+             claude   # interactive login, once, as the runtime user\n"
+        ));
+    }
+    if actions.which("ollama").await.is_none() {
+        io.print(
+            "\nOptional embedding backend `ollama` is not installed (only needed if you enable \
+             canonical-specs RAG with the ollama provider):\n  \
+             install from https://ollama.com, then `ollama pull nomic-embed-text`\n  \
+             (or run it as a container — see the bundled ollama-docker-compose.yml).\n",
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Entry point.
 // ----------------------------------------------------------------------------
 
@@ -1684,27 +1771,12 @@ pub(crate) async fn execute_inner(
             .await?;
     }
 
-    if actions.which("apt-get").await.is_some() {
-        let should_install = if args.non_interactive {
-            true
-        } else {
-            io.confirm("Install system dependencies via apt-get (git, ca-certificates)?", true).await?
-        };
-        if should_install {
-            actions.apt_install(&["git", "ca-certificates"]).await?;
-        }
-    }
-
-    if actions.which("claude").await.is_none() {
-        let should_install = if args.non_interactive {
-            true
-        } else {
-            io.confirm("Install Claude Code CLI now?", true).await?
-        };
-        if should_install {
-            actions.run_install_command("bash", &["-c", &format!("curl -fsSL {CLAUDE_INSTALL_URL} | bash")]).await?;
-        }
-    }
+    // a011: assisted dependency installation with per-step consent. Detects
+    // the host package manager and offers each MISSING OS-package dependency
+    // with its own consent step (showing the exact command); prints
+    // instructions for the dependencies it cannot auto-install (the agent CLIs
+    // and the optional embedding backend).
+    assisted_dependency_install(io, actions, args.non_interactive).await?;
 
     // 4. Collect answers — either via the wizard or directly from prefill.
     let answers = if args.non_interactive {
@@ -2786,7 +2858,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apt_install_skipped_on_non_debian() {
+    async fn os_package_install_skipped_without_package_manager() {
+        // No package manager on PATH → nothing is auto-installed; the wizard
+        // prints manual instructions instead.
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new()
             .with_which("apt-get", None)
@@ -2794,9 +2868,11 @@ mod tests {
         let mut io = ScriptedIo::new(vec![]);
         let args = ni_args(&tmp);
         execute_inner(args, &mut io, &actions, tmp.path().to_path_buf()).await.unwrap();
-        let calls = actions.calls();
-        let saw_apt = calls.iter().any(|c| matches!(c, RecordedCall::AptInstall(_)));
-        assert!(!saw_apt, "expected zero apt_install calls, got {calls:?}");
+        let pm_bins = ["apt-get", "dnf", "pacman", "zypper", "brew"];
+        let saw_pkg_install = actions.calls().iter().any(|c| {
+            matches!(c, RecordedCall::RunSubprocess { cmd, .. } if pm_bins.contains(&cmd.as_str()))
+        });
+        assert!(!saw_pkg_install, "no package manager → no install: {:?}", actions.calls());
     }
 
     #[tokio::test]
@@ -2817,6 +2893,69 @@ mod tests {
             !saw_claude_install,
             "claude installer should not run when `claude` is already on PATH; calls={calls:?}"
         );
+    }
+
+    // ----- a011 assisted dependency install -------------------------------
+
+    #[tokio::test]
+    async fn assisted_install_offers_each_os_package_with_its_own_consent_step() {
+        // apt-get present; git/bwrap/gh/claude/ollama all absent. OS packages
+        // are offered in order (git, bubblewrap, gh) — consent git + gh,
+        // decline bubblewrap.
+        let actions = RecordingActions::new().with_apt(true);
+        let mut io = ScriptedIo::new(vec!["y", "n", "y"]);
+        assisted_dependency_install(&mut io, &actions, false)
+            .await
+            .unwrap();
+
+        let out = io.output_str();
+        // Each missing OS package's exact command is shown.
+        assert!(out.contains("apt-get install -y git"), "git cmd shown: {out}");
+        assert!(out.contains("apt-get install -y bubblewrap"), "bwrap cmd shown: {out}");
+        assert!(out.contains("apt-get install -y gh"), "gh cmd shown: {out}");
+
+        let installed: Vec<String> = actions
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RunSubprocess { cmd, args } if cmd == "apt-get" => {
+                    Some(args.join(" "))
+                }
+                _ => None,
+            })
+            .collect();
+        // git + gh consented → installed; bubblewrap declined → not installed.
+        assert!(installed.iter().any(|a| a.contains("git")), "git installed: {installed:?}");
+        assert!(installed.iter().any(|a| a.contains("gh")), "gh installed: {installed:?}");
+        assert!(
+            !installed.iter().any(|a| a.contains("bubblewrap")),
+            "declined bubblewrap must not be installed: {installed:?}"
+        );
+
+        // Non-auto-installable agent CLI gets printed instructions, not an install.
+        assert!(out.contains("claude.ai/install.sh"), "claude instructions printed: {out}");
+        let ran_claude = actions.calls().iter().any(|c| {
+            matches!(c, RecordedCall::RunSubprocess { args, .. }
+                if args.iter().any(|a| a.contains("claude.ai/install.sh")))
+        });
+        assert!(!ran_claude, "claude must not be auto-installed");
+    }
+
+    #[tokio::test]
+    async fn assisted_install_prints_instructions_without_package_manager() {
+        // No package manager → OS packages get printed instructions, none run.
+        let actions = RecordingActions::new(); // apt-get etc. all absent
+        let mut io = ScriptedIo::new(vec![]);
+        assisted_dependency_install(&mut io, &actions, true)
+            .await
+            .unwrap();
+        let out = io.output_str();
+        assert!(out.contains("install it manually"), "manual hint shown: {out}");
+        let ran_any = actions
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RunSubprocess { .. }));
+        assert!(!ran_any, "nothing should be installed without a package manager");
     }
 
     // ----- audits ---------------------------------------------------------
@@ -3288,7 +3427,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         for c in &calls {
             match c {
                 RecordedCall::CreateUser { .. }
-                | RecordedCall::AptInstall(_)
                 | RecordedCall::DaemonReload
                 | RecordedCall::EnableSystemdUnit(_)
                 | RecordedCall::StartSystemdUnit(_)
@@ -3378,7 +3516,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         for c in &calls {
             match c {
                 RecordedCall::CreateUser { .. }
-                | RecordedCall::AptInstall(_)
                 | RecordedCall::DaemonReload
                 | RecordedCall::EnableSystemdUnit(_)
                 | RecordedCall::StartSystemdUnit(_) => {

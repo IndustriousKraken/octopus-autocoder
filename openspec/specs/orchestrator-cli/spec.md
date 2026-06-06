@@ -7112,7 +7112,9 @@ autocoder SHALL expose the sandbox's credential-protection layers as two boolean
 
 The named presets (both on — the default; `os_hide` off with `engine_deny` on, for a repository that develops CLI wrappers and needs a nested CLI to authenticate live; both off, for a repository whose purpose is testing credential-grab behavior) are documentation over these two switches; the switches are the contract.
 
-Separately, when no sandbox mechanism is available on the host (neither `systemd-run` nor `bwrap` can apply the sandbox), agentic runs SHALL fail closed with a clear error naming the missing mechanism, UNLESS the operator has explicitly set a config flag opting into unsandboxed operation — in which case the daemon emits a loud startup WARN AND proceeds.
+The executor's filesystem **mask-list** — the default-deny set of paths masked under its exposed-home policy (credential paths AND shell-init/persistence paths) — SHALL ship with sensible defaults AND be operator-editable both globally and per-repository: an operator MAY add a path to mask OR remove a default entry to expose it (e.g. open `~/.ssh` to develop an SSH tool). Removing a default mask entry SHALL be explicit AND logged at startup as a relaxed posture, since egress is unrestricted. `os_hide` governs the other-CLI-store subset of the mask-list as a named convenience toggle. The executor MAY additionally be opted into **strict mode** — the read-only-role allowlist (mask all of home; bind only the workspace, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime) — for high-compliance hosts; strict mode is NOT the default, AND read-only roles always use the allowlist.
+
+Separately, when no **platform-appropriate** sandbox mechanism is available on the host — on Linux, neither `systemd-run` nor `bwrap` can apply the sandbox; on macOS, `sandbox-exec` is unavailable — agentic runs SHALL fail closed with a clear error naming the missing mechanism, UNLESS the operator has explicitly set a config flag opting into unsandboxed operation — in which case the daemon emits a loud startup WARN AND proceeds. On macOS, `sandbox-exec` ships with the operating system, so the gate is normally satisfied without any install.
 
 #### Scenario: Secure default when unset
 - **WHEN** neither the global nor the per-repository config sets `os_hide` or `engine_deny`
@@ -7137,6 +7139,20 @@ Separately, when no sandbox mechanism is available on the host (neither `systemd
 - **WHEN** no sandbox mechanism is available AND the operator has explicitly opted into unsandboxed operation in config
 - **THEN** agentic runs proceed
 - **AND** the daemon emits a loud startup WARN that subprocesses are running unsandboxed
+
+#### Scenario: macOS satisfies the gate via sandbox-exec
+- **WHEN** the daemon runs on macOS AND `sandbox-exec` is available
+- **THEN** the mechanism gate is satisfied AND agentic runs proceed sandboxed
+- **AND** the run does not fail closed
+
+#### Scenario: Editing the mask-list adds or exposes a path
+- **WHEN** an operator adds a path to the mask-list
+- **THEN** that path is masked for the executor
+- **AND** WHEN an operator removes a default mask entry (e.g. `~/.ssh`), that path is exposed AND the daemon emits a startup relaxed-posture WARN naming it
+
+#### Scenario: Strict mode masks all of home
+- **WHEN** the executor is opted into strict mode
+- **THEN** it runs under the allowlist (home masked; only the workspace, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime bound)
 
 ### Requirement: Per-repo forge config block
 A repository MAY declare an explicit `forge:` block that selects AND configures its forge provider, with fields `kind` (`github` | `gitlab`), `host`, an optional `api_base`, AND a token route. Provider selection SHALL follow this precedence: (1) an explicit `forge:` block is authoritative; (2) absent a block, a `github.com` host resolves to `GithubForge`; (3) otherwise no provider is registered for the host AND the clear no-provider error is returned (per the `Forge provider abstraction` requirement).
@@ -7249,4 +7265,67 @@ Triage SHALL classify each report AND route it accordingly: a **Bug** (code has 
 #### Scenario: A question or duplicate is declined
 - **WHEN** triage classifies a report as a question, invalid, or a duplicate
 - **THEN** no work is queued
+
+### Requirement: Dependency preflight reports all dependencies; doctor subcommand
+The daemon SHALL run a dependency preflight that checks every REQUIRED dependency AND every dependency implied by the active configuration, reporting the status of all of them together rather than failing on the first. Required dependencies — at minimum `openspec`, `git`, AND a usable platform sandbox mechanism — SHALL fail the preflight when missing. Configuration-implied dependencies — the agent-CLI binary for each configured strategy, a forge/scout CLI when those features are enabled, AND an embedding backend when RAG is enabled — SHALL be reported AND warned when missing, fatal only when their feature is active. The same check SHALL be available on demand as an `autocoder doctor` subcommand that prints the full report AND exits non-zero when a required dependency is missing. The sandbox-mechanism check SHALL verify the mechanism is USABLE — e.g. `bwrap` actually runs under the host's user-namespace policy — not merely present, complementing (not replacing) the spawn-time fail-closed sandbox gate. This extends the existing openspec-availability preflight to cover the full dependency set.
+
+#### Scenario: All missing dependencies are reported together
+- **WHEN** the preflight runs with more than one dependency missing
+- **THEN** it reports all of them in one report
+- **AND** does not stop at the first
+
+#### Scenario: A missing required dependency fails the preflight
+- **WHEN** a required dependency (`openspec`, `git`, or a usable sandbox mechanism) is missing
+- **THEN** the preflight fails with a clear message naming it AND how to install it
+
+#### Scenario: Configured-strategy binaries are checked, unconfigured ones are not
+- **WHEN** a strategy is configured but its CLI binary is absent
+- **THEN** the report marks it missing for that strategy
+- **AND** binaries for strategies that are not configured are not required
+
+#### Scenario: A present-but-unusable mechanism is reported unusable
+- **WHEN** a sandbox-mechanism binary exists but cannot apply the sandbox (e.g. `bwrap` present but unprivileged user namespaces are disabled)
+- **THEN** the check reports the mechanism as unusable, not satisfied
+
+#### Scenario: doctor exits non-zero on a missing required dependency
+- **WHEN** `autocoder doctor` runs with a required dependency missing
+- **THEN** it prints the full report
+- **AND** exits non-zero
+
+### Requirement: Assisted dependency installation with per-step consent
+The installer SHALL detect the host platform AND its package manager, AND offer to install the OS-package dependencies it can (e.g. bubblewrap, git, a forge/scout CLI), showing the exact command for each AND installing only on explicit per-step consent. For dependencies it cannot reliably auto-install — the agent CLIs (which have their own installers and interactive login) AND optional backends (e.g. Ollama) — it SHALL print the exact install and auth commands rather than attempting them. It SHALL NOT run a privileged install without first showing the command AND obtaining consent for that step.
+
+#### Scenario: A missing OS package is offered with consent
+- **WHEN** the installer finds a missing OS-package dependency AND a supported package manager
+- **THEN** it shows the install command
+- **AND** installs it only after the operator consents to that step
+
+#### Scenario: Each install is its own consent step
+- **WHEN** more than one OS-package dependency is missing
+- **THEN** each is offered with its own consent step
+- **AND** none is installed without its command shown
+
+#### Scenario: Non-auto-installable dependencies get printed instructions
+- **WHEN** a dependency cannot be auto-installed (an agent CLI or an optional backend)
+- **THEN** the installer prints the exact install and auth commands
+- **AND** does not attempt to run them
+
+#### Scenario: No silent privileged install
+- **WHEN** an install step requires elevated privilege
+- **THEN** the command is shown AND consent obtained before it runs
+
+### Requirement: Config path is discovered from the systemd unit
+When a config path is not provided explicitly, `update.sh` AND the daemon CLI SHALL discover it from the installed systemd service unit — parsing the daemon's config argument out of the unit's `ExecStart`, matching the flag the daemon is actually launched with: the run command's `--config-dir <dir>` (from which the config file is `<dir>/config.yaml`), AND accepting a `--config <file>` form as well — so the operator does not retype a path that is already recorded. When no unit or no recorded config path is found, the existing default-path resolution applies. An explicitly provided config path SHALL always win and SHALL NOT consult the unit.
+
+#### Scenario: Discovered from the unit
+- **WHEN** no config path is provided AND the systemd unit's `ExecStart` launches the daemon with `--config-dir <dir>` (or `--config <file>`)
+- **THEN** the resolver uses `<dir>/config.yaml` (or `<file>`)
+
+#### Scenario: Falls back to default resolution
+- **WHEN** no config path is provided AND no systemd unit records one
+- **THEN** the existing default-path resolution applies
+
+#### Scenario: An explicit path wins
+- **WHEN** a config path is provided explicitly
+- **THEN** it is used AND the systemd unit is not consulted
 
