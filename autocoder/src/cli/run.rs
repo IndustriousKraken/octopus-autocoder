@@ -211,6 +211,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let global_sandbox_toggles = crate::config::SandboxToggles {
         os_hide: sandbox_global.and_then(|s| s.os_hide).unwrap_or(true),
         engine_deny: sandbox_global.and_then(|s| s.engine_deny).unwrap_or(true),
+        strict_mode: sandbox_global.and_then(|s| s.strict_mode).unwrap_or(false),
+        mask_add: sandbox_global.and_then(|s| s.mask_add.clone()).unwrap_or_default(),
+        mask_remove: sandbox_global.and_then(|s| s.mask_remove.clone()).unwrap_or_default(),
     };
     match sandbox_mechanism {
         Some(m) => tracing::info!(

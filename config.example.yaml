@@ -40,9 +40,16 @@ repositories:
     # a006 per-repo OS-sandbox credential toggles (override executor.sandbox;
     # both default ON). A repo that develops CLI wrappers needs `os_hide` off
     # so a nested CLI can authenticate live — loosening is logged at startup.
+    # a013: per-repo mask-list edits + strict mode (additive to the global
+    # executor.sandbox values). `mask_add`/`mask_remove` edit the executor's
+    # filesystem mask-list; `strict_mode` opts this repo's executor into the
+    # masked-home allowlist. Removing a default mask entry is logged at startup.
     # sandbox:
     #   os_hide: false
     #   engine_deny: true
+    #   mask_add: ["~/.config/myservice"]
+    #   mask_remove: ["~/.ssh"]   # e.g. to develop an SSH tool (logged)
+    #   strict_mode: false
 
     # ----------------------------------------------------------------
     # OSS-fork support (a26). See `docs/OPERATIONS.md`'s
@@ -126,10 +133,32 @@ executor:
   #   # engine_deny: extend the per-invocation tool-use denylist so the agent's
   #   #   Read/Bash tools are denied EVERY registered CLI store (self included).
   #   engine_deny: true
-  #   # allow_unsandboxed: when NO sandbox mechanism (systemd-run / bwrap) is
-  #   #   available, agentic runs FAIL CLOSED unless this opt-in is true (a loud
-  #   #   startup WARN is emitted when it is). Daemon-wide; NOT recommended.
+  #   # allow_unsandboxed: when NO platform-appropriate sandbox mechanism
+  #   #   (Linux: systemd-run / bwrap; macOS: sandbox-exec) is available, agentic
+  #   #   runs FAIL CLOSED unless this opt-in is true (a loud startup WARN is
+  #   #   emitted when it is). Daemon-wide; NOT recommended.
   #   allow_unsandboxed: false
+  #
+  #   # --- a013 executor filesystem policy: denylist + strict mode ---
+  #   # The executor runs under an EXPOSED-HOME DENYLIST: $HOME is present and
+  #   # writable (so build toolchains under ~/.cargo, ~/.nvm, ~/.pyenv, … just
+  #   # work) EXCEPT a default mask-list of sensitive paths (credentials AND
+  #   # shell-init/persistence files) which are masked. Read-only roles (audits,
+  #   # reviewer) always use the masked-home ALLOWLIST. Edit the mask-list:
+  #   #
+  #   # mask_add: extra paths to mask (~/ and $HOME/ expand to the home dir).
+  #   mask_add:
+  #     - "~/.config/myservice"
+  #   # mask_remove: default entries to EXPOSE — e.g. ~/.ssh to develop an SSH
+  #   #   tool. Removing a default is logged at startup as a relaxed posture
+  #   #   (egress is unrestricted).
+  #   mask_remove:
+  #     - "~/.ssh"
+  #   # strict_mode: run the EXECUTOR under the read-only-role allowlist (mask
+  #   #   ALL of home; bind only the workspace, the role's own store, the
+  #   #   resolved CLI binary + toolchain, and the minimal runtime) for
+  #   #   high-compliance hosts. Defaults OFF; read-only roles always allowlist.
+  #   strict_mode: false
 
   # Path to a file overriding the built-in implementer prompt template.
   # The template must contain the literal `{{change_body}}` placeholder
