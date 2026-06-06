@@ -44,6 +44,10 @@ use std::sync::Mutex;
 pub enum PromptId {
     /// `prompts/implementer.md` — main implementer template.
     Implementer,
+    /// `prompts/implementer-issue.md` — issue-flavored implementer
+    /// template (a009): fix the code to match the EXISTING spec; write no
+    /// spec change; kick a behavior-change fix back to the changes lane.
+    ImplementerIssue,
     /// `prompts/implementer-revision.md` — revision-loop template.
     ImplementerRevision,
     /// `prompts/changelog-stylist.md` — chat-driven changelog stylist.
@@ -100,6 +104,7 @@ pub enum PromptId {
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
+const PROMPT_IMPLEMENTER_ISSUE: &str = include_str!("../../../prompts/implementer-issue.md");
 const PROMPT_IMPLEMENTER_REVISION: &str =
     include_str!("../../../prompts/implementer-revision.md");
 const PROMPT_CHANGELOG_STYLIST: &str = include_str!("../../../prompts/changelog-stylist.md");
@@ -131,6 +136,7 @@ impl PromptId {
     pub fn embedded(self) -> &'static str {
         match self {
             Self::Implementer => PROMPT_IMPLEMENTER,
+            Self::ImplementerIssue => PROMPT_IMPLEMENTER_ISSUE,
             Self::ImplementerRevision => PROMPT_IMPLEMENTER_REVISION,
             Self::ChangelogStylist => PROMPT_CHANGELOG_STYLIST,
             Self::CodeReview => PROMPT_CODE_REVIEW,
@@ -156,6 +162,7 @@ impl PromptId {
     pub fn filename(self) -> &'static str {
         match self {
             Self::Implementer => "implementer.md",
+            Self::ImplementerIssue => "implementer-issue.md",
             Self::ImplementerRevision => "implementer-revision.md",
             Self::ChangelogStylist => "changelog-stylist.md",
             Self::CodeReview => "code-review-default.md",
@@ -179,6 +186,7 @@ impl PromptId {
     pub fn id_str(self) -> &'static str {
         match self {
             Self::Implementer => "Implementer",
+            Self::ImplementerIssue => "ImplementerIssue",
             Self::ImplementerRevision => "ImplementerRevision",
             Self::ChangelogStylist => "ChangelogStylist",
             Self::CodeReview => "CodeReview",
@@ -203,6 +211,7 @@ impl PromptId {
     pub fn all() -> &'static [PromptId] {
         &[
             Self::Implementer,
+            Self::ImplementerIssue,
             Self::ImplementerRevision,
             Self::ChangelogStylist,
             Self::CodeReview,

@@ -15,7 +15,7 @@
 
 use super::{
     BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
-    ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
+    IssueContext, ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
 };
 use crate::agentic_run::AgenticRunOutcome;
 use anyhow::{Context, Result, anyhow};
@@ -1463,6 +1463,29 @@ impl Executor for ClaudeCliExecutor {
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
+        self.classify_outcome(workspace, change, outcome).await
+    }
+
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        // The issues walker already rendered the issue-flavored prompt
+        // (`PromptId::ImplementerIssue`). Run it with the MCP outcome
+        // tools wired, keyed by the issue slug for the run-log + outcome
+        // store. Acceptance is against the EXISTING canon — there is no
+        // spec delta, so the acceptance scan / recovery turn (which read
+        // `openspec/changes/<change>/tasks.md`) do NOT apply here; a
+        // tool-recorded outcome OR the classifier's verdict is final.
+        let change = ctx.slug.as_str();
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &ctx.rendered_prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(&self.paths, workspace, change, &ctx.rendered_prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
 

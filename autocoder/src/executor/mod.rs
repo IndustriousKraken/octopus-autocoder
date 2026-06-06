@@ -150,6 +150,30 @@ pub trait Executor: Send + Sync {
             reason: "changelog stylist not supported by this executor backend".to_string(),
         })
     }
+
+    /// Issue-mode invocation for the issues lane (a009). The issues
+    /// walker has already rendered the issue-flavored implementer prompt
+    /// (fix-to-EXISTING-spec framing, NOT the change implementer prompt)
+    /// AND passes it here verbatim. The backend runs the wrapped CLI with
+    /// the MCP outcome tools wired (so the agent can call
+    /// `outcome_success` / `outcome_spec_needs_revision`), keyed by the
+    /// issue slug for run-log + outcome-store purposes. Acceptance is
+    /// against the EXISTING canon — there is no spec delta to apply.
+    ///
+    /// Default impl returns `Failed { reason: "issue mode not supported"
+    /// }` so a backend that hasn't been taught about the issues lane
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue mode not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -215,6 +239,19 @@ pub struct BrownfieldDraftContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoutContext {
     /// Fully rendered prompt: template + interpolated context.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue` (a009). The issues walker
+/// renders the issue-flavored implementer prompt (template + the issue's
+/// `issue.md` + `tasks.md` body) AND passes the result here. The slug
+/// keys the per-run log + the MCP outcome store (so the agent's
+/// `outcome_*` tool calls are consumed for this issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueContext {
+    /// The issue's directory slug under `openspec/issues/`.
+    pub slug: String,
+    /// Fully rendered issue-flavored prompt: template + issue body.
     pub rendered_prompt: String,
 }
 

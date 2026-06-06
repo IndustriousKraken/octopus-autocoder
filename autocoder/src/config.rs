@@ -552,6 +552,8 @@ pub struct FeaturesConfig {
     pub scout: ScoutFeatureConfig,
     #[serde(default)]
     pub brownfield_survey: BrownfieldSurveyFeatureConfig,
+    #[serde(default)]
+    pub issues: IssuesFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -714,6 +716,34 @@ impl BrownfieldSurveyFeatureConfig {
         }
         Ok(())
     }
+}
+
+/// Config for the issues lane (a009). The lane is gated by this flag,
+/// OFF by default — unlike the chatops-verb features above, an enabled
+/// issues lane changes the daemon's per-iteration unit selection
+/// (`issues > changes > audits`), so it is opt-in. `prompt_path`
+/// overrides the embedded issue-flavored implementer prompt template
+/// (`prompts/implementer-issue.md`) per the uniform a24 pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssuesFeatureConfig {
+    #[serde(default = "default_issues_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+}
+
+impl Default for IssuesFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_issues_enabled(),
+            prompt_path: None,
+        }
+    }
+}
+
+fn default_issues_enabled() -> bool {
+    false
 }
 
 /// Modernized nested prompt-override block (a24). Used as the value
@@ -8305,6 +8335,59 @@ features:
         let err = cfg.validate().expect_err("max_capabilities=0 invalid");
         assert!(err.contains("max_capabilities"), "{err}");
         assert!(err.contains("1..=50"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // features.issues (a009)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_issues_block_omitted_is_off_by_default() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        // The issues lane is OFF by default — unlike the chatops-verb
+        // features, an enabled lane changes per-iteration unit selection.
+        assert!(
+            !cfg.features.issues.enabled,
+            "issues lane must default to OFF"
+        );
+        assert!(cfg.features.issues.prompt_path.is_none());
+        assert_eq!(cfg.features.issues, IssuesFeatureConfig::default());
+    }
+
+    #[test]
+    fn features_issues_explicit_block_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  issues:
+    enabled: true
+    prompt_path: "./prompts/issue-custom.md"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit fields parse");
+        assert!(cfg.features.issues.enabled);
+        assert_eq!(
+            cfg.features.issues.prompt_path.as_deref(),
+            Some(Path::new("./prompts/issue-custom.md"))
+        );
     }
 
     #[test]

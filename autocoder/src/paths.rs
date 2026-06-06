@@ -135,6 +135,14 @@ impl DaemonPaths {
         self.state.join("revisions")
     }
 
+    /// `<state>/issues-state/` — the issues lane's per-unit failure
+    /// counters, keyed by workspace basename then issue slug (a009).
+    /// Disjoint from [`Self::failure_state_dir`] (the changes lane's
+    /// counters) so each walker reads + writes only its own lane's state.
+    pub fn issues_state_dir(&self) -> PathBuf {
+        self.state.join("issues-state")
+    }
+
     /// `<state>/audit-state/` — per-audit-type cadence + last-run state.
     #[allow(dead_code)]
     pub fn audit_state_dir(&self) -> PathBuf {
