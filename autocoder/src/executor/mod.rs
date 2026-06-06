@@ -226,8 +226,11 @@ pub struct TriageContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogContext {
     /// JSON payload produced by the deterministic `autocoder changelog`
-    /// extractor (the `--format json` shape). The stylist gets this as
-    /// its primary input.
+    /// extractor, wrapped in a `{ "sections": [ … ] }` envelope (a72):
+    /// one section per `--format json` shape. A flagless gap-fill run
+    /// carries one section per undocumented stable release tag,
+    /// oldest-first; an explicit `--since`/`--to` run carries a single
+    /// section. The stylist gets this as its primary input.
     pub changelog_json: String,
     /// Repository URL the changelog targets (for the prompt's context
     /// banner line).
