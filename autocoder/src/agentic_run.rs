@@ -58,6 +58,14 @@ pub struct AgenticRunOutcome {
     pub session_id: Option<String>,
     /// `true` when the streaming path built the structured log itself.
     pub streamed_log: bool,
+    /// a70: the strategy-agnostic handle for the session this run created,
+    /// resolved by [`agentic_run_with_session`]. For a streaming `claude`
+    /// run this is the streamed `session_id`; for a capture-mode run it is
+    /// the new entry that appeared in the strategy's session-store directory.
+    /// `None` when session management was not requested OR no new session
+    /// could be attributed. Used by the cleanup (prune) AND, for the
+    /// implementer, the AskUser resume step.
+    pub session_handle: Option<String>,
 }
 
 /// Output handling for a run. `Streaming` adds `--verbose --output-format
@@ -140,13 +148,79 @@ pub struct BuildContext<'a> {
     pub model: Option<&'a ResolvedModel>,
 }
 
+/// Roots a [`CliStrategy`]'s session capture / prune reads (a70). `home` is
+/// the CLI's home directory — the real `$HOME` in production; a temp dir in
+/// tests so the prune is exercised without touching the operator's store.
+/// `workspace` is the run's working directory (the `claude` strategy keys its
+/// per-project session store by a path hash of this).
+#[derive(Clone, Copy)]
+pub struct SessionStoreCtx<'a> {
+    pub home: &'a Path,
+    pub workspace: &'a Path,
+}
+
 /// Abstracts CLI invocation so a model's provider can determine the CLI
 /// without role code changing. Two jobs: build the invocation (binary,
 /// flags, allowed-tools/settings format) AND translate a [`ResolvedModel`]
 /// into the CLI's model-selection mechanism.
+///
+/// a70 adds two further jobs behind defaulted methods so existing strategies
+/// opt in incrementally: a native headless-resume mechanism
+/// ([`Self::apply_resume`]) AND a surgical session-delete
+/// ([`Self::delete_session`], scoped via [`Self::session_store_dir`]).
 pub trait CliStrategy: Send + Sync {
     fn build_command(&self, ctx: &BuildContext<'_>) -> Command;
     fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>);
+
+    /// Apply this CLI's native headless-resume mechanism to a freshly-built
+    /// command so the next invocation continues the session named by
+    /// `handle`, returning `true` (a70). A strategy with no headless resume
+    /// returns `false` WITHOUT touching `cmd` — the caller then requeues the
+    /// change rather than fresh-running (a70 §5.3: no stash-and-recombine
+    /// fallback). Called from each strategy's `build_command` when
+    /// [`BuildContext::resume_session_id`] is set, so the resume flag lands in
+    /// the same place for every transport. Default: unsupported.
+    fn apply_resume(&self, cmd: &mut Command, handle: &str) -> bool {
+        let _ = (cmd, handle);
+        false
+    }
+
+    /// The directory under `ctx.home` where this CLI persists a transcript
+    /// per session for a run in `ctx.workspace`. `None` means the CLI's store
+    /// layout is unknown to us, so capture AND prune become no-ops. Used to
+    /// capture a freshly-created session handle (the entry that appears after
+    /// a run — see [`agentic_run_with_session`]) AND to scope
+    /// [`Self::delete_session`]. Default: `None`.
+    fn session_store_dir(&self, ctx: SessionStoreCtx<'_>) -> Option<PathBuf> {
+        let _ = ctx;
+        None
+    }
+
+    /// Delete ONLY the session record named by `handle` from this CLI's store
+    /// (a70). Surgical: it removes that one session's transcript (and any
+    /// per-session sidecar the CLI keeps keyed by the SAME handle) and nothing
+    /// else — never settings, memory/context files (`CLAUDE.md` / `GEMINI.md`
+    /// / project memories), credentials, OR the generated MCP config. Returns
+    /// `Ok(true)` when a record was removed, `Ok(false)` when none matched.
+    /// Default: no-op (`Ok(false)`).
+    fn delete_session(&self, ctx: SessionStoreCtx<'_>, handle: &str) -> Result<bool> {
+        let _ = (ctx, handle);
+        Ok(false)
+    }
+}
+
+/// Encode an absolute workspace path the way the `claude` CLI names its
+/// per-project session directory under `~/.claude/projects/`: every character
+/// that is not ASCII-alphanumeric or `-` becomes `-` (so `/`, `.`, and `_`
+/// all map to `-`). The integration spike confirmed this against a live store
+/// (e.g. `/home/u/.cache/ws/github_com_x-y` →
+/// `-home-u--cache-ws-github-com-x-y`).
+pub(crate) fn claude_project_hash(workspace: &Path) -> String {
+    workspace
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect()
 }
 
 /// Build the `--allowedTools` value Claude CLI expects. When
@@ -207,7 +281,10 @@ impl CliStrategy for ClaudeStrategy {
             .arg("--permission-mode")
             .arg("acceptEdits");
         if let Some(sid) = ctx.resume_session_id {
-            cmd.arg("--resume").arg(sid);
+            // a70: route resume through the trait method so every transport
+            // injects its flag uniformly. For `claude` this is the same
+            // `--resume <id>` in the same position as before (byte-identical).
+            self.apply_resume(&mut cmd, sid);
         }
         if ctx.emit_stream_json {
             // `--verbose` is required by Claude CLI alongside `stream-json`
@@ -230,6 +307,47 @@ impl CliStrategy for ClaudeStrategy {
             cmd.env("ANTHROPIC_MODEL", &m.model);
         }
         // model: None → set nothing; the CLI uses its own default model.
+    }
+
+    /// `claude --resume <session_id>` continues the conversation captured from
+    /// the streamed `system`-init `session_id` (a70). Always supported.
+    fn apply_resume(&self, cmd: &mut Command, handle: &str) -> bool {
+        cmd.arg("--resume").arg(handle);
+        true
+    }
+
+    /// `~/.claude/projects/<project-hash>/` holds one `<session_id>.jsonl`
+    /// transcript per session (the store the upstream bug reports show growing
+    /// unbounded). The project hash encodes the workspace path
+    /// ([`claude_project_hash`]).
+    fn session_store_dir(&self, ctx: SessionStoreCtx<'_>) -> Option<PathBuf> {
+        Some(
+            ctx.home
+                .join(".claude")
+                .join("projects")
+                .join(claude_project_hash(ctx.workspace)),
+        )
+    }
+
+    /// Remove ONLY `<store>/<handle>.jsonl` — the one session transcript,
+    /// addressed by its `session_id`. Leaves `settings.json`, `.credentials.json`,
+    /// `CLAUDE.md`, the generated `.mcp.json`, AND every other session intact.
+    fn delete_session(&self, ctx: SessionStoreCtx<'_>, handle: &str) -> Result<bool> {
+        let Some(dir) = self.session_store_dir(ctx) else {
+            return Ok(false);
+        };
+        delete_session_file(&dir.join(format!("{handle}.jsonl")))
+    }
+}
+
+/// Remove a single session file if it exists, returning whether it was there.
+/// A missing file is `Ok(false)` (idempotent prune); any other IO error
+/// propagates so a real permission/disk problem is visible.
+fn delete_session_file(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("pruning session record {}", path.display())),
     }
 }
 
@@ -441,9 +559,11 @@ impl CliStrategy for OpencodeStrategy {
         cmd.args(&self.args).arg("run");
         // The prompt is delivered on stdin by `agentic_run`; `opencode run`
         // reads its message from piped stdin, so no positional message is
-        // appended here. `resume_session_id` is the claude recovery
-        // mechanism (streaming) and is not used by the capture-mode opencode
-        // roles, so it is intentionally ignored.
+        // appended here. a70: when a resume handle is set (the implementer's
+        // AskUser answer), continue that session with `--session <id>`.
+        if let Some(sid) = ctx.resume_session_id {
+            self.apply_resume(&mut cmd, sid);
+        }
         cmd
     }
 
@@ -455,6 +575,22 @@ impl CliStrategy for OpencodeStrategy {
         // No `ANTHROPIC_*` env — that is the claude strategy's mechanism;
         // opencode reads the provider config from `opencode.json` (written in
         // `build_command`) AND the `--model <provider>/<model>` selection.
+    }
+
+    /// `opencode run --session <id>` continues an existing session (a70). The
+    /// id is captured from opencode's session store after the first run.
+    ///
+    /// NOTE: opencode is NOT installed in this sandbox, so the a70 integration
+    /// spike (tasks 1.1/1.3) could not be run live; this flag follows
+    /// opencode's documented `run` interface. The scoped session-DELETE is
+    /// deliberately left as the defaulted no-op ([`CliStrategy::delete_session`])
+    /// rather than guessing opencode's on-disk store layout — the surgical
+    /// delete path is wired the moment that layout is confirmed (the same
+    /// call-site seam a60 left for the opencode roles). No opencode sessions
+    /// are created here, so the no-op leaks nothing in practice.
+    fn apply_resume(&self, cmd: &mut Command, handle: &str) -> bool {
+        cmd.arg("--session").arg(handle);
+        true
     }
 }
 
@@ -480,6 +616,13 @@ const ANTIGRAVITY_SETTINGS_FILENAME: &str = "agy_settings.json";
 /// `gemini-3-pro`; the strategy selects it via `--model` when a role resolves
 /// no explicit model, so a Google/Gemini-family model is always chosen.
 const ANTIGRAVITY_DEFAULT_MODEL: &str = "gemini-3-pro";
+
+/// `agy` persists one SQLite transcript per conversation under
+/// `~/.gemini/antigravity-cli/conversations/<id>.db` (a70 spike, confirmed
+/// against the installed `agy` 1.0.6 — NOT `~/.antigravity`, which does not
+/// exist). A matching `~/.gemini/antigravity-cli/brain/<id>/` directory holds
+/// the same conversation's working state, keyed by the SAME id.
+const ANTIGRAVITY_STORE_SUBDIR: &str = ".gemini/antigravity-cli";
 
 /// The `agy` (Antigravity) CLI strategy (a69) — the third [`CliStrategy`],
 /// for Google's Antigravity CLI, the successor to the sunset Gemini CLI. A
@@ -690,6 +833,11 @@ impl CliStrategy for AntigravityStrategy {
             // streaming-recovery mechanism and is intentionally ignored.
             .arg("-p")
             .arg("");
+        // a70: when a resume handle is set (the implementer's AskUser answer),
+        // continue that conversation with `--conversation <id>`.
+        if let Some(sid) = ctx.resume_session_id {
+            self.apply_resume(&mut cmd, sid);
+        }
         if read_only {
             // The OS-level Terminal Sandbox; the tool restriction + the
             // `WritePolicy::None` post-hoc revert are the deny backstops.
@@ -713,6 +861,41 @@ impl CliStrategy for AntigravityStrategy {
         {
             cmd.env("AV_API_KEY", &m.api_key);
         }
+    }
+
+    /// `agy --conversation <id>` resumes a previous conversation by id (a70
+    /// spike: `agy --help` lists `--conversation` for "Resume a previous
+    /// conversation by ID"). Delivered alongside the `-p ""` print flag so the
+    /// answer arrives on stdin into the resumed conversation.
+    fn apply_resume(&self, cmd: &mut Command, handle: &str) -> bool {
+        cmd.arg("--conversation").arg(handle);
+        true
+    }
+
+    /// The conversations directory holding one `<id>.db` per conversation.
+    /// Antigravity keys its store by conversation id, NOT by workspace, so the
+    /// directory is workspace-independent.
+    fn session_store_dir(&self, ctx: SessionStoreCtx<'_>) -> Option<PathBuf> {
+        Some(ctx.home.join(ANTIGRAVITY_STORE_SUBDIR).join("conversations"))
+    }
+
+    /// Remove ONLY this conversation's records — `conversations/<id>.db` AND
+    /// the matching `brain/<id>/` directory (both keyed by the same id) —
+    /// leaving `settings.json`, `oauth_creds.json`, `GEMINI.md`, the generated
+    /// `mcp_config.json`, AND every other conversation intact.
+    fn delete_session(&self, ctx: SessionStoreCtx<'_>, handle: &str) -> Result<bool> {
+        let store = ctx.home.join(ANTIGRAVITY_STORE_SUBDIR);
+        let mut removed = delete_session_file(&store.join("conversations").join(format!("{handle}.db")))?;
+        let brain = store.join("brain").join(handle);
+        match std::fs::remove_dir_all(&brain) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("pruning conversation brain dir {}", brain.display()));
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -995,6 +1178,117 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
     }
 }
 
+/// Resolve the home directory used to locate a strategy's session store:
+/// the explicit `override_home` (tests) else `$HOME`.
+fn resolve_session_home(override_home: Option<&Path>) -> Option<PathBuf> {
+    override_home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+}
+
+/// The set of session-record stems (filenames without extension) currently in
+/// `dir`. A missing directory yields the empty set. Used to attribute the
+/// session a run created by diffing this snapshot before/after the run.
+fn snapshot_session_stems(dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                set.insert(stem.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// Run a session AND manage its lifecycle (a70). Wraps [`agentic_run`] with
+/// the session-hygiene the daemon owns:
+///
+/// 1. Snapshot the strategy's session-store directory before the run.
+/// 2. Run it.
+/// 3. Attribute the created session handle — the streamed `session_id` for a
+///    `claude` run, else the single new entry that appeared in the store — AND
+///    record it on [`AgenticRunOutcome::session_handle`].
+/// 4. When `prune` is set (single-shot roles, which never resume), delete that
+///    one session record via the strategy's scoped [`CliStrategy::delete_session`].
+///    The implementer passes `prune = false` and prunes at its terminal
+///    outcome instead, because it may retain the session across an AskUser.
+///
+/// `home_override` points the store resolution at a test home; production
+/// passes `None` (resolves `$HOME`). A strategy with no known store
+/// ([`CliStrategy::session_store_dir`] → `None`) is a no-op for capture AND
+/// prune — the run still completes normally.
+pub async fn agentic_run_with_session(
+    opts: AgenticRunOpts<'_>,
+    prune: bool,
+    home_override: Option<&Path>,
+) -> Result<AgenticRunOutcome> {
+    let strategy = opts.strategy;
+    let workspace = opts.workspace.to_path_buf();
+    // A resume run continues an existing session, so no NEW store entry
+    // appears; fall back to the resumed id so the handle survives a
+    // resume-then-AskUser-again sequence.
+    let resume_id = opts.resume_session_id.map(str::to_string);
+    let home = resolve_session_home(home_override);
+    let store_dir = home.as_ref().and_then(|h| {
+        strategy.session_store_dir(SessionStoreCtx {
+            home: h,
+            workspace: &workspace,
+        })
+    });
+    let before = store_dir
+        .as_ref()
+        .map(|d| snapshot_session_stems(d))
+        .unwrap_or_default();
+
+    let mut outcome = agentic_run(opts).await?;
+
+    // Attribute the created session: a streamed `session_id` is authoritative;
+    // otherwise the lone new store entry. >1 new entries (concurrent writers)
+    // or 0 leave the handle `None` rather than guess.
+    let handle = outcome
+        .session_id
+        .clone()
+        .or_else(|| {
+            store_dir.as_ref().and_then(|d| {
+                let after = snapshot_session_stems(d);
+                let mut fresh = after.difference(&before);
+                match (fresh.next(), fresh.next()) {
+                    (Some(only), None) => Some(only.clone()),
+                    _ => None,
+                }
+            })
+        })
+        .or(resume_id);
+    outcome.session_handle = handle.clone();
+
+    if prune && let (Some(h), Some(home)) = (handle, home.as_ref()) {
+        match strategy.delete_session(
+            SessionStoreCtx {
+                home,
+                workspace: &workspace,
+            },
+            &h,
+        ) {
+            Ok(removed) => {
+                tracing::debug!(
+                    session = %h,
+                    removed,
+                    "pruned single-shot agentic session record"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %h,
+                    "failed to prune agentic session record (run continues): {e:#}"
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Capture path: wait for child exit (or timeout) then read stdout +
 /// stderr in one shot. No structured log is written.
 async fn run_capture(
@@ -1182,6 +1476,9 @@ async fn run_streaming(
         final_answer,
         session_id,
         streamed_log: true,
+        // Populated by `agentic_run_with_session` (it owns the home/store
+        // resolution); the bare `agentic_run` path leaves it `None`.
+        session_handle: None,
     })
 }
 
@@ -2292,5 +2589,187 @@ mod tests {
         let e = envs(&cmd);
         assert!(!e.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!e.values().any(|v| v.contains(KEY_SENTINEL)));
+    }
+
+    // -----------------------------------------------------------------------
+    // a70: session resume + scoped delete + single-shot prune.
+    // -----------------------------------------------------------------------
+
+    /// The claude project-hash maps every non-[alnum-] char to `-` (so `/`,
+    /// `.`, `_` all collapse), matching the `~/.claude/projects/` directory
+    /// naming the integration spike observed against a live store.
+    #[test]
+    fn claude_project_hash_collapses_non_alnum() {
+        assert_eq!(
+            claude_project_hash(Path::new("/home/u/.cache/ws/github_com_x-y")),
+            "-home-u--cache-ws-github-com-x-y"
+        );
+    }
+
+    /// a70 §2.1: each strategy's native headless-resume injects its own flag
+    /// (`claude --resume`, `opencode --session`, `agy --conversation`).
+    #[test]
+    fn strategies_apply_native_resume_flag() {
+        let mut c = Command::new("claude");
+        assert!(ClaudeStrategy::new("claude".into(), vec![]).apply_resume(&mut c, "sid"));
+        let a = args(&c);
+        assert_eq!(a[a.iter().position(|x| x == "--resume").unwrap() + 1], "sid");
+
+        let mut o = Command::new("opencode");
+        assert!(OpencodeStrategy::new("opencode".into(), vec![]).apply_resume(&mut o, "osid"));
+        let a = args(&o);
+        assert_eq!(a[a.iter().position(|x| x == "--session").unwrap() + 1], "osid");
+
+        let mut g = Command::new("agy");
+        assert!(AntigravityStrategy::new("agy".into(), vec![]).apply_resume(&mut g, "gsid"));
+        let a = args(&g);
+        assert_eq!(a[a.iter().position(|x| x == "--conversation").unwrap() + 1], "gsid");
+    }
+
+    /// a70 scenario "The prune is surgical": the claude scoped delete removes
+    /// ONLY `<store>/<handle>.jsonl`, leaving sibling sessions AND the
+    /// settings / credentials / memory files intact. Re-deleting is idempotent.
+    #[test]
+    fn claude_delete_session_is_surgical() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/some/workspace/repo");
+        let store = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_hash(workspace));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("target.jsonl"), "{}").unwrap();
+        std::fs::write(store.join("other.jsonl"), "{}").unwrap();
+        let claude_dir = home.path().join(".claude");
+        std::fs::write(claude_dir.join("settings.json"), "{}").unwrap();
+        std::fs::write(claude_dir.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "memory").unwrap();
+
+        let strat = ClaudeStrategy::new("claude".into(), vec![]);
+        let ctx = SessionStoreCtx {
+            home: home.path(),
+            workspace,
+        };
+        assert!(strat.delete_session(ctx, "target").unwrap());
+        assert!(!store.join("target.jsonl").exists(), "named session is gone");
+        assert!(store.join("other.jsonl").exists(), "sibling session survives");
+        assert!(claude_dir.join("settings.json").exists());
+        assert!(claude_dir.join(".credentials.json").exists());
+        assert!(claude_dir.join("CLAUDE.md").exists());
+        assert!(
+            !strat.delete_session(ctx, "target").unwrap(),
+            "re-delete is idempotent (Ok(false))"
+        );
+    }
+
+    /// a70: the antigravity scoped delete removes the conversation `.db` AND
+    /// its `brain/<id>/` dir (both keyed by the conversation id), leaving
+    /// other conversations AND settings / oauth creds intact.
+    #[test]
+    fn antigravity_delete_session_removes_db_and_brain_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(store.join("conversations")).unwrap();
+        std::fs::create_dir_all(store.join("brain/target")).unwrap();
+        std::fs::create_dir_all(store.join("brain/other")).unwrap();
+        std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        std::fs::write(store.join("conversations/target.db"), "x").unwrap();
+        std::fs::write(store.join("conversations/other.db"), "x").unwrap();
+        std::fs::write(store.join("brain/target/state"), "x").unwrap();
+        std::fs::write(home.path().join(".gemini/settings.json"), "{}").unwrap();
+        std::fs::write(home.path().join(".gemini/oauth_creds.json"), "{}").unwrap();
+
+        let strat = AntigravityStrategy::new("agy".into(), vec![]);
+        let ctx = SessionStoreCtx {
+            home: home.path(),
+            workspace: Path::new("/ws"),
+        };
+        assert!(strat.delete_session(ctx, "target").unwrap());
+        assert!(!store.join("conversations/target.db").exists());
+        assert!(!store.join("brain/target").exists());
+        assert!(store.join("conversations/other.db").exists());
+        assert!(store.join("brain/other").exists());
+        assert!(home.path().join(".gemini/settings.json").exists());
+        assert!(home.path().join(".gemini/oauth_creds.json").exists());
+    }
+
+    /// a70 §4.1 / scenario "A single-shot agentic role prunes its session on
+    /// completion": a `prune = true` run deletes the session record it
+    /// created (captured by store-diff) while a sibling session AND an
+    /// out-of-store settings sentinel survive (surgical scope).
+    #[tokio::test]
+    async fn agentic_run_with_session_prunes_single_shot_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_hash(ws.path()));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("preexisting.jsonl"), "{}").unwrap();
+        std::fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+
+        // A stub claude that creates a NEW session record in the store (what
+        // the real CLI does), drains the prompt, exits 0.
+        let created = store.join("created-by-run.jsonl");
+        let stub = ws.path().join("claude_stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho '{{}}' > '{}'\necho done\n",
+                created.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let strat = ClaudeStrategy::new(stub.to_string_lossy().into_owned(), vec![]);
+        let outcome = agentic_run_with_session(
+            AgenticRunOpts {
+                workspace: ws.path(),
+                change: "audit",
+                strategy: &strat,
+                prompt: "do the thing",
+                sandbox: SandboxConfig {
+                    allowed_tools: vec!["Read".into()],
+                    disallowed_bash_patterns: vec![],
+                    disallowed_read_paths: vec![],
+                    deny_writes: true,
+                },
+                model: None,
+                output_mode: OutputMode::Capture,
+                timeout: std::time::Duration::from_secs(30),
+                paths: None,
+                settings_dir: Some(ws.path()),
+                include_autocoder_tools: false,
+                emit_stream_json_in_capture: false,
+                resume_session_id: None,
+                track_subprocess_marker: false,
+                etxtbsy_retry_spawn: false,
+                os_sandbox: crate::sandbox::RunSandbox::default(),
+            },
+            true,
+            Some(home.path()),
+        )
+        .await
+        .expect("run completes");
+
+        assert_eq!(
+            outcome.session_handle.as_deref(),
+            Some("created-by-run"),
+            "the created session's handle is captured from the store diff"
+        );
+        assert!(!created.exists(), "the created session record is pruned");
+        assert!(
+            store.join("preexisting.jsonl").exists(),
+            "sibling session survives the surgical prune"
+        );
+        assert!(
+            home.path().join(".claude/settings.json").exists(),
+            "settings survive the surgical prune"
+        );
     }
 }

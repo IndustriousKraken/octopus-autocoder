@@ -389,7 +389,9 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
         )
         .context("writing code-implements-spec MCP config")?;
 
-        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        // a70: a single-shot role — prune the session it creates on completion.
+        let result = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
             workspace: self.workspace,
             change: CODE_IMPLEMENTS_SPEC_ROLE,
             strategy: self.strategy,
@@ -416,7 +418,10 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
                 crate::config::default_cli_for(self.model.provider),
                 false,
             ),
-        })
+            },
+            true,
+            None,
+        )
         .await;
 
         // Always remove the config we wrote, regardless of run outcome.

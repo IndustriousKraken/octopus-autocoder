@@ -1157,7 +1157,9 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         )
         .context("writing reviewer MCP config")?;
 
-        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        // a70: a single-shot role — prune the session it creates on completion.
+        let result = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
             workspace: self.workspace,
             change: REVIEWER_ROLE,
             strategy: self.strategy,
@@ -1181,7 +1183,10 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             // a006: the agentic reviewer is a read-only role — read-only
             // workspace. It drives `claude` (no per-run model override here).
             os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
-        })
+            },
+            true,
+            None,
+        )
         .await;
 
         // Always remove the config we wrote, regardless of run outcome.
