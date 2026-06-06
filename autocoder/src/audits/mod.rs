@@ -977,7 +977,9 @@ pub(crate) async fn run_audit_cli(
     settings_dir: Option<&Path>,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
     let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
-    crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+    // a70: a single-shot role — prune the session it creates on completion.
+    crate::agentic_run::agentic_run_with_session(
+        crate::agentic_run::AgenticRunOpts {
         workspace,
         // Capture mode never consults `change` (it is only used for the
         // streaming structured-log path); a stable placeholder is fine.
@@ -1003,7 +1005,10 @@ pub(crate) async fn run_audit_cli(
         // a006: audits are read-only roles — workspace mounted read-only. They
         // drive the `claude` CLI (self-store `~/.claude`, admitted ro for auth).
         os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
-    })
+        },
+        true,
+        None,
+    )
     .await
 }
 
@@ -1047,7 +1052,9 @@ pub(crate) async fn run_audit_cli_with_submit(
         .context("writing audit MCP config")?;
 
     let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
-    let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+    // a70: a single-shot role — prune the session it creates on completion.
+    let result = crate::agentic_run::agentic_run_with_session(
+        crate::agentic_run::AgenticRunOpts {
         workspace,
         change: role,
         strategy: &strategy,
@@ -1071,7 +1078,10 @@ pub(crate) async fn run_audit_cli_with_submit(
         // a006: advisory audits are read-only roles too — read-only workspace,
         // `claude` self-store.
         os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
-    })
+        },
+        true,
+        None,
+    )
     .await;
 
     // Always remove the config we wrote, regardless of run outcome.

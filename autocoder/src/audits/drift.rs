@@ -403,6 +403,7 @@ mod tests {
     fn executor_cfg(command: &str) -> ExecutorConfig {
         ExecutorConfig {
             kind: ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: command.to_string(),
             timeout_secs: 30,
             sandbox: None,

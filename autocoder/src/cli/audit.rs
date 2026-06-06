@@ -195,6 +195,7 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
 fn default_standalone_executor_cfg() -> ExecutorConfig {
     ExecutorConfig {
         kind: ExecutorKind::ClaudeCli,
+        implementer_cli: None,
         command: "claude".to_string(),
         timeout_secs: 600,
         sandbox: None,

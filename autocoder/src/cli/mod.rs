@@ -16,6 +16,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         repositories: vec![],
         executor: config::ExecutorConfig {
             kind: config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: String::new(),
             timeout_secs: 60,
             sandbox: None,

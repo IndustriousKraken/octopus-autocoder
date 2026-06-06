@@ -1059,6 +1059,15 @@ pub struct ExecutorConfig {
     pub kind: ExecutorKind,
     #[serde(default = "default_executor_command")]
     pub command: String,
+    /// a70: the agentic CLI the implementer runs through. Unset → `claude`
+    /// (the default; streaming live-log path, byte-identical to pre-a70). Set
+    /// to `opencode` / `antigravity` to run the implementer capture-mode
+    /// through that strategy (no live log; outcome + `final_answer` arrive via
+    /// the MCP outcome relay). When this selects a non-`claude` CLI AND
+    /// `command` is left at its default, the binary defaults to that CLI's own
+    /// (`agy` for antigravity, `opencode` for opencode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer_cli: Option<CliKind>,
     #[serde(default = "default_executor_timeout")]
     pub timeout_secs: u64,
     #[serde(default)]
@@ -1859,7 +1868,7 @@ pub enum ExecutorKind {
     ClaudeCli,
 }
 
-fn default_executor_command() -> String {
+pub(crate) fn default_executor_command() -> String {
     "claude".to_string()
 }
 

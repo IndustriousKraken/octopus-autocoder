@@ -486,6 +486,7 @@ mod tests {
             repositories: vec![],
             executor: ExecutorConfig {
                 kind: ExecutorKind::ClaudeCli,
+                implementer_cli: None,
                 command: "claude".into(),
                 timeout_secs: 60,
                 sandbox: None,
