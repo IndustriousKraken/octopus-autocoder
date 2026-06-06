@@ -71,6 +71,13 @@ pub fn build_client(config: &CanonicalRagConfig) -> Result<Arc<dyn EmbedClient>>
         LlmProvider::Anthropic => Err(anyhow!(
             "anthropic does not support embeddings; configure canonical_rag.provider as ollama or openai_compatible"
         )),
+        // a69: same defensive backstop for the Google/Antigravity provider.
+        // Config-load validation rejects `canonical_rag.provider: google`
+        // (no embeddings API is exposed to autocoder), so this arm is
+        // unreachable in normal operation.
+        LlmProvider::Google => Err(anyhow!(
+            "google (Antigravity) does not expose an embeddings API; configure canonical_rag.provider as ollama or openai_compatible"
+        )),
     }
 }
 

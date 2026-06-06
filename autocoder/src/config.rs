@@ -153,22 +153,42 @@ pub enum CliKind {
     Claude,
     /// The provider-agnostic `opencode` CLI.
     Opencode,
+    /// Google's Antigravity CLI (`agy`), successor to the sunset Gemini CLI
+    /// (a69). Drives Google/Gemini-family models agentically.
+    Antigravity,
 }
 
 impl CliKind {
     /// Every registered CLI kind. The OS-sandbox credential layers (a006)
     /// iterate this so the protected config-store set grows automatically as
     /// strategies are added — never a hardcoded literal list (task 5.2).
-    pub const ALL: [CliKind; 2] = [CliKind::Claude, CliKind::Opencode];
+    pub const ALL: [CliKind; 3] = [CliKind::Claude, CliKind::Opencode, CliKind::Antigravity];
 
-    /// Operator-facing YAML string. Matches the `#[serde]` rename rules.
-    /// Consumed by the agentic-run primitive (a later change) for
-    /// diagnostics; no production call site exists in this change.
+    /// Operator-facing YAML string. Matches the `#[serde]` rename rules
+    /// (`cli: claude` / `cli: opencode` / `cli: antigravity`). NOT necessarily
+    /// the binary name — see [`CliKind::default_command`] (the Antigravity CLI
+    /// is configured as `antigravity` but the binary is `agy`). Kept as the
+    /// type's operator-facing accessor / serde-parity mirror even when no
+    /// direct call site exists.
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    /// The default binary name for this CLI on `PATH`. For `claude`/`opencode`
+    /// this matches [`as_str`](Self::as_str); the Antigravity CLI ships as the
+    /// `agy` binary even though it is selected with `cli: antigravity` (a69).
+    /// Used by the startup dependency preflight to probe the model registry's
+    /// driving CLIs.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+            Self::Antigravity => "agy",
         }
     }
 }
@@ -186,6 +206,9 @@ pub fn default_cli_for(provider: LlmProvider) -> CliKind {
     match provider {
         LlmProvider::Anthropic => CliKind::Claude,
         LlmProvider::OpenAiCompatible | LlmProvider::Ollama => CliKind::Opencode,
+        // a69: the Google/Antigravity provider is driven by the `agy` CLI
+        // (Antigravity), the successor to the sunset Gemini CLI.
+        LlmProvider::Google => CliKind::Antigravity,
     }
 }
 
@@ -250,6 +273,16 @@ pub enum LlmProvider {
     /// `<base>/api/embed` for embeddings). Valid for every subsystem;
     /// does not authenticate (api_key forbidden).
     Ollama,
+    /// Google's Gemini-family models, driven agentically through the
+    /// Antigravity CLI (`agy`) — the successor to the sunset Gemini CLI
+    /// (a69). This is a CLI-only (agentic) provider: it has NO in-process
+    /// HTTP client (the `oneshot` reviewer / RAG embedding paths reject it)
+    /// and NO embeddings API. `agy` authenticates from its own OAuth login /
+    /// credential store; an optional `api_key` becomes the `AV_API_KEY`
+    /// auth env the strategy sets. Valid for the agentic completion
+    /// subsystems (reviewer, contradiction checks, code-implements-spec);
+    /// INVALID for canonical_rag.
+    Google,
 }
 
 impl LlmProvider {
@@ -259,6 +292,7 @@ impl LlmProvider {
             Self::Anthropic => "anthropic",
             Self::OpenAiCompatible => "openai_compatible",
             Self::Ollama => "ollama",
+            Self::Google => "google",
         }
     }
 }
@@ -318,7 +352,13 @@ impl SubsystemKind {
                 LlmProvider::Anthropic,
                 LlmProvider::OpenAiCompatible,
                 LlmProvider::Ollama,
+                // a69: Google/Antigravity runs these roles agentically via the
+                // `agy` CLI (the `oneshot` in-process path rejects it).
+                LlmProvider::Google,
             ],
+            // canonical_rag is embeddings-only; Google/Antigravity exposes no
+            // embeddings API to autocoder, so it stays excluded (alongside
+            // anthropic).
             Self::CanonicalRag => &[LlmProvider::Ollama, LlmProvider::OpenAiCompatible],
         }
     }
@@ -376,6 +416,14 @@ pub fn validate_llm_provider_config(
                     "{subsystem}: ollama requires api_base_url; set the field to e.g. http://localhost:11434"
                 ));
             }
+        }
+        LlmProvider::Google => {
+            // a69: the Google/Antigravity provider is CLI-only (agentic). `agy`
+            // authenticates from its own OAuth login / credential store; an
+            // optional `api_key` (→ `AV_API_KEY`) and `api_base_url` are
+            // permitted but not required. No in-process HTTP requirements, so
+            // no fields are mandatory here.
+            let _ = (api_key_present, has_base);
         }
     }
     Ok(())
@@ -1015,6 +1063,12 @@ pub struct ExecutorConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
+    /// a014: capture of the operator's activated login-shell environment +
+    /// the credential-exclusion edits + the `doctor` expected-toolchain set.
+    /// Unset → capture is ON with the default credential filter and the default
+    /// expected-toolchain list.
+    #[serde(default)]
+    pub agent_env: Option<AgentEnvConfig>,
     /// Optional path to a custom implementer prompt template. When unset,
     /// the binary uses the template embedded at compile time from
     /// `prompts/implementer.md`. The file must contain the literal
@@ -1530,6 +1584,57 @@ pub fn clamp_wipe_drain_timeout_secs(requested: u64) -> (u64, Option<String>) {
         (WIPE_DRAIN_TIMEOUT_CEILING_SECS, Some(msg))
     } else {
         (requested, None)
+    }
+}
+
+/// a014: the operator's activated-toolchain environment capture, the
+/// credential-exclusion edits, and the `doctor` runnability set. All fields are
+/// optional; an absent block (or absent field) keeps the secure defaults
+/// (capture ON, the default credential filter, the default expected-toolchain
+/// list).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEnvConfig {
+    /// Whether to capture the operator's login-shell environment at startup and
+    /// inject it into every agentic subprocess. Defaults ON (`true`); set to
+    /// `false` to run agentic subprocesses against the daemon's base
+    /// environment only.
+    #[serde(default)]
+    pub capture: Option<bool>,
+    /// Additional credential-pattern entries to EXCLUDE from the captured
+    /// environment, on top of the defaults (`TOKEN`/`SECRET`/`KEY`/`PASSWORD`
+    /// substrings, `AWS_`/`ANTHROPIC_` prefixes). An entry ending in `_` is a
+    /// name PREFIX (e.g. `GCP_`); otherwise a case-insensitive substring.
+    /// Mirrors `a013`'s `mask_add`.
+    #[serde(default)]
+    pub exclude_add: Option<Vec<String>>,
+    /// Default credential-pattern entries to REMOVE (so a name matching only
+    /// that pattern can propagate) — e.g. `KEY` to admit a `*_KEY` toolchain
+    /// variable. An explicit relaxed posture. Mirrors `a013`'s `mask_remove`.
+    #[serde(default)]
+    pub exclude_remove: Option<Vec<String>>,
+    /// The expected-toolchain set the `doctor` runnability check probes in the
+    /// agent's actual environment (`<tool> --version`). Unset → the default
+    /// common list (`python3`, `node`, `ruby`, `go`).
+    #[serde(default)]
+    pub expected_toolchains: Option<Vec<String>>,
+}
+
+impl AgentEnvConfig {
+    /// Whether login-shell environment capture is enabled (defaults ON).
+    pub fn capture_enabled(&self) -> bool {
+        self.capture.unwrap_or(true)
+    }
+
+    /// The expected-toolchain set for the `doctor` runnability check: the
+    /// operator's list when configured, else the default common list.
+    pub fn expected_toolchains(&self) -> Vec<String> {
+        self.expected_toolchains.clone().unwrap_or_else(|| {
+            crate::agent_env::DEFAULT_EXPECTED_TOOLCHAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
     }
 }
 
@@ -4116,6 +4221,12 @@ github:
             "mask_add",
             "mask_remove",
             "strict_mode",
+            // a014 `AgentEnvConfig` (executor.agent_env).
+            "agent_env",
+            "capture",
+            "exclude_add",
+            "exclude_remove",
+            "expected_toolchains",
             // `GithubConfig`.
             "token_env",
             "token",
@@ -9744,6 +9855,40 @@ models:
             default_cli_for(LlmProvider::OpenAiCompatible),
             CliKind::Opencode
         );
+        // a69: the Google/Antigravity provider maps to the `agy` CLI.
+        assert_eq!(default_cli_for(LlmProvider::Google), CliKind::Antigravity);
+    }
+
+    /// a69 / task 3.1: the Antigravity CLI is configured as `cli: antigravity`
+    /// but its binary on `PATH` is `agy`; the two accessors diverge only for
+    /// this CLI (claude/opencode coincide).
+    #[test]
+    fn antigravity_cli_kind_string_and_binary() {
+        assert_eq!(CliKind::Antigravity.as_str(), "antigravity");
+        assert_eq!(CliKind::Antigravity.default_command(), "agy");
+        assert_eq!(CliKind::Claude.default_command(), "claude");
+        assert_eq!(CliKind::Opencode.default_command(), "opencode");
+        // The registry's `cli: antigravity` parses to the variant, and an
+        // explicit override wins over the provider default.
+        let entry = ModelEntry {
+            provider: LlmProvider::Anthropic,
+            model: "x".into(),
+            api_base_url: None,
+            api_key: None,
+            api_key_env: None,
+            cli: Some(CliKind::Antigravity),
+        };
+        assert_eq!(entry.resolved_cli(), CliKind::Antigravity);
+        // And a Google-provider entry defaults to Antigravity with no override.
+        let google = ModelEntry {
+            provider: LlmProvider::Google,
+            model: "gemini-3-pro".into(),
+            api_base_url: None,
+            api_key: None,
+            api_key_env: None,
+            cli: None,
+        };
+        assert_eq!(google.resolved_cli(), CliKind::Antigravity);
     }
 
     /// 4.5: an entry's explicit `cli` override wins over the provider

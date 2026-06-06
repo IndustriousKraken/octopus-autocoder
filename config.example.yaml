@@ -160,6 +160,31 @@ executor:
   #   #   high-compliance hosts. Defaults OFF; read-only roles always allowlist.
   #   strict_mode: false
 
+  # --- a014 agent toolchain environment ---
+  # The daemon captures the operator's ACTIVATED login-shell environment
+  # (`bash -lic env`) at startup and injects it — credential-filtered — into
+  # every agentic subprocess, so toolchains activated by shell init
+  # (pyenv/rbenv/poetry/nvm: the shims on PATH, PYENV_ROOT/NVM_DIR, the
+  # virtualenv) are USABLE, not merely present on disk under a013's exposed
+  # home. A run-set variable (the sandbox/strategy env, e.g. ANTHROPIC_BASE_URL)
+  # always wins over a captured one; a failed/partial capture degrades to the
+  # base environment (it never aborts a run).
+  #
+  # agent_env:
+  #   # capture: master switch (default ON). false → base environment only.
+  #   capture: true
+  #   # exclude_add: extra credential patterns withheld from the captured env,
+  #   #   on top of the defaults (TOKEN/SECRET/KEY/PASSWORD substrings,
+  #   #   AWS_/ANTHROPIC_ prefixes). An entry ending in `_` is a name prefix.
+  #   exclude_add: ["GCP_", "COMPANYAUTH"]
+  #   # exclude_remove: default patterns to drop so a matching name can pass —
+  #   #   e.g. KEY to admit a *_KEY toolchain variable (a relaxed posture).
+  #   exclude_remove: ["KEY"]
+  #   # expected_toolchains: the set `autocoder doctor` runs `<tool> --version`
+  #   #   against IN THE AGENT ENVIRONMENT, reporting any present-on-disk but
+  #   #   not-runnable (the activation gap). Unset → python3, node, ruby, go.
+  #   expected_toolchains: ["python3", "node", "ruby", "go"]
+
   # Path to a file overriding the built-in implementer prompt template.
   # The template must contain the literal `{{change_body}}` placeholder
   # (replaced with `openspec instructions apply` output each invocation).

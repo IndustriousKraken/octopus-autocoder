@@ -489,6 +489,7 @@ mod tests {
                 command: "claude".into(),
                 timeout_secs: 60,
                 sandbox: None,
+                agent_env: None,
                 implementer_prompt_path: None,
                 changelog_stylist_prompt_path: None,
                 perma_stuck_after_failures: None,

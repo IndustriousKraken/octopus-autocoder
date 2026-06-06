@@ -130,13 +130,20 @@ pub fn home_dir() -> PathBuf {
 ///
 /// `claude` keeps its login + settings under `~/.claude`. `opencode` keeps
 /// its credential store under `~/.local/share/opencode` and its config under
-/// `~/.config/opencode`; both are protected.
+/// `~/.config/opencode`; both are protected. `agy` (Antigravity, a69) keeps
+/// its OAuth login + settings + per-conversation state under `~/.gemini`
+/// (including `~/.gemini/antigravity-cli` and `oauth_creds.json`) and a cache
+/// under `~/.cache/antigravity`; both are protected.
 pub fn config_stores_for(cli: CliKind, home: &Path) -> Vec<PathBuf> {
     match cli {
         CliKind::Claude => vec![home.join(".claude")],
         CliKind::Opencode => vec![
             home.join(".local/share/opencode"),
             home.join(".config/opencode"),
+        ],
+        CliKind::Antigravity => vec![
+            home.join(".gemini"),
+            home.join(".cache/antigravity"),
         ],
     }
 }

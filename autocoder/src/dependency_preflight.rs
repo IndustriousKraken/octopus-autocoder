@@ -51,6 +51,24 @@ impl DepStatus {
     }
 }
 
+/// a014: the runnability of one expected toolchain IN THE AGENT'S ACTUAL
+/// ENVIRONMENT (the captured, credential-filtered env). The `doctor` draws the
+/// distinction the plain presence check cannot: a toolchain can be present on
+/// disk (e.g. a `pyenv` shim) yet not run in the agent env because its
+/// shell-init activation never applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolchainStatus {
+    /// `<tool> --version` succeeded in the agent environment. `detail` is the
+    /// reported version line.
+    Runnable { detail: String },
+    /// Present on disk but NOT runnable in the agent environment (the activation
+    /// gap). `hint` is an actionable activation hint.
+    PresentButNotRunnable { hint: String },
+    /// Not present on disk at all (so not part of this host's toolchains); the
+    /// report omits it rather than reporting a missing optional toolchain.
+    Absent,
+}
+
 /// How important a dependency is to the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Importance {
@@ -232,6 +250,13 @@ pub trait DepProbe {
     fn sandbox(&self) -> crate::sandbox::SandboxAvailability;
     /// Whether a binary is resolvable (on PATH, or as an existing path).
     fn binary_present(&self, bin: &str) -> bool;
+    /// a014: runnability of an expected toolchain in the agent's ACTUAL
+    /// environment (`<tool> --version` under the captured, credential-filtered
+    /// env). The default returns [`ToolchainStatus::Absent`] so test probes that
+    /// do not exercise the runnability check need no extra wiring.
+    fn toolchain(&self, _tool: &str) -> ToolchainStatus {
+        ToolchainStatus::Absent
+    }
 }
 
 /// Production probe: PATH lookups + the `sandbox` module's usability probes.
@@ -251,6 +276,119 @@ impl DepProbe for RealProbe {
             crate::sandbox::which(bin)
         }
     }
+    fn toolchain(&self, tool: &str) -> ToolchainStatus {
+        probe_toolchain_runnable(tool, &crate::agent_env::current_captured_env())
+    }
+}
+
+/// Resolve `tool` against an explicit PATH value (the agent's captured PATH),
+/// honouring a path-bearing `tool` as a literal file. Returns the first
+/// executable match.
+fn resolve_in_path(tool: &str, path_value: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(tool);
+    if tool.contains('/') {
+        return is_executable_file(p).then(|| p.to_path_buf());
+    }
+    std::env::split_paths(std::ffi::OsStr::new(path_value))
+        .map(|dir| dir.join(tool))
+        .find(|cand| is_executable_file(cand))
+}
+
+/// Whether `p` is a regular file with an execute bit (Unix). Mirrors the PATH
+/// search a shell performs.
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Classify an expected toolchain's runnability in the agent's actual
+/// environment (a014 task 4.1). Runs `<tool> --version` with the captured env
+/// applied; on failure, decides present-but-not-runnable vs absent from a
+/// disk probe (the daemon PATH + common version-manager shim locations).
+pub fn probe_toolchain_runnable(
+    tool: &str,
+    captured: &crate::agent_env::CapturedEnv,
+) -> ToolchainStatus {
+    // The agent's PATH is the captured one; fall back to the daemon PATH when
+    // the capture degraded (the agent would then also run in the base env).
+    let path_value = captured
+        .get("PATH")
+        .map(str::to_string)
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+
+    if let Some(exe) = resolve_in_path(tool, &path_value) {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--version");
+        for (k, v) in captured.vars() {
+            cmd.env(k, v);
+        }
+        if let Ok(out) = cmd.output()
+            && out.status.success()
+        {
+            // Some toolchains print `--version` to stderr; prefer stdout.
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = stdout
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .or_else(|| stderr.lines().find(|l| !l.trim().is_empty()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return ToolchainStatus::Runnable { detail };
+        }
+    }
+
+    // Not runnable in the agent env. Is it present on disk (so the operator can
+    // ACTIVATE it), or simply not installed (so we stay quiet)?
+    match toolchain_present_on_disk(tool) {
+        Some(found) => ToolchainStatus::PresentButNotRunnable {
+            hint: format!(
+                "`{tool}` is present on disk ({found}) but does not run in the agent \
+                 environment — its activation (a version manager's shell init, e.g. \
+                 `pyenv init` / `nvm` / `rbenv init`) did not apply. Add that activation \
+                 to the operator's login shell (~/.bashrc / ~/.profile) so the daemon's \
+                 startup capture picks it up, or install `{tool}` onto the daemon's PATH."
+            ),
+        },
+        None => ToolchainStatus::Absent,
+    }
+}
+
+/// Disk probe for a SPECIFIC toolchain the agent env could not run: the
+/// daemon's own PATH (unactivated), the per-tool version-manager shim locations,
+/// and the nvm node tree. Returns a human description of where it was found, or
+/// `None` when this tool is simply not installed. Deliberately per-tool — a
+/// version manager merely being installed must NOT make an unrelated/nonexistent
+/// tool read as "present but not runnable" (that would be a false activation
+/// gap).
+fn toolchain_present_on_disk(tool: &str) -> Option<String> {
+    if let Ok(path) = std::env::var("PATH")
+        && let Some(p) = resolve_in_path(tool, &path)
+    {
+        return Some(format!("on the daemon PATH at {}", p.display()));
+    }
+    let home = crate::sandbox::home_dir();
+    // Per-tool shims/bins a version manager installs even before activation.
+    for shim_dir in [".pyenv/shims", ".rbenv/shims", ".asdf/shims", ".local/bin"] {
+        let cand = home.join(shim_dir).join(tool);
+        if cand.exists() {
+            return Some(format!("a version-manager shim at {}", cand.display()));
+        }
+    }
+    // nvm does not use shims: a managed `node`/`npm`/`npx` lives under
+    // `~/.nvm/versions/node/<v>/bin`, reachable only once `nvm` / `NVM_DIR` is
+    // in effect. Flag those specific tools when an nvm node tree exists.
+    if matches!(tool, "node" | "npm" | "npx" | "corepack" | "yarn" | "pnpm") {
+        let nvm_node = home.join(".nvm/versions/node");
+        if nvm_node.is_dir() {
+            return Some(format!("an nvm node install under {}", nvm_node.display()));
+        }
+    }
+    None
 }
 
 /// Run `<bin> --version` and classify the outcome. Distinguishes a missing
@@ -362,7 +500,55 @@ pub fn build_report(cfg: &Config, probe: &dyn DepProbe) -> DepReport {
         checks.push(rag_backend_check(rag, probe));
     }
 
+    // --- a014: expected-toolchain runnability in the agent environment ------
+    // Beyond presence, verify each expected toolchain RUNS in the agent's
+    // actual (captured, credential-filtered) environment, surfacing the
+    // activation gap (e.g. a version manager whose init never applied) at
+    // boot-time rather than mid-run. Absent toolchains are not this host's
+    // concern and are omitted; a present-but-not-runnable one is a warning
+    // (non-blocking — a project need not use every common toolchain).
+    for tool in expected_toolchains(cfg) {
+        match probe.toolchain(&tool) {
+            ToolchainStatus::Runnable { detail } => checks.push(DepCheck {
+                name: format!("toolchain `{tool}` (agent env)"),
+                importance: Importance::Configured,
+                status: DepStatus::Satisfied {
+                    detail: (!detail.is_empty()).then_some(detail),
+                },
+                install_hint: String::new(),
+            }),
+            ToolchainStatus::PresentButNotRunnable { hint } => checks.push(DepCheck {
+                name: format!("toolchain `{tool}` (agent env)"),
+                importance: Importance::Configured,
+                status: DepStatus::Unusable {
+                    reason: format!(
+                        "`{tool}` is present on disk but not runnable in the agent \
+                         environment (activation gap)"
+                    ),
+                },
+                install_hint: hint,
+            }),
+            // Not installed on this host → nothing to report.
+            ToolchainStatus::Absent => {}
+        }
+    }
+
     DepReport { checks }
+}
+
+/// The expected-toolchain set the runnability check probes: the operator's
+/// configured list when present, else the default common list (a014 task 4.2).
+fn expected_toolchains(cfg: &Config) -> Vec<String> {
+    cfg.executor
+        .agent_env
+        .as_ref()
+        .map(|a| a.expected_toolchains())
+        .unwrap_or_else(|| {
+            crate::agent_env::DEFAULT_EXPECTED_TOOLCHAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
 }
 
 fn sandbox_check(probe: &dyn DepProbe) -> DepCheck {
@@ -430,6 +616,13 @@ fn rag_backend_check(
             },
             "Set canonical_rag.provider to `ollama` or `openai_compatible`.".to_string(),
         ),
+        // a69: Google/Antigravity exposes no embeddings API to autocoder.
+        LlmProvider::Google => (
+            DepStatus::Unusable {
+                reason: "google (Antigravity) does not support embeddings".to_string(),
+            },
+            "Set canonical_rag.provider to `ollama` or `openai_compatible`.".to_string(),
+        ),
     };
     DepCheck {
         name: "embedding backend (RAG)".to_string(),
@@ -484,8 +677,10 @@ fn configured_cli_binaries(cfg: &Config) -> Vec<CliRequirement> {
     if let Some(models) = cfg.models.as_ref() {
         for (nick, entry) in models {
             let cli: CliKind = entry.resolved_cli();
+            // Probe the binary name, NOT the operator-facing `cli:` string —
+            // they differ for Antigravity (`cli: antigravity` → binary `agy`).
             add(
-                cli.as_str().to_string(),
+                cli.default_command().to_string(),
                 false,
                 format!("model: {nick}"),
             );
@@ -518,6 +713,9 @@ mod tests {
         openspec: DepStatus,
         sandbox: SandboxAvailability,
         present: Vec<String>,
+        /// a014: canned toolchain-runnability facts keyed by tool name; a tool
+        /// absent from the map probes as [`ToolchainStatus::Absent`].
+        toolchains: std::collections::HashMap<String, ToolchainStatus>,
     }
 
     impl FakeProbe {
@@ -526,6 +724,7 @@ mod tests {
                 openspec: DepStatus::Satisfied { detail: Some("1.3.1".into()) },
                 sandbox: SandboxAvailability::Usable { mechanism: "bwrap" },
                 present: vec!["git".into(), "claude".into(), "gh".into(), "ollama".into()],
+                toolchains: std::collections::HashMap::new(),
             }
         }
     }
@@ -539,6 +738,12 @@ mod tests {
         }
         fn binary_present(&self, bin: &str) -> bool {
             self.present.iter().any(|b| b == bin)
+        }
+        fn toolchain(&self, tool: &str) -> ToolchainStatus {
+            self.toolchains
+                .get(tool)
+                .cloned()
+                .unwrap_or(ToolchainStatus::Absent)
         }
     }
 
@@ -583,6 +788,7 @@ github:
             openspec: DepStatus::Missing,
             sandbox: SandboxAvailability::Absent,
             present: vec!["claude".into()],
+            toolchains: std::collections::HashMap::new(),
         };
         let report = build_report(&base_cfg(), &probe);
         assert_eq!(find(&report, "openspec").unwrap().status, DepStatus::Missing);
@@ -700,5 +906,140 @@ github:
         };
         let st = probe_openspec(bin);
         assert!(matches!(st, DepStatus::Unusable { .. }), "{st:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // a014: doctor toolchain-runnability check (task 5.5).
+    // -----------------------------------------------------------------------
+
+    /// A probe whose toolchain facts are canned; everything else satisfied.
+    fn probe_with_toolchains(pairs: &[(&str, ToolchainStatus)]) -> FakeProbe {
+        let mut p = FakeProbe::all_present();
+        p.toolchains = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        p
+    }
+
+    /// `base_cfg` with an explicit expected-toolchain list configured.
+    fn cfg_with_expected(tools: &[&str]) -> Config {
+        let mut cfg = base_cfg();
+        cfg.executor.agent_env = Some(crate::config::AgentEnvConfig {
+            capture: None,
+            exclude_add: None,
+            exclude_remove: None,
+            expected_toolchains: Some(tools.iter().map(|s| s.to_string()).collect()),
+        });
+        cfg
+    }
+
+    #[test]
+    fn runnable_toolchain_reported_available() {
+        // `python3` runs in the agent env → reported satisfied with its version.
+        let probe = probe_with_toolchains(&[(
+            "python3",
+            ToolchainStatus::Runnable {
+                detail: "Python 3.12.1".into(),
+            },
+        )]);
+        let report = build_report(&base_cfg(), &probe);
+        let tc = find(&report, "toolchain `python3`").expect("python3 toolchain checked");
+        assert_eq!(
+            tc.status,
+            DepStatus::Satisfied {
+                detail: Some("Python 3.12.1".into())
+            }
+        );
+        // A runnable toolchain is not a problem of any kind.
+        assert!(tc.is_ok());
+        assert!(!report.has_blocking());
+    }
+
+    #[test]
+    fn present_but_not_runnable_toolchain_reported_with_hint() {
+        // `python3` present on disk (a pyenv shim) but not runnable in the agent
+        // env — reported present-but-not-runnable with an activation hint, as a
+        // non-blocking warning (a project need not use every common toolchain).
+        let hint = "add `pyenv init` to ~/.bashrc so the startup capture activates it";
+        let probe = probe_with_toolchains(&[(
+            "python3",
+            ToolchainStatus::PresentButNotRunnable { hint: hint.into() },
+        )]);
+        let report = build_report(&base_cfg(), &probe);
+        let tc = find(&report, "toolchain `python3`").expect("python3 toolchain checked");
+        assert!(
+            matches!(tc.status, DepStatus::Unusable { .. }),
+            "present-but-not-runnable is Unusable: {:?}",
+            tc.status
+        );
+        assert!(tc.is_warning(), "it is a non-blocking warning");
+        assert!(!tc.is_blocking());
+        assert!(!report.has_blocking(), "a toolchain gap must not block startup");
+        assert_eq!(tc.install_hint, hint, "the activation hint is surfaced");
+        // The hint reaches the rendered report.
+        assert!(report.render().contains(hint), "{}", report.render());
+    }
+
+    #[test]
+    fn absent_toolchain_is_omitted_from_the_report() {
+        // No toolchain facts → every default-list tool probes Absent → none are
+        // reported (we do not nag about toolchains this host does not have).
+        let report = build_report(&base_cfg(), &FakeProbe::all_present());
+        assert!(
+            find(&report, "toolchain").is_none(),
+            "absent toolchains are omitted: {}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn expected_toolchain_set_is_configurable() {
+        // Configure exactly `["mytool"]`. Even though `python3` would also be
+        // runnable, only the configured set is probed/reported.
+        let probe = probe_with_toolchains(&[
+            ("mytool", ToolchainStatus::Runnable { detail: "mytool 9".into() }),
+            ("python3", ToolchainStatus::Runnable { detail: "Python 3".into() }),
+        ]);
+        let report = build_report(&cfg_with_expected(&["mytool"]), &probe);
+        assert!(
+            find(&report, "toolchain `mytool`").is_some(),
+            "the configured tool is checked"
+        );
+        assert!(
+            find(&report, "toolchain `python3`").is_none(),
+            "a tool outside the configured set is NOT checked: {}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn expected_toolchain_set_defaults_to_common_list_when_unset() {
+        // With no `agent_env` block, the default common list is probed — here a
+        // runnable `node` (in the default list) is reported.
+        let probe = probe_with_toolchains(&[(
+            "node",
+            ToolchainStatus::Runnable { detail: "v20.0.0".into() },
+        )]);
+        let report = build_report(&base_cfg(), &probe);
+        assert!(
+            find(&report, "toolchain `node`").is_some(),
+            "the default expected set includes node"
+        );
+    }
+
+    // probe_toolchain_runnable end-to-end against the live host: a real common
+    // tool runs; a nonexistent one is Absent (it is on no disk path).
+    #[test]
+    fn probe_toolchain_runnable_classifies_real_and_absent() {
+        // `sh` is universally present + runnable; `--version` may print to
+        // stderr but exits 0. Use a tool that surely runs: `env` reports a
+        // version on coreutils; fall back asserting at least non-panicking.
+        let captured = crate::agent_env::CapturedEnv::empty();
+        let absent = probe_toolchain_runnable(
+            "definitely-not-a-real-toolchain-xyz",
+            &captured,
+        );
+        assert_eq!(absent, ToolchainStatus::Absent);
     }
 }

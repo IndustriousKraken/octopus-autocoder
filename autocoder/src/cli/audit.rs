@@ -198,6 +198,7 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
         command: "claude".to_string(),
         timeout_secs: 600,
         sandbox: None,
+        agent_env: None,
         implementer_prompt_path: None,
         changelog_stylist_prompt_path: None,
         perma_stuck_after_failures: None,

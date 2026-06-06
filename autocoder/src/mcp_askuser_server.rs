@@ -1797,6 +1797,83 @@ mod tests {
         }
     }
 
+    // a69 / task 4.6: the submission contract holds for the roles `agy`
+    // serves (here `reviewer` / `submit_review`) — a schema-invalid payload
+    // comes back as a CORRECTABLE tool error (-32602) the agent can fix AND
+    // resubmit in the SAME session. CLI-agnostic: the relay/validation lives
+    // here, not in any strategy, so it applies identically to the antigravity
+    // path. Mirrors `submit_findings_schema_rejection_surfaces_as_tool_error`,
+    // adding the corrected-resubmit-succeeds half.
+    #[test]
+    fn submit_review_rejection_is_correctable_and_resubmit_succeeds_in_session() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            // Each submission is one connection; the relay reads the response
+            // until EOF, so the stream must be CLOSED (dropped) after the
+            // reply — hence the per-connection blocks.
+            // First submission: the daemon rejects (schema-invalid).
+            {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut buf = String::new();
+                std::io::BufRead::read_line(&mut r, &mut buf).unwrap();
+                let mut rej = serde_json::to_string(
+                    &serde_json::json!({"ok": false, "error": "schema invalid: missing 'verdict'"}),
+                )
+                .unwrap();
+                rej.push('\n');
+                s.write_all(rej.as_bytes()).unwrap();
+            }
+            // Second (corrected) submission in the same session: accepted.
+            {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut buf = String::new();
+                std::io::BufRead::read_line(&mut r, &mut buf).unwrap();
+                let mut acc = serde_json::to_string(&serde_json::json!({"ok": true})).unwrap();
+                acc.push('\n');
+                s.write_all(acc.as_bytes()).unwrap();
+            }
+        });
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, socket_path.to_string_lossy().to_string());
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "reviewer");
+            std::env::set_var(ENV_ROLE, "reviewer");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_review","arguments":{"approved":false}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit_review","arguments":{"approved":true,"summary":"ok"}}}"#,
+            ],
+        );
+        handle.join().unwrap();
+        // The rejection is a correctable tool error carrying the daemon reason.
+        assert_eq!(resps[0]["error"]["code"], -32602, "resp0: {:?}", resps[0]);
+        let msg = resps[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("missing 'verdict'"), "carries the daemon reason: {msg}");
+        // The corrected resubmit succeeds within the SAME session (a result,
+        // no error).
+        assert!(
+            resps[1].get("error").is_none(),
+            "the corrected resubmit must succeed: {:?}",
+            resps[1]
+        );
+        assert!(resps[1]["result"].is_object(), "resp1 has a result: {:?}", resps[1]);
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+            std::env::remove_var(ENV_ROLE);
+        }
+    }
+
     #[test]
     fn initialize_returns_capabilities() {
         let dir = TempDir::new().unwrap();
