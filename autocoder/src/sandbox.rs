@@ -186,6 +186,9 @@ pub const DEFAULT_MASK_RELATIVE: &[&str] = &[
     ".kube",          // Kubernetes credentials
     ".docker/config.json", // Docker registry auth
     ".config/gh",     // GitHub CLI token
+    ".git-credentials", // git `store` helper plaintext tokens
+    ".config/git/credentials", // git `store` helper under XDG config
+    ".gitcookies",    // git http cookie file (`cookie` helper / curl)
     ".cargo/credentials.toml",
     ".cargo/credentials", // older cargo credentials filename
     ".npmrc",
@@ -1517,6 +1520,10 @@ mod tests {
             ".npmrc",
             ".pypirc",
             ".gem/credentials",
+            // git credential-helper stores (`store` / `cookie`).
+            ".git-credentials",
+            ".config/git/credentials",
+            ".gitcookies",
             ".bashrc",
             ".profile",
             ".ssh/authorized_keys",
