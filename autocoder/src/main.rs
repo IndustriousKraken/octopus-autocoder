@@ -32,6 +32,7 @@ mod github_credentials;
 pub(crate) use forge::github;
 mod ignore_for_queue;
 mod iteration_pending;
+mod lanes;
 mod llm;
 mod log_retention;
 mod mcp_askuser_server;

@@ -394,6 +394,27 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         None
     };
 
+    // Build the issues-lane context — the second work lane (a009). OFF by
+    // default: a context is produced ONLY when `features.issues.enabled`,
+    // so the polling pass short-circuits at the `lanes::gate::current()`
+    // read AND `issues/<slug>/` directories are not worked.
+    let issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>> =
+        if cfg.features.issues.enabled {
+            tracing::info!(
+                "issues lane enabled (a009; precedence issues > changes > audits)"
+            );
+            Some(Arc::new(crate::lanes::gate::IssuesLaneContext {
+                prompt_path: cfg.features.issues.prompt_path.clone(),
+                // Hybrid PUBLIC ingestion (a010) is gated behind the
+                // existing scout issue-read opt-in. With the issues lane on
+                // AND `features.scout.include_issues` true, the bot triages
+                // reported GitHub issues read-only AND posts candidates.
+                ingest: cfg.features.scout.include_issues,
+            }))
+        } else {
+            None
+        };
+
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
@@ -680,6 +701,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         contradiction_ctx: contradiction_ctx.clone(),
         canon_contradiction_ctx: canon_contradiction_ctx.clone(),
         code_implements_spec_ctx: code_implements_spec_ctx.clone(),
+        issues_ctx: issues_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -984,6 +1006,7 @@ struct SpawnDeps {
         Option<Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>>,
     code_implements_spec_ctx:
         Option<Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>>,
+    issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -1097,6 +1120,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
         let canon_contradiction_ctx_for_task = deps.canon_contradiction_ctx.clone();
         let code_implements_spec_ctx_for_task = deps.code_implements_spec_ctx.clone();
+        let issues_ctx_for_task = deps.issues_ctx.clone();
         let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
@@ -1143,11 +1167,14 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 canon_contradiction_ctx_for_task,
                 in_scoped,
             );
-            crate::code_implements_spec::scope(
+            let out_scoped = crate::code_implements_spec::scope(
                 code_implements_spec_ctx_for_task,
                 canon_scoped,
-            )
-            .await;
+            );
+            // Issues lane gate (a009): bind the `features.issues` context
+            // for the whole polling future; the pass reads it via
+            // `lanes::gate::current()`. `None` (disabled) → lane inactive.
+            crate::lanes::gate::scope(issues_ctx_for_task, out_scoped).await;
             {
                 let mut guard = map_for_task.lock().unwrap();
                 guard.remove(&url_for_task);

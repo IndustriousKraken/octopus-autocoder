@@ -520,6 +520,32 @@ fn read_recent_activity(workspace: &Path, since_days: u64) -> String {
     }
 }
 
+/// Fetch the raw `gh api repos/<o>/<r>/issues?state=open --paginate`
+/// JSON for `repo_url`, UNCAPPED (the scout-prompt variant caps for
+/// prompt budget; this one returns the full body so callers that PARSE
+/// the issues — e.g. the a010 hybrid-ingestion lane — get the complete
+/// array). Returns the stdout on success; an `Err` string on a parse,
+/// non-zero-status, OR spawn failure. This is the single `gh api` issue
+/// read both scout AND ingestion compose.
+pub(crate) fn fetch_open_issues_json(repo_url: &str) -> std::result::Result<String, String> {
+    let (owner, repo) =
+        crate::github::parse_repo_url(repo_url).map_err(|e| format!("parsing repo URL: {e}"))?;
+    let endpoint = format!("repos/{owner}/{repo}/issues?state=open");
+    let out = std::process::Command::new("gh")
+        .args(["api", "--paginate", &endpoint])
+        .output()
+        .map_err(|e| format!("spawning `gh api`: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!(
+            "`gh api` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 /// Fetch open issues via `gh api`. Returns `(text, failed)` — when
 /// `failed` is true, the caller posts a note saying issue-derived
 /// items were skipped.

@@ -22,6 +22,24 @@ pub async fn run_pass_through_commits(
 ) -> Result<(Vec<String>, bool)> {
     prepare_workspace_for_pass(paths, workspace, repo, github_cfg, chatops_ctx).await?;
 
+    // Issues lane (a009): highest precedence (issues > changes > audits).
+    // Gated by `features.issues` via the task-local context installed at
+    // daemon startup; inactive (None) → no-op. The issues walker runs
+    // BEFORE the changes walk AND independently of the changes-lane queue
+    // gates (a stuck/waiting change does not block issues — fault
+    // isolation between lanes). Any commits it produces ride this pass's
+    // push + PR via the commit-count gate downstream.
+    run_issues_lane(
+        paths,
+        workspace,
+        repo,
+        github_cfg,
+        executor,
+        chatops_ctx,
+        max_changes_per_pr,
+    )
+    .await;
+
     let pending_at_start = queue::list_pending(paths, workspace)?;
     let waiting_at_start = queue::list_waiting(workspace)?;
     tracing::info!(
@@ -182,6 +200,112 @@ pub async fn run_pass_through_commits(
         "polling pass complete"
     );
     Ok((processed, includes_self_heal))
+}
+
+/// Drive the issues lane (a009) for this pass, when enabled. Reads the
+/// task-local `features.issues` gate; `None` → the lane is inactive AND
+/// this is a no-op. The issues walker owns its control flow + its own
+/// state file; any error is logged AND never aborts the surrounding pass
+/// (fault isolation — an issues-lane fault cannot break the changes
+/// lane). Returns nothing: the issues walker's commits are detected by
+/// the downstream commit-count gate, so they ship in this pass's PR.
+async fn run_issues_lane(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    executor: &dyn Executor,
+    chatops_ctx: Option<&ChatOpsContext>,
+    max_units: u32,
+) {
+    let Some(ctx) = crate::lanes::gate::current() else {
+        return;
+    };
+
+    // Hybrid PUBLIC ingestion (a010): when the scout issue-read opt-in is
+    // on, triage reported GitHub issues read-only AND post candidates to
+    // chatops BEFORE the curated walk. This writes NOTHING to `issues/` AND
+    // queues NOTHING — a maintainer "send it" is the promotion gate. It is
+    // best-effort: it never aborts the pass (fault isolation between lanes).
+    if ctx.ingest {
+        let outcomes = crate::lanes::ingestion::run_issue_ingestion(
+            paths,
+            workspace,
+            repo,
+            executor,
+            chatops_ctx,
+            &github_cfg.command_authorization.allowed_associations,
+        )
+        .await;
+        let posted = outcomes
+            .iter()
+            .filter(|o| matches!(o.action, crate::lanes::ingestion::ReportAction::PostedCandidate { .. }))
+            .count();
+        if posted > 0 {
+            tracing::info!(
+                url = %repo.url,
+                posted,
+                "issue ingestion: posted {posted} candidate(s) to chatops (none queued — awaiting `send it`)"
+            );
+        }
+    }
+    let issues_ready = match crate::lanes::issues::list_ready(workspace) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "issues lane: listing ready issues failed (skipping lane this pass): {e:#}"
+            );
+            return;
+        }
+    };
+    if issues_ready.is_empty() {
+        return;
+    }
+    // Precedence (a009 §4): issues > changes > audits. Confirm via the
+    // shared selector that a ready issue is the highest-precedence unit —
+    // it always is when one is ready (issue-precedence is strict). The
+    // changes lane runs later in this same pass; audits later still.
+    let changes_ready = queue::list_pending(paths, workspace).unwrap_or_default();
+    match crate::lanes::select::select_next_unit(&issues_ready, &changes_ready, &[]) {
+        Some(sel @ crate::lanes::select::LaneUnit::Issue(_)) => {
+            tracing::info!(
+                url = %repo.url,
+                lane = sel.lane(),
+                unit = sel.name(),
+                "issues lane: selected highest-precedence ready unit"
+            );
+        }
+        _ => return,
+    }
+    match crate::lanes::walker::walk_issues(
+        paths,
+        workspace,
+        repo,
+        executor,
+        chatops_ctx,
+        ctx.prompt_path.as_deref(),
+        max_units,
+    )
+    .await
+    {
+        Ok(slugs) if !slugs.is_empty() => {
+            tracing::info!(
+                url = %repo.url,
+                archived = slugs.len(),
+                "issues lane: archived {} issue(s) this pass: {}",
+                slugs.len(),
+                slugs.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                url = %repo.url,
+                "issues lane errored (iteration continues): {e:#}"
+            );
+        }
+    }
 }
 
 /// Bring the workspace to a clean, initialized state for a pass: fork/refork,

@@ -150,6 +150,54 @@ pub trait Executor: Send + Sync {
             reason: "changelog stylist not supported by this executor backend".to_string(),
         })
     }
+
+    /// Issue-mode invocation for the issues lane (a009). The issues
+    /// walker has already rendered the issue-flavored implementer prompt
+    /// (fix-to-EXISTING-spec framing, NOT the change implementer prompt)
+    /// AND passes it here verbatim. The backend runs the wrapped CLI with
+    /// the MCP outcome tools wired (so the agent can call
+    /// `outcome_success` / `outcome_spec_needs_revision`), keyed by the
+    /// issue slug for run-log + outcome-store purposes. Acceptance is
+    /// against the EXISTING canon — there is no spec delta to apply.
+    ///
+    /// Default impl returns `Failed { reason: "issue mode not supported"
+    /// }` so a backend that hasn't been taught about the issues lane
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue mode not supported by this executor backend".to_string(),
+        })
+    }
+
+    /// Read-only triage of a reported GitHub issue for the a010 hybrid
+    /// issues-lane ingestion. The ingestion layer has already rendered the
+    /// `prompts/issue-report-triage.md` template (reported body embedded as
+    /// untrusted DATA) AND passes it here verbatim. The backend runs the
+    /// wrapped CLI read-only AND returns the agent's final answer (expected
+    /// to carry a `CLASSIFICATION:` verdict block, parsed by the ingestion
+    /// layer). The agent writes nothing — classification is advice, not an
+    /// action.
+    ///
+    /// Default impl returns `Failed { reason: "issue-triage mode not
+    /// supported" }` so a backend that hasn't been taught about ingestion
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue_triage(
+        &self,
+        workspace: &Path,
+        ctx: &IssueReportTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue-triage mode not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -215,6 +263,31 @@ pub struct BrownfieldDraftContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoutContext {
     /// Fully rendered prompt: template + interpolated context.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue` (a009). The issues walker
+/// renders the issue-flavored implementer prompt (template + the issue's
+/// `issue.md` + `tasks.md` body) AND passes the result here. The slug
+/// keys the per-run log + the MCP outcome store (so the agent's
+/// `outcome_*` tool calls are consumed for this issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueContext {
+    /// The issue's directory slug under `openspec/issues/`.
+    pub slug: String,
+    /// Fully rendered issue-flavored prompt: template + issue body.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue_triage` (a010). The hybrid
+/// ingestion layer renders the `prompts/issue-report-triage.md` template
+/// (with the reported body embedded as untrusted DATA via single-pass
+/// substitution) AND passes the result here. The executor runs it
+/// read-only AND returns the agent's final answer; the ingestion layer
+/// parses the `CLASSIFICATION:` verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueReportTriageContext {
+    /// Fully rendered triage prompt: template + interpolated context.
     pub rendered_prompt: String,
 }
 

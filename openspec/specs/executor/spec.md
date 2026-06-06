@@ -1646,3 +1646,36 @@ The running role's own CLI store stays readable by that same-uid subprocess beca
 - **THEN** they are delivered via the per-invocation settings mechanism (e.g. the temp Claude Code settings file)
 - **AND** the operator's global CLI configuration is not modified
 
+### Requirement: Issue-flavored implementer prompt verifies against existing canon
+When the executor runs an issue (an `issues/<slug>/` unit, NOT a change), it SHALL use an issue-flavored implementer prompt that instructs: fix the code to match the EXISTING specification; do NOT invent or write a spec change; AND if the fix actually requires new or changed behavior, report that the item belongs in the changes lane (kick it back) rather than altering any spec. The prompt SHALL be loaded through the uniform PromptLoader AND declare its override field via the nested naming convention. Acceptance for an issue run SHALL be verified against the existing canon, not a spec delta.
+
+#### Scenario: An issue run uses the issue-flavored prompt
+- **WHEN** the executor runs an `issues/<slug>/` unit
+- **THEN** it uses the issue-flavored implementer prompt (fix-to-existing-spec framing)
+- **AND** not the change implementer prompt
+
+#### Scenario: A behavior-change fix is kicked back to changes
+- **WHEN** an issue's fix would require new or changed behavior
+- **THEN** the run reports that the item belongs in the changes lane
+- **AND** it does NOT modify any spec
+
+#### Scenario: Acceptance is evaluated against canon
+- **WHEN** an issue run completes
+- **THEN** its acceptance is evaluated against the existing specification, not a spec delta
+
+### Requirement: Public issue body is quarantined as untrusted data in the implementer prompt
+When an issue originates from a public author, the implementer prompt SHALL embed the issue body as DATA inside a robust delimiter — NOT a markdown fence the body can break out of — with an explicit untrusted-report framing. The task AND scope SHALL come from the lane and the maintainer-approved classification, NEVER from the body. Single-pass substitution SHALL prevent `{{token}}` expansion of placeholder-looking text inside the body.
+
+#### Scenario: The body is embedded as untrusted data
+- **WHEN** a public-origin issue is run
+- **THEN** its body is placed in a delimited untrusted-data region distinct from the instruction region
+- **AND** the delimiter is not a markdown fence the body can break out of
+
+#### Scenario: Body instructions do not become the task
+- **WHEN** the issue body contains instruction-like text
+- **THEN** the task is taken from the maintainer-approved classification, not from the body
+
+#### Scenario: No token expansion inside the body
+- **WHEN** the issue body contains `{{token}}`-looking text
+- **THEN** it is not expanded during prompt construction
+

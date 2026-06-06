@@ -15,7 +15,8 @@
 
 use super::{
     BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
-    ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
+    IssueContext, IssueReportTriageContext, ResumeHandle, ScoutContext, TriageContext,
+    UnimplementableTask,
 };
 use crate::agentic_run::AgenticRunOutcome;
 use anyhow::{Context, Result, anyhow};
@@ -101,6 +102,7 @@ const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
 
 /// Synthetic "change" name used for the scout-mode run-log path (a25).
 const SCOUT_LOG_CHANGE_NAME: &str = "scout";
+const ISSUE_TRIAGE_LOG_CHANGE_NAME: &str = "issue-report-triage";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -1466,6 +1468,29 @@ impl Executor for ClaudeCliExecutor {
         self.classify_outcome(workspace, change, outcome).await
     }
 
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        // The issues walker already rendered the issue-flavored prompt
+        // (`PromptId::ImplementerIssue`). Run it with the MCP outcome
+        // tools wired, keyed by the issue slug for the run-log + outcome
+        // store. Acceptance is against the EXISTING canon — there is no
+        // spec delta, so the acceptance scan / recovery turn (which read
+        // `openspec/changes/<change>/tasks.md`) do NOT apply here; a
+        // tool-recorded outcome OR the classifier's verdict is final.
+        let change = ctx.slug.as_str();
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &ctx.rendered_prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(&self.paths, workspace, change, &ctx.rendered_prompt, &outcome);
+        self.classify_outcome(workspace, change, outcome).await
+    }
+
     async fn run_triage(
         &self,
         workspace: &Path,
@@ -1541,6 +1566,33 @@ impl Executor for ClaudeCliExecutor {
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, SCOUT_LOG_CHANGE_NAME, outcome)
+            .await
+    }
+
+    async fn run_issue_triage(
+        &self,
+        workspace: &Path,
+        ctx: &IssueReportTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        // The ingestion layer already rendered the issue-report-triage
+        // prompt (reported body embedded as untrusted DATA); pass it
+        // verbatim. The agent classifies read-only AND returns its verdict
+        // as the final answer, which the ingestion layer parses.
+        let prompt = ctx.rendered_prompt.clone();
+        let _mcp_path = Self::write_mcp_config(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, None)?;
+        let outcome = self
+            .spawn_agentic_session(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(
+            &self.paths,
+            workspace,
+            ISSUE_TRIAGE_LOG_CHANGE_NAME,
+            &prompt,
+            &outcome,
+        );
+        self.classify_outcome(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
 
