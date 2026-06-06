@@ -627,6 +627,19 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
         let mut inner_cmd = opts.strategy.build_command(&ctx);
         opts.strategy.apply_model_selection(&mut inner_cmd, opts.model);
 
+        // a014 (task 3.1): layer the operator's captured, credential-filtered
+        // login-shell environment onto the strategy command so shell-init-
+        // activated toolchains (pyenv/rbenv/poetry/nvm) are usable in the
+        // subprocess. Applied to the INNER command BEFORE the OS-sandbox wrapper
+        // so it flows through every mechanism uniformly (systemd `--setenv`,
+        // bwrap inheritance). `apply_captured_env` never overrides a variable
+        // the strategy/model already set — the run-set value wins on conflict —
+        // and is a no-op for an empty (degraded / not-yet-captured) capture.
+        crate::agent_env::apply_captured_env(
+            &mut inner_cmd,
+            &crate::agent_env::current_captured_env(),
+        );
+
         // a006 (tasks 2.1–2.5, 3.1): wrap the strategy command in the OS-level
         // sandbox via the resolved mechanism. The wrapper preserves stdio +
         // process-group + timeout/kill behavior unchanged — the `--pipe` /

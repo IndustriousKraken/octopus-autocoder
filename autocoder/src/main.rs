@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod agent_env;
 mod agentic_run;
 mod alert_state;
 mod alert_state_migration;

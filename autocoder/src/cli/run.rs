@@ -232,6 +232,42 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     }
     crate::sandbox::init_global(sandbox_mechanism, allow_unsandboxed, global_sandbox_toggles);
 
+    // a014: capture the operator's ACTIVATED login-shell environment and seed
+    // it (credential-filtered) for every agentic subprocess, so shell-init-
+    // activated toolchains (pyenv/rbenv/poetry/nvm) are usable — not merely
+    // present on disk under a013's exposed home. Best-effort and time-bounded:
+    // a failed/partial capture degrades to the base environment and never
+    // aborts startup. The credential filter (defaults + operator edits) keeps
+    // shell-exported secrets AND provider API keys out of the subprocess.
+    let agent_env_cfg = cfg.executor.agent_env.clone().unwrap_or_default();
+    if agent_env_cfg.capture_enabled() {
+        let filter = crate::agent_env::CredentialFilter::from_edits(
+            agent_env_cfg.exclude_add.as_ref(),
+            agent_env_cfg.exclude_remove.as_ref(),
+        );
+        let captured = crate::agent_env::capture_login_shell(&filter).await;
+        if captured.is_empty() {
+            tracing::warn!(
+                "a014: login-shell environment capture produced nothing; agentic \
+                 subprocesses run against the daemon's base environment (toolchains \
+                 activated only by shell init may not resolve — see `autocoder doctor`)"
+            );
+        } else {
+            tracing::info!(
+                propagated = captured.len(),
+                excluded = captured.excluded_count(),
+                "a014: captured operator login-shell environment for agentic subprocesses \
+                 (credential variables withheld)"
+            );
+        }
+        crate::agent_env::init_captured_env(captured);
+    } else {
+        tracing::info!(
+            "a014: login-shell environment capture disabled (executor.agent_env.capture: \
+             false); agentic subprocesses use the daemon's base environment"
+        );
+    }
+
     // Build the change-internal contradiction pre-flight context
     // (a19). Disabled by default → no LLM client built, no context
     // produced; the polling loop short-circuits at the

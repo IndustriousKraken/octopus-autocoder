@@ -1015,6 +1015,12 @@ pub struct ExecutorConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
+    /// a014: capture of the operator's activated login-shell environment +
+    /// the credential-exclusion edits + the `doctor` expected-toolchain set.
+    /// Unset → capture is ON with the default credential filter and the default
+    /// expected-toolchain list.
+    #[serde(default)]
+    pub agent_env: Option<AgentEnvConfig>,
     /// Optional path to a custom implementer prompt template. When unset,
     /// the binary uses the template embedded at compile time from
     /// `prompts/implementer.md`. The file must contain the literal
@@ -1530,6 +1536,57 @@ pub fn clamp_wipe_drain_timeout_secs(requested: u64) -> (u64, Option<String>) {
         (WIPE_DRAIN_TIMEOUT_CEILING_SECS, Some(msg))
     } else {
         (requested, None)
+    }
+}
+
+/// a014: the operator's activated-toolchain environment capture, the
+/// credential-exclusion edits, and the `doctor` runnability set. All fields are
+/// optional; an absent block (or absent field) keeps the secure defaults
+/// (capture ON, the default credential filter, the default expected-toolchain
+/// list).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEnvConfig {
+    /// Whether to capture the operator's login-shell environment at startup and
+    /// inject it into every agentic subprocess. Defaults ON (`true`); set to
+    /// `false` to run agentic subprocesses against the daemon's base
+    /// environment only.
+    #[serde(default)]
+    pub capture: Option<bool>,
+    /// Additional credential-pattern entries to EXCLUDE from the captured
+    /// environment, on top of the defaults (`TOKEN`/`SECRET`/`KEY`/`PASSWORD`
+    /// substrings, `AWS_`/`ANTHROPIC_` prefixes). An entry ending in `_` is a
+    /// name PREFIX (e.g. `GCP_`); otherwise a case-insensitive substring.
+    /// Mirrors `a013`'s `mask_add`.
+    #[serde(default)]
+    pub exclude_add: Option<Vec<String>>,
+    /// Default credential-pattern entries to REMOVE (so a name matching only
+    /// that pattern can propagate) — e.g. `KEY` to admit a `*_KEY` toolchain
+    /// variable. An explicit relaxed posture. Mirrors `a013`'s `mask_remove`.
+    #[serde(default)]
+    pub exclude_remove: Option<Vec<String>>,
+    /// The expected-toolchain set the `doctor` runnability check probes in the
+    /// agent's actual environment (`<tool> --version`). Unset → the default
+    /// common list (`python3`, `node`, `ruby`, `go`).
+    #[serde(default)]
+    pub expected_toolchains: Option<Vec<String>>,
+}
+
+impl AgentEnvConfig {
+    /// Whether login-shell environment capture is enabled (defaults ON).
+    pub fn capture_enabled(&self) -> bool {
+        self.capture.unwrap_or(true)
+    }
+
+    /// The expected-toolchain set for the `doctor` runnability check: the
+    /// operator's list when configured, else the default common list.
+    pub fn expected_toolchains(&self) -> Vec<String> {
+        self.expected_toolchains.clone().unwrap_or_else(|| {
+            crate::agent_env::DEFAULT_EXPECTED_TOOLCHAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
     }
 }
 
@@ -4116,6 +4173,12 @@ github:
             "mask_add",
             "mask_remove",
             "strict_mode",
+            // a014 `AgentEnvConfig` (executor.agent_env).
+            "agent_env",
+            "capture",
+            "exclude_add",
+            "exclude_remove",
+            "expected_toolchains",
             // `GithubConfig`.
             "token_env",
             "token",

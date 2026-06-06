@@ -406,6 +406,7 @@ mod tests {
             command: command.to_string(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
