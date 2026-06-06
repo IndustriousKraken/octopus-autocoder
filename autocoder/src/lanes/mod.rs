@@ -22,6 +22,7 @@
 //! the task-local context in [`gate`].
 
 pub mod gate;
+pub mod ingestion;
 pub mod issues;
 pub mod select;
 pub mod shared;

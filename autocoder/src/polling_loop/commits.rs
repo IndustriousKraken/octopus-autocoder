@@ -33,6 +33,7 @@ pub async fn run_pass_through_commits(
         paths,
         workspace,
         repo,
+        github_cfg,
         executor,
         chatops_ctx,
         max_changes_per_pr,
@@ -212,6 +213,7 @@ async fn run_issues_lane(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     max_units: u32,
@@ -219,6 +221,34 @@ async fn run_issues_lane(
     let Some(ctx) = crate::lanes::gate::current() else {
         return;
     };
+
+    // Hybrid PUBLIC ingestion (a010): when the scout issue-read opt-in is
+    // on, triage reported GitHub issues read-only AND post candidates to
+    // chatops BEFORE the curated walk. This writes NOTHING to `issues/` AND
+    // queues NOTHING — a maintainer "send it" is the promotion gate. It is
+    // best-effort: it never aborts the pass (fault isolation between lanes).
+    if ctx.ingest {
+        let outcomes = crate::lanes::ingestion::run_issue_ingestion(
+            paths,
+            workspace,
+            repo,
+            executor,
+            chatops_ctx,
+            &github_cfg.command_authorization.allowed_associations,
+        )
+        .await;
+        let posted = outcomes
+            .iter()
+            .filter(|o| matches!(o.action, crate::lanes::ingestion::ReportAction::PostedCandidate { .. }))
+            .count();
+        if posted > 0 {
+            tracing::info!(
+                url = %repo.url,
+                posted,
+                "issue ingestion: posted {posted} candidate(s) to chatops (none queued — awaiting `send it`)"
+            );
+        }
+    }
     let issues_ready = match crate::lanes::issues::list_ready(workspace) {
         Ok(r) => r,
         Err(e) => {

@@ -22,6 +22,12 @@ pub struct IssuesLaneContext {
     /// (`features.issues.prompt_path`). `None` → embedded default
     /// (`prompts/implementer-issue.md`).
     pub prompt_path: Option<PathBuf>,
+    /// Whether the hybrid PUBLIC ingestion path (a010) is active for this
+    /// task: the bot triages reported GitHub issues read-only AND posts
+    /// candidates to chatops. Gated behind the existing scout issue-read
+    /// opt-in (`features.scout.include_issues`); `false` → only the curated
+    /// (a009) path is active. Default `false`.
+    pub ingest: bool,
 }
 
 tokio::task_local! {
@@ -68,6 +74,7 @@ mod tests {
     async fn current_returns_scoped_context() {
         let ctx = Arc::new(IssuesLaneContext {
             prompt_path: Some(PathBuf::from("prompts/custom-issue.md")),
+            ingest: true,
         });
         let seen = scope(Some(ctx.clone()), async { current() }).await;
         let seen = seen.expect("scoped Some must read back as Some");
@@ -75,5 +82,6 @@ mod tests {
             seen.prompt_path.as_deref(),
             Some(std::path::Path::new("prompts/custom-issue.md"))
         );
+        assert!(seen.ingest, "scoped ingest flag must read back");
     }
 }

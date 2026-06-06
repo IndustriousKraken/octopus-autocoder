@@ -25,6 +25,13 @@ const ISSUE_FILE: &str = "issue.md";
 const TASKS_FILE: &str = "tasks.md";
 const SPECS_DIR: &str = "specs";
 
+/// Optional file carrying the RAW, UNTRUSTED body of a public-origin
+/// reported issue (a010). Its presence marks the unit as public-origin:
+/// the implementer prompt quarantines this body as DATA, distinct from
+/// the maintainer-approved task in `issue.md` / `tasks.md`. Curated
+/// (a009) units have no such file AND are not quarantined.
+pub const REPORT_BODY_FILE: &str = "report-body.md";
+
 /// `<workspace>/openspec/issues/`.
 pub fn issues_dir(workspace: &Path) -> PathBuf {
     workspace.join(ISSUES_SUBDIR)
@@ -75,6 +82,20 @@ pub struct LoadedIssue {
     pub slug: String,
     pub issue_body: String,
     pub tasks_body: String,
+    /// The raw, untrusted public report body, present ONLY when the unit
+    /// carries a `report-body.md` (a010 public-origin path). `None` for a
+    /// curated (a009) issue. When `Some`, the implementer prompt embeds it
+    /// as quarantined DATA.
+    pub report_body: Option<String>,
+}
+
+impl LoadedIssue {
+    /// True when this is a public-origin reported issue (it carries a
+    /// quarantined `report-body.md`). The task is always taken from
+    /// `issue.md` / `tasks.md`; the body is data only.
+    pub fn is_public_origin(&self) -> bool {
+        self.report_body.is_some()
+    }
 }
 
 /// True when `issues/<slug>/` carries a `specs/` directory (malformed —
@@ -116,10 +137,22 @@ pub fn load(workspace: &Path, slug: &str) -> std::result::Result<LoadedIssue, Is
         tracing::warn!(slug, "reading {} failed: {e}", tasks_path.display());
         IssueLoadError::MissingTasksMd
     })?;
+    // Optional public-origin quarantine body (a010). Its presence marks
+    // the unit as public-origin; a read error is logged AND treated as
+    // absent (curated path) rather than failing the load.
+    let report_body = match std::fs::read_to_string(dir.join(REPORT_BODY_FILE)) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(slug, "reading {REPORT_BODY_FILE} failed (treating as curated): {e}");
+            None
+        }
+    };
     Ok(LoadedIssue {
         slug: slug.to_string(),
         issue_body,
         tasks_body,
+        report_body,
     })
 }
 
@@ -233,6 +266,27 @@ mod tests {
             Err(IssueLoadError::MalformedHasSpecsDir)
         );
         assert!(is_malformed(td.path(), "has-delta"));
+    }
+
+    #[test]
+    fn load_reads_optional_report_body_marking_public_origin() {
+        let td = TempDir::new().unwrap();
+        // Curated (a009): no report-body.md → not public-origin.
+        make_issue(td.path(), "curated");
+        let curated = load(td.path(), "curated").unwrap();
+        assert!(curated.report_body.is_none());
+        assert!(!curated.is_public_origin());
+
+        // Public (a010): a report-body.md is present → public-origin.
+        make_issue(td.path(), "public");
+        std::fs::write(
+            issue_dir(td.path(), "public").join(REPORT_BODY_FILE),
+            "raw reporter body {{token}}",
+        )
+        .unwrap();
+        let public = load(td.path(), "public").unwrap();
+        assert_eq!(public.report_body.as_deref(), Some("raw reporter body {{token}}"));
+        assert!(public.is_public_origin());
     }
 
     #[test]

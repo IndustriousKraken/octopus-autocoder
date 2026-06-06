@@ -58,6 +58,9 @@ pub enum PromptId {
     AuditTriage,
     /// `prompts/chat-request-triage.md` — `propose` triage.
     ChatRequestTriage,
+    /// `prompts/issue-report-triage.md` — read-only triage of a reported
+    /// GitHub issue for the a010 hybrid issues-lane ingestion.
+    IssueReportTriage,
     /// `prompts/architecture-consultative.md` — consultative audit.
     AuditArchitectureConsultative,
     /// `prompts/drift-audit.md` — drift audit.
@@ -112,6 +115,8 @@ const PROMPT_CODE_REVIEW: &str = include_str!("../../../prompts/code-review-defa
 const PROMPT_AUDIT_TRIAGE: &str = include_str!("../../../prompts/audit-triage.md");
 const PROMPT_CHAT_REQUEST_TRIAGE: &str =
     include_str!("../../../prompts/chat-request-triage.md");
+const PROMPT_ISSUE_REPORT_TRIAGE: &str =
+    include_str!("../../../prompts/issue-report-triage.md");
 const PROMPT_ARCHITECTURE_CONSULTATIVE: &str =
     include_str!("../../../prompts/architecture-consultative.md");
 const PROMPT_DRIFT_AUDIT: &str = include_str!("../../../prompts/drift-audit.md");
@@ -142,6 +147,7 @@ impl PromptId {
             Self::CodeReview => PROMPT_CODE_REVIEW,
             Self::AuditTriage => PROMPT_AUDIT_TRIAGE,
             Self::ChatRequestTriage => PROMPT_CHAT_REQUEST_TRIAGE,
+            Self::IssueReportTriage => PROMPT_ISSUE_REPORT_TRIAGE,
             Self::AuditArchitectureConsultative => PROMPT_ARCHITECTURE_CONSULTATIVE,
             Self::AuditDrift => PROMPT_DRIFT_AUDIT,
             Self::AuditMissingTests => PROMPT_MISSING_TESTS_AUDIT,
@@ -168,6 +174,7 @@ impl PromptId {
             Self::CodeReview => "code-review-default.md",
             Self::AuditTriage => "audit-triage.md",
             Self::ChatRequestTriage => "chat-request-triage.md",
+            Self::IssueReportTriage => "issue-report-triage.md",
             Self::AuditArchitectureConsultative => "architecture-consultative.md",
             Self::AuditDrift => "drift-audit.md",
             Self::AuditMissingTests => "missing-tests-audit.md",
@@ -192,6 +199,7 @@ impl PromptId {
             Self::CodeReview => "CodeReview",
             Self::AuditTriage => "AuditTriage",
             Self::ChatRequestTriage => "ChatRequestTriage",
+            Self::IssueReportTriage => "IssueReportTriage",
             Self::AuditArchitectureConsultative => "AuditArchitectureConsultative",
             Self::AuditDrift => "AuditDrift",
             Self::AuditMissingTests => "AuditMissingTests",
@@ -217,6 +225,7 @@ impl PromptId {
             Self::CodeReview,
             Self::AuditTriage,
             Self::ChatRequestTriage,
+            Self::IssueReportTriage,
             Self::AuditArchitectureConsultative,
             Self::AuditDrift,
             Self::AuditMissingTests,

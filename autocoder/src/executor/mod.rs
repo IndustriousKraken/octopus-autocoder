@@ -174,6 +174,30 @@ pub trait Executor: Send + Sync {
             reason: "issue mode not supported by this executor backend".to_string(),
         })
     }
+
+    /// Read-only triage of a reported GitHub issue for the a010 hybrid
+    /// issues-lane ingestion. The ingestion layer has already rendered the
+    /// `prompts/issue-report-triage.md` template (reported body embedded as
+    /// untrusted DATA) AND passes it here verbatim. The backend runs the
+    /// wrapped CLI read-only AND returns the agent's final answer (expected
+    /// to carry a `CLASSIFICATION:` verdict block, parsed by the ingestion
+    /// layer). The agent writes nothing — classification is advice, not an
+    /// action.
+    ///
+    /// Default impl returns `Failed { reason: "issue-triage mode not
+    /// supported" }` so a backend that hasn't been taught about ingestion
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue_triage(
+        &self,
+        workspace: &Path,
+        ctx: &IssueReportTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue-triage mode not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -252,6 +276,18 @@ pub struct IssueContext {
     /// The issue's directory slug under `openspec/issues/`.
     pub slug: String,
     /// Fully rendered issue-flavored prompt: template + issue body.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue_triage` (a010). The hybrid
+/// ingestion layer renders the `prompts/issue-report-triage.md` template
+/// (with the reported body embedded as untrusted DATA via single-pass
+/// substitution) AND passes the result here. The executor runs it
+/// read-only AND returns the agent's final answer; the ingestion layer
+/// parses the `CLASSIFICATION:` verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueReportTriageContext {
+    /// Fully rendered triage prompt: template + interpolated context.
     pub rendered_prompt: String,
 }
 

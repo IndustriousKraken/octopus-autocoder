@@ -405,6 +405,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             );
             Some(Arc::new(crate::lanes::gate::IssuesLaneContext {
                 prompt_path: cfg.features.issues.prompt_path.clone(),
+                // Hybrid PUBLIC ingestion (a010) is gated behind the
+                // existing scout issue-read opt-in. With the issues lane on
+                // AND `features.scout.include_issues` true, the bot triages
+                // reported GitHub issues read-only AND posts candidates.
+                ingest: cfg.features.scout.include_issues,
             }))
         } else {
             None
