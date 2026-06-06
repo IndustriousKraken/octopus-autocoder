@@ -633,7 +633,7 @@ fn bwrap_usable() -> bool {
 }
 
 /// Whether `bin` is resolvable on `$PATH`.
-fn which(bin: &str) -> bool {
+pub(crate) fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
@@ -651,6 +651,56 @@ pub fn detect_mechanism() -> Option<SandboxMechanism> {
         Some(SandboxMechanism::Bwrap)
     } else {
         None
+    }
+}
+
+/// Richer than [`detect_mechanism`]: the dependency preflight (a011) needs to
+/// tell "a mechanism binary is present but cannot apply the sandbox" (e.g.
+/// `bwrap` installed but the host disables unprivileged user namespaces) apart
+/// from "no mechanism present at all", so it can report *unusable* vs *missing*.
+/// This complements — it does not replace — the spawn-time fail-closed gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxAvailability {
+    /// A mechanism is usable; the field is its operator-facing name.
+    Usable { mechanism: &'static str },
+    /// One or more mechanism binaries are present but none can apply the
+    /// sandbox on this host (the classic case: `bwrap` present, unprivileged
+    /// user namespaces disabled).
+    PresentButUnusable { present: Vec<&'static str> },
+    /// No platform sandbox mechanism is present at all.
+    Absent,
+}
+
+/// Probe the platform sandbox mechanism for the dependency preflight. On
+/// Linux this prefers a usable `systemd-run` service mode, then a usable
+/// `bwrap`; if neither *applies* the sandbox but a binary is *present*, it is
+/// reported `PresentButUnusable`. On macOS the seatbelt compiler
+/// `sandbox-exec` need only be present (per a011 task 1.2).
+pub fn sandbox_availability() -> SandboxAvailability {
+    if cfg!(target_os = "macos") {
+        return if which("sandbox-exec") {
+            SandboxAvailability::Usable { mechanism: "sandbox-exec" }
+        } else {
+            SandboxAvailability::Absent
+        };
+    }
+    if systemd_run_usable() {
+        return SandboxAvailability::Usable { mechanism: "systemd-run" };
+    }
+    if bwrap_usable() {
+        return SandboxAvailability::Usable { mechanism: "bwrap" };
+    }
+    let mut present = Vec::new();
+    if which("systemd-run") {
+        present.push("systemd-run");
+    }
+    if which("bwrap") {
+        present.push("bwrap");
+    }
+    if present.is_empty() {
+        SandboxAvailability::Absent
+    } else {
+        SandboxAvailability::PresentButUnusable { present }
     }
 }
 

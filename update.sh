@@ -42,11 +42,23 @@ target_version() {
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
 }
 
+# Resolve the daemon's config path (a011 task 3): an explicit --config-dir
+# always wins and skips the unit lookup; otherwise the installed systemd unit's
+# ExecStart is parsed for the flag the daemon is launched with (--config <file>,
+# or --config-dir <dir> from which the file is <dir>/config.yaml); absent a unit
+# or a recorded path, fall back to the default server-mode location.
 resolve_config_path() {
   if [[ -n "$CONFIG_DIR" ]]; then echo "${CONFIG_DIR}/config.yaml"; return; fi
-  local exec_line
+  local exec_line cfg dir
   exec_line="$(systemctl show autocoder.service -p ExecStart 2>/dev/null || true)"
-  echo "$exec_line" | sed -n 's/.*--config[= ]\([^ ;]*\).*/\1/p' | head -n1
+  # Prefer an explicit --config <file> recorded in the unit.
+  cfg="$(echo "$exec_line" | sed -n 's/.*--config[= ]\([^ ;]*\).*/\1/p' | head -n1)"
+  if [[ -n "$cfg" ]]; then echo "$cfg"; return; fi
+  # Accept a --config-dir <dir> form and derive <dir>/config.yaml.
+  dir="$(echo "$exec_line" | sed -n 's/.*--config-dir[= ]\([^ ;]*\).*/\1/p' | head -n1)"
+  if [[ -n "$dir" ]]; then echo "${dir%/}/config.yaml"; return; fi
+  # Fall back to the default-path resolution.
+  echo "/etc/autocoder/config.yaml"
 }
 
 run_preflight() {
