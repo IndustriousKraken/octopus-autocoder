@@ -117,6 +117,31 @@ pub(crate) async fn walk_queue(
         ) {
             break;
         }
+
+        // a71: yield to pending operator chatops requests. The change just
+        // processed reached its outcome (recorded above) and the walk would
+        // otherwise start the next change. If any operator request (`send
+        // it` / `propose` / `changelog`) is now pending for this repo, end
+        // the batch here — the caller opens its PR with the changes
+        // accumulated so far AND the next iteration's iteration-top drain
+        // consumes the operator request before starting a new batch. This is
+        // an ADDITIONAL, request-driven halt on top of the existing
+        // "any non-Archive outcome halts the walk" rule; the currently-
+        // executing change is never interrupted (the check runs strictly
+        // between changes). The peek does NOT drain — the iteration-top drain
+        // remains the sole consumer. `current()` is `None` (so the walk never
+        // yields) when the surrounding task did not bind the queue handles —
+        // every test that does not opt in, preserving pre-a71 behavior.
+        if let Some(queues) = operator_requests::current()
+            && queues.any_pending()
+        {
+            tracing::info!(
+                url = %repo.url,
+                archived = archived.len(),
+                "operator chatops request pending; ending the batch after the current change so the next iteration drains it (a71)"
+            );
+            break;
+        }
     }
 
     Ok((archived, includes_self_heal))

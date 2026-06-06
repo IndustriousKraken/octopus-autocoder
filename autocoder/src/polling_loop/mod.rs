@@ -40,6 +40,8 @@ mod alerts_notify;
 pub(crate) use alerts_notify::*;
 mod queue_walk;
 pub(crate) use queue_walk::*;
+mod operator_requests;
+pub(crate) use operator_requests::*;
 mod queue_waiting;
 pub(crate) use queue_waiting::*;
 mod preflight_checks;
@@ -270,6 +272,18 @@ pub async fn run_with_hooks(
         return;
     }
 
+    // a71: bundle the three operator-chatops-request queue handles so the
+    // queue walk can PEEK them between changes and yield the batch early
+    // when an operator request is waiting (the iteration-top drains below
+    // remain the sole consumer). Bound to a task-local around each
+    // iteration's work future via `operator_requests::scope`. Cheap clone
+    // (three `Arc`s) per iteration.
+    let operator_request_queues = OperatorRequestQueues {
+        triages: pending_triages.clone(),
+        proposal_requests: pending_proposal_requests.clone(),
+        changelog_requests: pending_changelog_requests.clone(),
+    };
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -356,24 +370,31 @@ pub async fn run_with_hooks(
         )
         .await;
 
-        run_iteration_work(
-            &paths,
-            &workspace,
-            snapshot_ref,
-            executor.as_ref(),
-            &github_snap,
-            reviewer_snap.as_deref(),
-            chatops_ctx.as_ref(),
-            want_rebuild,
-            &queued_audit_types,
-            stuck_threshold_secs,
-            perma_stuck_threshold,
-            max_changes_per_pr,
-            revision_cap,
-            human_revise_cap,
-            audit_registry.as_ref(),
-            audits_cfg.as_deref(),
-            audit_settings.as_ref(),
+        // a71: bind the operator-request-queue handles for the duration of
+        // the iteration's work future so `walk_queue` can peek them between
+        // changes (via `operator_requests::current()`) and yield the batch
+        // when an operator request is pending.
+        operator_requests::scope(
+            Some(operator_request_queues.clone()),
+            run_iteration_work(
+                &paths,
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                reviewer_snap.as_deref(),
+                chatops_ctx.as_ref(),
+                want_rebuild,
+                &queued_audit_types,
+                stuck_threshold_secs,
+                perma_stuck_threshold,
+                max_changes_per_pr,
+                revision_cap,
+                human_revise_cap,
+                audit_registry.as_ref(),
+                audits_cfg.as_deref(),
+                audit_settings.as_ref(),
+            ),
         )
         .await;
 
