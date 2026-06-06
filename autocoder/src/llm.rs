@@ -235,6 +235,14 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
             })?;
             Ok(Box::new(OllamaChatClient::new(base, model)))
         }
+        // a69: Google/Antigravity is a CLI-only (agentic) provider with no
+        // in-process HTTP client. The `oneshot` reviewer path cannot drive it;
+        // the operator must select the agentic transport (the `agy` CLI).
+        LlmProvider::Google => Err(anyhow!(
+            "reviewer provider 'google' (Antigravity) has no in-process oneshot client; \
+             Google/Gemini models run only agentically via the `agy` CLI — set \
+             reviewer.kind: agentic"
+        )),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             let api_key = resolve_reviewer_api_key(cfg)?;
             Ok(match provider {
@@ -251,7 +259,7 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
                     })?;
                     Box::new(OpenAiCompatibleClient::new(base, api_key, model))
                 }
-                LlmProvider::Ollama => unreachable!("handled above"),
+                LlmProvider::Ollama | LlmProvider::Google => unreachable!("handled above"),
             })
         }
     }
@@ -319,9 +327,16 @@ pub fn resolve_contradiction_check_model(
                 "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
             )
         })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; a base URL is
+        // optional and unused by the strategy.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
     };
     let api_key = match provider {
-        LlmProvider::Ollama => String::new(),
+        // a69: `agy` authenticates from its own OAuth login / credential store,
+        // so — like Ollama — no per-model credential is threaded through this
+        // gate (an `AV_API_KEY` would be the strategy's job from an explicit
+        // resolved key).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             resolve_contradiction_check_api_key(cfg)?
         }
@@ -390,9 +405,13 @@ pub fn resolve_canon_contradiction_check_model(
                 "executor.change_canonical_contradiction_check_llm.api_base_url is required when provider=ollama"
             )
         })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
     };
     let api_key = match provider {
-        LlmProvider::Ollama => String::new(),
+        // a69: `agy` authenticates from its own login store (see
+        // `resolve_contradiction_check_model`).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             resolve_canon_contradiction_check_api_key(cfg)?
         }
@@ -462,9 +481,13 @@ pub fn resolve_code_implements_spec_check_model(
                 "executor.code_implements_spec_check_llm.api_base_url is required when provider=ollama"
             )
         })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
     };
     let api_key = match provider {
-        LlmProvider::Ollama => String::new(),
+        // a69: `agy` authenticates from its own login store (see
+        // `resolve_contradiction_check_model`).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             resolve_code_implements_spec_check_api_key(cfg)?
         }

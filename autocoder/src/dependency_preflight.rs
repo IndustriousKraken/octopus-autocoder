@@ -616,6 +616,13 @@ fn rag_backend_check(
             },
             "Set canonical_rag.provider to `ollama` or `openai_compatible`.".to_string(),
         ),
+        // a69: Google/Antigravity exposes no embeddings API to autocoder.
+        LlmProvider::Google => (
+            DepStatus::Unusable {
+                reason: "google (Antigravity) does not support embeddings".to_string(),
+            },
+            "Set canonical_rag.provider to `ollama` or `openai_compatible`.".to_string(),
+        ),
     };
     DepCheck {
         name: "embedding backend (RAG)".to_string(),
@@ -670,8 +677,10 @@ fn configured_cli_binaries(cfg: &Config) -> Vec<CliRequirement> {
     if let Some(models) = cfg.models.as_ref() {
         for (nick, entry) in models {
             let cli: CliKind = entry.resolved_cli();
+            // Probe the binary name, NOT the operator-facing `cli:` string —
+            // they differ for Antigravity (`cli: antigravity` → binary `agy`).
             add(
-                cli.as_str().to_string(),
+                cli.default_command().to_string(),
                 false,
                 format!("model: {nick}"),
             );

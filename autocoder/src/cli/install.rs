@@ -2253,6 +2253,11 @@ pub(crate) async fn reconfigure_reviewer(
         Some(ReviewerProvider::Anthropic) => ReviewerProviderArg::Anthropic,
         Some(ReviewerProvider::OpenAiCompatible) => ReviewerProviderArg::OpenAiCompatible,
         Some(ReviewerProvider::Ollama) => ReviewerProviderArg::Ollama,
+        // a69: the Google/Antigravity provider is agentic-only (driven by the
+        // `agy` CLI) and is not surfaced in this oneshot-oriented wizard;
+        // operators configure it by editing the reviewer block directly. On
+        // reconfigure we present no pre-selection rather than a wrong one.
+        Some(ReviewerProvider::Google) => ReviewerProviderArg::None,
         None => ReviewerProviderArg::None,
     };
 

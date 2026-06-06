@@ -661,7 +661,10 @@ async fn drive_one_audit(
     Ok(true)
 }
 
-struct PolicyViolation {
+/// `pub(crate)` so the `pub(crate)` [`detect_write_policy_violation`] does not
+/// expose a more-private return type (a69 also reuses the detector from the
+/// agentic-run tests to assert the read-only write backstop applies to `agy`).
+pub(crate) struct PolicyViolation {
     reason: String,
 }
 

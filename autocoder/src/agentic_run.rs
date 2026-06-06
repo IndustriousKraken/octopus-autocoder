@@ -13,12 +13,13 @@
 //!
 //! CLI selection is abstracted behind the [`CliStrategy`] trait so a
 //! model's provider can pick the `claude` CLI or the provider-agnostic
-//! `opencode` CLI without role code changing. Two strategies are
-//! registered: [`ClaudeStrategy`] (Anthropic-shaped, streaming-capable)
-//! and [`OpencodeStrategy`] (a60 — any OpenAI-compatible / Ollama
-//! endpoint, capture-mode only). A provider that resolves to any other
-//! CLI returns a clear "strategy not yet implemented" error
-//! ([`strategy_for_provider`]).
+//! `opencode` CLI without role code changing. Three strategies are
+//! registered: [`ClaudeStrategy`] (Anthropic-shaped, streaming-capable),
+//! [`OpencodeStrategy`] (a60 — any OpenAI-compatible / Ollama endpoint,
+//! capture-mode only), AND [`AntigravityStrategy`] (a69 — Google's `agy`
+//! CLI for Gemini-family models, capture-mode only). A provider that
+//! resolves to any other CLI returns a clear "strategy not yet
+//! implemented" error ([`strategy_for_provider`]).
 //!
 //! The refactor is behavior-neutral: the executor keeps streaming-JSON +
 //! MCP + the recovery/session-reuse path; each audit keeps simple-capture
@@ -457,6 +458,264 @@ impl CliStrategy for OpencodeStrategy {
     }
 }
 
+/// Filename of the MCP config the [`AntigravityStrategy`] writes into the
+/// workspace. The Antigravity CLI (`agy`) reads MCP servers from an
+/// `mcp_config.json` with the standard `mcpServers` schema (the same shape
+/// Gemini CLI used). Note: the integration spike found the installed `agy`
+/// discovers this file from its global config dir (`~/.gemini/config/`), NOT
+/// the project root — so the end-to-end role wiring that points `agy` at this
+/// workspace copy (e.g. via the CLI's config-dir resolution) is a follow-up,
+/// the same call-site step a60 left for the opencode roles. This strategy
+/// writes the file per the a69 contract AND unit-tests its shape.
+const ANTIGRAVITY_MCP_CONFIG_FILENAME: &str = "mcp_config.json";
+
+/// Filename of the per-run Antigravity settings the [`AntigravityStrategy`]
+/// writes into the workspace, carrying the read-only tool restriction
+/// (a56 sandbox → `agy` permissions). A tangible artifact mirroring a60's
+/// `opencode.json` `permission` block; the runtime backstop for any escaped
+/// write is the `WritePolicy::None` post-hoc revert (see the type docs).
+const ANTIGRAVITY_SETTINGS_FILENAME: &str = "agy_settings.json";
+
+/// The Antigravity CLI's default model (a69). `agy` itself drives
+/// `gemini-3-pro`; the strategy selects it via `--model` when a role resolves
+/// no explicit model, so a Google/Gemini-family model is always chosen.
+const ANTIGRAVITY_DEFAULT_MODEL: &str = "gemini-3-pro";
+
+/// The `agy` (Antigravity) CLI strategy (a69) — the third [`CliStrategy`],
+/// for Google's Antigravity CLI, the successor to the sunset Gemini CLI. A
+/// role whose model provider resolves to `antigravity` (a55's `provider →
+/// CLI` rule for [`crate::config::LlmProvider::Google`], OR an explicit
+/// registry `cli: antigravity`) runs agentically through `agy` instead of
+/// erroring with "no registered strategy".
+///
+/// The invocation is `agy -p "" --model <model>` (capture). The empty `-p`
+/// value satisfies `agy`'s required print-mode flag while the prompt is
+/// delivered on stdin (the integration spike confirmed `agy` reads the
+/// stdin prompt and that a non-empty `-p` value would be treated as a SECOND
+/// prompt; [`agentic_run`] already pipes the prompt on stdin). The model is
+/// selected via `--model <model>` (default `gemini-3-pro`).
+///
+/// Auth (a69): the strategy sets `AV_API_KEY` from the resolved model's
+/// `api_key` when one is configured, AND sets NO `ANTHROPIC_*` (the claude
+/// strategy's mechanism). In practice the registry resolves Google models
+/// with an empty key (a003-faithful — like Ollama), so `agy` authenticates
+/// from its own OAuth login / credential store (the spike confirmed the host
+/// login); the `AV_API_KEY` path covers operators who provide an explicit
+/// Antigravity API key. The key is NEVER written into any workspace file.
+///
+/// MCP (a69): writes `mcp_config.json` (`mcpServers` schema: per-server
+/// `command`/`args`/`env` incl. `ORCH_MCP_ROLE`, local stdio) so the role's
+/// `submit_*` tool is reachable — the same submission contract a56 requires
+/// of the claude path. It writes NEITHER `.mcp.json` (claude) NOR
+/// `opencode.json` (opencode).
+///
+/// Read-only sandbox (a69): for a read-only role (a56 sandbox: allow
+/// Read/Glob/Grep; deny Write/Edit/Bash) the strategy appends `--sandbox`
+/// (the OS-level Terminal Sandbox) AND emits a tool restriction (read tools +
+/// the role's `submit_*` tool allowed; shell/write/edit denied). Because the
+/// exact non-interactive deny mechanism is best-effort (the spike found `agy`
+/// auto-runs read/terminal tools in `-p` mode), a read-only `agy` role does
+/// NOT rely on the restriction alone: the existing `WritePolicy::None`
+/// post-hoc enforcement (non-empty `git status --porcelain` → `git reset
+/// --hard HEAD` + fail) is the backstop.
+///
+/// `agy` is capture-mode only; the streaming-JSON event path stays claude-
+/// specific (`agy`'s `--stream` emits SSE, a different format).
+pub struct AntigravityStrategy {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl AntigravityStrategy {
+    pub fn new(command: String, args: Vec<String>) -> Self {
+        Self { command, args }
+    }
+
+    /// Whether the a56 sandbox is read-only: none of Write/Edit/Bash is in
+    /// the allowed-tools list. Read-only roles get `--sandbox` AND the
+    /// deny-shell/write/edit tool restriction.
+    fn is_read_only(allowed_tools: &[String]) -> bool {
+        let allows = |name: &str| allowed_tools.iter().any(|t| t.eq_ignore_ascii_case(name));
+        !(allows("Write") || allows("Edit") || allows("Bash"))
+    }
+
+    /// The MCP child's `env` map for `mcp_config.json`
+    /// (`mcpServers.<server>.env`). Mirrors [`OpencodeStrategy::mcp_environment`]
+    /// AND `ClaudeCliExecutor::write_mcp_config`: always the workspace; the role
+    /// (as both `ORCH_MCP_CHANGE` submission key AND `ORCH_MCP_ROLE`) when set;
+    /// the daemon control-socket vars when the parent carries them.
+    fn mcp_environment(ctx: &BuildContext<'_>) -> serde_json::Value {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            crate::mcp_askuser_server::ENV_WORKSPACE.to_string(),
+            serde_json::Value::String(ctx.workspace.to_string_lossy().into_owned()),
+        );
+        if let Some(role) = ctx.mcp_role {
+            env.insert(
+                crate::mcp_askuser_server::ENV_CHANGE.to_string(),
+                serde_json::Value::String(role.to_string()),
+            );
+            env.insert(
+                crate::mcp_askuser_server::ENV_ROLE.to_string(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
+        if let Ok(socket) = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET) {
+            env.insert(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET.to_string(),
+                serde_json::Value::String(socket),
+            );
+            let basename = std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME)
+                .unwrap_or_else(|_| {
+                    ctx.workspace
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown_workspace")
+                        .to_string()
+                });
+            env.insert(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME.to_string(),
+                serde_json::Value::String(basename),
+            );
+        }
+        serde_json::Value::Object(env)
+    }
+
+    /// Assemble the `mcp_config.json` value: the `mcpServers` block with the
+    /// orchestrator MCP child (`command` string + `args` array +
+    /// `env` incl. `ORCH_MCP_ROLE`, local stdio). a003: NO credential is ever
+    /// written here (the resolved `api_key` goes to `AV_API_KEY` env, not a
+    /// file).
+    fn mcp_config_value(ctx: &BuildContext<'_>) -> Result<serde_json::Value> {
+        let exe = std::env::current_exe()
+            .context("resolving current autocoder binary path for antigravity MCP config")?;
+        let mut server = serde_json::Map::new();
+        server.insert(
+            "command".to_string(),
+            serde_json::Value::String(exe.to_string_lossy().into_owned()),
+        );
+        server.insert(
+            "args".to_string(),
+            serde_json::json!(["mcp-ask-user-server"]),
+        );
+        server.insert("env".to_string(), Self::mcp_environment(ctx));
+
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            crate::mcp_askuser_server::SERVER_NAME.to_string(),
+            serde_json::Value::Object(server),
+        );
+        let mut config = serde_json::Map::new();
+        config.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
+        Ok(serde_json::Value::Object(config))
+    }
+
+    /// Map a56's allowed-tools list onto Antigravity's read-only tool
+    /// restriction: the read tools (whatever is in `allowed_tools`) plus the
+    /// role's `submit_*` MCP tool are `allow`ed; shell/write/edit (`Bash` /
+    /// `Write` / `Edit`) are `deny`ed unless explicitly allowed. `toolPermission:
+    /// deny` makes deny the default so nothing outside the allow-list runs
+    /// unprompted in non-interactive mode. Returned as a value so the writer
+    /// AND the unit test share one source of truth (mirrors a60's
+    /// `OpencodeStrategy::permission_block`).
+    fn tool_restriction(allowed_tools: &[String], mcp_role: Option<&str>) -> serde_json::Value {
+        let allows = |name: &str| allowed_tools.iter().any(|t| t.eq_ignore_ascii_case(name));
+        // Allow the read tools the sandbox granted, plus the role's submit_* tool.
+        let mut allow: Vec<String> = allowed_tools.to_vec();
+        if let Some(role) = mcp_role
+            && let Some(tool) = crate::mcp_askuser_server::submission_tool_name_for_role(role)
+        {
+            allow.push(crate::mcp_askuser_server::qualified_tool_name(tool));
+        }
+        // Deny the mutating/shell tools that are NOT in the allow-list.
+        let deny: Vec<String> = ["Bash", "Write", "Edit"]
+            .iter()
+            .filter(|t| !allows(t))
+            .map(|t| t.to_string())
+            .collect();
+        serde_json::json!({
+            "sandbox": true,
+            "toolPermission": "deny",
+            "permissions": { "allow": allow, "deny": deny },
+        })
+    }
+
+    /// Write `<workspace>/mcp_config.json`. `pub(crate)` so callers wiring
+    /// `agy` end-to-end can reuse the exact shape; returns the path.
+    pub(crate) fn write_mcp_config(ctx: &BuildContext<'_>) -> Result<PathBuf> {
+        let value = Self::mcp_config_value(ctx)?;
+        let path = ctx.workspace.join(ANTIGRAVITY_MCP_CONFIG_FILENAME);
+        let raw = serde_json::to_string_pretty(&value)?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("writing antigravity mcp config {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Write `<workspace>/agy_settings.json` carrying the read-only tool
+    /// restriction. Returns the path.
+    pub(crate) fn write_settings(ctx: &BuildContext<'_>) -> Result<PathBuf> {
+        let value = Self::tool_restriction(ctx.allowed_tools, ctx.mcp_role);
+        let path = ctx.workspace.join(ANTIGRAVITY_SETTINGS_FILENAME);
+        let raw = serde_json::to_string_pretty(&value)?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("writing antigravity settings {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+impl CliStrategy for AntigravityStrategy {
+    fn build_command(&self, ctx: &BuildContext<'_>) -> Command {
+        // Write the workspace MCP config (mcpServers). Best-effort: a write
+        // failure is logged but does not abort argv assembly.
+        if let Err(e) = Self::write_mcp_config(ctx) {
+            tracing::warn!(
+                workspace = %ctx.workspace.display(),
+                "failed to write antigravity mcp_config.json (run continues): {e:#}"
+            );
+        }
+        let read_only = Self::is_read_only(ctx.allowed_tools);
+        if read_only && let Err(e) = Self::write_settings(ctx) {
+            tracing::warn!(
+                workspace = %ctx.workspace.display(),
+                "failed to write antigravity settings (run continues): {e:#}"
+            );
+        }
+
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args)
+            // Print (single-shot) mode. The empty value satisfies `agy`'s
+            // required print flag; the prompt is delivered on stdin by
+            // `agentic_run` (a non-empty value would be treated as a SECOND
+            // prompt — see the spike notes). `--resume` is the claude
+            // streaming-recovery mechanism and is intentionally ignored.
+            .arg("-p")
+            .arg("");
+        if read_only {
+            // The OS-level Terminal Sandbox; the tool restriction + the
+            // `WritePolicy::None` post-hoc revert are the deny backstops.
+            cmd.arg("--sandbox");
+        }
+        cmd
+    }
+
+    fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>) {
+        let model_id = model
+            .map(|m| m.model.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(ANTIGRAVITY_DEFAULT_MODEL);
+        cmd.arg("--model").arg(model_id);
+        // a69: Antigravity's auth env. Set ONLY from an explicitly-resolved
+        // key; the registry resolves Google models with an empty key
+        // (a003-faithful), so production runs authenticate from `agy`'s own
+        // OAuth login store. NO `ANTHROPIC_*` (the claude mechanism).
+        if let Some(m) = model
+            && !m.api_key.is_empty()
+        {
+            cmd.env("AV_API_KEY", &m.api_key);
+        }
+    }
+}
+
 /// Resolve a role's strategy from the model's provider via a55's
 /// `provider → default CLI` rule ([`crate::config::default_cli_for`]).
 ///
@@ -472,10 +731,10 @@ pub fn strategy_for_provider(
     strategy_for_cli(crate::config::default_cli_for(provider), command, args)
 }
 
-/// Resolve the strategy for a specific CLI. `claude` (a56) AND `opencode`
-/// (a60) are registered; both map to a real strategy with no subprocess
-/// spawned at resolution time. The `Result` is retained so a future CLI can
-/// land an error arm without changing call sites.
+/// Resolve the strategy for a specific CLI. `claude` (a56), `opencode`
+/// (a60) AND `antigravity` (a69) are registered; each maps to a real
+/// strategy with no subprocess spawned at resolution time. The `Result` is
+/// retained so a future CLI can land an error arm without changing call sites.
 #[allow(dead_code)]
 pub fn strategy_for_cli(
     cli: crate::config::CliKind,
@@ -485,6 +744,10 @@ pub fn strategy_for_cli(
     match cli {
         crate::config::CliKind::Claude => Ok(Box::new(ClaudeStrategy::new(command, args))),
         crate::config::CliKind::Opencode => Ok(Box::new(OpencodeStrategy::new(command, args))),
+        // a69: the Antigravity (`agy`) strategy for Google/Gemini models.
+        crate::config::CliKind::Antigravity => {
+            Ok(Box::new(AntigravityStrategy::new(command, args)))
+        }
     }
 }
 
@@ -1558,6 +1821,374 @@ mod tests {
         // The strategy wrote opencode.json (not .mcp.json) for the run.
         assert!(tmp.path().join("opencode.json").exists());
         assert!(!tmp.path().join(".mcp.json").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // a69: AntigravityStrategy (the `agy` CLI).
+    // -----------------------------------------------------------------------
+
+    fn read_antigravity_mcp_config(workspace: &Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(workspace.join("mcp_config.json"))
+            .expect("mcp_config.json was written");
+        serde_json::from_str(&raw).expect("mcp_config.json is valid JSON")
+    }
+
+    // a69 / task 4.1: a Google-provider model (a55's `provider → CLI` rule)
+    // AND an explicit `cli: antigravity` both resolve to AntigravityStrategy —
+    // NOT a "no registered strategy" error — AND it builds `agy -p ""`
+    // selecting the model via `--model` (default `gemini-3-pro`).
+    #[test]
+    fn strategy_for_provider_google_resolves_antigravity() {
+        // a55 provider path: default_cli_for(Google) == Antigravity.
+        let strat = strategy_for_provider(LlmProvider::Google, "agy".into(), Vec::new())
+            .expect("Google provider resolves to the antigravity strategy (a69)");
+        // Explicit `cli: antigravity` path.
+        assert!(strategy_for_cli(CliKind::Antigravity, "agy".into(), Vec::new()).is_ok());
+
+        let allowed = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let mut cmd = strat.build_command(&bctx);
+        strat.apply_model_selection(&mut cmd, None);
+        assert_eq!(cmd.as_std().get_program().to_string_lossy(), "agy");
+        let a = args(&cmd);
+        // `-p ""` print mode (the prompt arrives on stdin), `--model
+        // gemini-3-pro` (default), `--sandbox` (read-only role).
+        let p = a.iter().position(|x| x == "-p").expect("-p present");
+        assert_eq!(a[p + 1], "", "the -p value is empty; the prompt is piped on stdin");
+        let m = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[m + 1], "gemini-3-pro", "default model when none is resolved");
+        assert!(a.iter().any(|x| x == "--sandbox"), "a read-only role gets --sandbox");
+    }
+
+    // a69 / task 4.1 (model selection): a resolved model is selected via
+    // `--model <model>`.
+    #[test]
+    fn antigravity_apply_model_selection_uses_resolved_model() {
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let model = ResolvedModel {
+            provider: LlmProvider::Google,
+            model: "gemini-3-pro-preview".into(),
+            api_base_url: String::new(),
+            api_key: String::new(),
+        };
+        let mut cmd = Command::new("agy");
+        strat.apply_model_selection(&mut cmd, Some(&model));
+        let a = args(&cmd);
+        let m = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[m + 1], "gemini-3-pro-preview");
+        // No key configured → no AV_API_KEY (agy uses its OAuth login store).
+        assert!(!envs(&cmd).contains_key("AV_API_KEY"));
+    }
+
+    // a69 / task 4.2: writes `mcp_config.json` with the `mcpServers` entry
+    // (command/args + env incl. ORCH_MCP_ROLE, local stdio) AND writes NEITHER
+    // `.mcp.json` (claude) NOR `opencode.json` (opencode).
+    #[test]
+    fn antigravity_writes_mcp_config_with_role_env_and_no_other_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        assert!(tmp.path().join("mcp_config.json").exists());
+        assert!(!tmp.path().join(".mcp.json").exists(), "no claude .mcp.json");
+        assert!(!tmp.path().join("opencode.json").exists(), "no opencode.json");
+
+        let v = read_antigravity_mcp_config(tmp.path());
+        let server = &v["mcpServers"][crate::mcp_askuser_server::SERVER_NAME];
+        assert!(server["command"].is_string(), "command is a string path (local stdio)");
+        let cmdargs = server["args"].as_array().expect("args is an array");
+        assert_eq!(
+            cmdargs.last().and_then(|v| v.as_str()),
+            Some("mcp-ask-user-server"),
+            "MCP child launches the autocoder mcp-ask-user-server subcommand"
+        );
+        let env = &server["env"];
+        assert_eq!(env[crate::mcp_askuser_server::ENV_ROLE], "reviewer");
+        assert_eq!(env[crate::mcp_askuser_server::ENV_CHANGE], "reviewer");
+        assert!(env[crate::mcp_askuser_server::ENV_WORKSPACE].is_string());
+    }
+
+    // a69 / task 4.2 (no role): with no role, no submission env is advertised.
+    #[test]
+    fn antigravity_omits_role_env_when_no_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: None,
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+        let v = read_antigravity_mcp_config(tmp.path());
+        let env = &v["mcpServers"][crate::mcp_askuser_server::SERVER_NAME]["env"];
+        assert!(env.get(crate::mcp_askuser_server::ENV_ROLE).is_none());
+        assert!(env.get(crate::mcp_askuser_server::ENV_CHANGE).is_none());
+    }
+
+    // a69 / task 4.3: a resolved model with a key sets `AV_API_KEY` AND NONE
+    // of the `ANTHROPIC_*` env vars; the key never lands in any workspace file.
+    #[test]
+    fn antigravity_auth_env_av_api_key_no_anthropic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let model = ResolvedModel {
+            provider: LlmProvider::Google,
+            model: "gemini-3-pro".into(),
+            api_base_url: String::new(),
+            api_key: "av-secret-sentinel".into(),
+        };
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            model: Some(&model),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let mut cmd = strat.build_command(&bctx);
+        strat.apply_model_selection(&mut cmd, Some(&model));
+        let e = envs(&cmd);
+        assert_eq!(
+            e.get("AV_API_KEY").map(String::as_str),
+            Some("av-secret-sentinel")
+        );
+        assert!(!e.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!e.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!e.contains_key("ANTHROPIC_MODEL"));
+        // a003: the key is NEVER written into any workspace file (mcp_config /
+        // settings carry no credential).
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    !raw.contains("av-secret-sentinel"),
+                    "a003: the api_key leaked into workspace file {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // a69 / task 4.4: a read-only role's generated tool restriction allows the
+    // read tools + the role's `submit_*` tool AND denies shell/write/edit.
+    #[test]
+    fn antigravity_readonly_restriction_allows_read_and_submit_denies_write_edit_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            mcp_role: Some("reviewer"),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let _ = strat.build_command(&bctx);
+
+        let raw = std::fs::read_to_string(tmp.path().join("agy_settings.json"))
+            .expect("agy_settings.json written for a read-only role");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let allow: Vec<String> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect();
+        for t in ["Read", "Glob", "Grep"] {
+            assert!(allow.iter().any(|a| a == t), "read tool {t} allowed: {allow:?}");
+        }
+        let submit = crate::mcp_askuser_server::qualified_tool_name(
+            crate::mcp_askuser_server::submission_tool_name_for_role("reviewer").unwrap(),
+        );
+        assert!(
+            allow.contains(&submit),
+            "the role's submit_* tool {submit} is allowed: {allow:?}"
+        );
+        let deny: Vec<String> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect();
+        for t in ["Write", "Edit", "Bash"] {
+            assert!(deny.iter().any(|d| d == t), "shell/write/edit tool {t} denied: {deny:?}");
+        }
+    }
+
+    // a69 / task 4.4 (converse): a write-enabled role gets no `--sandbox` and
+    // writes no read-only settings file (it may write/edit/run).
+    #[test]
+    fn antigravity_write_role_no_sandbox_no_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = crate::config::default_allowed_tools();
+        let bctx = BuildContext {
+            workspace: tmp.path(),
+            ..ctx(Path::new("/tmp/s.json"), &allowed, true, false, None)
+        };
+        let strat = AntigravityStrategy::new("agy".into(), Vec::new());
+        let cmd = strat.build_command(&bctx);
+        assert!(
+            !args(&cmd).iter().any(|x| x == "--sandbox"),
+            "a write-enabled role gets no --sandbox"
+        );
+        assert!(!tmp.path().join("agy_settings.json").exists());
+    }
+
+    // a69 (spec scenario "Capture mode only"): an agy role runs through
+    // `agentic_run` in capture mode — stdout read at exit, NO streaming-JSON
+    // parse (no final_answer / session_id / structured log).
+    #[tokio::test]
+    async fn antigravity_role_runs_through_agentic_run_in_capture_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("agy_stub.sh");
+        std::fs::write(&stub, "#!/bin/sh\ncat >/dev/null\necho 'agy stub done'\n").unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let strat = AntigravityStrategy::new(stub.to_string_lossy().into_owned(), Vec::new());
+        let outcome = agentic_run(AgenticRunOpts {
+            workspace: tmp.path(),
+            change: "reviewer",
+            strategy: &strat,
+            prompt: "review this change",
+            sandbox: SandboxConfig {
+                allowed_tools: vec!["Read".to_string()],
+                disallowed_bash_patterns: Vec::new(),
+                disallowed_read_paths: Vec::new(),
+                deny_writes: true,
+            },
+            model: None,
+            output_mode: OutputMode::Capture,
+            timeout: std::time::Duration::from_secs(30),
+            paths: None,
+            settings_dir: Some(tmp.path()),
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: false,
+            etxtbsy_retry_spawn: false,
+            os_sandbox: crate::sandbox::RunSandbox::default(),
+        })
+        .await
+        .expect("agentic_run completes for the agy stub");
+
+        assert!(!outcome.timed_out);
+        assert!(
+            outcome.stdout.contains("agy stub done"),
+            "capture mode reads stdout at exit: {:?}",
+            outcome.stdout
+        );
+        assert!(outcome.final_answer.is_none(), "capture mode parses no final_answer");
+        assert!(outcome.session_id.is_none(), "capture mode parses no session_id");
+        assert!(!outcome.streamed_log, "capture mode writes no streaming log");
+        // The agy strategy wrote mcp_config.json — NOT .mcp.json / opencode.json.
+        assert!(tmp.path().join("mcp_config.json").exists());
+        assert!(!tmp.path().join(".mcp.json").exists());
+        assert!(!tmp.path().join("opencode.json").exists());
+    }
+
+    // a69 / task 4.5: a read-only agy run that escapes a write (non-empty
+    // post-run `git status --porcelain`) is caught by the `WritePolicy::None`
+    // backstop — `detect_write_policy_violation` flags it (the run fails) AND
+    // `git reset --hard HEAD` + `git clean -fd` revert it. CLI-agnostic: the
+    // enforcement runs on git status after ANY strategy's run.
+    #[tokio::test]
+    async fn antigravity_escaped_write_caught_by_write_policy_none_backstop() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command as StdCommand;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // A committed baseline so `git status` is clean before the run.
+        let git = |args: &[&str]| {
+            StdCommand::new("git")
+                .args(args)
+                .current_dir(ws)
+                .output()
+                .expect("git runs")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(ws.join("baseline.txt"), "baseline\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "baseline"]);
+
+        // An agy stub standing in for a read-only role that nonetheless writes
+        // a stray file (the synthetic escaped write the spike probes).
+        let stub = ws.join("agy_stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncat >/dev/null\necho INTRUDER > escaped.txt\necho done\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let strat = AntigravityStrategy::new(stub.to_string_lossy().into_owned(), Vec::new());
+        let _ = agentic_run(AgenticRunOpts {
+            workspace: ws,
+            change: "reviewer",
+            strategy: &strat,
+            prompt: "review",
+            sandbox: SandboxConfig {
+                allowed_tools: vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()],
+                disallowed_bash_patterns: Vec::new(),
+                disallowed_read_paths: Vec::new(),
+                deny_writes: true,
+            },
+            model: None,
+            output_mode: OutputMode::Capture,
+            timeout: std::time::Duration::from_secs(30),
+            paths: None,
+            settings_dir: Some(ws),
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: false,
+            etxtbsy_retry_spawn: false,
+            os_sandbox: crate::sandbox::RunSandbox::default(),
+        })
+        .await
+        .expect("agentic_run completes for the agy stub");
+
+        // The escaped write landed.
+        assert!(ws.join("escaped.txt").exists(), "the stub wrote escaped.txt");
+        let entries = crate::git::status_entries(ws).expect("git status");
+        // WritePolicy::None enforcement: a non-empty status is a violation
+        // (the run fails) regardless of which CLI produced it.
+        assert!(
+            crate::audits::scheduler::detect_write_policy_violation(
+                crate::audits::WritePolicy::None,
+                &entries,
+            )
+            .is_some(),
+            "a non-empty post-run status must trip the WritePolicy::None violation (run failure)"
+        );
+        // The revert the enforcement performs.
+        crate::git::reset_hard_head(ws).unwrap();
+        crate::git::clean_force(ws).unwrap();
+        let porcelain = crate::git::status_porcelain(ws).unwrap();
+        assert!(
+            porcelain.trim().is_empty(),
+            "the escaped write must be reverted; got: {porcelain}"
+        );
+        assert!(
+            !ws.join("escaped.txt").exists(),
+            "escaped.txt must not persist into the workspace"
+        );
     }
 
     // -----------------------------------------------------------------------
