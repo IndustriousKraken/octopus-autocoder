@@ -693,6 +693,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     registry.register(Arc::new(CanonContradictionAudit::new(
         &audit_settings,
         &cfg.executor,
+        &daemon_paths,
     )));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so

@@ -25,7 +25,12 @@
 //!   - Re-report suppression: reported pairs are persisted (keyed by an
 //!     order-independent capability+title pair plus a content hash of each
 //!     requirement) so an unhealed contradiction does not re-spam chatops,
-//!     while an edited pair re-surfaces and a healed pair is pruned.
+//!     while an edited pair re-surfaces and a healed pair is pruned. The
+//!     suppression state is daemon bookkeeping, so it lives under
+//!     `<state_dir>/canon-contradiction-state/<workspace-basename>.json`
+//!     (resolved via `DaemonPaths`), NOT in the managed repo's workspace —
+//!     per the canonical "Workspaces, markers, and state move to standard
+//!     locations" requirement.
 //!
 //! `requires_head_change = true` — a canon contradiction can only emerge
 //! when the canon changes. `WritePolicy::None` — the audit never writes
@@ -43,6 +48,7 @@ use super::{
     workspace_is_valid, workspace_unavailable_outcome,
 };
 use crate::config::{AuditSettings, ChunkStrategy, ExecutorConfig, ResolvedSandbox};
+use crate::paths::DaemonPaths;
 use crate::prompts::{PromptId, PromptLoader};
 
 /// Tools the audit agent may call. Read-only by construction: NO `Bash`,
@@ -64,18 +70,18 @@ const DEFAULT_RETRIEVAL_BREADTH: u64 = 8;
 /// `audits.settings.canon_contradiction_audit.extra.max_findings_per_run`.
 const DEFAULT_MAX_FINDINGS_PER_RUN: u64 = 20;
 
-/// Sibling state file holding this audit's re-report suppression records.
-/// Kept distinct from `.audit-state.json` (which the scheduler owns AND
-/// re-saves after every audit run, so co-locating suppression there would
-/// be clobbered). Registered in `.git/info/exclude` before it is written
-/// so the `WritePolicy::None` post-hoc clean-tree check sees a clean tree.
-const REPORT_STATE_FILE: &str = ".canon-contradiction-audit-state.json";
-
 pub struct CanonContradictionAudit {
     settings: AuditSettings,
     executor_command: String,
     executor_timeout_secs: u64,
     sandbox: ResolvedSandbox,
+    /// Directory under `<state_dir>` holding this audit's per-workspace
+    /// re-report suppression state (`<basename>.json`). Resolved from the
+    /// daemon-threaded [`DaemonPaths`] at construction so the state is
+    /// daemon bookkeeping under `<state_dir>`, NOT a file in the managed
+    /// repo's workspace (per the canonical "standard locations"
+    /// requirement). Cf. `alert_state` / `failure_state` / `revisions`.
+    report_state_dir: PathBuf,
     /// Override for the directory the per-invocation sandbox settings file
     /// is written to. `None` (production) means `std::env::temp_dir()`.
     settings_dir: Option<PathBuf>,
@@ -96,6 +102,7 @@ impl CanonContradictionAudit {
     pub fn new(
         audit_settings: &HashMap<String, AuditSettings>,
         executor: &ExecutorConfig,
+        paths: &DaemonPaths,
     ) -> Self {
         let settings = audit_settings.get(Self::TYPE).cloned().unwrap_or_default();
         let sandbox = ResolvedSandbox::resolve(executor.sandbox.as_ref());
@@ -104,6 +111,7 @@ impl CanonContradictionAudit {
             executor_command: executor.command.clone(),
             executor_timeout_secs: executor.timeout_secs,
             sandbox,
+            report_state_dir: paths.canon_contradiction_state_dir(),
             settings_dir: None,
             #[cfg(test)]
             test_submission: None,
@@ -180,6 +188,18 @@ impl CanonContradictionAudit {
             None,
             workspace,
         ))
+    }
+
+    /// The per-workspace re-report suppression state file under
+    /// `<state_dir>/canon-contradiction-state/`, keyed by the workspace
+    /// basename (mirrors `DaemonPaths::alert_state_path`). The file is
+    /// daemon bookkeeping, NOT an in-tree marker.
+    fn report_state_path(&self, workspace: &Path) -> PathBuf {
+        let basename = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        self.report_state_dir.join(format!("{basename}.json"))
     }
 }
 
@@ -329,23 +349,18 @@ impl Audit for CanonContradictionAudit {
             .map(|c| DetectedPair::from_contradiction(c, &req_index))
             .collect();
 
-        // Re-report suppression. Register the state file in
-        // `.git/info/exclude` BEFORE writing it so the post-hoc clean-tree
-        // check (WritePolicy::None) does not flag it.
-        if let Err(e) = crate::workspace::ensure_git_info_excluded(ctx.workspace, REPORT_STATE_FILE)
-        {
-            // no-url: audit driver, ctx.repo.url is available for context
-            tracing::warn!(
-                url = %ctx.repo.url,
-                "canon_contradiction_audit: could not register {REPORT_STATE_FILE} in .git/info/exclude: {e:#}"
-            );
-        }
-        let mut report_state = ReportState::load_or_default(ctx.workspace);
+        // Re-report suppression. The state lives under `<state_dir>` (NOT
+        // in the workspace), so it is daemon bookkeeping that never appears
+        // in the managed repo's working tree — no `.git/info/exclude`
+        // registration is needed AND the `WritePolicy::None` post-hoc
+        // clean-tree check is satisfied trivially.
+        let state_path = self.report_state_path(ctx.workspace);
+        let mut report_state = ReportState::load_or_default(&state_path);
         let (to_report, new_reported) =
             apply_suppression(detected_pairs, &report_state.reported, cap);
         let suppressed = detected.len().saturating_sub(to_report.len());
         report_state.reported = new_reported;
-        if let Err(e) = report_state.save(ctx.workspace) {
+        if let Err(e) = report_state.save(&state_path) {
             tracing::warn!(
                 url = %ctx.repo.url,
                 "canon_contradiction_audit: failed to persist report state: {e:#}"
@@ -673,7 +688,8 @@ fn build_requirement_index(workspace: &Path) -> HashMap<(String, String), String
 }
 
 // ---------------------------------------------------------------------------
-// Re-report suppression state (persisted in a git-excluded sibling file).
+// Re-report suppression state (persisted under `<state_dir>`, keyed by
+// workspace basename — daemon bookkeeping, never in the repo workspace).
 // ---------------------------------------------------------------------------
 
 /// The two content hashes of a recorded contradiction pair, ordered to
@@ -693,13 +709,13 @@ pub(crate) struct ReportState {
 }
 
 impl ReportState {
-    /// Load the per-workspace report state. Missing → empty default;
-    /// corrupt → WARN + empty default (never blocks the audit).
-    pub fn load_or_default(workspace: &Path) -> Self {
-        let path = workspace.join(REPORT_STATE_FILE);
-        match std::fs::read_to_string(&path) {
+    /// Load the report state from the given file path (under `<state_dir>`).
+    /// Missing → empty default; corrupt → WARN + empty default (never blocks
+    /// the audit).
+    pub fn load_or_default(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                // no-url: report-state loader keyed on workspace path
+                // no-url: report-state loader keyed on state-dir path
                 tracing::warn!(
                     "canon_contradiction_audit report state at {} is corrupt; starting empty: {e:#}",
                     path.display()
@@ -717,9 +733,9 @@ impl ReportState {
         }
     }
 
-    /// Atomically persist via tempfile-then-rename in the workspace dir.
-    pub fn save(&self, workspace: &Path) -> Result<()> {
-        let path = workspace.join(REPORT_STATE_FILE);
+    /// Atomically persist to the given file path via tempfile-then-rename in
+    /// its parent directory (created if absent).
+    pub fn save(&self, path: &Path) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
@@ -854,6 +870,16 @@ mod tests {
         std::mem::forget(td);
         AuditLogWriter::open(&paths, workspace, "canon_contradiction_audit")
             .expect("log writer opens")
+    }
+
+    /// A tempdir-scoped [`DaemonPaths`] for constructing the audit. The
+    /// tempdir is leaked (as `make_log_writer` does) so the resolved
+    /// `<state_dir>/canon-contradiction-state/` survives for the duration
+    /// of the test, including across the run-1/run-2 suppression checks.
+    fn test_paths() -> DaemonPaths {
+        let (td, paths) = crate::testing::test_daemon_paths();
+        std::mem::forget(td);
+        paths
     }
 
     /// Build a workspace with the given capability→spec.md map and a bare
@@ -1155,9 +1181,12 @@ mod tests {
 
     #[test]
     fn report_state_round_trips_and_handles_missing_and_corrupt() {
-        let ws = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        // The state file lives under a state-dir-shaped subdir (created on
+        // save), NOT in any repo workspace.
+        let path = dir.path().join("canon-contradiction-state/repo.json");
         // missing → empty
-        let s = ReportState::load_or_default(ws.path());
+        let s = ReportState::load_or_default(&path);
         assert!(s.reported.is_empty());
         // round-trip
         let mut s2 = ReportState::default();
@@ -1168,12 +1197,12 @@ mod tests {
                 hash_1: "h1".into(),
             },
         );
-        s2.save(ws.path()).unwrap();
-        let reloaded = ReportState::load_or_default(ws.path());
+        s2.save(&path).unwrap();
+        let reloaded = ReportState::load_or_default(&path);
         assert_eq!(reloaded, s2);
         // corrupt → empty
-        std::fs::write(ws.path().join(REPORT_STATE_FILE), "{not json").unwrap();
-        let s3 = ReportState::load_or_default(ws.path());
+        std::fs::write(&path, "{not json").unwrap();
+        let s3 = ReportState::load_or_default(&path);
         assert!(s3.reported.is_empty());
     }
 
@@ -1211,7 +1240,7 @@ mod tests {
     #[test]
     fn audit_type_and_policy_are_fixed() {
         let cfg = executor_cfg("/bin/true");
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg);
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths());
         assert_eq!(audit.audit_type(), "canon_contradiction_audit");
         assert!(audit.requires_head_change());
         assert!(matches!(audit.write_policy(), WritePolicy::None));
@@ -1234,7 +1263,7 @@ mod tests {
             },
         );
         let cfg = executor_cfg("claude");
-        let audit = CanonContradictionAudit::new(&map, &cfg);
+        let audit = CanonContradictionAudit::new(&map, &cfg, &test_paths());
         assert_eq!(audit.retrieval_breadth(), 12);
         assert_eq!(audit.max_findings_per_run(), 3);
     }
@@ -1242,7 +1271,7 @@ mod tests {
     #[test]
     fn knob_defaults_apply_when_absent_or_zero() {
         let cfg = executor_cfg("claude");
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg);
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths());
         assert_eq!(audit.retrieval_breadth(), DEFAULT_RETRIEVAL_BREADTH);
         assert_eq!(
             audit.max_findings_per_run(),
@@ -1253,7 +1282,7 @@ mod tests {
     #[test]
     fn resolve_prompt_uses_embedded_default() {
         let cfg = executor_cfg("/bin/true");
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg);
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths());
         let prompt = audit.resolve_prompt(None).expect("default resolves");
         assert!(prompt.contains("submit_canon_internal_contradictions"));
         assert!(prompt.contains("openspec/specs"));
@@ -1287,7 +1316,8 @@ mod tests {
             "Document store",
             "Relational-only vs document-store: cannot both hold.",
         )]);
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let paths = test_paths();
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &paths)
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_submission(Some(sub))
             .with_rag_enabled(true);
@@ -1309,16 +1339,28 @@ mod tests {
             }
             other => panic!("expected Reported, got {other:?}"),
         }
-        // The audit must not modify the canon (WritePolicy::None). The only
-        // file it writes is the git-excluded report-state sibling.
+        // The audit must not modify the canon (WritePolicy::None). It writes
+        // NO file into the workspace — the suppression state lives under
+        // `<state_dir>`, so the tree is clean with no `.git/info/exclude`
+        // dance required.
         let entries = crate::git::status_entries(workspace).expect("status");
         assert!(
             entries.is_empty(),
-            "tree must be clean after run (report-state file is git-excluded); got: {entries:?}"
+            "tree must be clean after run (state lives under <state_dir>, not the workspace); got: {entries:?}"
+        );
+        let basename = workspace.file_name().unwrap().to_str().unwrap();
+        let state_file = paths
+            .canon_contradiction_state_dir()
+            .join(format!("{basename}.json"));
+        assert!(
+            state_file.exists(),
+            "report state must be persisted under <state_dir> at {}",
+            state_file.display()
         );
         assert!(
-            workspace.join(REPORT_STATE_FILE).exists(),
-            "report state must be persisted"
+            state_file.starts_with(&paths.state),
+            "report state must live under <state_dir>, not the workspace: {}",
+            state_file.display()
         );
         let log = std::fs::read_to_string(&log_path).expect("log");
         assert!(log.contains("canon_contradiction_audit_rag"));
@@ -1335,7 +1377,7 @@ mod tests {
         let script = write_script(workspace, "fake.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths())
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_submission(Some(serde_json::json!({ "contradictions": [] })))
             .with_rag_enabled(false);
@@ -1371,7 +1413,7 @@ mod tests {
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
         // `with_submission(None)` simulates "agent never submitted".
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths())
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_submission(None);
         let repo = fixture_repo();
@@ -1405,7 +1447,7 @@ mod tests {
         let script = write_script(workspace, "fake.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths())
             .with_settings_dir(settings_dir.path().to_path_buf())
             .with_submission(Some(serde_json::json!({ "wrong": [] })));
         let repo = fixture_repo();
@@ -1431,7 +1473,7 @@ mod tests {
         let script = write_script(workspace, "fail.sh", "#!/bin/sh\necho boom >&2\nexit 7\n");
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths())
             .with_settings_dir(settings_dir.path().to_path_buf());
         let repo = fixture_repo();
         let mut ctx = AuditContext {
@@ -1473,10 +1515,13 @@ mod tests {
             "cannot both hold",
         )]);
         let repo = fixture_repo();
+        // Both runs share one state dir so the persisted suppression state
+        // from run 1 is visible to run 2.
+        let paths = test_paths();
 
         // Run 1 reports the pair.
         {
-            let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+            let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &paths)
                 .with_settings_dir(settings_dir.path().to_path_buf())
                 .with_submission(Some(sub.clone()));
             let mut ctx = AuditContext {
@@ -1493,7 +1538,7 @@ mod tests {
         }
         // Run 2 (same canon, same detection) suppresses.
         {
-            let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+            let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &paths)
                 .with_settings_dir(settings_dir.path().to_path_buf())
                 .with_submission(Some(sub.clone()));
             let mut ctx = AuditContext {
@@ -1518,7 +1563,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let cfg = executor_cfg("/bin/true");
         let settings_dir = TempDir::new().unwrap();
-        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg)
+        let audit = CanonContradictionAudit::new(&HashMap::new(), &cfg, &test_paths())
             .with_settings_dir(settings_dir.path().to_path_buf());
         let repo = fixture_repo();
         let mut ctx = AuditContext {

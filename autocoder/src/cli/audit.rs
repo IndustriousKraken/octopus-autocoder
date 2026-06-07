@@ -160,6 +160,7 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
     registry.register(std::sync::Arc::new(CanonContradictionAudit::new(
         &audit_settings,
         &executor_cfg,
+        paths,
     )));
 
     let audit_arc = registry

@@ -3027,6 +3027,7 @@ mod tests {
             "kind: claude_cli\ncommand: claude\ntimeout_secs: 600\n",
         )
         .expect("test executor config");
+        let (_paths_td, paths) = crate::testing::test_daemon_paths();
         let audits: Vec<Arc<dyn Audit>> = vec![
             Arc::new(crate::audits::brightline::ArchitectureBrightlineAudit::new(
                 &audit_settings,
@@ -3050,6 +3051,7 @@ mod tests {
                 crate::audits::canon_contradiction::CanonContradictionAudit::new(
                     &audit_settings,
                     &executor,
+                    &paths,
                 ),
             ),
         ];
