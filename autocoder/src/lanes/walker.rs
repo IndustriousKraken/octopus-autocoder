@@ -264,6 +264,13 @@ async fn map_issue_outcome(
             let _ = state::record_failure(paths, workspace, slug, &reason);
             IssueStep::Failed { reason }
         }
+        Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+            // a74: surfaced only on the revise path today; the issues lane is
+            // out of scope. Treat it as a failure (defensive — never produced
+            // here at runtime).
+            let _ = state::record_failure(paths, workspace, slug, &reason);
+            IssueStep::Failed { reason }
+        }
         Err(e) => {
             let reason = format!("executor errored: {e:#}");
             let _ = state::record_failure(paths, workspace, slug, &reason);

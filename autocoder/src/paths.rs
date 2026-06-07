@@ -163,6 +163,18 @@ impl DaemonPaths {
         self.alert_state_dir().join(format!("{workspace_basename}.json"))
     }
 
+    /// `<state>/canon-contradiction-state/` — per-workspace re-report
+    /// suppression state for the canon-internal contradiction audit (a75).
+    /// One file per workspace, named `<workspace-basename>.json` (the audit
+    /// joins the basename). Lives under `<state>/` (NOT inside the
+    /// workspace) so the suppression bookkeeping never appears in the
+    /// managed repo's working tree, per the "Workspaces, markers, and state
+    /// move to standard locations" requirement — it is daemon bookkeeping,
+    /// not an in-tree marker file.
+    pub fn canon_contradiction_state_dir(&self) -> PathBuf {
+        self.state.join("canon-contradiction-state")
+    }
+
     /// `<logs>/runs/<basename>/` — per-change run logs for the named
     /// workspace.
     pub fn run_logs_dir(&self, workspace_basename: &str) -> PathBuf {

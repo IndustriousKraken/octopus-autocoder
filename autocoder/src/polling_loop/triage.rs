@@ -119,6 +119,17 @@ pub async fn process_audit_triages(
                 );
                 mark_triage_failed(paths, &state_root, &mut state, reason, chatops_ctx).await;
             }
+            Ok(crate::executor::ExecutorOutcome::PreconditionUnmet { reason }) => {
+                // a74: surfaced only on the revise path today; triage is out of
+                // scope. Treat it as a failure (defensive — never produced here
+                // at runtime).
+                tracing::error!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor returned PreconditionUnmet: {reason}"
+                );
+                mark_triage_failed(paths, &state_root, &mut state, reason, chatops_ctx).await;
+            }
             Ok(crate::executor::ExecutorOutcome::AskUser { .. }) => {
                 // Triage's escalation: the agent asked a question. The
                 // existing chatops escalation machinery is per-change;

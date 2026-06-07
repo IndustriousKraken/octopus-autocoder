@@ -519,6 +519,12 @@ async fn process_one_request(
             commit_and_open_pr(workspace, repo, github_cfg, chatops_ctx, state_root, state).await
         }
         ExecutorOutcome::Failed { reason } => Err(anyhow!("executor failed: {reason}")),
+        // a74: surfaced only on the revise path today; the changelog flow is
+        // out of scope. Treat it as a failure (defensive — never produced here
+        // at runtime).
+        ExecutorOutcome::PreconditionUnmet { reason } => {
+            Err(anyhow!("executor reported PreconditionUnmet: {reason}"))
+        }
         ExecutorOutcome::AskUser { .. } => Err(anyhow!(
             "executor returned AskUser; changelog flow does not support clarification"
         )),
@@ -933,6 +939,11 @@ async fn re_run_stylist_and_force_push(
         ExecutorOutcome::Completed { .. } => {}
         ExecutorOutcome::Failed { reason } => {
             return Err(anyhow!("executor failed: {reason}"));
+        }
+        // a74: surfaced only on the revise path today; out of scope here.
+        // Treat it as a failure (defensive — never produced here at runtime).
+        ExecutorOutcome::PreconditionUnmet { reason } => {
+            return Err(anyhow!("executor reported PreconditionUnmet: {reason}"));
         }
         ExecutorOutcome::AskUser { .. } => {
             return Err(anyhow!("executor returned AskUser; not supported here"));

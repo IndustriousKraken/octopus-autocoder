@@ -19,6 +19,7 @@
 
 pub mod architecture_consultative;
 pub mod brightline;
+pub mod canon_contradiction;
 pub mod documentation_audit;
 pub mod drift;
 pub mod missing_tests;
@@ -1198,6 +1199,16 @@ pub fn register_submission_schemas(store: &crate::submission_store::SubmissionSt
     store.register_schema(
         documentation_audit::DocumentationAudit::TYPE,
         Arc::new(|p: &serde_json::Value| documentation_audit::payload_to_findings(p).map(|_| ())),
+    );
+    // a75: the canon-internal contradiction audit's
+    // `submit_canon_internal_contradictions` payload schema. The validator
+    // IS `payload_to_contradictions` with its `Ok` value discarded, so a
+    // payload that records successfully is exactly one that maps.
+    store.register_schema(
+        canon_contradiction::CanonContradictionAudit::TYPE,
+        Arc::new(|p: &serde_json::Value| {
+            canon_contradiction::payload_to_contradictions(p).map(|_| ())
+        }),
     );
 }
 
@@ -3016,6 +3027,7 @@ mod tests {
             "kind: claude_cli\ncommand: claude\ntimeout_secs: 600\n",
         )
         .expect("test executor config");
+        let (_paths_td, paths) = crate::testing::test_daemon_paths();
         let audits: Vec<Arc<dyn Audit>> = vec![
             Arc::new(crate::audits::brightline::ArchitectureBrightlineAudit::new(
                 &audit_settings,
@@ -3035,6 +3047,13 @@ mod tests {
                 &audit_settings,
                 &executor,
             )),
+            Arc::new(
+                crate::audits::canon_contradiction::CanonContradictionAudit::new(
+                    &audit_settings,
+                    &executor,
+                    &paths,
+                ),
+            ),
         ];
         for a in &audits {
             let d = a.description();

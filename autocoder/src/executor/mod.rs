@@ -334,6 +334,18 @@ pub enum ExecutorOutcome {
     /// Unrecoverable failure. autocoder unlocks the change and does
     /// NOT archive it.
     Failed { reason: String },
+    /// a74: the agentic run could not START because a required precondition
+    /// was unmet — the agent subprocess never spawned. The motivating case is
+    /// the a006 OS-sandbox-mechanism gate refusing to spawn when no usable
+    /// mechanism is available AND the operator has not opted into unsandboxed
+    /// operation. DISTINCT from `Failed` (where the subprocess ran and THEN
+    /// the task failed): no revision/implementation work was attempted. The
+    /// distinction is carried by THIS variant (the outcome kind), NOT a
+    /// message substring, so callers branch reliably. The revise dispatcher
+    /// posts a guiding failure reply AND consumes the trigger (manual
+    /// re-trigger — an unmet precondition will not heal between polls) but does
+    /// NOT charge a revision slot.
+    PreconditionUnmet { reason: String },
     /// The agent inspected `tasks.md` and identified one or more tasks
     /// that require capabilities outside its sandbox. autocoder writes
     /// a `.needs-spec-revision.json` marker, posts a chatops alert under

@@ -738,9 +738,61 @@ pub enum SpawnPlan {
     Unsandboxed,
 }
 
+/// The operator-facing message carried by [`SandboxMechanismUnavailable`] —
+/// the fail-closed gate's refusal text (mechanisms missing + the remedy). A
+/// const so the typed error AND any diagnostic share one source of truth.
+pub const SANDBOX_GATE_REFUSAL_MESSAGE: &str =
+    "no platform-appropriate OS sandbox mechanism is available on this \
+     host: on Linux neither `systemd-run` (transient service mode) nor \
+     `bwrap` can apply the sandbox; on macOS `sandbox-exec` is \
+     unavailable. Refusing to spawn an unsandboxed agentic subprocess. \
+     Install/enable one of them, or set \
+     `executor.sandbox.allow_unsandboxed: true` to override (NOT \
+     recommended — the model could then reach host credentials).";
+
+/// The pre-spawn refusal raised by [`decide_spawn`] when no OS sandbox
+/// mechanism is available AND the operator has NOT opted into unsandboxed
+/// operation (a74). A *typed* error — NOT a bare `anyhow!` — so callers branch
+/// on its KIND via [`precondition_unmet_message`] (`downcast_ref` through the
+/// `anyhow` chain) rather than matching the message text. This is a
+/// *precondition-unmet* failure: the agent subprocess never started, so the
+/// revise path treats it distinctly from a substantive `Failed` (no revision
+/// slot charged; manual re-trigger).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMechanismUnavailable {
+    /// The operator-facing guidance (mechanisms missing + the remedy).
+    pub message: String,
+}
+
+impl std::fmt::Display for SandboxMechanismUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SandboxMechanismUnavailable {}
+
+/// The guidance message from the sandbox-mechanism gate's pre-spawn refusal,
+/// if `err` — or anything in its `anyhow` cause chain — carries one (a74);
+/// `None` for any other error (so `is_some()` doubles as the precondition-unmet
+/// predicate). When `Some`, the agentic run could not START because a required
+/// precondition was unmet (the subprocess never spawned), as opposed to a
+/// substantive failure where the subprocess ran and then failed. Driven by the
+/// error's KIND ([`SandboxMechanismUnavailable`] via `downcast`), NOT by
+/// matching message text, so callers branch reliably — and it survives the
+/// `.context(...)` wrapper `agentic_run` adds. Used by the executor to surface
+/// the precondition-unmet reason on its outcome.
+pub fn precondition_unmet_message(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<SandboxMechanismUnavailable>())
+        .map(|e| e.message.clone())
+}
+
 /// Decide how to spawn given the detected mechanism + the unsandboxed opt-in.
-/// Fail-closed: with no mechanism AND no opt-in, return an error naming the
-/// missing mechanisms so NO unsandboxed subprocess is spawned (task 4.1).
+/// Fail-closed: with no mechanism AND no opt-in, return a typed
+/// [`SandboxMechanismUnavailable`] error (classifiable as precondition-unmet)
+/// naming the missing mechanisms so NO unsandboxed subprocess is spawned
+/// (task 4.1).
 pub fn decide_spawn(
     mechanism: Option<SandboxMechanism>,
     allow_unsandboxed: bool,
@@ -748,15 +800,9 @@ pub fn decide_spawn(
     match (mechanism, allow_unsandboxed) {
         (Some(m), _) => Ok(SpawnPlan::Wrap(m)),
         (None, true) => Ok(SpawnPlan::Unsandboxed),
-        (None, false) => Err(anyhow::anyhow!(
-            "no platform-appropriate OS sandbox mechanism is available on this \
-             host: on Linux neither `systemd-run` (transient service mode) nor \
-             `bwrap` can apply the sandbox; on macOS `sandbox-exec` is \
-             unavailable. Refusing to spawn an unsandboxed agentic subprocess. \
-             Install/enable one of them, or set \
-             `executor.sandbox.allow_unsandboxed: true` to override (NOT \
-             recommended — the model could then reach host credentials)."
-        )),
+        (None, false) => Err(anyhow::Error::new(SandboxMechanismUnavailable {
+            message: SANDBOX_GATE_REFUSAL_MESSAGE.to_string(),
+        })),
     }
 }
 
@@ -1379,6 +1425,38 @@ mod tests {
         let err = decide_spawn(None, false).unwrap_err().to_string();
         assert!(err.contains("systemd-run") && err.contains("bwrap"));
         assert!(err.to_lowercase().contains("refus"));
+    }
+
+    // a74 task 1.1: the gate's pre-spawn refusal is classifiable as
+    // precondition-unmet by its KIND (the typed `SandboxMechanismUnavailable`),
+    // surviving an `anyhow` `.context(...)` wrapper — NOT by message substring.
+    #[test]
+    fn gate_refusal_is_classifiable_precondition_unmet_by_kind() {
+        use anyhow::Context as _;
+        let err = decide_spawn(None, false).unwrap_err();
+        assert_eq!(
+            precondition_unmet_message(&err).as_deref(),
+            Some(SANDBOX_GATE_REFUSAL_MESSAGE)
+        );
+        // Through a context layer (as `agentic_run` adds) the kind still
+        // classifies — the helper walks the whole chain.
+        let wrapped =
+            Err::<(), _>(err).context("OS-level sandbox mechanism gate").unwrap_err();
+        assert_eq!(
+            precondition_unmet_message(&wrapped).as_deref(),
+            Some(SANDBOX_GATE_REFUSAL_MESSAGE)
+        );
+    }
+
+    // a74 task 1.2: a substantive error (subprocess ran, then failed) is NOT
+    // classified as precondition-unmet — even when its message happens to
+    // mention the same words, classification keys off the error KIND.
+    #[test]
+    fn substantive_error_is_not_precondition_unmet() {
+        let substantive = anyhow::anyhow!(
+            "executor exited with status 1: systemd-run bwrap refusing nonsense"
+        );
+        assert!(precondition_unmet_message(&substantive).is_none());
     }
 
     #[test]

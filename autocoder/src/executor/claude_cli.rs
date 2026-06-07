@@ -1641,7 +1641,21 @@ impl Executor for ClaudeCliExecutor {
             .spawn_agentic_session(workspace, change, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
-        let outcome = outcome?;
+        // a74: a pre-spawn precondition refusal (the a006 OS-sandbox-mechanism
+        // gate, which fails BEFORE the subprocess is spawned) is NOT a
+        // substantive task failure — no revision work was attempted. Surface
+        // it as the classifiable `PreconditionUnmet` outcome (by KIND, via the
+        // typed sandbox error) so the revise dispatcher does not charge a
+        // revision slot. Any other executor error propagates unchanged.
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(reason) = crate::sandbox::precondition_unmet_message(&e) {
+                    return Ok(ExecutorOutcome::PreconditionUnmet { reason });
+                }
+                return Err(e);
+            }
+        };
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
         let session_handle = outcome.session_handle.clone();
         let classified = self.classify_outcome(workspace, change, outcome).await?;
