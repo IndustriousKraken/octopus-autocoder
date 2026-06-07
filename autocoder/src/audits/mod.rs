@@ -19,6 +19,7 @@
 
 pub mod architecture_consultative;
 pub mod brightline;
+pub mod canon_consolidation;
 pub mod canon_contradiction;
 pub mod documentation_audit;
 pub mod drift;

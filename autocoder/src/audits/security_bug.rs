@@ -22,7 +22,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{ALLOWED_TOOLS, SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -155,6 +155,8 @@ impl Audit for SecurityBugAudit {
                 openspec_command: &self.openspec_command,
                 prompt_source: &prompt_source,
                 commit_subject: "security-bug proposals",
+                allowed_tools: ALLOWED_TOOLS,
+                include_autocoder_tools: false,
             },
             ctx,
         )
