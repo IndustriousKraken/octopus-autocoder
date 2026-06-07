@@ -125,6 +125,17 @@ pub async fn process_proposal_requests(
                 );
                 mark_proposal_failed(paths, &state_root, &mut state, reason, chatops_ctx).await;
             }
+            Ok(crate::executor::ExecutorOutcome::PreconditionUnmet { reason }) => {
+                // a74: surfaced only on the revise path today; chat-triage is
+                // out of scope. Treat it as a failure (defensive — never
+                // produced here at runtime).
+                tracing::error!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor returned PreconditionUnmet: {reason}"
+                );
+                mark_proposal_failed(paths, &state_root, &mut state, reason, chatops_ctx).await;
+            }
             Ok(crate::executor::ExecutorOutcome::AskUser { .. }) => {
                 tracing::info!(
                     url = %repo.url,

@@ -184,6 +184,14 @@ pub async fn process_pending_brownfield(
             let _ = git::reset_hard_head(workspace);
             let _ = git::clean_force(workspace);
         }
+        Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+            // a74: surfaced only on the revise path today; brownfield-draft is
+            // out of scope. Treat it as a failure (defensive — never produced
+            // here at runtime).
+            mark_failed(workspace, &mut state, reason, chatops_ctx).await;
+            let _ = git::reset_hard_head(workspace);
+            let _ = git::clean_force(workspace);
+        }
         Ok(ExecutorOutcome::AskUser { .. }) => {
             // AskUser leaves the state at InProgress; the existing
             // chatops escalation pipeline posts the question. We do

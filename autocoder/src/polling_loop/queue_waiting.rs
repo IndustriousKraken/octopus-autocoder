@@ -174,6 +174,15 @@ async fn process_one_waiting(
             // to pending state for the next iteration.
             (ResumeDisposition::Failed, Some(reason))
         }
+        Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+            // a74: surfaced only on the revise path today; the resume path is
+            // out of scope. Treat it as a Failed-equivalent so the operator
+            // sees the unhandled case rather than silent loss.
+            tracing::error!(
+                "resume of `{change}` returned PreconditionUnmet: {reason}"
+            );
+            (ResumeDisposition::Failed, Some(reason))
+        }
         Ok(ExecutorOutcome::SpecNeedsRevision {
             unimplementable_tasks,
             revision_suggestion,

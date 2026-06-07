@@ -3210,7 +3210,7 @@ Each polling iteration, before processing pending changes for a repository, the 
 - **AND** the same reply does not trigger a recursive revision
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
-On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); `Failed` → failure reply comment + count increment.
+On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); a substantive `Failed` (the subprocess ran and the task failed) → failure reply comment + count increment; a **precondition-unmet** failure (the agent subprocess never started because a required precondition was unmet, e.g. the OS-sandbox-mechanism gate) → failure reply comment that directs the operator to resolve the precondition AND post a new revision request, with the trigger consumed (manual re-trigger; the daemon does NOT auto-retry, since an unmet precondition will not heal between polls) but the revision count NOT incremented (no revision work was attempted).
 
 For the `Completed` outcome, the daemon SHALL first determine whether the agent produced code changes (a dirty working tree):
 
@@ -3266,6 +3266,14 @@ The combined body SHALL be passed through the existing GitHub-comment-size trunc
 - **THEN** the body is truncated at the largest char boundary fitting under the limit
 - **AND** a truncation marker is appended naming the per-change log file path on disk
 - **AND** the operator can recover the full summary from `<logs_dir>/runs/<workspace-basename>/<change>.log`
+
+#### Scenario: Precondition-unmet revision failure does not count and guides re-trigger
+- **GIVEN** the executor surfaces a precondition-unmet failure for a revision context (the agent subprocess never started, e.g. no usable sandbox mechanism)
+- **WHEN** the revision dispatcher processes the outcome
+- **THEN** the daemon posts a failure reply comment that directs the operator to resolve the precondition AND post a new revision request
+- **AND** the revision-count counter is NOT incremented (no revision was attempted)
+- **AND** the trigger comment's timestamp is advanced so the daemon does NOT auto-retry (manual re-trigger required)
+- **AND** no commit or push is made
 
 ### Requirement: Revision cap per PR, with one-time decline
 The `executor.max_auto_revisions_per_pr` config (default `5`, capped at `20` with WARN-and-clamp at startup; the legacy name `executor.max_revisions_per_pr` is accepted as a serde alias so existing config files load unchanged) SHALL bound only AUTOMATIC revisions per PR — those triggered by reviewer-marked comments carrying the `<!-- reviewer-revision -->` marker (the code-reviewer auto-revise path). Human-initiated `@<bot> revise` comments SHALL NOT be counted against this cap AND SHALL NOT be declined for cap reasons; an operator's deliberate revision request always processes.

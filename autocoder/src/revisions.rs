@@ -1358,6 +1358,49 @@ async fn process_one_pr(
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
+            Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+                // a74: the agent subprocess never STARTED — a required
+                // precondition was unmet (e.g. the a006 OS-sandbox-mechanism
+                // gate refused to spawn with no usable mechanism AND no
+                // unsandboxed opt-in). No revision work was attempted, so this
+                // does NOT charge a revision slot (neither the automatic
+                // `auto_revisions_applied` nor the human `human_revise_count`
+                // counter is incremented). We still post a failure reply that
+                // directs the operator to resolve the precondition AND post a
+                // new revision request, AND we advance the seen-marker so the
+                // daemon does NOT auto-retry — an unmet precondition will not
+                // heal between polls, so a deliberate operator re-trigger is
+                // the right recovery. No commit or push is made.
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    &reason,
+                    &comment_id_str,
+                )
+                .await;
+                let body = format!(
+                    "✗ Revision could not start: {}. The agent subprocess never started, so no revision was attempted AND this does NOT count against the revision cap. Resolve the precondition (see the message above), then reply with another `@{} revise ...` to re-trigger — the daemon will NOT retry automatically.",
+                    reason, bot_username
+                );
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        url = %repo.url,
+                        pr_number = pr.number,
+                        "failed to post precondition-unmet PR comment: {e:#}"
+                    );
+                }
+                // No count increment — no revision was attempted. Consume the
+                // trigger (advance the seen-marker) so it does not re-fire on
+                // the next poll; manual re-trigger is required.
+                advance_seen(&mut latest_seen, comment.created_at);
+                write_state(paths, workspace, &state)?;
+            }
             Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
                 // The revise-lifecycle "failed" notification surfaces the
                 // iteration framing for chat operators. The pending-side
@@ -4568,6 +4611,184 @@ mod tests {
             "counter must not be incremented twice",
         );
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// a74 task 3.1 / 3.3: a precondition-unmet revise failure (the agent
+    /// subprocess never started — e.g. no usable OS sandbox mechanism) does
+    /// NOT increment the revision count AND advances the seen-marker (consumes
+    /// the trigger; manual re-trigger, no auto-retry). The classification is
+    /// driven by the outcome KIND (`ExecutorOutcome::PreconditionUnmet`), NOT a
+    /// message substring: the scripted reason carries no sandbox/gate keyword,
+    /// yet the dispatcher branches correctly and posts a guiding
+    /// "could not start" reply (distinct from `✗ Revision attempt failed`).
+    #[tokio::test]
+    async fn dispatcher_precondition_unmet_does_not_count_and_advances_seen() {
+        let env_var = "REVISIONS_TOKEN_PRECONDITION_UNMET";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(73, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/73/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // The dispatcher posts a guiding "could not start" reply — NOT the
+        // generic `✗ Revision attempt failed:` form used for substantive
+        // failures.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/73/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision could not start".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Synthetic precondition-unmet outcome. The reason text deliberately
+        // carries NO sandbox/gate/mechanism keyword, proving the dispatcher
+        // branches on the outcome KIND, not a message substring (task 3.3).
+        let executor = StubExecutor::new(vec![ExecutorOutcome::PreconditionUnmet {
+            reason: "synthetic unmet precondition for this PR".to_string(),
+        }]);
+        process_revision_requests_at(
+            &paths,
+            &ws,
+            &repo,
+            &gh,
+            None,
+            &executor,
+            None,
+            5,
+            10,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "the comment should be processed exactly once",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 73).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 0,
+            "precondition-unmet must NOT charge an automatic-revision slot (no work attempted)",
+        );
+        assert_eq!(
+            state.human_revise_count, 0,
+            "precondition-unmet must NOT charge the human-revise counter either",
+        );
+        assert_eq!(
+            state.last_seen_comment_at,
+            ts("2026-05-25T11:00:00Z"),
+            "the trigger must be consumed (seen-marker advanced) — manual re-trigger, no auto-retry",
+        );
+
+        token_env_clear(env_var);
+    }
+
+    /// a74 task 3.2: a substantive `Failed` revise outcome (the subprocess ran
+    /// and the task then failed) STILL increments the revision count —
+    /// unchanged behavior, the contrast case for the precondition-unmet
+    /// carve-out above.
+    #[tokio::test]
+    async fn dispatcher_substantive_failed_still_increments_count() {
+        let env_var = "REVISIONS_TOKEN_SUBSTANTIVE_FAILED";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(74, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/74/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/74/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision attempt failed".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Failed {
+            reason: "subprocess ran, then the build failed".to_string(),
+        }]);
+        process_revision_requests_at(
+            &paths,
+            &ws,
+            &repo,
+            &gh,
+            None,
+            &executor,
+            None,
+            5,
+            10,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "the comment should be processed exactly once",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 74).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 1,
+            "a substantive Failed still counts toward the cap (unchanged behavior)",
+        );
+        assert_eq!(
+            state.last_seen_comment_at,
+            ts("2026-05-25T11:00:00Z"),
+            "the trigger is consumed on a substantive failure too",
+        );
 
         token_env_clear(env_var);
     }

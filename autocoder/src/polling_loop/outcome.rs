@@ -23,6 +23,18 @@ pub(crate) async fn handle_outcome(
             tracing::error!("executor reported Failed for `{change}`: {reason}");
             Ok(QueueStep::Failed { reason })
         }
+        Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+            // a74: surfaced only on the revise path today (the pending/
+            // implementer path still propagates the gate refusal as an `Err`,
+            // handled above). The pending-change precondition case is out of
+            // scope for a74 — treat it as `Failed` here so the implementer
+            // path's behavior is unchanged if a future executor entry point
+            // ever produces this variant.
+            tracing::error!(
+                "executor reported PreconditionUnmet for `{change}`: {reason}"
+            );
+            Ok(QueueStep::Failed { reason })
+        }
         Ok(ExecutorOutcome::Aborted { reason }) => {
             // a39: the executor's subprocess was killed by the
             // daemon's own SIGTERM cascade. The classifier set this
