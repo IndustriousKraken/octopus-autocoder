@@ -1163,6 +1163,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         s
@@ -1766,6 +1767,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         s

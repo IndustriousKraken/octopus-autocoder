@@ -254,6 +254,9 @@ impl Audit for DocumentationAudit {
         // a57: run WITH MCP enabled. `submit_findings` coexists with the
         // common `query_canonical_specs` tool (available when canonical_rag
         // is configured); findings arrive via the submission, not stdout.
+        // audit-model-selection: route this audit to its configured model
+        // (if any); `None` keeps the default `claude` strategy.
+        let model = super::audit_resolved_model(&self.settings);
         let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
             &sandbox,
@@ -262,6 +265,7 @@ impl Audit for DocumentationAudit {
             Duration::from_secs(self.executor_timeout_secs),
             self.settings_dir.as_deref(),
             Self::TYPE,
+            model.as_ref(),
         )
         .await
         .context("spawning documentation-audit CLI subprocess")?;
@@ -762,6 +766,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -784,6 +789,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -822,6 +828,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -847,6 +854,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");

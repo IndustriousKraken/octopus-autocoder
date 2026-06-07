@@ -143,6 +143,8 @@ impl Audit for SecurityBugAudit {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<embedded default>".to_string());
+        // audit-model-selection: route to the configured model (if any).
+        let model = super::audit_resolved_model(&self.settings);
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -157,6 +159,7 @@ impl Audit for SecurityBugAudit {
                 commit_subject: "security-bug proposals",
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: false,
+                model: model.as_ref(),
             },
             ctx,
         )
@@ -331,6 +334,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");

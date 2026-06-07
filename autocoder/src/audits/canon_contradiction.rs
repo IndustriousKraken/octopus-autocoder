@@ -280,6 +280,9 @@ impl Audit for CanonContradictionAudit {
             .log_writer
             .write_section("canon_contradiction_audit_prompt", &prompt);
 
+        // audit-model-selection: route this audit to its configured model
+        // (if any); `None` keeps the default `claude` strategy.
+        let model = super::audit_resolved_model(&self.settings);
         let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
             &sandbox,
@@ -288,6 +291,7 @@ impl Audit for CanonContradictionAudit {
             Duration::from_secs(self.executor_timeout_secs),
             self.settings_dir.as_deref(),
             Self::TYPE,
+            model.as_ref(),
         )
         .await
         .context("spawning canon-contradiction-audit CLI subprocess")?;
@@ -724,6 +728,7 @@ impl ReportState {
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
+                // no-url: report-state loader keyed on state-dir path
                 tracing::warn!(
                     "canon_contradiction_audit report state at {} unreadable; starting empty: {e:#}",
                     path.display()
@@ -1260,6 +1265,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("claude");

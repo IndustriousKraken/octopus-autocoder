@@ -1384,6 +1384,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let post_mock = server
@@ -1617,6 +1618,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let repo = fixture_repo();
@@ -1829,6 +1831,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
 

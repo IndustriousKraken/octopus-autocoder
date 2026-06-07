@@ -977,8 +977,11 @@ pub(crate) async fn run_audit_cli(
     prompt: &str,
     timeout: std::time::Duration,
     settings_dir: Option<&Path>,
+    model: Option<&crate::agentic_run::ResolvedModel>,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
-    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
+    // audit-model-selection: select the CLI strategy from the resolved
+    // model's provider (or default to `claude` when no model is configured).
+    let strategy = audit_strategy(command, model)?;
     // a70: a single-shot role — prune the session it creates on completion.
     crate::agentic_run::agentic_run_with_session(
         crate::agentic_run::AgenticRunOpts {
@@ -986,7 +989,7 @@ pub(crate) async fn run_audit_cli(
         // Capture mode never consults `change` (it is only used for the
         // streaming structured-log path); a stable placeholder is fine.
         change: "audit",
-        strategy: &strategy,
+        strategy: strategy.as_ref(),
         prompt,
         sandbox: crate::agentic_run::SandboxConfig {
             allowed_tools: sandbox.allowed_tools.clone(),
@@ -994,7 +997,7 @@ pub(crate) async fn run_audit_cli(
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
             deny_writes: true,
         },
-        model: None,
+        model,
         output_mode: crate::agentic_run::OutputMode::Capture,
         timeout,
         paths: None,
@@ -1004,14 +1007,67 @@ pub(crate) async fn run_audit_cli(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-        // a006: audits are read-only roles — workspace mounted read-only. They
-        // drive the `claude` CLI (self-store `~/.claude`, admitted ro for auth).
-        os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
+        // a006: audits are read-only roles — workspace mounted read-only. The
+        // OS-sandbox CLI kind follows the resolved model's provider (the
+        // wrapped CLI's self-store is admitted ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
         },
         true,
         None,
     )
     .await
+}
+
+/// Resolve the CLI strategy for an audit run (audit-model-selection). When a
+/// model is configured, select the strategy for its provider via
+/// [`crate::agentic_run::strategy_for_provider`] — the same `provider → CLI`
+/// rule the reviewer and executor use (e.g. `openai_compatible` →
+/// `OpencodeStrategy`). With no model, default to the `claude` strategy with
+/// no `--model` override, preserving backward compatibility.
+fn audit_strategy(
+    command: &str,
+    model: Option<&crate::agentic_run::ResolvedModel>,
+) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
+    match model {
+        Some(m) => {
+            crate::agentic_run::strategy_for_provider(m.provider, command.to_string(), Vec::new())
+        }
+        None => Ok(Box::new(crate::agentic_run::ClaudeStrategy::new(
+            command.to_string(),
+            Vec::new(),
+        ))),
+    }
+}
+
+/// The OS-sandbox CLI kind for an audit run (audit-model-selection): the
+/// resolved model's provider's default CLI, or `Claude` when no model is
+/// configured. Kept in lock-step with [`audit_strategy`] so the sandbox's
+/// admitted credential store matches the CLI actually spawned.
+fn audit_cli_kind(model: Option<&crate::agentic_run::ResolvedModel>) -> crate::config::CliKind {
+    match model {
+        Some(m) => crate::config::default_cli_for(m.provider),
+        None => crate::config::CliKind::Claude,
+    }
+}
+
+/// Build the agentic-run [`crate::agentic_run::ResolvedModel`] an audit
+/// threads to its CLI runner from its config-resolved model
+/// (audit-model-selection), or `None` when the audit configured no `model`
+/// (preserving the default `claude` strategy). The credential is empty —
+/// every audit drives a CLI strategy, which authenticates from the wrapped
+/// CLI's own store (a003) and ignores any resolved key.
+pub(crate) fn audit_resolved_model(
+    settings: &crate::config::AuditSettings,
+) -> Option<crate::agentic_run::ResolvedModel> {
+    settings
+        .resolved_model
+        .as_ref()
+        .map(|m| crate::agentic_run::ResolvedModel {
+            provider: m.provider,
+            model: m.model.clone(),
+            api_base_url: m.api_base_url.clone().unwrap_or_default(),
+            api_key: String::new(),
+        })
 }
 
 /// Run an advisory audit's wrapped CLI WITH MCP enabled (a57). Identical
@@ -1028,6 +1084,7 @@ pub(crate) async fn run_audit_cli(
 /// key so the recorder (MCP child) AND the consumer (this module) agree.
 /// The MCP config is deleted on every exit path so the read-only
 /// `WritePolicy::None` post-hoc diff check sees a clean tree.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_audit_cli_with_submit(
     command: &str,
     sandbox: &ResolvedSandbox,
@@ -1036,6 +1093,7 @@ pub(crate) async fn run_audit_cli_with_submit(
     timeout: std::time::Duration,
     settings_dir: Option<&Path>,
     role: &str,
+    model: Option<&crate::agentic_run::ResolvedModel>,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
     // Allow the role's submit tool in addition to the read-only tools AND
     // the auto-included autocoder MCP tools (`ask_user` /
@@ -1053,13 +1111,15 @@ pub(crate) async fn run_audit_cli_with_submit(
     crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(workspace, role, Some(role))
         .context("writing audit MCP config")?;
 
-    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
+    // audit-model-selection: select the CLI strategy from the resolved
+    // model's provider (or default to `claude` when no model is configured).
+    let strategy = audit_strategy(command, model)?;
     // a70: a single-shot role — prune the session it creates on completion.
     let result = crate::agentic_run::agentic_run_with_session(
         crate::agentic_run::AgenticRunOpts {
         workspace,
         change: role,
-        strategy: &strategy,
+        strategy: strategy.as_ref(),
         prompt,
         sandbox: crate::agentic_run::SandboxConfig {
             allowed_tools,
@@ -1067,7 +1127,7 @@ pub(crate) async fn run_audit_cli_with_submit(
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
             deny_writes: true,
         },
-        model: None,
+        model,
         output_mode: crate::agentic_run::OutputMode::Capture,
         timeout,
         paths: None,
@@ -1077,9 +1137,10 @@ pub(crate) async fn run_audit_cli_with_submit(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-        // a006: advisory audits are read-only roles too — read-only workspace,
-        // `claude` self-store.
-        os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
+        // a006: advisory audits are read-only roles too — read-only workspace.
+        // The OS-sandbox CLI kind follows the resolved model's provider
+        // (self-store admitted ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
         },
         true,
         None,
@@ -1632,6 +1693,80 @@ mod tests {
         assert!(
             !msg.contains("validated on retry"),
             "first-attempt success must omit retry parenthetical: {msg}"
+        );
+    }
+
+    /// audit-model-selection: an audit whose resolved model has an
+    /// `openai_compatible` provider selects the `opencode` strategy (via the
+    /// shared `provider → CLI` rule) AND its OS-sandbox CLI kind is
+    /// `Opencode`.
+    #[test]
+    fn audit_with_openai_compatible_model_selects_opencode_strategy() {
+        use crate::config::{CliKind, LlmProvider};
+        let model = crate::agentic_run::ResolvedModel {
+            provider: LlmProvider::OpenAiCompatible,
+            model: "moonshotai/kimi-k2".to_string(),
+            api_base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: String::new(),
+        };
+        // The OS-sandbox CLI kind follows the provider's default CLI.
+        assert_eq!(audit_cli_kind(Some(&model)), CliKind::Opencode);
+        // And the resolved strategy builds an `opencode` invocation.
+        let strat = audit_strategy("opencode", Some(&model))
+            .expect("openai_compatible resolves to the opencode strategy");
+        let tmp = TempDir::new().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let settings = tmp.path().join("s.json");
+        let bctx = crate::agentic_run::BuildContext {
+            settings_path: &settings,
+            allowed_tools: &allowed,
+            include_autocoder_tools: false,
+            emit_stream_json: false,
+            resume_session_id: None,
+            workspace: tmp.path(),
+            mcp_role: None,
+            model: Some(&model),
+        };
+        let cmd = strat.build_command(&bctx);
+        assert_eq!(
+            cmd.as_std().get_program().to_string_lossy(),
+            "opencode",
+            "an openai_compatible audit must spawn the opencode CLI"
+        );
+    }
+
+    /// audit-model-selection (backward compatibility): an audit with no
+    /// configured model resolves to `None`, defaults to the `claude` CLI
+    /// strategy, AND its OS-sandbox CLI kind is `Claude`.
+    #[test]
+    fn audit_without_model_defaults_to_claude_strategy() {
+        use crate::config::{AuditSettings, CliKind};
+        let settings = AuditSettings::default();
+        assert!(
+            audit_resolved_model(&settings).is_none(),
+            "an audit with no model field must resolve to None"
+        );
+        assert_eq!(audit_cli_kind(None), CliKind::Claude);
+        let strat =
+            audit_strategy("claude", None).expect("None defaults to the claude strategy");
+        let tmp = TempDir::new().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let settings_path = tmp.path().join("s.json");
+        let bctx = crate::agentic_run::BuildContext {
+            settings_path: &settings_path,
+            allowed_tools: &allowed,
+            include_autocoder_tools: false,
+            emit_stream_json: false,
+            resume_session_id: None,
+            workspace: tmp.path(),
+            mcp_role: None,
+            model: None,
+        };
+        let cmd = strat.build_command(&bctx);
+        assert_eq!(
+            cmd.as_std().get_program().to_string_lossy(),
+            "claude",
+            "an audit with no model must spawn the default claude CLI"
         );
     }
 

@@ -81,6 +81,11 @@ pub(crate) struct SpecsWritingAuditParams<'a> {
     /// `query_canonical_specs` when a21's RAG is enabled. `false` keeps the
     /// no-MCP capture path the missing-tests / security-bug audits use.
     pub include_autocoder_tools: bool,
+    /// audit-model-selection: the resolved model this audit routes to (the
+    /// audit runner selects the CLI strategy for its provider AND passes
+    /// `--model <provider>/<model>`), or `None` to keep the default `claude`
+    /// strategy with no model override.
+    pub model: Option<&'a crate::agentic_run::ResolvedModel>,
 }
 
 /// Execute one spec-writing audit run. Returns the outcome the framework
@@ -188,6 +193,7 @@ pub(crate) async fn run_specs_writing_audit(
                 Duration::from_secs(params.executor_timeout_secs),
                 params.settings_dir,
                 audit_type,
+                params.model,
             )
             .await
         } else {
@@ -198,6 +204,7 @@ pub(crate) async fn run_specs_writing_audit(
                 &effective_prompt,
                 Duration::from_secs(params.executor_timeout_secs),
                 params.settings_dir,
+                params.model,
             )
             .await
         }

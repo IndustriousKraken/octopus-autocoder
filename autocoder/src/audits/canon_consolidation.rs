@@ -225,6 +225,8 @@ impl Audit for CanonConsolidationAudit {
             );
         }
 
+        // audit-model-selection: route to the configured model (if any).
+        let model = super::audit_resolved_model(&self.settings);
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -239,6 +241,7 @@ impl Audit for CanonConsolidationAudit {
                 commit_subject: "canon-consolidation proposals",
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: true,
+                model: model.as_ref(),
             },
             ctx,
         )
@@ -438,6 +441,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("claude");
@@ -467,6 +471,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("claude");

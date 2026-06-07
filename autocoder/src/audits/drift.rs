@@ -190,6 +190,9 @@ impl Audit for DriftAudit {
         // `submit_findings` tool. The findings come from the consumed
         // submission below — NOT from stdout (the stdout-JSON path is
         // retired for this audit).
+        // audit-model-selection: route this audit to its configured model
+        // (if any); `None` keeps the default `claude` strategy.
+        let model = super::audit_resolved_model(&self.settings);
         let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
             &sandbox,
@@ -198,6 +201,7 @@ impl Audit for DriftAudit {
             Duration::from_secs(self.executor_timeout_secs),
             self.settings_dir.as_deref(),
             Self::TYPE,
+            model.as_ref(),
         )
         .await
         .context("spawning drift-audit CLI subprocess")?;
@@ -584,6 +588,7 @@ mod tests {
                 prompt_path: Some(PathBuf::from("/tmp/example.md")),
                 notify_on_clean: true,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -629,6 +634,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -654,6 +660,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
