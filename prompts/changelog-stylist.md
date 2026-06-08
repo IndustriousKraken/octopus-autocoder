@@ -5,29 +5,40 @@ window AND the corresponding `proposal.md` files (read them with the
 
 ## Input
 
-A JSON document with this shape:
+A JSON document with a `sections` array. Each entry is one release
+version's deterministic data:
 
 ```json
 {
-  "version": "<release version>",
-  "date": "<YYYY-MM-DD>",
-  "since": "<lower bound label>",
-  "to": "<upper bound label>",
-  "entries": [
+  "sections": [
     {
-      "slug": "<change-slug>",
-      "archive_dir": "<absolute path to the archive directory>",
-      "primary_capability": "<capability name or null>",
-      "summary": "<first paragraph of ## Why>",
-      "shipped_commit": "<sha>",
-      "shipped_date": "<YYYY-MM-DD>"
+      "version": "<release version>",
+      "date": "<YYYY-MM-DD>",
+      "since": "<lower bound label>",
+      "to": "<upper bound label>",
+      "entries": [
+        {
+          "slug": "<change-slug>",
+          "archive_dir": "<absolute path to the archive directory>",
+          "primary_capability": "<capability name or null>",
+          "summary": "<first paragraph of ## Why>",
+          "shipped_commit": "<sha>",
+          "shipped_date": "<YYYY-MM-DD>"
+        }
+      ],
+      "skipped": [
+        { "slug": "...", "reason": "..." }
+      ]
     }
-  ],
-  "skipped": [
-    { "slug": "...", "reason": "..." }
   ]
 }
 ```
+
+The `sections` array carries **one OR MORE** version sections. A flagless
+gap-fill run supplies one section per previously-undocumented stable
+release tag, oldest-first; an explicit `--since`/`--to` run supplies a
+single section. Treat each section independently — produce one changelog
+section per array element.
 
 The exact JSON data follows below the `## Deterministic data` heading.
 
@@ -44,15 +55,20 @@ workspace root.
 
 - If `CHANGELOG.md` IS present, READ it AND match its established style:
   heading hierarchy, item phrasing register, grouping convention, presence
-  or absence of dates and PR links. Insert the new release's section in
-  the correct chronological position (typically above the previous
-  release, below any `## [Unreleased]` placeholder).
+  or absence of dates and PR links. Insert **each** provided section in
+  its correct chronological position (a newer version sits above an older
+  one; typically above the previous release, below any `## [Unreleased]`
+  placeholder). When the input carries multiple sections, insert every one
+  — do not document only the newest. Never regenerate, reorder, or
+  duplicate a version that the file already documents; add only the
+  sections you were given.
 - If `CHANGELOG.md` is NOT present, CREATE it in the Keep a Changelog
   v1.1.0 format. The file MUST begin with:
   1. A top-level `# Changelog` heading (or the project's name).
   2. A brief explanatory paragraph linking to https://keepachangelog.com/en/1.1.0/.
   3. An `## [Unreleased]` placeholder section.
-  4. This release's section: `## [<version>] - <YYYY-MM-DD>`.
+  4. One section per provided element — `## [<version>] - <YYYY-MM-DD>` —
+     newest first, oldest last.
 
 ## Register guidance
 

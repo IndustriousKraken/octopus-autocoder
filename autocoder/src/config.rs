@@ -73,6 +73,14 @@ pub struct Config {
     /// absent block is equivalent to all fields being `None`.
     #[serde(default, skip_serializing_if = "DaemonPathsConfig::is_empty")]
     pub paths: DaemonPathsConfig,
+    /// Optional workspace-cache bounding (a65). Today this carries only
+    /// `workspaces_max_gb`, the optional cap on the total size of
+    /// `<cache>/workspaces/`. An absent block (the default) is equivalent
+    /// to all fields being `None` — the cache is unbounded, as it has
+    /// always been. Eligible for the hot-reload subset so a reload applies
+    /// a new cap at the next iteration.
+    #[serde(default, skip_serializing_if = "CacheConfig::is_empty")]
+    pub cache: CacheConfig,
     /// Optional per-workspace feature flags. Each sub-block is opt-in;
     /// absent fields take their type-default. Today this block carries
     /// only the `brownfield` toggle (a23); future per-workspace
@@ -145,17 +153,42 @@ pub enum CliKind {
     Claude,
     /// The provider-agnostic `opencode` CLI.
     Opencode,
+    /// Google's Antigravity CLI (`agy`), successor to the sunset Gemini CLI
+    /// (a69). Drives Google/Gemini-family models agentically.
+    Antigravity,
 }
 
 impl CliKind {
-    /// Operator-facing YAML string. Matches the `#[serde]` rename rules.
-    /// Consumed by the agentic-run primitive (a later change) for
-    /// diagnostics; no production call site exists in this change.
+    /// Every registered CLI kind. The OS-sandbox credential layers (a006)
+    /// iterate this so the protected config-store set grows automatically as
+    /// strategies are added — never a hardcoded literal list (task 5.2).
+    pub const ALL: [CliKind; 3] = [CliKind::Claude, CliKind::Opencode, CliKind::Antigravity];
+
+    /// Operator-facing YAML string. Matches the `#[serde]` rename rules
+    /// (`cli: claude` / `cli: opencode` / `cli: antigravity`). NOT necessarily
+    /// the binary name — see [`CliKind::default_command`] (the Antigravity CLI
+    /// is configured as `antigravity` but the binary is `agy`). Kept as the
+    /// type's operator-facing accessor / serde-parity mirror even when no
+    /// direct call site exists.
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    /// The default binary name for this CLI on `PATH`. For `claude`/`opencode`
+    /// this matches [`as_str`](Self::as_str); the Antigravity CLI ships as the
+    /// `agy` binary even though it is selected with `cli: antigravity` (a69).
+    /// Used by the startup dependency preflight to probe the model registry's
+    /// driving CLIs.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+            Self::Antigravity => "agy",
         }
     }
 }
@@ -173,6 +206,9 @@ pub fn default_cli_for(provider: LlmProvider) -> CliKind {
     match provider {
         LlmProvider::Anthropic => CliKind::Claude,
         LlmProvider::OpenAiCompatible | LlmProvider::Ollama => CliKind::Opencode,
+        // a69: the Google/Antigravity provider is driven by the `agy` CLI
+        // (Antigravity), the successor to the sunset Gemini CLI.
+        LlmProvider::Google => CliKind::Antigravity,
     }
 }
 
@@ -237,6 +273,16 @@ pub enum LlmProvider {
     /// `<base>/api/embed` for embeddings). Valid for every subsystem;
     /// does not authenticate (api_key forbidden).
     Ollama,
+    /// Google's Gemini-family models, driven agentically through the
+    /// Antigravity CLI (`agy`) — the successor to the sunset Gemini CLI
+    /// (a69). This is a CLI-only (agentic) provider: it has NO in-process
+    /// HTTP client (the `oneshot` reviewer / RAG embedding paths reject it)
+    /// and NO embeddings API. `agy` authenticates from its own OAuth login /
+    /// credential store; an optional `api_key` becomes the `AV_API_KEY`
+    /// auth env the strategy sets. Valid for the agentic completion
+    /// subsystems (reviewer, contradiction checks, code-implements-spec);
+    /// INVALID for canonical_rag.
+    Google,
 }
 
 impl LlmProvider {
@@ -246,6 +292,7 @@ impl LlmProvider {
             Self::Anthropic => "anthropic",
             Self::OpenAiCompatible => "openai_compatible",
             Self::Ollama => "ollama",
+            Self::Google => "google",
         }
     }
 }
@@ -275,6 +322,14 @@ pub enum SubsystemKind {
     /// Change-internal contradiction check (`executor.change_internal_contradiction_check_llm:`).
     /// All three providers valid.
     ContradictionCheck,
+    /// Change-vs-canonical contradiction check — the `[canon]` gate
+    /// (`executor.change_canonical_contradiction_check_llm:`, a62). All three
+    /// providers valid.
+    CanonContradictionCheck,
+    /// Code-implements-spec verification — the `[out]` gate
+    /// (`executor.code_implements_spec_check_llm:`, a63). All three providers
+    /// valid.
+    CodeImplementsSpecCheck,
 }
 
 impl SubsystemKind {
@@ -283,16 +338,27 @@ impl SubsystemKind {
             Self::Reviewer => "reviewer",
             Self::CanonicalRag => "canonical_rag",
             Self::ContradictionCheck => "change_internal_contradiction_check_llm",
+            Self::CanonContradictionCheck => "change_canonical_contradiction_check_llm",
+            Self::CodeImplementsSpecCheck => "code_implements_spec_check_llm",
         }
     }
 
     fn valid_providers(self) -> &'static [LlmProvider] {
         match self {
-            Self::Reviewer | Self::ContradictionCheck => &[
+            Self::Reviewer
+            | Self::ContradictionCheck
+            | Self::CanonContradictionCheck
+            | Self::CodeImplementsSpecCheck => &[
                 LlmProvider::Anthropic,
                 LlmProvider::OpenAiCompatible,
                 LlmProvider::Ollama,
+                // a69: Google/Antigravity runs these roles agentically via the
+                // `agy` CLI (the `oneshot` in-process path rejects it).
+                LlmProvider::Google,
             ],
+            // canonical_rag is embeddings-only; Google/Antigravity exposes no
+            // embeddings API to autocoder, so it stays excluded (alongside
+            // anthropic).
             Self::CanonicalRag => &[LlmProvider::Ollama, LlmProvider::OpenAiCompatible],
         }
     }
@@ -350,6 +416,14 @@ pub fn validate_llm_provider_config(
                     "{subsystem}: ollama requires api_base_url; set the field to e.g. http://localhost:11434"
                 ));
             }
+        }
+        LlmProvider::Google => {
+            // a69: the Google/Antigravity provider is CLI-only (agentic). `agy`
+            // authenticates from its own OAuth login / credential store; an
+            // optional `api_key` (→ `AV_API_KEY`) and `api_base_url` are
+            // permitted but not required. No in-process HTTP requirements, so
+            // no fields are mandatory here.
+            let _ = (api_key_present, has_base);
         }
     }
     Ok(())
@@ -526,6 +600,8 @@ pub struct FeaturesConfig {
     pub scout: ScoutFeatureConfig,
     #[serde(default)]
     pub brownfield_survey: BrownfieldSurveyFeatureConfig,
+    #[serde(default)]
+    pub issues: IssuesFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -690,6 +766,34 @@ impl BrownfieldSurveyFeatureConfig {
     }
 }
 
+/// Config for the issues lane (a009). The lane is gated by this flag,
+/// OFF by default — unlike the chatops-verb features above, an enabled
+/// issues lane changes the daemon's per-iteration unit selection
+/// (`issues > changes > audits`), so it is opt-in. `prompt_path`
+/// overrides the embedded issue-flavored implementer prompt template
+/// (`prompts/implementer-issue.md`) per the uniform a24 pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssuesFeatureConfig {
+    #[serde(default = "default_issues_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+}
+
+impl Default for IssuesFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_issues_enabled(),
+            prompt_path: None,
+        }
+    }
+}
+
+fn default_issues_enabled() -> bool {
+    false
+}
+
 /// Modernized nested prompt-override block (a24). Used as the value
 /// type for every `<area>.<thing>` field that overrides an embedded
 /// prompt template. The single `prompt_path` field is workspace-
@@ -726,6 +830,32 @@ impl DaemonPathsConfig {
             && self.cache_dir.is_none()
             && self.logs_dir.is_none()
             && self.runtime_dir.is_none()
+    }
+}
+
+/// Workspace-cache bounding config (a65). Optional top-level `cache`
+/// block. Today it carries only `workspaces_max_gb`; future cache-tuning
+/// knobs land here so the schema scales without one-off top-level keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Optional cap on the TOTAL size of `<cache>/workspaces/`, in
+    /// gigabytes. `None` (the default) = unbounded — the daemon never
+    /// evicts a workspace, matching pre-a65 behaviour. When set, the
+    /// daemon keeps the cache under the cap by evicting least-recently-
+    /// used IDLE workspaces at each repo's iteration start (see
+    /// `crate::workspace_cache`). A configured `0` is rejected at
+    /// config-load (an unbounded cache is expressed by omitting the
+    /// field, not by a zero cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces_max_gb: Option<u64>,
+}
+
+impl CacheConfig {
+    /// `true` when every field is `None`. Used by the serializer to
+    /// suppress an empty `cache: {}` block from the rendered YAML.
+    pub fn is_empty(&self) -> bool {
+        self.workspaces_max_gb.is_none()
     }
 }
 
@@ -777,10 +907,103 @@ pub struct RepositoryConfig {
     /// (preserves existing auto-submit behavior).
     #[serde(default = "default_auto_submit_pr")]
     pub auto_submit_pr: bool,
+    /// a006: per-repository override of the credential-protection toggles
+    /// (`os_hide`, `engine_deny`). Each set field overrides the global
+    /// `executor.sandbox` value for this repository only; unset fields inherit
+    /// global, then the secure default (ON). Loosening either is explicit and
+    /// logged at startup. See [`RepositoryConfig::resolved_sandbox_toggles`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<RepoSandboxConfig>,
+    /// a008: optional per-repo forge-provider selection + configuration.
+    /// When present, this block is authoritative for provider selection (see
+    /// [`ForgeConfig`] AND `crate::forge::resolve_forge`). Absent → the
+    /// provider defaults to GitHub against `github.com`; existing GitHub
+    /// configurations need no block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeConfig>,
 }
 
 fn default_auto_submit_pr() -> bool {
     true
+}
+
+/// a008: which forge-provider implementation serves a repository's forge
+/// operations. Selected by the per-repo [`ForgeConfig::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeKind {
+    /// GitHub (`github.com`) OR a GitHub-Enterprise endpoint (via `api_base`).
+    Github,
+    /// GitLab SaaS (`gitlab.com`) OR a self-hosted GitLab endpoint.
+    Gitlab,
+}
+
+/// a008: per-repo `forge:` block. Declares AND configures the forge provider
+/// for a repository. When present it is **authoritative** for provider
+/// selection (see `crate::forge::resolve_forge`); when absent the provider
+/// defaults to GitHub against `github.com`, so existing GitHub configurations
+/// need no block. The `api_base` additionally enables GitHub Enterprise
+/// (`kind: github` against a self-hosted endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeConfig {
+    /// The provider implementation (`github` | `gitlab`).
+    pub kind: ForgeKind,
+    /// The forge host (e.g. `gitlab.example.com`). Optional: when omitted the
+    /// host is inferred from the repository URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Explicit REST API base (e.g. `https://gitlab.example.com/api/v4`, or a
+    /// GitHub-Enterprise `https://ghe.example.com/api/v3`). Optional: when
+    /// omitted it is derived from `host`/`kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    /// The provider token, sourced through the existing [`SecretSource`]
+    /// mechanism (an inline value OR an env-var name). Optional: when omitted,
+    /// `token_env` is consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<SecretSource>,
+    /// Fallback env-var name holding the provider token, used when `token` is
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+}
+
+impl ForgeConfig {
+    /// Resolve the provider token through the forge block's token route: the
+    /// inline/env `token` [`SecretSource`] when present, else the `token_env`
+    /// env var. Errors (naming the field AND, for env-var sources, the env
+    /// var) when neither route yields a value. `#[allow(dead_code)]`: the
+    /// token-fetch entry point for the Phase-3 GitLab API call path
+    /// (validation uses [`ForgeConfig::token_route_resolves`]).
+    #[allow(dead_code)]
+    pub fn resolve_token(&self) -> Result<String> {
+        if let Some(src) = self.token.as_ref() {
+            return src.resolve("forge.token");
+        }
+        if let Some(env) = self.token_env.as_ref() {
+            return SecretSource::EnvVar(env.clone())
+                .resolve(&format!("forge.token_env={env}"));
+        }
+        Err(anyhow!(
+            "forge block declares no token route: set `forge.token` (an inline value or env-var \
+             name) or `forge.token_env`"
+        ))
+    }
+
+    /// `true` when the forge block's token route can produce a value right
+    /// now (inline always resolves; an env-var source resolves iff the env
+    /// var is set). Used by config-load token-route validation.
+    pub fn token_route_resolves(&self) -> bool {
+        if let Some(src) = self.token.as_ref() {
+            return matches!(src, SecretSource::Inline { .. })
+                || matches!(src, SecretSource::EnvVar(name) if std::env::var(name).is_ok());
+        }
+        if let Some(env) = self.token_env.as_ref() {
+            return std::env::var(env).is_ok();
+        }
+        false
+    }
 }
 
 /// OSS-fork support (a26): per-repo spec-storage config. When set,
@@ -836,10 +1059,25 @@ pub struct ExecutorConfig {
     pub kind: ExecutorKind,
     #[serde(default = "default_executor_command")]
     pub command: String,
+    /// a70: the agentic CLI the implementer runs through. Unset → `claude`
+    /// (the default; streaming live-log path, byte-identical to pre-a70). Set
+    /// to `opencode` / `antigravity` to run the implementer capture-mode
+    /// through that strategy (no live log; outcome + `final_answer` arrive via
+    /// the MCP outcome relay). When this selects a non-`claude` CLI AND
+    /// `command` is left at its default, the binary defaults to that CLI's own
+    /// (`agy` for antigravity, `opencode` for opencode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer_cli: Option<CliKind>,
     #[serde(default = "default_executor_timeout")]
     pub timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
+    /// a014: capture of the operator's activated login-shell environment +
+    /// the credential-exclusion edits + the `doctor` expected-toolchain set.
+    /// Unset → capture is ON with the default credential filter and the default
+    /// expected-toolchain list.
+    #[serde(default)]
+    pub agent_env: Option<AgentEnvConfig>,
     /// Optional path to a custom implementer prompt template. When unset,
     /// the binary uses the template embedded at compile time from
     /// `prompts/implementer.md`. The file must contain the literal
@@ -1020,6 +1258,50 @@ pub struct ExecutorConfig {
     /// failure mode is fail-open).
     #[serde(default)]
     pub change_internal_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Opt-in gate for the change-vs-canonical contradiction pre-flight —
+    /// the `[canon]` gate of the verifier framework (a62). `Disabled` (the
+    /// default) skips the LLM call entirely. `Enabled` runs the check
+    /// alongside the `[in]` gate, BEFORE the executor; non-empty findings
+    /// write `.needs-spec-revision.json` and halt the queue walk. Enabling
+    /// without configuring `change_canonical_contradiction_check_llm` is a
+    /// fail-fast startup error.
+    #[serde(default)]
+    pub change_canonical_contradiction_check: ContradictionCheckMode,
+    /// Optional path to a custom change-vs-canonical-check prompt template.
+    /// When unset, the binary uses the template embedded at compile time
+    /// from `prompts/change-vs-canonical-check.md`. An empty override file
+    /// is rejected at use time so the daemon does not feed an empty prompt
+    /// to the session.
+    #[serde(default)]
+    pub change_canonical_contradiction_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the change-vs-canonical check. Required when
+    /// `change_canonical_contradiction_check` is `Enabled`. Parallel to the
+    /// `[in]` gate's `change_internal_contradiction_check_llm` block so
+    /// operators can pick a model independently.
+    #[serde(default)]
+    pub change_canonical_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Opt-in gate for the code-implements-spec verification — the `[out]`
+    /// gate of the verifier framework (a63). `Disabled` (the default) skips
+    /// the LLM call entirely AND spawns no post-executor session. `Enabled`
+    /// runs the check AFTER the executor implements a change, in a read-only
+    /// sandbox, AND renders an advisory `## Spec Verification` PR-body section.
+    /// The gate NEVER opens a revision AND NEVER blocks PR creation. Enabling
+    /// without configuring `code_implements_spec_check_llm` is a fail-fast
+    /// startup error.
+    #[serde(default)]
+    pub code_implements_spec_check: ContradictionCheckMode,
+    /// Optional path to a custom code-implements-spec-check prompt template.
+    /// When unset, the binary uses the template embedded at compile time from
+    /// `prompts/code-implements-spec-check.md`. An empty override file is
+    /// rejected at use time so the daemon does not feed an empty prompt to the
+    /// session.
+    #[serde(default)]
+    pub code_implements_spec_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the code-implements-spec check. Required when
+    /// `code_implements_spec_check` is `Enabled`. Parallel to the pre-executor
+    /// gates' `*_llm` blocks so operators can pick a model independently.
+    #[serde(default)]
+    pub code_implements_spec_check_llm: Option<ContradictionCheckLlmConfig>,
 }
 
 /// Opt-in gate for the change-internal contradiction pre-flight (a19).
@@ -1173,6 +1455,29 @@ pub fn busy_marker_threshold_startup_log(
     }
 }
 
+/// Decide the one-time startup log for the workspace-cache cap (a65).
+/// Pure function — no side effects, no logging — so the decision is
+/// unit-testable. The caller emits the actual `tracing` call.
+///
+/// `workspaces_max_gb` is the resolved `cache.workspaces_max_gb`. When
+/// unset (`None`), the daemon returns a `Some(message)` nudging the
+/// operator that the cache is unbounded AND naming the field that bounds
+/// it. When set, returns `None` — a bounded cache needs no warning.
+pub fn workspace_cache_unbounded_notice(workspaces_max_gb: Option<u64>) -> Option<String> {
+    if workspaces_max_gb.is_none() {
+        Some(
+            "workspace cache is UNBOUNDED — per-repo workspaces under \
+             <cache>/workspaces/ accumulate build artifacts with no size \
+             cap and can fill the disk. Set `cache.workspaces_max_gb` to \
+             bound the cache (least-recently-used idle workspaces are then \
+             evicted to stay under the cap)."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Clamp the configured log-retention window. Values above
 /// `LOG_RETENTION_DAYS_CEILING` are clamped down to the ceiling AND
 /// a `tracing::warn!` is emitted naming both the requested and
@@ -1291,6 +1596,57 @@ pub fn clamp_wipe_drain_timeout_secs(requested: u64) -> (u64, Option<String>) {
     }
 }
 
+/// a014: the operator's activated-toolchain environment capture, the
+/// credential-exclusion edits, and the `doctor` runnability set. All fields are
+/// optional; an absent block (or absent field) keeps the secure defaults
+/// (capture ON, the default credential filter, the default expected-toolchain
+/// list).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEnvConfig {
+    /// Whether to capture the operator's login-shell environment at startup and
+    /// inject it into every agentic subprocess. Defaults ON (`true`); set to
+    /// `false` to run agentic subprocesses against the daemon's base
+    /// environment only.
+    #[serde(default)]
+    pub capture: Option<bool>,
+    /// Additional credential-pattern entries to EXCLUDE from the captured
+    /// environment, on top of the defaults (`TOKEN`/`SECRET`/`KEY`/`PASSWORD`
+    /// substrings, `AWS_`/`ANTHROPIC_` prefixes). An entry ending in `_` is a
+    /// name PREFIX (e.g. `GCP_`); otherwise a case-insensitive substring.
+    /// Mirrors `a013`'s `mask_add`.
+    #[serde(default)]
+    pub exclude_add: Option<Vec<String>>,
+    /// Default credential-pattern entries to REMOVE (so a name matching only
+    /// that pattern can propagate) — e.g. `KEY` to admit a `*_KEY` toolchain
+    /// variable. An explicit relaxed posture. Mirrors `a013`'s `mask_remove`.
+    #[serde(default)]
+    pub exclude_remove: Option<Vec<String>>,
+    /// The expected-toolchain set the `doctor` runnability check probes in the
+    /// agent's actual environment (`<tool> --version`). Unset → the default
+    /// common list (`python3`, `node`, `ruby`, `go`).
+    #[serde(default)]
+    pub expected_toolchains: Option<Vec<String>>,
+}
+
+impl AgentEnvConfig {
+    /// Whether login-shell environment capture is enabled (defaults ON).
+    pub fn capture_enabled(&self) -> bool {
+        self.capture.unwrap_or(true)
+    }
+
+    /// The expected-toolchain set for the `doctor` runnability check: the
+    /// operator's list when configured, else the default common list.
+    pub fn expected_toolchains(&self) -> Vec<String> {
+        self.expected_toolchains.clone().unwrap_or_else(|| {
+            crate::agent_env::DEFAULT_EXPECTED_TOOLCHAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+    }
+}
+
 /// Per-iteration tool-use restrictions for the wrapped agent CLI. When
 /// absent, restrictive safe defaults apply (see `default_allowed_tools`,
 /// `default_disallowed_bash_patterns`, `default_disallowed_read_paths`).
@@ -1305,6 +1661,130 @@ pub struct ExecutorSandboxConfig {
     pub disallowed_bash_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub disallowed_read_paths: Option<Vec<String>>,
+    /// a006: hide every CLI strategy's config store EXCEPT the running role's
+    /// own from the OS-level sandbox namespace (the filesystem allowlist).
+    /// Defaults ON. A per-repository value overrides this global one. See
+    /// [`crate::sandbox`].
+    #[serde(default)]
+    pub os_hide: Option<bool>,
+    /// a006: extend the per-invocation tool-use denylist to deny the agent's
+    /// `Read`/`Bash` tools on EVERY registered CLI store (the self-store
+    /// included). Defaults ON. A per-repository value overrides this global
+    /// one.
+    #[serde(default)]
+    pub engine_deny: Option<bool>,
+    /// a006: when NO OS sandbox mechanism (`systemd-run` / `bwrap` /
+    /// `sandbox-exec`) can apply the sandbox, agentic runs fail closed UNLESS
+    /// this is `true` — the operator's explicit opt-in to running subprocesses
+    /// unsandboxed (logged loudly at startup). Daemon-wide; not a
+    /// per-repository toggle.
+    #[serde(default)]
+    pub allow_unsandboxed: bool,
+    /// a013: additional filesystem paths to MASK for the executor under its
+    /// exposed-home denylist policy, on top of the default mask-list. A leading
+    /// `~/` or `$HOME/` expands to the home directory. Per-repository
+    /// `mask_add` entries are appended to these.
+    #[serde(default)]
+    pub mask_add: Option<Vec<String>>,
+    /// a013: default mask-list entries to REMOVE (expose) for the executor —
+    /// e.g. `~/.ssh` to develop an SSH tool. Removing a default is an explicit
+    /// relaxed posture, logged at startup. Per-repository `mask_remove` entries
+    /// are appended to these.
+    #[serde(default)]
+    pub mask_remove: Option<Vec<String>>,
+    /// a013: run the executor under the read-only-role allowlist (home masked;
+    /// only the workspace read-write, the role's own store, the resolved CLI
+    /// binary + toolchain, and the minimal runtime bound) for high-compliance
+    /// hosts. Defaults OFF — the executor uses the exposed-home denylist.
+    /// A per-repository value overrides this global one.
+    #[serde(default)]
+    pub strict_mode: Option<bool>,
+}
+
+/// Per-repository override of the a006 credential-protection toggles. Each
+/// field, when set, overrides the global `executor.sandbox` value for that
+/// repository; absent fields inherit global, then the secure default (ON).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoSandboxConfig {
+    #[serde(default)]
+    pub os_hide: Option<bool>,
+    #[serde(default)]
+    pub engine_deny: Option<bool>,
+    /// a013: per-repository additions to the executor's filesystem mask-list,
+    /// appended to the global `executor.sandbox.mask_add`.
+    #[serde(default)]
+    pub mask_add: Option<Vec<String>>,
+    /// a013: per-repository default mask-list entries to remove (expose),
+    /// appended to the global `executor.sandbox.mask_remove`. Removing a
+    /// default is an explicit relaxed posture, logged at startup.
+    #[serde(default)]
+    pub mask_remove: Option<Vec<String>>,
+    /// a013: per-repository override of the executor strict-mode flag.
+    #[serde(default)]
+    pub strict_mode: Option<bool>,
+}
+
+/// The fully-resolved per-repository sandbox posture (a006 credential
+/// toggles + a013 mask-list edits + strict mode). The `os_hide`/`engine_deny`
+/// toggles default ON (the secure default); `strict_mode` defaults OFF (the
+/// executor uses the exposed-home denylist); the mask edit lists default empty.
+///
+/// Not `Copy` because of the `Vec` mask-edit fields — cloned where it was
+/// previously copied (the runtime threading in [`crate::sandbox`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxToggles {
+    pub os_hide: bool,
+    pub engine_deny: bool,
+    /// a013: run the executor under the allowlist (home masked). Read-only
+    /// roles always use the allowlist regardless of this flag.
+    pub strict_mode: bool,
+    /// a013: operator additions to the executor's filesystem mask-list.
+    pub mask_add: Vec<String>,
+    /// a013: default mask-list entries the operator removed (exposed).
+    pub mask_remove: Vec<String>,
+}
+
+impl Default for SandboxToggles {
+    fn default() -> Self {
+        Self {
+            os_hide: true,
+            engine_deny: true,
+            strict_mode: false,
+            mask_add: Vec::new(),
+            mask_remove: Vec::new(),
+        }
+    }
+}
+
+impl SandboxToggles {
+    /// Apply a per-repository override on top of these (global) toggles: each
+    /// set boolean field of `repo` wins; unset booleans keep `self`'s value.
+    /// The mask-edit lists are ADDITIVE — the repo's `mask_add`/`mask_remove`
+    /// are appended to the global ones (a repo can mask more or expose more,
+    /// never silently drop a global edit). Used at runtime to resolve the
+    /// active repository's effective posture against the daemon-global default
+    /// (equivalent to [`RepositoryConfig::resolved_sandbox_toggles`] when
+    /// `self` is the global resolution).
+    pub fn with_repo_override(&self, repo: Option<&RepoSandboxConfig>) -> SandboxToggles {
+        let mut mask_add = self.mask_add.clone();
+        let mut mask_remove = self.mask_remove.clone();
+        if let Some(r) = repo {
+            if let Some(a) = r.mask_add.as_ref() {
+                mask_add.extend(a.iter().cloned());
+            }
+            if let Some(rm) = r.mask_remove.as_ref() {
+                mask_remove.extend(rm.iter().cloned());
+            }
+        }
+        SandboxToggles {
+            os_hide: repo.and_then(|r| r.os_hide).unwrap_or(self.os_hide),
+            engine_deny: repo.and_then(|r| r.engine_deny).unwrap_or(self.engine_deny),
+            strict_mode: repo.and_then(|r| r.strict_mode).unwrap_or(self.strict_mode),
+            mask_add,
+            mask_remove,
+        }
+    }
 }
 
 /// The fully-resolved sandbox after per-field defaulting. Used by the
@@ -1388,7 +1868,7 @@ pub enum ExecutorKind {
     ClaudeCli,
 }
 
-fn default_executor_command() -> String {
+pub(crate) fn default_executor_command() -> String {
     "claude".to_string()
 }
 
@@ -1551,16 +2031,22 @@ pub struct ReviewerConfig {
     /// Modernized form of `prompt_template_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<PromptOverrideBlock>,
-    /// Opt-in flag: when `true`, reviewer-authored revision-request PR
-    /// comments are posted for each concern the reviewer marked
-    /// `should_request_revision: true` with a non-empty `actionable_request`,
-    /// REGARDLESS of the review's verdict (`Pass`, `Concerns`, OR `Block`).
-    /// The dispatcher from the PR-comment revision loop picks these up on
-    /// the next polling iteration. Default `false` (no behavioural change).
-    /// The legacy key `auto_revise_on_block` is accepted as a silent alias
-    /// so existing config files load unchanged.
-    #[serde(default, alias = "auto_revise_on_block")]
-    pub auto_revise: bool,
+    /// a005: tri-state reviewer auto-revision gate. Accepts `block`,
+    /// `actionable`, or `off` and defaults to `block` (see [`AutoRevise`]).
+    /// When it fires, the review's actionable concerns
+    /// (`should_request_revision: true` with a non-empty `actionable_request`)
+    /// are forwarded — AGGREGATED into a single revision run — to the
+    /// PR-comment revision dispatcher, which picks them up on the next
+    /// polling iteration. The legacy boolean is mapped for backward
+    /// compatibility (`true` → `actionable`, `false` → `off`); the legacy key
+    /// `auto_revise_on_block` is accepted as a silent alias so existing
+    /// config files load unchanged.
+    #[serde(
+        default,
+        alias = "auto_revise_on_block",
+        deserialize_with = "deserialize_auto_revise"
+    )]
+    pub auto_revise: AutoRevise,
     /// Maximum size (in chars) of the rendered reviewer prompt body —
     /// change context + changed files + diff combined. Default
     /// `2_000_000` preserves the historical hard-coded value. No clamping:
@@ -1605,24 +2091,28 @@ pub struct ReviewerConfig {
     /// (preserves canonical behavior: reviewer runs against every PR).
     #[serde(default)]
     pub skip_spec_only_prs: bool,
-    /// a58: reviewer transport. `oneshot` (default) is the existing
-    /// single-shot HTTP path that pre-dumps every touched file into one
-    /// prompt and scrapes a `VERDICT:` line. `agentic` runs the reviewer
-    /// through the shared `agentic_run` primitive (a56) as a CLI-wrapped,
-    /// read-only session that reads files on demand AND returns its
-    /// verdict via the `submit_review` MCP tool. The default stays
-    /// `oneshot`: the agentic path runs through the `claude` strategy,
-    /// which only reaches Anthropic-shaped endpoints, so non-Anthropic
-    /// reviewers cannot go agentic until the opencode strategy lands
-    /// (a60). Hot-applicable via the existing `reviewer:` reload path.
+    /// a58: reviewer transport. `agentic` (the default since a64) runs the
+    /// reviewer through the shared `agentic_run` primitive (a56) as a
+    /// CLI-wrapped, read-only session that reads files on demand AND returns
+    /// its verdict via the `submit_review` MCP tool. `oneshot` is the
+    /// existing single-shot HTTP path that pre-dumps every touched file into
+    /// one prompt and scrapes a `VERDICT:` line. The default flipped to
+    /// `agentic` once the `opencode` strategy (a60) made the agentic path
+    /// provider-agnostic. When the resolved reviewer CLI is unavailable at
+    /// startup, an effective-`agentic` reviewer degrades to the `oneshot`
+    /// HTTP path for that boot with one WARN (review is never disabled); set
+    /// `kind: oneshot` explicitly to opt out of agentic and silence the
+    /// warning. Hot-applicable via the existing `reviewer:` reload path.
     #[serde(default)]
     pub kind: ReviewerKind,
     /// a58: the CLI binary the agentic reviewer wraps. Default `"claude"`.
     /// A non-`claude` command resolves its strategy via the a55/a56
-    /// `provider → CLI` rule AND currently returns a clear "strategy not
-    /// yet implemented" error (only `claude` is registered until a60).
-    /// Ignored when `kind: oneshot`. Hot-applicable via the `reviewer:`
-    /// reload path.
+    /// `provider → CLI` rule (Anthropic → `claude`, other providers →
+    /// `opencode` since a60). When the effective kind is `agentic` but this
+    /// CLI is unavailable at startup (no registered strategy OR the binary
+    /// is not on the daemon host's PATH) the reviewer falls back to
+    /// `oneshot` for that boot. Ignored when `kind: oneshot`. Hot-applicable
+    /// via the `reviewer:` reload path.
     #[serde(default = "default_reviewer_command")]
     pub command: String,
 }
@@ -1665,19 +2155,97 @@ pub enum ReviewerMode {
 
 /// a58: reviewer transport selector (`reviewer.kind`).
 ///
-/// `Oneshot` (default) is the existing HTTP single-shot path governed by
-/// the `AI-driven code-quality review` requirement. `Agentic` runs the
-/// reviewer through the shared `agentic_run` primitive (a56) — a read-only
-/// CLI-wrapped session that reads files on demand AND returns its verdict
-/// via the `submit_review` MCP tool. The default stays `Oneshot` because
-/// the `claude` strategy reaches only Anthropic-shaped endpoints (a60
-/// lifts that restriction).
+/// `Oneshot` is the existing HTTP single-shot path governed by the
+/// `AI-driven code-quality review` requirement. `Agentic` (the default
+/// since a64) runs the reviewer through the shared `agentic_run` primitive
+/// (a56) — a read-only CLI-wrapped session that reads files on demand AND
+/// returns its verdict via the `submit_review` MCP tool. The default is
+/// `Agentic` now that the `opencode` strategy (a60) makes the agentic path
+/// provider-agnostic, so it is the preferred default for every provider —
+/// not only Anthropic-shaped ones. When the resolved reviewer CLI is
+/// unavailable at startup the reviewer degrades to the `Oneshot` HTTP path
+/// for that boot (see the `Agentic reviewer mode` requirement's startup
+/// fallback); review is never disabled.
 #[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerKind {
-    #[default]
     Oneshot,
+    #[default]
     Agentic,
+}
+
+/// a005: tri-state reviewer auto-revision gate (`reviewer.auto_revise`).
+///
+/// Governs whether — AND under which verdict — a review's actionable
+/// concerns are forwarded (aggregated into a SINGLE revision run per the
+/// orchestrator-cli `Reviewer-initiated revisions from one review dispatch
+/// as a single run` requirement) to the revision dispatcher.
+///
+/// - [`AutoRevise::Block`] (default): auto-revise fires only when the
+///   review's effective verdict is `Block`. Combined with a004
+///   (security-critical findings escalate the verdict to `Block`),
+///   security-critical findings still auto-fix while non-`Block` `Concerns`
+///   stay advisory — surfaced to the operator, not silently rewritten.
+/// - [`AutoRevise::Actionable`]: fires on any actionable concern regardless
+///   of verdict (the pre-a005 fire-regardless-of-verdict behavior).
+/// - [`AutoRevise::Off`]: never auto-revise.
+///
+/// Deserializes from the canonical lowercase strings (`block`, `actionable`,
+/// `off`) OR, for backward compatibility, from the legacy boolean: `true` →
+/// [`AutoRevise::Actionable`], `false` → [`AutoRevise::Off`]. An absent field
+/// defaults to [`AutoRevise::Block`] (the a005 default change, from the prior
+/// `false`/off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoRevise {
+    #[default]
+    Block,
+    Actionable,
+    Off,
+}
+
+impl AutoRevise {
+    /// Whether auto-revise should fire for a review whose effective verdict
+    /// is (or is not) `Block`. `verdict_is_block` is computed from the final
+    /// [`crate::code_reviewer::ReviewReport`] verdict, so it already includes
+    /// the a004 security escalation.
+    pub fn fires(self, verdict_is_block: bool) -> bool {
+        match self {
+            AutoRevise::Off => false,
+            AutoRevise::Actionable => true,
+            AutoRevise::Block => verdict_is_block,
+        }
+    }
+}
+
+/// Deserialize [`AutoRevise`] from either the canonical lowercase string
+/// (`block`/`actionable`/`off`) or the legacy boolean (`true` → `actionable`,
+/// `false` → `off`). Used by `ReviewerConfig::auto_revise`'s
+/// `deserialize_with`, composing with `#[serde(default)]` (absent → `Block`)
+/// and the `auto_revise_on_block` legacy-key alias.
+fn deserialize_auto_revise<'de, D>(deserializer: D) -> Result<AutoRevise, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match BoolOrStr::deserialize(deserializer)? {
+        BoolOrStr::Bool(true) => Ok(AutoRevise::Actionable),
+        BoolOrStr::Bool(false) => Ok(AutoRevise::Off),
+        BoolOrStr::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "block" => Ok(AutoRevise::Block),
+            "actionable" => Ok(AutoRevise::Actionable),
+            "off" => Ok(AutoRevise::Off),
+            other => Err(D::Error::custom(format!(
+                "invalid auto_revise value {other:?}: expected one of `block`, `actionable`, `off` (or legacy `true`/`false`)"
+            ))),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2018,12 +2586,33 @@ pub fn clamp_max_audits_per_iteration(
     }
 }
 
+/// The model an audit resolves to at config-load (audit-model-selection).
+/// Populated from [`AuditSettings::model`] (a `models:` registry nickname)
+/// during [`Config::load_from`]; `None` when the audit configured no model
+/// and therefore keeps the default `claude` CLI strategy.
+///
+/// The credential is intentionally NOT retained: every periodic audit drives
+/// a CLI strategy, which authenticates from the wrapped CLI's own login /
+/// credential store (a003) and ignores any resolved key. Only the provider
+/// (which selects the CLI strategy + OS-sandbox CLI kind), the concrete model
+/// name, AND the optional API base URL (consumed by the `opencode` strategy's
+/// `--model <provider>/<model>` flag + provider config) are needed downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAuditModel {
+    pub provider: LlmProvider,
+    pub model: String,
+    pub api_base_url: Option<String>,
+}
+
 /// Per-audit settings keyed by audit type name. `prompt_path` overrides
 /// the audit's embedded default LLM prompt template (no LLM audits ship
 /// in the foundation change; the field is laid in for future audits).
 /// `notify_on_clean` toggles a brief "no findings" chatops post for
 /// `Reported(vec![])` outcomes (silence is success by default). `extra`
 /// is a free-form YAML mapping each audit can read its own knobs out of.
+/// `model` (audit-model-selection) is an optional `models:` registry
+/// nickname routing this audit to a specific LLM + CLI strategy; it is
+/// resolved into `resolved_model` at config-load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditSettings {
@@ -2031,6 +2620,18 @@ pub struct AuditSettings {
     pub prompt_path: Option<PathBuf>,
     #[serde(default)]
     pub notify_on_clean: bool,
+    /// Optional `models:` registry nickname (audit-model-selection). When
+    /// set, the audit runner selects the CLI strategy for the resolved
+    /// model's provider AND passes `--model <provider>/<model>`. Resolved
+    /// against the registry at config-load; an unknown nickname fails fast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The `model` nickname resolved against the top-level `models:`
+    /// registry at config-load. Never deserialized from / serialized to the
+    /// config file — it is a derived runtime field. `None` when no `model`
+    /// was configured (preserving the default `claude` CLI behavior).
+    #[serde(skip)]
+    pub resolved_model: Option<ResolvedAuditModel>,
     #[serde(default)]
     pub extra: HashMap<String, serde_yml::Value>,
 }
@@ -2296,6 +2897,82 @@ impl RepositoryConfig {
             .unwrap_or(DEFAULT);
         chosen.max(1)
     }
+
+    /// a006: resolve the effective credential-protection toggles for this
+    /// repository. Lookup order, per toggle: per-repo override → global
+    /// `executor.sandbox` → the secure default (ON). There is no implicit
+    /// downgrade — both are ON unless an operator explicitly set one off.
+    pub fn resolved_sandbox_toggles(&self, global: Option<&ExecutorSandboxConfig>) -> SandboxToggles {
+        let repo = self.sandbox.as_ref();
+        let os_hide = repo
+            .and_then(|r| r.os_hide)
+            .or_else(|| global.and_then(|g| g.os_hide))
+            .unwrap_or(true);
+        let engine_deny = repo
+            .and_then(|r| r.engine_deny)
+            .or_else(|| global.and_then(|g| g.engine_deny))
+            .unwrap_or(true);
+        // a013: strict mode — per-repo → global → default OFF.
+        let strict_mode = repo
+            .and_then(|r| r.strict_mode)
+            .or_else(|| global.and_then(|g| g.strict_mode))
+            .unwrap_or(false);
+        // a013: mask edits are additive — global first, then this repo's.
+        let mut mask_add: Vec<String> = global
+            .and_then(|g| g.mask_add.clone())
+            .unwrap_or_default();
+        if let Some(a) = repo.and_then(|r| r.mask_add.as_ref()) {
+            mask_add.extend(a.iter().cloned());
+        }
+        let mut mask_remove: Vec<String> = global
+            .and_then(|g| g.mask_remove.clone())
+            .unwrap_or_default();
+        if let Some(rm) = repo.and_then(|r| r.mask_remove.as_ref()) {
+            mask_remove.extend(rm.iter().cloned());
+        }
+        SandboxToggles {
+            os_hide,
+            engine_deny,
+            strict_mode,
+            mask_add,
+            mask_remove,
+        }
+    }
+
+    /// a006: the per-repository startup WARN naming each credential-protection
+    /// toggle that is OFF for this repository, or `None` when both are ON (the
+    /// secure default — no WARN). Separated from the logging site so the
+    /// disposition can be asserted without a daemon (task 8.6).
+    pub fn relaxed_sandbox_warning(&self, global: Option<&ExecutorSandboxConfig>) -> Option<String> {
+        let toggles = self.resolved_sandbox_toggles(global);
+        let mut off: Vec<&str> = Vec::new();
+        if !toggles.os_hide {
+            off.push("os_hide");
+        }
+        if !toggles.engine_deny {
+            off.push("engine_deny");
+        }
+        // a013: removing a default mask-list entry exposes a sensitive path —
+        // an explicit relaxed posture that SHALL be logged, naming each entry.
+        let exposed = crate::sandbox::removed_default_mask_entries(&toggles.mask_remove);
+        if off.is_empty() && exposed.is_empty() {
+            return None;
+        }
+        let mut clauses: Vec<String> = Vec::new();
+        if !off.is_empty() {
+            clauses.push(format!("{} OFF", off.join(" + ")));
+        }
+        if !exposed.is_empty() {
+            clauses.push(format!("default mask entries exposed: {}", exposed.join(", ")));
+        }
+        Some(format!(
+            "repository `{}` runs with relaxed sandbox credential protection: \
+             {}. Sensitive paths may be reachable by the wrapped model, and \
+             egress is unrestricted. This is an explicit, non-default posture.",
+            self.url,
+            clauses.join("; ")
+        ))
+    }
 }
 
 impl Config {
@@ -2332,6 +3009,17 @@ impl Config {
             slack.dedup_cache_capacity = cap;
             let (ttl, _) = clamp_dedup_cache_ttl_secs(slack.dedup_cache_ttl_secs);
             slack.dedup_cache_ttl_secs = ttl;
+        }
+        // a65: the workspace-cache cap is expressed by OMITTING the field
+        // (unbounded) — a zero cap is a misconfiguration (it would demand
+        // evicting every workspace) and is rejected up front.
+        if let Some(max_gb) = cfg.cache.workspaces_max_gb
+            && max_gb == 0
+        {
+            return Err(anyhow!(
+                "cache.workspaces_max_gb must be greater than 0 when set; \
+                 omit the field entirely for an unbounded workspace cache"
+            ));
         }
         // a55: validate every `models:` registry entry's own per-provider
         // auth config up front, regardless of whether any block references
@@ -2453,6 +3141,89 @@ impl Config {
                 llm.api_base_url.as_deref(),
                 "change_internal_contradiction_check_llm",
             )?;
+        }
+        if let Some(llm) = cfg
+            .executor
+            .change_canonical_contradiction_check_llm
+            .as_mut()
+        {
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "change_canonical_contradiction_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("change_canonical_contradiction_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::CanonContradictionCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            validate_llm_provider_config(
+                provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "change_canonical_contradiction_check_llm",
+            )?;
+        }
+        if let Some(llm) = cfg.executor.code_implements_spec_check_llm.as_mut() {
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "code_implements_spec_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("code_implements_spec_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::CodeImplementsSpecCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            validate_llm_provider_config(
+                provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "code_implements_spec_check_llm",
+            )?;
+        }
+        // audit-model-selection: resolve each audit's optional `model`
+        // nickname against the `models:` registry, mirroring the reviewer
+        // validation above. A nickname naming no registry entry fails
+        // config-load fast (the error names both the nickname AND the
+        // referencing `audits.settings.<audit_type>` block). The credential
+        // is intentionally dropped — audits always drive a CLI strategy,
+        // which authenticates from its own store (a003), so only provider +
+        // model + base URL are retained for strategy + flag selection.
+        if let Some(audits) = cfg.audits.as_mut() {
+            for (audit_type, settings) in audits.settings.iter_mut() {
+                let Some(nickname) = settings.model.clone() else {
+                    continue;
+                };
+                let label = format!("audits.settings.{audit_type}");
+                if let Some(resolved) =
+                    resolve_model_reference(None, &nickname, models.as_ref(), &label)?
+                {
+                    settings.resolved_model = Some(ResolvedAuditModel {
+                        provider: resolved.provider,
+                        model: resolved.model,
+                        api_base_url: resolved.api_base_url,
+                    });
+                }
+            }
         }
         // a000: reject typo'd author_association entries up front so a
         // misconfigured allowlist fails at startup rather than silently
@@ -2759,6 +3530,8 @@ pub const KNOWN_AUDIT_TYPES: &[&str] = &[
     "security_bug_audit",
     "architecture_consultative",
     "documentation_audit",
+    "canon_contradiction_audit",
+    "canon_consolidation_audit",
 ];
 
 /// Run every config validation check and return a structured report.
@@ -2850,6 +3623,39 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some("executor/change_internal_contradiction_check_llm".into()),
         );
     }
+    // a62: opting into the change-vs-canonical check (the `[canon]` gate)
+    // requires configuring its LLM block, exactly as the `[in]` gate does.
+    // Fail fast at startup so the misconfig surfaces before the first
+    // polling iteration.
+    if matches!(
+        config.executor.change_canonical_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) && config
+        .executor
+        .change_canonical_contradiction_check_llm
+        .is_none()
+    {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.change_canonical_contradiction_check is enabled but executor.change_canonical_contradiction_check_llm is not configured",
+            Some("executor/change_canonical_contradiction_check_llm".into()),
+        );
+    }
+    // a63: opting into the code-implements-spec check (the `[out]` gate)
+    // requires configuring its LLM block, exactly as the pre-executor gates
+    // do. Fail fast at startup so the misconfig surfaces before the first
+    // polling iteration.
+    if matches!(
+        config.executor.code_implements_spec_check,
+        ContradictionCheckMode::Enabled
+    ) && config.executor.code_implements_spec_check_llm.is_none()
+    {
+        report.push_error(
+            FindingCategory::Schema,
+            "executor.code_implements_spec_check is enabled but executor.code_implements_spec_check_llm is not configured",
+            Some("executor/code_implements_spec_check_llm".into()),
+        );
+    }
     // a25: features.scout.max_items must be within 1..=50.
     if let Err(msg) = config.features.scout.validate() {
         report.push_error(
@@ -2876,7 +3682,27 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
 /// trouble only when none of those produces a usable secret.
 fn check_token_routes(config: &Config, report: &mut ValidationReport) {
     for (idx, repo) in config.repositories.iter().enumerate() {
-        let owner = match crate::github::parse_repo_url(&repo.url) {
+        // a008: a repo with an explicit `forge:` block sources its token from
+        // that block's token route, NOT the global `github` config. The check
+        // is independent of URL parsing (the block carries its own token), so
+        // it runs first — a non-`github.com` host (GitLab / GHE) is the whole
+        // point of the block AND must not be rejected as "unparsable github".
+        if let Some(forge) = repo.forge.as_ref() {
+            if forge.token_route_resolves() {
+                continue;
+            }
+            report.push_error(
+                FindingCategory::TokenRoute,
+                format!(
+                    "repositories[{idx}].url declares a `forge:` block whose token route does not \
+                     resolve: set `forge.token` (inline or env-var name) or `forge.token_env`"
+                ),
+                Some(format!("repositories/{idx}/forge")),
+            );
+            continue;
+        }
+        // No `forge:` block → the GitHub/`github.com` default path.
+        let owner = match crate::forge::parse_repo_with(None, &repo.url) {
             Ok((o, _r)) => o,
             Err(e) => {
                 report.push_error(
@@ -3168,6 +3994,70 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(canon_llm) = config
+        .executor
+        .change_canonical_contradiction_check_llm
+        .as_ref()
+    {
+        let has_inline = canon_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = canon_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_canonical_contradiction_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/change_canonical_contradiction_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = canon_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.change_canonical_contradiction_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/change_canonical_contradiction_check_llm/api_key".into()),
+            );
+        }
+    }
+    if let Some(cis_llm) = config.executor.code_implements_spec_check_llm.as_ref() {
+        let has_inline = cis_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = cis_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.code_implements_spec_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/code_implements_spec_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = cis_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.code_implements_spec_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/code_implements_spec_check_llm/api_key".into()),
+            );
+        }
+    }
     if let Some(chatops) = config.chatops.as_ref() {
         if let Some(slack) = chatops.slack.as_ref() {
             let bot_inline = slack
@@ -3383,9 +4273,29 @@ github:
             "change_internal_contradiction_check",
             "change_internal_contradiction_check_prompt_path",
             "change_internal_contradiction_check_llm",
+            "change_canonical_contradiction_check",
+            "change_canonical_contradiction_check_prompt_path",
+            "change_canonical_contradiction_check_llm",
+            "code_implements_spec_check",
+            "code_implements_spec_check_prompt_path",
+            "code_implements_spec_check_llm",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
+            // a006 `ExecutorSandboxConfig` + per-repo `RepoSandboxConfig`.
+            "os_hide",
+            "engine_deny",
+            "allow_unsandboxed",
+            // a013 mask-list edits + strict mode.
+            "mask_add",
+            "mask_remove",
+            "strict_mode",
+            // a014 `AgentEnvConfig` (executor.agent_env).
+            "agent_env",
+            "capture",
+            "exclude_add",
+            "exclude_remove",
+            "expected_toolchains",
             // `GithubConfig`.
             "token_env",
             "token",
@@ -3444,6 +4354,9 @@ github:
             // a34: spec_storage extensions + reviewer skip-spec-only-prs.
             "push_remote",
             "base_branch",
+            // a65: workspace-cache size cap.
+            "cache",
+            "workspaces_max_gb",
         ];
 
         let path = example_yaml_path();
@@ -3502,6 +4415,119 @@ github:
         assert_eq!(cfg.executor.command, "claude");
         assert_eq!(cfg.executor.timeout_secs, 1800);
         assert_eq!(cfg.github.token_env, "GITHUB_TOKEN");
+    }
+
+    // ----------------------------------------------------------------
+    // a65 workspace-cache config.
+    // ----------------------------------------------------------------
+
+    const MINIMAL_YAML: &str = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 1800
+github:
+  token_env: GITHUB_TOKEN
+"#;
+
+    #[test]
+    fn cache_absent_defaults_to_unbounded() {
+        let (_dir, path) = write_config(MINIMAL_YAML);
+        let cfg = Config::load_from(&path).expect("config without cache block parses");
+        assert!(
+            cfg.cache.workspaces_max_gb.is_none(),
+            "absent cache block must mean unbounded (None)"
+        );
+        assert!(cfg.cache.is_empty());
+    }
+
+    #[test]
+    fn cache_workspaces_max_gb_parses_when_set() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  workspaces_max_gb: 50\n");
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).expect("config with cache cap parses");
+        assert_eq!(cfg.cache.workspaces_max_gb, Some(50));
+        assert!(!cfg.cache.is_empty());
+    }
+
+    #[test]
+    fn cache_workspaces_max_gb_zero_is_rejected() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  workspaces_max_gb: 0\n");
+        let (_dir, path) = write_config(&yaml);
+        let err = Config::load_from(&path)
+            .expect_err("a zero workspace-cache cap must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("workspaces_max_gb"),
+            "error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("greater than 0") || msg.contains("unbounded"),
+            "error must explain the constraint: {msg}"
+        );
+    }
+
+    #[test]
+    fn cache_unknown_field_is_rejected() {
+        let yaml = format!("{MINIMAL_YAML}cache:\n  bogus_key: 1\n");
+        let (_dir, path) = write_config(&yaml);
+        Config::load_from(&path)
+            .expect_err("an unknown key under `cache:` must be rejected (deny_unknown_fields)");
+    }
+
+    #[test]
+    fn unbounded_notice_emitted_only_when_cap_unset() {
+        // Unset → a notice naming the bounding field.
+        let notice = workspace_cache_unbounded_notice(None)
+            .expect("unset cap must produce a one-time unbounded notice");
+        assert!(
+            notice.contains("cache.workspaces_max_gb"),
+            "notice must name the bounding field: {notice}"
+        );
+        assert!(
+            notice.to_lowercase().contains("unbounded"),
+            "notice must call out the unbounded failure mode: {notice}"
+        );
+        // Set → no notice.
+        assert!(
+            workspace_cache_unbounded_notice(Some(50)).is_none(),
+            "a bounded cache needs no startup notice"
+        );
+    }
+
+    /// a64 task 1.1: an unset `reviewer.kind` resolves to `Agentic` (the
+    /// field stays optional in YAML; omitting it picks the default), while
+    /// explicit `oneshot` / `agentic` values are honored verbatim.
+    #[test]
+    fn reviewer_kind_defaults_to_agentic_and_honors_explicit() {
+        // Unset → the post-a64 default.
+        let unset: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\n").expect("minimal reviewer parses");
+        assert_eq!(
+            unset.kind,
+            ReviewerKind::Agentic,
+            "unset reviewer.kind must default to agentic"
+        );
+        assert_eq!(
+            ReviewerKind::default(),
+            ReviewerKind::Agentic,
+            "the ReviewerKind Default impl is agentic"
+        );
+
+        // Explicit values round-trip unchanged.
+        let oneshot: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\nkind: oneshot\n")
+                .expect("explicit oneshot parses");
+        assert_eq!(oneshot.kind, ReviewerKind::Oneshot);
+        let agentic: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\nkind: agentic\n")
+                .expect("explicit agentic parses");
+        assert_eq!(agentic.kind, ReviewerKind::Agentic);
     }
 
     #[test]
@@ -3590,14 +4616,14 @@ reviewer:
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
-        // Default (field omitted) → false.
-        assert!(!rv.auto_revise);
+        // a005: default (field omitted) → `block` (was `false`/off pre-a005).
+        assert_eq!(rv.auto_revise, AutoRevise::Block);
     }
 
     #[test]
     fn reviewer_auto_revise_legacy_alias_explicit_true() {
         // The legacy key `auto_revise_on_block` is still accepted via the
-        // serde alias and deserializes to `auto_revise == true`.
+        // serde alias; a005 maps the legacy boolean `true` → `actionable`.
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -3618,12 +4644,13 @@ reviewer:
         let cfg =
             Config::load_from(&path).expect("config with legacy auto_revise_on_block should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
     }
 
     #[test]
     fn reviewer_auto_revise_explicit_true() {
-        // The canonical key `auto_revise` deserializes identically.
+        // The canonical key `auto_revise` with a legacy boolean deserializes
+        // identically (`true` → `actionable`).
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -3643,7 +4670,92 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config with auto_revise should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise);
+        assert_eq!(rv.auto_revise, AutoRevise::Actionable);
+    }
+
+    /// a005: the canonical tri-state string values deserialize as expected.
+    #[test]
+    fn reviewer_auto_revise_tristate_strings() {
+        for (value, expected) in [
+            ("block", AutoRevise::Block),
+            ("actionable", AutoRevise::Actionable),
+            ("off", AutoRevise::Off),
+        ] {
+            let yaml = format!(
+                r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {{}}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: {value}
+"#
+            );
+            let (_dir, path) = write_config(&yaml);
+            let cfg = Config::load_from(&path)
+                .unwrap_or_else(|e| panic!("config with auto_revise: {value} should parse: {e}"));
+            let rv = cfg.reviewer.expect("reviewer block should be present");
+            assert_eq!(rv.auto_revise, expected, "auto_revise: {value}");
+        }
+    }
+
+    /// a005: the legacy boolean `false` maps to `off`.
+    #[test]
+    fn reviewer_auto_revise_legacy_false_maps_off() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with auto_revise: false should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert_eq!(rv.auto_revise, AutoRevise::Off);
+    }
+
+    /// a005: an unrecognized string value is a hard config-load error.
+    #[test]
+    fn reviewer_auto_revise_invalid_string_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: sometimes
+"#;
+        let (_dir, path) = write_config(yaml);
+        assert!(
+            Config::load_from(&path).is_err(),
+            "an invalid auto_revise string must fail config-load"
+        );
     }
 
     #[test]
@@ -3846,6 +4958,91 @@ github:
         assert_eq!(llm.model, "claude-haiku-4-5-20251001");
     }
 
+    // a63 (task 1.2): enabling the `[out]` gate without configuring its LLM
+    // block is a fail-fast startup error, exactly as the pre-executor gates.
+    #[test]
+    fn code_implements_spec_check_enabled_without_llm_config_fails_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  code_implements_spec_check: enabled
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses even when llm is missing");
+        let report = validate_config(&cfg);
+        let msg = report
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains(
+                "executor.code_implements_spec_check is enabled but executor.code_implements_spec_check_llm is not configured"
+            ),
+            "expected fail-fast error message; got: {msg}"
+        );
+    }
+
+    // a63 (task 1.1/1.2): the `[out]` gate config parses (mode + llm +
+    // prompt-path override) AND passes validation when the LLM block is set.
+    #[test]
+    fn code_implements_spec_check_enabled_with_llm_config_passes_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  code_implements_spec_check: enabled
+  code_implements_spec_check_prompt_path: /tmp/custom-out-gate.md
+  code_implements_spec_check_llm:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    api_key:
+      value: sk-ant-inline
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let report = validate_config(&cfg);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.message.contains("code_implements_spec_check")),
+            "expected no code-implements-spec validation error; got: {:#?}",
+            report.errors
+        );
+        assert_eq!(
+            cfg.executor.code_implements_spec_check,
+            ContradictionCheckMode::Enabled
+        );
+        assert_eq!(
+            cfg.executor.code_implements_spec_check_prompt_path.as_deref(),
+            Some(std::path::Path::new("/tmp/custom-out-gate.md"))
+        );
+        let llm = cfg
+            .executor
+            .code_implements_spec_check_llm
+            .as_ref()
+            .expect("llm block present");
+        assert_eq!(llm.provider, Some(ReviewerProvider::Anthropic));
+        assert_eq!(llm.model, "claude-haiku-4-5-20251001");
+    }
+
     #[test]
     fn reviewer_openai_compatible_provider() {
         let yaml = r#"
@@ -4038,7 +5235,7 @@ chatops:
 
     #[test]
     fn repo_overrides_channel() {
-        let repo_with_override = RepositoryConfig {
+        let repo_with_override = RepositoryConfig { forge: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -4050,10 +5247,11 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
-        let repo_default = RepositoryConfig {
+        let repo_default = RepositoryConfig { forge: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -4065,6 +5263,7 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
@@ -4183,6 +5382,267 @@ github: {}
         assert_eq!(
             resolved.disallowed_read_paths,
             vec!["/custom/path/**".to_string()]
+        );
+    }
+
+    // a006 / task 8.5: the secure default applies when neither global nor
+    // per-repo sets a toggle — both ON, and no relaxed-posture WARN.
+    #[test]
+    fn sandbox_toggles_secure_default_when_unset() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let repo = &cfg.repositories[0];
+        let toggles = repo.resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(toggles.os_hide, "os_hide defaults ON");
+        assert!(toggles.engine_deny, "engine_deny defaults ON");
+        assert!(
+            repo.relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+                .is_none(),
+            "the secure default emits no relaxed-posture WARN"
+        );
+    }
+
+    // a006 / task 8.5: per-repo overrides global; repos without a per-repo
+    // value keep the global value.
+    #[test]
+    fn sandbox_toggles_per_repo_overrides_global() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/relaxed.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      os_hide: false
+  - url: "git@github.com:owner/strict.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    os_hide: true
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let global = cfg.executor.sandbox.as_ref();
+        // The repo that overrides → os_hide off; engine_deny still defaults on.
+        let relaxed = cfg.repositories[0].resolved_sandbox_toggles(global);
+        assert!(!relaxed.os_hide, "per-repo os_hide off wins over global on");
+        assert!(relaxed.engine_deny, "unset engine_deny falls back to default ON");
+        // The repo without an override → global os_hide on.
+        let strict = cfg.repositories[1].resolved_sandbox_toggles(global);
+        assert!(strict.os_hide, "repo without override keeps global os_hide on");
+    }
+
+    // a006 / task 8.6: a repo running with a toggle off emits a relaxed-posture
+    // WARN naming that toggle (assert a WARN fires, not exact wording).
+    #[test]
+    fn sandbox_relaxed_posture_warns_naming_the_off_toggle() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      os_hide: false
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+            .expect("a repo with os_hide off must emit a relaxed-posture WARN");
+        assert!(warn.contains("os_hide"), "the WARN names the off toggle: {warn}");
+        // engine_deny still on → it is NOT named.
+        assert!(!warn.contains("engine_deny"), "an ON toggle is not named: {warn}");
+    }
+
+    // a006: a global toggle off with no per-repo value resolves off (and warns).
+    #[test]
+    fn sandbox_global_off_flows_to_repo_without_override() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    engine_deny: false
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let toggles = cfg.repositories[0].resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(toggles.os_hide, "os_hide still defaults on");
+        assert!(!toggles.engine_deny, "global engine_deny off flows to the repo");
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(cfg.executor.sandbox.as_ref())
+            .expect("engine_deny off must warn");
+        assert!(warn.contains("engine_deny"), "{warn}");
+    }
+
+    // a006: the `allow_unsandboxed` opt-in parses and defaults false.
+    #[test]
+    fn sandbox_allow_unsandboxed_parses_and_defaults_false() {
+        let default_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_d, p) = write_config(default_yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        assert!(
+            !cfg.executor
+                .sandbox
+                .as_ref()
+                .map(|s| s.allow_unsandboxed)
+                .unwrap_or(false),
+            "allow_unsandboxed defaults false"
+        );
+
+        let opt_in = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    allow_unsandboxed: true
+github: {}
+"#;
+        let (_d2, p2) = write_config(opt_in);
+        let cfg2 = Config::load_from(&p2).expect("parses");
+        assert!(cfg2.executor.sandbox.as_ref().unwrap().allow_unsandboxed);
+    }
+
+    // a013: strict_mode resolves per-repo → global → default OFF.
+    #[test]
+    fn sandbox_strict_mode_resolves_per_repo_over_global() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/strict.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      strict_mode: true
+  - url: "git@github.com:owner/normal.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  sandbox:
+    strict_mode: false
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let global = cfg.executor.sandbox.as_ref();
+        assert!(
+            cfg.repositories[0].resolved_sandbox_toggles(global).strict_mode,
+            "per-repo strict_mode on wins over global off"
+        );
+        assert!(
+            !cfg.repositories[1].resolved_sandbox_toggles(global).strict_mode,
+            "a repo without an override keeps the global strict_mode off"
+        );
+        // strict mode is MORE secure → no relaxed-posture WARN.
+        assert!(
+            cfg.repositories[0]
+                .relaxed_sandbox_warning(global)
+                .is_none(),
+            "strict mode does not emit a relaxed-posture WARN"
+        );
+    }
+
+    // a013: mask edits are additive — the global list, then the per-repo list.
+    #[test]
+    fn sandbox_mask_edits_are_additive_global_then_repo() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_add: ["~/repo-extra"]
+      mask_remove: ["~/.netrc"]
+executor:
+  kind: claude_cli
+  sandbox:
+    mask_add: ["~/global-extra"]
+    mask_remove: ["~/.aws"]
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let t = cfg.repositories[0].resolved_sandbox_toggles(cfg.executor.sandbox.as_ref());
+        assert!(t.mask_add.contains(&"~/global-extra".to_string()));
+        assert!(t.mask_add.contains(&"~/repo-extra".to_string()));
+        assert!(t.mask_remove.contains(&"~/.aws".to_string()));
+        assert!(t.mask_remove.contains(&"~/.netrc".to_string()));
+    }
+
+    // a013: removing a DEFAULT mask entry is a relaxed posture, logged and
+    // named at startup; adding a path (or removing a non-default) is not.
+    #[test]
+    fn sandbox_removing_default_mask_entry_warns_naming_it() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/exposed.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_remove: ["~/.ssh"]
+      mask_add: ["~/custom"]
+  - url: "git@github.com:owner/quiet.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    sandbox:
+      mask_add: ["~/custom"]
+      mask_remove: ["~/not-a-default"]
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_d, p) = write_config(yaml);
+        let cfg = Config::load_from(&p).expect("parses");
+        let global = cfg.executor.sandbox.as_ref();
+        let warn = cfg.repositories[0]
+            .relaxed_sandbox_warning(global)
+            .expect("removing a default mask entry must warn");
+        assert!(warn.contains(".ssh"), "the WARN names the exposed default: {warn}");
+        // Adding a path / removing a non-default path is NOT a relaxed posture.
+        assert!(
+            cfg.repositories[1].relaxed_sandbox_warning(global).is_none(),
+            "mask_add and removing a non-default entry emit no WARN"
         );
     }
 
@@ -5886,7 +7346,7 @@ github: {}
     // -----------------------------------------------------------------
 
     fn make_repo(url: &str, audits: Option<HashMap<String, Cadence>>) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),
@@ -5898,6 +7358,7 @@ github: {}
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -6314,6 +7775,127 @@ audits:
             .expect("registered audit must pass validation");
     }
 
+    /// a75 (task 6.7): `validate_audit_type_names` accepts the new
+    /// `canon_contradiction_audit` slug AND still rejects an unknown one,
+    /// listing the registered slugs in the error.
+    #[test]
+    fn validate_audit_type_names_accepts_canon_contradiction_audit() {
+        let known = &[
+            "architecture_brightline",
+            "architecture_consultative",
+            "drift_audit",
+            "missing_tests_audit",
+            "security_bug_audit",
+            "canon_contradiction_audit",
+        ];
+
+        // Accepts the new slug.
+        let ok_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    canon_contradiction_audit: monthly
+"#;
+        let (_d1, p1) = write_config(ok_yaml);
+        let cfg_ok = Config::load_from(&p1).unwrap();
+        validate_audit_type_names(&cfg_ok, known)
+            .expect("canon_contradiction_audit must be accepted");
+
+        // Rejects an unknown slug, naming it AND listing the registered set.
+        let bad_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    not_a_real_audit: monthly
+"#;
+        let (_d2, p2) = write_config(bad_yaml);
+        let cfg_bad = Config::load_from(&p2).unwrap();
+        let err = validate_audit_type_names(&cfg_bad, known)
+            .expect_err("unknown slug must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not_a_real_audit"), "names the unknown slug: {msg}");
+        assert!(
+            msg.contains("canon_contradiction_audit"),
+            "lists the registered slugs including the new one: {msg}"
+        );
+    }
+
+    /// a76 (task 5.7): `validate_audit_type_names` accepts the new
+    /// `canon_consolidation_audit` slug AND still rejects an unknown one,
+    /// listing the seven registered slugs in the error.
+    #[test]
+    fn validate_audit_type_names_accepts_canon_consolidation_audit() {
+        // The seven slugs the canonical "Registered periodic audits"
+        // enumeration carries after a76 (a75's six + canon_consolidation).
+        let known = &[
+            "architecture_brightline",
+            "architecture_consultative",
+            "drift_audit",
+            "missing_tests_audit",
+            "security_bug_audit",
+            "canon_contradiction_audit",
+            "canon_consolidation_audit",
+        ];
+
+        // Accepts the new slug.
+        let ok_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    canon_consolidation_audit: monthly
+"#;
+        let (_d1, p1) = write_config(ok_yaml);
+        let cfg_ok = Config::load_from(&p1).unwrap();
+        validate_audit_type_names(&cfg_ok, known)
+            .expect("canon_consolidation_audit must be accepted");
+
+        // Rejects an unknown slug, naming it AND listing the registered set.
+        let bad_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    not_a_real_audit: monthly
+"#;
+        let (_d2, p2) = write_config(bad_yaml);
+        let cfg_bad = Config::load_from(&p2).unwrap();
+        let err = validate_audit_type_names(&cfg_bad, known)
+            .expect_err("unknown slug must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not_a_real_audit"), "names the unknown slug: {msg}");
+        assert!(
+            msg.contains("canon_consolidation_audit"),
+            "lists the registered slugs including the new one: {msg}"
+        );
+    }
+
     #[test]
     fn cadence_interval_matches_documented_durations() {
         assert!(Cadence::Disabled.interval().is_none());
@@ -6671,6 +8253,89 @@ github:
     }
 
     #[test]
+    fn validate_config_gitlab_forge_block_with_inline_token_routes() {
+        // a008: a `forge: { kind: gitlab }` block with an inline token parses
+        // AND its token route resolves — a non-github.com host is NOT rejected
+        // as "unparsable github", AND the global github token route is not
+        // consulted for this repo.
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let unset = "AUTOCODER_TEST_VALIDATE_GITLAB_FALLBACK_UNSET";
+        unsafe { std::env::remove_var(unset) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "https://gitlab.example.com/group/subgroup/project.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    forge:
+      kind: gitlab
+      host: gitlab.example.com
+      token: {{ value: "glpat-xxx" }}
+executor:
+  kind: claude_cli
+github:
+  token_env: {unset}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        // The block parsed into the typed config.
+        let forge = cfg.repositories[0].forge.as_ref().expect("forge block");
+        assert_eq!(forge.kind, ForgeKind::Gitlab);
+        assert_eq!(forge.host.as_deref(), Some("gitlab.example.com"));
+        assert!(forge.token_route_resolves());
+        // No token-route error despite the (unset) global github fallback.
+        let report = validate_config(&cfg);
+        let route_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::TokenRoute)
+            .collect();
+        assert!(
+            route_errs.is_empty(),
+            "gitlab forge block with inline token must route cleanly; got: {route_errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_gitlab_forge_block_without_token_route_errors() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let unset = "AUTOCODER_TEST_VALIDATE_GITLAB_TOKEN_ENV_UNSET";
+        unsafe { std::env::remove_var(unset) };
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "https://gitlab.example.com/group/project.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    forge:
+      kind: gitlab
+      host: gitlab.example.com
+      token_env: {unset}
+executor:
+  kind: claude_cli
+github:
+  token: {{ value: "ignored-for-this-repo" }}
+"#
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let route_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::TokenRoute)
+            .collect();
+        assert_eq!(route_errs.len(), 1, "expected one forge token-route error");
+        assert_eq!(
+            route_errs[0].config_pointer.as_deref(),
+            Some("repositories/0/forge")
+        );
+    }
+
+    #[test]
     fn validate_config_workspace_collision_emits_one_error_per_repo() {
         let _g = VALIDATE_ENV_LOCK.lock().unwrap();
         let yaml = r#"
@@ -6740,6 +8405,48 @@ audits:
             slug_errs[0].message.contains("typo_audit_name"),
             "error must name the offending slug; got: {}",
             slug_errs[0].message
+        );
+    }
+
+    /// a76 regression: `validate_config`'s audit-slug check (which reads
+    /// `KNOWN_AUDIT_TYPES`) accepts the registered `canon_consolidation_audit`
+    /// slug. The const must stay in lock-step with the `AuditRegistry` built in
+    /// `cli/run.rs`; a drift would make `validate-config` reject a valid
+    /// operator config that enables the audit.
+    #[test]
+    fn validate_config_accepts_canon_consolidation_audit_slug() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+audits:
+  defaults:
+    canon_consolidation_audit: monthly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let slug_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::AuditSlug)
+            .collect();
+        assert!(
+            slug_errs.is_empty(),
+            "canon_consolidation_audit is a registered slug and must not raise an audit-slug error; got: {slug_errs:?}"
+        );
+        // The const is the source of the validator's known set: it must list
+        // the slug the registry registers.
+        assert!(
+            KNOWN_AUDIT_TYPES.contains(&"canon_consolidation_audit"),
+            "KNOWN_AUDIT_TYPES must list canon_consolidation_audit to match the registry"
         );
     }
 
@@ -7175,6 +8882,59 @@ features:
         let err = cfg.validate().expect_err("max_capabilities=0 invalid");
         assert!(err.contains("max_capabilities"), "{err}");
         assert!(err.contains("1..=50"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // features.issues (a009)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_issues_block_omitted_is_off_by_default() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        // The issues lane is OFF by default — unlike the chatops-verb
+        // features, an enabled lane changes per-iteration unit selection.
+        assert!(
+            !cfg.features.issues.enabled,
+            "issues lane must default to OFF"
+        );
+        assert!(cfg.features.issues.prompt_path.is_none());
+        assert_eq!(cfg.features.issues, IssuesFeatureConfig::default());
+    }
+
+    #[test]
+    fn features_issues_explicit_block_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  issues:
+    enabled: true
+    prompt_path: "./prompts/issue-custom.md"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit fields parse");
+        assert!(cfg.features.issues.enabled);
+        assert_eq!(
+            cfg.features.issues.prompt_path.as_deref(),
+            Some(Path::new("./prompts/issue-custom.md"))
+        );
     }
 
     #[test]
@@ -8252,6 +10012,129 @@ reviewer:
         assert!(msg.contains("reviewer"), "must name the block: {msg}");
     }
 
+    // ---- audit-model-selection: per-audit `model` registry references ----
+
+    /// An audit configured with a valid `models:` registry nickname resolves
+    /// at config-load to the registry entry's full tuple (provider + model +
+    /// base URL), surfaced on `AuditSettings::resolved_model`.
+    #[test]
+    fn audit_model_nickname_resolves_to_registry_entry() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  beefy_security:
+    provider: openai_compatible
+    model: moonshotai/kimi-k2
+    api_base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_KEY
+audits:
+  defaults:
+    drift_audit: daily
+  settings:
+    drift_audit:
+      model: beefy_security
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("audit nickname must resolve");
+        let audits = cfg.audits.expect("audits block present");
+        let settings = audits
+            .settings
+            .get("drift_audit")
+            .expect("drift_audit settings present");
+        // The unresolved nickname is preserved AND the resolved tuple is set.
+        assert_eq!(settings.model.as_deref(), Some("beefy_security"));
+        let resolved = settings
+            .resolved_model
+            .as_ref()
+            .expect("model nickname resolved at config-load");
+        assert_eq!(resolved.provider, LlmProvider::OpenAiCompatible);
+        assert_eq!(resolved.model, "moonshotai/kimi-k2");
+        assert_eq!(
+            resolved.api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    /// An audit whose `model` names no registry entry fails config-load,
+    /// naming BOTH the missing nickname AND the referencing audit setting.
+    #[test]
+    fn audit_model_unknown_nickname_fails_with_diagnostic() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  fast_local:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    api_base_url: http://localhost:11434
+audits:
+  settings:
+    security_bug_audit:
+      model: nonexistent_model
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("unknown audit model nickname must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent_model"),
+            "must name the missing nickname: {msg}"
+        );
+        assert!(
+            msg.contains("audits.settings.security_bug_audit"),
+            "must name the referencing audit setting: {msg}"
+        );
+    }
+
+    /// An audit with settings but no `model` field resolves to `None`,
+    /// preserving the default `claude` CLI behavior.
+    #[test]
+    fn audit_without_model_field_resolves_to_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+audits:
+  defaults:
+    drift_audit: daily
+  settings:
+    drift_audit:
+      notify_on_clean: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("audit without a model must load");
+        let audits = cfg.audits.expect("audits block present");
+        let settings = audits
+            .settings
+            .get("drift_audit")
+            .expect("drift_audit settings present");
+        assert!(settings.model.is_none(), "no model nickname configured");
+        assert!(
+            settings.resolved_model.is_none(),
+            "no model field must leave resolved_model None (default claude behavior)"
+        );
+    }
+
     /// 4.4 / 2.2: a `canonical_rag` block resolving (via the registry) to
     /// `anthropic` fails the subsystem-validity gate exactly as an inline
     /// `provider: anthropic` would.
@@ -8327,6 +10210,40 @@ models:
             default_cli_for(LlmProvider::OpenAiCompatible),
             CliKind::Opencode
         );
+        // a69: the Google/Antigravity provider maps to the `agy` CLI.
+        assert_eq!(default_cli_for(LlmProvider::Google), CliKind::Antigravity);
+    }
+
+    /// a69 / task 3.1: the Antigravity CLI is configured as `cli: antigravity`
+    /// but its binary on `PATH` is `agy`; the two accessors diverge only for
+    /// this CLI (claude/opencode coincide).
+    #[test]
+    fn antigravity_cli_kind_string_and_binary() {
+        assert_eq!(CliKind::Antigravity.as_str(), "antigravity");
+        assert_eq!(CliKind::Antigravity.default_command(), "agy");
+        assert_eq!(CliKind::Claude.default_command(), "claude");
+        assert_eq!(CliKind::Opencode.default_command(), "opencode");
+        // The registry's `cli: antigravity` parses to the variant, and an
+        // explicit override wins over the provider default.
+        let entry = ModelEntry {
+            provider: LlmProvider::Anthropic,
+            model: "x".into(),
+            api_base_url: None,
+            api_key: None,
+            api_key_env: None,
+            cli: Some(CliKind::Antigravity),
+        };
+        assert_eq!(entry.resolved_cli(), CliKind::Antigravity);
+        // And a Google-provider entry defaults to Antigravity with no override.
+        let google = ModelEntry {
+            provider: LlmProvider::Google,
+            model: "gemini-3-pro".into(),
+            api_base_url: None,
+            api_key: None,
+            api_key_env: None,
+            cli: None,
+        };
+        assert_eq!(google.resolved_cli(), CliKind::Antigravity);
     }
 
     /// 4.5: an entry's explicit `cli` override wins over the provider

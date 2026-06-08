@@ -224,7 +224,7 @@ test_config_branch_empty() {
   rm -rf "$sandbox" "$stderr_file"
 
   [[ "$rc" -eq 1 ]] || { echo "  FAIL: exit code: expected 1, got $rc" >&2; return 1; }
-  assert_contains "could not resolve config path" "$stderr" "branch-1 message" || return 1
+  assert_contains "no config file at /etc/autocoder/config.yaml" "$stderr" "branch-1 message" || return 1
   assert_not_contains "cannot find config" "$stderr" "no pre-spec generic text" || return 1
 }
 
@@ -278,8 +278,7 @@ test_config_branch_missing() {
   rm -rf "$sandbox" "$stderr_file"
 
   [[ "$rc" -eq 1 ]] || { echo "  FAIL: exit code: expected 1, got $rc" >&2; return 1; }
-  assert_contains "no config file at" "$stderr" "branch-3 message" || return 1
-  assert_contains "${sandbox}/nope/config.yaml" "$stderr" "branch-3 names path" || return 1
+  assert_contains "no config file at ${sandbox}/nope/config.yaml" "$stderr" "branch-3 message" || return 1
   assert_not_contains "cannot find config" "$stderr" "no pre-spec generic text" || return 1
 }
 

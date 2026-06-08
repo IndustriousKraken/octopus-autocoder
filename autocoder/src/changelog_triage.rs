@@ -5,9 +5,17 @@
 //! loop drains the queue once per iteration and calls
 //! `process_changelog_requests`. For each request the handler:
 //!
-//! 1. Runs the deterministic `a05` extractor against the workspace's
-//!    archive (no subprocess — the extractor's data-producing helpers
-//!    are called directly).
+//! 1. Resolves which versions a flagless run documents (a72): with no
+//!    `--since`/`--to` it runs tag-driven gap-fill — every stable release
+//!    tag missing from `CHANGELOG.md`, oldest-first, each as its own
+//!    `(previous stable tag … this tag]` section — and combines the
+//!    per-tag results into one `{ "sections": [ … ] }` payload. An
+//!    explicit `--since`/`--to` keeps the single-range path. When nothing
+//!    is undocumented (or there are no stable tags), the run is a friendly
+//!    no-op: no stylist, no PR, a short thread reply, terminal status.
+//!    Either way the deterministic `a05` extractor produces each section's
+//!    data (no subprocess — its data-producing helpers are called
+//!    directly).
 //! 2. Builds the stylist prompt from the JSON output AND invokes the
 //!    executor's `run_changelog` method.
 //! 3. Validates the resulting diff's path scope: must touch only
@@ -18,6 +26,7 @@
 //! 5. Posts a threaded reply in the lifecycle thread naming the PR URL.
 
 use anyhow::{Context, Result, anyhow};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::changelog_requests::{
@@ -54,18 +63,18 @@ fn is_in_scope(path: &str) -> bool {
     false
 }
 
-/// Run the deterministic `a05` extractor against the workspace's
-/// archive AND return the rendered JSON payload. Calls the extractor's
+/// Run the deterministic `a05` extractor over `(since … to]` AND return
+/// the rendered section as a JSON value (the single-section shape:
+/// `{version, date, since, to, entries, skipped}`). Calls the extractor's
 /// data-producing helpers directly (no subprocess).
-fn extract_changelog_json(workspace: &Path, args: &ParsedChangelogArgs) -> Result<String> {
+fn extract_section_json(
+    workspace: &Path,
+    since: Option<&str>,
+    to: &str,
+) -> Result<serde_json::Value> {
     let mut stderr_buf: Vec<u8> = Vec::new();
-    let range = resolve_tag_range(
-        workspace,
-        args.since.as_deref(),
-        args.to.as_deref().unwrap_or("HEAD"),
-        &mut stderr_buf,
-    )
-    .with_context(|| "changelog-stylist: resolving tag range".to_string())?;
+    let range = resolve_tag_range(workspace, since, to, &mut stderr_buf)
+        .with_context(|| "changelog-stylist: resolving tag range".to_string())?;
     let discovered = cli_changelog::find_archives_in_range(workspace, &range)
         .with_context(|| "changelog-stylist: discovering archives".to_string())?;
 
@@ -97,8 +106,279 @@ fn extract_changelog_json(workspace: &Path, args: &ParsedChangelogArgs) -> Resul
         }
     }
     let version = range.to_label.clone();
-    render_json(&version, &range, &entries, &skipped)
-        .map_err(|e| anyhow!("rendering changelog JSON: {e}"))
+    let json = render_json(&version, &range, &entries, &skipped)
+        .map_err(|e| anyhow!("rendering changelog JSON: {e}"))?;
+    serde_json::from_str(&json).map_err(|e| anyhow!("parsing rendered changelog JSON: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// a72: tag-driven gap-fill
+// ---------------------------------------------------------------------------
+
+/// A git tag that parses as a `major.minor.patch` semantic version,
+/// retaining its original tag string AND any pre-release suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTag {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    /// The semver pre-release component (the part after `-`), if any.
+    /// `None` for stable releases.
+    prerelease: Option<String>,
+    /// The original tag string as it appears in the repo (e.g. `v1.2.0`).
+    tag: String,
+}
+
+impl ParsedTag {
+    /// Canonical, `v`-stripped version key used for set membership AND
+    /// equality against the versions a `CHANGELOG.md` already documents.
+    /// Retains the pre-release suffix so `1.0.0-rc.1` never matches the
+    /// stable `1.0.0`.
+    fn version_key(&self) -> String {
+        match &self.prerelease {
+            Some(pre) => format!("{}.{}.{}-{}", self.major, self.minor, self.patch, pre),
+            None => format!("{}.{}.{}", self.major, self.minor, self.patch),
+        }
+    }
+
+    fn is_stable(&self) -> bool {
+        self.prerelease.is_none()
+    }
+}
+
+/// Parse a tag string as a semver release version, tolerant of a leading
+/// `v`/`V` AND of `+build` metadata. Returns `None` for tags that do not
+/// parse as `major.minor.patch[-prerelease][+build]` (non-version tags are
+/// simply ignored by gap-fill).
+fn parse_version_tag(tag: &str) -> Option<ParsedTag> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Tolerate a single leading `v`/`V`.
+    let core = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    // Strip `+build` metadata: per semver it carries no precedence AND has
+    // no bearing on stable-vs-pre-release.
+    let core = core.split('+').next().unwrap_or(core);
+    // Split off the pre-release component at the first `-`.
+    let (numbers, prerelease) = match core.split_once('-') {
+        Some((nums, pre)) if !pre.is_empty() => (nums, Some(pre.to_string())),
+        // A trailing `-` with an empty pre-release is not a valid version.
+        Some((_nums, _empty)) => return None,
+        None => (core, None),
+    };
+    let mut parts = numbers.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        // More than three numeric components — not a release version.
+        return None;
+    }
+    Some(ParsedTag {
+        major,
+        minor,
+        patch,
+        prerelease,
+        tag: trimmed.to_string(),
+    })
+}
+
+/// Parse `tags`, keep only stable release versions (no pre-release
+/// component), AND return them sorted ascending by version. Non-version
+/// tags AND pre-release tags (`-dev`/`-rc`/`-alpha`/`-beta`/any semver
+/// pre-release suffix) are dropped. Duplicate versions (e.g. `1.0.0` AND
+/// `v1.0.0`) are collapsed to one.
+fn stable_release_tags(tags: &[String]) -> Vec<ParsedTag> {
+    let mut stable: Vec<ParsedTag> = tags
+        .iter()
+        .filter_map(|t| parse_version_tag(t))
+        .filter(ParsedTag::is_stable)
+        .collect();
+    stable.sort_by_key(|a| (a.major, a.minor, a.patch));
+    stable.dedup_by(|a, b| a.major == b.major && a.minor == b.minor && a.patch == b.patch);
+    stable
+}
+
+/// Regex matching a `CHANGELOG.md` version heading AND capturing the
+/// version string (`v`-stripped, pre-release suffix retained). Matches the
+/// heading shapes the stylist produces — `## [1.0.0] - …`, `## v1.0.0 — …`,
+/// `### 1.2.0-rc.1`, etc. — so daemon-side gap detection stays symmetric
+/// with the stylist's own headings.
+fn changelog_heading_version_regex() -> regex::Regex {
+    regex::Regex::new(r"(?i)^#+\s*\[?v?(\d+\.\d+\.\d+(?:-[\w.]+)?)\]?")
+        .expect("changelog heading version regex is a valid literal")
+}
+
+/// Extract the set of versions a `CHANGELOG.md` body already documents by
+/// matching its version headings. The returned keys are `v`-stripped AND
+/// retain any pre-release suffix so they line up with
+/// `ParsedTag::version_key`.
+fn documented_versions(changelog: &str) -> BTreeSet<String> {
+    let re = changelog_heading_version_regex();
+    let mut out = BTreeSet::new();
+    for line in changelog.lines() {
+        if let Some(caps) = re.captures(line) {
+            out.insert(caps[1].to_string());
+        }
+    }
+    out
+}
+
+/// A single gap-fill extraction range: `(since … to]`. `since` is the
+/// previous stable release tag's name, or `None` meaning "ever" (from the
+/// beginning of archive history).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GapRange {
+    since: Option<String>,
+    to: String,
+}
+
+/// Compute the per-tag extraction ranges for the undocumented stable tags,
+/// oldest-first. For each missing tag, the lower bound is the
+/// immediately-preceding stable tag in the full ascending list (whether or
+/// not it is itself documented), or `None` ("ever") when the missing tag is
+/// the earliest stable release.
+fn gap_fill_ranges(stable_sorted: &[ParsedTag], documented: &BTreeSet<String>) -> Vec<GapRange> {
+    let mut ranges = Vec::new();
+    for (i, tag) in stable_sorted.iter().enumerate() {
+        if documented.contains(&tag.version_key()) {
+            continue;
+        }
+        let since = if i == 0 {
+            None
+        } else {
+            Some(stable_sorted[i - 1].tag.clone())
+        };
+        ranges.push(GapRange {
+            since,
+            to: tag.tag.clone(),
+        });
+    }
+    ranges
+}
+
+/// List the workspace's tags (one per line, blank lines dropped).
+fn list_repo_tags(workspace: &Path) -> Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["tag", "--list"])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git tag --list` in {}", workspace.display()))?;
+    if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!("git tag --list failed: {stderr_text}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Read `<workspace>/CHANGELOG.md`, returning an empty string when the file
+/// is absent (a fresh repo documents nothing yet).
+fn read_changelog(workspace: &Path) -> Result<String> {
+    let path = workspace.join("CHANGELOG.md");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Why a gap-fill run had nothing to do, for the friendly thread reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoOpReason {
+    /// Every stable release tag is already documented.
+    AlreadyCurrent,
+    /// The repo has no stable release tags to document yet.
+    NoStableTags,
+}
+
+impl NoOpReason {
+    fn reply_body(self, repo_url: &str) -> String {
+        match self {
+            NoOpReason::AlreadyCurrent => format!(
+                "ℹ️ Changelog for `{repo_url}` is already current — every stable release tag is documented. Nothing to do."
+            ),
+            NoOpReason::NoStableTags => format!(
+                "ℹ️ No stable release tags to document yet for `{repo_url}`. Tag a release (e.g. `v1.0.0`), or pass `--since`/`--to` for an explicit range."
+            ),
+        }
+    }
+}
+
+/// What `build_stylist_payload` resolved a request to.
+enum StylistPayload {
+    /// One or more version sections to hand to the stylist, already
+    /// serialized as the `{ "sections": [ … ] }` JSON the prompt consumes.
+    Sections(String),
+    /// Nothing to document — the caller posts a friendly no-op reply AND
+    /// advances the request to its terminal status without invoking the
+    /// stylist or opening a PR.
+    NoOp(NoOpReason),
+}
+
+/// Wrap one or more section objects into the `{ "sections": [ … ] }`
+/// envelope the stylist prompt consumes. Pretty-printed for readability.
+fn wrap_sections(sections: Vec<serde_json::Value>) -> Result<String> {
+    let doc = serde_json::json!({ "sections": sections });
+    let mut text = serde_json::to_string_pretty(&doc)
+        .map_err(|e| anyhow!("serializing combined changelog sections: {e}"))?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// Build the JSON payload handed to the stylist (a72).
+///
+/// With an explicit `--since` AND/OR `--to`, the single-range behavior is
+/// preserved: one section for the operator-specified `(since … to]`.
+/// Otherwise gap-fill runs: every undocumented stable release tag becomes
+/// its own section, oldest-first — OR a `NoOp` when there is nothing to
+/// document (all stable tags already documented, or no stable tags yet).
+fn build_stylist_payload(
+    workspace: &Path,
+    parsed: &ParsedChangelogArgs,
+) -> Result<StylistPayload> {
+    // Explicit range overrides gap-fill: one section for the
+    // operator-specified `(since … to]`.
+    if parsed.since.is_some() || parsed.to.is_some() {
+        let section = extract_section_json(
+            workspace,
+            parsed.since.as_deref(),
+            parsed.to.as_deref().unwrap_or("HEAD"),
+        )?;
+        return Ok(StylistPayload::Sections(wrap_sections(vec![section])?));
+    }
+
+    // Flagless: tag-driven gap-fill.
+    let tags = list_repo_tags(workspace)?;
+    let stable = stable_release_tags(&tags);
+    if stable.is_empty() {
+        return Ok(StylistPayload::NoOp(NoOpReason::NoStableTags));
+    }
+    let changelog = read_changelog(workspace)?;
+    let documented = documented_versions(&changelog);
+    let ranges = gap_fill_ranges(&stable, &documented);
+    if ranges.is_empty() {
+        return Ok(StylistPayload::NoOp(NoOpReason::AlreadyCurrent));
+    }
+    let mut sections = Vec::with_capacity(ranges.len());
+    for range in &ranges {
+        // A `None` lower bound means "from the beginning of archive
+        // history": pass the `ever` sentinel, NOT `None`. Passing `None`
+        // would auto-detect the most-recent tag on `to`'s ancestry — which
+        // for the earliest stable tag is the tag itself, yielding an empty
+        // range.
+        let since = range.since.as_deref().unwrap_or("ever");
+        let section = extract_section_json(workspace, Some(since), &range.to)?;
+        sections.push(section);
+    }
+    Ok(StylistPayload::Sections(wrap_sections(sections)?))
 }
 
 /// Drain handler for chat-driven changelog requests. The polling loop's
@@ -201,7 +481,28 @@ async fn process_one_request(
             "refusing changelog: --workspace override arrived via chatops"
         ));
     }
-    let changelog_json = extract_changelog_json(workspace, &parsed)?;
+    let changelog_json = match build_stylist_payload(workspace, &parsed)? {
+        StylistPayload::Sections(json) => json,
+        StylistPayload::NoOp(reason) => {
+            // a72: nothing to document — no stylist, no PR. Post a short
+            // thread reply AND advance to the terminal `Acted` status.
+            tracing::info!(
+                url = %repo.url,
+                request_id = %state.request_id,
+                "changelog-stylist: gap-fill no-op ({reason:?}); skipping stylist + PR"
+            );
+            if let Some(ctx) = chatops_ctx {
+                let body = reason.reply_body(&state.repo_url);
+                let _ = ctx
+                    .chatops
+                    .post_threaded_reply(&state.channel, &state.lifecycle_thread_ts, &body)
+                    .await;
+            }
+            state.status = ChangelogStatus::Acted;
+            let _ = changelog_requests::write_state(state_root, state);
+            return Ok(());
+        }
+    };
     let ctx = ChangelogContext {
         changelog_json,
         repo_url: state.repo_url.clone(),
@@ -218,6 +519,12 @@ async fn process_one_request(
             commit_and_open_pr(workspace, repo, github_cfg, chatops_ctx, state_root, state).await
         }
         ExecutorOutcome::Failed { reason } => Err(anyhow!("executor failed: {reason}")),
+        // a74: surfaced only on the revise path today; the changelog flow is
+        // out of scope. Treat it as a failure (defensive — never produced here
+        // at runtime).
+        ExecutorOutcome::PreconditionUnmet { reason } => {
+            Err(anyhow!("executor reported PreconditionUnmet: {reason}"))
+        }
         ExecutorOutcome::AskUser { .. } => Err(anyhow!(
             "executor returned AskUser; changelog flow does not support clarification"
         )),
@@ -611,7 +918,17 @@ async fn re_run_stylist_and_force_push(
         format!("changelog-revision: pull --ff-only `{}`", repo.base_branch)
     })?;
     let parsed = ParsedChangelogArgs::default();
-    let changelog_json = extract_changelog_json(workspace, &parsed)?;
+    let changelog_json = match build_stylist_payload(workspace, &parsed)? {
+        StylistPayload::Sections(json) => json,
+        StylistPayload::NoOp(_) => {
+            // A flagless revision found no undocumented stable tags — the
+            // base changelog is already current, so there is nothing to
+            // restyle. Surface as an error so the revise loop reports it.
+            return Err(anyhow!(
+                "changelog revision: nothing to document (gap-fill found no missing stable tags)"
+            ));
+        }
+    };
     let ctx = ChangelogContext {
         changelog_json,
         repo_url: repo.url.clone(),
@@ -622,6 +939,11 @@ async fn re_run_stylist_and_force_push(
         ExecutorOutcome::Completed { .. } => {}
         ExecutorOutcome::Failed { reason } => {
             return Err(anyhow!("executor failed: {reason}"));
+        }
+        // a74: surfaced only on the revise path today; out of scope here.
+        // Treat it as a failure (defensive — never produced here at runtime).
+        ExecutorOutcome::PreconditionUnmet { reason } => {
+            return Err(anyhow!("executor reported PreconditionUnmet: {reason}"));
         }
         ExecutorOutcome::AskUser { .. } => {
             return Err(anyhow!("executor returned AskUser; not supported here"));
@@ -819,5 +1141,313 @@ mod tests {
             is_in_scope(&changed[0]),
             "is_in_scope must accept the intact path"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // a72: tag-driven gap-fill — pure helpers
+    // -----------------------------------------------------------------
+
+    /// 1.1 / 1.2 — tolerant parse: `v` prefix accepted, build metadata
+    /// stripped, non-version tags ignored.
+    #[test]
+    fn parse_version_tag_is_tolerant_and_ignores_non_versions() {
+        assert_eq!(parse_version_tag("v1.2.0").unwrap().version_key(), "1.2.0");
+        assert_eq!(parse_version_tag("1.2.0").unwrap().version_key(), "1.2.0");
+        assert_eq!(parse_version_tag("V2.0.0").unwrap().version_key(), "2.0.0");
+        // Pre-release suffix is retained AND marks the tag non-stable.
+        let rc = parse_version_tag("v1.2.0-rc.1").unwrap();
+        assert!(!rc.is_stable());
+        assert_eq!(rc.version_key(), "1.2.0-rc.1");
+        // Build metadata is tolerated AND does not make the tag a
+        // pre-release.
+        let bm = parse_version_tag("v1.2.0+build.5").unwrap();
+        assert!(bm.is_stable());
+        assert_eq!(bm.version_key(), "1.2.0");
+        // Non-version tags are ignored.
+        assert!(parse_version_tag("nightly").is_none());
+        assert!(parse_version_tag("v1.2").is_none());
+        assert!(parse_version_tag("1.2.0.3").is_none());
+        assert!(parse_version_tag("release-2026").is_none());
+        assert!(parse_version_tag("v1.2.0-").is_none());
+    }
+
+    /// 4.1 — stable filter: pre-release tags are skipped AND stable
+    /// releases come back ascending by version.
+    #[test]
+    fn stable_filter_skips_prerelease_and_sorts_ascending() {
+        let tags = vec![
+            "v1.2.0".to_string(),
+            "v1.2.0-dev-108".to_string(),
+            "v1.2.0-rc.1".to_string(),
+            "v1.1.0".to_string(),
+        ];
+        let stable = stable_release_tags(&tags);
+        let names: Vec<&str> = stable.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(names, vec!["v1.1.0", "v1.2.0"]);
+    }
+
+    /// 4.1 (extra) — versions sort numerically, not lexically
+    /// (`v1.10.0` is newer than `v1.9.0`), AND non-version tags drop out.
+    #[test]
+    fn stable_filter_sorts_numerically_and_drops_non_versions() {
+        let tags = vec![
+            "v1.10.0".to_string(),
+            "v1.9.0".to_string(),
+            "nightly".to_string(),
+            "v2.0.0".to_string(),
+        ];
+        let stable = stable_release_tags(&tags);
+        let names: Vec<&str> = stable.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(names, vec!["v1.9.0", "v1.10.0", "v2.0.0"]);
+    }
+
+    /// 4.2 — documented-version detection: a `## [1.0.0]` heading yields
+    /// `{1.0.0}`, AND the missing set against tags `{v1.0.0, v1.1.0}` is
+    /// `[v1.1.0]` (read off the gap-fill ranges' `to` labels).
+    #[test]
+    fn documented_versions_and_missing_set() {
+        let changelog =
+            "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-05-01\n- did things\n";
+        let documented = documented_versions(changelog);
+        assert!(documented.contains("1.0.0"));
+        assert_eq!(documented.len(), 1, "only 1.0.0 is a version heading");
+
+        let tags = vec!["v1.0.0".to_string(), "v1.1.0".to_string()];
+        let stable = stable_release_tags(&tags);
+        let ranges = gap_fill_ranges(&stable, &documented);
+        let missing: Vec<&str> = ranges.iter().map(|r| r.to.as_str()).collect();
+        assert_eq!(missing, vec!["v1.1.0"], "1.0.0 documented → only v1.1.0 missing");
+    }
+
+    /// 4.2 (extra) — the stylist's own `## v1.0.0 — <date>` heading shape
+    /// is detected too, keeping daemon gap detection symmetric with the
+    /// stylist's headings.
+    #[test]
+    fn documented_versions_detects_v_prefixed_emdash_headings() {
+        let changelog = "# Changelog\n\n## v1.0.0 — 2026-05-01\n- thing\n\n### 1.2.0-rc.1\n- pre\n";
+        let documented = documented_versions(changelog);
+        assert!(documented.contains("1.0.0"));
+        assert!(documented.contains("1.2.0-rc.1"));
+    }
+
+    /// 4.3 — gap-fill ranges, oldest-first, with an `ever` lower bound for
+    /// the earliest stable release. Asserts the ranges/order, not message
+    /// text.
+    #[test]
+    fn gap_fill_ranges_oldest_first_with_ever_lower_bound() {
+        let tags = vec!["v1.1.0".to_string(), "v1.0.0".to_string()];
+        let stable = stable_release_tags(&tags);
+        let documented = BTreeSet::new();
+        let ranges = gap_fill_ranges(&stable, &documented);
+        assert_eq!(
+            ranges,
+            vec![
+                GapRange {
+                    since: None,
+                    to: "v1.0.0".to_string(),
+                },
+                GapRange {
+                    since: Some("v1.0.0".to_string()),
+                    to: "v1.1.0".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// 4.3 (extra) — when the earliest stable tag is already documented,
+    /// the next missing tag's lower bound is still the previous stable tag
+    /// (documented or not), not `ever`.
+    #[test]
+    fn gap_fill_range_uses_documented_predecessor_as_lower_bound() {
+        let tags = vec!["v1.0.0".to_string(), "v1.1.0".to_string()];
+        let stable = stable_release_tags(&tags);
+        let mut documented = BTreeSet::new();
+        documented.insert("1.0.0".to_string());
+        let ranges = gap_fill_ranges(&stable, &documented);
+        assert_eq!(
+            ranges,
+            vec![GapRange {
+                since: Some("v1.0.0".to_string()),
+                to: "v1.1.0".to_string(),
+            }]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // a72: build_stylist_payload — git-backed end-to-end
+    // -----------------------------------------------------------------
+
+    fn git_run(ws: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_repo(ws: &std::path::Path) {
+        git_run(ws, &["init", "-q", "--initial-branch=main"]);
+        git_run(ws, &["config", "user.email", "test@example.com"]);
+        git_run(ws, &["config", "user.name", "test"]);
+        git_run(ws, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn write_file(ws: &std::path::Path, rel: &str, contents: &str) {
+        let path = ws.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(ws: &std::path::Path, msg: &str) -> String {
+        git_run(ws, &["add", "-A"]);
+        git_run(ws, &["commit", "-q", "-m", msg]);
+        git_run(ws, &["rev-parse", "HEAD"])
+    }
+
+    fn write_archive(ws: &std::path::Path, date_prefix: &str, slug: &str, proposal_md: &str) {
+        let dir_name = format!("{date_prefix}-{slug}");
+        let archive_dir = ws.join("openspec/changes/archive").join(&dir_name);
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("proposal.md"), proposal_md).unwrap();
+        let cap_dir = archive_dir.join("specs").join("cap");
+        std::fs::create_dir_all(&cap_dir).unwrap();
+        std::fs::write(
+            cap_dir.join("spec.md"),
+            "## ADDED Requirements\n\n### Requirement: stub\nstub.\n",
+        )
+        .unwrap();
+    }
+
+    /// Flagless run fills every missing stable release tag, oldest-first,
+    /// each as its own section, each over its `(previous stable tag … this
+    /// tag]` range.
+    #[test]
+    fn build_payload_gapfill_fills_two_missing_tags_oldest_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        write_archive(ws, "2026-05-01", "alpha", "## Why\n\nAlpha.\n");
+        commit_all(ws, "ship alpha");
+        git_run(ws, &["tag", "v1.0.0"]);
+        write_archive(ws, "2026-05-02", "beta", "## Why\n\nBeta.\n");
+        commit_all(ws, "ship beta");
+        git_run(ws, &["tag", "v1.1.0"]);
+
+        let parsed = ParsedChangelogArgs::default();
+        let json = match build_stylist_payload(ws, &parsed).unwrap() {
+            StylistPayload::Sections(j) => j,
+            StylistPayload::NoOp(_) => panic!("expected sections, got no-op"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sections = v["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 2, "two undocumented stable tags → two sections");
+        // Oldest-first; first section's lower bound is the `ever` sentinel.
+        assert_eq!(sections[0]["version"], "v1.0.0");
+        assert_eq!(sections[0]["since"], "ever");
+        assert_eq!(sections[0]["to"], "v1.0.0");
+        assert_eq!(sections[1]["version"], "v1.1.0");
+        assert_eq!(sections[1]["since"], "v1.0.0");
+        assert_eq!(sections[1]["to"], "v1.1.0");
+        // Each section carries exactly the archive in its range.
+        assert_eq!(sections[0]["entries"][0]["slug"], "alpha");
+        assert_eq!(sections[0]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(sections[1]["entries"][0]["slug"], "beta");
+        assert_eq!(sections[1]["entries"].as_array().unwrap().len(), 1);
+    }
+
+    /// 4.4 — no-op: every stable tag already documented → `NoOp`, so the
+    /// caller invokes no stylist AND opens no PR.
+    #[test]
+    fn build_payload_noop_when_all_stable_tags_documented() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        write_archive(ws, "2026-05-01", "alpha", "## Why\n\nAlpha.\n");
+        commit_all(ws, "ship alpha");
+        git_run(ws, &["tag", "v1.0.0"]);
+        write_file(
+            ws,
+            "CHANGELOG.md",
+            "# Changelog\n\n## [1.0.0] - 2026-05-01\n- alpha\n",
+        );
+        commit_all(ws, "document v1.0.0");
+
+        let parsed = ParsedChangelogArgs::default();
+        let payload = build_stylist_payload(ws, &parsed).unwrap();
+        assert!(
+            matches!(payload, StylistPayload::NoOp(NoOpReason::AlreadyCurrent)),
+            "all stable tags documented → AlreadyCurrent no-op (no stylist, no PR)"
+        );
+    }
+
+    /// 4.4 (extra) — no-op: a repo with only pre-release tags has no
+    /// stable release to document.
+    #[test]
+    fn build_payload_noop_when_no_stable_tags() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        git_run(ws, &["tag", "v1.0.0-rc.1"]);
+
+        let parsed = ParsedChangelogArgs::default();
+        let payload = build_stylist_payload(ws, &parsed).unwrap();
+        assert!(
+            matches!(payload, StylistPayload::NoOp(NoOpReason::NoStableTags)),
+            "only a pre-release tag exists → NoStableTags no-op (no PR)"
+        );
+    }
+
+    /// 4.5 — override: an explicit `--since`/`--to` takes the single-range
+    /// path AND does not enumerate the other missing stable tags.
+    #[test]
+    fn explicit_range_takes_single_section_and_skips_gapfill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        write_archive(ws, "2026-05-01", "alpha", "## Why\n\nAlpha.\n");
+        commit_all(ws, "ship alpha");
+        git_run(ws, &["tag", "v1.0.0"]);
+        write_archive(ws, "2026-05-02", "beta", "## Why\n\nBeta.\n");
+        commit_all(ws, "ship beta");
+        git_run(ws, &["tag", "v1.1.0"]);
+        write_archive(ws, "2026-05-03", "gamma", "## Why\n\nGamma.\n");
+        commit_all(ws, "ship gamma");
+        git_run(ws, &["tag", "v1.2.0"]);
+
+        let parsed = ParsedChangelogArgs {
+            since: Some("v1.0.0".to_string()),
+            to: Some("v1.1.0".to_string()),
+            workspace_override: None,
+        };
+        let json = match build_stylist_payload(ws, &parsed).unwrap() {
+            StylistPayload::Sections(j) => j,
+            StylistPayload::NoOp(_) => panic!("explicit range must produce a section"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sections = v["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 1, "explicit range → exactly one section");
+        assert_eq!(sections[0]["since"], "v1.0.0");
+        assert_eq!(sections[0]["to"], "v1.1.0");
+        // Only beta sits in `(v1.0.0 … v1.1.0]`; gamma / v1.2.0 are not
+        // enumerated by the override path.
+        let entries = sections[0]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["slug"], "beta");
     }
 }

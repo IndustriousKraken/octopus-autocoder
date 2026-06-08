@@ -9,6 +9,7 @@ use crate::audits::{
     AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
@@ -156,6 +157,11 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
         &audit_settings,
         &executor_cfg,
     )));
+    registry.register(std::sync::Arc::new(CanonContradictionAudit::new(
+        &audit_settings,
+        &executor_cfg,
+        paths,
+    )));
 
     let audit_arc = registry
         .iter()
@@ -195,9 +201,11 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
 fn default_standalone_executor_cfg() -> ExecutorConfig {
     ExecutorConfig {
         kind: ExecutorKind::ClaudeCli,
+        implementer_cli: None,
         command: "claude".to_string(),
         timeout_secs: 600,
         sandbox: None,
+        agent_env: None,
         implementer_prompt_path: None,
         changelog_stylist_prompt_path: None,
         perma_stuck_after_failures: None,
@@ -214,6 +222,14 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
             crate::config::ContradictionCheckMode::Disabled,
         change_internal_contradiction_check_prompt_path: None,
         change_internal_contradiction_check_llm: None,
+        change_canonical_contradiction_check:
+            crate::config::ContradictionCheckMode::Disabled,
+        change_canonical_contradiction_check_prompt_path: None,
+        change_canonical_contradiction_check_llm: None,
+        code_implements_spec_check:
+            crate::config::ContradictionCheckMode::Disabled,
+        code_implements_spec_check_prompt_path: None,
+        code_implements_spec_check_llm: None,
         implementer: None,
         changelog_stylist: None,
         implementer_revision: None,
@@ -223,7 +239,7 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
 }
 
 fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
-    RepositoryConfig {
+    RepositoryConfig { forge: None,
         url: "standalone://audit-run".to_string(),
         local_path: Some(workspace.to_path_buf()),
         base_branch: "main".to_string(),
@@ -235,6 +251,7 @@ fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        sandbox: None,
     }
 }
 

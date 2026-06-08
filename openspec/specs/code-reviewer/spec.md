@@ -485,11 +485,18 @@ The reviewer SHALL assemble its prompt using the single-pass substitution helper
 - **AND** the rendered prompt is byte-identical to the prior chained-`.replace` rendering
 
 ### Requirement: Agentic reviewer mode
-The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic` (the field defaults to `oneshot`, the existing HTTP path governed by the **AI-driven code-quality review** requirement). In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
+The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic`. The `reviewer.kind` field SHALL default to `agentic`: now that the `opencode` strategy makes the agentic path provider-agnostic (a60), agentic is the preferred default for every provider, not only Anthropic-shaped ones. The `oneshot` HTTP path (governed by the **AI-driven code-quality review** requirement) remains available as an explicit opt-in AND as the automatic startup fallback described below. In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
 
 The agentic session SHALL run in a read-only sandbox whose CLI tool permissions are `["Read", "Glob", "Grep"]` ONLY — NO `Bash`, NO `Write`, NO `Edit` — plus the `submit_review` MCP tool, with `ORCH_MCP_ROLE = reviewer`. The rendered prompt SHALL carry the change briefs, the unified diff, AND the list of changed file paths; it SHALL NOT pre-dump full file contents — the agent reads whatever files it needs via `Read`. Because there is no touched-file pre-dump, `reviewer.prompt_budget_chars` does NOT apply in agentic mode AND no `## Skipped (budget exhausted)` truncation occurs.
 
-The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule, AND a CLI with no registered strategy SHALL return a clear error naming it. The default `reviewer.kind` is `oneshot` because the `claude` strategy reaches only Anthropic-shaped endpoints; agentic review for other providers becomes available once their CLI strategy is registered.
+The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule.
+
+When the effective reviewer kind is `agentic` (whether defaulted OR set explicitly) but the resolved reviewer CLI is unavailable at startup — its strategy is not registered OR its binary is not found on the daemon host — the reviewer SHALL fall back to the `oneshot` HTTP path for that boot AND log ONE loud startup WARN naming the missing CLI AND the remedy (install it, OR set `reviewer.kind: oneshot` to silence the warning). The fallback SHALL NOT disable review: every provider has a working `oneshot` HTTP client, so a missing CLI degrades to HTTP review rather than no review. This keeps the default flip upgrade-safe — an operator whose reviewer points at a provider whose CLI is not installed keeps reviewing via HTTP until they install it. A daemon restart OR `autocoder reload` re-evaluates CLI availability.
+
+#### Scenario: `reviewer.kind` defaults to agentic when the CLI is available
+- **WHEN** `reviewer.kind` is unset AND the resolved reviewer CLI (default `claude`) is available at startup
+- **THEN** the reviewer runs in agentic mode (the default)
+- **AND** no fallback WARN fires
 
 #### Scenario: Agentic session runs in a read-only, no-Bash sandbox
 - **WHEN** `reviewer.kind: agentic` AND a review runs
@@ -520,8 +527,115 @@ The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, ra
 - **WHEN** `reviewer.mode` is the bundled default
 - **THEN** the reviewer runs one session for the whole PR
 
-#### Scenario: A reviewer command with no registered strategy returns a clear error
-- **WHEN** `reviewer.kind: agentic` AND `reviewer.command` resolves (via the a55/a56 `provider → CLI` rule) to a CLI with no registered strategy
-- **THEN** strategy resolution returns an error naming the CLI
-- **AND** no review session is spawned
+#### Scenario: Unavailable reviewer CLI falls back to oneshot
+- **WHEN** the effective reviewer kind is `agentic` (defaulted OR explicit) AND the resolved reviewer CLI is unavailable at startup (its strategy is not registered OR its binary is not found on the daemon host)
+- **THEN** the reviewer logs ONE loud startup WARN naming the CLI AND the remedy (install it, OR set `reviewer.kind: oneshot`)
+- **AND** it uses the `oneshot` HTTP path for that boot — review continues AND is NOT disabled
+- **AND** a daemon restart OR `autocoder reload` re-evaluates availability
+
+#### Scenario: Explicit oneshot is honored as the opt-out
+- **WHEN** `reviewer.kind: oneshot` is set explicitly
+- **THEN** the reviewer uses the HTTP one-shot path AND no agentic session is spawned
+- **AND** no fallback WARN fires (the operator chose `oneshot` deliberately)
+
+### Requirement: Reviewer flags files and functions that breach the size brightline
+The code-reviewer SHALL add an advisory, non-blocking size observation to its `ReviewReport.markdown` when the pass under review pushes a changed file or function past a size threshold, OR grows one that is already past it. For each file in the `ReviewContext`'s changed-files set, the reviewer SHALL determine, from the file's contents AND the unified diff, (a) whether the file — or a function within it — exceeds the file-size OR function-size threshold, AND (b) whether this pass added net lines to that file or function. When BOTH hold, the report SHALL note the path, the resulting line count, AND — for whole-file findings where test-only regions are identifiable — the production/test split. The thresholds are the project's configured file-size AND function-size thresholds (the same values the `architecture-brightline` audit applies; defaults file `800`, function `200`).
+
+A changed file or function that exceeds a threshold but to which the pass adds NO net lines (it is left the same size or made smaller) SHALL NOT be flagged, so a pass that reduces oversized code is not penalized AND pre-existing bloat the pass does not enlarge is not re-litigated on every unrelated PR.
+
+Size is a maintainability signal, NOT a correctness defect: a size observation SHALL NOT, on its own, set the verdict to `Block`. The verdict continues to reflect the code-quality criteria of the `AI-driven code-quality review` requirement; the size observation is appended to the markdown regardless of verdict.
+
+#### Scenario: A pass that pushes a file over the threshold is flagged
+- **WHEN** the pass adds net lines to a changed file such that its resulting line count exceeds the file-size threshold
+- **THEN** `ReviewReport.markdown` includes an advisory observation naming the file AND its resulting line count
+- **AND** the observation does not, on its own, force the verdict to `Block`
+
+#### Scenario: A pass that shrinks an oversized file is not flagged for size
+- **WHEN** a changed file already exceeds the file-size threshold AND the pass leaves it the same size or smaller
+- **THEN** the reviewer adds no size observation for that file
+
+#### Scenario: A pass that grows a function past the function threshold is flagged
+- **WHEN** the pass adds net lines to a function such that its resulting span exceeds the function-size threshold
+- **THEN** the report includes an advisory observation naming the function AND its resulting line count
+- **AND** the verdict is not forced to `Block` by the size observation alone
+
+#### Scenario: A whole-file size observation reports the production/test split
+- **WHEN** the pass pushes a file past the file-size threshold AND the file contains identifiable test-only regions
+- **THEN** the advisory observation reports the production-line / test-line breakdown alongside the total resulting line count
+
+### Requirement: Security-critical findings yield a Block verdict
+A security-critical finding SHALL produce a `Block` verdict — never `Concerns` or `Pass`. Security-critical means: credential or secret leakage (a key, token, or secret written where it could be committed or otherwise exposed), hardcoded secrets, AND injection vulnerabilities. A credential leak is stop-the-line; surfacing it as a soft verdict that neither drafts the PR nor gates a merge is a mis-classification.
+
+This is enforced in two layers:
+- **Prompt rule.** The reviewer prompt SHALL instruct that credential/secret leakage, secret exposure, AND injection are `Block`-class findings, not `Concerns`.
+- **Code-level safety net.** When the reviewer's own structured output flags a finding as a secret/credential/key exposure (or injection) AND returns a non-`Block` verdict, the daemon SHALL escalate the effective verdict to `Block`, so a mis-classifying model cannot downgrade a security-critical finding to advisory.
+
+Non-security findings are unaffected — their verdicts are whatever the reviewer assigns.
+
+#### Scenario: A credential-leak finding blocks
+- **WHEN** the reviewer reports a finding that a key/secret/token is written where it could be committed or exposed
+- **THEN** the effective verdict is `Block`
+- **AND** the PR is drafted per the existing `Block` handling
+
+#### Scenario: A non-Block verdict on a security finding is escalated
+- **WHEN** the reviewer's output flags a secret/credential/key exposure (or an injection vulnerability) but returns `Concerns` or `Pass`
+- **THEN** the daemon escalates the effective verdict to `Block`
+- **AND** the escalation does not depend on the exact prose of the finding (it keys on the reviewer's own security-finding signal, not message wording)
+
+#### Scenario: Non-security findings keep their verdict
+- **WHEN** the reviewer reports only non-security findings (style, idioms, error handling, naming) with a `Concerns` verdict
+- **THEN** the effective verdict stays `Concerns`
+- **AND** no security escalation occurs
+
+### Requirement: `auto_revise` is a tri-state defaulting to block
+The reviewer's `auto_revise` config SHALL accept three values — `block`, `actionable`, `off` — and default to `block`. It governs when a review's actionable concerns are forwarded (aggregated, per the orchestrator-cli `Reviewer-initiated revisions from one review dispatch as a single run` requirement) to the revision dispatcher:
+
+- **`block`** (default): auto-revise fires only when the review's effective verdict is `Block`. Combined with the `Security-critical findings yield a Block verdict` requirement, security-critical findings still auto-fix (they Block), while non-`Block` `Concerns` are advisory — surfaced to the operator, not silently rewritten.
+- **`actionable`**: auto-revise fires on any actionable concern regardless of verdict (the prior fire-regardless-of-verdict behavior).
+- **`off`**: no auto-revise.
+
+For backward compatibility the legacy boolean SHALL map: `true` → `actionable`, `false` → `off`. The change in default behavior is from the prior `false`/off to `block` (auto-revise now fires on a `Block` verdict by default).
+
+#### Scenario: Default block does not revise on a Concerns verdict
+- **WHEN** `auto_revise` is unset (default `block`) AND a review returns `Concerns` with actionable non-security concerns
+- **THEN** no auto-revision is dispatched
+- **AND** the concerns are surfaced for the operator to act on with `@<bot> revise`
+
+#### Scenario: Default block revises on a Block verdict
+- **WHEN** `auto_revise` is `block` AND a review's effective verdict is `Block`
+- **THEN** the review's actionable concerns are forwarded as one aggregated revision run
+
+#### Scenario: actionable restores fire-regardless-of-verdict
+- **WHEN** `auto_revise: actionable` AND a review returns `Concerns` with actionable concerns
+- **THEN** the concerns are forwarded as one aggregated revision run (regardless of the non-`Block` verdict)
+
+#### Scenario: Legacy boolean maps
+- **WHEN** `auto_revise: true` is configured
+- **THEN** it is treated as `actionable`
+- **AND** `auto_revise: false` is treated as `off`
+
+### Requirement: Per-change review falls back to bundled when the change set is empty
+In `reviewer.mode: per_change`, the reviewer SHALL fall back to a single bundled review of the whole context whenever splitting the context into per-change sub-contexts yields ZERO sub-contexts, rather than synthesizing a verdict from zero reviews. Every verdict the reviewer emits SHALL be derived from at least one completed reviewer invocation; an empty per-change synthesis SHALL NOT be treated as a `Pass`/`Approve`.
+
+This closes a path where a `per_change` PR whose change set fails to resolve — for example, a PR created under one daemon build and re-reviewed under another, so no archived-change briefs are found and the split is empty — was silently approved with no reviewer invocation (zero LLM calls, an empty synthesized report defaulting to `Pass`). With the fallback, the PR's diff and changed files still reach the reviewer in bundled form and the verdict reflects an actual review.
+
+The populated per-change path is unchanged: when the split yields one or more sub-contexts, each is reviewed and the results are synthesized as before, with no fallback.
+
+#### Scenario: Empty split falls back to a bundled review
+- **WHEN** `reviewer.mode` is `per_change` AND splitting the review context yields zero per-change sub-contexts
+- **THEN** the reviewer performs exactly one bundled review of the whole context (one reviewer invocation occurs)
+- **AND** the emitted verdict is the one that bundled review returns, NOT a verdict defaulted from an empty synthesis
+
+#### Scenario: The fallback review still receives the diff
+- **WHEN** the context that triggers the fallback carries a non-empty diff or changed-file set
+- **THEN** that diff and those changed files are passed to the bundled review (the reviewer builds its prompt rather than skipping the call)
+
+#### Scenario: An empty per-change synthesis is never an approval
+- **WHEN** a per-change report would be synthesized from zero per-change reviews
+- **THEN** the result is not a `Pass`/`Approve` verdict produced without any review
+
+#### Scenario: A resolvable change set still dispatches per change
+- **WHEN** `reviewer.mode` is `per_change` AND the split yields one or more per-change sub-contexts
+- **THEN** each sub-context is reviewed and the results are synthesized as before
+- **AND** no bundled fallback occurs
 

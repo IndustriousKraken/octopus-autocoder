@@ -235,6 +235,14 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
             })?;
             Ok(Box::new(OllamaChatClient::new(base, model)))
         }
+        // a69: Google/Antigravity is a CLI-only (agentic) provider with no
+        // in-process HTTP client. The `oneshot` reviewer path cannot drive it;
+        // the operator must select the agentic transport (the `agy` CLI).
+        LlmProvider::Google => Err(anyhow!(
+            "reviewer provider 'google' (Antigravity) has no in-process oneshot client; \
+             Google/Gemini models run only agentically via the `agy` CLI — set \
+             reviewer.kind: agentic"
+        )),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             let api_key = resolve_reviewer_api_key(cfg)?;
             Ok(match provider {
@@ -251,7 +259,7 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
                     })?;
                     Box::new(OpenAiCompatibleClient::new(base, api_key, model))
                 }
-                LlmProvider::Ollama => unreachable!("handled above"),
+                LlmProvider::Ollama | LlmProvider::Google => unreachable!("handled above"),
             })
         }
     }
@@ -319,9 +327,16 @@ pub fn resolve_contradiction_check_model(
                 "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
             )
         })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; a base URL is
+        // optional and unused by the strategy.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
     };
     let api_key = match provider {
-        LlmProvider::Ollama => String::new(),
+        // a69: `agy` authenticates from its own OAuth login / credential store,
+        // so — like Ollama — no per-model credential is threaded through this
+        // gate (an `AV_API_KEY` would be the strategy's job from an explicit
+        // resolved key).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
             resolve_contradiction_check_api_key(cfg)?
         }
@@ -360,6 +375,157 @@ fn resolve_contradiction_check_api_key(
     }
 }
 
+/// Resolve the change-vs-canonical pre-flight's LLM config — the `[canon]`
+/// gate (a62) — into a [`crate::agentic_run::ResolvedModel`] (a56) for the
+/// agentic transport. Parallel to [`resolve_contradiction_check_model`]; the
+/// only differences are the config-label strings in error messages. The
+/// `claude` CLI strategy reads the resulting tuple to set `ANTHROPIC_*`; its
+/// `provider` selects which CLI strategy runs (a provider whose CLI has no
+/// registered strategy fails open at strategy-resolution time, never spawning
+/// a process).
+pub fn resolve_canon_contradiction_check_model(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<crate::agentic_run::ResolvedModel> {
+    let provider = cfg
+        .provider
+        .expect("change_canonical_contradiction_check_llm.provider resolved at config-load");
+    let model = cfg.model.clone();
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_canonical_contradiction_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_canonical_contradiction_check_llm.api_base_url is required when provider=ollama"
+            )
+        })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
+    };
+    let api_key = match provider {
+        // a69: `agy` authenticates from its own login store (see
+        // `resolve_contradiction_check_model`).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            resolve_canon_contradiction_check_api_key(cfg)?
+        }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
+}
+
+fn resolve_canon_contradiction_check_api_key(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key =
+                inline.resolve("executor.change_canonical_contradiction_check_llm.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "executor.change_canonical_contradiction_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
+                );
+            }
+            Ok(key)
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!(
+                "executor.change_canonical_contradiction_check_llm.api_key_env={env_name}"
+            )),
+        (None, None) => Err(anyhow!(
+            "executor.change_canonical_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
+        )),
+    }
+}
+
+/// Resolve the code-implements-spec `[out]` gate's LLM config (a63) into a
+/// [`crate::agentic_run::ResolvedModel`] (a56) for the agentic transport.
+/// Parallel to [`resolve_canon_contradiction_check_model`]; the only
+/// differences are the config-label strings in error messages. The `claude`
+/// CLI strategy reads the resulting tuple to set `ANTHROPIC_*`; its `provider`
+/// selects which CLI strategy runs (a provider whose CLI has no registered
+/// strategy makes the gate advisory-unavailable at strategy-resolution time,
+/// never spawning a process).
+pub fn resolve_code_implements_spec_check_model(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<crate::agentic_run::ResolvedModel> {
+    let provider = cfg
+        .provider
+        .expect("code_implements_spec_check_llm.provider resolved at config-load");
+    let model = cfg.model.clone();
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.code_implements_spec_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.code_implements_spec_check_llm.api_base_url is required when provider=ollama"
+            )
+        })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
+    };
+    let api_key = match provider {
+        // a69: `agy` authenticates from its own login store (see
+        // `resolve_contradiction_check_model`).
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            resolve_code_implements_spec_check_api_key(cfg)?
+        }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
+}
+
+fn resolve_code_implements_spec_check_api_key(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("executor.code_implements_spec_check_llm.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "executor.code_implements_spec_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
+                );
+            }
+            Ok(key)
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!(
+                "executor.code_implements_spec_check_llm.api_key_env={env_name}"
+            )),
+        (None, None) => Err(anyhow!(
+            "executor.code_implements_spec_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,7 +542,7 @@ mod tests {
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -419,7 +585,7 @@ mod tests {
             api_base_url: Some(server.url()),
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -431,6 +597,51 @@ mod tests {
         let client = build_from_config(&cfg)
             .expect("inline api_key with no api_key_env should succeed");
         let _ = client.complete("hi").await.expect("complete succeeds");
+        mock.assert_async().await;
+    }
+
+    /// a003 / task 3.4: the in-process HTTP `oneshot` reviewer still receives
+    /// the resolved key for its call. The key stays in the daemon's process —
+    /// it is placed in the request's auth header by the in-process `LlmClient`,
+    /// never handed to a subprocess. The mock asserts the request carried the
+    /// configured key; if `build_from_config` dropped the key (regressing the
+    /// HTTP path) the header would not match and `complete` would error.
+    #[tokio::test]
+    async fn oneshot_reviewer_in_process_client_still_receives_the_key() {
+        use crate::config::{ReviewerConfig, ReviewerProvider, SecretSource};
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("x-api-key", "sk-oneshot-a003")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"content":[{"type":"text","text":"ok"}]}"#)
+            .create_async()
+            .await;
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: Some(ReviewerProvider::Anthropic),
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: None,
+            api_key: Some(SecretSource::Inline {
+                value: "sk-oneshot-a003".into(),
+            }),
+            api_base_url: Some(server.url()),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: crate::config::AutoRevise::Off,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: Some(5),
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
+        };
+        let client = build_from_config(&cfg).expect("oneshot client builds");
+        let out = client.complete("review this").await.expect("complete succeeds");
+        assert_eq!(out, "ok");
+        // The mock only matches when the in-process client sent the key.
         mock.assert_async().await;
     }
 
@@ -469,7 +680,7 @@ mod tests {
             api_base_url: Some(server.url()),
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -833,7 +1044,7 @@ mod tests {
             api_base_url: Some(server.url()),
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),

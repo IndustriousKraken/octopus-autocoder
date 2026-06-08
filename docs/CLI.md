@@ -38,6 +38,8 @@ After a successful patch, the subcommand prints `Patched <section> in <path>. To
 
 If neither the systemd probe nor `<default-config-dir>/config.yaml` resolves to an existing file, `--reconfigure` exits non-zero with `no existing install detected; run install.sh for first-time setup`.
 
+**`--issues-lane <enabled|disabled>`** (non-interactive) opts into the issues lane (`features.issues.enabled`). The default is `disabled`, mirroring the interactive yes/no gate the wizard shows after the periodic-audits prompts; an install that omits the flag produces the same lane-off config, so existing IaC is unaffected. Enabling the lane is a deliberate choice — it changes daemon behavior autonomously. See [CONFIG.md → features.issues](CONFIG.md#featuresissues).
+
 ## `check-config`
 
 Validate a config file against this binary's schema, without starting the daemon. Runs the same pipeline `autocoder run` executes at startup (YAML parse, schema validation, token-route resolution, workspace-collision check, audit-slug validation, path-collision check, secret-source check) and reports the outcome to stdout / stderr.

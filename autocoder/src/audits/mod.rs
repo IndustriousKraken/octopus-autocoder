@@ -19,6 +19,8 @@
 
 pub mod architecture_consultative;
 pub mod brightline;
+pub mod canon_consolidation;
+pub mod canon_contradiction;
 pub mod documentation_audit;
 pub mod drift;
 pub mod missing_tests;
@@ -439,7 +441,12 @@ impl Drop for SandboxSettingsGuard {
 ///
 /// `settings_dir` selects the directory the file is written to. Pass
 /// `None` to use `std::env::temp_dir()`; tests pass a per-test
-/// `TempDir` so concurrent runs do not collide on filename probes.
+/// `TempDir` so concurrent runs do not collide on filename probes. The
+/// production caller ([`crate::agentic_run::agentic_run`]) passes the run
+/// workspace's `.git` directory via `sandbox_settings_dir`, because the host
+/// temp dir is NOT visible inside the OS sandbox's mount namespace — only the
+/// workspace is bound in, and `.git` rides along inside it without ever being
+/// staged, reported, or cleaned by git.
 ///
 /// Returns the path and an RAII guard. Drop the guard AFTER the
 /// spawned CLI has exited.
@@ -475,7 +482,7 @@ pub fn write_sandbox_settings(
     let dir: PathBuf = settings_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(std::env::temp_dir);
-    let path = dir.join(format!("autocoder-audit-settings-{pid}-{stamp}.json"));
+    let path = dir.join(format!(".autocoder-sandbox-settings-{pid}-{stamp}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&json)?)
         .with_context(|| format!("writing audit sandbox settings to {}", path.display()))?;
     Ok((path.clone(), SandboxSettingsGuard(path)))
@@ -975,14 +982,19 @@ pub(crate) async fn run_audit_cli(
     prompt: &str,
     timeout: std::time::Duration,
     settings_dir: Option<&Path>,
+    model: Option<&crate::agentic_run::ResolvedModel>,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
-    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
-    crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+    // audit-model-selection: select the CLI strategy from the resolved
+    // model's provider (or default to `claude` when no model is configured).
+    let strategy = audit_strategy(command, model)?;
+    // a70: a single-shot role — prune the session it creates on completion.
+    crate::agentic_run::agentic_run_with_session(
+        crate::agentic_run::AgenticRunOpts {
         workspace,
         // Capture mode never consults `change` (it is only used for the
         // streaming structured-log path); a stable placeholder is fine.
         change: "audit",
-        strategy: &strategy,
+        strategy: strategy.as_ref(),
         prompt,
         sandbox: crate::agentic_run::SandboxConfig {
             allowed_tools: sandbox.allowed_tools.clone(),
@@ -990,7 +1002,7 @@ pub(crate) async fn run_audit_cli(
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
             deny_writes: true,
         },
-        model: None,
+        model,
         output_mode: crate::agentic_run::OutputMode::Capture,
         timeout,
         paths: None,
@@ -1000,8 +1012,83 @@ pub(crate) async fn run_audit_cli(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-    })
+        // a006: audits are read-only roles — workspace mounted read-only. The
+        // OS-sandbox CLI kind follows the resolved model's provider (the
+        // wrapped CLI's self-store is admitted ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
+        },
+        true,
+        None,
+    )
     .await
+}
+
+/// Resolve the CLI strategy for an audit run (audit-model-selection). When a
+/// model is configured, select the strategy for its provider's default CLI —
+/// the same `provider → CLI` rule the reviewer and executor use (e.g.
+/// `openai_compatible` → `OpencodeStrategy`). With no model, default to the
+/// `claude` strategy with no `--model` override, preserving backward
+/// compatibility.
+///
+/// The `command` passed here is the GLOBAL `executor.command`, which defaults
+/// to `claude`. That default binary is wrong for a non-Claude provider — an
+/// `opencode` strategy spawning the `claude` binary cannot run — so for a
+/// non-Claude CLI we resolve the provider's own default binary
+/// ([`crate::config::CliKind::default_command`]) UNLESS the operator set a
+/// custom `executor.command`, which we honor as an escape hatch. This mirrors
+/// the implementer's a70 command resolution in `ClaudeCliExecutor`.
+fn audit_strategy(
+    command: &str,
+    model: Option<&crate::agentic_run::ResolvedModel>,
+) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
+    match model {
+        Some(m) => {
+            let cli = crate::config::default_cli_for(m.provider);
+            let resolved_command = if cli != crate::config::CliKind::Claude
+                && command == crate::config::default_executor_command()
+            {
+                cli.default_command().to_string()
+            } else {
+                command.to_string()
+            };
+            crate::agentic_run::strategy_for_cli(cli, resolved_command, Vec::new())
+        }
+        None => Ok(Box::new(crate::agentic_run::ClaudeStrategy::new(
+            command.to_string(),
+            Vec::new(),
+        ))),
+    }
+}
+
+/// The OS-sandbox CLI kind for an audit run (audit-model-selection): the
+/// resolved model's provider's default CLI, or `Claude` when no model is
+/// configured. Kept in lock-step with [`audit_strategy`] so the sandbox's
+/// admitted credential store matches the CLI actually spawned.
+fn audit_cli_kind(model: Option<&crate::agentic_run::ResolvedModel>) -> crate::config::CliKind {
+    match model {
+        Some(m) => crate::config::default_cli_for(m.provider),
+        None => crate::config::CliKind::Claude,
+    }
+}
+
+/// Build the agentic-run [`crate::agentic_run::ResolvedModel`] an audit
+/// threads to its CLI runner from its config-resolved model
+/// (audit-model-selection), or `None` when the audit configured no `model`
+/// (preserving the default `claude` strategy). The credential is empty —
+/// every audit drives a CLI strategy, which authenticates from the wrapped
+/// CLI's own store (a003) and ignores any resolved key.
+pub(crate) fn audit_resolved_model(
+    settings: &crate::config::AuditSettings,
+) -> Option<crate::agentic_run::ResolvedModel> {
+    settings
+        .resolved_model
+        .as_ref()
+        .map(|m| crate::agentic_run::ResolvedModel {
+            provider: m.provider,
+            model: m.model.clone(),
+            api_base_url: m.api_base_url.clone().unwrap_or_default(),
+            api_key: String::new(),
+        })
 }
 
 /// Run an advisory audit's wrapped CLI WITH MCP enabled (a57). Identical
@@ -1018,6 +1105,7 @@ pub(crate) async fn run_audit_cli(
 /// key so the recorder (MCP child) AND the consumer (this module) agree.
 /// The MCP config is deleted on every exit path so the read-only
 /// `WritePolicy::None` post-hoc diff check sees a clean tree.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_audit_cli_with_submit(
     command: &str,
     sandbox: &ResolvedSandbox,
@@ -1026,6 +1114,7 @@ pub(crate) async fn run_audit_cli_with_submit(
     timeout: std::time::Duration,
     settings_dir: Option<&Path>,
     role: &str,
+    model: Option<&crate::agentic_run::ResolvedModel>,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
     // Allow the role's submit tool in addition to the read-only tools AND
     // the auto-included autocoder MCP tools (`ask_user` /
@@ -1043,11 +1132,15 @@ pub(crate) async fn run_audit_cli_with_submit(
     crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(workspace, role, Some(role))
         .context("writing audit MCP config")?;
 
-    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
-    let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+    // audit-model-selection: select the CLI strategy from the resolved
+    // model's provider (or default to `claude` when no model is configured).
+    let strategy = audit_strategy(command, model)?;
+    // a70: a single-shot role — prune the session it creates on completion.
+    let result = crate::agentic_run::agentic_run_with_session(
+        crate::agentic_run::AgenticRunOpts {
         workspace,
         change: role,
-        strategy: &strategy,
+        strategy: strategy.as_ref(),
         prompt,
         sandbox: crate::agentic_run::SandboxConfig {
             allowed_tools,
@@ -1055,7 +1148,7 @@ pub(crate) async fn run_audit_cli_with_submit(
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
             deny_writes: true,
         },
-        model: None,
+        model,
         output_mode: crate::agentic_run::OutputMode::Capture,
         timeout,
         paths: None,
@@ -1065,7 +1158,14 @@ pub(crate) async fn run_audit_cli_with_submit(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-    })
+        // a006: advisory audits are read-only roles too — read-only workspace.
+        // The OS-sandbox CLI kind follows the resolved model's provider
+        // (self-store admitted ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
+        },
+        true,
+        None,
+    )
     .await;
 
     // Always remove the config we wrote, regardless of run outcome.
@@ -1182,6 +1282,16 @@ pub fn register_submission_schemas(store: &crate::submission_store::SubmissionSt
     store.register_schema(
         documentation_audit::DocumentationAudit::TYPE,
         Arc::new(|p: &serde_json::Value| documentation_audit::payload_to_findings(p).map(|_| ())),
+    );
+    // a75: the canon-internal contradiction audit's
+    // `submit_canon_internal_contradictions` payload schema. The validator
+    // IS `payload_to_contradictions` with its `Ok` value discarded, so a
+    // payload that records successfully is exactly one that maps.
+    store.register_schema(
+        canon_contradiction::CanonContradictionAudit::TYPE,
+        Arc::new(|p: &serde_json::Value| {
+            canon_contradiction::payload_to_contradictions(p).map(|_| ())
+        }),
     );
 }
 
@@ -1366,7 +1476,7 @@ pub fn format_audit_notification_with_attribution(
 }
 
 /// Build the per-audit-type top-line string. Documented shapes:
-/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)` —
+/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <P> function(s) over line threshold; <M> duplicate signature(s); <Q> duplicate body group(s)` —
 ///   with an optional trailing `; <K> stale ignore entries to clean up`
 ///   clause when the audit detected stale entries in `.brightline-ignore`.
 /// - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
@@ -1385,13 +1495,18 @@ fn format_audit_top_line(
     }
     match audit_type {
         "architecture_brightline" => {
-            let (files, dupes, stale) = count_brightline_findings(findings);
+            let counts = count_brightline_findings(findings);
             let mut line = format!(
-                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {dupes} duplicate signature(s)"
+                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {funcs} function(s) over line threshold; {dupes} duplicate signature(s); {bodies} duplicate body group(s)",
+                files = counts.files,
+                funcs = counts.functions,
+                dupes = counts.duplicate_signatures,
+                bodies = counts.duplicate_bodies,
             );
-            if stale > 0 {
+            if counts.stale > 0 {
                 line.push_str(&format!(
-                    "; {stale} stale ignore entries to clean up"
+                    "; {stale} stale ignore entries to clean up",
+                    stale = counts.stale
                 ));
             }
             line
@@ -1417,29 +1532,48 @@ fn format_audit_top_line(
     }
 }
 
-/// Partition brightline findings by subject shape. Files-over-threshold
-/// subjects start with `"file "` and contain `" lines (threshold:"`;
-/// duplicate-signature subjects start with `"duplicate signature "`;
+/// Per-metric brightline finding counts, derived from finding-subject
+/// prefixes. Used to render the chatops top-line's per-metric clauses.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BrightlineCounts {
+    files: usize,
+    functions: usize,
+    duplicate_signatures: usize,
+    duplicate_bodies: usize,
+    stale: usize,
+}
+
+/// Partition brightline findings by subject shape, using the
+/// subject-prefix constants the audit stamps onto each finding kind.
+/// File-size subjects start with `"file "` AND contain
+/// `" lines (threshold:"`; function-size subjects start with
+/// `"function "` AND contain the same; duplicate-signature AND
+/// duplicate-body subjects start with their respective prefixes;
 /// stale-ignore-entry subjects start with
-/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any
-/// other finding shape falls into none of the three buckets and is
-/// not counted in any total (the per-finding body still appears in
-/// the thread).
-fn count_brightline_findings(findings: &[Finding]) -> (usize, usize, usize) {
-    let mut files = 0usize;
-    let mut dupes = 0usize;
-    let mut stale = 0usize;
+/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any other
+/// finding shape falls into none of the buckets AND is not counted in any
+/// total (the per-finding body still appears in the thread).
+fn count_brightline_findings(findings: &[Finding]) -> BrightlineCounts {
+    let mut counts = BrightlineCounts::default();
     for f in findings {
         let s = f.subject.as_str();
         if s.starts_with(brightline::STALE_IGNORE_SUBJECT_PREFIX) {
-            stale += 1;
-        } else if s.starts_with("file ") && s.contains(" lines (threshold:") {
-            files += 1;
-        } else if s.starts_with("duplicate signature ") {
-            dupes += 1;
+            counts.stale += 1;
+        } else if s.starts_with(brightline::FUNCTION_SIZE_SUBJECT_PREFIX)
+            && s.contains(" lines (threshold:")
+        {
+            counts.functions += 1;
+        } else if s.starts_with(brightline::FILE_SIZE_SUBJECT_PREFIX)
+            && s.contains(" lines (threshold:")
+        {
+            counts.files += 1;
+        } else if s.starts_with(brightline::DUPLICATE_SIGNATURE_SUBJECT_PREFIX) {
+            counts.duplicate_signatures += 1;
+        } else if s.starts_with(brightline::DUPLICATE_BODY_SUBJECT_PREFIX) {
+            counts.duplicate_bodies += 1;
         }
     }
-    (files, dupes, stale)
+    counts
 }
 
 /// Render the per-finding body the thread reply carries. Same shape as
@@ -1580,6 +1714,83 @@ mod tests {
         assert!(
             !msg.contains("validated on retry"),
             "first-attempt success must omit retry parenthetical: {msg}"
+        );
+    }
+
+    /// audit-model-selection: an audit whose resolved model has an
+    /// `openai_compatible` provider selects the `opencode` strategy (via the
+    /// shared `provider → CLI` rule) AND its OS-sandbox CLI kind is
+    /// `Opencode`.
+    #[test]
+    fn audit_with_openai_compatible_model_selects_opencode_strategy() {
+        use crate::config::{CliKind, LlmProvider};
+        let model = crate::agentic_run::ResolvedModel {
+            provider: LlmProvider::OpenAiCompatible,
+            model: "moonshotai/kimi-k2".to_string(),
+            api_base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: String::new(),
+        };
+        // The OS-sandbox CLI kind follows the provider's default CLI.
+        assert_eq!(audit_cli_kind(Some(&model)), CliKind::Opencode);
+        // The audit's command is the GLOBAL `executor.command` (default
+        // `claude`); for an openai_compatible provider the strategy must
+        // resolve the correct `opencode` binary from the provider, NOT spawn
+        // the wrong `claude` binary. Feeding the default here proves that.
+        let strat = audit_strategy(&crate::config::default_executor_command(), Some(&model))
+            .expect("openai_compatible resolves to the opencode strategy");
+        let tmp = TempDir::new().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let settings = tmp.path().join("s.json");
+        let bctx = crate::agentic_run::BuildContext {
+            settings_path: &settings,
+            allowed_tools: &allowed,
+            include_autocoder_tools: false,
+            emit_stream_json: false,
+            resume_session_id: None,
+            workspace: tmp.path(),
+            mcp_role: None,
+            model: Some(&model),
+        };
+        let cmd = strat.build_command(&bctx);
+        assert_eq!(
+            cmd.as_std().get_program().to_string_lossy(),
+            "opencode",
+            "an openai_compatible audit must spawn the opencode CLI"
+        );
+    }
+
+    /// audit-model-selection (backward compatibility): an audit with no
+    /// configured model resolves to `None`, defaults to the `claude` CLI
+    /// strategy, AND its OS-sandbox CLI kind is `Claude`.
+    #[test]
+    fn audit_without_model_defaults_to_claude_strategy() {
+        use crate::config::{AuditSettings, CliKind};
+        let settings = AuditSettings::default();
+        assert!(
+            audit_resolved_model(&settings).is_none(),
+            "an audit with no model field must resolve to None"
+        );
+        assert_eq!(audit_cli_kind(None), CliKind::Claude);
+        let strat =
+            audit_strategy("claude", None).expect("None defaults to the claude strategy");
+        let tmp = TempDir::new().unwrap();
+        let allowed = vec!["Read".to_string()];
+        let settings_path = tmp.path().join("s.json");
+        let bctx = crate::agentic_run::BuildContext {
+            settings_path: &settings_path,
+            allowed_tools: &allowed,
+            include_autocoder_tools: false,
+            emit_stream_json: false,
+            resume_session_id: None,
+            workspace: tmp.path(),
+            mcp_role: None,
+            model: None,
+        };
+        let cmd = strat.build_command(&bctx);
+        assert_eq!(
+            cmd.as_std().get_program().to_string_lossy(),
+            "claude",
+            "an audit with no model must spawn the default claude CLI"
         );
     }
 
@@ -2287,6 +2498,24 @@ mod tests {
         }
     }
 
+    fn brightline_function_finding(name: &str, rel: &str, n: u64) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!("function {name} in {rel} is {n} lines (threshold: 200)"),
+            body: format!("path: {rel}\nfunction: {name}\nstart_line: 1\nlines: {n}\nthreshold: 200"),
+            anchor: Some(format!("{rel}:1")),
+        }
+    }
+
+    fn brightline_dup_body_finding(name_a: &str, name_b: &str) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!("duplicate body across 2 files ({name_a}, {name_b})"),
+            body: format!("mod_a.rs:1 {name_a}\nmod_b.rs:1 {name_b}"),
+            anchor: Some("mod_a.rs:1".into()),
+        }
+    }
+
     fn brightline_stale_finding(file: &str, function: &str, reason: &str) -> Finding {
         Finding {
             severity: Severity::Low,
@@ -2421,6 +2650,47 @@ mod tests {
         assert!(
             !n.top_line.contains("stale ignore"),
             "no stale entries → no clause: {}",
+            n.top_line
+        );
+    }
+
+    /// 8.6 — the top-line renders all four metric counts (file, function,
+    /// duplicate signature, duplicate body) from a mixed finding set. We
+    /// assert the derived counts, not the exact sentence.
+    #[test]
+    fn format_audit_notification_brightline_renders_all_four_counts() {
+        let findings = vec![
+            brightline_file_finding("src/a.rs", 1200),
+            brightline_file_finding("src/b.rs", 1300),
+            brightline_function_finding("huge", "src/c.rs", 400),
+            brightline_dup_finding("fn helper(u32)"),
+            brightline_dup_body_finding("alert_disk", "alert_mem"),
+        ];
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.contains("2 file(s) over line threshold"),
+            "top_line should report 2 files: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 function(s) over line threshold"),
+            "top_line should report 1 function: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 duplicate signature(s)"),
+            "top_line should report 1 duplicate signature: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 duplicate body group(s)"),
+            "top_line should report 1 duplicate body group: {}",
             n.top_line
         );
     }
@@ -2917,6 +3187,7 @@ mod tests {
             "kind: claude_cli\ncommand: claude\ntimeout_secs: 600\n",
         )
         .expect("test executor config");
+        let (_paths_td, paths) = crate::testing::test_daemon_paths();
         let audits: Vec<Arc<dyn Audit>> = vec![
             Arc::new(crate::audits::brightline::ArchitectureBrightlineAudit::new(
                 &audit_settings,
@@ -2936,6 +3207,13 @@ mod tests {
                 &audit_settings,
                 &executor,
             )),
+            Arc::new(
+                crate::audits::canon_contradiction::CanonContradictionAudit::new(
+                    &audit_settings,
+                    &executor,
+                    &paths,
+                ),
+            ),
         ];
         for a in &audits {
             let d = a.description();

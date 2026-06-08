@@ -1,0 +1,386 @@
+use super::*;
+
+/// Run the spec-delta archivability pre-flight (a17) against `change`.
+/// On clean result: returns `Ok(None)` and the caller proceeds to the
+/// executor. On any violation: writes the `.needs-spec-revision.json`
+/// marker with `unarchivable_deltas` populated, posts the existing
+/// `AlertCategory::SpecNeedsRevision` chatops alert (subject to the 24h
+/// throttle), and returns `Ok(Some(QueueStep::SpecRevisionMarked))` so
+/// the caller short-circuits without invoking the executor.
+pub(crate) async fn handle_archivability_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+) -> Result<Option<QueueStep>> {
+    let violations =
+        crate::preflight::spec_archivability::check_spec_deltas_archivable(workspace, change)
+            .with_context(|| format!("spec-delta archivability check for `{change}`"))?;
+    if violations.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_unarchivable_revision_suggestion(change, &violations);
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        violations = violations.len(),
+        "spec-delta archivability pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: violations.clone(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to write spec-needs-revision marker (pre-flight): {e:#}"
+        );
+    }
+    maybe_post_unarchivable_deltas_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &violations,
+        &suggestion,
+    )
+    .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into
+/// the marker file when the pre-flight catches one or more unarchivable
+/// deltas. Names each violation and points the operator at the spec
+/// file to edit + the recovery verb.
+fn build_unarchivable_revision_suggestion(
+    change: &str,
+    violations: &[crate::preflight::spec_archivability::UnarchivableDelta],
+) -> String {
+    let mut out = format!(
+        "Pre-flight check found {} unarchivable spec delta{}:\n",
+        violations.len(),
+        if violations.len() == 1 { "" } else { "s" }
+    );
+    for v in violations {
+        out.push_str(&format!(
+            "- capability={cap} kind={kind} header=\"{hdr}\" reason=\"{reason}\"\n",
+            cap = v.capability,
+            kind = v.kind.as_str(),
+            hdr = v.header,
+            reason = v.reason,
+        ));
+    }
+    out.push_str(&format!(
+        "\nEdit openspec/changes/{change}/specs/<capability>/spec.md to use the\n\
+         exact canonical header. After fixing, push the spec change AND clear\n\
+         this marker via @<bot> clear-revision <repo> <change>.\n"
+    ));
+    out
+}
+
+/// Run the change-internal contradiction pre-flight (a19) against
+/// `change`. On clean result (LLM returned an empty array OR failed
+/// open): returns `Ok(None)` and the caller proceeds to the executor.
+/// On non-empty findings: writes the `.needs-spec-revision.json`
+/// marker with `revision_suggestion` populated from the contradictions
+/// narrative, posts the existing `AlertCategory::SpecNeedsRevision`
+/// chatops alert (subject to 24h throttle), AND returns
+/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the
+/// queue walk without invoking the executor.
+pub(crate) async fn handle_contradiction_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
+) -> Result<Option<QueueStep>> {
+    // a59: the check runs agentically through `agentic_run` AND is fail-open
+    // by contract — it returns an empty `Vec` (with a WARN) on any session
+    // error, missing submission, OR re-validation failure, so there is no
+    // `Result` to propagate here.
+    let findings = crate::preflight::change_contradiction::run_agentic_contradiction_check(
+        cc_ctx, workspace, change,
+    )
+    .await;
+    if findings.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_contradiction_revision_suggestion(&findings);
+    // a61: this is the `[in]` verifier gate; its diagnostics carry the label.
+    let label = crate::verifier_gate::VerifierGate::In.label();
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        findings = findings.len(),
+        "{label} change-contradiction pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
+        );
+    }
+    maybe_post_contradiction_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        cc_ctx.attribution.as_deref(),
+    )
+    .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into
+/// the marker file when the contradiction pre-flight catches one or
+/// more findings. Numbers each finding 1..N, includes the LLM's
+/// `requirement_a`, `requirement_b`, AND `summary`, AND closes with
+/// operator-action guidance.
+pub(crate) fn build_contradiction_revision_suggestion(
+    findings: &[crate::preflight::change_contradiction::ContradictionFinding],
+) -> String {
+    let n = findings.len();
+    let mut out = format!(
+        "Pre-flight contradiction check found {n} issue(s) where this change's\n\
+         requirements appear to contradict each other:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!(
+            "{idx}. Requirement A: {a}\n   Requirement B: {b}\n   {summary}\n\n",
+            idx = i + 1,
+            a = f.requirement_a,
+            b = f.requirement_b,
+            summary = f.summary,
+        ));
+    }
+    out.push_str(
+        "Edit the conflicting requirements so they can hold simultaneously,\n\
+         OR REMOVE one of them. Push the spec change AND clear this marker\n\
+         via @<bot> clear-revision <repo> <change>.\n",
+    );
+    out
+}
+
+/// Run the change-vs-canonical contradiction pre-flight — the `[canon]` gate
+/// (a62) — against `change`. On clean result (the agent returned an empty
+/// array OR the gate failed open): returns `Ok(None)` and the caller proceeds
+/// to the executor. On non-empty findings: writes the
+/// `.needs-spec-revision.json` marker with `revision_suggestion` populated
+/// from the canon-contradiction narrative (empty structural arrays — this
+/// case is semantic), posts the existing `AlertCategory::SpecNeedsRevision`
+/// chatops alert (subject to the 24h throttle), AND returns
+/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the queue
+/// walk without invoking the executor. Disposition is identical to the `[in]`
+/// gate's; the gates differ only in what they read AND what each finding names.
+pub(crate) async fn handle_canon_contradiction_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    canon_ctx: &crate::preflight::canon_contradiction::CanonContradictionCheckCtx,
+) -> Result<Option<QueueStep>> {
+    // a62: the check runs agentically through `agentic_run` AND is fail-open
+    // by contract — it returns an empty `Vec` (with a WARN) on any session
+    // error, missing submission, OR re-validation failure, so there is no
+    // `Result` to propagate here.
+    let findings = crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
+        canon_ctx, workspace, change,
+    )
+    .await;
+    if findings.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_canon_contradiction_revision_suggestion(&findings);
+    // a61: this is the `[canon]` verifier gate; its diagnostics carry the label.
+    let label = crate::verifier_gate::VerifierGate::Canon.label();
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        findings = findings.len(),
+        "{label} change-vs-canonical pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to write spec-needs-revision marker (canon pre-flight): {e:#}"
+        );
+    }
+    maybe_post_canon_contradiction_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        canon_ctx.attribution.as_deref(),
+    )
+    .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into the
+/// marker file when the `[canon]` gate catches one or more findings. Numbers
+/// each finding 1..N, naming the change's requirement AND the conflicting
+/// canonical requirement (by capability + title), AND closes with
+/// operator-action guidance.
+pub(crate) fn build_canon_contradiction_revision_suggestion(
+    findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
+) -> String {
+    let n = findings.len();
+    let mut out = format!(
+        "Pre-flight change-vs-canonical check found {n} issue(s) where this change's\n\
+         requirements appear to contradict the project's existing canonical specs:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!(
+            "{idx}. Change requirement: {cr}\n   \
+             Conflicting canonical requirement: {canon_req} (capability: {cap})\n   {summary}\n\n",
+            idx = i + 1,
+            cr = f.change_requirement,
+            canon_req = f.canonical_requirement,
+            cap = f.canonical_capability,
+            summary = f.summary,
+        ));
+    }
+    out.push_str(
+        "Revise this change so its requirements are consistent with canon (align the\n\
+         delta with the canonical requirement, OR turn it into a coherent MODIFIED\n\
+         delta of that canonical requirement). Push the spec change AND clear this\n\
+         marker via @<bot> clear-revision <repo> <change>.\n",
+    );
+    out
+}
+
+/// Pre-flight archive-collision check. For each entry in `candidates`,
+/// call `queue::would_collide_on_archive`. Colliding entries are dropped
+/// from the returned list, a WARN-level structured log fires (so
+/// journalctl tailing surfaces the diagnosis even with chatops disabled),
+/// and a chatops alert is posted under `AlertCategory::ArchiveCollision`
+/// (subject to the existing 24h per-category throttle). The executor is
+/// never invoked for an excluded change — the caller must use the
+/// returned (non-colliding) list to drive its queue walk.
+///
+/// Centralizes the check so both the pending side (`walk_queue` call) and
+/// the waiting side (`process_waiting_changes`) share one implementation.
+pub(crate) async fn apply_archive_collision_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    candidates: Vec<String>,
+) -> Vec<String> {
+    let mut kept = Vec::with_capacity(candidates.len());
+    for change in candidates {
+        if !queue::would_collide_on_archive(workspace, &change) {
+            kept.push(change);
+            continue;
+        }
+        let archive_path = queue::archive_collision_path(workspace, &change);
+        // WARN-level structured log: emits per iteration regardless of
+        // whether the chatops alert is throttled, so operators tailing
+        // journalctl see the diagnosis at least once per occurrence.
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            archive_path = %archive_path.display(),
+            iteration_skipped = true,
+            "archive collision detected for `{change}`: openspec/changes/{change}/ would archive to {} but that path already exists; excluding from this iteration",
+            archive_path.display(),
+        );
+        // Body shape per proposal: concrete paths + the fix workflow so
+        // the operator's chatops alert is actionable rather than
+        // "something's wrong." `handle_predictable_failure` truncates the
+        // excerpt at 200 chars when formatting; the long-form body is
+        // also captured in the WARN log above so no diagnosis is lost.
+        let err = anyhow!(
+            "archive collision for `{change}`: openspec/changes/{change}/ would archive to {} but that path already exists. This usually means the change was archived earlier (via a merged PR) and re-added to the active path without removing the prior archive entry. The change is excluded from this iteration's queue walk to avoid burning agent tokens on a run that will fail at archive time. To resolve, on the base branch: (a) if the prior implementation is final: `git rm -r openspec/changes/{change}` and push; (b) if the prior implementation should be reverted and re-done: `git revert -m 1 <merge-sha>` (the merge that landed the prior PR), keeping the revised spec via `git checkout --ours` on the conflicting spec files, then push. Iteration continues with `{change}` excluded.",
+            archive_path.display(),
+        );
+        handle_predictable_failure(
+            paths,
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            chatops_ctx
+                .map(|c| c.failure_alerts_enabled)
+                .unwrap_or(false),
+            AlertCategory::ArchiveCollision,
+            &err,
+        )
+        .await;
+    }
+    kept
+}
+
+/// Increment the per-change failure counter, and on threshold transition
+/// write the perma-stuck marker + post the chatops alert. Best-effort: any
+/// I/O or transport failure here is logged at WARN and does not propagate.
+pub(crate) async fn handle_failure_counter(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    reason: &str,
+    threshold: u32,
+) {
+    let count = match failure_state::record_failure(paths, workspace, change, reason) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "failed to record consecutive-failure state: {e:#}"
+            );
+            return;
+        }
+    };
+    if count < threshold {
+        return;
+    }
+    let entry = failure_state::FailureEntry {
+        count,
+        last_reason: reason.to_string(),
+        last_failed_at: Utc::now(),
+    };
+    if let Err(e) = perma_stuck::write_marker(workspace, change, &entry) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to write perma-stuck marker: {e:#}"
+        );
+        // Continue to alert — the operator should still know.
+    }
+    let marker_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join(".perma-stuck.json");
+    tracing::error!(
+        url = %repo.url,
+        change = %change,
+        marker = %marker_path.display(),
+        consecutive_failures = count,
+        "change marked perma-stuck after {count} consecutive failures; daemon will not retry until {} is removed",
+        marker_path.display()
+    );
+    post_perma_stuck_alert(paths, chatops_ctx, repo, change, reason, count).await;
+}

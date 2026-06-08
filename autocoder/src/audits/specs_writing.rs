@@ -26,10 +26,12 @@ use super::{
 };
 use crate::config::ResolvedSandbox;
 
-/// Tools every spec-writing audit allows. `Write` and `Edit` are needed
-/// because the agent's whole job is to create OpenSpec change files;
-/// the framework's post-hoc `OpenSpecOnly` check catches writes outside
-/// `openspec/changes/`.
+/// Default tools a spec-writing audit allows. `Write` and `Edit` are
+/// needed because the agent's whole job is to create OpenSpec change
+/// files; the framework's post-hoc `OpenSpecOnly` check catches writes
+/// outside `openspec/changes/`. Audits with narrower needs pass their own
+/// list via [`SpecsWritingAuditParams::allowed_tools`] (e.g. the
+/// canon-consolidation audit drops `Bash`, which it never needs).
 pub(crate) const ALLOWED_TOOLS: &[&str] =
     &["Read", "Glob", "Grep", "Bash", "Write", "Edit"];
 
@@ -67,6 +69,23 @@ pub(crate) struct SpecsWritingAuditParams<'a> {
     /// Human-readable subject inserted into the commit message:
     /// `audit: <commit_subject> (N change(s))`.
     pub commit_subject: &'a str,
+    /// Sandbox tool allow-list for this audit's agent invocation. Most
+    /// audits pass [`ALLOWED_TOOLS`]; an audit that needs a narrower set
+    /// (e.g. canon-consolidation, which never shells out, drops `Bash`)
+    /// passes its own slice.
+    pub allowed_tools: &'a [&'a str],
+    /// When `true`, the agent is invoked through the MCP-enabled CLI path
+    /// so the autocoder MCP tools (`query_canonical_specs` / `ask_user` /
+    /// `outcome_*`) are reachable — the canon-consolidation audit (a76)
+    /// uses this to retrieve nearest canonical requirements via
+    /// `query_canonical_specs` when a21's RAG is enabled. `false` keeps the
+    /// no-MCP capture path the missing-tests / security-bug audits use.
+    pub include_autocoder_tools: bool,
+    /// audit-model-selection: the resolved model this audit routes to (the
+    /// audit runner selects the CLI strategy for its provider AND passes
+    /// `--model <provider>/<model>`), or `None` to keep the default `claude`
+    /// strategy with no model override.
+    pub model: Option<&'a crate::agentic_run::ResolvedModel>,
 }
 
 /// Execute one spec-writing audit run. Returns the outcome the framework
@@ -105,19 +124,20 @@ pub(crate) async fn run_specs_writing_audit(
     let total_attempts = max_retries.saturating_add(1);
 
     let mut sandbox = params.sandbox.clone();
-    sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
+    sandbox.allowed_tools = params.allowed_tools.iter().map(|s| (*s).to_string()).collect();
 
     let initial_before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
     let _ = ctx.log_writer.write_section(
         &format!("{audit_type}_preamble"),
         &format!(
-            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nallowed_tools: {}\npre_run_change_dirs: {}",
+            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nallowed_tools: {}\ninclude_autocoder_tools: {}\npre_run_change_dirs: {}",
             params.executor_command,
             params.executor_timeout_secs,
             params.prompt_source,
             params.max_proposals,
             max_retries,
             sandbox.allowed_tools.join(","),
+            params.include_autocoder_tools,
             initial_before.len(),
         ),
     );
@@ -155,15 +175,39 @@ pub(crate) async fn run_specs_writing_audit(
             &effective_prompt,
         );
 
-        let outcome = super::run_audit_cli(
-            params.executor_command,
-            &sandbox,
-            ctx.workspace,
-            &effective_prompt,
-            Duration::from_secs(params.executor_timeout_secs),
-            params.settings_dir,
-        )
-        .await
+        // When the audit needs the autocoder MCP tools (e.g. a76's
+        // `query_canonical_specs` for RAG-assisted overlap detection), go
+        // through the MCP-enabled CLI path — which advertises the autocoder
+        // MCP server in a per-run `.mcp.json` (written AND deleted around the
+        // call) AND appends the provided-tool names to `--allowedTools`.
+        // Otherwise use the plain capture path the missing-tests /
+        // security-bug audits use. The role key is the audit type; an audit
+        // with no registered `submit_*` tool (a76 writes its change to disk,
+        // it does not submit) simply gets the common tools.
+        let outcome = if params.include_autocoder_tools {
+            super::run_audit_cli_with_submit(
+                params.executor_command,
+                &sandbox,
+                ctx.workspace,
+                &effective_prompt,
+                Duration::from_secs(params.executor_timeout_secs),
+                params.settings_dir,
+                audit_type,
+                params.model,
+            )
+            .await
+        } else {
+            super::run_audit_cli(
+                params.executor_command,
+                &sandbox,
+                ctx.workspace,
+                &effective_prompt,
+                Duration::from_secs(params.executor_timeout_secs),
+                params.settings_dir,
+                params.model,
+            )
+            .await
+        }
         .with_context(|| format!("spawning {audit_type} CLI subprocess"))?;
 
         let _ = ctx.log_writer.write_section(

@@ -84,6 +84,15 @@ pub struct ReviewConcern {
     pub actionable_request: Option<String>,
     #[serde(default)]
     pub should_request_revision: bool,
+    /// The reviewer's own structured security signal (a004). `true` when the
+    /// reviewer classified this finding as a credential/secret/key exposure
+    /// or an injection vulnerability. The verdict-handling path escalates the
+    /// effective verdict to `Block` when any concern carries this flag (see
+    /// [`concerns_flag_security_critical`]) — keyed on this signal, NEVER on a
+    /// substring scan of `summary`. `#[serde(default)]` keeps older
+    /// reviewer templates (which omit the field) parsing as `false`.
+    #[serde(default)]
+    pub security_critical: bool,
     /// Per-change attribution: in per_change reviewer mode, set to the
     /// change slug whose review surfaced this concern. Used by the
     /// dropped-cap annotator to write the "(not auto-revised; cap
@@ -141,6 +150,23 @@ pub struct PerChangeContext {
     pub cross_change_preamble: String,
 }
 
+impl ReviewConcern {
+    /// Whether this concern is an actionable reviewer-initiated revision
+    /// request: it carries `should_request_revision: true` AND a non-empty
+    /// (whitespace-trimmed) `actionable_request`. The auto-revise aggregation
+    /// (a005) collects every revisable concern from one review into a single
+    /// revision run. The verdict is NOT consulted here — verdict gating is
+    /// the caller's `auto_revise` tri-state decision.
+    pub fn is_revisable(&self) -> bool {
+        self.should_request_revision
+            && self
+                .actionable_request
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+    }
+}
+
 /// One per-change reviewer result. Returned by `run_per_change_review`
 /// for each change in the pass; the PR-body composer turns each one
 /// into a `## Code Review: <change-slug>` section.
@@ -153,7 +179,7 @@ pub struct PerChangeReview {
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
-    auto_revise: bool,
+    auto_revise: crate::config::AutoRevise,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
     /// Per-PR cap on operator-initiated re-reviews. `None` means UNLIMITED
@@ -179,6 +205,13 @@ pub struct CodeReviewer {
     /// strategy via the a55 `provider → CLI` rule. Anthropic for the
     /// test-only [`CodeReviewer::new`] path.
     provider: LlmProvider,
+    /// a67: file/function line thresholds for the advisory size flag. The
+    /// reviewer appends a `## Size advisory` note when a pass pushes a
+    /// changed file or function past these, OR grows one already over.
+    /// Default to the same values the `architecture-brightline` audit
+    /// applies (file `800`, function `200`).
+    file_lines_threshold: u64,
+    function_lines_threshold: u64,
 }
 
 impl CodeReviewer {
@@ -186,7 +219,11 @@ impl CodeReviewer {
         Self {
             client,
             template,
-            auto_revise: false,
+            // Test-only constructor: default to `Off` so a reviewer built via
+            // `new()` does not auto-revise unless a test opts in with
+            // `with_auto_revise`. (The config-driven default is `Block`; see
+            // `AutoRevise::default`.)
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: None,
@@ -196,7 +233,21 @@ impl CodeReviewer {
             kind: ReviewerKind::Oneshot,
             command: "claude".to_string(),
             provider: LlmProvider::Anthropic,
+            file_lines_threshold: crate::audits::brightline::DEFAULT_FILE_LINES_THRESHOLD,
+            function_lines_threshold: crate::audits::brightline::DEFAULT_FUNCTION_LINES_THRESHOLD,
         }
+    }
+
+    /// Builder-style setter for the advisory size-flag thresholds (a67).
+    /// Defaults match the `architecture-brightline` audit (file `800`,
+    /// function `200`); `from_config` leaves the defaults in place since
+    /// `ReviewerConfig` carries no per-reviewer override. Exercised by the
+    /// size-advisory tests.
+    #[allow(dead_code)]
+    pub fn with_size_thresholds(mut self, file_lines: u64, function_lines: u64) -> Self {
+        self.file_lines_threshold = file_lines;
+        self.function_lines_threshold = function_lines;
+        self
     }
 
     /// Builder-style setter for the reviewer transport (`oneshot` vs
@@ -295,25 +346,25 @@ impl CodeReviewer {
         self.mode
     }
 
-    /// Builder-style setter mirroring the config flag of the same name.
-    /// The flag controls whether concerns marked `should_request_revision`
-    /// (with a non-empty `actionable_request`) get forwarded to the
-    /// revision dispatcher as `<!-- reviewer-revision -->` PR comments,
-    /// regardless of the review's verdict. Default `false` (no behavioural
-    /// change). Used by `from_config` to propagate
-    /// `ReviewerConfig::auto_revise` onto the constructed reviewer; tests
-    /// use it directly when they need the flag flipped without
-    /// round-tripping a full config.
-    pub fn with_auto_revise(mut self, enabled: bool) -> Self {
-        self.auto_revise = enabled;
+    /// Builder-style setter mirroring the tri-state config field of the
+    /// same name (a005). It controls whether — AND under which verdict —
+    /// concerns marked `should_request_revision` (with a non-empty
+    /// `actionable_request`) get forwarded (aggregated into a single
+    /// revision run) to the revision dispatcher. Used by `from_config` to
+    /// propagate `ReviewerConfig::auto_revise` onto the constructed
+    /// reviewer; tests use it directly when they need a specific mode
+    /// without round-tripping a full config.
+    pub fn with_auto_revise(mut self, mode: crate::config::AutoRevise) -> Self {
+        self.auto_revise = mode;
         self
     }
 
-    /// Whether reviewer-initiated revisions are enabled for this
-    /// reviewer instance. Read by the polling-loop posting step that
-    /// turns actionable concerns into `<!-- reviewer-revision -->` PR
-    /// comments (regardless of verdict).
-    pub fn auto_revise(&self) -> bool {
+    /// The reviewer-initiated revision mode for this reviewer instance
+    /// (a005 tri-state). Read by the posting step that turns actionable
+    /// concerns into the single aggregated `<!-- reviewer-revision -->` PR
+    /// comment; the caller combines it with the review's verdict via
+    /// [`crate::config::AutoRevise::fires`].
+    pub fn auto_revise(&self) -> crate::config::AutoRevise {
         self.auto_revise
     }
 
@@ -408,8 +459,250 @@ impl CodeReviewer {
         // Stamp the reviewer's redaction-safe attribution (a49) so the
         // PR-body composer can render `*Reviewer: <provider>/<model>*`.
         report.attribution = self.attribution.clone();
+        // a67: advisory, non-blocking size flag. Appended to the markdown
+        // AFTER the verdict/markdown are assembled; the verdict is never
+        // touched (size is a maintainability signal, not a correctness
+        // defect).
+        append_size_advisory(
+            &mut report,
+            context,
+            self.file_lines_threshold,
+            self.function_lines_threshold,
+        );
         Ok(report)
     }
+}
+
+/// Append the advisory `## Size advisory` section to `report.markdown`
+/// when this pass pushes a changed file or function past a size threshold
+/// (or grows one already over it). The `verdict` is NOT modified — size
+/// is a maintainability signal, not a correctness defect. A no-op when no
+/// changed file/function is both over-threshold AND net-grown by the pass.
+fn append_size_advisory(
+    report: &mut ReviewReport,
+    ctx: &ReviewContext,
+    file_threshold: u64,
+    function_threshold: u64,
+) {
+    if let Some(section) = size_advisory_section(ctx, file_threshold, function_threshold) {
+        if report.markdown.trim().is_empty() {
+            report.markdown = section;
+        } else {
+            report.markdown.push_str("\n\n");
+            report.markdown.push_str(&section);
+        }
+    }
+}
+
+/// Net additions/deletions for one file in the unified diff, plus its
+/// hunks (used to attribute growth to individual functions).
+#[derive(Debug, Default, Clone)]
+struct FileDiffStats {
+    additions: u64,
+    deletions: u64,
+    hunks: Vec<DiffHunk>,
+}
+
+impl FileDiffStats {
+    /// Net lines the pass added to the file (`additions − deletions`).
+    fn net(&self) -> i64 {
+        self.additions as i64 - self.deletions as i64
+    }
+}
+
+/// One unified-diff hunk's new-file footprint AND its add/delete counts.
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    /// First new-file line number the hunk covers (1-based).
+    new_start: usize,
+    /// Last new-file line number the hunk covers (1-based, inclusive).
+    /// For a pure-deletion hunk this is `new_start − 1` (no new lines).
+    new_end: usize,
+    additions: u64,
+    deletions: u64,
+}
+
+/// Compute the advisory `## Size advisory` markdown section for a review,
+/// or `None` when nothing crosses a threshold with net growth. For each
+/// changed file the reviewer determines — from the file's full contents
+/// AND the unified diff — whether the file (or a function within it)
+/// exceeds the file/function threshold AND whether this pass added net
+/// lines to it; only files/functions that are BOTH over-threshold AND
+/// net-grown are reported. Pure (no I/O) for testability.
+fn size_advisory_section(
+    ctx: &ReviewContext,
+    file_threshold: u64,
+    function_threshold: u64,
+) -> Option<String> {
+    let per_file = parse_unified_diff(&ctx.diff);
+    let mut items: Vec<String> = Vec::new();
+    for file in &ctx.changed_files {
+        let ext = file_extension(&file.path);
+        let stats = per_file.get(&file.path);
+        let total = file.contents.lines().count() as u64;
+        // Whole-file advisory.
+        let file_net = stats.map(|s| s.net()).unwrap_or(0);
+        if total > file_threshold && file_net > 0 {
+            match crate::audits::brightline::production_test_line_split(&file.contents, &ext) {
+                Some((prod, test)) => items.push(format!(
+                    "- `{}` is now {total} lines (production {prod} / test {test}); this pass added net lines.",
+                    file.path
+                )),
+                None => items.push(format!(
+                    "- `{}` is now {total} lines; this pass added net lines.",
+                    file.path
+                )),
+            }
+        }
+        // Function-level advisories.
+        let hunks: &[DiffHunk] = stats.map(|s| s.hunks.as_slice()).unwrap_or(&[]);
+        for span in crate::audits::brightline::function_line_spans(&file.contents, &ext) {
+            let n = span.line_count();
+            if n <= function_threshold {
+                continue;
+            }
+            if function_net_lines(hunks, span.start_line, span.end_line) > 0 {
+                items.push(format!(
+                    "- function `{}` in `{}` is now {n} lines; this pass added net lines.",
+                    span.name, file.path
+                ));
+            }
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Size advisory\n\n");
+    out.push_str(&items.join("\n"));
+    Some(out)
+}
+
+/// Net lines (`additions − deletions`) the pass contributed to a function
+/// spanning new-file lines `[fstart, fend]`, attributed by hunk overlap:
+/// every hunk whose new-file footprint intersects the span contributes
+/// its add/delete counts.
+fn function_net_lines(hunks: &[DiffHunk], fstart: usize, fend: usize) -> i64 {
+    let mut adds: i64 = 0;
+    let mut dels: i64 = 0;
+    for h in hunks {
+        // A pure-deletion hunk has new_end == new_start - 1; clamp so the
+        // overlap test treats it as the single insertion point new_start.
+        let hend = h.new_end.max(h.new_start);
+        if fstart <= hend && h.new_start <= fend {
+            adds += h.additions as i64;
+            dels += h.deletions as i64;
+        }
+    }
+    adds - dels
+}
+
+/// Parse a unified diff into per-file add/delete totals AND hunk
+/// footprints, keyed by the new-file path (the `+++ b/<path>` line with
+/// its `a/`/`b/` prefix stripped). Robust to git's extended headers
+/// (`diff --git`, `index`, mode/rename lines) AND to hunk headers that
+/// omit the optional `,count`.
+fn parse_unified_diff(diff: &str) -> std::collections::HashMap<String, FileDiffStats> {
+    use std::collections::HashMap;
+    static HUNK_RE: OnceLock<Regex> = OnceLock::new();
+    let hunk_re = HUNK_RE
+        .get_or_init(|| Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@").unwrap());
+    let mut map: HashMap<String, FileDiffStats> = HashMap::new();
+    let mut current: Option<String> = None;
+    let mut cur_new: usize = 0;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            current = normalize_diff_path(rest);
+            if let Some(p) = &current {
+                map.entry(p.clone()).or_default();
+            }
+            continue;
+        }
+        if line.starts_with("--- ")
+            || line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
+            || line.starts_with("Binary ")
+        {
+            continue;
+        }
+        if let Some(caps) = hunk_re.captures(line) {
+            cur_new = caps[1].parse().unwrap_or(1);
+            if let Some(cur) = &current {
+                let fd = map.entry(cur.clone()).or_default();
+                fd.hunks.push(DiffHunk {
+                    new_start: cur_new,
+                    new_end: cur_new.saturating_sub(1),
+                    additions: 0,
+                    deletions: 0,
+                });
+            }
+            continue;
+        }
+        let cur = match &current {
+            Some(c) => c,
+            None => continue,
+        };
+        let fd = match map.get_mut(cur) {
+            Some(fd) => fd,
+            None => continue,
+        };
+        match line.as_bytes().first().copied() {
+            Some(b'+') => {
+                fd.additions += 1;
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.additions += 1;
+                    h.new_end = cur_new;
+                }
+                cur_new += 1;
+            }
+            Some(b'-') => {
+                fd.deletions += 1;
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.deletions += 1;
+                }
+            }
+            Some(b'\\') => { /* "\ No newline at end of file" — ignore */ }
+            _ => {
+                // Context line (leading space) or a blank context line.
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.new_end = cur_new;
+                }
+                cur_new += 1;
+            }
+        }
+    }
+    map
+}
+
+/// Strip a unified-diff path's `a/`/`b/` prefix AND any trailing tab
+/// metadata, yielding the workspace-relative path. `/dev/null` (an
+/// added/deleted side) yields `None`.
+fn normalize_diff_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw.split('\t').next().unwrap_or(raw);
+    if raw == "/dev/null" {
+        return None;
+    }
+    let stripped = raw
+        .strip_prefix("b/")
+        .or_else(|| raw.strip_prefix("a/"))
+        .unwrap_or(raw);
+    Some(stripped.to_string())
+}
+
+/// File extension (lowercased) for a workspace-relative path, or empty
+/// when there is none.
+fn file_extension(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 /// Operator-facing verdict for the re-review entry point (a33). The
@@ -528,8 +821,21 @@ pub async fn review_pr_at_state_with(
         crate::config::ReviewerMode::Bundled => reviewer.review(ctx).await?,
         crate::config::ReviewerMode::PerChange => {
             let contexts = split_per_change_contexts(ctx);
-            let per_change = reviewer.review_per_change(&contexts).await?;
-            synthesize_per_change_report(per_change)
+            // a015: an empty split (no archived-change briefs resolved for
+            // this PR — e.g. a PR opened under one daemon build and
+            // re-reviewed under another) must NEVER synthesize a verdict
+            // from zero reviews. `review_per_change(&[])` makes zero
+            // reviewer invocations and `synthesize_per_change_report(vec![])`
+            // would return a defaulted `Pass` — a blank `Approve` the
+            // reviewer never performed. Fall back to a single bundled
+            // review so the PR's diff and changed files still reach the
+            // reviewer and the verdict reflects an actual invocation.
+            if contexts.is_empty() {
+                reviewer.review(ctx).await?
+            } else {
+                let per_change = reviewer.review_per_change(&contexts).await?;
+                synthesize_per_change_report(per_change)
+            }
         }
     };
     Ok(ReviewResult {
@@ -590,6 +896,13 @@ struct RawReviewConcern {
     should_request_revision: bool,
     #[serde(default)]
     actionable_request: Option<String>,
+    /// The reviewer's own security signal (a004): `true` when this finding
+    /// is a credential/secret/key exposure or an injection vulnerability.
+    /// Drives the verdict-escalation safety net the same way the oneshot
+    /// `revision-requests` block's `security_critical` does. Defaults to
+    /// `false` when the reviewer omits it.
+    #[serde(default)]
+    security_critical: bool,
 }
 
 /// The `submit_review` payload shape.
@@ -654,8 +967,19 @@ pub(crate) fn payload_to_review_result(
             actionable_request: c.actionable_request.clone(),
             should_request_revision: c.should_request_revision,
             change_slug: None,
+            security_critical: c.security_critical,
         });
     }
+    // a004 safety net (agentic path): a payload flagging a credential/secret/
+    // key exposure or injection via its own `security_critical` finding signal
+    // but returning a non-`Block` verdict is escalated to `Block` before the
+    // result reaches the PR-draft / auto-revise handling. Keyed on the
+    // structured signal, never on the prose of the finding.
+    let verdict = if verdict != Verdict::Block && concerns_flag_security_critical(&concerns) {
+        Verdict::Block
+    } else {
+        verdict
+    };
     let raw_output = render_review_submission_markdown(&sub.summary, &sub.concerns);
     let per_concern = concerns.iter().map(ConcernEntry::from).collect();
     Ok(ReviewResult {
@@ -766,10 +1090,20 @@ pub fn render_agentic_review_prompt(ctx: &ReviewContext, preamble: &str) -> Stri
     }
 
     out.push_str(
+        "Security-critical findings are always Block. Credential or secret leakage (a key, \
+         token, or secret written where it could be committed or otherwise exposed), hardcoded \
+         secrets, AND injection vulnerabilities (SQL, command, path) are stop-the-line: return \
+         `Block`, never a soft verdict, AND set `security_critical: true` on that concern. The \
+         daemon escalates the verdict to `Block` from the `security_critical` signal even if you \
+         returned `Approve`.\n\n",
+    );
+
+    out.push_str(
         "When your analysis is complete, call the `submit_review` MCP tool exactly once with \
          your verdict (Approve | Block), a summary, AND any concerns. Each concern that should \
          drive a revision MUST set `should_request_revision: true` with a non-empty \
-         `actionable_request`. Do NOT print the verdict to stdout — the daemon reads it ONLY \
+         `actionable_request`. Mark any credential/secret/key-exposure or injection finding with \
+         `security_critical: true`. Do NOT print the verdict to stdout — the daemon reads it ONLY \
          from `submit_review`.\n",
     );
     out
@@ -823,7 +1157,9 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         )
         .context("writing reviewer MCP config")?;
 
-        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        // a70: a single-shot role — prune the session it creates on completion.
+        let result = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
             workspace: self.workspace,
             change: REVIEWER_ROLE,
             strategy: self.strategy,
@@ -844,7 +1180,13 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
-        })
+            // a006: the agentic reviewer is a read-only role — read-only
+            // workspace. It drives `claude` (no per-run model override here).
+            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
+            },
+            true,
+            None,
+        )
         .await;
 
         // Always remove the config we wrote, regardless of run outcome.
@@ -862,9 +1204,10 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
 }
 
 /// Resolve the agentic reviewer's CLI strategy from its provider via the
-/// a55/a56 `provider → CLI` rule. Anthropic → the `claude` strategy; any
-/// other provider resolves to a CLI with no registered strategy yet (a60)
-/// AND returns a clear error naming it, with no session spawned.
+/// a55/a56 `provider → CLI` rule. Anthropic → the `claude` strategy;
+/// non-Anthropic providers → the `opencode` strategy (a60). No session is
+/// spawned at resolution time. (A future provider whose CLI has no
+/// registered strategy would still return a clear error here.)
 fn resolve_reviewer_strategy(
     reviewer: &CodeReviewer,
 ) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
@@ -875,11 +1218,115 @@ fn resolve_reviewer_strategy(
     )
 }
 
+/// Whether `cli` resolves to an executable on the daemon host. An absolute
+/// or path-qualified command (`/usr/local/bin/claude`, `./claude`) is tested
+/// directly; a bare name (`claude`) is searched across the entries in `$PATH`.
+/// No subprocess is spawned — the binary is located, not executed — so the
+/// startup probe is fast AND has no side effects. Used by
+/// [`resolve_startup_reviewer_kind`] for the a64 agentic-CLI fallback.
+fn reviewer_binary_on_path(cli: &str) -> bool {
+    let candidate = Path::new(cli);
+    if candidate.is_absolute() || cli.contains('/') {
+        return candidate.is_file();
+    }
+    match std::env::var_os("PATH") {
+        Some(path_var) => std::env::split_paths(&path_var).any(|dir| dir.join(cli).is_file()),
+        None => false,
+    }
+}
+
+/// Pure decision behind the a64 startup CLI-availability fallback. Given the
+/// configured reviewer transport, the resolved CLI name, AND whether that CLI
+/// is available on the host, return the effective startup transport plus an
+/// optional loud WARN message:
+///
+/// - `Oneshot` configured → `(Oneshot, None)`: the operator opted out of
+///   agentic deliberately, so no probe AND no warning.
+/// - `Agentic` configured AND CLI available → `(Agentic, None)`: agentic runs.
+/// - `Agentic` configured AND CLI unavailable → `(Oneshot, Some(warn))`: the
+///   reviewer degrades to the HTTP one-shot path for the boot (review is NOT
+///   disabled) AND the caller logs `warn`, which names the missing CLI AND the
+///   remedy. The same disposition applies whether `agentic` was the default or
+///   set explicitly.
+///
+/// Separated from the host probe ([`resolve_startup_reviewer_kind`]) so tests
+/// assert the decision without depending on what is installed on the host —
+/// mirroring [`crate::config::clamp_max_code_reviews_per_pr`]'s observable
+/// `Option<String>` warning return.
+pub fn startup_reviewer_kind_decision(
+    configured: ReviewerKind,
+    cli: &str,
+    cli_available: bool,
+) -> (ReviewerKind, Option<String>) {
+    match configured {
+        ReviewerKind::Oneshot => (ReviewerKind::Oneshot, None),
+        ReviewerKind::Agentic if cli_available => (ReviewerKind::Agentic, None),
+        ReviewerKind::Agentic => {
+            let warn = format!(
+                "reviewer.kind is `agentic` but the resolved reviewer CLI `{cli}` is unavailable \
+                 on the daemon host (no registered strategy, OR the binary is not on PATH); \
+                 falling back to the `oneshot` HTTP review path for this boot — review is NOT \
+                 disabled. Install `{cli}` to enable the agentic reviewer, OR set \
+                 `reviewer.kind: oneshot` to silence this warning. A daemon restart or \
+                 `autocoder reload` re-evaluates availability."
+            );
+            (ReviewerKind::Oneshot, Some(warn))
+        }
+    }
+}
+
+/// Resolve the reviewer's effective transport at startup AND on
+/// `autocoder reload`, applying the a64 agentic-CLI-availability fallback.
+///
+/// When the configured kind is `agentic` (defaulted OR explicit) this probes
+/// the host: the CLI is "available" only when its strategy is registered
+/// (resolved via the a55/a56 `provider → CLI` rule) AND its binary is found on
+/// PATH. An unavailable CLI degrades to `oneshot` for the boot, returning the
+/// loud WARN for the caller to log exactly once. When the configured kind is
+/// `oneshot` no probe runs. The daemon wires this in at the two reviewer
+/// construction sites (startup in `cli::run`, reload in `control_socket`), so
+/// availability is evaluated once per boot/reload — never per polling
+/// iteration. This supersedes a58's "a reviewer CLI with no registered
+/// strategy returns a clear error, no session" behavior for the reviewer role:
+/// instead of erroring, the reviewer degrades to HTTP review.
+pub fn resolve_startup_reviewer_kind(reviewer: &CodeReviewer) -> (ReviewerKind, Option<String>) {
+    if reviewer.kind() != ReviewerKind::Agentic {
+        return (reviewer.kind(), None);
+    }
+    // "Available" requires BOTH a registered strategy AND a binary on PATH.
+    let cli_available =
+        resolve_reviewer_strategy(reviewer).is_ok() && reviewer_binary_on_path(&reviewer.command);
+    startup_reviewer_kind_decision(ReviewerKind::Agentic, &reviewer.command, cli_available)
+}
+
+/// Apply the a64 startup CLI-availability fallback to a freshly built
+/// reviewer. When the effective kind is `agentic` but the resolved reviewer
+/// CLI is unavailable, log ONE loud WARN (naming the missing CLI AND the
+/// remedy) AND return the reviewer with its kind overridden to `oneshot` for
+/// the boot — review continues over HTTP, never disabled. Otherwise the
+/// reviewer is returned unchanged. Both reviewer construction sites (startup
+/// in `cli::run`, reload in `control_socket::build_reviewer`) call this, so
+/// availability is evaluated once per boot/reload — the live polling-loop
+/// reviewer slot already carries the resolved kind, so no per-iteration probe
+/// (and no re-warn) occurs.
+pub fn apply_startup_cli_fallback(reviewer: CodeReviewer) -> CodeReviewer {
+    let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+    if let Some(msg) = warn {
+        tracing::warn!("{msg}");
+    }
+    reviewer.with_kind(effective)
+}
+
 /// Run the agentic reviewer against `ctx` (a58). Production entry point for
 /// both the polling-loop initial review AND the operator-triggered rerun
-/// composer. Resolves the CLI strategy (erroring before any spawn when the
-/// reviewer command has no registered strategy), then dispatches one
-/// session per `reviewer.mode()`.
+/// composer. Resolves the CLI strategy (`claude` for Anthropic, `opencode`
+/// for non-Anthropic providers — a60), then dispatches one session per
+/// `reviewer.mode()`. This is reached only when the reviewer's effective
+/// kind is `agentic`; under a64 the startup CLI-availability check
+/// ([`resolve_startup_reviewer_kind`]) has already degraded an
+/// unavailable-CLI reviewer to `oneshot` for the boot, so the strategy
+/// resolution here succeeds in the common case (a later availability change
+/// still surfaces as `Err`, handled by the caller).
 pub async fn run_agentic_review(
     reviewer: &CodeReviewer,
     ctx: &ReviewContext,
@@ -909,12 +1356,32 @@ async fn run_agentic_review_with_runner(
 ) -> Result<AgenticReviewOutcome> {
     // Build the per-session work list. Bundled is always exactly one
     // session even when the pass has zero archived changes.
-    let sessions: Vec<(Option<String>, ReviewContext, String)> = match reviewer.mode() {
-        crate::config::ReviewerMode::Bundled => vec![(None, ctx.clone(), String::new())],
-        crate::config::ReviewerMode::PerChange => split_per_change_contexts(ctx)
-            .into_iter()
-            .map(|p| (Some(p.change_slug), p.context, p.cross_change_preamble))
-            .collect(),
+    //
+    // a015: an empty per-change split (no archived-change briefs resolved
+    // for this PR — e.g. a PR opened under one daemon build and re-reviewed
+    // under another) must NEVER reach `synthesize_agentic_per_change` with
+    // zero reviews: that initializer defaults to `Approve`, so the loop
+    // running zero sessions would produce a blank `Approve` the reviewer
+    // never performed — the exact silent-approval bug the one-shot
+    // `review_pr_at_state_with` path fixes. Mirror that fix here: fall back
+    // to a single BUNDLED session so the PR's diff and changed files still
+    // reach the reviewer and the verdict comes from an actual invocation.
+    // The `bundled` flag then also routes synthesis below through the
+    // bundled arm (no empty per-change synthesis).
+    let mut bundled = matches!(reviewer.mode(), crate::config::ReviewerMode::Bundled);
+    let sessions: Vec<(Option<String>, ReviewContext, String)> = if bundled {
+        vec![(None, ctx.clone(), String::new())]
+    } else {
+        let per_change = split_per_change_contexts(ctx);
+        if per_change.is_empty() {
+            bundled = true;
+            vec![(None, ctx.clone(), String::new())]
+        } else {
+            per_change
+                .into_iter()
+                .map(|p| (Some(p.change_slug), p.context, p.cross_change_preamble))
+                .collect()
+        }
     };
 
     let mut reviews: Vec<(Option<String>, ReviewResult)> = Vec::with_capacity(sessions.len());
@@ -946,18 +1413,19 @@ async fn run_agentic_review_with_runner(
         }
     }
 
-    let outcome = match reviewer.mode() {
-        crate::config::ReviewerMode::Bundled => {
-            let mut result = reviews
-                .pop()
-                .map(|(_, r)| r)
-                .expect("bundled mode always runs exactly one session");
-            result.attribution = reviewer.attribution.clone();
-            result
-        }
-        crate::config::ReviewerMode::PerChange => {
-            synthesize_agentic_per_change(reviews, reviewer.attribution.clone())
-        }
+    // a015: synthesize through the SAME `bundled` flag the session list was
+    // built with, so an empty-split fallback (bundled = true above) takes
+    // the single-review bundled arm instead of synthesizing per-change from
+    // an effectively empty set.
+    let outcome = if bundled {
+        let mut result = reviews
+            .pop()
+            .map(|(_, r)| r)
+            .expect("bundled mode always runs exactly one session");
+        result.attribution = reviewer.attribution.clone();
+        result
+    } else {
+        synthesize_agentic_per_change(reviews, reviewer.attribution.clone())
     };
     Ok(AgenticReviewOutcome::Reviewed(outcome))
 }
@@ -972,6 +1440,27 @@ fn synthesize_agentic_per_change(
     reviews: Vec<(Option<String>, ReviewResult)>,
     attribution: Option<String>,
 ) -> ReviewResult {
+    // a015: a synthesis from zero per-change reviews must NEVER be the
+    // source of a defaulted `Approve`. The dispatch in
+    // `run_agentic_review_with_runner` now falls back to a bundled session
+    // before reaching here with an empty vec, so this guard is defensive —
+    // it makes the "never a defaulted Approve" invariant explicit. `Block`
+    // is the only fail-safe verdict: an empty synthesis can never become a
+    // silent approval. (Mirrors the one-shot `synthesize_per_change_report`
+    // guard.)
+    if reviews.is_empty() {
+        return ReviewResult {
+            verdict: Verdict::Block,
+            per_concern: Vec::new(),
+            raw_output: String::new(),
+            markdown: "No per-change reviews were performed; refusing to \
+                synthesize a verdict from zero reviews."
+                .to_string(),
+            per_change_sections: Vec::new(),
+            concerns: Vec::new(),
+            attribution,
+        };
+    }
     let mut verdict = Verdict::Approve;
     let mut concerns: Vec<ReviewConcern> = Vec::new();
     let mut sections: Vec<PerChangeSection> = Vec::with_capacity(reviews.len());
@@ -1072,6 +1561,24 @@ fn split_per_change_contexts(ctx: &ReviewContext) -> Vec<PerChangeContext> {
 /// per-change report's concerns (tagged with their `change_slug`), used
 /// by the auto-revise pipeline.
 pub(crate) fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewReport {
+    // a015: a synthesis from zero per-change reviews must NEVER be the
+    // source of a defaulted `Pass`/`Approve`. The per_change dispatch arm
+    // now falls back to a bundled review before reaching here with an
+    // empty vec, so this guard is defensive — it makes that invariant
+    // explicit. `Block` is the only verdict that does not map to `Approve`
+    // on the operator-facing surface, so it is the fail-safe choice: an
+    // empty synthesis can never become a silent approval.
+    if per_change.is_empty() {
+        return ReviewReport {
+            verdict: ReviewVerdict::Block,
+            markdown: "No per-change reviews were performed; refusing to \
+                synthesize a verdict from zero reviews."
+                .to_string(),
+            concerns: Vec::new(),
+            per_change_sections: Vec::new(),
+            attribution: None,
+        };
+    }
     let mut verdict = ReviewVerdict::Pass;
     let mut concerns: Vec<ReviewConcern> = Vec::new();
     let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
@@ -1320,6 +1827,18 @@ fn render_sections(ctx: &ReviewContext, budget: usize) -> RenderedSections {
     }
 }
 
+/// Whether the reviewer's own structured findings flag a security-critical
+/// issue — a credential/secret/key exposure or an injection vulnerability —
+/// via the per-concern `security_critical` signal (a004). This drives the
+/// verdict-escalation safety net: such a finding forces a `Block` even when
+/// the reviewer returned a softer verdict. It keys on the structured signal
+/// the reviewer emitted, NEVER on the prose of the finding, so a
+/// mis-classifying model cannot downgrade a credential leak to advisory and
+/// a finding that merely mentions "credential" in passing does not escalate.
+fn concerns_flag_security_critical(concerns: &[ReviewConcern]) -> bool {
+    concerns.iter().any(|c| c.security_critical)
+}
+
 /// Parse the LLM response into a `ReviewReport`. Per spec, the first
 /// non-empty line MUST match `(?i)^VERDICT:\s*(Pass|Concerns|Block)\s*$`.
 /// If matched, the rest of the response (after that line) is the
@@ -1349,7 +1868,7 @@ fn parse_response(raw: &str) -> ReviewReport {
 
     let concerns = extract_revision_requests(raw);
 
-    match (first_nonempty, found_idx) {
+    let mut report = match (first_nonempty, found_idx) {
         (Some(line), Some(idx)) if re.is_match(line) => {
             let caps = re.captures(line).unwrap();
             let verdict = match caps.get(1).unwrap().as_str().to_ascii_lowercase().as_str() {
@@ -1379,7 +1898,19 @@ fn parse_response(raw: &str) -> ReviewReport {
             per_change_sections: Vec::new(),
             attribution: None,
         },
+    };
+    // a004 safety net: a review that flagged a credential/secret/key exposure
+    // or injection (via the reviewer's own `security_critical` finding signal)
+    // but returned a softer verdict is escalated to `Block` here — before the
+    // PR-draft / auto-revise handling runs — so a mis-classifying model cannot
+    // ship a security-critical finding through as advisory. Non-security
+    // findings are untouched.
+    if report.verdict != ReviewVerdict::Block
+        && concerns_flag_security_critical(&report.concerns)
+    {
+        report.verdict = ReviewVerdict::Block;
     }
+    report
 }
 
 /// Extract the `revision-requests` fenced YAML block from `raw` (if any)
@@ -1565,6 +2096,153 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(r.verdict, ReviewVerdict::Concerns);
         assert_eq!(r.concerns.len(), 1);
         assert!(r.concerns[0].should_request_revision);
+    }
+
+    // =================================================================
+    // a004: security-critical findings escalate the verdict to Block.
+    // The escalation keys ONLY on the reviewer's own structured
+    // `security_critical` signal, never on the prose of the finding.
+    // =================================================================
+
+    /// 3.1: a credential/secret-leak finding (`security_critical: true`)
+    /// returned with a `Concerns` verdict is escalated to `Block`.
+    #[test]
+    fn security_finding_escalates_concerns_to_block() {
+        let raw = r#"VERDICT: Concerns
+
+## Security
+- API key persisted to a committable config file.
+
+```revision-requests
+- summary: "API key written to committable opencode.json"
+  actionable_request: "read the key from an env var instead of persisting it"
+  should_request_revision: true
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Block,
+            "a security_critical finding must force Block even when the reviewer wrote Concerns"
+        );
+    }
+
+    /// 3.1: the same escalation applies when the reviewer wrote `Pass`.
+    #[test]
+    fn security_finding_escalates_pass_to_block() {
+        let raw = r#"VERDICT: Pass
+
+## Security
+- Token leaked into the workspace.
+
+```revision-requests
+- summary: "auth token written to a tracked file"
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+    }
+
+    /// 3.2: an injection finding (also carried by `security_critical`) with
+    /// a non-`Block` verdict escalates to `Block`.
+    #[test]
+    fn injection_finding_escalates_to_block() {
+        let raw = r#"VERDICT: Concerns
+
+## Security
+- User input concatenated into a shell command.
+
+```revision-requests
+- summary: "command injection in run_hook"
+  actionable_request: "pass arguments as a vector instead of building a shell string"
+  should_request_revision: true
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
+    }
+
+    /// 3.3: a `Concerns` verdict whose findings are all non-security
+    /// (`security_critical` omitted → `false`) stays `Concerns` — no
+    /// escalation.
+    #[test]
+    fn non_security_concerns_are_not_escalated() {
+        let raw = r#"VERDICT: Concerns
+
+## Naming, style, idioms
+- `tmp` is an unclear name.
+
+```revision-requests
+- summary: "rename tmp to something descriptive"
+  should_request_revision: false
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Concerns,
+            "non-security findings must keep their verdict"
+        );
+        assert!(
+            !r.concerns[0].security_critical,
+            "omitted security_critical defaults to false"
+        );
+    }
+
+    /// 3.4: the escalation is driven by the structured `security_critical`
+    /// signal, NOT by message wording. A finding whose prose screams
+    /// "credential leak" but is NOT flagged stays `Concerns`; an innocuous-
+    /// worded finding that IS flagged escalates to `Block`.
+    #[test]
+    fn escalation_keys_on_signal_not_wording() {
+        // Prose mentions a credential leak, but the structured signal is
+        // absent (defaults to false) → no escalation.
+        let worded_but_unflagged = r#"VERDICT: Concerns
+
+```revision-requests
+- summary: "possible credential leak / secret / api key exposure here"
+  should_request_revision: false
+```
+"#;
+        let r = parse_response(worded_but_unflagged);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Concerns,
+            "wording alone must NOT escalate — only the structured signal does"
+        );
+
+        // Innocuous wording, but the structured signal is set → escalates.
+        let flagged_but_innocuous = r#"VERDICT: Concerns
+
+```revision-requests
+- summary: "tidy up helper foo"
+  security_critical: true
+```
+"#;
+        let r = parse_response(flagged_but_innocuous);
+        assert_eq!(
+            r.verdict,
+            ReviewVerdict::Block,
+            "the structured signal escalates regardless of innocuous wording"
+        );
+    }
+
+    /// A `security_critical` finding that ALSO carries a `Block` verdict is
+    /// a no-op for the escalation (already Block) — the verdict is unchanged.
+    #[test]
+    fn security_finding_already_block_is_unchanged() {
+        let raw = r#"VERDICT: Block
+
+```revision-requests
+- summary: "hardcoded secret"
+  security_critical: true
+```
+"#;
+        let r = parse_response(raw);
+        assert_eq!(r.verdict, ReviewVerdict::Block);
     }
 
     #[test]
@@ -1763,6 +2441,111 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(r.diff_or_explanation, "DELTA");
     }
 
+    // ====================================================================
+    // a67: advisory size flag (tasks 7.x / 8.7)
+    // ====================================================================
+
+    async fn review_with_size_thresholds(
+        ctx: &ReviewContext,
+        file_t: u64,
+        func_t: u64,
+    ) -> ReviewReport {
+        let (client, _captured) = stub_with_capture("VERDICT: Pass\n\n## Review\nlooks fine\n");
+        let reviewer =
+            CodeReviewer::new(client, "{{diff}}".to_string()).with_size_thresholds(file_t, func_t);
+        reviewer.review(ctx).await.unwrap()
+    }
+
+    /// 8.7a — a pass that grows a changed file past the file threshold
+    /// yields a size advisory naming the file, AND leaves the verdict
+    /// untouched.
+    #[tokio::test]
+    async fn size_advisory_flags_file_grown_past_threshold() {
+        let contents: String = (0..60).map(|i| format!("// line {i}\n")).collect();
+        let mut diff = String::from(
+            "diff --git a/src/foo.rs b/src/foo.rs\n--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1,1 +1,11 @@\n // line 0\n",
+        );
+        for i in 0..10 {
+            diff.push_str(&format!("+// added {i}\n"));
+        }
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/foo.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        let report = review_with_size_thresholds(&ctx, 50, 20).await;
+        assert!(
+            report.markdown.contains("## Size advisory") && report.markdown.contains("src/foo.rs"),
+            "expected a file size advisory: {}",
+            report.markdown
+        );
+        // Size is advisory only — the parsed verdict is unchanged.
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
+    }
+
+    /// 8.7b — a pass that only shrinks an over-threshold file is NOT
+    /// flagged.
+    #[tokio::test]
+    async fn size_advisory_skips_file_only_shrunk() {
+        let contents: String = (0..60).map(|i| format!("// line {i}\n")).collect();
+        let diff = String::from(
+            "diff --git a/src/bar.rs b/src/bar.rs\n--- a/src/bar.rs\n+++ b/src/bar.rs\n@@ -1,5 +1,1 @@\n // keep\n-// del 0\n-// del 1\n-// del 2\n-// del 3\n",
+        );
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/bar.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        let report = review_with_size_thresholds(&ctx, 50, 20).await;
+        assert!(
+            !report.markdown.contains("## Size advisory"),
+            "a shrinking pass must not be flagged: {}",
+            report.markdown
+        );
+    }
+
+    /// 8.7c — a pass that grows a single function past the function
+    /// threshold yields a function-level advisory.
+    #[tokio::test]
+    async fn size_advisory_flags_function_grown_past_threshold() {
+        // 27-line function (1 signature + 25 body + 1 close).
+        let mut contents = String::from("pub fn grower() {\n");
+        for i in 0..25 {
+            contents.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        contents.push_str("}\n");
+        // Diff that adds the 25 body lines (net +25 within the function).
+        let mut diff = String::from(
+            "diff --git a/src/grow.rs b/src/grow.rs\n--- a/src/grow.rs\n+++ b/src/grow.rs\n@@ -1,2 +1,27 @@\n pub fn grower() {\n",
+        );
+        for i in 0..25 {
+            diff.push_str(&format!("+    let v{i} = {i};\n"));
+        }
+        diff.push_str(" }\n");
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/grow.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        // High file threshold so only the function advisory can fire.
+        let report = review_with_size_thresholds(&ctx, 100_000, 20).await;
+        assert!(
+            report.markdown.contains("## Size advisory") && report.markdown.contains("grower"),
+            "expected a function size advisory naming `grower`: {}",
+            report.markdown
+        );
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
+    }
+
     /// a34 §6: `skip_spec_only_prs` defaults to `false` AND propagates
     /// from `ReviewerConfig` via `from_config`. This is the gate the
     /// polling iteration consults before invoking the reviewer call.
@@ -1780,7 +2563,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -1808,7 +2591,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -1880,7 +2663,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -1918,7 +2701,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(template_path),
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -1961,7 +2744,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2005,7 +2788,7 @@ this is not yaml: at all: ::: {{{ broken
             code_review: Some(PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2034,7 +2817,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: Some(5),
@@ -2536,6 +3319,185 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(Verdict::from(ref_report.verdict), result.verdict);
     }
 
+    /// a015 task 2.1: `per_change` mode with an empty `archived_changes`
+    /// context (the split yields zero sub-contexts) but a non-empty
+    /// diff/changed_files falls back to a single bundled review. Exactly
+    /// one reviewer invocation occurs AND the verdict is the one the
+    /// stubbed bundled review returns — NOT a defaulted `Pass`/`Approve`
+    /// synthesized from zero reviews. The stub returns `Block` precisely
+    /// because `Block` is the only verdict that does not map to `Approve`:
+    /// if the pre-a015 bug were present (empty synthesis → `Pass` →
+    /// `Approve`), this assertion would fail.
+    #[tokio::test]
+    async fn per_change_empty_split_falls_back_to_bundled_with_real_verdict() {
+        use std::sync::Mutex;
+        struct CountingClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok("VERDICT: Block\n\nbundled review found a real problem\n".to_string())
+            }
+        }
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(CountingClient { prompts: prompts.clone() });
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}{{diff}}".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+
+        // Empty archived_changes → split yields zero sub-contexts, but the
+        // PR still has a real diff and changed files to review.
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the union diff".into(),
+        };
+
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("fallback bundled review succeeds");
+
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "empty split falls back to exactly one bundled reviewer invocation"
+        );
+        assert_eq!(
+            result.verdict,
+            Verdict::Block,
+            "verdict comes from the bundled review, not a defaulted Pass/Approve"
+        );
+        assert!(
+            result.per_change_sections.is_empty(),
+            "the fallback is a bundled review — no per-change sections"
+        );
+        assert!(result.markdown.contains("bundled review found a real problem"));
+    }
+
+    /// a015 task 2.2: the fallback bundled review is handed the context's
+    /// diff and changed files (asserting on what the stub reviewer
+    /// received, not on any log/message wording). Proves the reviewer
+    /// builds its prompt over the real context rather than skipping the
+    /// call.
+    #[tokio::test]
+    async fn per_change_empty_split_fallback_passes_diff_and_files() {
+        let (client, captured) = stub_with_capture("VERDICT: Concerns\n\nnit\n");
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}{{diff}}".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/touched.rs".into(),
+                contents: "FILE_BODY_SENTINEL_a015".into(),
+            }],
+            diff: "DIFF_SENTINEL_a015".into(),
+        };
+
+        let _ = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("fallback bundled review succeeds");
+
+        let prompt = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the reviewer built and submitted a prompt");
+        assert!(
+            prompt.contains("DIFF_SENTINEL_a015"),
+            "the fallback review receives the context's diff"
+        );
+        assert!(
+            prompt.contains("FILE_BODY_SENTINEL_a015"),
+            "the fallback review receives the context's changed files"
+        );
+    }
+
+    /// a015 task 2.3 (regression): `per_change` mode with a populated
+    /// `archived_changes` (≥1 change) still dispatches one review per
+    /// change and synthesizes the results — no bundled fallback fires.
+    #[tokio::test]
+    async fn per_change_populated_split_still_dispatches_per_change() {
+        use std::sync::Mutex;
+        struct CountingClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok("VERDICT: Pass\n\nlooks fine\n".to_string())
+            }
+        }
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(CountingClient { prompts: prompts.clone() });
+        let reviewer = CodeReviewer::new(
+            client,
+            "{{cross_change_preamble}}{{changed_files}}{{diff}}".to_string(),
+        )
+        .with_mode(crate::config::ReviewerMode::PerChange);
+
+        let brief = |name: &str| ChangeBrief {
+            name: name.into(),
+            proposal: format!("## Why\nreasons for {name}\n"),
+            design: None,
+            tasks: String::new(),
+        };
+        let ctx = ReviewContext {
+            archived_changes: vec![brief("alpha"), brief("beta")],
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the union diff".into(),
+        };
+
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("per-change review succeeds");
+
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            2,
+            "one reviewer invocation per change — no bundled fallback"
+        );
+        let slugs: Vec<&str> = result
+            .per_change_sections
+            .iter()
+            .map(|s| s.change_slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            ["alpha", "beta"],
+            "results are synthesized per change, in input order"
+        );
+    }
+
+    /// a015 task 1.2: the empty-input guard on `synthesize_per_change_report`
+    /// makes the "never a defaulted Pass" invariant explicit. Called with
+    /// an empty vec it returns a non-`Pass` (here `Block`) verdict so a
+    /// synthesis from zero reviews can never become a silent approval.
+    #[test]
+    fn synthesize_per_change_report_empty_input_is_not_pass() {
+        let report = synthesize_per_change_report(Vec::new());
+        assert_ne!(
+            report.verdict,
+            ReviewVerdict::Pass,
+            "an empty per-change synthesis must never default to Pass"
+        );
+        assert_ne!(
+            Verdict::from(report.verdict),
+            Verdict::Approve,
+            "an empty per-change synthesis must never map to Approve"
+        );
+        assert!(report.per_change_sections.is_empty());
+        assert!(report.concerns.is_empty());
+    }
+
     /// Behavior test (a48): the shipped default template must reference
     /// all three substitution placeholders, because the production render
     /// path (`review_with_preamble`) fills them. Rendering the real
@@ -2676,14 +3638,21 @@ this is not yaml: at all: ::: {{{ broken
         }
     }
 
-    /// 4.1: `kind: oneshot` is the default AND its prompt + parsed output
-    /// are byte-identical to the pre-change one-shot path (the agentic
-    /// branch is never taken).
+    /// The `oneshot` transport's prompt + parsed output are byte-identical
+    /// to the pre-change one-shot path (the agentic branch is never taken).
+    /// `CodeReviewer::new` is the test-only constructor and keeps `oneshot`
+    /// so this surface exercises the HTTP path directly; the operator-facing
+    /// `reviewer.kind` config default is `agentic` since a64 (see
+    /// `config::ReviewerKind` AND `startup_reviewer_kind_decision`).
     #[tokio::test]
-    async fn oneshot_kind_is_default_and_byte_identical() {
+    async fn oneshot_kind_is_byte_identical() {
         let (client, captured) = stub_with_capture("VERDICT: Pass\n\nthe review body");
         let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
-        assert_eq!(reviewer.kind(), ReviewerKind::Oneshot, "default kind is oneshot");
+        assert_eq!(
+            reviewer.kind(),
+            ReviewerKind::Oneshot,
+            "the test-only `new` constructor keeps oneshot"
+        );
         let ctx = ctx_with_diff("DIFFTEXT");
         let result = review_pr_at_state_with(&reviewer, &ctx).await.unwrap();
         // The one-shot prompt is the unchanged render: the bare diff for a
@@ -2692,6 +3661,127 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(prompt, "DIFFTEXT");
         assert_eq!(result.verdict, Verdict::Approve);
         assert_eq!(result.markdown, "the review body");
+    }
+
+    // =================================================================
+    // a64: startup CLI-availability fallback (tasks 3.1–3.4)
+    // =================================================================
+
+    /// An absolute path to a file that is guaranteed to exist on the host
+    /// (the running test binary). `reviewer_binary_on_path` treats a
+    /// path-qualified command as "available" when the file exists, giving the
+    /// "CLI present" branch a deterministic input that does not depend on
+    /// what bare-name binaries happen to be on the CI `$PATH`.
+    fn present_cli() -> String {
+        std::env::current_exe()
+            .expect("current_exe resolves in tests")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A bare command name guaranteed NOT to be on any sane `$PATH`, so
+    /// `reviewer_binary_on_path` reports it missing.
+    const MISSING_CLI: &str = "autocoder-a64-definitely-not-installed-cli";
+
+    /// 3.1: unset `reviewer.kind` resolves to agentic AND, with an available
+    /// reviewer CLI, the startup resolver keeps the reviewer agentic with no
+    /// fallback WARN.
+    #[test]
+    fn unset_kind_with_available_cli_stays_agentic() {
+        // Unset kind defaults to agentic (the `new` test constructor is
+        // oneshot, so model the config default explicitly).
+        assert_eq!(ReviewerKind::default(), ReviewerKind::Agentic);
+
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Agentic)
+            .with_command(present_cli());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(effective, ReviewerKind::Agentic, "available CLI → agentic");
+        assert!(warn.is_none(), "no WARN when the CLI is available: {warn:?}");
+    }
+
+    /// 3.2 / 3.3: an effective-agentic reviewer (defaulted OR explicit) whose
+    /// CLI is unavailable degrades to `oneshot` for the boot AND emits exactly
+    /// one WARN naming the CLI + the remedy. Review is NOT disabled — the
+    /// effective kind is `oneshot`, not "off".
+    #[test]
+    fn agentic_with_unavailable_cli_falls_back_to_oneshot_with_warn() {
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Agentic)
+            .with_command(MISSING_CLI.to_string());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(
+            effective,
+            ReviewerKind::Oneshot,
+            "missing CLI → oneshot fallback (review continues, not disabled)"
+        );
+        let warn = warn.expect("missing CLI must produce a fallback WARN");
+        assert!(
+            warn.contains(MISSING_CLI),
+            "WARN must name the missing CLI: {warn}"
+        );
+        assert!(
+            warn.contains("oneshot"),
+            "WARN must name the `reviewer.kind: oneshot` remedy: {warn}"
+        );
+    }
+
+    /// 3.4: an explicit `oneshot` reviewer is honored with no probe, no
+    /// agentic session, AND no fallback WARN — even when the CLI is missing
+    /// (the operator opted out deliberately).
+    #[test]
+    fn explicit_oneshot_is_honored_without_warn() {
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Oneshot)
+            .with_command(MISSING_CLI.to_string());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(effective, ReviewerKind::Oneshot);
+        assert!(warn.is_none(), "explicit oneshot never warns: {warn:?}");
+    }
+
+    /// The pure decision function covers all four arms independently of any
+    /// host probe (tasks 3.1–3.4 condensed): oneshot is always honored
+    /// warning-free; agentic + available stays agentic; agentic + unavailable
+    /// degrades to oneshot with a CLI-naming, remedy-naming WARN.
+    #[test]
+    fn startup_kind_decision_truth_table() {
+        // Oneshot configured: honored, never warns, regardless of availability.
+        for available in [true, false] {
+            assert_eq!(
+                startup_reviewer_kind_decision(ReviewerKind::Oneshot, "claude", available),
+                (ReviewerKind::Oneshot, None)
+            );
+        }
+        // Agentic + available CLI: agentic, no warn.
+        assert_eq!(
+            startup_reviewer_kind_decision(ReviewerKind::Agentic, "claude", true),
+            (ReviewerKind::Agentic, None)
+        );
+        // Agentic + unavailable CLI: oneshot + WARN naming the CLI and remedy.
+        let (kind, warn) =
+            startup_reviewer_kind_decision(ReviewerKind::Agentic, "qwen-cli", false);
+        assert_eq!(kind, ReviewerKind::Oneshot);
+        let warn = warn.expect("unavailable agentic CLI warns");
+        assert!(warn.contains("qwen-cli"), "names the CLI: {warn}");
+        assert!(warn.contains("oneshot"), "names the remedy: {warn}");
+    }
+
+    /// `reviewer_binary_on_path` finds a real file via an absolute path AND
+    /// reports a bare name absent from `$PATH` as missing — the primitive the
+    /// startup resolver's binary check rests on.
+    #[test]
+    fn binary_on_path_detects_present_and_missing() {
+        assert!(
+            reviewer_binary_on_path(&present_cli()),
+            "an absolute path to an existing file is available"
+        );
+        assert!(
+            !reviewer_binary_on_path(MISSING_CLI),
+            "a bare name not on PATH is unavailable"
+        );
     }
 
     /// 4.2: the agentic sandbox advertises Read/Glob/Grep + `submit_review`
@@ -2800,6 +3890,91 @@ this is not yaml: at all: ::: {{{ broken
         assert!(result.raw_output.contains("sql injection"));
         // Drained: a second consume returns nothing.
         assert!(store.consume("repo", REVIEWER_ROLE).is_none());
+    }
+
+    /// a004 (agentic path, tasks 3.1/3.2): a `submit_review` payload that
+    /// flags a finding `security_critical: true` but returns `Approve` is
+    /// escalated to `Block` by `payload_to_review_result`, keyed on the
+    /// structured signal.
+    #[test]
+    fn agentic_security_finding_escalates_approve_to_block() {
+        let payload = json!({
+            "verdict": "Approve",
+            "summary": "mostly fine",
+            "concerns": [{
+                "title": "api key written to opencode.json",
+                "detail": "the key lands in a committable workspace file",
+                "anchor": "src/config.rs:10",
+                "should_request_revision": true,
+                "actionable_request": "read the key from an env var at runtime",
+                "security_critical": true
+            }]
+        });
+        let result = payload_to_review_result(&payload).expect("maps to ReviewResult");
+        assert_eq!(
+            result.verdict,
+            Verdict::Block,
+            "a security_critical concern must escalate Approve to Block"
+        );
+        assert!(result.concerns[0].security_critical);
+    }
+
+    /// a004 (agentic path, task 3.3): a payload with only non-security
+    /// concerns (`security_critical` omitted → false) keeps its `Approve`
+    /// verdict — no escalation.
+    #[test]
+    fn agentic_non_security_concern_is_not_escalated() {
+        let payload = json!({
+            "verdict": "Approve",
+            "summary": "minor nits",
+            "concerns": [{
+                "title": "rename tmp",
+                "detail": "unclear name",
+                "anchor": "src/x.rs:3",
+                "should_request_revision": false
+            }]
+        });
+        let result = payload_to_review_result(&payload).expect("maps to ReviewResult");
+        assert_eq!(result.verdict, Verdict::Approve);
+        assert!(!result.concerns[0].security_critical);
+    }
+
+    /// a004 (agentic path, task 3.4): the escalation keys on the structured
+    /// signal, not the wording. A credential-leak-worded but unflagged
+    /// concern stays `Approve`; an innocuous-worded but flagged concern
+    /// escalates to `Block`.
+    #[test]
+    fn agentic_escalation_keys_on_signal_not_wording() {
+        let worded_but_unflagged = json!({
+            "verdict": "Approve",
+            "summary": "s",
+            "concerns": [{
+                "title": "possible credential leak / secret / api key exposure",
+                "detail": "d",
+                "anchor": "a",
+                "should_request_revision": false
+            }]
+        });
+        let r = payload_to_review_result(&worded_but_unflagged).expect("maps");
+        assert_eq!(
+            r.verdict,
+            Verdict::Approve,
+            "wording alone must not escalate the agentic verdict"
+        );
+
+        let flagged_but_innocuous = json!({
+            "verdict": "Approve",
+            "summary": "s",
+            "concerns": [{
+                "title": "tidy up helper foo",
+                "detail": "d",
+                "anchor": "a",
+                "should_request_revision": false,
+                "security_critical": true
+            }]
+        });
+        let r = payload_to_review_result(&flagged_but_innocuous).expect("maps");
+        assert_eq!(r.verdict, Verdict::Block);
     }
 
     /// 4.4: a non-enum verdict AND a `should_request_revision` concern with
@@ -2960,21 +4135,130 @@ this is not yaml: at all: ::: {{{ broken
         assert!(matches!(outcome, AgenticReviewOutcome::Discarded { .. }));
     }
 
-    /// A reviewer command resolving (via the a55 provider→CLI rule) to a CLI
-    /// with no registered strategy returns a clear error naming it; an
-    /// Anthropic reviewer resolves the `claude` strategy.
+    /// a015 (agentic path): `per_change` mode whose split yields ZERO
+    /// sub-contexts (empty `archived_changes`) but a real diff falls back to
+    /// a single BUNDLED session — exactly one reviewer session runs AND the
+    /// verdict is the one that session returned, NOT a defaulted
+    /// `Approve`/`Reviewed` synthesized from zero reviews. The canned
+    /// submission returns `Block` precisely because `Block` is the only
+    /// verdict that does not map to an approval: if the pre-fix bug were
+    /// present (empty split → zero sessions → `synthesize_agentic_per_change`
+    /// defaulting to `Approve`), this assertion would fail.
+    #[tokio::test]
+    async fn agentic_per_change_empty_split_falls_back_to_bundled_with_real_verdict() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        // Empty archived_changes → split yields zero sub-contexts, but the
+        // PR still has a real diff and changed files to review.
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the union diff".into(),
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Block"))]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        assert_eq!(
+            runner.session_count(),
+            1,
+            "empty split falls back to exactly one bundled reviewer session"
+        );
+        assert_eq!(
+            runner.slugs.lock().unwrap().as_slice(),
+            [String::new()],
+            "the fallback session is bundled (empty slug), not per-change"
+        );
+        match outcome {
+            AgenticReviewOutcome::Reviewed(r) => {
+                assert_eq!(
+                    r.verdict,
+                    Verdict::Block,
+                    "verdict comes from the bundled review, not a defaulted Approve"
+                );
+                assert!(
+                    r.per_change_sections.is_empty(),
+                    "the fallback is a bundled review — no per-change sections"
+                );
+            }
+            AgenticReviewOutcome::Discarded { .. } => {
+                panic!("a valid bundled submission must produce a reviewed outcome")
+            }
+        }
+    }
+
+    /// a015 (agentic path): the fallback bundled session is handed the
+    /// context's diff and changed files (asserting on the prompt the stub
+    /// runner received, not on any log/message wording). Proves the reviewer
+    /// builds its prompt over the real context rather than skipping the call.
+    #[tokio::test]
+    async fn agentic_per_change_empty_split_fallback_passes_diff_and_files() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/TOUCHED_SENTINEL_a015.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "DIFF_SENTINEL_a015".into(),
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+        let _ = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        let prompts = runner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "exactly one bundled session prompt");
+        assert!(
+            prompts[0].contains("DIFF_SENTINEL_a015"),
+            "the fallback review receives the context's diff"
+        );
+        assert!(
+            prompts[0].contains("src/TOUCHED_SENTINEL_a015.rs"),
+            "the fallback review receives the context's changed files"
+        );
+    }
+
+    /// a015 (agentic path): the empty-input guard on
+    /// `synthesize_agentic_per_change` makes the "never a defaulted Approve"
+    /// invariant explicit. Called with an empty `reviews` vec it returns
+    /// `Block` (not `Approve`), so a synthesis from zero reviews can never
+    /// become a silent approval even if a future caller reaches it directly.
     #[test]
-    fn agentic_strategy_resolution_errors_for_unregistered_cli() {
+    fn synthesize_agentic_per_change_empty_input_is_block() {
+        let result = synthesize_agentic_per_change(Vec::new(), Some("p/m".to_string()));
+        assert_eq!(
+            result.verdict,
+            Verdict::Block,
+            "an empty per-change synthesis must never default to Approve"
+        );
+        assert!(result.per_change_sections.is_empty());
+        assert!(result.concerns.is_empty());
+        assert_eq!(
+            result.attribution.as_deref(),
+            Some("p/m"),
+            "attribution is preserved through the guard"
+        );
+    }
+
+    /// A reviewer whose provider resolves (via the a55 provider→CLI rule) to
+    /// the `opencode` CLI now resolves to a working strategy (a60 registered
+    /// it); an Anthropic reviewer resolves the `claude` strategy. Neither
+    /// spawns a subprocess at resolution time.
+    #[test]
+    fn agentic_strategy_resolution_resolves_registered_clis() {
         let (c1, _) = stub_with_capture("");
         let opencode_reviewer = CodeReviewer::new(c1, "t".to_string())
             .with_provider(LlmProvider::OpenAiCompatible)
             .with_command("opencode".to_string());
-        let err = resolve_reviewer_strategy(&opencode_reviewer)
-            .err()
-            .expect("opencode has no registered strategy yet");
         assert!(
-            format!("{err:#}").contains("opencode"),
-            "error must name the CLI: {err:#}"
+            resolve_reviewer_strategy(&opencode_reviewer).is_ok(),
+            "openai_compatible reviewer resolves the opencode strategy (a60)"
         );
 
         let (c2, _) = stub_with_capture("");

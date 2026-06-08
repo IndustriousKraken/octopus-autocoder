@@ -47,6 +47,8 @@ The first non-empty line MUST be `VERDICT:` followed by exactly one of `Pass`, `
 - **Concerns** when issues warrant a discussion or follow-up but the diff is mergeable.
 - **Block** when at least one issue would cause real harm if merged: a security vulnerability, data-loss bug, or breakage of an existing invariant.
 
+**Security-critical findings are always `Block`.** Credential or secret leakage (a key, token, or secret written where it could be committed or otherwise exposed), hardcoded secrets, AND injection vulnerabilities (SQL, command, path) are stop-the-line. If you find one, the verdict MUST be `Block` — never `Concerns` or `Pass`. A credential leak rated `Concerns` rides through as advisory; that is a mis-classification. This rule applies only to security-critical findings; all other findings keep the verdict guidance above.
+
 If you see a `## Skipped (budget exhausted)` line under "Changed files" or a `(diff omitted: budget exhausted by change context and changed files)` line under "Diff", some context was dropped to fit the configured `reviewer.prompt_budget_chars` cap. Acknowledge the missing context in your first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
 
 # Structured revision-requests block (when you surfaced concerns)
@@ -60,6 +62,7 @@ Schema for each entry in the block:
 - `summary`: short text mirroring the bullet you wrote in the markdown sections above
 - `actionable_request`: text suitable for an implementer agent to act on, OR omit the field when no concrete fix applies
 - `should_request_revision`: `true` or `false`
+- `security_critical`: `true` or `false` (omit for `false`). Set `true` ONLY when this finding is a credential/secret/key exposure (a key, token, or secret written where it could be committed or otherwise exposed), a hardcoded secret, OR an injection vulnerability. The daemon treats this signal as the source of truth for security severity: any entry marked `security_critical: true` forces the verdict to `Block`, regardless of the `VERDICT:` line you wrote. Leave it `false` (or omit it) for every non-security finding.
 
 Rules:
 
@@ -70,9 +73,13 @@ Rules:
 - Style preferences, philosophical disagreements, and "consider whether..." suggestions stay `should_request_revision: false`. They are commentary, not revision requests.
 - When in doubt, prefer `false` — a false positive generates a wasted revision cycle and noisy PR comments; a false negative just leaves the concern as commentary for the human reviewer.
 
-Concrete example of the block you should produce when there are two concerns to report:
+Concrete example of the block you should produce when there are three concerns to report (note the credential-leak entry carries `security_critical: true`, which forces the verdict to `Block`):
 
 ```revision-requests
+- summary: "API key written to committable opencode.json"
+  actionable_request: "read the key from an env var at runtime instead of persisting it into opencode.json"
+  should_request_revision: true
+  security_critical: true
 - summary: "find_user drops the error context"
   actionable_request: "fix find_user to propagate the underlying error via anyhow::Context"
   should_request_revision: true

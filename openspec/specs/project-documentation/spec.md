@@ -1119,3 +1119,50 @@ A future change MAY add a per-repository tooling-config block that injects the e
 - **THEN** the command is reported as a finding: the prompt assumes a specific toolchain that does not apply to all managed repositories
 - **AND** the disposition is to replace it with language-neutral guidance, NOT to special-case the prompt per language
 
+### Requirement: Source files and functions stay within a size budget
+The project SHALL treat source-file AND function length as a maintainability budget, not merely a metric an audit happens to report. A source file SHOULD stay at or under a target of roughly **500 lines** AND a function at or under roughly **50 lines**. These are judgment targets, NOT hard caps: genuinely cohesive, single-responsibility code MAY exceed them when splitting would add indirection without reducing complexity — the test is cohesion, not the line count.
+
+Past the brightline thresholds (file `800`, function `200` — both operator-configurable), a file or function is treated as a **structural defect to be addressed**, with the concern escalating as it climbs further over: the architecture-brightline audit grades it `low` / `medium` / `high` at `1×` / `1.5×` / `2.5×` the threshold. Duplicated logic — near-identical function bodies, OR repeated signatures across files — is likewise a structural defect, because in an LLM-grown codebase the bloat is reachable (it passes a dead-code linter) and only a size/duplication signal catches it.
+
+These defects are surfaced **advisorily** — graded by the architecture-brightline audit, prioritized by the architecture-consultative audit (which reasons about cohesion, not raw lines), AND noted by code review when a pass enlarges an over-budget file or function. A size or duplication finding SHALL NOT, on its own, block a pull request or a change from archiving; it is a maintainability signal that informs prioritization, not a correctness gate.
+
+This requirement is the single source of the size budget that the `Architecture-brightline audit`, `Consultative audit prioritizes oversized, low-cohesion code`, AND `Reviewer flags files and functions that breach the size brightline` requirements enforce.
+
+#### Scenario: A file far past the threshold is a high-severity structural defect
+- **WHEN** a source file's length reaches or exceeds `2.5 ×` the file-line threshold
+- **THEN** the project treats it as a high-severity structural defect to be addressed
+- **AND** it is surfaced advisorily — `high` severity from the architecture-brightline audit, prioritized by the architecture-consultative audit, AND noted by code review when a pass enlarges it — without, on size alone, blocking a pull request or a change from archiving
+
+#### Scenario: A cohesive file may exceed the target by judgment
+- **WHEN** a file exceeds the ~500-line target but implements a single cohesive responsibility that splitting would only fragment into indirection
+- **THEN** exceeding the target is not, by itself, a structural defect
+- **AND** the architecture-consultative audit is directed to leave it unflagged (size without a cohesion problem)
+
+#### Scenario: Duplicated logic is a structural defect
+- **WHEN** two or more functions share a near-identical body, OR a signature is repeated across files
+- **THEN** the duplication is treated as a structural defect surfaced by the architecture-brightline audit (duplicate-body AND duplicate-signature metrics respectively)
+
+### Requirement: The orchestrator polling loop is decomposed by responsibility
+The polling-loop orchestration SHALL be organized as a directory module whose submodules each own a single responsibility — rather than a single flat file that mixes all of them. Distinct responsibilities such as alert/notification posting, queue walking, waiting-change handling, pre-flight checks, review-context assembly, pull-request construction, rebuild iteration, audit-triage handling, proposal handling, AND outcome handling SHALL each reside in their own submodule. No submodule SHALL exceed the file-size budget (per `Source files and functions stay within a size budget`), AND a function that exceeds the function-size budget SHALL be split along its internal phases rather than left as one oversized body. Unit tests SHALL reside in sibling test module(s), NOT in a `#[cfg(test)] mod tests` block inside the orchestration source.
+
+This requirement gives the project's largest historical bloat hotspot a durable structural contract: the architecture-brightline, drift, AND architecture-consultative audits verify it on every run, so the module cannot silently re-accrete into one file.
+
+#### Scenario: Orchestration responsibilities live in separate submodules
+- **WHEN** the polling-loop orchestration is evaluated
+- **THEN** each distinct responsibility (alert posting, queue walking, waiting-change handling, pre-flight checks, review-context assembly, PR construction, rebuild, audit-triage, proposals, outcome handling) resides in its own submodule rather than in a single flat file
+- **AND** no submodule exceeds the file-size budget
+
+#### Scenario: No orchestration function exceeds the function budget
+- **WHEN** a function in the polling-loop orchestration would exceed the function-size budget
+- **THEN** it is split along its internal phases into smaller functions
+- **AND** none of the resulting functions exceeds the function-size budget
+
+#### Scenario: Tests are not inline in the orchestration source
+- **WHEN** the polling-loop orchestration source is evaluated
+- **THEN** its unit tests reside in sibling test module(s), not in a `#[cfg(test)] mod tests` block inside the orchestration source
+
+#### Scenario: The relocated suite carries no wording-assertion tests
+- **WHEN** the polling-loop test suite is evaluated against the `Tests assert behavior or derivation, never message wording` requirement
+- **THEN** no test asserts a hand-authored substring of a shipped alert, notification, PR-body, OR marker message
+- **AND** message-content intent is carried by requirement prose (verified by the drift audit), not by unit-test substring checks
+

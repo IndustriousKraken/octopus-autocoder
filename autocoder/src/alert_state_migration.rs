@@ -347,7 +347,7 @@ mod tests {
     }
 
     fn fixture_repo(workspace: PathBuf, url: &str) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.into(),
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
@@ -359,6 +359,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 

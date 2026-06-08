@@ -150,6 +150,54 @@ pub trait Executor: Send + Sync {
             reason: "changelog stylist not supported by this executor backend".to_string(),
         })
     }
+
+    /// Issue-mode invocation for the issues lane (a009). The issues
+    /// walker has already rendered the issue-flavored implementer prompt
+    /// (fix-to-EXISTING-spec framing, NOT the change implementer prompt)
+    /// AND passes it here verbatim. The backend runs the wrapped CLI with
+    /// the MCP outcome tools wired (so the agent can call
+    /// `outcome_success` / `outcome_spec_needs_revision`), keyed by the
+    /// issue slug for run-log + outcome-store purposes. Acceptance is
+    /// against the EXISTING canon — there is no spec delta to apply.
+    ///
+    /// Default impl returns `Failed { reason: "issue mode not supported"
+    /// }` so a backend that hasn't been taught about the issues lane
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue mode not supported by this executor backend".to_string(),
+        })
+    }
+
+    /// Read-only triage of a reported GitHub issue for the a010 hybrid
+    /// issues-lane ingestion. The ingestion layer has already rendered the
+    /// `prompts/issue-report-triage.md` template (reported body embedded as
+    /// untrusted DATA) AND passes it here verbatim. The backend runs the
+    /// wrapped CLI read-only AND returns the agent's final answer (expected
+    /// to carry a `CLASSIFICATION:` verdict block, parsed by the ingestion
+    /// layer). The agent writes nothing — classification is advice, not an
+    /// action.
+    ///
+    /// Default impl returns `Failed { reason: "issue-triage mode not
+    /// supported" }` so a backend that hasn't been taught about ingestion
+    /// degrades to a polite refusal instead of a panic.
+    async fn run_issue_triage(
+        &self,
+        workspace: &Path,
+        ctx: &IssueReportTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "issue-triage mode not supported by this executor backend".to_string(),
+        })
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -178,8 +226,11 @@ pub struct TriageContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogContext {
     /// JSON payload produced by the deterministic `autocoder changelog`
-    /// extractor (the `--format json` shape). The stylist gets this as
-    /// its primary input.
+    /// extractor, wrapped in a `{ "sections": [ … ] }` envelope (a72):
+    /// one section per `--format json` shape. A flagless gap-fill run
+    /// carries one section per undocumented stable release tag,
+    /// oldest-first; an explicit `--since`/`--to` run carries a single
+    /// section. The stylist gets this as its primary input.
     pub changelog_json: String,
     /// Repository URL the changelog targets (for the prompt's context
     /// banner line).
@@ -215,6 +266,31 @@ pub struct BrownfieldDraftContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoutContext {
     /// Fully rendered prompt: template + interpolated context.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue` (a009). The issues walker
+/// renders the issue-flavored implementer prompt (template + the issue's
+/// `issue.md` + `tasks.md` body) AND passes the result here. The slug
+/// keys the per-run log + the MCP outcome store (so the agent's
+/// `outcome_*` tool calls are consumed for this issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueContext {
+    /// The issue's directory slug under `openspec/issues/`.
+    pub slug: String,
+    /// Fully rendered issue-flavored prompt: template + issue body.
+    pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_issue_triage` (a010). The hybrid
+/// ingestion layer renders the `prompts/issue-report-triage.md` template
+/// (with the reported body embedded as untrusted DATA via single-pass
+/// substitution) AND passes the result here. The executor runs it
+/// read-only AND returns the agent's final answer; the ingestion layer
+/// parses the `CLASSIFICATION:` verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueReportTriageContext {
+    /// Fully rendered triage prompt: template + interpolated context.
     pub rendered_prompt: String,
 }
 
@@ -258,6 +334,18 @@ pub enum ExecutorOutcome {
     /// Unrecoverable failure. autocoder unlocks the change and does
     /// NOT archive it.
     Failed { reason: String },
+    /// a74: the agentic run could not START because a required precondition
+    /// was unmet — the agent subprocess never spawned. The motivating case is
+    /// the a006 OS-sandbox-mechanism gate refusing to spawn when no usable
+    /// mechanism is available AND the operator has not opted into unsandboxed
+    /// operation. DISTINCT from `Failed` (where the subprocess ran and THEN
+    /// the task failed): no revision/implementation work was attempted. The
+    /// distinction is carried by THIS variant (the outcome kind), NOT a
+    /// message substring, so callers branch reliably. The revise dispatcher
+    /// posts a guiding failure reply AND consumes the trigger (manual
+    /// re-trigger — an unmet precondition will not heal between polls) but does
+    /// NOT charge a revision slot.
+    PreconditionUnmet { reason: String },
     /// The agent inspected `tasks.md` and identified one or more tasks
     /// that require capabilities outside its sandbox. autocoder writes
     /// a `.needs-spec-revision.json` marker, posts a chatops alert under

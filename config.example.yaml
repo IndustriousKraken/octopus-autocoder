@@ -36,6 +36,20 @@ repositories:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
     #   architecture_brightline: weekly
+    #
+    # a006 per-repo OS-sandbox credential toggles (override executor.sandbox;
+    # both default ON). A repo that develops CLI wrappers needs `os_hide` off
+    # so a nested CLI can authenticate live — loosening is logged at startup.
+    # a013: per-repo mask-list edits + strict mode (additive to the global
+    # executor.sandbox values). `mask_add`/`mask_remove` edit the executor's
+    # filesystem mask-list; `strict_mode` opts this repo's executor into the
+    # masked-home allowlist. Removing a default mask entry is logged at startup.
+    # sandbox:
+    #   os_hide: false
+    #   engine_deny: true
+    #   mask_add: ["~/.config/myservice"]
+    #   mask_remove: ["~/.ssh"]   # e.g. to develop an SSH tool (logged)
+    #   strict_mode: false
 
     # ----------------------------------------------------------------
     # OSS-fork support (a26). See `docs/OPERATIONS.md`'s
@@ -103,6 +117,73 @@ executor:
   #   disallowed_read_paths:
   #     - "/home/*/.ssh/**"
   #     - "/home/*/.claude/**"
+  #
+  #   # --- a006 OS-level sandbox credential protection ---
+  #   # Every agentic subprocess is wrapped in a kernel-enforced sandbox
+  #   # (systemd-run service mode, or bwrap on non-systemd/unprivileged
+  #   # hosts). Two credential-protection layers, each a toggle, BOTH default
+  #   # ON. Per-repository values (repositories[].sandbox) override these.
+  #   #
+  #   # os_hide: filesystem allowlist — every CLI store OTHER than the running
+  #   #   role's own is absent from the subprocess namespace (fail-closed). A
+  #   #   repository that DEVELOPS CLI wrappers and needs a nested CLI to
+  #   #   authenticate live must set this OFF (the `os_hide off / engine_deny
+  #   #   on` preset); see docs/CONFIG.md.
+  #   os_hide: true
+  #   # engine_deny: extend the per-invocation tool-use denylist so the agent's
+  #   #   Read/Bash tools are denied EVERY registered CLI store (self included).
+  #   engine_deny: true
+  #   # allow_unsandboxed: when NO platform-appropriate sandbox mechanism
+  #   #   (Linux: systemd-run / bwrap; macOS: sandbox-exec) is available, agentic
+  #   #   runs FAIL CLOSED unless this opt-in is true (a loud startup WARN is
+  #   #   emitted when it is). Daemon-wide; NOT recommended.
+  #   allow_unsandboxed: false
+  #
+  #   # --- a013 executor filesystem policy: denylist + strict mode ---
+  #   # The executor runs under an EXPOSED-HOME DENYLIST: $HOME is present and
+  #   # writable (so build toolchains under ~/.cargo, ~/.nvm, ~/.pyenv, … just
+  #   # work) EXCEPT a default mask-list of sensitive paths (credentials AND
+  #   # shell-init/persistence files) which are masked. Read-only roles (audits,
+  #   # reviewer) always use the masked-home ALLOWLIST. Edit the mask-list:
+  #   #
+  #   # mask_add: extra paths to mask (~/ and $HOME/ expand to the home dir).
+  #   mask_add:
+  #     - "~/.config/myservice"
+  #   # mask_remove: default entries to EXPOSE — e.g. ~/.ssh to develop an SSH
+  #   #   tool. Removing a default is logged at startup as a relaxed posture
+  #   #   (egress is unrestricted).
+  #   mask_remove:
+  #     - "~/.ssh"
+  #   # strict_mode: run the EXECUTOR under the read-only-role allowlist (mask
+  #   #   ALL of home; bind only the workspace, the role's own store, the
+  #   #   resolved CLI binary + toolchain, and the minimal runtime) for
+  #   #   high-compliance hosts. Defaults OFF; read-only roles always allowlist.
+  #   strict_mode: false
+
+  # --- a014 agent toolchain environment ---
+  # The daemon captures the operator's ACTIVATED login-shell environment
+  # (`bash -lic env`) at startup and injects it — credential-filtered — into
+  # every agentic subprocess, so toolchains activated by shell init
+  # (pyenv/rbenv/poetry/nvm: the shims on PATH, PYENV_ROOT/NVM_DIR, the
+  # virtualenv) are USABLE, not merely present on disk under a013's exposed
+  # home. A run-set variable (the sandbox/strategy env, e.g. ANTHROPIC_BASE_URL)
+  # always wins over a captured one; a failed/partial capture degrades to the
+  # base environment (it never aborts a run).
+  #
+  # agent_env:
+  #   # capture: master switch (default ON). false → base environment only.
+  #   capture: true
+  #   # exclude_add: extra credential patterns withheld from the captured env,
+  #   #   on top of the defaults (TOKEN/SECRET/KEY/PASSWORD substrings,
+  #   #   AWS_/ANTHROPIC_ prefixes). An entry ending in `_` is a name prefix.
+  #   exclude_add: ["GCP_", "COMPANYAUTH"]
+  #   # exclude_remove: default patterns to drop so a matching name can pass —
+  #   #   e.g. KEY to admit a *_KEY toolchain variable (a relaxed posture).
+  #   exclude_remove: ["KEY"]
+  #   # expected_toolchains: the set `autocoder doctor` runs `<tool> --version`
+  #   #   against IN THE AGENT ENVIRONMENT, reporting any present-on-disk but
+  #   #   not-runnable (the activation gap). Unset → python3, node, ruby, go.
+  #   expected_toolchains: ["python3", "node", "ruby", "go"]
 
   # Path to a file overriding the built-in implementer prompt template.
   # The template must contain the literal `{{change_body}}` placeholder
@@ -276,6 +357,61 @@ executor:
   #   #                                 # (`/v1/messages` for anthropic,
   #   #                                 # `/chat/completions` for openai_compatible,
   #   #                                 # `/api/chat` for ollama).
+  #
+  # --- The [canon] gate: change-vs-canonical contradiction pre-flight ---
+  #
+  # The sibling of the check above (the [in] gate). Where the [in] gate
+  # catches a change that contradicts ITSELF, the [canon] gate catches a
+  # change that contradicts an ALREADY-canonical requirement (a delta that
+  # re-specifies a behavior the project has locked elsewhere). Same
+  # lifecycle position (pre-executor), same opt-in + fail-open posture.
+  # Reads the change's spec-deltas AND `openspec/specs/*/spec.md` (and uses
+  # `query_canonical_specs` when canonical_rag is enabled).
+  #
+  # Disabled by default. To enable, set the mode below AND configure the
+  # LLM block. Enabling without configuring the LLM block is a fail-fast
+  # startup error.
+  # change_canonical_contradiction_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the prompt
+  # compiled into the binary from `prompts/change-vs-canonical-check.md` is
+  # used. An empty override file is rejected at use time.
+  # change_canonical_contradiction_check_prompt_path: /etc/autocoder/prompts/change-vs-canonical-check.md
+  #
+  # Required when the check is enabled. Same surface as the [in] gate's LLM
+  # block (provider | model | api_key_env | api_key | api_base_url).
+  # change_canonical_contradiction_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
+  #                                     # FORBIDDEN for ollama (rejected at config-load).
+  #
+  # Code-implements-spec verification — the `[out]` gate of the verifier
+  # framework (a63). Runs AFTER the executor implements a change, in a
+  # read-only sandbox, AND judges — requirement by requirement, scenario by
+  # scenario — whether the implementation satisfies the change's spec delta.
+  # ADVISORY: it renders a `## Spec Verification` section into the PR body
+  # (parallel to the reviewer's `## Code Review` block) AND posts a chatops
+  # note ONLY when gaps are found. It NEVER opens a revision AND NEVER blocks
+  # PR creation — the operator reads the verification and decides.
+  #
+  # Disabled by default. To enable, set the mode below AND configure the
+  # LLM block. Enabling without configuring the LLM block is a fail-fast
+  # startup error.
+  # code_implements_spec_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the prompt
+  # compiled into the binary from `prompts/code-implements-spec-check.md` is
+  # used. An empty override file is rejected at use time.
+  # code_implements_spec_check_prompt_path: /etc/autocoder/prompts/code-implements-spec-check.md
+  #
+  # Required when the check is enabled. Same surface as the pre-executor
+  # gates' LLM block (provider | model | api_key_env | api_key | api_base_url).
+  # code_implements_spec_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
+  #                                     # FORBIDDEN for ollama (rejected at config-load).
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
@@ -422,17 +558,39 @@ github:
 #   #   prompt_budget_chars: 300000
 #   #   mode: per_change
 #   #
-#   # Reviewer-initiated revisions on actionable concerns. When `true`,
-#   # every concern the reviewer marked `should_request_revision: true`
-#   # (with a non-empty `actionable_request`) posts a
-#   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
-#   # picks up on the next polling iteration — REGARDLESS of the verdict
-#   # (`Pass`, `Concerns`, OR `Block`). Defaults to `false`. Requires
-#   # `executor.max_auto_revisions_per_pr > 0` (the dispatcher); operator-
-#   # customized reviewer templates must be updated to emit the new
-#   # per-concern fields. See README's "Reviewer-initiated revisions" section.
-#   # The legacy key `auto_revise_on_block` is still accepted as an alias.
-#   # auto_revise: false
+#   # Reviewer transport. `agentic` (the default since a64) runs the
+#   # reviewer as a read-only CLI-wrapped session (via the `command`
+#   # CLI below) that reads files on demand and returns its verdict
+#   # through the `submit_review` MCP tool — no 2M-char prompt-budget
+#   # truncation, schema-validated verdict, discard-and-alert instead of
+#   # default-approve. `oneshot` is the legacy single-shot HTTP path that
+#   # pre-dumps every touched file into one prompt. When the effective
+#   # kind is `agentic` but the resolved reviewer CLI (`command`, resolved
+#   # per provider: anthropic → `claude`, others → `opencode`) is not
+#   # installed on the daemon host, the reviewer logs one startup WARN and
+#   # degrades to the `oneshot` HTTP path for that boot — review is never
+#   # disabled. Set `kind: oneshot` to opt out of agentic and silence the
+#   # warning. Re-evaluated on restart / `autocoder reload`.
+#   # kind: agentic
+#   # command: claude        # the agentic CLI binary; default `claude`
+#   #
+#   # Reviewer-initiated revisions on actionable concerns. Tri-state:
+#   #   block      (default) fire only when the verdict is `Block`
+#   #              (security-critical findings escalate to `Block`, so they
+#   #              auto-fix; non-`Block` `Concerns` stay advisory).
+#   #   actionable fire on any actionable concern regardless of verdict.
+#   #   off        never fire.
+#   # When it fires, ALL of a review's concerns marked
+#   # `should_request_revision: true` (with a non-empty `actionable_request`)
+#   # are AGGREGATED into ONE `<!-- reviewer-revision -->` PR comment that
+#   # the dispatcher picks up as a SINGLE revision run on the next polling
+#   # iteration — one `executor.max_auto_revisions_per_pr` slot per review,
+#   # not per concern. Requires `executor.max_auto_revisions_per_pr > 0`;
+#   # operator-customized reviewer templates must emit the per-concern
+#   # `revision-requests` fields. The legacy boolean is mapped
+#   # (`true` -> `actionable`, `false` -> `off`) and the legacy key
+#   # `auto_revise_on_block` is still accepted as an alias.
+#   # auto_revise: block
 #   #
 #   # Maximum size (in chars) of the rendered reviewer prompt body —
 #   # change context + changed files + diff combined. Default 2000000
@@ -576,13 +734,15 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Six audits ship today:
+# daemon between regular polling iterations. Eight audits ship today:
 #   - architecture_brightline    — flags files exceeding a line-count threshold
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
 #   - security_bug_audit         — LLM scan for security smells
 #   - architecture_consultative  — LLM architectural-health review
 #   - documentation_audit        — LLM docs coverage / stale-reference / organization check
+#   - canon_contradiction_audit  — LLM scan for two canonical requirements that cannot both hold
+#   - canon_consolidation_audit  — LLM scan for redundant canonical requirements; drafts a consolidate- change
 #
 # Cadence vocabulary (per audit; default `disabled`):
 #   disabled | daily | every-N-days | weekly | monthly | quarterly
@@ -601,6 +761,8 @@ github:
 #     security_bug_audit: weekly
 #     architecture_consultative: quarterly
 #     documentation_audit: monthly
+#     canon_contradiction_audit: monthly   # whole-canon scope → heavy default
+#     canon_consolidation_audit: monthly   # rewrites canon → heavy default
 #
 #   # Per-audit knobs. `prompt_path` overrides the audit's embedded LLM
 #   # prompt template. `notify_on_clean` toggles a brief "no findings"
@@ -637,6 +799,18 @@ github:
 #       extra:
 #         readme_max_lines: 200             # threshold for "README too long" finding
 #         page_max_lines_without_toc: 500   # threshold for "missing TOC" finding
+#     canon_contradiction_audit:
+#       # prompt_path: /etc/autocoder/prompts/canon-contradiction-audit.md
+#       notify_on_clean: false
+#       extra:
+#         retrieval_breadth: 8        # nearest requirements retrieved per requirement (RAG on)
+#         max_findings_per_run: 20    # cap on findings surfaced per run (overflow surfaces later)
+#     canon_consolidation_audit:
+#       # prompt_path: /etc/autocoder/prompts/canon-consolidation-audit.md
+#       notify_on_clean: false
+#       extra:
+#         retrieval_breadth: 8        # nearest requirements retrieved per requirement (RAG on)
+#         max_proposals_per_run: 1    # cap on consolidate- changes drafted per run (dense to review)
 #
 #   # Number of retry attempts after an LLM-driven audit's generated
 #   # proposal fails `openspec validate --strict`. Each retry re-invokes
@@ -680,6 +854,27 @@ github:
 #   cache_dir: /var/cache/autocoder
 #   logs_dir: /var/log/autocoder
 #   runtime_dir: /run/autocoder
+
+# Workspace-cache bounding (a65). Optional top-level block. Per-repo
+# workspaces under `<cache>/workspaces/<key>` accumulate a build-artifact
+# tree (a Rust repo's multi-GB `target/debug`, a Node repo's
+# `node_modules/`, …) with no bound. Left unset, the cache is UNBOUNDED
+# (today's behaviour) and a daemon running several repos long enough can
+# fill its disk — the daemon logs a one-time startup notice in this case.
+#
+# When `workspaces_max_gb` is set, at each repo's iteration start the
+# daemon measures the total `<cache>/workspaces/` size; if it exceeds the
+# cap, it evicts whole least-recently-used IDLE workspaces (oldest
+# last-used first) until under the cap. Eviction is language-agnostic
+# (it removes entire clones, not just `target/`/`node_modules/`) AND
+# lossless: an evicted repo re-clones on its next iteration, and per-PR
+# revision + audit state live under `<state>/`, not the workspace. The
+# repo currently iterating AND any workspace holding a busy marker are
+# never evicted. A value of `0` is rejected — omit the field for an
+# unbounded cache.
+#
+# cache:
+#   workspaces_max_gb: 50
 
 # Per-workspace feature flags (a23 + future). Each sub-block is opt-in;
 # absent sub-blocks take their type-default behaviour. Omit the entire
@@ -739,6 +934,38 @@ github:
 #     # Cap on the survey's returned proposed-capability list. Valid
 #     # range 1..=50. Default: 20.
 #     # max_capabilities: 20
+#
+#   issues:
+#     # The issues lane (a009/a010). UNLIKE the chatops-verb features above —
+#     # which are inert until explicitly invoked — enabling this changes the
+#     # daemon's behavior autonomously, so it is OFF by default and opt-in.
+#     #
+#     # When `true`, two things turn on:
+#     #   1. Lane processing. Per-iteration unit selection becomes
+#     #      `issues > changes > audits`: any ready `openspec/issues/<slug>/`
+#     #      directory is worked into a fix PR before the changes queue. With no
+#     #      issues present this is a no-op. The CURATED entry is a maintainer
+#     #      committing `openspec/issues/<slug>/` directly.
+#     #   2. Public ingestion (only when `features.scout.include_issues` is also
+#     #      true — the default). Each pass the bot reads open GitHub issues
+#     #      read-only via `gh api`, runs each through an LLM triage (the body is
+#     #      UNTRUSTED public input, carried as data, never as an instruction),
+#     #      dedups against open + archived issues, and posts a CANDIDATE to
+#     #      chatops. It queues NOTHING — a maintainer reply of `send it` in the
+#     #      candidate's thread is the promotion gate that writes
+#     #      `openspec/issues/<slug>/` and authorizes the work. Issue ASSIGNEE
+#     #      is not consulted; assigning an issue to the bot does nothing.
+#     #
+#     # `features.*` is not hot-reloadable: enabling this needs a daemon
+#     # restart, not `autocoder reload`. Ingestion also needs `gh` authenticated
+#     # on the host; on a failed read a WARN logs and the pass proceeds.
+#     # Default: false.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom issue-flavored implementer prompt
+#     # template. Resolved via the uniform Prompt overrides table.
+#     # Default: null (use the embedded `prompts/implementer-issue.md`).
+#     # prompt_path: ./prompts/implementer-issue-custom.md
 
 
 # Canonical-spec RAG (a21). Optional top-level block. When absent OR

@@ -661,7 +661,10 @@ async fn drive_one_audit(
     Ok(true)
 }
 
-struct PolicyViolation {
+/// `pub(crate)` so the `pub(crate)` [`detect_write_policy_violation`] does not
+/// expose a more-private return type (a69 also reuses the detector from the
+/// agentic-run tests to assert the read-only write backstop applies to `agy`).
+pub(crate) struct PolicyViolation {
     reason: String,
 }
 
@@ -984,7 +987,7 @@ mod tests {
     }
 
     fn fixture_repo() -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -996,6 +999,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -1380,6 +1384,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let post_mock = server
@@ -1613,6 +1618,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let repo = fixture_repo();
@@ -1825,6 +1831,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: true,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
 

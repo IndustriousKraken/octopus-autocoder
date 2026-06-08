@@ -23,6 +23,7 @@
 //! found"). The daemon never gates iteration progress on the check.
 
 use crate::agentic_run::ResolvedModel;
+use crate::verifier_gate::VerifierGate;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -273,7 +274,9 @@ impl ContradictionSessionRunner for CliContradictionSessionRunner<'_> {
         )
         .context("writing contradiction-check MCP config")?;
 
-        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        // a70: a single-shot role — prune the session it creates on completion.
+        let result = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
             workspace: self.workspace,
             change: CONTRADICTION_CHECK_ROLE,
             strategy: self.strategy,
@@ -294,7 +297,16 @@ impl ContradictionSessionRunner for CliContradictionSessionRunner<'_> {
             resume_session_id: None,
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
-        })
+            // a006: read-only contradiction-check role — read-only workspace;
+            // self-store from the resolved model's provider (task 2.5).
+            os_sandbox: crate::sandbox::current_run_sandbox(
+                crate::config::default_cli_for(self.model.provider),
+                false,
+            ),
+            },
+            true,
+            None,
+        )
         .await;
 
         // Always remove the config we wrote, regardless of run outcome.
@@ -379,9 +391,10 @@ pub async fn run_agentic_contradiction_check(
     ) {
         Ok(s) => s,
         Err(e) => {
+            let label = VerifierGate::In.label();
             tracing::warn!(
                 change = %change_slug,
-                "change-contradiction-check CLI strategy unavailable; treating as no contradictions found (fail-open): {e:#}"
+                "{label} change-contradiction-check CLI strategy unavailable; treating as no contradictions found (fail-open): {e:#}"
             );
             return Vec::new();
         }
@@ -407,11 +420,14 @@ async fn run_agentic_contradiction_check_with_runner(
     runner: &dyn ContradictionSessionRunner,
 ) -> Vec<ContradictionFinding> {
     let prompt = build_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
+    // a61: every fail-open diagnostic this gate emits carries the `[in]`
+    // verifier-gate label so the finding is attributable to the gate.
+    let label = VerifierGate::In.label();
     match runner.run_session(&prompt).await {
         Err(e) => {
             tracing::warn!(
                 change = %change_slug,
-                "change-contradiction-check session failed; treating as no contradictions found (fail-open): {e:#}"
+                "{label} change-contradiction-check session failed; treating as no contradictions found (fail-open): {e:#}"
             );
             Vec::new()
         }
@@ -419,7 +435,7 @@ async fn run_agentic_contradiction_check_with_runner(
             None => {
                 tracing::warn!(
                     change = %change_slug,
-                    "change-contradiction-check session ended with no submit_contradictions submission; treating as no contradictions found (fail-open). Session output excerpt: {}",
+                    "{label} change-contradiction-check session ended with no submit_contradictions submission; treating as no contradictions found (fail-open). Session output excerpt: {}",
                     outcome.stdout_excerpt
                 );
                 Vec::new()
@@ -433,7 +449,7 @@ async fn run_agentic_contradiction_check_with_runner(
                     // proceed rather than propagate.
                     tracing::warn!(
                         change = %change_slug,
-                        "change-contradiction-check submission failed re-validation; treating as no contradictions found (fail-open): {e}"
+                        "{label} change-contradiction-check submission failed re-validation; treating as no contradictions found (fail-open): {e}"
                     );
                     Vec::new()
                 }
@@ -667,6 +683,28 @@ mod tests {
         let out =
             run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
         assert!(out.is_empty(), "no submission must fail open: {out:?}");
+    }
+
+    /// a61 (task 4.1): the `[in]` gate runs the a59 contradiction check
+    /// UNCHANGED in what it decides (a no-submission session still fails open
+    /// to an empty `Vec`), AND its emitted diagnostics carry the
+    /// `[verifier:in]` gate identifier so the finding is attributable to the
+    /// gate that produced it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn fail_open_diagnostics_carry_the_in_gate_label() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        // A session that records no submission takes the fail-open WARN path.
+        let runner = CannedContradictionRunner { submission: None };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(out.is_empty(), "decision unchanged: fail-open yields no findings");
+        assert!(
+            logs_contain("[verifier:in]"),
+            "the fail-open WARN must carry the [verifier:in] gate identifier"
+        );
     }
 
     /// A session error (spawn/timeout/strategy) fails open (empty Vec).

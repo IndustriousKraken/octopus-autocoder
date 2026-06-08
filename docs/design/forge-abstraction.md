@@ -6,7 +6,7 @@
 
 A user already runs autocoder against a private GitLab instance, and self-hosted GitLab is concentrated where it matters for this tool: security/pentest shops whose tooling gets flagged by GitHub scanners, air-gapped or compliance-controlled infra, and operators who keep their own code on their own servers. The core loop already works there *by accident* — the git half (clone / fetch / branch / commit / push) uses the raw URL and the `origin` remote, so it is host-neutral. What does NOT work is everything routed through `github.rs`: `parse_repo_url` literally rejects non-GitHub URLs (test `parse_url_rejects_non_github`), and the REST calls are GitHub-shaped (`/repos/{owner}/{repo}/pulls`). So a GitLab user today gets autonomous implementation + a pushed agent branch (especially under `auto_submit_pr: false`), and opens the MR by hand.
 
-Making the forge swappable turns that into first-class support — and is the same trait-with-providers shape already used for `CliStrategy` (claude / opencode / gemini).
+Making the forge swappable turns that into first-class support — and is the same trait-with-providers shape already used for `CliStrategy` (claude / opencode / antigravity).
 
 ## The abstraction
 
@@ -60,9 +60,9 @@ The surface is broad, so phase it rather than boil the ocean:
 - **Issues-fix lane:** the issues ingestion (hybrid triage of public issues) reads the forge's issues API — Phase 3 gives it a GitLab implementation through the same trait.
 - **`CliStrategy` parallel:** same trait-with-providers pattern already in use; the forge is the second axis of swappability (which CLI drives the agent × which forge hosts the code).
 
-## Open decisions (settle before Phase 2)
+## Decisions (settled for Phase 2)
 
-- **Authorize mapping:** which GitLab access levels count as authorized for the a000 gate — Owner + Maintainer only, or also Developer?
-- **v1 scope:** Phase 1 + 2 (the daily loop); defer fork mode and issues to Phase 3.
-- **Config shape:** a per-repo `forge:` block (kind / host / api_base / token route) vs. inferring everything from the URL host plus the existing token routing. Lean: infer kind+host from the URL, carry only api_base/token-route in config when non-default.
-- **Draft/label semantics on GitLab:** GitLab uses "Draft:" MR title prefix / WIP rather than a draft flag — map `set_pr_draft` onto that.
+- **Authorize mapping — Developer and above.** GitLab member access level Developer / Maintainer / Owner is authorized; Reporter and Guest are not. This mirrors the GitHub `author_association` gate (OWNER / MEMBER / COLLABORATOR all have push access ≈ GitLab Developer+).
+- **v1 scope — Phase 1 (`a007`) + Phase 2 (`a008`, the daily loop).** Fork mode and issues ingestion are deferred to Phase 3.
+- **Config shape — an explicit `forge:` block** (`kind` / `host` / `api_base` / token route). When present it is authoritative for provider selection; absent, the provider defaults to GitHub against `github.com` (existing configs unchanged). GitLab is selected ONLY via an explicit `forge: { kind: gitlab }` — there is no host-sniffing fallback to GitLab. `api_base` additionally enables GitHub Enterprise (`kind: github`, self-hosted host/api_base). (Chosen over the earlier infer-from-URL lean, for explicitness over host-inference magic.)
+- **Draft semantics — Draft: title prefix.** `set_pr_draft` maps onto GitLab's `Draft:` MR title prefix rather than a draft flag.

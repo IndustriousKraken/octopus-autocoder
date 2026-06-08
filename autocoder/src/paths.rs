@@ -135,6 +135,14 @@ impl DaemonPaths {
         self.state.join("revisions")
     }
 
+    /// `<state>/issues-state/` — the issues lane's per-unit failure
+    /// counters, keyed by workspace basename then issue slug (a009).
+    /// Disjoint from [`Self::failure_state_dir`] (the changes lane's
+    /// counters) so each walker reads + writes only its own lane's state.
+    pub fn issues_state_dir(&self) -> PathBuf {
+        self.state.join("issues-state")
+    }
+
     /// `<state>/audit-state/` — per-audit-type cadence + last-run state.
     #[allow(dead_code)]
     pub fn audit_state_dir(&self) -> PathBuf {
@@ -153,6 +161,18 @@ impl DaemonPaths {
     /// state file for the named workspace.
     pub fn alert_state_path(&self, workspace_basename: &str) -> PathBuf {
         self.alert_state_dir().join(format!("{workspace_basename}.json"))
+    }
+
+    /// `<state>/canon-contradiction-state/` — per-workspace re-report
+    /// suppression state for the canon-internal contradiction audit (a75).
+    /// One file per workspace, named `<workspace-basename>.json` (the audit
+    /// joins the basename). Lives under `<state>/` (NOT inside the
+    /// workspace) so the suppression bookkeeping never appears in the
+    /// managed repo's working tree, per the "Workspaces, markers, and state
+    /// move to standard locations" requirement — it is daemon bookkeeping,
+    /// not an in-tree marker file.
+    pub fn canon_contradiction_state_dir(&self) -> PathBuf {
+        self.state.join("canon-contradiction-state")
     }
 
     /// `<logs>/runs/<basename>/` — per-change run logs for the named
@@ -206,6 +226,42 @@ impl DaemonPaths {
     /// URL-sanitized basename.
     pub fn workspaces_dir(&self) -> PathBuf {
         self.cache.join("workspaces")
+    }
+
+    /// `<state>/workspace-last-used/` — per-workspace last-used timestamp
+    /// markers keyed by workspace basename. Maintained by the
+    /// workspace-cache LRU eviction (a65) to order eviction candidates
+    /// oldest-first. Lives under `<state>/` (NOT inside the workspace) so
+    /// the timestamp is independent of the `remove_dir_all` eviction of
+    /// the workspace itself AND never appears in the managed repo's
+    /// working tree.
+    pub fn workspace_last_used_dir(&self) -> PathBuf {
+        self.state.join("workspace-last-used")
+    }
+
+    /// `<state>/workspace-last-used/<workspace_basename>` — the last-used
+    /// timestamp marker for the named workspace.
+    pub fn workspace_last_used_path(&self, workspace_basename: &str) -> PathBuf {
+        self.workspace_last_used_dir().join(workspace_basename)
+    }
+
+    /// `<state>/workspace-sizes/` — per-workspace cached measured size (in
+    /// bytes) keyed by workspace basename. Maintained by the workspace-cache
+    /// LRU eviction (a65) so the cap-enforcement pass does NOT recursively
+    /// re-walk every idle workspace on every poll tick: an idle workspace's
+    /// size cannot change (nothing writes to it between the iterations that
+    /// use it), so its last measured size is reused from this cache. Lives
+    /// under `<state>/` (NOT inside the workspace) for the same reasons as
+    /// the last-used markers — independent of the workspace's eviction AND
+    /// never visible in the managed repo's working tree.
+    pub fn workspace_sizes_dir(&self) -> PathBuf {
+        self.state.join("workspace-sizes")
+    }
+
+    /// `<state>/workspace-sizes/<workspace_basename>` — the cached measured
+    /// size (decimal bytes) for the named workspace.
+    pub fn workspace_size_path(&self, workspace_basename: &str) -> PathBuf {
+        self.workspace_sizes_dir().join(workspace_basename)
     }
 
     /// `<runtime>/control.sock` — the daemon's control socket.
@@ -368,16 +424,32 @@ fn xdg_logs_default() -> Option<PathBuf> {
 }
 
 fn xdg_runtime_default() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR")
-        && !v.is_empty()
-    {
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").ok().filter(|v| !v.is_empty());
+    runtime_default_from(xdg_runtime, xdg_state_default())
+}
+
+/// Pure core of [`xdg_runtime_default`]: `$XDG_RUNTIME_DIR/autocoder` when the
+/// var is set; otherwise a `runtime/` subdir of the XDG state default.
+///
+/// NEVER `/tmp`. The control socket and transient locks live here; a `/tmp`
+/// runtime is wrong on two counts — `tmpreaper` / `systemd-tmpfiles` can delete
+/// the *live* control socket out from under the daemon, and the OS sandbox's
+/// private `/tmp` (`PrivateTmp=yes` / `--tmpfs /tmp`) hides it from the per-
+/// execution MCP relay (the timeout class of bug). The path-resolution spec's
+/// precedence never sanctions `/tmp` for runtime — its fallback is a standard
+/// location. Server installs still resolve `/run/autocoder` via the systemd
+/// unit's `$RUNTIME_DIRECTORY` (a higher-precedence resolver step); this branch
+/// only governs the no-`$XDG_RUNTIME_DIR`, no-systemd case, where a user-
+/// writable state-dir location is correct (the daemon clears stale locks at
+/// startup). Pure so it is testable without mutating the process environment.
+fn runtime_default_from(
+    xdg_runtime_dir: Option<String>,
+    state_default: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(v) = xdg_runtime_dir {
         return Some(PathBuf::from(v).join("autocoder"));
     }
-    // Per XDG: when $XDG_RUNTIME_DIR is unset, fall back to a per-UID
-    // directory under the system temp. This keeps dev mode functional
-    // on hosts that don't run user-level systemd.
-    let uid = unsafe { libc::getuid() };
-    Some(std::env::temp_dir().join(format!("{uid}-runtime")).join("autocoder"))
+    state_default.map(|s| s.join("runtime"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -432,6 +504,27 @@ mod tests {
     };
     use std::sync::Mutex;
 
+    /// Regression: the runtime fallback NEVER resolves under `/tmp`. With
+    /// `$XDG_RUNTIME_DIR` set it uses it; without, it falls back under the XDG
+    /// state dir — not `/tmp` (where tmpreaper can delete the live control
+    /// socket and the OS sandbox's private `/tmp` hides it from the relay).
+    #[test]
+    fn runtime_default_never_falls_back_to_tmp() {
+        // $XDG_RUNTIME_DIR present → used verbatim (+ /autocoder).
+        assert_eq!(
+            runtime_default_from(Some("/run/user/1000".to_string()), None),
+            Some(PathBuf::from("/run/user/1000/autocoder"))
+        );
+        // Absent → under the state dir, NOT /tmp.
+        let got = runtime_default_from(None, Some(PathBuf::from("/home/u/.local/state/autocoder")))
+            .expect("state default present");
+        assert_eq!(got, PathBuf::from("/home/u/.local/state/autocoder/runtime"));
+        assert!(
+            !got.starts_with("/tmp"),
+            "runtime must never fall back under /tmp: {got:?}"
+        );
+    }
+
     /// Env-var mutation is global; serialize the env-var-touching tests
     /// so concurrent runs do not race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -442,9 +535,11 @@ mod tests {
             repositories: vec![],
             executor: ExecutorConfig {
                 kind: ExecutorKind::ClaudeCli,
+                implementer_cli: None,
                 command: "claude".into(),
                 timeout_secs: 60,
                 sandbox: None,
+                agent_env: None,
                 implementer_prompt_path: None,
                 changelog_stylist_prompt_path: None,
                 perma_stuck_after_failures: None,
@@ -461,6 +556,14 @@ mod tests {
                     crate::config::ContradictionCheckMode::Disabled,
                 change_internal_contradiction_check_prompt_path: None,
                 change_internal_contradiction_check_llm: None,
+                change_canonical_contradiction_check:
+                    crate::config::ContradictionCheckMode::Disabled,
+                change_canonical_contradiction_check_prompt_path: None,
+                change_canonical_contradiction_check_llm: None,
+                code_implements_spec_check:
+                    crate::config::ContradictionCheckMode::Disabled,
+                code_implements_spec_check_prompt_path: None,
+                code_implements_spec_check_llm: None,
                 implementer: None,
                 changelog_stylist: None,
                 implementer_revision: None,
@@ -479,6 +582,7 @@ mod tests {
             chatops: None,
             audits: None,
             paths,
+            cache: crate::config::CacheConfig::default(),
             features: crate::config::FeaturesConfig::default(),
             canonical_rag: None,
             models: None,
@@ -579,14 +683,15 @@ mod tests {
         assert_eq!(p.state, PathBuf::from("/home/dev/.local/state/autocoder"));
         assert_eq!(p.cache, PathBuf::from("/home/dev/.cache/autocoder"));
         assert_eq!(p.logs, PathBuf::from("/home/dev/.local/state/autocoder/logs"));
-        // Runtime falls back to system tempdir per-UID even when HOME is
-        // set, because $XDG_RUNTIME_DIR is the only XDG var without a
-        // user-derived fallback.
-        let uid = unsafe { libc::getuid() };
-        let expected_runtime = std::env::temp_dir()
-            .join(format!("{uid}-runtime"))
-            .join("autocoder");
-        assert_eq!(p.runtime, expected_runtime);
+        // Runtime: with no $XDG_RUNTIME_DIR, it falls back UNDER the XDG state
+        // dir (a `runtime/` subdir) — NOT `/tmp`. A `/tmp` runtime is wrong on
+        // two counts: tmpreaper can delete the live control socket, and the OS
+        // sandbox's private `/tmp` hides it from the per-execution MCP relay.
+        assert_eq!(
+            p.runtime,
+            PathBuf::from("/home/dev/.local/state/autocoder/runtime")
+        );
+        assert!(!p.runtime.starts_with("/tmp"), "runtime must never be under /tmp");
         clear_env_vars();
     }
 
@@ -687,6 +792,22 @@ mod tests {
         assert_eq!(
             p.workspaces_dir(),
             PathBuf::from("/srv/cache/workspaces")
+        );
+        assert_eq!(
+            p.workspace_last_used_dir(),
+            PathBuf::from("/srv/state/workspace-last-used")
+        );
+        assert_eq!(
+            p.workspace_last_used_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/workspace-last-used/github_com_owner_repo")
+        );
+        assert_eq!(
+            p.workspace_sizes_dir(),
+            PathBuf::from("/srv/state/workspace-sizes")
+        );
+        assert_eq!(
+            p.workspace_size_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/workspace-sizes/github_com_owner_repo")
         );
         assert_eq!(
             p.control_socket_path(),

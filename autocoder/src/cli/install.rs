@@ -71,6 +71,7 @@ pub struct InstallArgs {
             "audit_missing_tests_audit",
             "audit_security_bug_audit",
             "audit_documentation_audit",
+            "issues_lane",
         ]
     )]
     pub reconfigure: Option<ReconfigureSection>,
@@ -117,6 +118,13 @@ pub struct InstallArgs {
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     #[arg(long, value_enum)]
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+
+    // ---------- issues lane (a009/a010) ----------
+    /// Enable the issues lane (`features.issues.enabled`) in non-interactive
+    /// mode. Default `disabled`, mirroring the conservative interactive gate so
+    /// IaC scripts that predate this flag keep producing a lane-off install.
+    #[arg(long, value_enum)]
+    pub issues_lane: Option<IssuesLaneArg>,
 
     // ---------- canonical-spec RAG (a21) ----------
     /// Canonical-spec RAG provider in non-interactive mode. `none`
@@ -240,6 +248,25 @@ impl AuditCadenceArg {
     }
 }
 
+/// Issues-lane toggle in non-interactive mode (a009/a010). Mirrors the
+/// interactive "Enable the issues lane? [y/N]" gate; `disabled` (the default)
+/// matches the conservative interactive default so IaC scripts that predate the
+/// flag keep producing a lane-off install.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
+pub enum IssuesLaneArg {
+    /// Same as the default: the issues lane stays off.
+    #[default]
+    Disabled,
+    /// Write `features.issues.enabled: true`.
+    Enabled,
+}
+
+impl IssuesLaneArg {
+    fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Slugs of the audits the wizard knows about. The order is the order they
 /// appear in the per-audit walk-through.
 pub const LLM_DRIVEN_SLUGS: &[(&str, Cadence)] = &[
@@ -302,6 +329,7 @@ pub struct WizardPrefill {
     pub audit_missing_tests_audit: Option<AuditCadenceArg>,
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+    pub issues_lane: Option<IssuesLaneArg>,
     pub rag_provider: Option<RagProviderArg>,
     pub rag_base_url: Option<String>,
     pub rag_model: Option<String>,
@@ -334,6 +362,10 @@ pub struct WizardAnswers {
     pub audits: HashMap<String, Cadence>,
     /// Canonical-spec RAG block (a21). `None` → no block written.
     pub canonical_rag: Option<RagAnswers>,
+    /// Issues lane (a009/a010) opt-in. `true` → `features.issues.enabled: true`
+    /// in config.yaml; `false` → no `features.issues` entry (the default-off
+    /// representation). Off by default — enabling changes daemon behavior.
+    pub issues_enabled: bool,
 }
 
 /// Wizard-resolved canonical-spec RAG settings. `None` from the wizard
@@ -408,7 +440,6 @@ pub trait SystemActions: Send + Sync {
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()>;
     async fn chown(&self, path: &Path, owner: &str, group: &str) -> Result<()>;
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()>;
-    async fn apt_install(&self, packages: &[&str]) -> Result<()>;
     async fn daemon_reload(&self) -> Result<()>;
     async fn enable_systemd_unit(&self, name: &str) -> Result<()>;
     async fn start_systemd_unit(&self, name: &str) -> Result<()>;
@@ -499,23 +530,6 @@ impl SystemActions for RealSystemActions {
             .context("failed to spawn chmod")?;
         if !status.success() {
             bail!("chmod failed for {}", path.display());
-        }
-        Ok(())
-    }
-
-    async fn apt_install(&self, packages: &[&str]) -> Result<()> {
-        if !Path::new("/etc/debian_version").exists() {
-            return Ok(());
-        }
-        let mut args = vec!["install", "-y"];
-        args.extend_from_slice(packages);
-        let status = tokio::process::Command::new("apt-get")
-            .args(&args)
-            .status()
-            .await
-            .context("failed to spawn apt-get")?;
-        if !status.success() {
-            bail!("apt-get install failed for {packages:?}");
         }
         Ok(())
     }
@@ -655,7 +669,6 @@ pub enum RecordedCall {
     CreateUser { name: String, home_dir: PathBuf, shell: String },
     Chown { path: PathBuf, owner: String, group: String },
     Chmod { path: PathBuf, mode: u32 },
-    AptInstall(Vec<String>),
     DaemonReload,
     EnableSystemdUnit(String),
     StartSystemdUnit(String),
@@ -741,12 +754,6 @@ impl SystemActions for RecordingActions {
     }
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()> {
         self.record(RecordedCall::Chmod { path: path.to_path_buf(), mode });
-        Ok(())
-    }
-    async fn apt_install(&self, packages: &[&str]) -> Result<()> {
-        self.record(RecordedCall::AptInstall(
-            packages.iter().map(|s| s.to_string()).collect(),
-        ));
         Ok(())
     }
     async fn daemon_reload(&self) -> Result<()> {
@@ -1029,6 +1036,18 @@ pub async fn run_wizard(
     let audits = run_audit_prompts(io).await?;
     let canonical_rag = run_rag_prompts(io, prefill).await?;
 
+    // Issues lane (a009/a010). Opt-in gate, default NO: unlike the chatops-verb
+    // features, enabling it changes daemon behavior autonomously (per-iteration
+    // unit selection AND read-only triage of public issues), so the prompt
+    // states the effects and the operator chooses informed.
+    io.print("\nIssues lane\n");
+    io.print(
+        "  When enabled, per-iteration unit selection becomes issues > changes > audits,\n  \
+         and (with features.scout.include_issues on) the bot triages open GitHub issues\n  \
+         read-only into chatops candidates you promote with `send it`. Off by default.\n",
+    );
+    let issues_enabled = io.confirm("\n  Enable the issues lane?", false).await?;
+
     Ok(WizardAnswers {
         repo_url,
         base_branch,
@@ -1045,6 +1064,7 @@ pub async fn run_wizard(
         reviewer_api_base_url,
         audits,
         canonical_rag,
+        issues_enabled,
     })
 }
 
@@ -1131,7 +1151,14 @@ async fn run_rag_prompts(
 /// HTTP probe: GET `<base>/api/tags` with a 2-second timeout. Returns
 /// `true` on 200 OK. Any other status, network failure, or timeout is
 /// `false`. Used by the install wizard's detection step.
+///
+/// When `AUTOCODER_TEST_SKIP_OLLAMA_PROBE` is set, returns `false`
+/// immediately without making an HTTP request. This allows tests to
+/// control the probe behavior regardless of the host environment.
 async fn probe_ollama(base_url: &str) -> bool {
+    if std::env::var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE").is_ok() {
+        return false;
+    }
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -1466,13 +1493,17 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 api_base_url: answers.reviewer_api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
-                auto_revise: false,
+                auto_revise: crate::config::AutoRevise::Off,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
-                kind: crate::config::ReviewerKind::Oneshot,
+                // a64: track the spec-mandated `reviewer.kind` default
+                // (now `Agentic`) rather than pinning the wizard's output to
+                // `oneshot`. On a host whose reviewer CLI is missing, the
+                // daemon's startup fallback degrades to `oneshot` with a WARN.
+                kind: crate::config::ReviewerKind::default(),
                 command: "claude".to_string(),
             })
         }
@@ -1496,6 +1527,11 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
             ..AuditsConfig::default()
         })
     };
+
+    // Issues lane (a009/a010). Only the opt-in case writes anything: with the
+    // flag false, `features` stays at its default AND is omitted from the YAML
+    // (the top-level `features` field's `skip_serializing_if = is_default`).
+    cfg.features.issues.enabled = answers.issues_enabled;
 
     // Canonical-spec RAG (a21).
     cfg.canonical_rag = answers.canonical_rag.as_ref().map(|r| {
@@ -1544,6 +1580,118 @@ pub fn assemble_secrets_env(answers: &WizardAnswers) -> String {
         out.push_str(&format!("{env}={val}\n"));
     }
     out
+}
+
+// ----------------------------------------------------------------------------
+// a011: assisted dependency installation with per-step consent.
+// ----------------------------------------------------------------------------
+
+/// Offer to install each MISSING OS-package dependency with its own consent
+/// step, showing the exact command first. Dependencies that cannot be reliably
+/// auto-installed (the agent CLIs, the optional embedding backend) get printed
+/// install + auth instructions instead of an install attempt. Never runs a
+/// privileged install without first showing the command AND obtaining consent
+/// for that step (in non-interactive mode the `--non-interactive` flag is the
+/// consent, but the command is still shown).
+pub(crate) async fn assisted_dependency_install(
+    io: &mut dyn WizardIo,
+    actions: &dyn SystemActions,
+    non_interactive: bool,
+) -> Result<()> {
+    use super::pkg_manager::{self, OS_PACKAGE_DEPS};
+
+    let pm = pkg_manager::detect(actions).await;
+
+    for dep in OS_PACKAGE_DEPS {
+        if actions.which(dep.check_bin).await.is_some() {
+            continue; // already satisfied
+        }
+        match pm.and_then(|m| (dep.pkg_name)(m).map(|p| (m, p))) {
+            Some((m, pkg)) => {
+                let cmd = m.install_argv(pkg).join(" ");
+                let priv_note = if m.needs_privilege() {
+                    "  (requires elevated privileges)"
+                } else {
+                    ""
+                };
+                io.print(&format!(
+                    "\nMissing dependency: {} (binary `{}`).\n  Install command: {cmd}{priv_note}\n",
+                    dep.label, dep.check_bin,
+                ));
+                let consent = if non_interactive {
+                    true
+                } else {
+                    io.confirm(&format!("Install {} now?", dep.label), true).await?
+                };
+                if consent {
+                    // A failed optional install is non-fatal: warn and move on
+                    // so one unavailable package can't abort the whole setup.
+                    match run_consented_install(actions, m, pkg).await {
+                        Ok(()) => io.print(&format!("  Installed {}.\n", dep.label)),
+                        Err(e) => io.print(&format!(
+                            "  Install failed: {e}. Run the command above manually.\n"
+                        )),
+                    }
+                } else {
+                    io.print("  Skipped. Run the command above to install it later.\n");
+                }
+            }
+            None => {
+                io.print(&format!(
+                    "\nMissing dependency: {} (binary `{}`). No supported package manager \
+                     can auto-install it here — install it manually.\n",
+                    dep.label, dep.check_bin,
+                ));
+            }
+        }
+    }
+
+    print_manual_dependency_instructions(io, actions).await;
+    Ok(())
+}
+
+/// Run a consented OS-package install through the detected manager. The manager
+/// binary is invoked directly (the installer runs with the privilege the
+/// operator granted via `install.sh`/sudo, matching the historical
+/// `apt_install` behaviour).
+async fn run_consented_install(
+    actions: &dyn SystemActions,
+    pm: super::pkg_manager::PackageManager,
+    pkg: &str,
+) -> Result<()> {
+    let argv = pm.install_argv(pkg);
+    let arg_refs: Vec<&str> = argv[1..].iter().map(|s| s.as_str()).collect();
+    let out = actions.run_install_command(&argv[0], &arg_refs).await?;
+    if out.status != 0 {
+        bail!(
+            "install of `{pkg}` via {} exited {}: {}",
+            pm.binary(),
+            out.status,
+            out.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Print install + auth instructions for the dependencies the installer does
+/// NOT auto-install: the agent CLIs (own installers + interactive login) and
+/// the optional Ollama embedding backend.
+async fn print_manual_dependency_instructions(io: &mut dyn WizardIo, actions: &dyn SystemActions) {
+    if actions.which("claude").await.is_none() {
+        io.print(&format!(
+            "\nAgent CLI `claude` is not installed (install + authenticate it yourself):\n  \
+             curl -fsSL {CLAUDE_INSTALL_URL} | bash\n  \
+             claude   # interactive login, once, as the runtime user\n"
+        ));
+    }
+    if actions.which("ollama").await.is_none() {
+        io.print(
+            "\nOptional embedding backend `ollama` is not installed (only needed if you enable \
+             canonical-specs RAG with the ollama provider):\n  \
+             install from https://ollama.com, then `ollama pull nomic-embed-text`\n  \
+             (or run it as a container — see the bundled ollama-docker-compose.yml).\n",
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1664,6 +1812,7 @@ pub(crate) async fn execute_inner(
         audit_drift_audit: args.audit_drift_audit,
         audit_missing_tests_audit: args.audit_missing_tests_audit,
         audit_security_bug_audit: args.audit_security_bug_audit,
+        issues_lane: args.issues_lane,
         rag_provider: args.rag_provider,
         rag_base_url: args.rag_base_url.clone(),
         rag_model: args.rag_model.clone(),
@@ -1680,27 +1829,12 @@ pub(crate) async fn execute_inner(
             .await?;
     }
 
-    if actions.which("apt-get").await.is_some() {
-        let should_install = if args.non_interactive {
-            true
-        } else {
-            io.confirm("Install system dependencies via apt-get (git, ca-certificates)?", true).await?
-        };
-        if should_install {
-            actions.apt_install(&["git", "ca-certificates"]).await?;
-        }
-    }
-
-    if actions.which("claude").await.is_none() {
-        let should_install = if args.non_interactive {
-            true
-        } else {
-            io.confirm("Install Claude Code CLI now?", true).await?
-        };
-        if should_install {
-            actions.run_install_command("bash", &["-c", &format!("curl -fsSL {CLAUDE_INSTALL_URL} | bash")]).await?;
-        }
-    }
+    // a011: assisted dependency installation with per-step consent. Detects
+    // the host package manager and offers each MISSING OS-package dependency
+    // with its own consent step (showing the exact command); prints
+    // instructions for the dependencies it cannot auto-install (the agent CLIs
+    // and the optional embedding backend).
+    assisted_dependency_install(io, actions, args.non_interactive).await?;
 
     // 4. Collect answers — either via the wizard or directly from prefill.
     let answers = if args.non_interactive {
@@ -1946,6 +2080,7 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
         reviewer_api_base_url: None,
         audits: resolve_non_interactive_audits(p),
         canonical_rag,
+        issues_enabled: p.issues_lane.unwrap_or_default().enabled(),
     })
 }
 
@@ -2177,6 +2312,11 @@ pub(crate) async fn reconfigure_reviewer(
         Some(ReviewerProvider::Anthropic) => ReviewerProviderArg::Anthropic,
         Some(ReviewerProvider::OpenAiCompatible) => ReviewerProviderArg::OpenAiCompatible,
         Some(ReviewerProvider::Ollama) => ReviewerProviderArg::Ollama,
+        // a69: the Google/Antigravity provider is agentic-only (driven by the
+        // `agy` CLI) and is not surfaced in this oneshot-oriented wizard;
+        // operators configure it by editing the reviewer block directly. On
+        // reconfigure we present no pre-selection rather than a wrong one.
+        Some(ReviewerProvider::Google) => ReviewerProviderArg::None,
         None => ReviewerProviderArg::None,
     };
 
@@ -2256,13 +2396,17 @@ pub(crate) async fn reconfigure_reviewer(
                 api_base_url: api_base_url.clone(),
                 prompt_template_path: None,
                 code_review: None,
-                auto_revise: false,
+                auto_revise: crate::config::AutoRevise::Off,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
-                kind: crate::config::ReviewerKind::Oneshot,
+                // a64: track the spec-mandated `reviewer.kind` default
+                // (now `Agentic`) rather than pinning the wizard's output to
+                // `oneshot`. On a host whose reviewer CLI is missing, the
+                // daemon's startup fallback degrades to `oneshot` with a WARN.
+                kind: crate::config::ReviewerKind::default(),
                 command: "claude".to_string(),
             });
             reviewer.provider = Some(provider);
@@ -2496,6 +2640,7 @@ mod tests {
             reviewer_api_base_url: None,
             audits: HashMap::new(),
             canonical_rag: None,
+            issues_enabled: false,
         }
     }
 
@@ -2778,7 +2923,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apt_install_skipped_on_non_debian() {
+    async fn os_package_install_skipped_without_package_manager() {
+        // No package manager on PATH → nothing is auto-installed; the wizard
+        // prints manual instructions instead.
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new()
             .with_which("apt-get", None)
@@ -2786,9 +2933,11 @@ mod tests {
         let mut io = ScriptedIo::new(vec![]);
         let args = ni_args(&tmp);
         execute_inner(args, &mut io, &actions, tmp.path().to_path_buf()).await.unwrap();
-        let calls = actions.calls();
-        let saw_apt = calls.iter().any(|c| matches!(c, RecordedCall::AptInstall(_)));
-        assert!(!saw_apt, "expected zero apt_install calls, got {calls:?}");
+        let pm_bins = ["apt-get", "dnf", "pacman", "zypper", "brew"];
+        let saw_pkg_install = actions.calls().iter().any(|c| {
+            matches!(c, RecordedCall::RunSubprocess { cmd, .. } if pm_bins.contains(&cmd.as_str()))
+        });
+        assert!(!saw_pkg_install, "no package manager → no install: {:?}", actions.calls());
     }
 
     #[tokio::test]
@@ -2811,6 +2960,69 @@ mod tests {
         );
     }
 
+    // ----- a011 assisted dependency install -------------------------------
+
+    #[tokio::test]
+    async fn assisted_install_offers_each_os_package_with_its_own_consent_step() {
+        // apt-get present; git/bwrap/gh/claude/ollama all absent. OS packages
+        // are offered in order (git, bubblewrap, gh) — consent git + gh,
+        // decline bubblewrap.
+        let actions = RecordingActions::new().with_apt(true);
+        let mut io = ScriptedIo::new(vec!["y", "n", "y"]);
+        assisted_dependency_install(&mut io, &actions, false)
+            .await
+            .unwrap();
+
+        let out = io.output_str();
+        // Each missing OS package's exact command is shown.
+        assert!(out.contains("apt-get install -y git"), "git cmd shown: {out}");
+        assert!(out.contains("apt-get install -y bubblewrap"), "bwrap cmd shown: {out}");
+        assert!(out.contains("apt-get install -y gh"), "gh cmd shown: {out}");
+
+        let installed: Vec<String> = actions
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RunSubprocess { cmd, args } if cmd == "apt-get" => {
+                    Some(args.join(" "))
+                }
+                _ => None,
+            })
+            .collect();
+        // git + gh consented → installed; bubblewrap declined → not installed.
+        assert!(installed.iter().any(|a| a.contains("git")), "git installed: {installed:?}");
+        assert!(installed.iter().any(|a| a.contains("gh")), "gh installed: {installed:?}");
+        assert!(
+            !installed.iter().any(|a| a.contains("bubblewrap")),
+            "declined bubblewrap must not be installed: {installed:?}"
+        );
+
+        // Non-auto-installable agent CLI gets printed instructions, not an install.
+        assert!(out.contains("claude.ai/install.sh"), "claude instructions printed: {out}");
+        let ran_claude = actions.calls().iter().any(|c| {
+            matches!(c, RecordedCall::RunSubprocess { args, .. }
+                if args.iter().any(|a| a.contains("claude.ai/install.sh")))
+        });
+        assert!(!ran_claude, "claude must not be auto-installed");
+    }
+
+    #[tokio::test]
+    async fn assisted_install_prints_instructions_without_package_manager() {
+        // No package manager → OS packages get printed instructions, none run.
+        let actions = RecordingActions::new(); // apt-get etc. all absent
+        let mut io = ScriptedIo::new(vec![]);
+        assisted_dependency_install(&mut io, &actions, true)
+            .await
+            .unwrap();
+        let out = io.output_str();
+        assert!(out.contains("install it manually"), "manual hint shown: {out}");
+        let ran_any = actions
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RunSubprocess { .. }));
+        assert!(!ran_any, "nothing should be installed without a package manager");
+    }
+
     // ----- audits ---------------------------------------------------------
 
     /// Build the minimum prompt-answer queue for the existing pre-audit
@@ -2831,60 +3043,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wizard_audits_default_path_declines_all_audits() {
+    async fn wizard_rag_docker_option_writes_localhost_ollama() {
+        // SAFETY: This test runs in isolation and the env var is only read by probe_ollama
+        // within this test's execution context. No concurrent env var access occurs.
+        unsafe { std::env::set_var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE", "1") };
         let mut answers = baseline_wizard_answers();
-        // Bare-Enter on LLM gate → no.
-        answers.push("");
-        // RAG gate (a21) bare-Enter → no.
-        answers.push("n");
+        answers.push(""); // audits gate bare-Enter → no
+        answers.push("y"); // RAG gate
+        answers.push("1"); // docker option
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
             .unwrap();
-        assert!(
-            ans.audits.is_empty(),
-            "default path declines all audits; got {:?}",
-            ans.audits
-        );
-
-        let cfg = assemble_config(&ans).unwrap();
-        assert!(cfg.audits.is_none(), "no enabled audits → no audits: block");
-        let yaml = serialize_config(&cfg).unwrap();
-        for (slug, _) in LLM_DRIVEN_SLUGS {
-            assert!(
-                !yaml.contains(&format!("{slug}:")),
-                "YAML must not list {slug}:\n{yaml}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wizard_audits_fast_path_enables_all_llm_driven() {
-        let mut answers = baseline_wizard_answers();
-        // LLM gate yes, fast-path default Y.
-        answers.push("y"); // LLM gate
-        answers.push(""); // fast-path (default Y)
-        // RAG gate (a21) → no.
-        answers.push("n");
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        for (slug, rec) in LLM_DRIVEN_SLUGS {
-            assert_eq!(
-                ans.audits.get(*slug),
-                Some(rec),
-                "{slug} should be set to {:?}",
-                rec
-            );
-        }
-        let cfg = assemble_config(&ans).unwrap();
-        let audits = cfg.audits.as_ref().expect("audits block present");
-        assert_eq!(
-            audits.defaults.len(),
-            LLM_DRIVEN_SLUGS.len(),
-            "every LLM-driven audit slug must be present"
-        );
+        unsafe { std::env::remove_var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE") };
+        let rag = ans.canonical_rag.expect("docker option writes block");
+        assert_eq!(rag.provider, RagProviderArg::Ollama);
+        assert_eq!(rag.base_url, "http://localhost:11434");
+        assert_eq!(rag.model, "nomic-embed-text");
     }
 
     #[tokio::test]
@@ -2938,6 +3113,83 @@ mod tests {
 
     fn load_yaml(tmp: &TempDir) -> String {
         std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap()
+    }
+
+    // ---- issues lane (a009/a010) wizard gate ----
+
+    #[tokio::test]
+    async fn non_interactive_no_issues_flag_leaves_lane_off() {
+        // No --issues-lane → lane off, AND the features block is omitted
+        // entirely (IaC scripts that pre-date the flag are unaffected).
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        execute_inner(ni_args_audits(&tmp), &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            !yaml.contains("features:"),
+            "default install must omit the features block:\n{yaml}"
+        );
+        let cfg: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(!cfg.features.issues.enabled);
+    }
+
+    #[tokio::test]
+    async fn non_interactive_issues_lane_enabled_writes_flag() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            issues_lane: Some(IssuesLaneArg::Enabled),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
+        assert!(cfg.features.issues.enabled, "--issues-lane enabled must set the flag");
+    }
+
+    #[tokio::test]
+    async fn non_interactive_issues_lane_disabled_leaves_lane_off() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            issues_lane: Some(IssuesLaneArg::Disabled),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
+        assert!(!cfg.features.issues.enabled);
+    }
+
+    #[tokio::test]
+    async fn assemble_config_writes_issues_flag_when_opted_in() {
+        // The interactive opt-in funnels through assemble_config the same way.
+        let ans = WizardAnswers { issues_enabled: true, ..baseline_answers() };
+        let cfg = assemble_config(&ans).unwrap();
+        assert!(cfg.features.issues.enabled);
+        let yaml = serialize_config(&cfg).unwrap();
+        let round: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(round.features.issues.enabled, "serialized yaml carries the flag:\n{yaml}");
+    }
+
+    #[tokio::test]
+    async fn assemble_config_omits_features_when_issues_declined() {
+        // The interactive default (decline) leaves issues_enabled false → the
+        // features block is omitted (FeaturesConfig::is_default skip).
+        let cfg = assemble_config(&baseline_answers()).unwrap();
+        assert!(!cfg.features.issues.enabled);
+        let yaml = serialize_config(&cfg).unwrap();
+        assert!(
+            !yaml.contains("features:"),
+            "declined issues lane must omit the features block:\n{yaml}"
+        );
     }
 
     #[tokio::test]
@@ -3280,7 +3532,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         for c in &calls {
             match c {
                 RecordedCall::CreateUser { .. }
-                | RecordedCall::AptInstall(_)
                 | RecordedCall::DaemonReload
                 | RecordedCall::EnableSystemdUnit(_)
                 | RecordedCall::StartSystemdUnit(_)
@@ -3370,7 +3621,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         for c in &calls {
             match c {
                 RecordedCall::CreateUser { .. }
-                | RecordedCall::AptInstall(_)
                 | RecordedCall::DaemonReload
                 | RecordedCall::EnableSystemdUnit(_)
                 | RecordedCall::StartSystemdUnit(_) => {
@@ -3957,94 +4207,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         assert!(ans.canonical_rag.is_none());
         let cfg = assemble_config(&ans).unwrap();
         assert!(cfg.canonical_rag.is_none());
-    }
-
-    #[tokio::test]
-    async fn wizard_rag_disable_option_writes_no_block() {
-        let mut answers = baseline_wizard_answers();
-        answers.push(""); // audits gate bare-Enter → no
-        answers.push("y"); // RAG gate: yes, configure
-        // localhost ollama probe will fail in test env so the four-option
-        // menu fires; choose option 4 (disable).
-        answers.push("4");
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        assert!(ans.canonical_rag.is_none());
-    }
-
-    /// a37: reviewer Ollama choice exercises the bare-base-URL + no-api-key
-    /// branch. Mirrors the `wizard_rag_*` shape: feed the scripted answers,
-    /// run the wizard, assert the resolved `WizardAnswers` carries the
-    /// ollama provider AND the captured base URL, AND that
-    /// `assemble_config` produces a `reviewer:` block with the matching
-    /// provider, NO api_key_env, AND the bare base URL.
-    #[tokio::test]
-    async fn wizard_reviewer_ollama_collects_base_url_and_no_api_key() {
-        let mut answers: Vec<&'static str> = vec![
-            "git@github.com:acme/widgets.git",
-            "main",
-            "agent-q",
-            "300",
-            "GITHUB_TOKEN",
-            "ghp_test",
-            "1", // chatops: none
-            "4", // reviewer: ollama (1-indexed: none=1, anthropic=2, openai_compatible=3, ollama=4)
-            "qwen2.5-coder:32b", // reviewer model
-            "http://10.42.11.10:11434", // reviewer Ollama base URL (overrides default)
-            "", // audits LLM gate bare-Enter → no
-            "n", // RAG gate
-        ];
-        let _ = &mut answers;
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        assert_eq!(ans.reviewer_provider, ReviewerProviderArg::Ollama);
-        assert_eq!(ans.reviewer_model.as_deref(), Some("qwen2.5-coder:32b"));
-        assert!(
-            ans.reviewer_api_key.is_none(),
-            "ollama path must NOT collect an api_key"
-        );
-        assert_eq!(
-            ans.reviewer_api_base_url.as_deref(),
-            Some("http://10.42.11.10:11434")
-        );
-
-        let cfg = assemble_config(&ans).unwrap();
-        let rv = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(rv.provider, Some(ReviewerProvider::Ollama));
-        assert_eq!(rv.model, "qwen2.5-coder:32b");
-        assert_eq!(
-            rv.api_base_url.as_deref(),
-            Some("http://10.42.11.10:11434")
-        );
-        assert!(rv.api_key_env.is_none(), "no api_key_env for ollama");
-        assert!(rv.api_key.is_none(), "no inline api_key for ollama");
-
-        // secrets.env MUST NOT carry a reviewer key for the ollama path.
-        let secrets = assemble_secrets_env(&ans);
-        assert!(
-            !secrets.contains("ANTHROPIC_API_KEY") && !secrets.contains("OPENAI_API_KEY"),
-            "no reviewer key should leak into secrets.env: {secrets}"
-        );
-    }
-
-    #[tokio::test]
-    async fn wizard_rag_docker_option_writes_localhost_ollama() {
-        let mut answers = baseline_wizard_answers();
-        answers.push(""); // audits gate bare-Enter → no
-        answers.push("y"); // RAG gate
-        answers.push("1"); // docker option
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        let rag = ans.canonical_rag.expect("docker option writes block");
-        assert_eq!(rag.provider, RagProviderArg::Ollama);
-        assert_eq!(rag.base_url, "http://localhost:11434");
-        assert_eq!(rag.model, "nomic-embed-text");
     }
 
     #[test]

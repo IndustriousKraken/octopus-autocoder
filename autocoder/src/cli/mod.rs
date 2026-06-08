@@ -16,9 +16,11 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         repositories: vec![],
         executor: config::ExecutorConfig {
             kind: config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: String::new(),
             timeout_secs: 60,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -34,6 +36,14 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
             change_internal_contradiction_check: config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -52,6 +62,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         chatops: None,
         audits: None,
         paths: config::DaemonPathsConfig::default(),
+        cache: config::CacheConfig::default(),
         features: config::FeaturesConfig::default(),
         canonical_rag: None,
         models: None,
@@ -62,8 +73,10 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
 pub mod audit;
 pub mod changelog;
 pub mod check_config;
+pub mod doctor;
 pub mod inspect;
 pub mod install;
+pub mod pkg_manager;
 pub mod reload;
 pub mod rewind;
 pub mod run;
@@ -177,9 +190,25 @@ pub enum Command {
     /// Run the autocoder daemon. Polls every configured repository on its
     /// interval, processes ready OpenSpec changes, and opens monolithic PRs.
     Run {
-        /// Path to the YAML configuration file.
+        /// Path to the YAML configuration file. When omitted, the path is
+        /// discovered from the installed systemd unit's `ExecStart`, then
+        /// from the default locations (`/etc/autocoder/config.yaml`, then
+        /// `~/.config/autocoder/config.yaml`).
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+    },
+
+    /// Run the dependency preflight on demand and print the full report:
+    /// every required dependency (`openspec`, `git`, a usable sandbox
+    /// mechanism) AND every dependency implied by the active configuration.
+    /// Exits non-zero when a required dependency is missing or unusable.
+    Doctor {
+        /// Path to the YAML configuration file whose strategies/features
+        /// drive the configuration-implied checks. When omitted, the same
+        /// discovery as `run` is used; if no config is found the required
+        /// dependencies are still checked.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Validate a config file against this binary's schema, without
@@ -289,9 +318,11 @@ pub enum Command {
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run { config } => {
-            let cfg = config::Config::load_from(&config)?;
-            run::execute(cfg, config).await
+            let resolved = run::resolve_run_config_path(config)?;
+            let cfg = config::Config::load_from(&resolved)?;
+            run::execute(cfg, resolved).await
         }
+        Command::Doctor { config } => doctor::execute(config).await,
         Command::CheckConfig(args) => check_config::execute(args).await,
         Command::Install(args) => install::execute(args).await,
         Command::Reload => reload::execute().await,

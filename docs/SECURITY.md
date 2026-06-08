@@ -124,10 +124,69 @@ executor:
 
 **What the agent sees on a denial:** the wrapped CLI tells the model the tool call was blocked. The model typically narrates the failure in its output, which surfaces in the iteration's captured stdout. If a legitimate workflow gets blocked, the iteration logs make it obvious which command was denied.
 
-**Threat model caveat:** this is a tool-routing-layer sandbox, not OS-level isolation. A determined model can in principle exec arbitrary code via the allowed `Bash` tool with command patterns that don't match the denylist. For hard isolation, run autocoder under OS-level sandboxing (firejail, bubblewrap, or systemd `ProtectHome=`/`ProtectSystem=`). The autocoder sandbox is a useful first layer.
+**Threat model caveat:** this is a tool-routing-layer sandbox, not OS-level isolation. A determined model can in principle exec arbitrary code via the allowed `Bash` tool with command patterns that don't match the denylist. autocoder now wraps every agentic subprocess in a kernel-enforced OS-level sandbox *in addition* to this tool-routing layer — see [§9 OS-level agentic sandbox](#9-os-level-agentic-sandbox-a006). The tool-routing sandbox remains the first layer; the OS layer is the hard boundary.
 
 **Lazy-archive structural detection.** Beyond the sandbox, autocoder inspects the working-tree diff after every executor invocation. If the only changes are renames into `openspec/changes/archive/<date>-<name>/`, the daemon treats the iteration as Failed (not Completed), reverts the staged moves via `git reset --hard`, and leaves the change pending for retry. This catches the "agent renamed the change directory and called itself done" failure mode regardless of which command produced the moves — the openspec-CLI denials above are belt-and-suspenders for the obvious path, but the structural check is what does the real work.
 
 **Reviewer LLM is a separate data flow.** The code reviewer (if enabled) sends the diff to its configured LLM provider as a direct HTTP call. That data flow is governed by your `reviewer:` config (provider, api_key, api_base_url), NOT by `executor.sandbox`. Operators opted in to that flow by enabling the reviewer; sandbox restrictions do not apply.
+
+---
+
+## 9. OS-level agentic sandbox (a006)
+
+Section 8 stops a model from *exfiltrating* over the tool layer. This section stops a model from *reaching* a credential that exists on the host in the first place — another CLI's config store, `~/.ssh`, autocoder's own config — by wrapping **every** agentic subprocess in a kernel-enforced sandbox. Enforcement is external to the wrapped CLI: the kernel applies it regardless of the CLI's own settings. Because the wrap lives on the single `agentic_run` spawn seam, no role (executor, audits, agentic reviewer, contradiction checks) can opt out.
+
+**Mechanism (auto-detected at startup).** The subprocess is launched under `systemd-run` in transient **service** mode (PID 1 applies the namespace; stdout captured with `--pipe --wait --collect`), with a **`bwrap`** (bubblewrap) fallback for unprivileged / non-systemd / in-container hosts. What it enforces, identically for every role:
+
+- **Filesystem allowlist (default-deny).** The subprocess sees only: the workspace (read-write for the executor, **read-only** for audits / the agentic reviewer / contradiction checks), the running role's *own* CLI config store (read-only, so the CLI can authenticate), and the minimal runtime (binaries/libraries, a private `/tmp`, a restricted `/dev`). The home directory, every *other* CLI's store, autocoder's config/state, and `~/.ssh` are **absent from the namespace** — unreadable even via a `Bash` `cat`.
+- **Capability drops.** `CAP_NET_RAW` (no raw-socket sniffing), `CAP_NET_ADMIN` (no route/iptables hijack), `CAP_SYS_PTRACE` (no reading another process's memory); `NoNewPrivileges`; address families restricted to exclude `AF_PACKET`.
+- **Process-table restriction.** `/proc` is mounted so the subprocess cannot read another process's `environ` or `mem`.
+
+**Network egress is deliberately NOT restricted** by this sandbox. Egress control belongs to the host firewall, and there is no maintainable in-app allowlist for CDN'd API/forge hosts. The sandbox does filesystem and host isolation, not a network allowlist.
+
+### Two credential-store toggles
+
+CLI config stores get two protection layers, each an independent toggle under `executor.sandbox` (and per-repository), **both ON by default**:
+
+| Toggle | Layer | Fail mode | What it does |
+|--------|-------|-----------|--------------|
+| `os_hide` | filesystem allowlist | **fail-closed** | Every CLI store *other than the running role's own* is absent from the namespace. An unenumerated store is hidden by default. It cannot protect the running role's own store (which must stay readable to authenticate); it protects every other store. |
+| `engine_deny` | the wrapped CLI's per-invocation tool-use denylist | fail-open | Denies the agent's `Read`/`Bash` tools on the config store of **every** registered CLI strategy — the self-store included. Covers the one store `os_hide` cannot, but is a string-pattern speed bump that determined shell indirection can evade: it deters, it does not bound. Supplied per-invocation; the operator's global CLI config is never mutated. |
+
+The running role's own CLI store stays readable by that same-uid subprocess because the CLI must read it to authenticate. Disclosure of that one store means a model could impersonate that CLI to *its own* provider — never reach another provider's credential or another secret. That residual is bounded by the single-store blast radius plus `engine_deny` deterrence.
+
+### Presets (documentation over the two switches)
+
+| Preset | `os_hide` | `engine_deny` | When |
+|--------|-----------|---------------|------|
+| **Secure default** | on | on | Every normal repository. |
+| **CLI-wrapping repo** | **off** | on | A repository whose code *develops CLI wrappers* and needs a nested CLI to authenticate live against another CLI's store. **This repository (autocoder itself) is in this category** — under the secure default, its live cross-CLI development breaks, so it sets `os_hide: false` (and is logged at startup, see below). |
+| **Credential-grab testing** | off | off | A repository whose explicit purpose is testing credential-grab behavior. |
+
+### Precedence and logging
+
+- A per-repository `sandbox.os_hide` / `sandbox.engine_deny` value **overrides** the global `executor.sandbox` value for that repository; absent both, the secure default (ON) applies. There is no implicit downgrade.
+- Loosening either toggle is explicit and **logged**: the daemon emits a per-repository startup **WARN** naming each toggle that is OFF for that repository.
+
+### No-mechanism fail-closed + opt-in
+
+When **no** sandbox mechanism is available (neither `systemd-run` service mode nor `bwrap` can apply the sandbox), agentic runs **fail closed** with a clear error naming the missing mechanism — no unsandboxed subprocess is spawned — **unless** the operator explicitly sets `executor.sandbox.allow_unsandboxed: true`. With that opt-in, runs proceed and the daemon emits a loud startup WARN that subprocesses are running unsandboxed. The opt-in is daemon-wide (not per-repository) and is **not recommended**: a wrapped model can then reach host credentials.
+
+```yaml
+executor:
+  kind: claude_cli
+  sandbox:
+    os_hide: true          # default; hide other CLIs' stores
+    engine_deny: true      # default; deny-read every CLI store at the tool layer
+    allow_unsandboxed: false  # default; fail closed when no mechanism is available
+
+repositories:
+  - url: "git@github.com:you/cli-wrapping-repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    sandbox:
+      os_hide: false       # this repo wraps CLIs; a nested CLI must authenticate live
+```
 
 ---

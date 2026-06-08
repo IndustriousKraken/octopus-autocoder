@@ -1,13 +1,17 @@
-# autocoder
+# Octopus Autocoder
 
-**autocoder** is an autonomous daemon that reads OpenSpec implementation proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review. It's "OpenSpec change at the top, working code in a PR at the bottom" wired into a single long-running process.
+<p align="center">
+  <img src="octopus-autocoder.jpg" alt="Octopus Autocoder — an octopus at the keyboard" width="320">
+</p>
+
+**Octopus Autocoder** is an autonomous daemon that reads OpenSpec implementation proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review. It's "OpenSpec change at the top, working code in a PR at the bottom" wired into a single long-running process.
 
 ---
 
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/master/install.sh | bash
 ```
 
 The one-liner downloads a pre-built binary, verifies its SHA-256, places it at `/usr/local/bin/autocoder` (or `~/.local/bin/autocoder` if `sudo` is unavailable or `--user` is passed), then execs `autocoder install`. **The bootstrap script is intentionally tiny (~75 lines, no operator prompts).** Everything else — the configuration wizard, `useradd`/`systemctl`/`apt-get`, optional Claude CLI bootstrap — lives in the `autocoder install` Rust subcommand which ships with `cargo test` coverage.
@@ -32,6 +36,10 @@ The wizard asks about periodic audits before writing `config.yaml`. The five LLM
 
 For non-interactive installs, the same configuration is available via `--audits-spec-sync <disabled|daily|weekly|monthly>` (defaults to `daily`), `--audits-llm-driven <none|recommended|all-disabled>` (defaults to `none`), and per-audit `--audit-<slug> <cadence>` overrides. A `--non-interactive` invocation that passes none of the `--audits-*` flags inherits the conservative default (spec-sync daily; everything else disabled), so IaC scripts that pre-date this wizard step keep working without surprise behavior changes. See [docs/CONFIG.md#audits-optional](docs/CONFIG.md#audits-optional) for cadence syntax and the `extra` knobs each audit reads.
 
+### Issues lane during install
+
+The wizard also asks whether to enable the **issues lane** — a single `[y/N]` gate, default no, shown after the periodic-audits prompts. Unlike the chatops-verb features, enabling the lane changes daemon behavior on its own: per-iteration precedence becomes `issues > changes > audits`, and — with `features.scout.include_issues` on — the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it`. Because that is automatic token spend and untrusted-input processing, it is opt-in rather than on by default. For non-interactive installs, pass `--issues-lane <enabled|disabled>` (defaults to `disabled`); omitting it leaves the lane off, so existing IaC is unaffected. `features.*` is not part of the `autocoder reload` hot-reload set, so enabling the lane after first install means editing `config.yaml` and restarting the daemon. See [docs/CONFIG.md#featuresissues](docs/CONFIG.md#featuresissues).
+
 ### Reinstalling / upgrading
 
 Re-running `install.sh` downloads the latest binary (or a specific tag — pass `--version vX.Y.Z` to the script or set `AUTOCODER_VERSION=vX.Y.Z` in the environment), verifies the checksum, and replaces `/usr/local/bin/autocoder`. The subsequent `autocoder install` detects the existing `config.yaml` and exits 0 without re-prompting: the operator's choices made on first run are preserved across binary upgrades. To force the wizard back on (e.g. to relocate the config), pass `--upgrade` after `--`.
@@ -47,6 +55,8 @@ Re-running `install.sh` downloads the latest binary (or a specific tag — pass 
 Once the daemon is running, this is the day-to-day surface.
 
 **Implement specs autonomously.** Drop an OpenSpec change into `openspec/changes/<slug>/`, push to the base branch. The next polling iteration drives the wrapped agent through it, opens a PR with the diff, and archives the change on merge. Failures surface via chatops; per-change `.perma-stuck.json` and `.needs-spec-revision.json` markers signal when human action is needed.
+
+**Fix corrections via the issues lane** *(opt-in; `features.issues.enabled`)*. A second work lane for *corrections* — small fixes that don't warrant a spec change — running alongside the changes queue. Two entry points: a maintainer commits `openspec/issues/<slug>/` directly (curated), or the bot triages the repo's open GitHub issues read-only and posts each as a chatops *candidate* a maintainer promotes with `send it` (public ingestion). Promotion is the authorization gate — the public can report but never trigger code work, and issue bodies are carried as untrusted data, never instructions. Promoted issues are worked into a `fix:` PR. Off by default; enabling it sets per-iteration precedence `issues > changes > audits`. See [docs/OPERATIONS.md → Issues lane](docs/OPERATIONS.md#issues-lane).
 
 **Talk to autocoder in chat** (Slack officially supported; Discord, Teams, Mattermost, Matrix [experimental](docs/CHATOPS.md#experimental-chatops-backends)). With Slack Socket Mode wired in:
 
@@ -69,6 +79,8 @@ Once the daemon is running, this is the day-to-day surface.
 | `drift_audit` | Each canonical-spec requirement vs. observable code behavior, plus spec-vs-spec contradiction detection. Read-only sandbox. | Yes | Reported findings (chatops `🧭`) |
 | `missing_tests_audit` | Surveys for uncovered error paths; writes `openspec/changes/tests-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 | `security_bug_audit` | Surveys for security issues and bugs; writes `openspec/changes/fix-*` / `secure-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
+| `canon_contradiction_audit` | Scans the whole canon for two requirements that cannot both hold (canon-vs-canon). RAG-assisted; read-only sandbox. Default cadence `monthly`. | Yes | Reported findings (chatops `📋`); maintainer heals via audit-thread `send it` |
+| `canon_consolidation_audit` | Scans the canon for redundant requirements expressing one invariant under different titles (canon-vs-canon); drafts a `consolidate-` change merging them. RAG-assisted; OpenSpec-only sandbox. Default cadence `monthly`. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 
 Spec-writing audits enqueue their new proposals into the same iteration's queue walk — implementer commit and audit's creation commit ship in one PR. Generated proposals run through `openspec validate --strict` before commit; invalid proposals are discarded and a `❌` chatops notification fires. See [docs/OPERATIONS.md → Periodic audits](docs/OPERATIONS.md#periodic-audits).
 

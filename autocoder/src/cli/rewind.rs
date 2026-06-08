@@ -242,7 +242,7 @@ mod tests {
     }
 
     fn cfg(url: &str) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".into(),
@@ -254,11 +254,12 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
     fn cfg_local(url: &str, local: &Path) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.to_string(),
             local_path: Some(local.to_path_buf()),
             base_branch: "main".into(),
@@ -270,6 +271,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 

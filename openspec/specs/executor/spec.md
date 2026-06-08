@@ -1452,3 +1452,476 @@ Because the contradiction check is fail-open (per the orchestrator-cli requireme
 - **THEN** `consume_submission` returns an empty result (no contradictions)
 - **AND** the tool layer does NOT raise an error — the orchestrator-cli caller's fail-open policy decides the WARN-and-proceed outcome
 
+### Requirement: OpencodeStrategy implements the opencode CLI for agentic roles
+The daemon SHALL provide a second `CliStrategy` (a56), `OpencodeStrategy`, for the `opencode` CLI, so a role whose model provider resolves to `opencode` (a55's `provider → CLI` rule for `openai_compatible`/`ollama`, OR an explicit registry `cli: opencode`) runs agentically instead of erroring with "no registered strategy."
+
+`OpencodeStrategy` SHALL build an `opencode run` invocation that: selects the model via `--model <provider>/<model>`; writes an `opencode.json` into the workspace carrying the MCP `mcp` block (`type: local`, the MCP-child command, AND env including `ORCH_MCP_ROLE`) AND the resolved provider config (base URL + key); AND maps a56's sandbox (allowed-tools list + deny patterns) onto opencode's permission configuration so a read-only role keeps its read-only profile. It SHALL set NO `ANTHROPIC_*` env (that is the `claude` strategy's mechanism), AND SHALL NOT write `.mcp.json` (the `claude` MCP format). The model SHALL be delivered the role's prompt by whichever mechanism headless `opencode run` accepts (stdin or positional argument), as determined by the integration spike.
+
+`OpencodeStrategy` SHALL run in capture mode; the streaming-JSON event path (`final_answer` / `session_id` / incremental log) is `claude`-specific. opencode therefore serves the capture-mode structured-submission roles (the advisory audits, the reviewer, the contradiction check); the executor's streaming implementer path remains on the `claude` strategy. The opencode integration SHALL surface MCP tool calls AND surface a daemon-rejected submission to the model as a correctable tool error it can retry in the same session — the same submission contract a56 requires of the `claude` path.
+
+Registering `opencode` unblocks the non-Anthropic agentic paths of the reviewer (a58) AND the contradiction check (a59); it does NOT change any role's default transport.
+
+#### Scenario: Opencode provider resolves to a working strategy
+- **WHEN** a role's model resolves (via a55's `provider → CLI` rule, OR an explicit `cli: opencode`) to the `opencode` CLI
+- **THEN** strategy resolution returns `OpencodeStrategy` (NOT a "no registered strategy" error)
+- **AND** it builds an `opencode run` invocation selecting the model via `--model <provider>/<model>`
+
+#### Scenario: MCP and role env are delivered via opencode.json
+- **WHEN** an `opencode` role runs with a structured-submission tool (e.g. `submit_review`)
+- **THEN** the strategy writes `opencode.json` with an `mcp` block (`type: local`, the MCP-child command, env including `ORCH_MCP_ROLE`) so the role's `submit_*` tool is reachable
+- **AND** NO `.mcp.json` is written for that run
+
+#### Scenario: Model selection targets the configured provider, not Anthropic env
+- **WHEN** the resolved model is `(openai_compatible, <model>, <base_url>, <key>)`
+- **THEN** the invocation selects `--model openai_compatible/<model>` AND `opencode.json` carries the provider's base URL AND key
+- **AND** none of `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` is set
+
+#### Scenario: Read-only sandbox is enforced via opencode permissions
+- **WHEN** a read-only role (a56 sandbox: allow Read/Glob/Grep; deny Write/Edit/Bash) runs under opencode
+- **THEN** the generated opencode permission configuration denies Write, Edit, AND Bash
+- **AND** exposes only the read tools plus the role's MCP submission tool
+
+#### Scenario: Capture mode only; streaming stays on claude
+- **WHEN** an `opencode` role runs through `agentic_run`
+- **THEN** it uses capture mode (stdout/stderr read at exit), NOT the streaming-JSON parse path
+- **AND** the executor's streaming implementer path continues to use the `claude` strategy
+
+#### Scenario: Submission contract holds under opencode
+- **WHEN** an `opencode` role's agent calls its `submit_*` tool AND the daemon rejects the payload (schema-invalid)
+- **THEN** the rejection reaches the model as a tool error it can correct AND retry within the same `opencode run` session
+- **AND** this matches the correctable-tool-error contract a56 requires of the `claude` path
+
+#### Scenario: Non-Anthropic agentic roles now function
+- **WHEN** the reviewer (`reviewer.kind: agentic`) OR the contradiction check is configured with a model whose provider resolves to `opencode`
+- **THEN** the role runs agentically via `OpencodeStrategy`
+- **AND** it no longer errors / fails open on "no registered strategy"
+
+### Requirement: submit_canon_contradictions MCP tool returns change-vs-canonical contradictions
+The per-execution MCP child SHALL advertise a `submit_canon_contradictions` tool — built on a56's per-role submission framework — whenever `ORCH_MCP_ROLE = canon_contradiction_check`, AND SHALL NOT advertise it for any other role. The tool's payload schema SHALL be `{ contradictions: [{ change_requirement: string, canonical_capability: string, canonical_requirement: string, summary: string }] }` — each finding names the canonical requirement (by capability AND title) that the change's requirement conflicts with, distinguishing it from the `[in]` gate's within-change `submit_contradictions`. The tool relays through a56's `relay_submission` → `record_submission`; a schema-invalid payload is rejected AND surfaced to the agent as a correctable tool error it can retry in the same session.
+
+Because the `[canon]` gate is fail-open (per the orchestrator-cli requirement AND the a61 framework), a session that ends with no stored submission SHALL be consumed as an empty result rather than an error — the fail-open WARN-and-proceed decision lives in the orchestrator-cli caller.
+
+#### Scenario: Advertised only for the canon-check role
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = canon_contradiction_check`
+- **THEN** the `tools/list` response advertises `submit_canon_contradictions` with the canon-contradictions schema alongside the common tools
+- **WHEN** the MCP child starts with any other role (`implementer`, `reviewer`, `contradiction_check`, an advisory audit)
+- **THEN** `submit_canon_contradictions` is NOT advertised
+
+#### Scenario: Valid submission is consumed by the caller
+- **WHEN** the agent calls `submit_canon_contradictions` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the session exits the daemon `consume_submission`s the stored payload for the orchestrator-cli caller to turn into the marker
+
+#### Scenario: Schema-invalid submission is correctable
+- **WHEN** a `submit_canon_contradictions` payload fails the schema (missing `canonical_requirement`, non-array `contradictions`)
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+
+#### Scenario: Missing submission consumed as empty, not an error
+- **WHEN** a `[canon]` session exits with no stored submission for the execution
+- **THEN** `consume_submission` returns an empty result
+- **AND** the tool layer does NOT raise an error — the orchestrator-cli caller's fail-open policy decides the outcome
+
+### Requirement: submit_verdict MCP tool returns the code-implements-spec verdict
+The per-execution MCP child SHALL advertise a `submit_verdict` tool — the last of a56's reserved per-role submission tools, built on the same framework — whenever `ORCH_MCP_ROLE = code_implements_spec`, AND SHALL NOT advertise it for any other role. The tool's payload schema SHALL be `{ verdict: "implemented" | "gaps_found", summary: string, gaps: [{ requirement: string, scenario: string|null, status: "missing" | "partial", evidence: string }] }`. The schema SHALL enforce the `verdict` enum AND SHALL require a non-empty `gaps` array whenever `verdict: gaps_found`. The tool relays through a56's `relay_submission` → `record_submission`; a schema-invalid payload is rejected AND surfaced to the agent as a correctable tool error it can retry in the same session.
+
+Because the `[out]` gate is advisory (per the orchestrator-cli requirement AND the a61 framework), a session that ends with no stored submission SHALL be consumed as an empty result rather than an error — the caller omits the `## Spec Verification` section AND logs a WARN; it never blocks. A consumed `gaps_found` verdict drives the advisory annotation AND the chatops heads-up, never a revision.
+
+#### Scenario: Advertised only for the code-implements-spec role
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = code_implements_spec`
+- **THEN** the `tools/list` response advertises `submit_verdict` with the verdict schema alongside the common tools
+- **WHEN** the MCP child starts with any other role (`implementer`, `reviewer`, a contradiction gate, an advisory audit)
+- **THEN** `submit_verdict` is NOT advertised
+
+#### Scenario: Valid verdict is consumed by the caller
+- **WHEN** the agent calls `submit_verdict` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the session exits the daemon `consume_submission`s the payload for the orchestrator-cli caller to render the advisory section
+
+#### Scenario: gaps_found requires a non-empty gaps array
+- **WHEN** a `submit_verdict` payload has `verdict: "gaps_found"` AND an empty `gaps` array, OR a `verdict` outside the enum
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+
+#### Scenario: Missing submission consumed as empty, never blocks
+- **WHEN** a `[out]` session exits with no stored submission for the execution
+- **THEN** `consume_submission` returns an empty result
+- **AND** the tool layer does NOT raise an error — the orchestrator-cli caller omits the advisory section AND proceeds (the gate never blocks)
+
+### Requirement: CLI strategies pass no LLM credential to the wrapped subprocess
+No `CliStrategy` implementation SHALL pass an LLM credential (the resolved `api_key`) to the wrapped CLI — NOT by writing it into a config file in the workspace (`opencode.json`, `mcp_config.json`, `.gemini/*`, etc.), and NOT by setting it in the subprocess environment. A strategy SHALL select the model (e.g. `--model`) and rely on the CLI's **own** authentication — the CLI's own credential store or login (`claude login`, opencode / Big-Pickle, `agy` login), or the operator's out-of-band CLI provider config (e.g. opencode → OpenRouter configured in opencode's own config). This supersedes any prior per-strategy credential passing: the `claude` strategy SHALL NOT set `ANTHROPIC_AUTH_TOKEN`, AND the `opencode` strategy's `opencode.json` SHALL carry the MCP block + the permission/sandbox config + the provider's model/base-URL, but NOT the `api_key`.
+
+The rationale is that the model never needs the credential: the CLI **process** authenticates by injecting the key into the request in its own memory; the model is tunneled across that connection. A credential written to a workspace file can be committed; a credential in the subprocess env is readable from the agent's Bash (and, for Anthropic, an env key also forces pay-per-token off the operator's subscription).
+
+A resolved `api_key` SHALL flow only to autocoder's **in-process** HTTP clients (the non-agentic `oneshot` reviewer AND the contradiction-check LLM block), which the daemon calls directly so the key stays in the daemon's process and never reaches a model. When a role that resolves to a CLI strategy has a configured `api_key`, the strategy SHALL ignore it AND the daemon SHALL emit exactly one startup WARN noting the key is unused for CLI roles.
+
+#### Scenario: opencode.json carries no api_key
+- **WHEN** the `opencode` strategy writes `opencode.json` for a role whose resolved model has a non-empty `api_key`
+- **THEN** the written `opencode.json` contains the MCP block, the permission/sandbox config, AND the provider's model + base URL
+- **AND** it does NOT contain the `api_key`
+
+#### Scenario: claude strategy sets no auth token
+- **WHEN** the `claude` strategy builds an invocation for a role whose resolved model has an `api_key`
+- **THEN** the invocation sets NO `ANTHROPIC_AUTH_TOKEN`
+- **AND** claude authenticates from its own login/credential store
+
+#### Scenario: no strategy writes a credential to a workspace file or env
+- **WHEN** any `CliStrategy` builds its invocation AND/OR writes its config
+- **THEN** no credential (the resolved `api_key`) appears in any file written into the workspace
+- **AND** no credential appears in the subprocess environment
+
+#### Scenario: a configured CLI-role key is ignored with one warning
+- **WHEN** a role that resolves to a CLI strategy is configured with an `api_key`
+- **THEN** the strategy ignores it (the CLI uses its own auth)
+- **AND** the daemon emits exactly one startup WARN that the key is unused for CLI roles
+
+#### Scenario: in-process HTTP roles still receive the key
+- **WHEN** the non-agentic `oneshot` reviewer (or the contradiction-check LLM block) runs with a configured `api_key`
+- **THEN** the key is used by the daemon's in-process HTTP client for that call
+- **AND** the key is never passed to a subprocess (file or env)
+
+### Requirement: Every agentic subprocess runs inside an OS-level sandbox
+Every role that spawns a CLI through the shared `agentic_run` primitive — the executor, every audit, AND any agentic role added by other changes (e.g. an agentic reviewer) — SHALL have that subprocess wrapped in an OS-level sandbox enforced by the kernel, NOT by the wrapped CLI's own sandbox. The wrap is a property of the single `agentic_run` spawn seam, so no role can opt out. The in-process HTTP roles (the non-agentic `oneshot` reviewer AND the contradiction-check LLM block) spawn no subprocess and are out of scope. This requirement governs the OS-level sandbox; it does not change the canonical tool-use-sandbox scoping (the CLI permission layer), which sits beside it.
+
+The sandbox SHALL be applied by a **platform-appropriate mechanism**: on Linux via `systemd-run` in transient-service mode (so PID 1 applies the filesystem and namespace properties; stdout captured with `--pipe --wait --collect`), with a bubblewrap (`bwrap`) fallback for hosts without a usable system manager; on macOS via `sandbox-exec` (the Seatbelt sandbox) with a generated profile.
+
+**The filesystem policy is role-dependent**, because the executor must run the project's build toolchain while read-only roles only read:
+
+- **Executor — exposed home, default-deny mask-list (denylist).** The home directory SHALL be present AND writable, so build toolchains installed under `$HOME` (`~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.rbenv`, caches, …) work without enumeration — EXCEPT a default-deny **mask-list** of sensitive paths which SHALL be masked (replaced with empty or inaccessible mounts). The mask-list covers **credential paths** (read-protection: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, cloud-token dirs, other CLIs' config stores, package-manager credential files such as `~/.cargo/credentials.toml` / `~/.npmrc`) AND **shell-init/persistence paths** (write-protection: `~/.bashrc`, `~/.profile`, `~/.ssh/authorized_keys`, autostart/cron). It ships with defaults AND is operator-editable (see the orchestrator-cli config requirement). System paths outside `$HOME` are visible read-only.
+- **Read-only roles (audits, agentic reviewer) — allowlist.** The home directory SHALL be masked; the subprocess sees only the workspace (read-only), the running role's own CLI config store (read-only, for authentication), the **resolved CLI binary AND its runtime dependency closure** (following symlinks, even when installed under `~/.local/bin`), AND the minimal runtime.
+- **Strict mode — opt-in allowlist for the executor.** An operator MAY opt the executor into the read-only-style allowlist (home masked; only the workspace read-write, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime bound) for high-compliance hosts. This is NOT the default.
+
+The workspace SHALL be read-write for the executor AND read-only for read-only roles, in every policy.
+
+- **Capability / operation restriction.** On Linux: drop `CAP_NET_RAW` (no raw-socket sniffing), `CAP_NET_ADMIN` (no route/iptables hijack), AND `CAP_SYS_PTRACE` (no reading another process's memory); `NoNewPrivileges`; address families restricted to exclude `AF_PACKET`. On macOS the generated Seatbelt profile SHALL deny the equivalents where the platform exposes them — raw/packet networking, inspection of other processes, AND privilege elevation.
+- **Process-table restriction.** On Linux, `/proc` mounted so the subprocess cannot read another process's `environ` or `mem`. On macOS (which has no `/proc`), the Seatbelt profile SHALL deny process-information access to other processes.
+
+Outbound network egress SHALL NOT be restricted by this sandbox: network egress control belongs to the host firewall, not the daemon. The sandbox does filesystem and host isolation, not a network allowlist.
+
+#### Scenario: The executor sees the host toolchains under an exposed home
+- **WHEN** the executor spawns through `agentic_run` under the default (denylist) policy
+- **THEN** the home directory and its build toolchains (e.g. `~/.cargo`, `~/.pyenv`, `~/.nvm`) are readable AND tool caches are writable
+- **AND** the workspace is read-write
+
+#### Scenario: A masked credential is unreadable even via Bash
+- **WHEN** the spawned agent attempts to read a mask-listed credential (e.g. `~/.ssh/id_ed25519`, another CLI's store, or `~/.cargo/credentials.toml`) through any tool, including a `Bash` command such as `cat`, `head`, or `python -c open()`
+- **THEN** the read fails because the path is masked
+- **AND** the failure does not depend on the wrapped CLI's own permission rules
+
+#### Scenario: A masked persistence file cannot be written
+- **WHEN** the spawned agent attempts to write a mask-listed persistence file (e.g. `~/.bashrc` or `~/.ssh/authorized_keys`)
+- **THEN** the write does not persist to the real file because the path is masked
+
+#### Scenario: Read-only roles get a home-masked allowlist with the CLI binary bound
+- **WHEN** a read-only role (an audit or an agentic reviewer) spawns through `agentic_run`
+- **THEN** the home directory is masked AND the role sees only the read-only workspace, its own CLI store, the resolved CLI binary (following symlinks, even under `~/.local/bin`) plus its dependency closure, and the minimal runtime
+- **AND** an attempt by that role to modify a workspace file fails
+
+#### Scenario: The CLI binary is reachable regardless of policy
+- **WHEN** the running role's CLI binary is installed under the home directory (e.g. `~/.local/bin/<cli>`)
+- **THEN** under the executor's exposed-home policy it is simply visible (home is present)
+- **AND** under an allowlist policy (a read-only role or strict mode) it is bound — following symlinks — with its dependency closure, read-only and executable, so the wrapped CLI execs
+
+#### Scenario: Capability drops block sniffing and cross-process reads
+- **WHEN** the spawned agent attempts to open a raw/packet socket OR to ptrace or read another process's memory
+- **THEN** the operation fails because the capability is not in the subprocess's bounding set
+
+#### Scenario: Enforcement is external to the CLI
+- **WHEN** the wrapped CLI's own sandbox configuration would otherwise permit a masked or out-of-allowlist read
+- **THEN** the read still fails, because the OS-level policy is enforced by the kernel around the subprocess regardless of the CLI's settings
+
+#### Scenario: Fallback on a host without a usable system manager
+- **WHEN** the daemon runs where `systemd-run` cannot apply the sandbox (unprivileged or non-systemd environment) AND `bwrap` is available
+- **THEN** `agentic_run` applies the equivalent policy via the `bwrap` fallback
+- **AND** no unsandboxed subprocess is spawned
+
+#### Scenario: macOS applies the sandbox via sandbox-exec
+- **WHEN** the daemon runs on macOS
+- **THEN** `agentic_run` applies the OS-level policy via `sandbox-exec` with a generated Seatbelt profile (exposed-home-minus-mask-list for the executor; the allowlist for read-only roles)
+- **AND** no unsandboxed subprocess is spawned
+
+#### Scenario: Strict mode masks all of home for the executor
+- **WHEN** the operator opts the executor into strict mode
+- **THEN** the executor runs under the allowlist (home masked; only the workspace read-write, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime bound)
+
+### Requirement: CLI config stores are protected by OS-hide and engine-deny
+A model running as one CLI SHALL NOT be able to read another CLI's credential/config store, AND SHALL be deterred from reading its own. Two complementary layers enforce this, each independently toggleable (`os_hide`, `engine_deny`), both ON by default:
+
+- **`os_hide` (mask-list membership).** The config store of every CLI OTHER than the running role's own is in the sandbox **mask-list**, so it is masked (absent) from the subprocess regardless of the role's filesystem policy. It cannot protect the running role's OWN store, which must stay readable for the CLI to authenticate; it protects every other store. Turning `os_hide` off removes the other CLI stores from the mask-list (exposing them, for the wrapper-development case).
+- **`engine_deny` (the wrapped CLI's own permission denylist; fail-open).** The per-invocation tool-use settings the executor already supplies to the CLI (the canonical "Tool-use sandbox is applied at every spawn" mechanism) SHALL deny the agent's file-reading tools (`Read`, AND the corresponding `Bash` patterns) on the config store of EVERY registered CLI strategy — the running role's own included. This covers the self-store that `os_hide` cannot, but is a string-pattern speed bump that determined shell indirection can evade: it deters, it does not bound.
+
+The engine-deny rules SHALL be supplied per-invocation through each CLI's own settings mechanism (as the existing tool-use sandbox already does for `claude`), NOT by mutating the operator's global CLI configuration.
+
+The running role's own CLI store stays readable by that same-uid subprocess because the CLI must read it to authenticate; disclosure of that one store means a model could impersonate that CLI to its own provider, never reach another provider's credential or another secret. This residual is NOT network-contained (egress is out of scope); it is bounded by the single-store blast radius AND by `engine_deny` deterrence.
+
+#### Scenario: Under the default, another CLI's store is unreadable
+- **WHEN** a role running as one CLI attempts to read a different registered CLI's config store under the default (`os_hide` on)
+- **THEN** that store is absent from the namespace AND the read fails
+
+#### Scenario: With os_hide off, other stores are still engine-denied
+- **WHEN** `os_hide` is off for the run AND `engine_deny` is on
+- **THEN** another CLI's config store is present in the namespace (so a nested CLI of that kind could authenticate)
+- **AND** the agent's `Read`/`Bash` tools are denied that store's paths at the CLI permission layer
+
+#### Scenario: The self-store authenticates but is engine-denied to the agent
+- **WHEN** a role runs as a CLI whose own config store is in the namespace read-only for authentication
+- **THEN** the CLI authenticates from that store
+- **AND** the agent's `Read`/`Bash` tools are denied that store's paths at the CLI permission layer
+
+#### Scenario: Deny rules are per-invocation, not global mutation
+- **WHEN** the engine-deny rules are applied for a run
+- **THEN** they are delivered via the per-invocation settings mechanism (e.g. the temp Claude Code settings file)
+- **AND** the operator's global CLI configuration is not modified
+
+### Requirement: Issue-flavored implementer prompt verifies against existing canon
+When the executor runs an issue (an `issues/<slug>/` unit, NOT a change), it SHALL use an issue-flavored implementer prompt that instructs: fix the code to match the EXISTING specification; do NOT invent or write a spec change; AND if the fix actually requires new or changed behavior, report that the item belongs in the changes lane (kick it back) rather than altering any spec. The prompt SHALL be loaded through the uniform PromptLoader AND declare its override field via the nested naming convention. Acceptance for an issue run SHALL be verified against the existing canon, not a spec delta.
+
+#### Scenario: An issue run uses the issue-flavored prompt
+- **WHEN** the executor runs an `issues/<slug>/` unit
+- **THEN** it uses the issue-flavored implementer prompt (fix-to-existing-spec framing)
+- **AND** not the change implementer prompt
+
+#### Scenario: A behavior-change fix is kicked back to changes
+- **WHEN** an issue's fix would require new or changed behavior
+- **THEN** the run reports that the item belongs in the changes lane
+- **AND** it does NOT modify any spec
+
+#### Scenario: Acceptance is evaluated against canon
+- **WHEN** an issue run completes
+- **THEN** its acceptance is evaluated against the existing specification, not a spec delta
+
+### Requirement: Public issue body is quarantined as untrusted data in the implementer prompt
+When an issue originates from a public author, the implementer prompt SHALL embed the issue body as DATA inside a robust delimiter — NOT a markdown fence the body can break out of — with an explicit untrusted-report framing. The task AND scope SHALL come from the lane and the maintainer-approved classification, NEVER from the body. Single-pass substitution SHALL prevent `{{token}}` expansion of placeholder-looking text inside the body.
+
+#### Scenario: The body is embedded as untrusted data
+- **WHEN** a public-origin issue is run
+- **THEN** its body is placed in a delimited untrusted-data region distinct from the instruction region
+- **AND** the delimiter is not a markdown fence the body can break out of
+
+#### Scenario: Body instructions do not become the task
+- **WHEN** the issue body contains instruction-like text
+- **THEN** the task is taken from the maintainer-approved classification, not from the body
+
+#### Scenario: No token expansion inside the body
+- **WHEN** the issue body contains `{{token}}`-looking text
+- **THEN** it is not expanded during prompt construction
+
+### Requirement: Agentic subprocesses inherit the operator's activated toolchain environment, credential-filtered
+The daemon SHALL capture the operator's login-shell environment — the activated `PATH` AND toolchain-activation variables (e.g. `PYENV_ROOT`, `RBENV_ROOT`, `NVM_DIR`, `CARGO_HOME`, `GOPATH`, `POETRY_*`) that shell initialization (`~/.bashrc` / `~/.profile`) sets up — AND provide it to every agentic subprocess through `agentic_run`, so toolchains activated by shell init (pyenv, rbenv, poetry, nvm) are usable, not merely present on disk. Capture SHALL be best-effort (dumping a login shell's environment) AND SHALL degrade gracefully: a partial or empty capture still proceeds with the base environment rather than failing the run.
+
+The captured environment SHALL be **credential-filtered**: it propagates `PATH` and toolchain-activation variables but SHALL NOT propagate variables matching credential patterns — names containing `TOKEN`, `SECRET`, `KEY`, or `PASSWORD`, or known provider prefixes such as `AWS_` / `ANTHROPIC_` — so secrets the operator's shell exports never reach the model, including provider API keys (which as an env value would also bill the wrapped CLI off its subscription, per the key-flow requirement). The exclusion set SHALL ship with defaults AND be operator-editable. Where a captured variable conflicts with a variable the run itself sets (sandbox or strategy), the run's value SHALL take precedence.
+
+#### Scenario: A shell-activated toolchain is runnable in the subprocess
+- **WHEN** a toolchain is activated only by the operator's shell init (e.g. `pyenv` / `poetry` via `~/.bashrc`) AND the captured environment is provided to the agentic subprocess
+- **THEN** the toolchain's commands resolve and run in the subprocess (the managed `python` / `poetry`), not the bare system fallback
+
+#### Scenario: Credential variables are not propagated
+- **WHEN** the operator's login-shell environment exports a credential-bearing variable (e.g. `FOO_TOKEN` or `ANTHROPIC_API_KEY`)
+- **THEN** that variable is excluded from the environment provided to the agentic subprocess
+
+#### Scenario: Run-set variables take precedence
+- **WHEN** a captured variable conflicts with one the sandbox or strategy sets for the run
+- **THEN** the run's value is used, not the captured one
+
+#### Scenario: Partial capture degrades gracefully
+- **WHEN** the login-shell environment capture fails or returns only a partial environment
+- **THEN** the agentic run still proceeds with the base environment, without crashing or aborting
+
+### Requirement: AntigravityStrategy implements the `agy` CLI for agentic roles
+The daemon SHALL provide a third `CliStrategy` (a56), `AntigravityStrategy`, for Google's Antigravity CLI (`agy`), so a role whose model provider resolves to `antigravity` (a55's `provider → CLI` rule for the Google/Antigravity provider, OR an explicit registry `cli: antigravity`) runs agentically instead of erroring with "no registered strategy." Antigravity CLI is the successor to the sunset Gemini CLI; the strategy targets `agy`, NOT `gemini`.
+
+`AntigravityStrategy` SHALL build an `agy` invocation that: runs single-shot command mode (`agy -p "<prompt>"`, capture); selects the model via `--model <model>` (default `gemini-3-pro`); writes an `mcp_config.json` into the workspace carrying the MCP server entry (the MCP-child `command`/`args`, AND `env` including `ORCH_MCP_ROLE`, local stdio transport); AND maps a56's sandbox (allowed-tools list + deny patterns) onto Antigravity's tool restriction so a read-only role exposes only the read tools plus the role's `submit_*` tool and denies shell/write/edit. It SHALL set Antigravity's auth env (`AV_API_KEY`), NOT any `ANTHROPIC_*` (the claude strategy's mechanism), AND SHALL write neither `.mcp.json` (claude) NOR `opencode.json` (opencode).
+
+`AntigravityStrategy` SHALL run in capture mode; the streaming-JSON event path (`final_answer` / `session_id` / incremental log) is claude-specific (Antigravity's `--stream` emits SSE, a different format). agy therefore serves the capture-mode structured-submission roles (the advisory audits, the reviewer, the contradiction check); the executor's streaming implementer path remains on the claude strategy until the strategy-agnostic-implementer change generalizes it. The agy integration SHALL surface MCP tool calls AND surface a daemon-rejected submission to the model as a correctable tool error it can retry in the same session — the same submission contract a56 requires of the claude path.
+
+Because the exact non-interactive tool-restriction mechanism is confirmed by the integration spike, a read-only agy role SHALL NOT rely on the tool restriction alone: the existing read-only post-hoc write enforcement (`WritePolicy::None` — a non-empty post-run `git status --porcelain` reverts via `git reset --hard HEAD` AND fails the run) applies, so any write that escapes is caught and reverted rather than corrupting the workspace. The integration spike SHALL verify the restriction holds under `agy -p`.
+
+Registering `agy` unblocks the non-Anthropic agentic paths of the reviewer (a58) AND the contradiction check (a59) for Google models; it does NOT change any role's default transport.
+
+#### Scenario: Antigravity provider resolves to a working strategy
+- **WHEN** a role's model resolves (via a55's `provider → CLI` rule, OR an explicit `cli: antigravity`) to the `agy` CLI
+- **THEN** strategy resolution returns `AntigravityStrategy` (NOT a "no registered strategy" error)
+- **AND** it builds an `agy -p` invocation selecting the model via `--model <model>`
+
+#### Scenario: MCP and role env are delivered via mcp_config.json
+- **WHEN** an `agy` role runs with a structured-submission tool (e.g. `submit_review`)
+- **THEN** the strategy writes `mcp_config.json` with the MCP server entry (the MCP-child `command`/`args`, AND `env` including `ORCH_MCP_ROLE`, local stdio) so the role's `submit_*` tool is reachable
+- **AND** neither `.mcp.json` NOR `opencode.json` is written for that run
+
+#### Scenario: Model selection targets Antigravity auth, not Anthropic env
+- **WHEN** the resolved model is a Google/Antigravity model (e.g. `gemini-3-pro`)
+- **THEN** the invocation selects it via `--model <model>` AND the Antigravity auth env (`AV_API_KEY`) is set
+- **AND** none of `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` is set
+
+#### Scenario: Read-only sandbox denies write/edit/shell
+- **WHEN** a read-only role (a56 sandbox: allow Read/Glob/Grep; deny Write/Edit/Bash) runs under agy
+- **THEN** the generated Antigravity tool restriction exposes only the read tools plus the role's `submit_*` tool
+- **AND** it denies shell, write, AND edit tools
+
+#### Scenario: A write that escapes the restriction is caught by the post-hoc revert
+- **WHEN** a read-only agy role nonetheless produces a non-empty post-run `git status --porcelain` (the non-interactive policy gap the spike probes)
+- **THEN** the `WritePolicy::None` enforcement reverts the workspace via `git reset --hard HEAD` AND fails the run
+- **AND** the escaped write does NOT persist into the workspace
+
+#### Scenario: Capture mode only; streaming stays on claude
+- **WHEN** an `agy` role runs through `agentic_run`
+- **THEN** it uses capture mode (stdout/stderr read at exit), NOT the streaming-JSON parse path
+- **AND** the executor's streaming implementer path continues to use the `claude` strategy
+
+#### Scenario: Submission contract holds under agy
+- **WHEN** an `agy` role's agent calls its `submit_*` tool AND the daemon rejects the payload (schema-invalid)
+- **THEN** the rejection reaches the model as a tool error it can correct AND retry within the same `agy` session
+- **AND** this matches the correctable-tool-error contract a56 requires of the `claude` path
+
+#### Scenario: Non-Anthropic agentic roles function under agy
+- **WHEN** the reviewer (`reviewer.kind: agentic`) OR the contradiction check is configured with a Google/Antigravity model
+- **THEN** the role runs agentically via `AntigravityStrategy`
+- **AND** it no longer errors / fails open on "no registered strategy"
+
+### Requirement: Implementer runs through any CliStrategy
+The implementer SHALL run through whichever `CliStrategy` its model resolves to (per a55's `provider → CLI` rule / an explicit `cli:`), not the `claude` strategy alone. For a capture-mode strategy (e.g. `opencode`, `antigravity`), the implementer SHALL run via `agentic_run` in capture mode: the structured outcome (Completed / AskUser / Failed) AND the agent's `final_answer` summary SHALL be delivered via the MCP outcome relay (`outcome_*` / `record_outcome`) rather than parsed from streaming-JSON, since the streaming-JSON event path is claude-specific.
+
+The streaming (live-log) implementer path remains claude-specific (per a60's `OpencodeStrategy` requirement); a capture-mode implementer runs WITHOUT the live incremental log. This is additive: the default implementer remains `claude` (streaming + `final_answer` + `session_id` unchanged), AND no role's default transport changes. It unblocks `opencode` AND `antigravity` as operator-selectable implementers.
+
+#### Scenario: A capture-mode strategy implements a change end-to-end
+- **WHEN** the implementer's model resolves to a capture-mode strategy (`opencode` OR `antigravity`) AND it runs a change through `agentic_run`
+- **THEN** it runs in capture mode (no streaming-JSON parse, no live log)
+- **AND** a `Completed` outcome AND the `final_answer` summary arrive via the MCP outcome relay
+- **AND** the agent branch is updated exactly as it is for the claude implementer
+
+#### Scenario: Capture-mode final_answer comes via the relay, not stream-JSON
+- **WHEN** a capture-mode implementer finishes
+- **THEN** its `final_answer` is taken from the outcome submission payload
+- **AND** no streaming-JSON `final_answer` parse is attempted for that run
+
+#### Scenario: The claude implementer is unchanged
+- **WHEN** the implementer's model resolves to the `claude` strategy (the default)
+- **THEN** it runs in streaming mode with the live log, parsed `final_answer`, AND `session_id` exactly as before
+- **AND** an operator who configures no implementer CLI gets `claude`
+
+### Requirement: Every agentic role cleans up the session it creates
+Any role that runs through `agentic_run` — the implementer AND every single-shot agentic role (the advisory audits, the reviewer, the contradiction check, AND any future agentic role) — SHALL remove the session it created from the CLI's session store when the role is done with it. The CLIs persist a transcript per invocation in the operator's home directory (`~/.claude/projects/<hash>/`, `~/.antigravity/<hash>/`, OpenCode's store); left alone these accumulate without bound. The principle: a run that creates litter — even when it is upstream software writing into the home directory — cleans it up at the end.
+
+"Done with it" is role-dependent: a single-shot role (which never resumes) prunes on run completion; the implementer (which may retain a session across AskUser — see the implementer-resume requirement) prunes on its terminal outcome (the change archives/completes OR fails terminally).
+
+The prune SHALL be surgical: it removes ONLY the specific session record the run created, addressed by that session's identifier, via the CLI's own session-delete mechanism (Antigravity's session delete under `~/.antigravity/`; the specific Claude `<uuid>` record under `~/.claude/projects/<hash>/`; OpenCode's session deletion). It SHALL NOT remove settings, memory/context files (`CLAUDE.md` / `AGENTS.md` / project memories), credentials, OR the generated MCP config — only the session record. (Claude's store is known to grow unbounded and to risk destroying settings and auth when the disk fills, so the prune is deliberately surgical rather than a directory wipe.)
+
+#### Scenario: A single-shot agentic role prunes its session on completion
+- **WHEN** an advisory audit, the reviewer, OR the contradiction check finishes its agentic run
+- **THEN** the session record it created is removed by its identifier via the CLI's session-delete mechanism
+- **AND** nothing it created persists in the CLI's session store
+
+#### Scenario: The implementer prunes on terminal outcome, not while waiting
+- **WHEN** the implementer reaches a terminal outcome (archives/completes OR fails terminally)
+- **THEN** the session it created is removed
+- **AND** while the change is instead waiting on an AskUser answer, the session is retained (NOT pruned)
+
+#### Scenario: The prune is surgical
+- **WHEN** any agentic role prunes the session it created
+- **THEN** only that session's record is removed, addressed by its identifier
+- **AND** settings, memory/context files, credentials, AND the generated MCP config remain intact
+
+### Requirement: Implementer resumes its session on AskUser; resume failure requeues
+On an AskUser outcome, the implementer SHALL submit the question via the outcome relay AND end the run with the change in the waiting state, retaining the agentic session (the cleanup requirement does NOT prune a retained session until the implementer's terminal outcome). When the operator answers, the implementer SHALL resume the same agentic session via the resolved strategy's native headless resume mechanism — `claude` via the captured `session_id`, `opencode` via `--session <id>`, `antigravity` via its session-resume mechanism — delivering the answer into that session.
+
+If the session cannot be restored (not found, corrupt, OR expired by the CLI's own retention), the implementer SHALL NOT fall back to a fresh-run-with-answer. It SHALL treat the attempt as a retryable failure AND requeue the change via the existing failure-counter path (repeated failures escalate per the existing perma-stuck policy). No stash-and-recombine path exists.
+
+#### Scenario: AskUser retains the session and waits
+- **WHEN** the implementer returns an AskUser outcome
+- **THEN** the question is posted via the outcome relay AND the change enters the waiting state
+- **AND** the agentic session is retained
+
+#### Scenario: The operator's answer resumes the same session
+- **WHEN** the operator answers a waiting AskUser AND the session is restorable
+- **THEN** the implementer resumes that same session via the strategy's native mechanism (`session_id` / `--session` / `--resume`) AND delivers the answer into it
+
+#### Scenario: Resume failure requeues the change with no fallback
+- **WHEN** the operator answers but the session cannot be restored (not found / corrupt / expired)
+- **THEN** the implementer does NOT start a fresh-run-with-answer
+- **AND** the change is requeued as a retryable failure via the existing failure-counter path
+- **AND** repeated resume failures escalate under the existing perma-stuck policy
+
+### Requirement: Agentic run surfaces a precondition-unmet failure distinct from a run failure
+When an agentic run cannot start because a required precondition is unmet — the agent subprocess never spawns (e.g. no usable OS-level sandbox mechanism is available, per the sandbox-mechanism gate) — the executor SHALL surface a classifiable **precondition-unmet** failure, distinct from a substantive `Failed` outcome where the subprocess ran and then the task failed. The distinction SHALL be carried by the outcome/error **kind**, NOT by matching a substring of the message, so callers can branch on it reliably.
+
+#### Scenario: The sandbox-mechanism gate yields a precondition-unmet failure
+- **WHEN** an agentic run is attempted on a host with no usable sandbox mechanism AND the operator has not opted into unsandboxed operation
+- **THEN** the executor surfaces a precondition-unmet failure (the subprocess never started)
+- **AND** it is distinguishable by kind from a substantive run failure
+
+#### Scenario: A substantive run failure is not precondition-unmet
+- **WHEN** the agent subprocess starts and then fails (e.g. a non-zero exit after running)
+- **THEN** the executor surfaces a substantive `Failed` outcome
+- **AND** it is NOT classified as precondition-unmet
+
+### Requirement: submit_canon_internal_contradictions MCP tool returns canon-internal contradictions
+The per-execution MCP child SHALL advertise a `submit_canon_internal_contradictions` tool — built on a56's per-role submission framework — whenever `ORCH_MCP_ROLE = canon_contradiction_audit`, AND SHALL NOT advertise it for any other role. The tool's payload schema SHALL be `{ contradictions: [{ capability_a: string, requirement_a: string, capability_b: string, requirement_b: string, summary: string }] }` — each finding names BOTH conflicting canonical requirements (by capability AND title). The schema is symmetric (both sides canonical), distinguishing it from a62's `submit_canon_contradictions`, which names a change requirement against a canonical one. The tool relays through a56's `relay_submission` → `record_submission`; a schema-invalid payload is rejected AND surfaced to the agent as a correctable tool error it can retry in the same session.
+
+Because the audit reports advisorily (an empty result is a clean canon, not a failure), a session that ends with no stored submission SHALL be consumed as an empty result rather than an error.
+
+#### Scenario: Advertised only for the canon-contradiction-audit role
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = canon_contradiction_audit`
+- **THEN** the `tools/list` response advertises `submit_canon_internal_contradictions` with the canon-internal-contradictions schema alongside the common tools
+- **WHEN** the MCP child starts with any other role (`implementer`, `reviewer`, `canon_contradiction_check`, an advisory audit)
+- **THEN** `submit_canon_internal_contradictions` is NOT advertised
+
+#### Scenario: Valid submission is consumed by the caller
+- **WHEN** the agent calls `submit_canon_internal_contradictions` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the session exits the daemon `consume_submission`s the stored payload for the audit to turn into `AuditOutcome::Reported` findings
+
+#### Scenario: Schema-invalid submission is correctable
+- **WHEN** a `submit_canon_internal_contradictions` payload fails the schema (missing `requirement_b`, non-array `contradictions`)
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+
+#### Scenario: Missing submission consumed as empty, not an error
+- **WHEN** a `canon_contradiction_audit` session exits with no stored submission for the execution
+- **THEN** `consume_submission` returns an empty result
+- **AND** the tool layer does NOT raise an error — the audit reports a clean canon
+
+### Requirement: Agentic run model resolution for audits
+The agentic run primitive SHALL accept an optional `ResolvedModel` parameter when invoked for periodic audits. When a model is provided, the audit runner SHALL dynamically select the appropriate `CliStrategy` (e.g., `ClaudeStrategy`, `OpencodeStrategy`, `AntigravityStrategy`) based on the resolved model's provider using the `strategy_for_provider` function, rather than hardcoding a single strategy. The resolved model SHALL be passed to the CLI execution command, ensuring the CLI receives the appropriate `--model <provider>/<model>` flag (or equivalent) when supported by the strategy.
+
+#### Scenario: Audit runs with a resolved OpenRouter model
+- **WHEN** an audit is executed with a `ResolvedModel` where the provider is `openai_compatible`
+- **THEN** the audit runner selects the `OpencodeStrategy`
+- **AND** the CLI command includes the `--model openai_compatible/<model_name>` flag
+- **AND** the CLI is invoked with the provider's configured API key and base URL
+
+#### Scenario: Audit runs with a resolved Anthropic model
+- **WHEN** an audit is executed with a `ResolvedModel` where the provider is `anthropic`
+- **THEN** the audit runner selects the `ClaudeStrategy`
+- **AND** the CLI command includes the `--model anthropic/<model_name>` flag (if applicable to the CLI)
+- **AND** the CLI is invoked with the provider's configured API key
+
+#### Scenario: Audit runs without a model (backward compatibility)
+- **WHEN** an audit is executed with `None` for the model parameter
+- **THEN** the audit runner defaults to the `ClaudeStrategy`
+- **AND** no `--model` flag is appended to the CLI command
+- **AND** the CLI uses its locally configured default model and authentication
+
+### Requirement: OS sandbox exposes the daemon control socket to the sandboxed relay
+Every agentic role relays its structured result to the daemon over the Unix-domain control socket via the per-execution MCP child, which runs INSIDE the OS-level sandbox. The OS sandbox SHALL therefore bind the daemon's control socket into the child's mount namespace, read-only, so the relay can `connect()` to it. (A read-only bind is sufficient: connecting to a Unix-domain socket is a socket operation, not a filesystem write.) The bind SHALL be applied in every mechanism — `systemd-run`, `bwrap`, AND `sandbox-exec` — AND under every filesystem policy — the executor's denylist AND the read-only roles' allowlist.
+
+The bind SHALL be applied so that it survives the policy's masking steps: the private `/tmp` (systemd `PrivateTmp=yes` / bwrap `--tmpfs /tmp`) AND the masked home (allowlist `ProtectHome=tmpfs` / `--tmpfs <home>`). A control socket residing under `/tmp` or under a masked home SHALL remain connectable from inside the sandbox.
+
+When no control socket is configured for the run (the relay env var is unset), no such bind SHALL be added.
+
+This does not widen the sandbox trust boundary: the control socket is the intended, already-authorized relay channel for these roles, and the daemon validates every request it receives — exposing the socket only lets the sanctioned relay succeed.
+
+#### Scenario: Control socket is bound under the executor (denylist) policy
+- **WHEN** the executor spawns under the OS sandbox AND a control socket is configured for the run
+- **THEN** the constructed sandbox invocation binds the control-socket path into the namespace read-only
+- **AND** the relay's `connect()` to the socket succeeds from inside the sandbox
+
+#### Scenario: Control socket is bound under a read-only role (allowlist) policy
+- **WHEN** a read-only role (an audit or an agentic reviewer) spawns under the OS sandbox AND a control socket is configured
+- **THEN** the constructed sandbox invocation binds the control-socket path into the namespace read-only, even though the home directory is masked
+
+#### Scenario: A control socket under /tmp survives the private-tmp masking
+- **WHEN** the control socket resides under `/tmp` (the runtime directory fell back to the per-uid temp location) AND the sandbox applies a private `/tmp`
+- **THEN** the control-socket bind is applied AFTER the private-`/tmp` masking
+- **AND** the socket remains present AND connectable inside the namespace
+
+#### Scenario: No control socket configured adds no bind
+- **WHEN** no control socket is configured for the run (the relay env var is unset)
+- **THEN** the constructed sandbox invocation adds no control-socket bind
+

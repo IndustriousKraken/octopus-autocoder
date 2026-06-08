@@ -324,3 +324,95 @@ The helper exposing the staged AND worktree codes lets callers distinguish stage
 - **THEN** the path reaches `is_in_scope` intact AND is accepted
 - **AND** the diff is NOT refused as out-of-scope
 
+### Requirement: Forge provider abstraction
+The daemon SHALL route every forge **API** operation through a single `Forge` trait whose concrete implementation is selected per repository by the repository URL's host. The trait surface SHALL cover everything coupled to the forge today: repository-URL parsing; PR/MR lifecycle (open, list-open, find-by-head, set-draft); comment listing-since AND posting; review posting; fork creation; commenter authorization; AND the push-only branch hint. The git operations (clone, fetch, branch, commit, push) are NOT part of the trait — they use the raw URL and the `origin` remote and remain host-neutral.
+
+This change SHALL provide the `GithubForge` implementation, reproducing the current GitHub behavior exactly: today's `github.rs` REST shapes, the `author_association`-based authorization gate, AND the draft-PR handling. It SHALL NOT introduce a second provider or any operator-visible behavior change; it is a behavior-preserving extraction whose correctness is established by the existing GitHub tests passing unchanged through the trait. After the change, no direct forge REST call SHALL exist outside the forge module — every forge call site goes through the trait (single source of truth).
+
+Provider selection SHALL resolve from the repository URL host: a GitHub host resolves to `GithubForge`. A host with no registered forge provider SHALL return a clear error naming the host, AND no forge API operation SHALL proceed for that repository — preserving today's rejection of non-GitHub URLs until a later change registers an additional provider.
+
+#### Scenario: A GitHub repository resolves to the GitHub forge
+- **WHEN** the daemon performs a forge operation for a repository whose URL host is GitHub
+- **THEN** the operation is served by `GithubForge`
+- **AND** it behaves identically to the pre-extraction `github.rs` (same REST shapes AND results)
+
+#### Scenario: Forge API calls have a single source of truth
+- **WHEN** the codebase is searched after this change
+- **THEN** no forge REST API call exists outside the forge module
+- **AND** every PR/MR-lifecycle, comment, review, fork, AND authorization call site goes through the `Forge` trait
+
+#### Scenario: An unsupported forge host returns a clear error
+- **WHEN** a repository URL resolves to a host with no registered forge provider
+- **THEN** forge resolution returns an error naming the host
+- **AND** no forge API operation is attempted for that repository
+
+#### Scenario: Commenter authorization rides the forge
+- **WHEN** a forge-sourced command (e.g. `@<bot> revise`) is evaluated for authorization
+- **THEN** the selected forge decides the commenter's authorization
+- **AND** `GithubForge` applies the GitHub `author_association` gate exactly as before
+
+#### Scenario: Git operations are unchanged
+- **WHEN** the daemon clones, fetches, branches, commits, or pushes for any repository
+- **THEN** those operations use the raw URL and the `origin` remote
+- **AND** they do NOT route through the `Forge` trait
+
+### Requirement: GitLab forge provider
+autocoder SHALL provide a `GitlabForge` implementation of the `Forge` trait so a GitLab-hosted repository is first-class for the daily loop. `GitlabForge` SHALL implement the trait against GitLab's API:
+
+- **`parse_repo`** extracts the GitLab host AND the URL-encoded `namespace/project` path, supporting nested groups (e.g. `group/subgroup/project`).
+- **MR lifecycle.** `open_pr` creates a merge request; `list_open_prs` lists open merge requests; `find_pr_by_head` matches an MR by its source branch; `set_pr_draft` toggles GitLab's `Draft:` title prefix (GitLab marks an MR draft via that prefix, not a flag).
+- **Comments.** `list_comments_since` AND `post_comment` operate on MR notes.
+- **Reviews.** `post_review` maps the verdict onto GitLab: approve → MR approval; request-changes AND comment → an MR note (GitLab has no distinct request-changes state).
+- **Authorization.** `authorize` maps the commenter's GitLab member access level: Developer, Maintainer, AND Owner are authorized; Reporter AND Guest are not. This mirrors the GitHub `author_association` gate.
+- **`branch_url`** produces the GitLab MR-create hint (`glab mr create` / MR web URL) for the push-only path.
+
+#### Scenario: Merge-request lifecycle round-trips
+- **WHEN** the daily loop opens, lists, and looks up a merge request for a GitLab repository
+- **THEN** `GitlabForge` creates the MR, lists it among open MRs, AND finds it by its source branch
+
+#### Scenario: Draft toggles via the title prefix
+- **WHEN** `set_pr_draft(true)` then `set_pr_draft(false)` is called for a GitLab MR
+- **THEN** the MR title gains the `Draft:` prefix AND then has it removed
+
+#### Scenario: Review verdict maps to GitLab
+- **WHEN** `post_review` is called with an approve verdict
+- **THEN** the MR is approved
+- **AND** a request-changes or comment verdict instead posts an MR note (GitLab has no request-changes state)
+
+#### Scenario: Authorization by access level
+- **WHEN** `authorize` evaluates a commenter whose GitLab access level is Developer, Maintainer, or Owner
+- **THEN** the commenter is authorized
+- **AND** a commenter at Reporter or Guest is not authorized
+
+#### Scenario: Repository parsing handles nested groups
+- **WHEN** `parse_repo` is given a GitLab URL with a nested-group path
+- **THEN** it returns the GitLab host AND the URL-encoded `namespace/project` path covering the nested groups
+
+### Requirement: Forge provider lists open issues via the authenticated API
+The `Forge` trait surface SHALL include listing a repository's open issues, so issue reads use the SAME authenticated forge API AND the SAME configured credential as the rest of the trait (PR/MR lifecycle, comments, reviews, authorization) — NOT a separate CLI with its own credential store.
+
+`GithubForge` SHALL list open issues via the GitHub REST API (`GET /repos/<owner>/<repo>/issues?state=open`, paginated) authenticated with the repository's configured token — the same per-owner-routed PAT used for PR creation — AND SHALL exclude pull-request entries (the GitHub issues endpoint interleaves PRs, marked by a `pull_request` object). `GitlabForge` SHALL list open issues via the GitLab issues API authenticated with its configured token.
+
+Every daemon code path that reads a repository's open issues — the scout handler's issue input AND the hybrid issue-ingestion triage — SHALL obtain them through this trait operation, preserving the trait's single-source-of-truth principle (no forge call outside the forge module). The standalone `gh` CLI SHALL NOT be required for issue reading: an operator who has configured the GitHub token for PR operations SHALL NOT need a separate `gh auth login`.
+
+A failure of the forge open-issue listing (auth, rate limit, network) SHALL be surfaced to the caller as an error so the caller can degrade gracefully (the scout/ingestion callers log a WARN AND continue with an empty issue list), NOT panic or abort the iteration.
+
+#### Scenario: Open-issue listing uses the configured forge credential
+- **WHEN** the daemon reads a repository's open issues
+- **THEN** the request goes through the `Forge` trait using the same configured token as PR operations
+- **AND** no separate CLI credential (e.g. `gh auth login`) is required
+
+#### Scenario: Pull requests are excluded from the issue list
+- **WHEN** the GitHub issues endpoint returns pull-request entries interleaved with issues
+- **THEN** `GithubForge` excludes the pull-request entries from the returned open-issue list
+
+#### Scenario: Issue reads route through the trait
+- **WHEN** the codebase is searched after this change
+- **THEN** the scout handler AND the issue-ingestion triage obtain open issues through the `Forge` trait
+- **AND** no open-issue read shells out to the `gh` CLI
+
+#### Scenario: A forge issue-read failure is non-fatal
+- **WHEN** the forge's open-issue listing fails (auth, rate limit, network)
+- **THEN** the listing returns an error to the caller
+- **AND** the caller logs a WARN naming the failure AND continues with an empty issue list
+

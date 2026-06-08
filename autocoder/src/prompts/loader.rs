@@ -44,6 +44,10 @@ use std::sync::Mutex;
 pub enum PromptId {
     /// `prompts/implementer.md` — main implementer template.
     Implementer,
+    /// `prompts/implementer-issue.md` — issue-flavored implementer
+    /// template (a009): fix the code to match the EXISTING spec; write no
+    /// spec change; kick a behavior-change fix back to the changes lane.
+    ImplementerIssue,
     /// `prompts/implementer-revision.md` — revision-loop template.
     ImplementerRevision,
     /// `prompts/changelog-stylist.md` — chat-driven changelog stylist.
@@ -54,6 +58,9 @@ pub enum PromptId {
     AuditTriage,
     /// `prompts/chat-request-triage.md` — `propose` triage.
     ChatRequestTriage,
+    /// `prompts/issue-report-triage.md` — read-only triage of a reported
+    /// GitHub issue for the a010 hybrid issues-lane ingestion.
+    IssueReportTriage,
     /// `prompts/architecture-consultative.md` — consultative audit.
     AuditArchitectureConsultative,
     /// `prompts/drift-audit.md` — drift audit.
@@ -64,6 +71,12 @@ pub enum PromptId {
     AuditSecurityBug,
     /// `prompts/documentation-audit.md` — documentation audit.
     AuditDocumentation,
+    /// `prompts/canon-contradiction-audit.md` — canon-internal
+    /// contradiction audit (a75).
+    AuditCanonContradiction,
+    /// `prompts/canon-consolidation-audit.md` — canon-consolidation
+    /// audit (a76): proposes merging redundant canonical requirements.
+    AuditCanonConsolidation,
     /// `prompts/brownfield-draft.md` — brownfield-draft handler.
     BrownfieldDraft,
     /// `prompts/brownfield-survey.md` — brownfield-survey handler (a29).
@@ -79,9 +92,28 @@ pub enum PromptId {
     /// Wired through the loader by a future change.
     #[allow(dead_code)]
     ChangeContradictionCheck,
+    /// `prompts/change-vs-canonical-check.md` — the `[canon]` gate's
+    /// change-vs-canonical pre-flight (a62).
+    ///
+    /// Registered for registry-completeness only; the `[canon]`-gate call
+    /// site resolves its own prompt directly via
+    /// `crate::preflight::canon_contradiction::load_prompt_template`.
+    /// Wired through the loader by a future change.
+    #[allow(dead_code)]
+    ChangeVsCanonicalCheck,
+    /// `prompts/code-implements-spec-check.md` — the `[out]` gate's
+    /// code-implements-spec verification (a63).
+    ///
+    /// Registered for registry-completeness only; the `[out]`-gate call site
+    /// resolves its own prompt directly via
+    /// `crate::code_implements_spec::load_prompt_template`. Wired through the
+    /// loader by a future change.
+    #[allow(dead_code)]
+    CodeImplementsSpecCheck,
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
+const PROMPT_IMPLEMENTER_ISSUE: &str = include_str!("../../../prompts/implementer-issue.md");
 const PROMPT_IMPLEMENTER_REVISION: &str =
     include_str!("../../../prompts/implementer-revision.md");
 const PROMPT_CHANGELOG_STYLIST: &str = include_str!("../../../prompts/changelog-stylist.md");
@@ -89,6 +121,8 @@ const PROMPT_CODE_REVIEW: &str = include_str!("../../../prompts/code-review-defa
 const PROMPT_AUDIT_TRIAGE: &str = include_str!("../../../prompts/audit-triage.md");
 const PROMPT_CHAT_REQUEST_TRIAGE: &str =
     include_str!("../../../prompts/chat-request-triage.md");
+const PROMPT_ISSUE_REPORT_TRIAGE: &str =
+    include_str!("../../../prompts/issue-report-triage.md");
 const PROMPT_ARCHITECTURE_CONSULTATIVE: &str =
     include_str!("../../../prompts/architecture-consultative.md");
 const PROMPT_DRIFT_AUDIT: &str = include_str!("../../../prompts/drift-audit.md");
@@ -98,31 +132,45 @@ const PROMPT_SECURITY_BUG_AUDIT: &str =
     include_str!("../../../prompts/security-bug-audit.md");
 const PROMPT_DOCUMENTATION_AUDIT: &str =
     include_str!("../../../prompts/documentation-audit.md");
+const PROMPT_CANON_CONTRADICTION_AUDIT: &str =
+    include_str!("../../../prompts/canon-contradiction-audit.md");
+const PROMPT_CANON_CONSOLIDATION_AUDIT: &str =
+    include_str!("../../../prompts/canon-consolidation-audit.md");
 const PROMPT_BROWNFIELD_DRAFT: &str = include_str!("../../../prompts/brownfield-draft.md");
 const PROMPT_BROWNFIELD_SURVEY: &str = include_str!("../../../prompts/brownfield-survey.md");
 const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
 const PROMPT_CHANGE_CONTRADICTION_CHECK: &str =
     include_str!("../../../prompts/change-contradiction-check.md");
+const PROMPT_CHANGE_VS_CANONICAL_CHECK: &str =
+    include_str!("../../../prompts/change-vs-canonical-check.md");
+const PROMPT_CODE_IMPLEMENTS_SPEC_CHECK: &str =
+    include_str!("../../../prompts/code-implements-spec-check.md");
 
 impl PromptId {
     /// Embedded default template content, loaded at compile time.
     pub fn embedded(self) -> &'static str {
         match self {
             Self::Implementer => PROMPT_IMPLEMENTER,
+            Self::ImplementerIssue => PROMPT_IMPLEMENTER_ISSUE,
             Self::ImplementerRevision => PROMPT_IMPLEMENTER_REVISION,
             Self::ChangelogStylist => PROMPT_CHANGELOG_STYLIST,
             Self::CodeReview => PROMPT_CODE_REVIEW,
             Self::AuditTriage => PROMPT_AUDIT_TRIAGE,
             Self::ChatRequestTriage => PROMPT_CHAT_REQUEST_TRIAGE,
+            Self::IssueReportTriage => PROMPT_ISSUE_REPORT_TRIAGE,
             Self::AuditArchitectureConsultative => PROMPT_ARCHITECTURE_CONSULTATIVE,
             Self::AuditDrift => PROMPT_DRIFT_AUDIT,
             Self::AuditMissingTests => PROMPT_MISSING_TESTS_AUDIT,
             Self::AuditSecurityBug => PROMPT_SECURITY_BUG_AUDIT,
             Self::AuditDocumentation => PROMPT_DOCUMENTATION_AUDIT,
+            Self::AuditCanonContradiction => PROMPT_CANON_CONTRADICTION_AUDIT,
+            Self::AuditCanonConsolidation => PROMPT_CANON_CONSOLIDATION_AUDIT,
             Self::BrownfieldDraft => PROMPT_BROWNFIELD_DRAFT,
             Self::BrownfieldSurvey => PROMPT_BROWNFIELD_SURVEY,
             Self::Scout => PROMPT_SCOUT,
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
+            Self::ChangeVsCanonicalCheck => PROMPT_CHANGE_VS_CANONICAL_CHECK,
+            Self::CodeImplementsSpecCheck => PROMPT_CODE_IMPLEMENTS_SPEC_CHECK,
         }
     }
 
@@ -132,20 +180,26 @@ impl PromptId {
     pub fn filename(self) -> &'static str {
         match self {
             Self::Implementer => "implementer.md",
+            Self::ImplementerIssue => "implementer-issue.md",
             Self::ImplementerRevision => "implementer-revision.md",
             Self::ChangelogStylist => "changelog-stylist.md",
             Self::CodeReview => "code-review-default.md",
             Self::AuditTriage => "audit-triage.md",
             Self::ChatRequestTriage => "chat-request-triage.md",
+            Self::IssueReportTriage => "issue-report-triage.md",
             Self::AuditArchitectureConsultative => "architecture-consultative.md",
             Self::AuditDrift => "drift-audit.md",
             Self::AuditMissingTests => "missing-tests-audit.md",
             Self::AuditSecurityBug => "security-bug-audit.md",
             Self::AuditDocumentation => "documentation-audit.md",
+            Self::AuditCanonContradiction => "canon-contradiction-audit.md",
+            Self::AuditCanonConsolidation => "canon-consolidation-audit.md",
             Self::BrownfieldDraft => "brownfield-draft.md",
             Self::BrownfieldSurvey => "brownfield-survey.md",
             Self::Scout => "scout.md",
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
+            Self::ChangeVsCanonicalCheck => "change-vs-canonical-check.md",
+            Self::CodeImplementsSpecCheck => "code-implements-spec-check.md",
         }
     }
 
@@ -153,20 +207,26 @@ impl PromptId {
     pub fn id_str(self) -> &'static str {
         match self {
             Self::Implementer => "Implementer",
+            Self::ImplementerIssue => "ImplementerIssue",
             Self::ImplementerRevision => "ImplementerRevision",
             Self::ChangelogStylist => "ChangelogStylist",
             Self::CodeReview => "CodeReview",
             Self::AuditTriage => "AuditTriage",
             Self::ChatRequestTriage => "ChatRequestTriage",
+            Self::IssueReportTriage => "IssueReportTriage",
             Self::AuditArchitectureConsultative => "AuditArchitectureConsultative",
             Self::AuditDrift => "AuditDrift",
             Self::AuditMissingTests => "AuditMissingTests",
             Self::AuditSecurityBug => "AuditSecurityBug",
             Self::AuditDocumentation => "AuditDocumentation",
+            Self::AuditCanonContradiction => "AuditCanonContradiction",
+            Self::AuditCanonConsolidation => "AuditCanonConsolidation",
             Self::BrownfieldDraft => "BrownfieldDraft",
             Self::BrownfieldSurvey => "BrownfieldSurvey",
             Self::Scout => "Scout",
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
+            Self::ChangeVsCanonicalCheck => "ChangeVsCanonicalCheck",
+            Self::CodeImplementsSpecCheck => "CodeImplementsSpecCheck",
         }
     }
 
@@ -175,20 +235,26 @@ impl PromptId {
     pub fn all() -> &'static [PromptId] {
         &[
             Self::Implementer,
+            Self::ImplementerIssue,
             Self::ImplementerRevision,
             Self::ChangelogStylist,
             Self::CodeReview,
             Self::AuditTriage,
             Self::ChatRequestTriage,
+            Self::IssueReportTriage,
             Self::AuditArchitectureConsultative,
             Self::AuditDrift,
             Self::AuditMissingTests,
             Self::AuditSecurityBug,
             Self::AuditDocumentation,
+            Self::AuditCanonContradiction,
+            Self::AuditCanonConsolidation,
             Self::BrownfieldDraft,
             Self::BrownfieldSurvey,
             Self::Scout,
             Self::ChangeContradictionCheck,
+            Self::ChangeVsCanonicalCheck,
+            Self::CodeImplementsSpecCheck,
         ]
     }
 }

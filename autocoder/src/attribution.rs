@@ -100,7 +100,7 @@ mod tests {
             api_base_url: Some("https://gateway.internal.example.com/v1".to_string()),
             prompt_template_path: None,
             code_review: None,
-            auto_revise: false,
+            auto_revise: crate::config::AutoRevise::Off,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: None,

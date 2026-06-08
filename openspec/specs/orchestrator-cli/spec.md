@@ -1343,7 +1343,17 @@ autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (g
 - **AND** the daemon does NOT start
 
 ### Requirement: Architecture-brightline audit
-autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, AND `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds.
+autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, AND `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds: whole-file length, function length, duplicate function signatures, AND duplicate function bodies.
+
+**Graduated severity.** For the size metrics (file length AND function length), the finding's severity SHALL be determined by the ratio of the measured line count `N` to the applicable threshold `T`: `low` when `N` is at least `T` but below `1.5 × T`, `medium` when `N` is at least `1.5 × T` but below `2.5 × T`, AND `high` when `N` is at or above `2.5 × T`. This replaces the previous flat `medium` severity for the file-size metric, so a file barely over threshold reads as `low` while a file many multiples over reads as `high`.
+
+**Function-size metric.** In addition to whole-file length, the audit SHALL measure the line span of each function definition (its signature line through its closing delimiter) outside test-only regions — e.g. Rust `#[cfg(test)]` modules, consistent with the duplicate-signature metric's exclusion of `mod tests {}` blocks — AND report any function whose span exceeds the function-line threshold. The file-line threshold defaults to `800` AND the function-line threshold defaults to `200`; both are operator-configurable via the audit's settings (`file_lines_threshold`, `function_lines_threshold`).
+
+**Production/test split.** Where the audit can identify test-only regions within a flagged file (e.g. `#[cfg(test)]` modules), the file-size finding's body SHALL report the production-line AND test-line breakdown alongside the total, so the operator can tell a file that needs its tests extracted from one that needs its production code decomposed. Where no test-only region is identifiable, the body reports the total only.
+
+**Duplicate-body metric.** Beyond identical signatures, the audit SHALL detect groups of two or more functions in different files (outside test-only regions) whose normalized bodies are identical — normalization strips comments, collapses whitespace, AND canonicalizes local identifier and string-literal spellings, so that rename-only clones (e.g. a family of helpers that differ only in a constant name and a few words of message) are matched despite differing function names. Each group emits one finding of severity `low` listing the sites. Duplicate-body findings participate in `.brightline-ignore` suppression on the same `file` / `function` / `signature_match` basis as duplicate-signature findings. This is the metric that catches copy-paste families, which the signature metric — keyed on the interface, not the body — cannot.
+
+**Signature metric uses the function's I/O profile.** The duplicate-signature metric SHALL key on the function's interface — its name, the sequence of parameter *types* (parameter names normalized away), AND, where the language exposes it, the return type — rather than the verbatim parameter text, so two declarations with the same interface but different parameter names are recognized as the same signature AND cosmetic naming differences do not split a genuine collision. For languages without static parameter types, the key falls back to name plus parameter arity.
 
 The audit SHALL load a per-workspace `.brightline-ignore` file (if present) AND apply match-suppression to duplicate-signature findings whose constituent sites are all listed in the ignore file. The audit SHALL also validate ignore entries against the current workspace state AND report stale entries via the chatops top-line (informational; the audit does NOT modify the ignore file itself given its `WritePolicy::None`).
 
@@ -1364,19 +1374,33 @@ Match-suppression rule: a duplicate-signature finding is suppressed in full when
 Stale-entry rule: each ignore entry is validated against the current workspace at audit time. Validation fails when (a) the named file doesn't exist, (b) the file doesn't contain a function with the named name, OR (c) the function's signature no longer contains `signature_match`. The audit collects the stale entries AND adds a trailing clause to the chatops top-line:
 
 ```
-📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s); <K> stale ignore entries to clean up
+📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <P> function(s) over line threshold; <M> duplicate signature(s); <Q> duplicate body group(s); <K> stale ignore entries to clean up
 ```
 
 The threaded body lists each stale entry's `file + function + reason` so the operator knows what to remove. The audit does NOT modify `.brightline-ignore` on disk (given `WritePolicy::None`); cleanup is operator-driven.
 
-#### Scenario: Reports files exceeding the size threshold
-- **WHEN** the audit runs AND a tracked file under the repository's source root has more lines than the threshold (default `800`)
-- **THEN** a finding of severity `medium` is included with `subject = "file <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:1")`
+#### Scenario: Reports files exceeding the size threshold with graduated severity
+- **WHEN** the audit runs AND a tracked file under the repository's source root has more lines than the file-line threshold (default `800`)
+- **THEN** a finding is included with `subject = "file <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:1")`
+- **AND** its severity is `low` when `N < 1.5 × T`, `medium` when `1.5 × T ≤ N < 2.5 × T`, AND `high` when `N ≥ 2.5 × T`
+- **AND** where the audit can identify test-only regions in the file, the finding body reports the production-line / test-line split alongside the total
+
+#### Scenario: Reports functions exceeding the function-line threshold
+- **WHEN** the audit runs AND a function defined outside any test-only region spans more lines than the function-line threshold (default `200`)
+- **THEN** a finding is included with `subject = "function <name> in <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:<start-line>")`
+- **AND** its severity follows the same graduated scale (`low` / `medium` / `high` at `1× / 1.5× / 2.5×` the threshold)
+- **AND** a function defined inside a `#[cfg(test)]` module is NOT measured
 
 #### Scenario: Reports identical function signatures across files
-- **WHEN** the audit detects two or more functions with identical name + parameter list signatures in different files (excluding `mod tests {}` blocks)
+- **WHEN** the audit detects two or more functions in different files (excluding `mod tests {}` blocks) whose I/O-profile signatures match — same name, same parameter-type sequence (parameter names normalized away), AND same return type where the language exposes it
 - **AND** no ignore entry suppresses the finding (see the ignore scenarios below)
 - **THEN** a finding of severity `low` lists each occurrence
+
+#### Scenario: Reports near-identical function bodies across files
+- **WHEN** two or more functions in different files (excluding `mod tests {}` blocks) have identical normalized bodies, differing only in their names AND in renamed local identifiers or string literals
+- **AND** no ignore entry suppresses the finding
+- **THEN** a finding of severity `low` lists each occurrence
+- **AND** the duplicate-body group is counted in the `<Q> duplicate body group(s)` clause of the chatops top-line
 
 #### Scenario: Reports dead public items
 - **WHEN** the audit (or a static-analysis subprocess it invokes) identifies public items with zero references in the repository
@@ -2113,21 +2137,21 @@ Three small pure helpers in the polling loop (`extract_stdout_section`, `filter_
 - **AND** truncation respects UTF-8 char boundaries (no panic on multi-byte input even when byte-count and char-count diverge)
 
 ### Requirement: Registered periodic audits
-autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`. The slug `dependency_update_triage` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
+autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slug `dependency_update_triage` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
 
 This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming an unregistered slug is a startup-time failure with a clear list of valid slugs.
 
 #### Scenario: Startup with default config registers the canonical set
 - **WHEN** autocoder starts with a config whose `audits:` block is
   absent OR present but with all-`disabled` cadences
-- **THEN** the in-memory `AuditRegistry` contains exactly the five
+- **THEN** the in-memory `AuditRegistry` contains exactly the seven
   audits enumerated above
 - **AND** no audit runs (all are `Disabled` by effective cadence),
   preserving prior daemon behavior
 
 #### Scenario: Operator configures a registered audit
 - **WHEN** an operator sets a non-`disabled` cadence under
-  `audits.defaults.<slug>` for any of the five registered slugs
+  `audits.defaults.<slug>` for any of the seven registered slugs
   OR under `repositories[].audits.<slug>`
 - **THEN** config validation succeeds AND the scheduler invokes
   that audit per its cadence on the appropriate iteration
@@ -3186,7 +3210,7 @@ Each polling iteration, before processing pending changes for a repository, the 
 - **AND** the same reply does not trigger a recursive revision
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
-On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); `Failed` → failure reply comment + count increment.
+On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); a substantive `Failed` (the subprocess ran and the task failed) → failure reply comment + count increment; a **precondition-unmet** failure (the agent subprocess never started because a required precondition was unmet, e.g. the OS-sandbox-mechanism gate) → failure reply comment that directs the operator to resolve the precondition AND post a new revision request, with the trigger consumed (manual re-trigger; the daemon does NOT auto-retry, since an unmet precondition will not heal between polls) but the revision count NOT incremented (no revision work was attempted).
 
 For the `Completed` outcome, the daemon SHALL first determine whether the agent produced code changes (a dirty working tree):
 
@@ -3242,6 +3266,14 @@ The combined body SHALL be passed through the existing GitHub-comment-size trunc
 - **THEN** the body is truncated at the largest char boundary fitting under the limit
 - **AND** a truncation marker is appended naming the per-change log file path on disk
 - **AND** the operator can recover the full summary from `<logs_dir>/runs/<workspace-basename>/<change>.log`
+
+#### Scenario: Precondition-unmet revision failure does not count and guides re-trigger
+- **GIVEN** the executor surfaces a precondition-unmet failure for a revision context (the agent subprocess never started, e.g. no usable sandbox mechanism)
+- **WHEN** the revision dispatcher processes the outcome
+- **THEN** the daemon posts a failure reply comment that directs the operator to resolve the precondition AND post a new revision request
+- **AND** the revision-count counter is NOT incremented (no revision was attempted)
+- **AND** the trigger comment's timestamp is advanced so the daemon does NOT auto-retry (manual re-trigger required)
+- **AND** no commit or push is made
 
 ### Requirement: Revision cap per PR, with one-time decline
 The `executor.max_auto_revisions_per_pr` config (default `5`, capped at `20` with WARN-and-clamp at startup; the legacy name `executor.max_revisions_per_pr` is accepted as a serde alias so existing config files load unchanged) SHALL bound only AUTOMATIC revisions per PR — those triggered by reviewer-marked comments carrying the `<!-- reviewer-revision -->` marker (the code-reviewer auto-revise path). Human-initiated `@<bot> revise` comments SHALL NOT be counted against this cap AND SHALL NOT be declined for cap reasons; an operator's deliberate revision request always processes.
@@ -5456,7 +5488,7 @@ The scout prompt SHALL be loaded via `PromptLoader::load(PromptId::Scout, &works
 3. The workspace's `README.md` contents AND the list of `docs/*.md` filenames.
 4. A code-symbol overview built via `cargo metadata` (Rust workspaces) OR a ripgrep pass for top-level public items (other languages).
 5. `git log --since="<N> days ago" --pretty=oneline` output for recent-activity context, where N is `features.scout.staleness_warn_days * 4`.
-6. The open-issues list via `gh api repos/<owner>/<repo>/issues?state=open --paginate` when `features.scout.include_issues: true`. On `gh` failure (auth, rate limit, network), the handler SHALL log a WARN naming the failure AND continue with an empty issue list.
+6. The open-issues list via the forge provider's authenticated open-issue listing (the same configured credential as PR operations; see the git-workflow-manager forge requirement), NOT the `gh` CLI, when `features.scout.include_issues: true`. On a forge issue-read failure (auth, rate limit, network), the handler SHALL log a WARN naming the failure AND continue with an empty issue list.
 
 The executor's response SHALL be a JSON array of opportunity items. Each item SHALL have:
 
@@ -5472,7 +5504,7 @@ The handler SHALL validate the response: well-formed JSON, every item has all re
 On validation success, the handler SHALL: write `<workspace>/.state/scout_runs/<request_id>.json` with `ScoutRunState { request_id, repo_url, guidance, head_sha_at_run, completed_at, thread_ts, channel, items }`; render the list (grouped by category, compact per-item format) AND post it to the request's thread; append the closing note `Reply with @<bot> spec-it <N> [optional guidance] to scope work on any item.`. When the rendered list exceeds the threaded-notification length limit, the handler SHALL truncate the displayed list AND append `… (truncated; full list in <workspace>/.state/scout_runs/<request_id>.json)`.
 
 #### Scenario: Happy-path scout run
-- **WHEN** the executor returns a valid JSON list of 12 items AND the workspace has no `gh` failure
+- **WHEN** the executor returns a valid JSON list of 12 items AND the issue fetch did not fail
 - **THEN** the handler persists `ScoutRunState` with 12 items
 - **AND** posts a thread reply grouping items by category with the closing spec-it instruction
 - **AND** the thread reply does NOT contain `(truncated; …)`
@@ -5482,9 +5514,9 @@ On validation success, the handler SHALL: write `<workspace>/.state/scout_runs/<
 - **THEN** no state file is written
 - **AND** the thread reply names the validation failure AND points at the daemon log
 
-#### Scenario: gh issues unavailable falls through gracefully
-- **WHEN** `features.scout.include_issues: true` AND `gh api` returns a non-success exit code
-- **THEN** a WARN is logged naming the gh failure
+#### Scenario: Issue fetch unavailable falls through gracefully
+- **WHEN** `features.scout.include_issues: true` AND the forge open-issue listing fails (auth, rate limit, network)
+- **THEN** a WARN is logged naming the failure
 - **AND** the scout proceeds with code-derived items only
 - **AND** the thread reply includes a note that issue-derived items were skipped this run
 
@@ -5577,7 +5609,7 @@ The per-repo config schema SHALL accept an optional `features.scout` block:
 - `enabled: bool` (default `true`) — when `false`, the `scout`, `spec-it`, AND `clear-scout` verbs are refused at parse time.
 - `prompt_path: Option<String>` (default `None`) — per the uniform PromptLoader pattern.
 - `max_items: usize` (default `30`, valid range `1..=50`) — cap on the scout's item list.
-- `include_issues: bool` (default `true`) — controls whether the handler attempts `gh api` for open issues.
+- `include_issues: bool` (default `true`) — controls whether the handler fetches open issues (via the forge provider's authenticated API) for inclusion in the scout input.
 - `staleness_warn_days: u64` (default `7`) — threshold for the staleness warning.
 
 Invalid values (non-bool where bool expected; `max_items` outside `1..=50`) cause config-load to fail-fast with an error naming the offending field.
@@ -6886,4 +6918,607 @@ This change establishes the actions AND the execution-scoped storage. The per-ro
 - **WHEN** `consume_submission` is called for an execution with no stored submission
 - **THEN** it returns an empty result (no submission) rather than failing
 - **AND** the caller treats absence as "the role did not submit"
+
+### Requirement: Verifier-gate framework
+autocoder's change-lifecycle consistency checks SHALL be organized as a verifier-gate framework of exactly three named gates positioned around the executor run:
+
+- the `[in]` gate — change-internal consistency, run BEFORE the executor;
+- the `[canon]` gate — change-vs-canonical consistency, run BEFORE the executor;
+- the `[out]` gate — code-implements-spec, run AFTER the executor.
+
+Each gate SHALL be individually opt-in AND SHALL own its disposition: the pre-executor gates (`[in]`, `[canon]`) are fail-open — a gate's own failure (transport, parse, unregistered strategy, no submission) logs a WARN AND never blocks the iteration; the `[out]` gate is advisory — it annotates operator surfaces AND never auto-acts (no revision, no block). Each gate's diagnostics (log lines AND any operator surface it writes) SHALL carry the gate's stable identifier so a finding is attributable to the gate that produced it.
+
+The `[in]` gate IS the existing change-internal contradiction pre-flight check (its own requirement defines its behavior, opt-in gating, fail-open posture, marker, AND alert); this framework reframes that check under the `[in]` identifier WITHOUT changing what it decides, its config key, OR its alert category. The `[canon]` AND `[out]` gates are realized by subsequent changes; until a gate is realized the framework treats it as absent AND invokes nothing for it. This change introduces ONLY the shared gate vocabulary, lifecycle positions, posture rules, AND labeling — it does NOT add a new gate.
+
+#### Scenario: The `[in]` gate runs the contradiction check, labeled
+- **WHEN** the `[in]` gate runs for a change
+- **THEN** it executes the change-internal contradiction pre-flight check unchanged in what it decides (same opt-in gating, fail-open posture, marker, AND alert category)
+- **AND** its emitted log / diagnostic lines carry the `[in]` gate identifier so the finding is attributable to that gate
+
+#### Scenario: An unrealized gate is inert
+- **WHEN** the `[canon]` OR `[out]` gate has not been realized by a subsequent change
+- **THEN** resolving that gate yields "no installed gate"
+- **AND** the framework invokes nothing for it — no gate is run speculatively
+
+#### Scenario: Gate disposition follows the gate's lifecycle position
+- **WHEN** a pre-executor gate (`[in]` or `[canon]`) fails for its own reasons
+- **THEN** the framework treats it as fail-open: it logs a WARN AND does NOT block the iteration
+- **WHEN** the `[out]` gate produces findings
+- **THEN** the framework treats them as advisory: they annotate operator surfaces AND do NOT auto-trigger a revision or block
+
+### Requirement: Change-vs-canonical contradiction pre-flight check (the [canon] gate)
+autocoder SHALL provide an opt-in pre-flight check — the `[canon]` gate of the verifier framework — that detects semantic contradictions between a single OpenSpec change's spec deltas AND the project's EXISTING canonical specs, before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files AND the canonical specs on demand, AND returns its findings via the `submit_canon_contradictions` MCP tool. On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the canon-contradiction narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found. The gate's disposition is identical to the `[in]` gate's; the gates differ only in what they read (deltas-only vs deltas-plus-canon) AND what each finding names.
+
+The check SHALL be gated by `executor.change_canonical_contradiction_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.change_canonical_contradiction_check_llm` (parallel to the `[in]` gate's block), which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
+
+Canon access SHALL follow the documentation-audit pattern: the gate reads `openspec/specs/*/spec.md` directly through the sandbox AND additionally uses the `query_canonical_specs` MCP tool when a21's RAG is enabled (focused retrieval for large canon). The gate SHALL function correctly with OR without RAG.
+
+Per the verifier framework (a61), the `[canon]` gate SHALL be fail-open AND SHALL label its diagnostics with the `[canon]` identifier: an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other failure log a WARN AND treat the check as "no contradictions found." A schema-invalid `submit_canon_contradictions` call mid-session is a correctable tool error the agent can retry (a56). The daemon does NOT gate work on a failed check.
+
+#### Scenario: Default-disabled produces no [canon] session
+- **WHEN** `executor.change_canonical_contradiction_check` is unset (default `disabled`)
+- **AND** any change reaches the pre-executor pipeline
+- **THEN** no `[canon]` session is spawned
+- **AND** the executor is invoked normally (assuming the earlier gates passed)
+
+#### Scenario: Enabled mode checks the deltas against canon
+- **WHEN** `executor.change_canonical_contradiction_check: enabled` AND the model config is set
+- **AND** a change reaches the pre-executor pipeline
+- **THEN** the gate runs an `agentic_run` session (a56) in a read-only sandbox (`Read`/`Glob`/`Grep`, `ORCH_MCP_ROLE = canon_contradiction_check`, the `submit_canon_contradictions` MCP tool) with the embedded `prompts/change-vs-canonical-check.md` prompt (OR the configured override)
+- **AND** the agent reads the change's spec-delta files AND the canonical specs on demand AND returns contradictions by calling `submit_canon_contradictions` with `{ contradictions: [{ change_requirement, canonical_capability, canonical_requirement, summary }] }`
+
+#### Scenario: Empty submission proceeds to executor
+- **WHEN** the agent calls `submit_canon_contradictions` with an empty `contradictions` array
+- **THEN** the pipeline proceeds to the executor
+- **AND** no marker is written AND no chatops alert fires
+
+#### Scenario: Non-empty submission writes marker and halts
+- **WHEN** the agent submits one or more change-vs-canonical contradictions
+- **THEN** the pipeline writes `.needs-spec-revision.json` with `revision_suggestion` text populated from the contradictions narrative (each finding naming the conflicting canonical requirement)
+- **AND** the marker's structural arrays (`unarchivable_deltas`, `unimplementable_tasks`) are empty (this case is semantic)
+- **AND** the chatops alert under `AlertCategory::SpecNeedsRevision` fires (subject to the throttle)
+- **AND** the executor is NOT invoked for this change OR any subsequent change in this iteration
+
+#### Scenario: Runs with and without a21 RAG
+- **WHEN** a21's `canonical_rag` is enabled AND the gate runs
+- **THEN** the session has `query_canonical_specs` available AND the prompt MAY use it for focused canonical retrieval
+- **WHEN** `canonical_rag` is disabled AND the gate runs
+- **THEN** the gate reads canon directly via the sandbox's `Read` of `openspec/specs/*/spec.md` AND still produces valid findings
+
+#### Scenario: Session failure fails open
+- **WHEN** the agentic session fails (spawn error, timeout, OR the resolved CLI strategy is not registered)
+- **THEN** the gate logs a WARN (carrying the `[canon]` label) naming the error
+- **AND** treats the check as "no contradictions found" AND proceeds to the executor
+
+#### Scenario: No valid submission fails open
+- **WHEN** the session ends with no schema-valid `submit_canon_contradictions` call (never submitted, OR every submission schema-rejected and never corrected)
+- **THEN** the gate logs a WARN (carrying the `[canon]` label) with a truncated session-output excerpt
+- **AND** treats the check as "no contradictions found" AND proceeds to the executor
+
+#### Scenario: Enabled without model config fails fast at startup
+- **WHEN** `config.yaml` sets `executor.change_canonical_contradiction_check: enabled`
+- **AND** `executor.change_canonical_contradiction_check_llm` is unset
+- **THEN** daemon startup fails with a named error AND does NOT begin polling
+- **AND** the operator sees the error on stderr AND in journalctl
+
+### Requirement: Code-implements-spec verification (the [out] gate, advisory)
+autocoder SHALL provide an opt-in post-executor check — the `[out]` gate of the verifier framework — that judges whether the executor's implementation satisfies the change's spec delta, requirement by requirement AND scenario by scenario. This is the verifier step the code-reviewer requirement defers to ("Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step"). The gate runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) AFTER the executor implements the change, in a read-only sandbox that reads the spec delta, the diff, AND source on demand, AND returns its verdict via the `submit_verdict` MCP tool.
+
+The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the a61 framework's advisory posture, a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND omits the section (OR writes "verification unavailable"); it never blocks. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
+
+The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.code_implements_spec_check_llm`, which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
+
+#### Scenario: Default-disabled produces no [out] session
+- **WHEN** `executor.code_implements_spec_check` is unset (default `disabled`)
+- **AND** the executor implements a change
+- **THEN** no `[out]` session is spawned AND PR assembly is unchanged
+
+#### Scenario: Enabled mode verifies the implementation against the spec
+- **WHEN** `executor.code_implements_spec_check: enabled` AND the model config is set
+- **AND** the executor has implemented a change
+- **THEN** the gate runs an `agentic_run` session (a56) in a read-only sandbox (`Read`/`Glob`/`Grep`, `ORCH_MCP_ROLE = code_implements_spec`, the `submit_verdict` MCP tool) with the embedded `prompts/code-implements-spec-check.md` prompt (OR the configured override), carrying the spec-delta files, the unified diff, AND the changed-file list
+- **AND** the agent reads source on demand AND returns its verdict by calling `submit_verdict` with `{ verdict, summary, gaps }`
+
+#### Scenario: Implemented verdict renders a clean section, no chatops
+- **WHEN** the agent submits `{ verdict: "implemented", ... }`
+- **THEN** the PR body's `## Spec Verification` section reports the implementation as complete
+- **AND** no chatops note is posted
+- **AND** no revision is opened AND PR creation proceeds normally
+
+#### Scenario: Gaps-found verdict annotates and notifies but never acts
+- **WHEN** the agent submits `{ verdict: "gaps_found", gaps: [ ... ] }`
+- **THEN** the PR body's `## Spec Verification` section lists each gap (`requirement`, optional `scenario`, `status`, `evidence`)
+- **AND** a chatops note is posted as an advisory heads-up
+- **AND** NO revision is opened AND PR creation is NOT blocked — the operator decides what to do
+
+#### Scenario: Gate failure is advisory, never blocking
+- **WHEN** the agentic session fails (spawn error, timeout, unregistered strategy, OR no valid `submit_verdict`)
+- **THEN** the gate logs a WARN carrying the `[out]` label
+- **AND** omits the `## Spec Verification` section (OR writes "verification unavailable")
+- **AND** PR creation proceeds — the gate never blocks
+
+#### Scenario: Enabled without model config fails fast at startup
+- **WHEN** `config.yaml` sets `executor.code_implements_spec_check: enabled`
+- **AND** `executor.code_implements_spec_check_llm` is unset
+- **THEN** daemon startup fails with a named error AND does NOT begin polling
+- **AND** the operator sees the error on stderr AND in journalctl
+
+### Requirement: Workspace cache LRU eviction under a size cap
+The daemon SHALL support an optional cap on the total size of the per-repo workspace cache (`<cache>/workspaces/`), configured via `cache.workspaces_max_gb` (`Option<u64>`; unset = unbounded, the default). When the cap is set, the daemon SHALL keep the workspace cache under it by evicting least-recently-used IDLE workspaces. Whole-workspace eviction is language-agnostic: it removes entire least-recently-used clones (`<cache>/workspaces/<key>`) rather than reasoning about which subdirectories are build artifacts. An evicted repo re-clones via the existing workspace-init path on its next iteration; eviction is lossless because per-PR revision state AND audit state live in the state directory, NOT the workspace.
+
+Eviction SHALL run at a repo's iteration start, before the repo does work: if `cache.workspaces_max_gb` is set AND the measured total exceeds the cap, the daemon evicts least-recently-used idle workspaces (oldest last-used first) until the total is under the cap OR only non-evictable workspaces remain. The daemon SHALL NEVER evict the repo currently iterating NOR any workspace holding a per-repo busy marker / active lock. If the non-evictable set alone exceeds the cap, the daemon SHALL log a WARN that it cannot reclaim to target AND proceed — eviction SHALL NEVER block or fail an iteration. Each eviction SHALL log the workspace key, the reclaimed size, AND the new total. "Least-recently-used" is ordered by the last iteration that used each workspace (a daemon-maintained per-workspace last-used timestamp).
+
+When `cache.workspaces_max_gb` is unset, the cache is unbounded (today's behavior) AND the daemon SHALL log a ONE-TIME startup notice that the workspace cache is unbounded AND name the field that bounds it, so the unbounded-growth failure mode is discoverable before it exhausts a disk.
+
+#### Scenario: Unset cap is unbounded with a one-time startup nudge
+- **WHEN** `cache.workspaces_max_gb` is unset
+- **THEN** no eviction occurs (the cache grows unbounded, as today)
+- **AND** the daemon logs exactly one startup notice that the workspace cache is unbounded AND names `cache.workspaces_max_gb` as the way to bound it
+
+#### Scenario: Over-cap cache evicts oldest idle workspaces
+- **WHEN** `cache.workspaces_max_gb` is set AND the total `<cache>/workspaces/` size exceeds it at a repo's iteration start
+- **THEN** the daemon evicts least-recently-used IDLE workspaces (oldest last-used first), removing each whole `<cache>/workspaces/<key>`, until the total is under the cap OR only non-evictable workspaces remain
+- **AND** each eviction logs the workspace key, the reclaimed size, AND the new total
+
+#### Scenario: The current and busy workspaces are never evicted
+- **WHEN** eviction runs
+- **THEN** the repo currently iterating is NOT evicted
+- **AND** any workspace holding a per-repo busy marker / active lock is NOT evicted (a concurrently-iterating repo is never removed out from under itself)
+
+#### Scenario: Best-effort when the active set exceeds the cap
+- **WHEN** the non-evictable workspaces (current + busy) alone exceed the cap
+- **THEN** the daemon logs a WARN that it cannot reclaim to the target
+- **AND** the iteration proceeds — eviction never blocks or fails an iteration
+
+#### Scenario: An evicted repo re-clones losslessly
+- **WHEN** a repo whose workspace was evicted reaches its next iteration
+- **THEN** the daemon re-creates the workspace via the existing workspace-init (clone) path
+- **AND** the repo's per-PR revision state AND audit state (resolved from the state directory, not the workspace) are intact
+
+### Requirement: Consultative audit prioritizes oversized, low-cohesion code
+The `architecture_consultative` audit's prompt SHALL direct the agent to treat code size as a priority signal. Among the observations it is allowed to raise (per the `Architecture consultative audit` requirement's 0-5 cap, question framing, AND finding schema — this requirement adds a prioritization directive only; it does NOT change the audit's output transport, severity range, or cap), the agent SHALL rank a file or function that is large relative to the rest of the codebase AND exhibits multiple responsibilities as a first-rank "should this split, and along what seams?" question. The prompt SHALL direct the agent to reason about cohesion rather than raw line count — a large file that is genuinely one cohesive responsibility is left unflagged, while a smaller file that mixes unrelated responsibilities may be raised — AND to flag families of near-identical functions (the same control-flow skeleton under different names) that an identical-signature comparison cannot detect.
+
+#### Scenario: An oversized, multi-responsibility file is raised as a split question
+- **WHEN** the consultative audit runs against a codebase containing a file that is large relative to its peers AND spans several unrelated responsibilities
+- **THEN** the prompt directs the agent to raise that file as a "should this split, and along what seams?" question, anchored to the file per the consultative audit's anchoring rule
+- **AND** the question is ranked ahead of lower-priority observations within the 0-5 cap
+
+#### Scenario: A large but cohesive file is not flagged for splitting
+- **WHEN** the consultative audit encounters a file that exceeds typical size but implements a single cohesive responsibility
+- **THEN** the prompt directs the agent NOT to raise a split question on size alone
+- **AND** size without a cohesion problem does not consume one of the 0-5 finding slots
+
+#### Scenario: Near-identical function families are flagged
+- **WHEN** the codebase contains several functions sharing one control-flow skeleton under different names, which an identical-signature comparison does not match
+- **THEN** the prompt directs the agent to raise the family as a consolidation observation anchored to the constituent sites
+
+### Requirement: Reviewer-initiated revisions from one review dispatch as a single run
+All `<!-- reviewer-revision -->` requests produced by a single review SHALL be collected and dispatched as ONE revision run — one executor invocation carrying every concern from that review together — rather than one run per request. The aggregated run SHALL count as exactly ONE increment against the auto-revision cap (`executor.max_auto_revisions_per_pr`), AND SHALL post one operator-visible summary of the concerns it is addressing.
+
+This replaces the per-comment loop (`revisions.rs`, `for comment in comments`) for reviewer-initiated revisions: instead of an executor run + cap increment per `<!-- reviewer-revision -->` comment, the dispatcher groups a review's reviewer-revision comments and issues a single revision. The aggregated run sees all concerns in one warm pass, so related fixes are made together AND a concern already satisfied by an earlier fix in the same batch does not become a separate no-op run.
+
+Human `@<bot> revise <text>` comments are unaffected — each is an explicit operator request and is dispatched as the operator wrote it (subject to the existing human-revise cap).
+
+#### Scenario: A multi-concern review dispatches one revision run
+- **WHEN** a single review produces N `<!-- reviewer-revision -->` requests (N ≥ 2)
+- **THEN** the dispatcher issues exactly ONE revision run carrying all N concerns
+- **AND** the auto-revision cap is incremented by exactly one
+- **AND** one summary of the addressed concerns is posted
+
+#### Scenario: Duplicate concerns in one review are fixed once
+- **WHEN** a review's requests include two that target the same code (e.g. the same function refactor worded twice)
+- **THEN** the single aggregated run addresses them together
+- **AND** there is no second run that evaluates to "no change made"
+
+#### Scenario: Human revise comments are still per-request
+- **WHEN** an operator posts `@<bot> revise <text>` on the PR
+- **THEN** it is dispatched as its own revision (not aggregated with reviewer-initiated requests)
+- **AND** it is bounded by the human-revise cap, not the auto-revision cap
+
+### Requirement: Sandbox credential-protection config — toggles, precedence, and relaxed-posture logging
+autocoder SHALL expose the sandbox's credential-protection layers as two boolean toggles, `os_hide` AND `engine_deny`, configurable both globally (under the `executor.sandbox` block) AND per-repository, each defaulting to ON. A per-repository value SHALL override the global value for that repository; absent both, the default applies. Loosening either toggle SHALL be explicit — there is no implicit downgrade — AND the daemon SHALL emit a startup WARN, per repository, naming each toggle that is OFF for that repository.
+
+The named presets (both on — the default; `os_hide` off with `engine_deny` on, for a repository that develops CLI wrappers and needs a nested CLI to authenticate live; both off, for a repository whose purpose is testing credential-grab behavior) are documentation over these two switches; the switches are the contract.
+
+The executor's filesystem **mask-list** — the default-deny set of paths masked under its exposed-home policy (credential paths AND shell-init/persistence paths) — SHALL ship with sensible defaults AND be operator-editable both globally and per-repository: an operator MAY add a path to mask OR remove a default entry to expose it (e.g. open `~/.ssh` to develop an SSH tool). Removing a default mask entry SHALL be explicit AND logged at startup as a relaxed posture, since egress is unrestricted. `os_hide` governs the other-CLI-store subset of the mask-list as a named convenience toggle. The executor MAY additionally be opted into **strict mode** — the read-only-role allowlist (mask all of home; bind only the workspace, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime) — for high-compliance hosts; strict mode is NOT the default, AND read-only roles always use the allowlist.
+
+Separately, when no **platform-appropriate** sandbox mechanism is available on the host — on Linux, neither `systemd-run` nor `bwrap` can apply the sandbox; on macOS, `sandbox-exec` is unavailable — agentic runs SHALL fail closed with a clear error naming the missing mechanism, UNLESS the operator has explicitly set a config flag opting into unsandboxed operation — in which case the daemon emits a loud startup WARN AND proceeds. On macOS, `sandbox-exec` ships with the operating system, so the gate is normally satisfied without any install.
+
+#### Scenario: Secure default when unset
+- **WHEN** neither the global nor the per-repository config sets `os_hide` or `engine_deny`
+- **THEN** both are ON for every repository
+- **AND** no relaxed-posture WARN is emitted
+
+#### Scenario: Per-repo overrides global
+- **WHEN** the global config sets `os_hide` on AND a repository sets `os_hide` off
+- **THEN** that repository runs with `os_hide` off
+- **AND** repositories without a per-repo value run with `os_hide` on
+
+#### Scenario: Relaxed posture is logged per repository
+- **WHEN** a repository runs with `os_hide` OR `engine_deny` off (by per-repo or global config)
+- **THEN** the daemon emits a startup WARN for that repository naming each toggle that is off
+
+#### Scenario: No sandbox mechanism fails closed by default
+- **WHEN** neither `systemd-run` nor `bwrap` can apply the sandbox AND the operator has not opted into unsandboxed operation
+- **THEN** an agentic run fails with an error naming the missing mechanism
+- **AND** no unsandboxed subprocess is spawned
+
+#### Scenario: Explicit unsandboxed opt-in proceeds with a loud warning
+- **WHEN** no sandbox mechanism is available AND the operator has explicitly opted into unsandboxed operation in config
+- **THEN** agentic runs proceed
+- **AND** the daemon emits a loud startup WARN that subprocesses are running unsandboxed
+
+#### Scenario: macOS satisfies the gate via sandbox-exec
+- **WHEN** the daemon runs on macOS AND `sandbox-exec` is available
+- **THEN** the mechanism gate is satisfied AND agentic runs proceed sandboxed
+- **AND** the run does not fail closed
+
+#### Scenario: Editing the mask-list adds or exposes a path
+- **WHEN** an operator adds a path to the mask-list
+- **THEN** that path is masked for the executor
+- **AND** WHEN an operator removes a default mask entry (e.g. `~/.ssh`), that path is exposed AND the daemon emits a startup relaxed-posture WARN naming it
+
+#### Scenario: Strict mode masks all of home
+- **WHEN** the executor is opted into strict mode
+- **THEN** it runs under the allowlist (home masked; only the workspace, the role's own store, the resolved CLI binary + toolchain, and the minimal runtime bound)
+
+### Requirement: Per-repo forge config block
+A repository MAY declare an explicit `forge:` block that selects AND configures its forge provider, with fields `kind` (`github` | `gitlab`), `host`, an optional `api_base`, AND a token route. Provider selection SHALL follow this precedence: (1) an explicit `forge:` block is authoritative; (2) absent a block, a `github.com` host resolves to `GithubForge`; (3) otherwise no provider is registered for the host AND the clear no-provider error is returned (per the `Forge provider abstraction` requirement).
+
+GitLab SHALL be selected ONLY via an explicit `forge: { kind: gitlab }` — there is NO host-sniffing fallback to GitLab, so a GitLab-host URL without a `forge:` block returns the no-provider error rather than silently selecting GitLab. Existing GitHub configurations are unchanged AND need no `forge:` block. The `api_base` field additionally supports GitHub Enterprise: `kind: github` with a self-hosted `host`/`api_base` uses the GitHub shape against the non-`github.com` endpoint. The forge block's token route SHALL supply the provider's token through the existing token-routing mechanism.
+
+#### Scenario: Explicit GitLab block selects GitlabForge
+- **WHEN** a repository declares `forge: { kind: gitlab, host, token }`
+- **THEN** its forge operations are served by `GitlabForge` against the configured host/`api_base`
+- **AND** the configured token route supplies the GitLab token
+
+#### Scenario: No forge block defaults to GitHub
+- **WHEN** a repository on `github.com` has no `forge:` block
+- **THEN** it resolves to `GithubForge` exactly as before
+- **AND** no `forge:` block is required
+
+#### Scenario: GitHub Enterprise via api_base
+- **WHEN** a repository declares `forge: { kind: github, host, api_base }` for a self-hosted GitHub endpoint
+- **THEN** it resolves to `GithubForge` using the GitHub shape against that `api_base`
+
+#### Scenario: GitLab host without a block does not auto-select GitLab
+- **WHEN** a repository URL has a non-`github.com` host AND no `forge:` block
+- **THEN** the no-provider error is returned (directing the operator to declare a `forge:` block)
+- **AND** GitLab is NOT selected by host inference
+
+### Requirement: Issues lane for corrections
+The daemon SHALL provide a second work lane, `issues/`, for corrections — fixes to code that is already correctly specified (bug fixes, behavior-preserving refactors) that carry NO spec delta. An issue SHALL be a directory `issues/<slug>/` containing `issue.md` (the report and diagnosis AND the acceptance criteria stated against the EXISTING specification) AND `tasks.md` (the fix steps), with NO `specs/` directory — that absence is the contract that an issue changes no spec. The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing `issues/<slug>/` directly (repository write is the allowlist; no public surface). On completion the issue directory SHALL move to `issues/archive/`, mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
+
+#### Scenario: An enabled lane works a committed issue
+- **WHEN** `features.issues` is on AND an `issues/<slug>/` with `issue.md` and `tasks.md` is present
+- **THEN** the issue is selected and worked
+- **AND** no spec delta is required for it
+
+#### Scenario: An issue carrying a specs directory is rejected
+- **WHEN** an `issues/<slug>/` contains a `specs/` directory
+- **THEN** it is rejected as malformed, because an issue carries no spec delta
+
+#### Scenario: Completion archives without touching canon
+- **WHEN** an issue's fix completes
+- **THEN** `issues/<slug>/` moves to `issues/archive/`
+- **AND** no canonical spec file is modified
+
+#### Scenario: The lane is disabled by default
+- **WHEN** `features.issues` is unset
+- **THEN** the issues lane is inactive AND `issues/<slug>/` directories are not worked
+
+### Requirement: Independent lane walkers over shared utilities
+The changes lane AND the issues lane SHALL be driven by separate walkers, each with its own control flow AND its own state file; lane-specific behavior SHALL live in each walker, NOT in shared branching keyed on a lane flag. Shared leaf functionality — the busy-marker, PR opening, archiving, chatops notification, queue-state I/O, AND workspace handling — SHALL be composed from stateless shared utilities that both walkers call. A fault in one walker SHALL NOT corrupt the other lane's control flow or state: each walker reads AND writes only its own lane's state.
+
+#### Scenario: Each walker owns its state
+- **WHEN** both lanes have ready work for a repository
+- **THEN** each walker reads and writes only its own lane's state file
+
+#### Scenario: Shared leaf operations are stateless utilities
+- **WHEN** either walker opens a PR, archives a unit, or posts a chatops notification
+- **THEN** it calls the shared stateless utility rather than a lane-private copy
+
+#### Scenario: One definition per shared primitive
+- **WHEN** the codebase is searched after this change
+- **THEN** the busy-marker, PR-open, archive, chatops-notify, queue-state, and workspace primitives each have a single definition composed by both walkers
+
+### Requirement: Lane precedence — issues over changes over audits
+Within the existing per-repo serializer (the busy-marker — one unit of work per repository at a time), each iteration SHALL select the highest-precedence READY unit in the order issues > changes > audits, extending the established changes-over-audits precedence. Within a lane, selection SHALL be alphabetical. Issue-precedence SHALL be strict: a ready issue beats a ready change. Anti-starvation is provided by the promotion gate (issues enter the lane only after maintainer approval), NOT by a scheduling fairness rule. Because issues run first, a change may later find its work already done; a plain failure for such a change is acceptable, AND no rebase-precheck is performed.
+
+#### Scenario: A ready issue beats a ready change
+- **WHEN** both a ready issue and a ready change exist for a repository
+- **THEN** the issue is selected first
+
+#### Scenario: A ready change beats a ready audit
+- **WHEN** a ready change and a ready audit exist AND no issue is ready
+- **THEN** the change is selected before the audit
+
+#### Scenario: Alphabetical within a lane
+- **WHEN** two issues are ready for a repository
+- **THEN** they are selected in alphabetical order
+
+### Requirement: Hybrid issue ingestion with maintainer promotion
+The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write `issues/<slug>/` AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
+
+#### Scenario: A triaged report posts a candidate and queues nothing
+- **WHEN** a reported issue is triaged
+- **THEN** a candidate `issues/<slug>/` is drafted and posted to chatops
+- **AND** nothing is written to `issues/` or queued
+
+#### Scenario: Promotion writes and queues
+- **WHEN** a maintainer "send it"s a posted candidate
+- **THEN** the daemon writes `issues/<slug>/`
+- **AND** queues it for the issues lane
+
+#### Scenario: An unpromoted candidate does no work
+- **WHEN** a candidate is posted but no maintainer promotes it
+- **THEN** no issue is written or queued
+
+#### Scenario: Duplicates are deduped
+- **WHEN** a report duplicates an open or an archived issue
+- **THEN** it is deduped AND no candidate is queued
+
+### Requirement: Triage routing classifies each report
+Triage SHALL classify each report AND route it accordingly: a **Bug** (code has drifted from a specification that is itself correct) becomes an issues-lane candidate; a **Behavior change** (the report wants new or changed behavior) is routed to the changes lane as a proposal, NOT an issue; a **Question, invalid report, or duplicate** is declined or deduped with no work queued.
+
+#### Scenario: A bug becomes an issue candidate
+- **WHEN** triage classifies a report as a bug against a correct spec
+- **THEN** it is drafted as an issues-lane candidate
+
+#### Scenario: A behavior-change report routes to changes
+- **WHEN** triage classifies a report as wanting new or changed behavior
+- **THEN** it is routed to the changes lane as a proposal
+- **AND** it is NOT written as an issue
+
+#### Scenario: A question or duplicate is declined
+- **WHEN** triage classifies a report as a question, invalid, or a duplicate
+- **THEN** no work is queued
+
+### Requirement: Dependency preflight reports all dependencies; doctor subcommand
+The daemon SHALL run a dependency preflight that checks every REQUIRED dependency AND every dependency implied by the active configuration, reporting the status of all of them together rather than failing on the first. Required dependencies — at minimum `openspec`, `git`, AND a usable platform sandbox mechanism — SHALL fail the preflight when missing. Configuration-implied dependencies — the agent-CLI binary for each configured strategy, a forge/scout CLI when those features are enabled, AND an embedding backend when RAG is enabled — SHALL be reported AND warned when missing, fatal only when their feature is active. The same check SHALL be available on demand as an `autocoder doctor` subcommand that prints the full report AND exits non-zero when a required dependency is missing. The sandbox-mechanism check SHALL verify the mechanism is USABLE — e.g. `bwrap` actually runs under the host's user-namespace policy — not merely present, complementing (not replacing) the spawn-time fail-closed sandbox gate. This extends the existing openspec-availability preflight to cover the full dependency set.
+
+#### Scenario: All missing dependencies are reported together
+- **WHEN** the preflight runs with more than one dependency missing
+- **THEN** it reports all of them in one report
+- **AND** does not stop at the first
+
+#### Scenario: A missing required dependency fails the preflight
+- **WHEN** a required dependency (`openspec`, `git`, or a usable sandbox mechanism) is missing
+- **THEN** the preflight fails with a clear message naming it AND how to install it
+
+#### Scenario: Configured-strategy binaries are checked, unconfigured ones are not
+- **WHEN** a strategy is configured but its CLI binary is absent
+- **THEN** the report marks it missing for that strategy
+- **AND** binaries for strategies that are not configured are not required
+
+#### Scenario: A present-but-unusable mechanism is reported unusable
+- **WHEN** a sandbox-mechanism binary exists but cannot apply the sandbox (e.g. `bwrap` present but unprivileged user namespaces are disabled)
+- **THEN** the check reports the mechanism as unusable, not satisfied
+
+#### Scenario: doctor exits non-zero on a missing required dependency
+- **WHEN** `autocoder doctor` runs with a required dependency missing
+- **THEN** it prints the full report
+- **AND** exits non-zero
+
+### Requirement: Assisted dependency installation with per-step consent
+The installer SHALL detect the host platform AND its package manager, AND offer to install the OS-package dependencies it can (e.g. bubblewrap, git, a forge/scout CLI), showing the exact command for each AND installing only on explicit per-step consent. For dependencies it cannot reliably auto-install — the agent CLIs (which have their own installers and interactive login) AND optional backends (e.g. Ollama) — it SHALL print the exact install and auth commands rather than attempting them. It SHALL NOT run a privileged install without first showing the command AND obtaining consent for that step.
+
+#### Scenario: A missing OS package is offered with consent
+- **WHEN** the installer finds a missing OS-package dependency AND a supported package manager
+- **THEN** it shows the install command
+- **AND** installs it only after the operator consents to that step
+
+#### Scenario: Each install is its own consent step
+- **WHEN** more than one OS-package dependency is missing
+- **THEN** each is offered with its own consent step
+- **AND** none is installed without its command shown
+
+#### Scenario: Non-auto-installable dependencies get printed instructions
+- **WHEN** a dependency cannot be auto-installed (an agent CLI or an optional backend)
+- **THEN** the installer prints the exact install and auth commands
+- **AND** does not attempt to run them
+
+#### Scenario: No silent privileged install
+- **WHEN** an install step requires elevated privilege
+- **THEN** the command is shown AND consent obtained before it runs
+
+### Requirement: Config path is discovered from the systemd unit
+When a config path is not provided explicitly, `update.sh` AND the daemon CLI SHALL discover it from the installed systemd service unit — parsing the daemon's config argument out of the unit's `ExecStart`, matching the flag the daemon is actually launched with: the run command's `--config-dir <dir>` (from which the config file is `<dir>/config.yaml`), AND accepting a `--config <file>` form as well — so the operator does not retype a path that is already recorded. When no unit or no recorded config path is found, the existing default-path resolution applies. An explicitly provided config path SHALL always win and SHALL NOT consult the unit.
+
+#### Scenario: Discovered from the unit
+- **WHEN** no config path is provided AND the systemd unit's `ExecStart` launches the daemon with `--config-dir <dir>` (or `--config <file>`)
+- **THEN** the resolver uses `<dir>/config.yaml` (or `<file>`)
+
+#### Scenario: Falls back to default resolution
+- **WHEN** no config path is provided AND no systemd unit records one
+- **THEN** the existing default-path resolution applies
+
+#### Scenario: An explicit path wins
+- **WHEN** a config path is provided explicitly
+- **THEN** it is used AND the systemd unit is not consulted
+
+### Requirement: doctor verifies toolchains are runnable in the agent environment
+Beyond checking presence, the dependency `doctor` / preflight SHALL verify that the expected toolchains are RUNNABLE in the agent's actual environment — the captured, credential-filtered environment applied under the sandbox policy — by invoking each (e.g. `<tool> --version`) AND reporting any that are present on disk but NOT runnable (for example, a version manager whose shim/init did not activate, so the managed interpreter does not resolve), with an actionable hint. The expected set SHALL default to a common toolchain list AND be operator-configurable. A present-but-not-runnable toolchain SHALL be reported so the activation gap surfaces at startup rather than mid-run.
+
+#### Scenario: A present-but-not-runnable toolchain is reported
+- **WHEN** a toolchain is present on disk but not runnable in the agent environment (e.g. `pyenv` installed but not initialized, so `python` does not resolve to the managed interpreter)
+- **THEN** `doctor` reports it as present-but-not-runnable with a hint to activate it (e.g. add its init to the unit's environment)
+
+#### Scenario: A runnable toolchain passes
+- **WHEN** an expected toolchain runs successfully in the agent environment (`<tool> --version` succeeds)
+- **THEN** `doctor` reports it as available
+
+#### Scenario: The expected set is configurable
+- **WHEN** the operator configures the expected-toolchain list
+- **THEN** `doctor` checks exactly that set, defaulting to the common list when unset
+
+### Requirement: The queue walk yields to pending operator chatops requests
+The per-repo change-queue walk SHALL NOT defer an operator chatops request — the `send it` audit-triage, the `propose` chat-request, OR the `changelog` request — by more than one change-cycle. These requests are drained at the top of each polling iteration, before the change walk; but because the walk processes a batch of pending changes (each a full executor run) before the iteration ends, a request that arrives mid-batch would otherwise wait for the entire batch to complete.
+
+To bound this, after completing each change in the walk, the daemon SHALL check whether any operator chatops request is pending for the repo (the same `pending_triages` / `pending_proposal_requests` / `pending_changelog_requests` queues the iteration-top drains read). When any is pending, the walk SHALL end the current batch — the caller opens its PR with the changes accumulated so far — AND return, so the next iteration drains the pending operator request before starting a new batch. Operator-request latency is thereby bounded to at most one in-flight change.
+
+The walk SHALL NOT interrupt a change that is already executing: the current change runs to its outcome before the walk yields. It only declines to START the next change when an operator request is waiting. A workspace-resetting operator request (changelog/propose reset to the base branch) therefore never interleaves with an in-flight change.
+
+#### Scenario: A changelog request queued mid-batch is processed within one change-cycle
+- **WHEN** a `changelog` request arrives while the walk is processing change N of a multi-change batch
+- **THEN** after change N reaches its outcome, the walk ends the batch (the caller opens the PR with the changes accumulated through N) AND returns
+- **AND** the next iteration drains the `changelog` request before starting a new batch
+- **AND** the request is NOT deferred until changes N+1 … end of the batch complete
+
+#### Scenario: The same bound applies to propose and send it
+- **WHEN** a `propose` OR `send it` request is pending after a change completes in the walk
+- **THEN** the walk yields after that change exactly as it does for `changelog`
+- **AND** the operator request is drained on the next iteration
+
+#### Scenario: An in-flight change is not interrupted
+- **WHEN** an operator chatops request arrives while a change is mid-execution
+- **THEN** that change runs to its outcome before the walk checks the operator-request queues
+- **AND** no workspace-resetting operator request runs while a change occupies the workspace
+
+#### Scenario: No operator request pending leaves batch behavior unchanged
+- **WHEN** no operator chatops request is pending after each change
+- **THEN** the walk processes the full batch (up to its existing limit) exactly as before
+- **AND** there is no change in PR bundling for iterations with no pending operator request
+
+### Requirement: The `changelog` chatops verb defaults to tag-driven gap-fill
+When the `@<bot> changelog <repo>` verb is invoked WITHOUT an explicit `--since` OR `--to` argument, the daemon SHALL document every stable release tag that is missing from the workspace's `CHANGELOG.md`, oldest-first — rather than producing a single section for the default `(last tag … HEAD]` range. Passing `--since` AND/OR `--to` selects the explicit single-range behavior of the `changelog chatops verb queues an LLM-styled CHANGELOG.md update via the standard triage path` requirement AND bypasses gap-fill. The shared mechanics of that requirement — stylist styling/insertion, path-scope validation, commit to a `changelog-<short-hash>` branch, a single PR, and the revision loop — are unchanged; this requirement governs only WHICH versions a flagless run documents AND that it may document several at once.
+
+**Stable release tags only.** Gap-fill SHALL consider only tags that parse as a release version with NO pre-release component (e.g. `v1.2.0`). Tags carrying a semver pre-release suffix — `-dev`, `-rc`, `-alpha`, `-beta`, etc., including the daemon's own `-dev` build tags — SHALL be skipped, so the changelog tracks real releases and does not churn on build tags.
+
+**Deterministic gap detection.** The daemon (NOT the stylist LLM) SHALL read the existing `CHANGELOG.md`, identify the versions it already documents from its headings, AND compute which stable release tags are undocumented. For each missing tag, oldest-first, the daemon SHALL run the deterministic extractor (per the `a05` requirement) over that tag's range — `(previous stable release tag … this tag]` — AND combine the per-tag results into the JSON handed to the stylist. The stylist inserts each as its own section in chronological position. The run SHALL be idempotent: only missing versions are added; already-documented versions are neither regenerated nor duplicated.
+
+**Nothing to do.** When every stable release tag is already documented, OR the repo has no stable release tags, the verb SHALL make no `CHANGELOG.md` change AND post a short thread reply stating so, rather than opening an empty PR.
+
+#### Scenario: Flagless run fills every missing stable release tag, oldest-first
+- **WHEN** `@<bot> changelog <repo>` is invoked with no `--since`/`--to` AND the repo has stable release tags `v1.0.0` AND `v1.1.0` not yet in `CHANGELOG.md`
+- **THEN** the daemon documents both, oldest-first (`v1.0.0` then `v1.1.0`), each as its own section, in a single PR
+- **AND** each section's range is `(previous stable release tag … this tag]`
+
+#### Scenario: Pre-release tags are skipped
+- **WHEN** the repo has tags `v1.2.0`, `v1.2.0-dev-108`, AND `v1.2.0-rc.1`
+- **THEN** only `v1.2.0` is considered for documentation
+- **AND** the pre-release tags (`-dev`, `-rc`) are given no changelog section
+
+#### Scenario: Already-documented versions are not regenerated (idempotent)
+- **WHEN** `CHANGELOG.md` already documents `v1.0.0` AND the only newer stable tag is `v1.1.0`
+- **THEN** only `v1.1.0` is added AND `v1.0.0`'s existing section is left intact
+- **AND** a subsequent flagless run with no new stable tags makes no `CHANGELOG.md` change AND posts that the log is already current
+
+#### Scenario: Explicit --since/--to bypasses gap-fill
+- **WHEN** `@<bot> changelog <repo> --since v1.0.0 --to v1.1.0` is invoked
+- **THEN** the single-range behavior of the `changelog chatops verb queues an LLM-styled CHANGELOG.md update via the standard triage path` requirement applies (one section for that range)
+- **AND** no gap-fill across other missing tags occurs
+
+#### Scenario: No stable release tags yet
+- **WHEN** `@<bot> changelog <repo>` is invoked AND the repo has no stable release tags (only pre-release tags, or none)
+- **THEN** no `CHANGELOG.md` change is made
+- **AND** the bot posts a thread reply that there are no stable release tags to document yet (the operator can tag a release, or pass `--since`/`--to` for an explicit range)
+
+### Requirement: Canon-internal contradiction audit
+autocoder SHALL register a `canon_contradiction_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI through the shared `agentic_run` primitive with a read-only sandbox (`Read`/`Glob`/`Grep`; NO `Bash`, `Write`, or `Edit`) and `ORCH_MCP_ROLE = canon_contradiction_audit`, scans the canonical specs for pairs of requirements that cannot both hold, and reports them advisorily. The agent SHALL return findings by calling the `submit_canon_internal_contradictions` MCP tool — consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` AND `WritePolicy::None`. Its default cadence is heavy (`monthly`) given that each run reasons over the whole canon; the cadence is operator-configurable per the cadence schema.
+
+**RAG-assisted detection, best-effort fallback.** The audit enumerates the canonical requirements across `openspec/specs/*/spec.md`. When `a21`'s canonical-spec RAG is enabled, the agent SHALL use `query_canonical_specs` to retrieve, for each requirement, a bounded set of the most semantically-similar requirements AND check that focused bundle for contradiction — bounding the per-call input AND targeting related requirements, where contradictions actually live, rather than attempting an intractable all-pairs sweep over a large canon. When RAG is not configured, the audit SHALL degrade to a best-effort direct read of the canon AND log that coverage is best-effort (subtle cross-capability pairs may be missed without retrieval). The retrieval breadth is an operator-tunable setting with a sensible default.
+
+**Precision over recall.** A finding REQUIRES that the two requirements be logically incompatible — both cannot hold at once. A general requirement together with a *compatible* specialization of it (e.g. "all data in a relational database" AND "use PostgreSQL", since PostgreSQL is relational) is NOT a contradiction AND SHALL NOT be reported; flagging it would be the general-vs-specific information-loss error in reverse. The prompt SHALL confidence-gate toward NOT reporting when uncertain, because a false positive is operator noise. This prompt guidance is design intent verified by the drift audit's semantic judgment; it SHALL NOT be pinned by a unit test asserting verbatim substrings of the prompt (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
+
+**Advisory disposition.** On findings the audit SHALL return `AuditOutcome::Reported(findings)`; the framework posts the standard chatops summary. The audit SHALL NOT modify the canon. Each finding's body SHALL name BOTH conflicting requirements (capability + requirement title) AND explain why they conflict, so the maintainer can judge project intent AND — where they choose to heal it — use the existing audit-thread `send it` verb to schedule a triage run that drafts the resolving MODIFY in the chosen direction. The number of findings per run is bounded by an operator-configurable cap with a sensible default; pairs beyond the cap surface on subsequent runs.
+
+**Re-report suppression.** The audit SHALL persist the contradictions it has reported — keyed by an order-independent pair of (capability + requirement title) for the two sides, plus a content hash of each requirement's text. This suppression state is daemon bookkeeping, so it SHALL live under `<state_dir>/canon-contradiction-state/<workspace-basename>.json` (resolved via `DaemonPaths`, threaded into the audit as a constructor argument) — NOT in the managed repository's workspace, per the canonical "Workspaces, markers, and state move to standard locations" requirement. On a later run it SHALL suppress re-reporting a recorded pair whose two requirements are textually unchanged; it SHALL re-surface a pair when either requirement's text has changed since it was recorded; AND it SHALL prune records for pairs no longer detected (healed). This keeps an unhealed contradiction from re-spamming chatops every run while still re-alerting when the conflicting text is edited.
+
+#### Scenario: Runs read-only and agentic with its role
+- **WHEN** the audit runs
+- **THEN** autocoder spawns the wrapped agent CLI via `agentic_run` with a sandbox that allows only `Read`/`Glob`/`Grep` (`Bash`, `Write`, and `Edit` denied) AND sets `ORCH_MCP_ROLE = canon_contradiction_audit`
+- **AND** the prompt is the embedded `prompts/canon-contradiction-audit.md` template OR the operator override at `audits.canon_contradiction_audit.prompt_path`
+
+#### Scenario: Uses RAG when enabled, degrades and logs when not
+- **WHEN** the audit runs AND `a21`'s canonical-spec RAG is enabled
+- **THEN** the agent retrieves the nearest requirements per requirement via `query_canonical_specs` AND checks those focused bundles
+- **WHEN** the audit runs AND RAG is not configured
+- **THEN** the audit proceeds with a best-effort direct read of the canon AND logs that coverage is best-effort
+
+#### Scenario: A general rule plus a compatible specialization is not a contradiction
+- **WHEN** the canon contains a general requirement AND a compatible specialization of it (e.g. "all data in a relational database" alongside "use PostgreSQL")
+- **THEN** the audit does NOT report them as a contradiction
+
+#### Scenario: A logically incompatible pair is reported advisorily without touching the canon
+- **WHEN** two canonical requirements cannot both hold (e.g. one mandates a relational database for all data, another mandates a document store for some of it)
+- **THEN** the audit returns `AuditOutcome::Reported` with a finding naming BOTH requirements (capability + title) AND the reason they conflict
+- **AND** no file under `openspec/specs/` is modified (the `WritePolicy::None` post-hoc clean-tree check holds)
+
+#### Scenario: Previously-reported pairs are suppressed; edited ones re-surface; healed ones are pruned
+- **WHEN** a contradiction was reported on a prior run AND both its requirements are textually unchanged on a later run
+- **THEN** the later run does NOT re-report that pair
+- **WHEN** either requirement's text has changed since the pair was recorded
+- **THEN** the later run re-surfaces the pair
+- **AND** a recorded pair that is no longer detected is pruned from the audit's report state
+
+#### Scenario: No contradictions produces a silent outcome
+- **WHEN** the audit finds no logically incompatible pair
+- **THEN** it returns `AuditOutcome::Reported(vec![])`
+- **AND** unless `notify_on_clean: true` is set, no chatops message is posted (per the framework-level scenario)
+
+### Requirement: Canon-consolidation audit
+autocoder SHALL register a `canon_consolidation_audit` audit in the periodic-audit framework, following the specs-writing pattern of `missing_tests_audit` / `security_bug_audit`. The audit invokes the wrapped agent CLI through the shared `agentic_run` primitive with a `WritePolicy::OpenSpecOnly` sandbox (`Read`/`Glob`/`Grep` plus `Write`/`Edit`), identifies a redundant cluster of canonical requirements, AND drafts a consolidation change under `openspec/changes/` that merges them. It returns `AuditOutcome::SpecsWritten(names)` so the same iteration's queue walk carries the change to a PR. The audit is `requires_head_change = true`; its default cadence is heavy (`monthly`). It NEVER modifies the canonical specs directly — its only output is a reviewable change.
+
+**RAG-assisted overlap detection, best-effort fallback.** The audit enumerates the canonical requirements across `openspec/specs/*/spec.md`. When `a21`'s canonical-spec RAG is enabled, the agent SHALL use `query_canonical_specs` to retrieve, for each requirement, a bounded set of the most semantically-similar requirements AND judge that focused bundle for redundancy — bounding per-call input AND targeting related requirements, where redundancy lives. When RAG is not configured, the audit SHALL degrade to a best-effort direct read of the canon AND log that coverage is best-effort. The retrieval breadth is an operator-tunable setting with a sensible default.
+
+**Conservative v1 scope.** The audit SHALL propose a merge only where the requirements express the *same invariant* under different titles (e.g. per-provider duplicates of one outbound-call retry rule). Broad capability restructuring AND speculative over-fragmentation merges are OUT of scope for this audit.
+
+**General-vs-specific guard.** The audit SHALL NOT merge a general, project-wide prescription with a feature-specific implementation of it — merging "all data is stored in a relational database" with "make PostgreSQL available" into "all data is stored in PostgreSQL" erases the general rule AND would forbid a later alternative. The prompt SHALL err toward NOT proposing when a merge would erase a broader prescription. This prompt guidance is design intent verified by the drift audit's semantic judgment; it SHALL NOT be pinned by a unit test asserting verbatim substrings of the prompt (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
+
+**Consolidation change shape.** The drafted change SHALL name itself with a `consolidate-` prefix; MODIFY the surviving requirement into the merged general form; REMOVE the now-redundant requirement(s) via a `## REMOVED Requirements` delta; AND preserve every non-redundant scenario across the merged result. Because consolidation is subtractive, the proposal SHALL state the before/after scenario count AND list any scenario dropped as redundant, with the reason, so the PR reviewer sees exactly what is consolidated AND can catch silent information loss. The audit SHALL validate the drafted change with `openspec validate <name> --strict` before committing; an invalid draft is discarded with a WARN AND no commit (consistent with the framework's `LLM-driven audits validate their generated proposals before committing` requirement).
+
+**Human arbitration.** The consolidation change is reviewed in a PR; the operator merges, `@<bot> revise`s, or rejects it. A merge that proves wrong after landing is recoverable by removing the change AND rebuilding canon from the archive (`Rebuild canonical specs from archive`). The number of proposals per run is bounded by `audits.canon_consolidation_audit.max_proposals_per_run` (default `1`; consolidation changes are denser to review than additive ones).
+
+#### Scenario: Runs agentic with an OpenSpec-only sandbox and RAG-assisted detection
+- **WHEN** the audit runs
+- **THEN** autocoder spawns the wrapped agent CLI via `agentic_run` with a `WritePolicy::OpenSpecOnly` sandbox (`Write`/`Edit` allowed alongside the read tools)
+- **AND** the prompt is the embedded `prompts/canon-consolidation-audit.md` template OR the operator override at `audits.canon_consolidation_audit.prompt_path`
+- **WHEN** `a21`'s RAG is enabled
+- **THEN** the agent retrieves the nearest requirements per requirement via `query_canonical_specs`; when RAG is not configured the audit proceeds with a best-effort direct read AND logs that coverage is best-effort
+
+#### Scenario: A near-duplicate cluster yields one consolidation change
+- **WHEN** two or more canonical requirements express the same invariant under different titles (e.g. a per-provider retry rule duplicated for Stripe AND PayPal)
+- **THEN** the audit drafts one `consolidate-`-prefixed change that MODIFIES the surviving requirement into the merged general form AND REMOVES the redundant one(s)
+- **AND** every non-redundant scenario is preserved in the merged result
+- **AND** the audit returns `AuditOutcome::SpecsWritten` naming the created change
+
+#### Scenario: A general rule plus a compatible specialization is not merged
+- **WHEN** a general project-wide prescription AND a compatible feature-specific implementation of it are candidates (e.g. "all data in a relational database" AND "make PostgreSQL available")
+- **THEN** the audit does NOT propose merging them, because the merge would erase the general prescription
+
+#### Scenario: The proposal surfaces the scenario-loss summary
+- **WHEN** the audit drafts a consolidation change that reduces the total scenario count
+- **THEN** the proposal states the before/after scenario count AND lists each scenario dropped as redundant with the reason
+- **AND** the PR reviewer can see exactly what was consolidated
+
+#### Scenario: An invalid draft is discarded without committing
+- **WHEN** the drafted consolidation change fails `openspec validate <name> --strict`
+- **THEN** the audit deletes the draft AND records a WARN naming the validation error
+- **AND** no consolidation change is committed from that run
+
+#### Scenario: No redundancy produces a silent outcome
+- **WHEN** the audit finds no redundant cluster within its conservative scope
+- **THEN** it returns `AuditOutcome::SpecsWritten(vec![])`
+- **AND** no commit is made AND no chatops post is sent (per the framework behavior for spec-writing audits)
+
+### Requirement: Audit model selection
+Periodic audits SHALL support an optional `model` field under `audits.settings.<audit_type>` in the configuration file. When specified, the value SHALL be a nickname referencing an entry in the top-level `models:` registry. At config load, this nickname SHALL be resolved to its full `(provider, model, api_base_url, api_key)` tuple. If the nickname does not exist in the registry, config validation SHALL fail fast with an error naming the missing nickname.
+
+#### Scenario: Audit configured with a valid registry nickname
+- **WHEN** an operator configures `audits.settings.drift_audit.model: "my_audit_model"`
+- **AND** `my_audit_model` exists in the `models:` registry
+- **THEN** config validation succeeds
+- **AND** the audit runner receives the resolved model configuration for that audit
+
+#### Scenario: Audit configured with an invalid registry nickname
+- **WHEN** an operator configures `audits.settings.security_bug_audit.model: "nonexistent_model"`
+- **AND** `nonexistent_model` is not present in the `models:` registry
+- **THEN** config validation fails at startup
+- **AND** the error message names the missing nickname and the referencing audit setting
+
+#### Scenario: Audit without a model field defaults to existing behavior
+- **WHEN** an operator does not specify a `model` field under `audits.settings.<audit_type>`
+- **THEN** the audit runner receives `None` for the model configuration
+- **AND** the audit executes using the default `claude` CLI strategy with no model override, preserving backward compatibility
 

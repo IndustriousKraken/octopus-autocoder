@@ -22,6 +22,7 @@ use crate::chatops::ChatOpsBackend;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{CommandAuthorizationConfig, GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, ExecutorOutcome};
+use crate::forge::{AuthLevel, Forge, GithubForge};
 use crate::github;
 
 /// HTML-comment marker the reviewer-initiated revision flow writes at the
@@ -31,6 +32,56 @@ use crate::github;
 /// reviewer pipeline posts on the bot's behalf are parsed normally even
 /// though their author is `bot_username`.
 pub const REVIEWER_REVISION_MARKER: &str = "<!-- reviewer-revision -->";
+
+/// a005: build the body of the SINGLE aggregated `<!-- reviewer-revision -->`
+/// PR comment for a review's actionable concerns. All concerns produced by
+/// one review are collected into ONE revision instruction — a numbered list
+/// of the per-concern `actionable_request`s — so the dispatcher issues
+/// exactly one executor run (one `max_auto_revisions_per_pr` increment) for
+/// the whole batch rather than one run per concern. The aggregated run sees
+/// every concern in one warm pass, so related fixes are reasoned about
+/// together AND a concern already satisfied by an earlier fix in the same
+/// batch does not become a separate no-op run.
+///
+/// `concerns` should already be the revisable set (see
+/// [`crate::code_reviewer::ReviewConcern::is_revisable`]); any concern whose
+/// trimmed `actionable_request` is empty is skipped defensively. Returns
+/// `None` when nothing actionable remains (the caller posts no comment).
+///
+/// A single concern renders the historical one-line shape
+/// (`@<bot> revise <request>`); two-or-more render the numbered list with a
+/// short preamble instructing the implementer to fix the related concerns
+/// together and skip redundant edits.
+pub fn build_aggregated_reviewer_revision_comment(
+    bot_username: &str,
+    concerns: &[crate::code_reviewer::ReviewConcern],
+) -> Option<String> {
+    let requests: Vec<&str> = concerns
+        .iter()
+        .filter_map(|c| match c.actionable_request.as_deref() {
+            Some(s) if !s.trim().is_empty() => Some(s.trim()),
+            _ => None,
+        })
+        .collect();
+    if requests.is_empty() {
+        return None;
+    }
+    let instruction = if requests.len() == 1 {
+        requests[0].to_string()
+    } else {
+        let mut s = format!(
+            "Address the following {} code-review concerns together in a single pass. They come from one review and are usually related — make them as one coherent change. If an earlier item in this list already satisfies a later one, do not make a redundant edit.\n",
+            requests.len()
+        );
+        for (i, request) in requests.iter().enumerate() {
+            s.push_str(&format!("\n{}. {}", i + 1, request));
+        }
+        s
+    };
+    Some(format!(
+        "{REVIEWER_REVISION_MARKER}\n@{bot_username} revise {instruction}"
+    ))
+}
 
 /// Per-PR state file persisted under
 /// `<state_dir>/revisions/<repo-sanitized>/<pr_number>.json`. The
@@ -369,23 +420,16 @@ fn strip_leading_html_comment_lines(body: &str) -> &str {
 /// trusted internal triggers and bypass this check, just as they bypass
 /// the bot-self-author filter — the caller passes only non-automatic
 /// comments here.
+///
+/// a007: the `author_association`/`allowed_users` decision now lives behind
+/// the forge — `GithubForge::authorize` owns the gate. This thin wrapper
+/// keeps the dispatcher's call sites unchanged while routing the decision
+/// through the `Forge` trait (the selected forge decides authorization).
 fn is_comment_authorized(
     comment: &github::IssueComment,
     auth: &CommandAuthorizationConfig,
 ) -> bool {
-    let login = comment.user_login();
-    if !login.is_empty()
-        && auth
-            .allowed_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(login))
-    {
-        return true;
-    }
-    match comment.author_association() {
-        Some(assoc) => auth.allowed_associations.iter().any(|a| a == assoc),
-        None => false,
-    }
+    GithubForge::new().authorize(comment, auth) == AuthLevel::Authorized
 }
 
 /// Best-effort: extract the list of change names from the PR body's
@@ -501,6 +545,9 @@ pub async fn process_revision_requests_at(
     }
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    // a007: forge-trait handle for this repository's REST operations. GitHub
+    // is the only provider; `with_api_base` threads the (test-injected) base.
+    let forge = GithubForge::with_api_base(api_base);
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -516,9 +563,7 @@ pub async fn process_revision_requests_at(
     // fork-headed PR, leaving fork-PR-mode operators without working
     // `@<bot> revise <text>` since fork-PR mode shipped.
     let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
-    let open_prs = github::list_open_prs_for_head(
-        api_base,
-        &token,
+    let open_prs = forge.find_pr_by_head(&token,
         &owner,
         &repo_name,
         head_owner,
@@ -596,6 +641,8 @@ async fn process_one_pr(
     cancel: CancellationToken,
 ) -> Result<()> {
     let _ = reviewer; // wired through; consumed by the code-review branch (task 4)
+    // a007: forge-trait handle for this PR's comment fetches + reply posting.
+    let forge = GithubForge::with_api_base(api_base);
     // Load or initialize per-PR state. The revision_cap stored in state
     // reflects the cap in effect when the PR was first observed; callers
     // that change `executor.max_auto_revisions_per_pr` mid-PR live with
@@ -630,9 +677,7 @@ async fn process_one_pr(
     // over-cap automatic trigger is silently advanced while a human
     // trigger interleaved on the same PR is dispatched normally.
 
-    let comments = github::list_issue_comments_since(
-        api_base,
-        token,
+    let comments = forge.list_comments_since(token,
         owner,
         repo_name,
         pr.number,
@@ -730,8 +775,7 @@ async fn process_one_pr(
                 let body = format!(
                     "🚫 This `@{bot_username}` command was ignored: only repository owners, members, and collaborators (or configured allowed users) can trigger it. (author_association: {assoc})"
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await
                 {
@@ -776,8 +820,7 @@ async fn process_one_pr(
                                 "🛑 Code review cap reached ({} reruns). Further @{} code-review requests will be ignored. Close + re-open the PR or merge as-is.",
                                 cap, bot_username,
                             );
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &pr_text,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &pr_text,
                             )
                             .await
                             {
@@ -831,13 +874,13 @@ async fn process_one_pr(
                         token,
                         owner,
                         repo_name,
+                        bot_username,
                     )
                     .await;
                     match outcome {
                         Ok(CodeReviewOutcome::ReviewerDisabled) => {
                             let body = "✗ Code review not available: reviewer is disabled in config".to_string();
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &body,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                             )
                             .await
                             {
@@ -883,8 +926,7 @@ async fn process_one_pr(
                             let body = format!(
                                 "✗ Code review failed: {reason}. The PR is unchanged. Reply with another `@{bot_username} code-review` to retry."
                             );
-                            if let Err(e) = github::post_issue_comment(
-                                api_base, token, owner, repo_name, pr.number, &body,
+                            if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                             )
                             .await
                             {
@@ -948,9 +990,7 @@ async fn process_one_pr(
                     "🛑 Revision cap reached ({} automatic revisions). Further reviewer-initiated revisions on this PR will be ignored; human `@{} revise` requests still process. Close + re-open or merge as-is.",
                     state.revision_cap, bot_username,
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base,
-                    token,
+                if let Err(e) = forge.post_comment(token,
                     owner,
                     repo_name,
                     pr.number,
@@ -999,8 +1039,7 @@ async fn process_one_pr(
                     "🛑 Human-revision cap reached ({} `@{} revise` requests on this PR). Further revise requests will be ignored. Close + re-open or merge as-is.",
                     human_revise_cap, bot_username,
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &pr_text,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &pr_text,
                 )
                 .await
                 {
@@ -1046,9 +1085,7 @@ async fn process_one_pr(
         // advance the comment-seen marker — the next iteration's
         // dispatcher pass re-attempts the assembly so transient API
         // errors don't lose the operator's revise comment.
-        let all_comments = match github::list_issue_comments_since(
-            api_base,
-            token,
+        let all_comments = match forge.list_comments_since(token,
             owner,
             repo_name,
             pr.number,
@@ -1068,8 +1105,7 @@ async fn process_one_pr(
                 let body = format!(
                     "✗ Cannot revise: failed to fetch PR context: {truncated_err}. The daemon will retry on the next polling iteration. If this persists, check journalctl for the daemon's GitHub API errors AND verify the bot's token has Read access on this repo."
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 // CRITICAL: do NOT advance latest_seen — re-attempt
@@ -1175,7 +1211,7 @@ async fn process_one_pr(
                         bot_username
                     );
                     let _ =
-                        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body)
+                        forge.post_comment(token, owner, repo_name, pr.number, &body)
                             .await;
                     if is_automatic {
                         state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
@@ -1229,8 +1265,7 @@ async fn process_one_pr(
                         final_answer.as_deref(),
                     )
                 };
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &reply,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &reply,
                 )
                 .await
                 {
@@ -1300,8 +1335,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     reason, bot_username
                 );
-                if let Err(e) = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await
                 {
@@ -1324,6 +1358,49 @@ async fn process_one_pr(
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
+            Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+                // a74: the agent subprocess never STARTED — a required
+                // precondition was unmet (e.g. the a006 OS-sandbox-mechanism
+                // gate refused to spawn with no usable mechanism AND no
+                // unsandboxed opt-in). No revision work was attempted, so this
+                // does NOT charge a revision slot (neither the automatic
+                // `auto_revisions_applied` nor the human `human_revise_count`
+                // counter is incremented). We still post a failure reply that
+                // directs the operator to resolve the precondition AND post a
+                // new revision request, AND we advance the seen-marker so the
+                // daemon does NOT auto-retry — an unmet precondition will not
+                // heal between polls, so a deliberate operator re-trigger is
+                // the right recovery. No commit or push is made.
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    paths,
+                    chatops_ctx,
+                    repo,
+                    pr.number,
+                    &pr.url,
+                    &reason,
+                    &comment_id_str,
+                )
+                .await;
+                let body = format!(
+                    "✗ Revision could not start: {}. The agent subprocess never started, so no revision was attempted AND this does NOT count against the revision cap. Resolve the precondition (see the message above), then reply with another `@{} revise ...` to re-trigger — the daemon will NOT retry automatically.",
+                    reason, bot_username
+                );
+                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        url = %repo.url,
+                        pr_number = pr.number,
+                        "failed to post precondition-unmet PR comment: {e:#}"
+                    );
+                }
+                // No count increment — no revision was attempted. Consume the
+                // trigger (advance the seen-marker) so it does not re-fire on
+                // the next poll; manual re-trigger is required.
+                advance_seen(&mut latest_seen, comment.created_at);
+                write_state(paths, workspace, &state)?;
+            }
             Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
                 // The revise-lifecycle "failed" notification surfaces the
                 // iteration framing for chat operators. The pending-side
@@ -1343,8 +1420,7 @@ async fn process_one_pr(
                 .await;
                 let body = "✗ Revision attempt failed: executor reported the original change spec is unimplementable. The PR is unchanged."
                     .to_string();
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1379,8 +1455,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
                     bot_username
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1435,8 +1510,7 @@ async fn process_one_pr(
                     "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
                     e, bot_username
                 );
-                let _ = github::post_issue_comment(
-                    api_base, token, owner, repo_name, pr.number, &body,
+                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
                 )
                 .await;
                 if is_automatic {
@@ -1648,9 +1722,10 @@ fn compose_rerun_review_comment(
 /// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
 /// reviewer's output as a fresh PR comment with the canonical
 /// `## Code Review (rerun N of M)` heading. When the reviewer's
-/// `auto_revise` flag is set, also posts per-concern
-/// `<!-- reviewer-revision -->`-marked comments for every actionable
-/// concern, regardless of the verdict.
+/// `auto_revise` tri-state fires for the rerun's verdict (a005), also posts
+/// ONE aggregated `<!-- reviewer-revision -->`-marked comment carrying every
+/// actionable concern from the rerun (one dispatcher run, one auto-revision
+/// increment), rather than one comment per concern.
 #[allow(clippy::too_many_arguments)]
 async fn execute_code_review(
     workspace: &Path,
@@ -1663,11 +1738,14 @@ async fn execute_code_review(
     token: &str,
     owner: &str,
     repo_name: &str,
+    bot_username: &str,
 ) -> Result<CodeReviewOutcome> {
     // Reviewer-not-available short-circuit.
     let Some(reviewer) = reviewer else {
         return Ok(CodeReviewOutcome::ReviewerDisabled);
     };
+    // a007: forge-trait handle for this re-review's PR-comment posting.
+    let forge = GithubForge::with_api_base(api_base);
     // Cap check. `None` means unlimited (a47 default) — no ceiling.
     if let Some(cap) = state.code_review_cap
         && state.code_reviews_applied >= cap
@@ -1738,7 +1816,7 @@ async fn execute_code_review(
         result.attribution.as_deref(),
     );
     if let Err(e) =
-        github::post_issue_comment(api_base, token, owner, repo_name, pr.number, &body).await
+        forge.post_comment(token, owner, repo_name, pr.number, &body).await
     {
         tracing::warn!(
             url = %repo.url,
@@ -1749,35 +1827,31 @@ async fn execute_code_review(
             reason: format!("PR comment post failed: {e}"),
         });
     }
-    // When `reviewer.auto_revise` is enabled, post one
-    // `<!-- reviewer-revision -->`-marked PR comment per actionable
-    // concern — REGARDLESS of the verdict, mirroring the initial-review
-    // partition logic. A concern is actionable when it carries
-    // `should_request_revision: true` AND a non-empty `actionable_request`.
-    if reviewer.auto_revise() {
-        for concern in &result.concerns {
-            if !concern.should_request_revision {
-                continue;
-            }
-            let request = match concern.actionable_request.as_deref() {
-                Some(s) if !s.trim().is_empty() => s.trim(),
-                _ => continue,
-            };
-            let comment_body = format!(
-                "{REVIEWER_REVISION_MARKER}\n@{bot_label} revise {request}",
-                bot_label = "<bot>", // dispatcher rewrites mention upstream
-            );
-            if let Err(e) = github::post_issue_comment(
-                api_base, token, owner, repo_name, pr.number, &comment_body,
+    // a005: when the reviewer's `auto_revise` tri-state fires for this
+    // rerun's verdict, post ONE aggregated `<!-- reviewer-revision -->`
+    // comment carrying every actionable concern — the dispatcher then issues
+    // a single revision run (one auto-revision increment) for the batch,
+    // mirroring the initial-review path. `block` fires only on a `Block`
+    // verdict; `actionable` fires regardless of verdict; `off` never fires.
+    let is_block = matches!(result.verdict, crate::code_reviewer::Verdict::Block);
+    if reviewer.auto_revise().fires(is_block) {
+        let revisable: Vec<crate::code_reviewer::ReviewConcern> = result
+            .concerns
+            .iter()
+            .filter(|c| c.is_revisable())
+            .cloned()
+            .collect();
+        if let Some(comment_body) =
+            build_aggregated_reviewer_revision_comment(bot_username, &revisable)
+            && let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &comment_body,
             )
             .await
-            {
-                tracing::warn!(
-                    url = %repo.url,
-                    pr_number = pr.number,
-                    "failed to post reviewer-revision PR comment: {e:#}"
-                );
-            }
+        {
+            tracing::warn!(
+                url = %repo.url,
+                pr_number = pr.number,
+                "failed to post aggregated reviewer-revision PR comment: {e:#}"
+            );
         }
     }
     // Increment the counter; caller writes the state file.
@@ -2736,7 +2810,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn make_repo(url: &str) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".to_string(),
@@ -2748,6 +2822,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -3257,6 +3332,199 @@ mod tests {
             "dirty-tree revision must commit the change",
         );
         let state = read_state(&paths, &ws, 53).unwrap().expect("state persisted");
+        assert_eq!(state.auto_revisions_applied, 1);
+
+        token_env_clear(env_var);
+    }
+
+    // ============================================================
+    // a005: aggregated reviewer-initiated revisions (one run per review)
+    // ============================================================
+
+    /// a005 unit: `build_aggregated_reviewer_revision_comment` collapses a
+    /// single concern to the historical one-line shape, and two-or-more into
+    /// one numbered-list instruction under a single marker + mention.
+    #[test]
+    fn build_aggregated_comment_single_and_multi_shape() {
+        let one = vec![crate::code_reviewer::ReviewConcern {
+            summary: "s".into(),
+            actionable_request: Some("fix the thing".into()),
+            should_request_revision: true,
+            ..Default::default()
+        }];
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &one).unwrap();
+        assert_eq!(body, "<!-- reviewer-revision -->\n@my-bot revise fix the thing");
+
+        let two = vec![
+            crate::code_reviewer::ReviewConcern {
+                summary: "s1".into(),
+                actionable_request: Some("fix the GateRegistry".into()),
+                should_request_revision: true,
+                ..Default::default()
+            },
+            crate::code_reviewer::ReviewConcern {
+                summary: "s2".into(),
+                actionable_request: Some("update its two callers".into()),
+                should_request_revision: true,
+                ..Default::default()
+            },
+        ];
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &two).unwrap();
+        // One marker, one mention, both requests as a numbered list.
+        assert_eq!(body.matches(REVIEWER_REVISION_MARKER).count(), 1);
+        assert_eq!(body.matches("@my-bot revise").count(), 1);
+        assert!(body.contains("1. fix the GateRegistry"));
+        assert!(body.contains("2. update its two callers"));
+    }
+
+    /// a005: an empty / all-non-actionable concern set yields no comment.
+    #[test]
+    fn build_aggregated_comment_empty_is_none() {
+        assert!(build_aggregated_reviewer_revision_comment("my-bot", &[]).is_none());
+        let blank = vec![crate::code_reviewer::ReviewConcern {
+            summary: "s".into(),
+            actionable_request: Some("   ".into()),
+            should_request_revision: true,
+            ..Default::default()
+        }];
+        assert!(build_aggregated_reviewer_revision_comment("my-bot", &blank).is_none());
+    }
+
+    /// a005 task 3.1: a single review's N≥2 reviewer-revision requests arrive
+    /// as ONE aggregated comment; the dispatcher issues exactly ONE executor
+    /// run AND increments the auto-revision cap by exactly one (not N).
+    #[tokio::test]
+    async fn dispatcher_aggregated_review_is_one_run_one_increment() {
+        let env_var = "REVISIONS_TOKEN_AGG_ONE_RUN";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(71, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // ONE aggregated comment carrying THREE concerns.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/71/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(aggregated_reviewer_marked_comment_body(
+                "2026-05-25T11:00:00Z",
+                &["fix the GateRegistry", "update its two callers", "add a test"],
+            ))
+            .create_async()
+            .await;
+        // The dispatcher posts exactly one success reply for the one run.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/71/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Fixed all three together.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        // Exactly one run for the whole batch — NOT one per concern.
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "a 3-concern review must dispatch exactly one aggregated run"
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 71).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 1,
+            "the whole batch increments the auto-revision cap by exactly one"
+        );
+
+        token_env_clear(env_var);
+    }
+
+    /// a005 task 3.2: duplicate-targeting concerns in one review do NOT
+    /// produce a second no-op run — they ride the single aggregated run.
+    #[tokio::test]
+    async fn dispatcher_aggregated_duplicate_concerns_one_run() {
+        let env_var = "REVISIONS_TOKEN_AGG_DUP";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(72, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // Two requests targeting the SAME refactor, worded twice (the #95
+        // duplicate case) — both ride one aggregated comment.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/72/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(aggregated_reviewer_marked_comment_body(
+                "2026-05-25T11:00:00Z",
+                &[
+                    "use GateRegistry::standard() in the constructor",
+                    "construct gates via GateRegistry::standard()",
+                ],
+            ))
+            .create_async()
+            .await;
+        let _post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/72/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed {
+            final_answer: Some("Applied the GateRegistry::standard() refactor once.".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "duplicate concerns must NOT spawn a second no-op run"
+        );
+        let state = read_state(&paths, &ws, 72).unwrap().expect("state persisted");
         assert_eq!(state.auto_revisions_applied, 1);
 
         token_env_clear(env_var);
@@ -3927,6 +4195,38 @@ mod tests {
         )
     }
 
+    /// a005: build a single GitHub-issue-comments JSON payload containing
+    /// ONE bot-authored, reviewer-marked comment whose body is the AGGREGATED
+    /// revision instruction the source posts for `requests` (built by the
+    /// real [`build_aggregated_reviewer_revision_comment`], JSON-encoded so
+    /// the dispatcher parses exactly what production would write). Used to
+    /// prove a multi-concern review dispatches one run, not N.
+    fn aggregated_reviewer_marked_comment_body(
+        comment_created_at: &str,
+        requests: &[&str],
+    ) -> String {
+        let concerns: Vec<crate::code_reviewer::ReviewConcern> = requests
+            .iter()
+            .map(|r| crate::code_reviewer::ReviewConcern {
+                summary: (*r).to_string(),
+                actionable_request: Some((*r).to_string()),
+                should_request_revision: true,
+                ..Default::default()
+            })
+            .collect();
+        let body = build_aggregated_reviewer_revision_comment("my-bot", &concerns)
+            .expect("aggregated body must be non-empty");
+        let body_json = serde_json::to_string(&body).expect("encode comment body");
+        format!(
+            r#"[{{
+                "id": 1,
+                "body": {body_json},
+                "user": {{"login": "my-bot"}},
+                "created_at": "{comment_created_at}"
+            }}]"#,
+        )
+    }
+
     fn pr_summary_body(pr_number: u64, pr_created_at: &str) -> String {
         format!(
             r#"[{{
@@ -4311,6 +4611,184 @@ mod tests {
             "counter must not be incremented twice",
         );
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// a74 task 3.1 / 3.3: a precondition-unmet revise failure (the agent
+    /// subprocess never started — e.g. no usable OS sandbox mechanism) does
+    /// NOT increment the revision count AND advances the seen-marker (consumes
+    /// the trigger; manual re-trigger, no auto-retry). The classification is
+    /// driven by the outcome KIND (`ExecutorOutcome::PreconditionUnmet`), NOT a
+    /// message substring: the scripted reason carries no sandbox/gate keyword,
+    /// yet the dispatcher branches correctly and posts a guiding
+    /// "could not start" reply (distinct from `✗ Revision attempt failed`).
+    #[tokio::test]
+    async fn dispatcher_precondition_unmet_does_not_count_and_advances_seen() {
+        let env_var = "REVISIONS_TOKEN_PRECONDITION_UNMET";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(73, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/73/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // The dispatcher posts a guiding "could not start" reply — NOT the
+        // generic `✗ Revision attempt failed:` form used for substantive
+        // failures.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/73/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision could not start".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Synthetic precondition-unmet outcome. The reason text deliberately
+        // carries NO sandbox/gate/mechanism keyword, proving the dispatcher
+        // branches on the outcome KIND, not a message substring (task 3.3).
+        let executor = StubExecutor::new(vec![ExecutorOutcome::PreconditionUnmet {
+            reason: "synthetic unmet precondition for this PR".to_string(),
+        }]);
+        process_revision_requests_at(
+            &paths,
+            &ws,
+            &repo,
+            &gh,
+            None,
+            &executor,
+            None,
+            5,
+            10,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "the comment should be processed exactly once",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 73).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 0,
+            "precondition-unmet must NOT charge an automatic-revision slot (no work attempted)",
+        );
+        assert_eq!(
+            state.human_revise_count, 0,
+            "precondition-unmet must NOT charge the human-revise counter either",
+        );
+        assert_eq!(
+            state.last_seen_comment_at,
+            ts("2026-05-25T11:00:00Z"),
+            "the trigger must be consumed (seen-marker advanced) — manual re-trigger, no auto-retry",
+        );
+
+        token_env_clear(env_var);
+    }
+
+    /// a74 task 3.2: a substantive `Failed` revise outcome (the subprocess ran
+    /// and the task then failed) STILL increments the revision count —
+    /// unchanged behavior, the contrast case for the precondition-unmet
+    /// carve-out above.
+    #[tokio::test]
+    async fn dispatcher_substantive_failed_still_increments_count() {
+        let env_var = "REVISIONS_TOKEN_SUBSTANTIVE_FAILED";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(74, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/74/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/74/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision attempt failed".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Failed {
+            reason: "subprocess ran, then the build failed".to_string(),
+        }]);
+        process_revision_requests_at(
+            &paths,
+            &ws,
+            &repo,
+            &gh,
+            None,
+            &executor,
+            None,
+            5,
+            10,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "the comment should be processed exactly once",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&paths, &ws, 74).unwrap().expect("state persisted");
+        assert_eq!(
+            state.auto_revisions_applied, 1,
+            "a substantive Failed still counts toward the cap (unchanged behavior)",
+        );
+        assert_eq!(
+            state.last_seen_comment_at,
+            ts("2026-05-25T11:00:00Z"),
+            "the trigger is consumed on a substantive failure too",
+        );
 
         token_env_clear(env_var);
     }
@@ -5333,7 +5811,7 @@ mod tests {
             }),
             "review the code".to_string(),
         )
-        .with_auto_revise(true);
+        .with_auto_revise(crate::config::AutoRevise::Actionable);
 
         let (_dir, ws) = init_git_workspace();
         let mut repo = make_repo("git@github.com:owner/repo.git");
@@ -5391,6 +5869,7 @@ mod tests {
             "test-token",
             "owner",
             "repo",
+            "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5472,7 +5951,7 @@ mod tests {
         state.code_reviews_applied = 100;
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5501,7 +5980,7 @@ mod tests {
         state.code_reviews_applied = 3;
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");
@@ -5541,7 +6020,7 @@ mod tests {
         state.code_review_cap = Some(5);
         let outcome = execute_code_review(
             &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
-            &server.url(), "test-token", "owner", "repo",
+            &server.url(), "test-token", "owner", "repo", "my-bot",
         )
         .await
         .expect("execute_code_review succeeds");

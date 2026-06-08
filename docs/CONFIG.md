@@ -20,6 +20,7 @@ A list of one or more repositories to manage. Each entry:
 | `spec_storage`       | no       | unset (workspace-internal specs) | OSS-fork support (a26): see [`spec_storage`](#repositoriesspec_storage). |
 | `upstream`           | no       | unset (no upstream remote management) | OSS-fork support (a26): see [`upstream`](#repositoriesupstream). |
 | `auto_submit_pr`     | no       | `true`  | OSS-fork support (a26): see [`auto_submit_pr`](#repositoriesauto_submit_pr). |
+| `sandbox`            | no       | inherits global, then ON | a006 per-repo override of the OS-level sandbox credential toggles (`os_hide`, `engine_deny`). Each set field overrides `executor.sandbox`; loosening is logged at startup. See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 
 ### `repositories[].spec_storage` {#repositoriesspec_storage}
 
@@ -97,7 +98,7 @@ Cross-link:
 | `kind`                      | yes      | —             | Currently only `claude_cli` is supported. |
 | `command`                   | no       | `claude`      | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
 | `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
-| `sandbox`                   | no       | safe defaults | Tool-use restrictions applied to every executor invocation. See [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox). |
+| `sandbox`                   | no       | safe defaults | Tool-use restrictions (`allowed_tools`, `disallowed_bash_patterns`, `disallowed_read_paths`) applied to every executor invocation — see [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox) — **plus** the a006 OS-level sandbox credential toggles `os_hide` / `engine_deny` (both default ON) and the `allow_unsandboxed` no-mechanism opt-in (default `false`, daemon-wide). See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. Operators with override templates MAY mention `query_canonical_specs` (a21 — see `canonical_rag:`) in their prompt OR ignore the new tool entirely; the tool stays registered regardless. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
 | `max_changes_per_pr`        | no       | `3`           | Default cap on archived changes committed in one iteration's PR; per-repo `max_changes_per_pr` overrides. Operators with long queues see them ship across multiple iterations instead of one large PR. A value of `0` is clamped to `1` with a WARN log at startup. |
@@ -242,7 +243,7 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 | `api_key`                  | no       | _absent_ | Inline alternative to `api_key_env` (`{ value: "..." }`); when set, `api_key_env` is ignored. |
 | `api_base_url`             | no       | provider default | Override the base URL — useful for OpenRouter, Grok, local Ollama, etc. |
 | `prompt_template_path`     | no       | _embedded_ | Path to a file overriding the built-in reviewer prompt template. Must contain `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders. |
-| `auto_revise`              | no       | `false` | When `true`, posts one `<!-- reviewer-revision -->` PR comment per concern the reviewer marked `should_request_revision: true` (with a non-empty `actionable_request`) — fires on actionable concerns **regardless of verdict** (`Pass`, `Concerns`, or `Block`). The [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks them up on the next iteration. Reviewer-initiated revisions are **automatic** and count against the per-PR `executor.max_auto_revisions_per_pr` cap (human `@<bot> revise` requests do not); concerns dropped due to the cap budget are annotated in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)`. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy key `auto_revise_on_block` is accepted as a silent alias. Default `false` (no behavioural change for sites already running the reviewer). |
+| `auto_revise`              | no       | `block` | **Tri-state** (`block` \| `actionable` \| `off`) gating reviewer-initiated revisions. `block` (default) fires only when the review's effective verdict is `Block` (security-critical findings escalate to `Block`, so they auto-fix; non-`Block` `Concerns` stay advisory). `actionable` fires on any actionable concern regardless of verdict. `off` disables it. When it fires, all of a review's concerns marked `should_request_revision: true` (with a non-empty `actionable_request`) are **aggregated into ONE** `<!-- reviewer-revision -->` PR comment (a numbered list) that the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks up as a **single** revision run on the next iteration. That run is **automatic** and consumes exactly **one** slot of the per-PR `executor.max_auto_revisions_per_pr` cap regardless of concern count (human `@<bot> revise` requests do not count); `max_auto_revisions_per_pr: 0` disables it. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy boolean is mapped (`true` → `actionable`, `false` → `off`) and the legacy key `auto_revise_on_block` is accepted as a silent alias. **The default changed from off to `block`.** |
 | `prompt_budget_chars`      | no       | `2000000` | Maximum size (in chars) of the rendered reviewer prompt body — change context + changed files + diff combined. No hard ceiling; operator matches the value to their LLM provider's actual context window (Grok-4 / Claude Sonnet 4.6 fit `4000000`+; smaller-window providers may want a tighter cap). YAML integers do NOT accept underscore separators — write the value as a plain decimal. Hot-applicable via `autocoder reload`. See [Prompt budget](CODE-REVIEW.md#prompt-budget) for the full discussion. |
 | `mode`                     | no       | `bundled` | Reviewer dispatch mode. `bundled` (default) keeps the existing one-reviewer-call-per-PR behaviour. `per_change` dispatches one reviewer call per change in a multi-change PR, emits a separate `## Code Review: <slug>` section per change in the PR body, and scales LLM cost linearly with the change count. See [Per-change reviewer mode](CODE-REVIEW.md#per-change-reviewer-mode) for the full discussion. |
 
@@ -575,7 +576,7 @@ features:
     enabled: true                 # default true; set false to refuse scout/spec-it/clear-scout at parse time
     prompt_path: null             # default null; relative path to a custom scout prompt
     max_items: 30                 # default 30; valid range 1..=50
-    include_issues: true          # default true; controls whether scout attempts `gh api` for open issues
+    include_issues: true          # default true; controls whether scout fetches open issues via the forge API
     staleness_warn_days: 7        # default 7; threshold for the spec-it staleness warning
 ```
 
@@ -584,7 +585,7 @@ features:
 | `enabled`            | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> scout ...`, `@<bot> spec-it ...`, AND `@<bot> clear-scout ...` at parse time with `✗ scout: disabled in this workspace's config (features.scout.enabled=false).` (or the analogous spec-it/clear-scout text). No state file is written.                       |
 | `prompt_path`        | `Option<String>` | `None`  | Workspace-relative path to a custom scout prompt template. Resolved via the uniform [Prompt overrides](#prompt-overrides) table — see the `Scout` row.                                                                                                                                                                              |
 | `max_items`          | `usize`          | `30`    | Maximum number of opportunity items the scout-mode executor may return. **Valid range: `1..=50`**. Values outside this range cause config-load to fail-fast with an error naming `features.scout.max_items` AND the valid range.                                                                                                     |
-| `include_issues`     | `bool`           | `true`  | When `true`, the scout handler attempts `gh api repos/<owner>/<repo>/issues?state=open --paginate` AND interpolates the result into the prompt. On `gh` failure, a WARN logs AND scout proceeds with code-derived items only. When `false`, the call is skipped entirely (use for repos where issues are noise).                       |
+| `include_issues`     | `bool`           | `true`  | When `true`, the scout handler fetches open issues via the forge provider's authenticated API (the same configured token as PRs — no separate `gh auth login`) AND interpolates them into the prompt. On a forge issue-read failure, a WARN logs AND scout proceeds with code-derived items only. When `false`, the fetch is skipped entirely (use for repos where issues are noise).                       |
 | `staleness_warn_days`| `u64`            | `7`     | When `spec-it` is invoked against a scout run whose `completed_at` is older than this many days OR whose `head_sha_at_run` differs from the workspace's current HEAD, the polling handler posts a one-time warning naming the gap BEFORE submitting the propose-request. The warning does NOT block — staleness is operator judgment. |
 
 **Default behaviour.** Omitting the `features.scout` block (or omitting the entire `features:` parent block) is equivalent to all five defaults above. The verb works out of the box on a fresh install.
@@ -612,6 +613,28 @@ features:
 **Default behaviour.** Omitting the `features.brownfield_survey` block (or omitting the entire `features:` parent block) is equivalent to all three defaults above. The verb works out of the box on a fresh install.
 
 **Prompt override.** See the [Prompt overrides](#prompt-overrides) table for the `BrownfieldSurvey` entry — `features.brownfield_survey.prompt_path` is workspace-relative AND falls back to the embedded `prompts/brownfield-survey.md` template when the configured file is missing or empty.
+
+### `features.issues` {#featuresissues}
+
+Config for the issues lane (a009/a010) — both the curated entry (a maintainer commits `openspec/issues/<slug>/` directly) AND the public ingestion path (the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it`). See [OPERATIONS.md → Issues lane](OPERATIONS.md) for the workflow.
+
+Unlike the chatops-verb features above — which are inert until invoked, hence `enabled: true` by default — the issues lane is **OFF by default**. Enabling it changes daemon behavior autonomously: per-iteration unit selection becomes `issues > changes > audits`, AND (when `features.scout.include_issues` is also true — the default) each pass runs an LLM triage over open GitHub issue bodies (untrusted public input) and posts candidates to chatops. That is automatic token spend and untrusted-input processing, so it is opt-in.
+
+```yaml
+features:
+  issues:
+    enabled: true                 # default FALSE; opt-in — enables lane processing + public ingestion
+    prompt_path: null             # default null; relative path to a custom issue-implementer prompt
+```
+
+| Field         | Type             | Default | Description                                                                                                                                                                                                                                                                            |
+|---------------|------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`     | `bool`           | `false` | Master switch for the issues lane. When `false` (default) the daemon short-circuits the entire issues subsystem — no lane processing AND no public ingestion. The install wizard surfaces this as a yes/no gate (or `--issues-lane <enabled\|disabled>` non-interactively).             |
+| `prompt_path` | `Option<String>` | `None`  | Workspace-relative path to a custom issue-flavored implementer prompt template. Resolved via the uniform [Prompt overrides](#prompt-overrides) table; falls back to the embedded `prompts/implementer-issue.md` when missing or empty.                                                  |
+
+**Default behaviour.** Omitting the `features.issues` block (or the entire `features:` parent block) is equivalent to `enabled: false` — the lane is off.
+
+**Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; enabling the issues lane requires a daemon restart. Public ingestion additionally needs `gh` authenticated on the host; on a failed read a WARN logs and the pass proceeds.
 
 
 ## `canonical_rag:` (optional)

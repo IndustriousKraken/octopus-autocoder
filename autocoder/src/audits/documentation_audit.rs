@@ -254,6 +254,9 @@ impl Audit for DocumentationAudit {
         // a57: run WITH MCP enabled. `submit_findings` coexists with the
         // common `query_canonical_specs` tool (available when canonical_rag
         // is configured); findings arrive via the submission, not stdout.
+        // audit-model-selection: route this audit to its configured model
+        // (if any); `None` keeps the default `claude` strategy.
+        let model = super::audit_resolved_model(&self.settings);
         let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
             &sandbox,
@@ -262,6 +265,7 @@ impl Audit for DocumentationAudit {
             Duration::from_secs(self.executor_timeout_secs),
             self.settings_dir.as_deref(),
             Self::TYPE,
+            model.as_ref(),
         )
         .await
         .context("spawning documentation-audit CLI subprocess")?;
@@ -552,9 +556,11 @@ mod tests {
     fn executor_cfg(command: &str) -> ExecutorConfig {
         ExecutorConfig {
             kind: ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: command.to_string(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -571,6 +577,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -580,7 +594,7 @@ mod tests {
     }
 
     fn fixture_repo() -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: "git@github.com:test/repo.git".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -592,6 +606,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -751,6 +766,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -773,6 +789,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -811,6 +828,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -836,6 +854,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");

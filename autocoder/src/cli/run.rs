@@ -6,6 +6,8 @@ use crate::audits::{
     AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    canon_consolidation::CanonConsolidationAudit,
+    canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
@@ -18,8 +20,8 @@ use crate::config::{
     validate_audit_type_names,
 };
 use crate::control_socket::{
-    self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
-    ReviewerHolder, SpawnOutcome, SpawnRepoFn,
+    self, CacheHolder, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle,
+    RepoTaskMap, ReviewerHolder, SpawnOutcome, SpawnRepoFn,
 };
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
@@ -117,7 +119,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    openspec_preflight()?;
+    // a011: comprehensive dependency preflight — extends the historical
+    // openspec-only check to the full set (openspec, git, a usable sandbox
+    // mechanism, every configured strategy's CLI, scout/RAG backends),
+    // reporting ALL missing dependencies together and aborting startup only
+    // when a required one is missing or unusable.
+    crate::dependency_preflight::run_startup_preflight(&cfg)?;
 
     // Shared startup-time validation: schema, token-route, workspace
     // collision, audit slug, path collision, secret source. Errors block
@@ -194,6 +201,75 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         ),
     };
 
+    // a006: detect the OS-level sandbox mechanism once at startup AND seed the
+    // daemon-global sandbox context. After this, every `agentic_run` spawn is
+    // gated + wrapped (the executor, every audit, the agentic reviewer, the
+    // contradiction checks). With no mechanism AND no opt-in, agentic runs
+    // fail closed at the spawn seam; with the explicit opt-in, they proceed
+    // unsandboxed and the loud WARN below fires.
+    let sandbox_mechanism = crate::sandbox::detect_mechanism();
+    let sandbox_global = cfg.executor.sandbox.as_ref();
+    let allow_unsandboxed = sandbox_global.map(|s| s.allow_unsandboxed).unwrap_or(false);
+    let global_sandbox_toggles = crate::config::SandboxToggles {
+        os_hide: sandbox_global.and_then(|s| s.os_hide).unwrap_or(true),
+        engine_deny: sandbox_global.and_then(|s| s.engine_deny).unwrap_or(true),
+        strict_mode: sandbox_global.and_then(|s| s.strict_mode).unwrap_or(false),
+        mask_add: sandbox_global.and_then(|s| s.mask_add.clone()).unwrap_or_default(),
+        mask_remove: sandbox_global.and_then(|s| s.mask_remove.clone()).unwrap_or_default(),
+    };
+    match sandbox_mechanism {
+        Some(m) => tracing::info!(
+            mechanism = m.as_str(),
+            "OS-level agentic sandbox active (every agentic subprocess is kernel-wrapped)"
+        ),
+        None if allow_unsandboxed => {}
+        None => tracing::info!(
+            "no OS sandbox mechanism (systemd-run / bwrap) detected; agentic runs will fail closed unless executor.sandbox.allow_unsandboxed is set"
+        ),
+    }
+    if let Some(warn) =
+        crate::sandbox::startup_unsandboxed_warning(sandbox_mechanism, allow_unsandboxed)
+    {
+        tracing::warn!("{warn}");
+    }
+    crate::sandbox::init_global(sandbox_mechanism, allow_unsandboxed, global_sandbox_toggles);
+
+    // a014: capture the operator's ACTIVATED login-shell environment and seed
+    // it (credential-filtered) for every agentic subprocess, so shell-init-
+    // activated toolchains (pyenv/rbenv/poetry/nvm) are usable — not merely
+    // present on disk under a013's exposed home. Best-effort and time-bounded:
+    // a failed/partial capture degrades to the base environment and never
+    // aborts startup. The credential filter (defaults + operator edits) keeps
+    // shell-exported secrets AND provider API keys out of the subprocess.
+    let agent_env_cfg = cfg.executor.agent_env.clone().unwrap_or_default();
+    if agent_env_cfg.capture_enabled() {
+        let filter = crate::agent_env::CredentialFilter::from_edits(
+            agent_env_cfg.exclude_add.as_ref(),
+            agent_env_cfg.exclude_remove.as_ref(),
+        );
+        let captured = crate::agent_env::capture_login_shell(&filter).await;
+        if captured.is_empty() {
+            tracing::warn!(
+                "a014: login-shell environment capture produced nothing; agentic \
+                 subprocesses run against the daemon's base environment (toolchains \
+                 activated only by shell init may not resolve — see `autocoder doctor`)"
+            );
+        } else {
+            tracing::info!(
+                propagated = captured.len(),
+                excluded = captured.excluded_count(),
+                "a014: captured operator login-shell environment for agentic subprocesses \
+                 (credential variables withheld)"
+            );
+        }
+        crate::agent_env::init_captured_env(captured);
+    } else {
+        tracing::info!(
+            "a014: login-shell environment capture disabled (executor.agent_env.capture: \
+             false); agentic subprocesses use the daemon's base environment"
+        );
+    }
+
     // Build the change-internal contradiction pre-flight context
     // (a19). Disabled by default → no LLM client built, no context
     // produced; the polling loop short-circuits at the
@@ -217,6 +293,15 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         // rather than over HTTP, so no `LlmClient` is built.
         let model = crate::llm::resolve_contradiction_check_model(llm_cfg)
             .context("resolving contradiction-check model from config")?;
+        // a003: the contradiction check runs agentically (a59) through a CLI
+        // strategy, which authenticates from its own login — so a configured
+        // `api_key` is unused. Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.change_internal_contradiction_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
         let prompt_template = crate::preflight::change_contradiction::load_prompt_template(
             cfg.executor
                 .change_internal_contradiction_check_prompt_path
@@ -247,13 +332,147 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         None
     };
 
+    // Build the change-vs-canonical contradiction pre-flight context — the
+    // `[canon]` gate (a62). Disabled by default → no context produced; the
+    // polling loop short-circuits at the `canon_contradiction::current()`
+    // read. Enabled-without-LLM-config already failed validation above.
+    let canon_contradiction_ctx: Option<
+        Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>,
+    > = if matches!(
+        cfg.executor.change_canonical_contradiction_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        let llm_cfg = cfg
+            .executor
+            .change_canonical_contradiction_check_llm
+            .as_ref()
+            .expect("validate_config guarantees the llm block is set when enabled");
+        let model = crate::llm::resolve_canon_contradiction_check_model(llm_cfg)
+            .context("resolving canon-contradiction-check model from config")?;
+        // a003: agentic CLI gate (a62) — a configured `api_key` is unused (the
+        // CLI authenticates itself). Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.change_canonical_contradiction_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
+        let prompt_template = crate::preflight::canon_contradiction::load_prompt_template(
+            cfg.executor
+                .change_canonical_contradiction_check_prompt_path
+                .as_deref(),
+        )
+        .context("loading change-vs-canonical-check prompt template")?;
+        tracing::info!(
+            provider = ?llm_cfg.provider,
+            model = llm_cfg.model.as_str(),
+            "change-vs-canonical contradiction pre-flight enabled (the [canon] gate, a62)"
+        );
+        let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
+        Some(Arc::new(
+            crate::preflight::canon_contradiction::CanonContradictionCheckCtx {
+                command: cfg.executor.command.clone(),
+                model,
+                prompt_template,
+                attribution: Some(attribution),
+                #[cfg(test)]
+                test_submission: None,
+            },
+        ))
+    } else {
+        tracing::info!(
+            "change-vs-canonical contradiction pre-flight disabled (the [canon] gate, a62; opt-in via executor.change_canonical_contradiction_check)"
+        );
+        None
+    };
+
+    // Build the code-implements-spec verification context — the `[out]` gate
+    // (a63). Disabled by default → no context produced; the polling loop
+    // short-circuits at the `code_implements_spec::current()` read post-
+    // executor. Enabled-without-LLM-config already failed validation above.
+    let code_implements_spec_ctx: Option<
+        Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>,
+    > = if matches!(
+        cfg.executor.code_implements_spec_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        let llm_cfg = cfg
+            .executor
+            .code_implements_spec_check_llm
+            .as_ref()
+            .expect("validate_config guarantees the llm block is set when enabled");
+        let model = crate::llm::resolve_code_implements_spec_check_model(llm_cfg)
+            .context("resolving code-implements-spec-check model from config")?;
+        // a003: agentic CLI gate (a63) — a configured `api_key` is unused (the
+        // CLI authenticates itself). Warn once at startup; the strategy ignores it.
+        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+            "executor.code_implements_spec_check_llm",
+            !model.api_key.is_empty(),
+        ) {
+            tracing::warn!("{warn}");
+        }
+        let prompt_template = crate::code_implements_spec::load_prompt_template(
+            cfg.executor
+                .code_implements_spec_check_prompt_path
+                .as_deref(),
+        )
+        .context("loading code-implements-spec-check prompt template")?;
+        tracing::info!(
+            provider = ?llm_cfg.provider,
+            model = llm_cfg.model.as_str(),
+            "code-implements-spec verification enabled (the [out] gate, a63)"
+        );
+        let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
+        Some(Arc::new(
+            crate::code_implements_spec::CodeImplementsSpecCheckCtx {
+                command: cfg.executor.command.clone(),
+                model,
+                prompt_template,
+                attribution: Some(attribution),
+                #[cfg(test)]
+                test_submission: None,
+            },
+        ))
+    } else {
+        tracing::info!(
+            "code-implements-spec verification disabled (the [out] gate, a63; opt-in via executor.code_implements_spec_check)"
+        );
+        None
+    };
+
+    // Build the issues-lane context — the second work lane (a009). OFF by
+    // default: a context is produced ONLY when `features.issues.enabled`,
+    // so the polling pass short-circuits at the `lanes::gate::current()`
+    // read AND `issues/<slug>/` directories are not worked.
+    let issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>> =
+        if cfg.features.issues.enabled {
+            tracing::info!(
+                "issues lane enabled (a009; precedence issues > changes > audits)"
+            );
+            Some(Arc::new(crate::lanes::gate::IssuesLaneContext {
+                prompt_path: cfg.features.issues.prompt_path.clone(),
+                // Hybrid PUBLIC ingestion (a010) is gated behind the
+                // existing scout issue-read opt-in. With the issues lane on
+                // AND `features.scout.include_issues` true, the bot triages
+                // reported GitHub issues read-only AND posts candidates.
+                ingest: cfg.features.scout.include_issues,
+            }))
+        } else {
+            None
+        };
+
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from config")?;
+            // a64: when the effective kind is `agentic` but the resolved
+            // reviewer CLI is unavailable on this host, degrade to the
+            // `oneshot` HTTP path for the boot (one loud WARN logged inside).
+            let r = crate::code_reviewer::apply_startup_cli_fallback(r);
             tracing::info!(
                 provider = ?rcfg.provider,
                 model = rcfg.model.as_str(),
+                kind = ?r.kind(),
                 "code reviewer enabled"
             );
             Some(Arc::new(r))
@@ -295,6 +514,18 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
     let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(reviewer_initial));
     let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
+    let cache_holder: CacheHolder = Arc::new(ArcSwap::from_pointee(cfg.cache.clone()));
+
+    // a65: one-time startup notice when the workspace cache is unbounded
+    // (`cache.workspaces_max_gb` unset, the default). Surfaces the
+    // unbounded-growth failure mode — and the field that bounds it —
+    // before it can wedge a disk. `execute` runs exactly once per daemon
+    // boot, so this WARN is emitted at most once per process lifetime.
+    if let Some(notice) =
+        crate::config::workspace_cache_unbounded_notice(cfg.cache.workspaces_max_gb)
+    {
+        tracing::warn!("{notice}");
+    }
 
     for repo in &cfg.repositories {
         let derived = workspace::resolve_path(&daemon_paths, repo);
@@ -409,6 +640,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // a006: per-repository relaxed-sandbox-posture WARN. Naming each
+    // credential-protection toggle that is OFF for the repo (per-repo override
+    // or global). Both ON (the secure default) emits nothing — loosening is
+    // explicit and logged so the operator notices.
+    for repo in &cfg.repositories {
+        if let Some(warn) = repo.relaxed_sandbox_warning(cfg.executor.sandbox.as_ref()) {
+            tracing::warn!(url = %repo.url, "{warn}");
+        }
+    }
+
     // Per-PR automatic-revision cap. Values above the ceiling are clamped
     // down in `max_auto_revisions_per_pr_clamped()`; we WARN once here so
     // the operator notices the bogus value.
@@ -447,6 +688,18 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         &cfg.executor,
     )));
     registry.register(Arc::new(DocumentationAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
+    registry.register(Arc::new(CanonContradictionAudit::new(
+        &audit_settings,
+        &cfg.executor,
+        &daemon_paths,
+    )));
+    // a76: the canon-consolidation audit drafts a `consolidate-` change
+    // (OpenSpecOnly) merging redundant requirements — the overlap twin of
+    // the contradiction audit's conflict scan.
+    registry.register(Arc::new(CanonConsolidationAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
@@ -492,6 +745,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         github_holder: github_holder.clone(),
         reviewer_holder: reviewer_holder.clone(),
         chatops_holder: chatops_holder.clone(),
+        cache_holder: cache_holder.clone(),
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
@@ -503,6 +757,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audits_cfg: audits_cfg_arc.clone(),
         audit_settings: audit_settings_arc.clone(),
         contradiction_ctx: contradiction_ctx.clone(),
+        canon_contradiction_ctx: canon_contradiction_ctx.clone(),
+        code_implements_spec_ctx: code_implements_spec_ctx.clone(),
+        issues_ctx: issues_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -565,6 +822,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
         chatops: chatops_holder.clone(),
+        cache: cache_holder.clone(),
         last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
         config_path,
         repo_tasks: task_map.clone(),
@@ -588,6 +846,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // a59: register the contradiction check's `submit_contradictions` payload
     // schema on the same store so its MCP child's submissions are validated.
     crate::preflight::change_contradiction::register_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
+    // a62: register the `[canon]` gate's `submit_canon_contradictions` payload
+    // schema on the same store so its MCP child's submissions are validated.
+    crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
+    // a63: register the `[out]` gate's `submit_verdict` payload schema on the
+    // same store so its MCP child's submissions are validated.
+    crate::code_implements_spec::register_code_implements_spec_submission_schema(
         &control_state.submission_store,
     );
     let listener_cancel = cancel.clone();
@@ -779,6 +1047,7 @@ struct SpawnDeps {
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
     chatops_holder: ChatOpsHolder,
+    cache_holder: CacheHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
@@ -791,6 +1060,11 @@ struct SpawnDeps {
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     contradiction_ctx:
         Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
+    canon_contradiction_ctx:
+        Option<Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>>,
+    code_implements_spec_ctx:
+        Option<Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>>,
+    issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -830,6 +1104,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let github_for_task = deps.github_holder.clone();
         let reviewer_for_task = deps.reviewer_holder.clone();
         let chatops_for_task = deps.chatops_holder.clone();
+        let cache_for_task = deps.cache_holder.clone();
         let stuck = deps.stuck_threshold_secs;
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
@@ -901,6 +1176,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
+        let canon_contradiction_ctx_for_task = deps.canon_contradiction_ctx.clone();
+        let code_implements_spec_ctx_for_task = deps.code_implements_spec_ctx.clone();
+        let issues_ctx_for_task = deps.issues_ctx.clone();
         let paths_for_task = deps.paths.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             let fut = polling_loop::run(
@@ -910,6 +1188,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 github_for_task,
                 reviewer_for_task,
                 chatops_for_task,
+                cache_for_task,
                 stuck,
                 perma,
                 exec_max,
@@ -935,8 +1214,25 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_drained_for_task,
                 cancel_for_task,
             );
-            crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut)
-                .await;
+            // Nest the verifier-gate scopes around the polling future: the two
+            // pre-executor gates (a59 `[in]`, a62 `[canon]`) AND the
+            // post-executor gate (a63 `[out]`). Each gate reads its own
+            // task-local via `current()`; any may be `None` (disabled)
+            // independently.
+            let in_scoped =
+                crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut);
+            let canon_scoped = crate::preflight::canon_contradiction::scope(
+                canon_contradiction_ctx_for_task,
+                in_scoped,
+            );
+            let out_scoped = crate::code_implements_spec::scope(
+                code_implements_spec_ctx_for_task,
+                canon_scoped,
+            );
+            // Issues lane gate (a009): bind the `features.issues` context
+            // for the whole polling future; the pass reads it via
+            // `lanes::gate::current()`. `None` (disabled) → lane inactive.
+            crate::lanes::gate::scope(issues_ctx_for_task, out_scoped).await;
             {
                 let mut guard = map_for_task.lock().unwrap();
                 guard.remove(&url_for_task);
@@ -1037,40 +1333,114 @@ pub fn emit_chatops_startup_log(provider: &str, experimental: bool) {
     }
 }
 
-/// Verify the `openspec` binary is reachable before the polling loop
-/// starts. A failed preflight aborts daemon startup so misconfigured
-/// deployments fail loudly instead of looping forever producing nothing.
-pub fn openspec_preflight() -> Result<()> {
-    openspec_preflight_with("openspec")
+/// Resolve the daemon's config-file path when `autocoder run` is invoked
+/// without an explicit `--config` (a011 task 3). An explicit path always wins
+/// AND skips the systemd-unit lookup. Otherwise the installed
+/// `autocoder.service` unit's `ExecStart` is parsed for the config argument
+/// the daemon is launched with; absent a unit (or a recorded path), the
+/// existing default-path resolution applies.
+pub fn resolve_run_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_run_config_path_inner(
+        explicit,
+        probe_unit_exec_start().as_deref(),
+        &default_config_candidates(),
+        &|p| p.exists(),
+    )
 }
 
-/// Internal preflight that takes the binary name as an argument so tests
-/// can target a name guaranteed to be absent.
-fn openspec_preflight_with(bin: &str) -> Result<()> {
-    match std::process::Command::new(bin).arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            tracing::info!(
-                version = %String::from_utf8_lossy(&out.stdout).trim(),
-                "openspec preflight passed"
-            );
-            Ok(())
-        }
-        Ok(out) => {
-            let stderr_tail: String =
-                String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
-            Err(anyhow!(
-                "openspec preflight failed: `{bin} --version` exited {code:?}. stderr: {stderr_tail}",
-                code = out.status.code(),
-            ))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-            "openspec preflight failed: `{bin}` binary not found on PATH. \
-             Install openspec and ensure the systemd unit's PATH covers its install directory."
-        )),
-        Err(e) => Err(anyhow!(
-            "openspec preflight failed: spawning `{bin} --version` errored: {e}"
-        )),
+/// Pure resolver behind [`resolve_run_config_path`]: every environment fact is
+/// injected so the precedence (explicit → unit → defaults) is unit-testable.
+fn resolve_run_config_path_inner(
+    explicit: Option<PathBuf>,
+    exec_start: Option<&str>,
+    default_candidates: &[PathBuf],
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> Result<PathBuf> {
+    // 1. An explicitly provided path always wins and never consults the unit.
+    if let Some(p) = explicit {
+        return Ok(p);
     }
+    // 2. Discover the path the unit launches the daemon with.
+    if let Some(es) = exec_start
+        && let Some(p) = config_path_from_exec_start(es)
+    {
+        tracing::info!(path = %p.display(), "config path discovered from systemd unit ExecStart");
+        return Ok(p);
+    }
+    // 3. Fall back to the existing default-path resolution.
+    for cand in default_candidates {
+        if exists(cand) {
+            return Ok(cand.clone());
+        }
+    }
+    Err(anyhow!(
+        "no config path provided, none recorded in the systemd unit's ExecStart, \
+         and no config file at the default locations ({}). \
+         Pass `autocoder run --config <path>`.",
+        default_candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The default config-file locations, checked in order: the server-mode path,
+/// then the dev-mode XDG path.
+fn default_config_candidates() -> Vec<PathBuf> {
+    let mut cands = vec![PathBuf::from(crate::cli::install::DEFAULT_SERVER_CONFIG_PATH)];
+    if let Some(home) = std::env::var_os("HOME") {
+        cands.push(PathBuf::from(home).join(".config/autocoder/config.yaml"));
+    }
+    cands
+}
+
+/// Parse a systemd `ExecStart=` value for the daemon's config path. Matches
+/// both `--config <file>` / `--config=<file>` AND `--config-dir <dir>` /
+/// `--config-dir=<dir>` (from which the file is `<dir>/config.yaml`). Returns
+/// `None` when neither flag carries a value.
+pub fn config_path_from_exec_start(exec_start: &str) -> Option<PathBuf> {
+    let tokens: Vec<&str> = exec_start.split_whitespace().collect();
+    let mut iter = tokens.iter().peekable();
+    while let Some(tok) = iter.next() {
+        // `--config-dir <dir>` → `<dir>/config.yaml`.
+        if *tok == "--config-dir" {
+            if let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                return Some(PathBuf::from(next).join("config.yaml"));
+            }
+        } else if let Some(rest) = tok.strip_prefix("--config-dir=") {
+            return Some(PathBuf::from(rest).join("config.yaml"));
+        // `--config <file>` → `<file>` (checked after `--config-dir` so the
+        // longer flag is not shadowed).
+        } else if *tok == "--config" {
+            if let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                return Some(PathBuf::from(next));
+            }
+        } else if let Some(rest) = tok.strip_prefix("--config=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
+}
+
+/// Probe the installed `autocoder.service` unit for its `ExecStart=` line.
+/// Returns `None` on any failure (no systemd, unit not found) — the resolver
+/// then falls through to the default-path resolution.
+fn probe_unit_exec_start() -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["show", "autocoder.service", "-p", "ExecStart"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart=").map(|r| r.to_string()))
 }
 
 /// Resolve a GitHub PAT route for every configured repository before any
@@ -1342,30 +1712,83 @@ mod tests {
     }
 
     #[test]
-    fn preflight_errors_when_openspec_binary_missing() {
-        let err = openspec_preflight_with("openspec-definitely-not-installed-on-this-host")
-            .expect_err("missing binary must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("openspec"), "error must name openspec: {msg}");
-        assert!(
-            msg.contains("PATH") || msg.contains("not found"),
-            "error must hint at PATH/install: {msg}"
+    fn config_path_from_exec_start_parses_config_file() {
+        let es = "{ path=/usr/local/bin/autocoder ; argv[]=/usr/local/bin/autocoder run --config /etc/autocoder/config.yaml ; ignore_errors=no }";
+        assert_eq!(
+            config_path_from_exec_start(es),
+            Some(PathBuf::from("/etc/autocoder/config.yaml"))
         );
     }
 
     #[test]
-    fn preflight_errors_when_binary_exits_nonzero() {
-        // `false` always exits 1. Path differs by platform (/bin/false on
-        // Linux, /usr/bin/false on macOS) — pick whichever exists so the
-        // test runs on both.
-        let false_bin = ["/bin/false", "/usr/bin/false"]
-            .iter()
-            .copied()
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("a `false` binary must exist for this test");
-        let err = openspec_preflight_with(false_bin).expect_err("nonzero exit must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("exited"), "error must mention exit code: {msg}");
+    fn config_path_from_exec_start_parses_config_dir() {
+        let es = "argv[]=/usr/local/bin/autocoder run --config-dir /home/ac/conf";
+        assert_eq!(
+            config_path_from_exec_start(es),
+            Some(PathBuf::from("/home/ac/conf/config.yaml"))
+        );
+        // `=`-joined form too.
+        assert_eq!(
+            config_path_from_exec_start("autocoder run --config-dir=/srv/ac"),
+            Some(PathBuf::from("/srv/ac/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn config_path_from_exec_start_none_without_flag() {
+        assert_eq!(config_path_from_exec_start("autocoder run"), None);
+        // `--config` with no value falls through to None.
+        assert_eq!(config_path_from_exec_start("autocoder run --config --verbose"), None);
+    }
+
+    #[test]
+    fn resolve_config_explicit_path_wins_and_skips_unit() {
+        // Even with a unit recording a different path, an explicit path wins
+        // AND the unit is not consulted (the explicit branch returns first).
+        let got = resolve_run_config_path_inner(
+            Some(PathBuf::from("/explicit/config.yaml")),
+            Some("autocoder run --config /unit/config.yaml"),
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/explicit/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_discovered_from_unit() {
+        let got = resolve_run_config_path_inner(
+            None,
+            Some("autocoder run --config /unit/config.yaml"),
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/unit/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_falls_back_to_default_without_unit() {
+        let got = resolve_run_config_path_inner(
+            None,
+            None,
+            &[PathBuf::from("/default/config.yaml")],
+            &|p| p == std::path::Path::new("/default/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/default/config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_errors_when_nothing_resolves() {
+        let err = resolve_run_config_path_inner(
+            None,
+            None,
+            &[PathBuf::from("/default/config.yaml")],
+            &|_| false,
+        )
+        .expect_err("no config anywhere must error");
+        assert!(format!("{err}").contains("--config"), "{err}");
     }
 
     /// Build a remote + workspace clone pair. The workspace has `origin`
@@ -1408,7 +1831,7 @@ mod tests {
     }
 
     fn cfg_with(local: PathBuf) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: format!("git@github.com:fixture/{}.git", local.file_name().unwrap().to_string_lossy()),
             local_path: Some(local),
             base_branch: "main".into(),
@@ -1420,6 +1843,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 
@@ -1431,7 +1855,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn repo(url: &str) -> RepositoryConfig {
-        RepositoryConfig {
+        RepositoryConfig { forge: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),
@@ -1443,6 +1867,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            sandbox: None,
         }
     }
 

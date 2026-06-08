@@ -15,7 +15,8 @@
 
 use super::{
     BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
-    ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
+    IssueContext, IssueReportTriageContext, ResumeHandle, ScoutContext, TriageContext,
+    UnimplementableTask,
 };
 use crate::agentic_run::AgenticRunOutcome;
 use anyhow::{Context, Result, anyhow};
@@ -101,6 +102,7 @@ const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
 
 /// Synthetic "change" name used for the scout-mode run-log path (a25).
 const SCOUT_LOG_CHANGE_NAME: &str = "scout";
+const ISSUE_TRIAGE_LOG_CHANGE_NAME: &str = "issue-report-triage";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -141,6 +143,16 @@ pub struct ClaudeCliExecutor {
     /// Tests use this to isolate their settings file from concurrent
     /// tests creating files under the same prefix in the shared OS temp.
     settings_dir: Option<PathBuf>,
+    /// a70: the agentic CLI the implementer runs through. `Claude` (the
+    /// default) keeps the streaming live-log path byte-identical; `Opencode`
+    /// / `Antigravity` run capture-mode (no live log; outcome + `final_answer`
+    /// via the MCP relay). Resolved from `executor.implementer_cli`.
+    cli: crate::config::CliKind,
+    /// a70: override for the home directory the session prune/resume resolves
+    /// the CLI's session store under. `None` (production) → `$HOME`. Tests set
+    /// a temp home so the surgical session prune is exercised without touching
+    /// the operator's real store.
+    session_home: Option<PathBuf>,
 }
 
 /// Opaque payload stashed inside `ResumeHandle.0` for this backend.
@@ -189,6 +201,8 @@ impl ClaudeCliExecutor {
             chat_triage_template: DEFAULT_CHAT_TRIAGE_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
+            cli: crate::config::CliKind::Claude,
+            session_home: None,
         }
     }
 
@@ -248,8 +262,20 @@ impl ClaudeCliExecutor {
             None,
             None,
         );
+        // a70: resolve the implementer's CLI (default `claude`) AND its
+        // command. When a non-`claude` CLI is selected AND `command` is left
+        // at the executor default, fall back to that CLI's own binary so an
+        // operator who only sets `implementer_cli` gets a working command.
+        let cli = cfg.implementer_cli.unwrap_or(crate::config::CliKind::Claude);
+        let command = if cli != crate::config::CliKind::Claude
+            && cfg.command == crate::config::default_executor_command()
+        {
+            cli.default_command().to_string()
+        } else {
+            cfg.command.clone()
+        };
         Ok(Self {
-            command: cfg.command.clone(),
+            command,
             args: Vec::new(),
             timeout: Duration::from_secs(cfg.timeout_secs),
             sandbox: crate::config::ResolvedSandbox::resolve(cfg.sandbox.as_ref()),
@@ -261,6 +287,8 @@ impl ClaudeCliExecutor {
             chat_triage_template,
             output_format: cfg.output_format,
             settings_dir: None,
+            cli,
+            session_home: None,
         })
     }
 
@@ -286,6 +314,8 @@ impl ClaudeCliExecutor {
             chat_triage_template: DEFAULT_CHAT_TRIAGE_TEMPLATE.to_string(),
             output_format: crate::config::default_output_format(),
             settings_dir: None,
+            cli: crate::config::CliKind::Claude,
+            session_home: None,
         }
     }
 
@@ -297,6 +327,94 @@ impl ClaudeCliExecutor {
     ) -> Self {
         self.output_format = format;
         self
+    }
+
+    /// Test-only override for the implementer's CLI strategy (a70). Lets a
+    /// test drive the implementer through a capture-mode strategy (`opencode`
+    /// / `antigravity`) without an operator config file.
+    #[cfg(test)]
+    pub(crate) fn with_cli(mut self, cli: crate::config::CliKind) -> Self {
+        self.cli = cli;
+        self
+    }
+
+    /// Test-only override for the session-store home (a70). Points the
+    /// surgical session prune/resume at a temp home so it is exercised
+    /// without touching the operator's real `~/.claude` etc.
+    #[cfg(test)]
+    pub(crate) fn with_session_home(mut self, home: PathBuf) -> Self {
+        self.session_home = Some(home);
+        self
+    }
+
+    /// Resolve the implementer's [`CliStrategy`](crate::agentic_run::CliStrategy)
+    /// from its configured CLI (a70). The default `claude` keeps the streaming
+    /// path; `opencode` / `antigravity` run capture-mode.
+    fn implementer_strategy(&self) -> Box<dyn crate::agentic_run::CliStrategy> {
+        // Registered CLIs all resolve; the `Result` cannot be `Err` for the
+        // three known kinds, but we degrade to `claude` defensively rather
+        // than panicking if a future kind lands without a strategy.
+        crate::agentic_run::strategy_for_cli(self.cli, self.command.clone(), self.args.clone())
+            .unwrap_or_else(|_| {
+                Box::new(crate::agentic_run::ClaudeStrategy::new(
+                    self.command.clone(),
+                    self.args.clone(),
+                ))
+            })
+    }
+
+    /// Whether the implementer runs in streaming (live-log) mode: only the
+    /// `claude` strategy AND only when the output format is `Json` (a70). A
+    /// capture-mode strategy never streams.
+    fn implementer_streaming(&self) -> bool {
+        self.cli == crate::config::CliKind::Claude
+            && matches!(self.output_format, crate::config::ExecutorOutputFormat::Json)
+    }
+
+    /// Prune the single session record named by `handle` from the resolved
+    /// strategy's store (a70 §4 / §5.4). Surgical AND best-effort: a missing
+    /// handle is a no-op; an IO error is logged, never fatal. `home` resolves
+    /// to the test override else `$HOME`.
+    fn prune_session(&self, workspace: &Path, handle: Option<&str>) {
+        let Some(handle) = handle else { return };
+        let home = self
+            .session_home
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let Some(home) = home else { return };
+        let strategy = self.implementer_strategy();
+        match strategy.delete_session(
+            crate::agentic_run::SessionStoreCtx {
+                home: &home,
+                workspace,
+            },
+            handle,
+        ) {
+            Ok(removed) => tracing::debug!(
+                session = %handle,
+                removed,
+                "pruned implementer session record on terminal outcome"
+            ),
+            Err(e) => tracing::warn!(
+                session = %handle,
+                "failed to prune implementer session record (run continues): {e:#}"
+            ),
+        }
+    }
+
+    /// Prune the session UNLESS the implementer is parking it for an AskUser
+    /// answer (a70 §5.1): an `AskUser` outcome retains the session (its handle
+    /// rides the `ResumeHandle`); every other outcome is terminal AND prunes.
+    fn prune_session_unless_waiting(
+        &self,
+        workspace: &Path,
+        handle: Option<&str>,
+        outcome: &ExecutorOutcome,
+    ) {
+        if matches!(outcome, ExecutorOutcome::AskUser { .. }) {
+            return;
+        }
+        self.prune_session(workspace, handle);
     }
 
     /// Build the prompt for `change` by running `openspec instructions
@@ -647,42 +765,54 @@ impl ClaudeCliExecutor {
         workspace: &Path,
         change: &str,
         prompt: &str,
+        resume_session_id: Option<&str>,
     ) -> Result<AgenticRunOutcome> {
-        let json_mode = matches!(
-            self.output_format,
-            crate::config::ExecutorOutputFormat::Json
-        );
-        let strategy =
-            crate::agentic_run::ClaudeStrategy::new(self.command.clone(), self.args.clone());
-        crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
-            workspace,
-            change,
-            strategy: &strategy,
-            prompt,
-            sandbox: crate::agentic_run::SandboxConfig {
-                allowed_tools: self.sandbox.allowed_tools.clone(),
-                disallowed_bash_patterns: self.sandbox.disallowed_bash_patterns.clone(),
-                disallowed_read_paths: self.sandbox.disallowed_read_paths.clone(),
-                // The executor implements code, so it allows Write/Edit:
-                // its settings file must NOT deny them (preserving the
-                // pre-refactor executor settings exactly).
-                deny_writes: false,
+        // a70: resolve the strategy from the configured CLI (default `claude`).
+        // Streaming (live log + parsed final_answer/session_id) only for the
+        // `claude` JSON path; a capture-mode strategy runs without the live
+        // log, taking outcome + final_answer from the MCP relay.
+        let streaming = self.implementer_streaming();
+        let strategy = self.implementer_strategy();
+        // a70: run through the session-managing wrapper so the created
+        // session's handle is captured onto the outcome. The implementer does
+        // NOT prune here (`prune = false`) — it may retain the session across
+        // an AskUser AND prunes at its terminal outcome instead.
+        crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
+                workspace,
+                change,
+                strategy: strategy.as_ref(),
+                prompt,
+                sandbox: crate::agentic_run::SandboxConfig {
+                    allowed_tools: self.sandbox.allowed_tools.clone(),
+                    disallowed_bash_patterns: self.sandbox.disallowed_bash_patterns.clone(),
+                    disallowed_read_paths: self.sandbox.disallowed_read_paths.clone(),
+                    // The executor implements code, so it allows Write/Edit:
+                    // its settings file must NOT deny them (preserving the
+                    // pre-refactor executor settings exactly).
+                    deny_writes: false,
+                },
+                model: None,
+                output_mode: if streaming {
+                    crate::agentic_run::OutputMode::Streaming
+                } else {
+                    crate::agentic_run::OutputMode::Capture
+                },
+                timeout: self.timeout,
+                paths: Some(&self.paths),
+                settings_dir: self.settings_dir.as_deref(),
+                include_autocoder_tools: true,
+                emit_stream_json_in_capture: false,
+                resume_session_id,
+                track_subprocess_marker: true,
+                etxtbsy_retry_spawn: false,
+                // a006: the executor implements code, so its workspace is mounted
+                // read-write. The self-store is keyed by the resolved CLI.
+                os_sandbox: crate::sandbox::current_run_sandbox(self.cli, true),
             },
-            model: None,
-            output_mode: if json_mode {
-                crate::agentic_run::OutputMode::Streaming
-            } else {
-                crate::agentic_run::OutputMode::Capture
-            },
-            timeout: self.timeout,
-            paths: Some(&self.paths),
-            settings_dir: self.settings_dir.as_deref(),
-            include_autocoder_tools: true,
-            emit_stream_json_in_capture: false,
-            resume_session_id: None,
-            track_subprocess_marker: true,
-            etxtbsy_retry_spawn: false,
-        })
+            false,
+            self.session_home.as_deref(),
+        )
         .await
     }
 
@@ -716,6 +846,11 @@ impl ClaudeCliExecutor {
         change: &str,
         outcome: AgenticRunOutcome,
     ) -> Result<ClassifiedOutcome> {
+        // a70: the session handle this run created (streamed `session_id` for
+        // claude; the captured store entry / resumed id for a capture-mode
+        // strategy). An AskUser outcome embeds it in the `ResumeHandle` so the
+        // implementer resume continues that same session natively.
+        let session_handle = outcome.session_handle.clone();
         // Tool-recorded outcome lookup (a27a0). The per-execution MCP
         // child relays outcome tool calls to the daemon via
         // `record_outcome`; we drain via `consume_outcome`. A recorded
@@ -738,7 +873,7 @@ impl ClaudeCliExecutor {
         // Layer-1 first: the marker file is the authoritative signal. It
         // may have been written even if the wrapped CLI exited non-zero.
         if let Some(question) = Self::check_askuser_marker(workspace, change)? {
-            let handle = build_handle(workspace, change, None);
+            let handle = build_handle(workspace, change, session_handle.clone());
             return Ok(ClassifiedOutcome {
                 outcome: ExecutorOutcome::AskUser {
                     question,
@@ -816,7 +951,7 @@ impl ClaudeCliExecutor {
         let porcelain = crate::git::status_porcelain(workspace).unwrap_or_default();
         if porcelain.is_empty() {
             if let Some(question) = Self::check_stdout_heuristic(&outcome.stdout) {
-                let handle = build_handle(workspace, change, None);
+                let handle = build_handle(workspace, change, session_handle.clone());
                 return Ok(ClassifiedOutcome {
                     outcome: ExecutorOutcome::AskUser {
                         question,
@@ -914,12 +1049,11 @@ impl ClaudeCliExecutor {
         prompt: &str,
         session_id: Option<&str>,
     ) -> Result<AgenticRunOutcome> {
-        let json_mode = matches!(
-            self.output_format,
-            crate::config::ExecutorOutputFormat::Json
-        );
-        let strategy =
-            crate::agentic_run::ClaudeStrategy::new(self.command.clone(), self.args.clone());
+        // a70: emit stream-json in capture only for the `claude` JSON path
+        // (the recovery turn reads it raw at exit); a capture-mode strategy
+        // never streams.
+        let emit_stream_json = self.implementer_streaming();
+        let strategy = self.implementer_strategy();
         // Recovery turns capture stdout/stderr at-exit (no structured log
         // writer — append_recovery_to_log appends into the existing log
         // files after classification). The command still emits stream-json
@@ -931,7 +1065,7 @@ impl ClaudeCliExecutor {
         crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
             workspace,
             change,
-            strategy: &strategy,
+            strategy: strategy.as_ref(),
             prompt,
             sandbox: crate::agentic_run::SandboxConfig {
                 allowed_tools: self.sandbox.allowed_tools.clone(),
@@ -945,10 +1079,13 @@ impl ClaudeCliExecutor {
             paths: Some(&self.paths),
             settings_dir: self.settings_dir.as_deref(),
             include_autocoder_tools: false,
-            emit_stream_json_in_capture: json_mode,
+            emit_stream_json_in_capture: emit_stream_json,
             resume_session_id: session_id,
             track_subprocess_marker: true,
             etxtbsy_retry_spawn: false,
+            // a006: recovery turns are the executor too — read-write workspace,
+            // self-store keyed by the resolved CLI.
+            os_sandbox: crate::sandbox::current_run_sandbox(self.cli, true),
         })
         .await
     }
@@ -1378,11 +1515,15 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
-        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &prompt, None)
+            .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
-        let session_id = outcome.session_id.clone();
+        // a70: the strategy-agnostic session handle (streamed `session_id` for
+        // claude; the captured store entry for a capture-mode strategy).
+        let session_handle = outcome.session_handle.clone();
         let classified = self
             .classify_outcome_with_meta(workspace, change, outcome)
             .await?;
@@ -1393,14 +1534,22 @@ impl Executor for ClaudeCliExecutor {
         // SpecNeedsRevision, IterationRequested) bypass the scan — they
         // are already structured signals.
         if classified.tool_recorded {
+            // a70 §5.4: a tool-recorded outcome is terminal (never AskUser, which
+            // comes from the marker path) — prune the session it created.
+            self.prune_session(workspace, session_handle.as_deref());
             return Ok(classified.outcome);
         }
         if !matches!(classified.outcome, ExecutorOutcome::Completed { .. }) {
+            // a70 §5.1/§5.4: AskUser retains the session (the handle rides the
+            // ResumeHandle for the native resume); every other terminal outcome
+            // prunes it.
+            self.prune_session_unless_waiting(workspace, session_handle.as_deref(), &classified.outcome);
             return Ok(classified.outcome);
         }
         let unchecked =
             crate::executor::acceptance_scan::scan_change_tasks_md(workspace, change);
         if unchecked.is_empty() {
+            self.prune_session(workspace, session_handle.as_deref());
             return Ok(classified.outcome);
         }
         tracing::warn!(
@@ -1408,8 +1557,15 @@ impl Executor for ClaudeCliExecutor {
             unchecked_count = unchecked.len(),
             "acceptance check failed; entering recovery turn for change {change}"
         );
-        self.run_recovery_turn(workspace, change, session_id, &unchecked)
-            .await
+        // The recovery turn re-uses the SAME session (native resume), so the
+        // handle is unchanged; prune once at the terminal outcome below.
+        let recovered = self
+            .run_recovery_turn(workspace, change, session_handle.clone(), &unchecked)
+            .await;
+        if let Ok(out) = &recovered {
+            self.prune_session_unless_waiting(workspace, session_handle.as_deref(), out);
+        }
+        recovered
     }
 
     async fn resume(&self, handle: ResumeHandle, answer: &str) -> Result<ExecutorOutcome> {
@@ -1417,10 +1573,29 @@ impl Executor for ClaudeCliExecutor {
             .context("decoding ClaudeCliExecutor resume handle")?;
         let workspace = data.workspace.as_path();
         let change = data.change.as_str();
-        let base = self.build_prompt(workspace, change)?;
-        let prompt = format!(
-            "(Earlier you asked a question and the human answered: {answer}) Continue the implementation.\n\n{base}"
-        );
+
+        // a70 §5.2/§5.3: resume the RETAINED agentic session natively, delivering
+        // the operator's answer into it. The session id was captured at the
+        // AskUser outcome AND stashed in the handle. With NO captured session
+        // (a strategy with no headless resume, OR a pre-a70 handle), we do NOT
+        // fall back to a fresh-run-with-answer: we requeue the change as a
+        // retryable failure via the existing failure-counter path (no
+        // stash-and-recombine).
+        let Some(session_id) = data.session_id.clone() else {
+            tracing::warn!(
+                change = %change,
+                "resume has no retained session handle; requeueing (no fresh-run fallback)"
+            );
+            return Ok(ExecutorOutcome::Failed {
+                reason: "agentic session could not be resumed (no retained handle); requeued"
+                    .to_string(),
+            });
+        };
+
+        // The answer alone is the resume prompt — the retained session already
+        // holds the full conversation context (it is NOT re-seeded with the
+        // base implementer prompt).
+        let prompt = format!("The human answered your question: {answer}\n\nContinue the implementation.");
 
         let stale_marker = workspace
             .join("openspec/changes")
@@ -1429,11 +1604,21 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
-        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &prompt, Some(&session_id))
+            .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
-        self.classify_outcome(workspace, change, outcome).await
+        // The resumed run continues the SAME session, so the handle is
+        // unchanged. Classify with it so a follow-up AskUser re-retains it; a
+        // CLI resume failure (session not found / corrupt / expired) surfaces
+        // as a non-zero exit → `Failed` → the failure-counter path.
+        let classified = self
+            .classify_outcome(workspace, change, outcome)
+            .await?;
+        self.prune_session_unless_waiting(workspace, Some(&session_id), &classified);
+        Ok(classified)
     }
 
     async fn run_revision(
@@ -1452,11 +1637,56 @@ impl Executor for ClaudeCliExecutor {
         let _ = std::fs::remove_file(&stale_marker);
 
         let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
-        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &prompt, None)
+            .await;
+        Self::delete_mcp_config(workspace);
+        // a74: a pre-spawn precondition refusal (the a006 OS-sandbox-mechanism
+        // gate, which fails BEFORE the subprocess is spawned) is NOT a
+        // substantive task failure — no revision work was attempted. Surface
+        // it as the classifiable `PreconditionUnmet` outcome (by KIND, via the
+        // typed sandbox error) so the revise dispatcher does not charge a
+        // revision slot. Any other executor error propagates unchanged.
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(reason) = crate::sandbox::precondition_unmet_message(&e) {
+                    return Ok(ExecutorOutcome::PreconditionUnmet { reason });
+                }
+                return Err(e);
+            }
+        };
+        persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
+        let session_handle = outcome.session_handle.clone();
+        let classified = self.classify_outcome(workspace, change, outcome).await?;
+        self.prune_session_unless_waiting(workspace, session_handle.as_deref(), &classified);
+        Ok(classified)
+    }
+
+    async fn run_issue(
+        &self,
+        workspace: &Path,
+        ctx: &IssueContext,
+    ) -> Result<ExecutorOutcome> {
+        // The issues walker already rendered the issue-flavored prompt
+        // (`PromptId::ImplementerIssue`). Run it with the MCP outcome
+        // tools wired, keyed by the issue slug for the run-log + outcome
+        // store. Acceptance is against the EXISTING canon — there is no
+        // spec delta, so the acceptance scan / recovery turn (which read
+        // `openspec/changes/<change>/tasks.md`) do NOT apply here; a
+        // tool-recorded outcome OR the classifier's verdict is final.
+        let change = ctx.slug.as_str();
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self
+            .spawn_agentic_session(workspace, change, &ctx.rendered_prompt, None)
+            .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
-        self.classify_outcome(workspace, change, outcome).await
+        persist_run_log(&self.paths, workspace, change, &ctx.rendered_prompt, &outcome);
+        let session_handle = outcome.session_handle.clone();
+        let classified = self.classify_outcome(workspace, change, outcome).await?;
+        self.prune_session_unless_waiting(workspace, session_handle.as_deref(), &classified);
+        Ok(classified)
     }
 
     async fn run_triage(
@@ -1469,7 +1699,7 @@ impl Executor for ClaudeCliExecutor {
         // per-change MCP marker plumbing is keyed by a synthetic name.
         let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .spawn_agentic_session(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1486,7 +1716,7 @@ impl Executor for ClaudeCliExecutor {
         let prompt = self.build_chat_triage_prompt(ctx);
         let _mcp_path = Self::write_mcp_config(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .spawn_agentic_session(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1505,7 +1735,7 @@ impl Executor for ClaudeCliExecutor {
         let prompt = ctx.rendered_prompt.clone();
         let _mcp_path = Self::write_mcp_config(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .spawn_agentic_session(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1528,12 +1758,39 @@ impl Executor for ClaudeCliExecutor {
         let prompt = ctx.rendered_prompt.clone();
         let _mcp_path = Self::write_mcp_config(workspace, SCOUT_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .spawn_agentic_session(workspace, SCOUT_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, SCOUT_LOG_CHANGE_NAME, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, SCOUT_LOG_CHANGE_NAME, outcome)
+            .await
+    }
+
+    async fn run_issue_triage(
+        &self,
+        workspace: &Path,
+        ctx: &IssueReportTriageContext,
+    ) -> Result<ExecutorOutcome> {
+        // The ingestion layer already rendered the issue-report-triage
+        // prompt (reported body embedded as untrusted DATA); pass it
+        // verbatim. The agent classifies read-only AND returns its verdict
+        // as the final answer, which the ingestion layer parses.
+        let prompt = ctx.rendered_prompt.clone();
+        let _mcp_path = Self::write_mcp_config(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, None)?;
+        let outcome = self
+            .spawn_agentic_session(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, &prompt, None)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(
+            &self.paths,
+            workspace,
+            ISSUE_TRIAGE_LOG_CHANGE_NAME,
+            &prompt,
+            &outcome,
+        );
+        self.classify_outcome(workspace, ISSUE_TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
     }
 
@@ -1545,7 +1802,7 @@ impl Executor for ClaudeCliExecutor {
         let prompt = self.build_changelog_prompt(ctx);
         let _mcp_path = Self::write_mcp_config(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .spawn_agentic_session(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, &prompt, None)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -2018,6 +2275,34 @@ mod tests {
         let script = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
 
+        // a70: resume requires a RETAINED session handle to continue natively.
+        let handle = ResumeHandle(
+            serde_json::to_value(ClaudeResumeData {
+                workspace: ws.clone(),
+                change: "x".into(),
+                session_id: Some("sess-resume-1".into()),
+            })
+            .unwrap(),
+        );
+        let outcome = executor.resume(handle, "use SAMPLE").await.unwrap();
+        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
+    }
+
+    /// a70 §5.3 / scenario "Resume failure requeues the change with no
+    /// fallback": a resume handle carrying NO retained session id is NOT
+    /// fresh-run with the answer — it requeues as a retryable `Failed`.
+    #[tokio::test]
+    async fn resume_without_retained_session_requeues_no_fresh_run() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        // A script that, if it WERE run, would create a diff (proving a fresh
+        // run happened). The requeue path must NOT invoke it at all.
+        let script = write_script(
+            &ws,
+            "intruder.sh",
+            "#!/bin/sh\necho FRESH_RUN > fresh_run_marker.txt\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc());
+
         let handle = ResumeHandle(
             serde_json::to_value(ClaudeResumeData {
                 workspace: ws.clone(),
@@ -2026,8 +2311,15 @@ mod tests {
             })
             .unwrap(),
         );
-        let outcome = executor.resume(handle, "use SAMPLE").await.unwrap();
-        assert!(matches!(outcome, ExecutorOutcome::Completed { .. }));
+        let outcome = executor.resume(handle, "the answer").await.unwrap();
+        assert!(
+            matches!(outcome, ExecutorOutcome::Failed { .. }),
+            "no retained session → requeue as Failed, got {outcome:?}"
+        );
+        assert!(
+            !ws.join("fresh_run_marker.txt").exists(),
+            "resume MUST NOT fresh-run the CLI when there is no session to resume"
+        );
     }
 
     #[tokio::test]
@@ -2222,9 +2514,11 @@ mod tests {
     fn from_config_uses_default_template_when_path_unset() {
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2241,6 +2535,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2259,9 +2561,11 @@ mod tests {
         std::fs::write(&path, "CUSTOM_TEMPLATE_SENTINEL {{change_body}}").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: Some(path),
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2278,6 +2582,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2295,9 +2607,11 @@ mod tests {
     fn from_config_falls_back_when_override_file_missing() {
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: Some(PathBuf::from("/definitely/not/a/real/path.md")),
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2314,6 +2628,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2345,9 +2667,11 @@ mod tests {
     fn from_config_uses_default_changelog_stylist_when_path_unset() {
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2364,6 +2688,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2386,9 +2718,11 @@ mod tests {
         std::fs::write(&path, "CUSTOM_STYLIST_SENTINEL {{changelog_json}}").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: Some(path),
             perma_stuck_after_failures: None,
@@ -2405,6 +2739,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2429,9 +2771,11 @@ mod tests {
         std::fs::write(&path, "   \n  \n").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: Some(path),
             perma_stuck_after_failures: None,
@@ -2448,6 +2792,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2471,9 +2823,11 @@ mod tests {
         std::fs::write(&path, "   \n  \n").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: Some(path),
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2490,6 +2844,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2513,9 +2875,11 @@ mod tests {
         std::fs::write(&legacy, "LEGACY_IMPL {{change_body}}").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: Some(legacy),
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2532,6 +2896,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: Some(crate::config::PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
@@ -2560,9 +2932,11 @@ mod tests {
         std::fs::write(&revision, "REVISION_SENTINEL").unwrap();
         let cfg = crate::config::ExecutorConfig {
             kind: crate::config::ExecutorKind::ClaudeCli,
+            implementer_cli: None,
             command: "/bin/true".into(),
             timeout_secs: 30,
             sandbox: None,
+            agent_env: None,
             implementer_prompt_path: None,
             changelog_stylist_prompt_path: None,
             perma_stuck_after_failures: None,
@@ -2579,6 +2953,14 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_internal_contradiction_check_prompt_path: None,
             change_internal_contradiction_check_llm: None,
+            change_canonical_contradiction_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            change_canonical_contradiction_check_prompt_path: None,
+            change_canonical_contradiction_check_llm: None,
+            code_implements_spec_check:
+                crate::config::ContradictionCheckMode::Disabled,
+            code_implements_spec_check_prompt_path: None,
+            code_implements_spec_check_llm: None,
             implementer: None,
             changelog_stylist: None,
             implementer_revision: Some(crate::config::PromptOverrideBlock {
@@ -2692,6 +3074,7 @@ mod tests {
             stderr: "STDERR_SENTINEL".to_string(),
             final_answer: None,
             streamed_log: false,
+            session_handle: None,
             session_id: None,
         };
         persist_run_log(&test_paths_arc(), &ws, "my-change", "PROMPT_SENTINEL", &outcome);
@@ -2757,6 +3140,7 @@ some tool output\n\
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -2796,6 +3180,7 @@ some tool output\n\
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -3415,6 +3800,7 @@ exit 0
             stderr: String::new(),
             final_answer: None,
             streamed_log: false,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -3464,6 +3850,7 @@ exit 0
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -4234,6 +4621,7 @@ exit 0
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -4256,6 +4644,7 @@ exit 0
             stderr: "timeout".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -4279,6 +4668,7 @@ exit 0
             stderr: "broke somewhere".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -4309,6 +4699,7 @@ exit 0
             stderr: String::new(),
             final_answer: Some("done".to_string()),
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
@@ -4375,6 +4766,7 @@ exit 0
             stderr: "killed by signal".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor
@@ -4417,6 +4809,7 @@ exit 0
             stderr: "killed by signal".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor
@@ -4461,6 +4854,7 @@ exit 0
             stderr: String::new(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor
@@ -4500,6 +4894,7 @@ exit 0
             stderr: "real agent failure".to_string(),
             final_answer: None,
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor
@@ -4539,6 +4934,7 @@ exit 0
             stderr: String::new(),
             final_answer: Some("done despite shutdown".to_string()),
             streamed_log: true,
+            session_handle: None,
             session_id: None,
         };
         let result = executor
@@ -4554,5 +4950,177 @@ exit 0
                 "expected Completed when exit=0 AND SHUTDOWN_REQUESTED is true, got {other:?}"
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // a70: strategy-agnostic implementer + session resume/prune.
+    // -----------------------------------------------------------------------
+
+    /// a70 §6.2 / scenario "The claude implementer is unchanged": with no
+    /// configured CLI the implementer defaults to `claude` AND streams (live
+    /// log). §6.1: a capture-only CLI (opencode) does NOT stream.
+    #[test]
+    fn default_implementer_cli_is_claude_and_streams() {
+        let exec = ClaudeCliExecutor::new("claude".into(), 30, test_paths_arc());
+        assert_eq!(exec.cli, crate::config::CliKind::Claude);
+        assert!(
+            exec.implementer_streaming(),
+            "claude + Json output streams the live log"
+        );
+        let oc = exec.with_cli(crate::config::CliKind::Opencode);
+        assert!(
+            !oc.implementer_streaming(),
+            "a capture-only CLI never streams (no live log / no stream-JSON parse)"
+        );
+    }
+
+    /// a70 §6.1 / scenario "A capture-mode strategy implements a change
+    /// end-to-end": with the implementer's CLI resolved to a capture-mode
+    /// strategy (opencode), a `Completed` outcome AND its `final_answer`
+    /// arrive via the MCP outcome relay (NOT a streaming-JSON parse — the
+    /// stub emits no stream events).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn capture_mode_implementer_takes_outcome_and_final_answer_from_relay() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_dir, ws) = fixture_workspace_with_git();
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let (_sock_dir, socket) = spawn_multi_consume_outcome_responder_for(
+            &basename,
+            vec![Some(serde_json::json!({
+                "type": "success",
+                "final_answer": "shipped via the relay"
+            }))],
+        )
+        .await;
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        // A capture-mode (opencode) stub: drains the piped prompt, prints a
+        // line, exits 0 — emits NO streaming-JSON system/result events.
+        let stub = write_script(
+            &ws,
+            "opencode_stub.sh",
+            "#!/bin/sh\ncat >/dev/null\necho 'capture stub done'\nexit 0\n",
+        );
+        let executor = ClaudeCliExecutor::new(stub.to_string_lossy().into(), 30, test_paths_arc())
+            .with_cli(crate::config::CliKind::Opencode);
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match outcome {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(
+                    final_answer.as_deref(),
+                    Some("shipped via the relay"),
+                    "final_answer is taken from the outcome relay, not a stream parse"
+                );
+            }
+            other => panic!("expected Completed via relay, got {other:?}"),
+        }
+        // The capture-mode strategy wrote opencode.json (not the claude
+        // .mcp.json stream config) — corroborating it ran capture-mode.
+        assert!(ws.join("opencode.json").exists());
+    }
+
+    /// a70 §6.5 / scenario "The implementer prunes on terminal outcome": a
+    /// terminal `Completed` prunes ONLY the session the run created (by its
+    /// captured handle), leaving a sibling session AND the settings file in
+    /// place (surgical scope).
+    #[tokio::test]
+    async fn implementer_terminal_outcome_prunes_session_surgically() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let home = TempDir::new().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects")
+            .join(crate::agentic_run::claude_project_hash(&ws));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("sess-term.jsonl"), "{}").unwrap();
+        std::fs::write(store.join("other-sess.jsonl"), "{}").unwrap();
+        std::fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+
+        // Stub claude emits session_id "sess-term" then exits 0; the fixture's
+        // tasks.md is fully checked, so the run completes with no recovery turn.
+        let script = write_system_event_script(&ws, "ok.sh", "sess-term");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc())
+            .with_session_home(home.path().to_path_buf());
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        assert!(
+            matches!(outcome, ExecutorOutcome::Completed { .. }),
+            "expected Completed, got {outcome:?}"
+        );
+        assert!(
+            !store.join("sess-term.jsonl").exists(),
+            "the run's own session is pruned at the terminal outcome"
+        );
+        assert!(
+            store.join("other-sess.jsonl").exists(),
+            "a sibling session survives the surgical prune"
+        );
+        assert!(
+            home.path().join(".claude/settings.json").exists(),
+            "settings survive the surgical prune"
+        );
+    }
+
+    /// a70 §6.4 / scenario "AskUser retains the session and waits": an AskUser
+    /// outcome does NOT prune the session (it is retained for the resume) AND
+    /// the returned `ResumeHandle` carries the session id so the answer can
+    /// resume it natively.
+    #[tokio::test]
+    async fn askuser_retains_session_and_handle_carries_id() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let home = TempDir::new().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects")
+            .join(crate::agentic_run::claude_project_hash(&ws));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("sess-ask.jsonl"), "{}").unwrap();
+
+        // Stub emits session_id "sess-ask" AND drops the askuser marker so the
+        // classifier returns AskUser.
+        let marker = ws
+            .join("openspec/changes/x")
+            .join(".askuser-pending.json");
+        let script = write_script(
+            &ws,
+            "ask.sh",
+            &format!(
+                "#!/bin/sh\n\
+echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-ask\"}}'\n\
+printf '%s' '{{\"question\":\"which directory?\"}}' > '{}'\n\
+exit 0\n",
+                marker.display()
+            ),
+        );
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30, test_paths_arc())
+            .with_session_home(home.path().to_path_buf());
+        let outcome = executor.run(&ws, "x").await.unwrap();
+        match outcome {
+            ExecutorOutcome::AskUser { resume_handle, .. } => {
+                let data: ClaudeResumeData = serde_json::from_value(resume_handle.0).unwrap();
+                assert_eq!(
+                    data.session_id.as_deref(),
+                    Some("sess-ask"),
+                    "the AskUser handle carries the session id for the native resume"
+                );
+            }
+            other => panic!("expected AskUser, got {other:?}"),
+        }
+        assert!(
+            store.join("sess-ask.jsonl").exists(),
+            "AskUser retains the session — it is NOT pruned while waiting"
+        );
     }
 }

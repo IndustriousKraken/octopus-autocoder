@@ -4,5 +4,6 @@
 //! doesn't catch but that would abort `openspec archive` later, after the
 //! LLM cost has already been spent.
 
+pub mod canon_contradiction;
 pub mod change_contradiction;
 pub mod spec_archivability;
