@@ -71,6 +71,7 @@ pub struct InstallArgs {
             "audit_missing_tests_audit",
             "audit_security_bug_audit",
             "audit_documentation_audit",
+            "issues_lane",
         ]
     )]
     pub reconfigure: Option<ReconfigureSection>,
@@ -117,6 +118,13 @@ pub struct InstallArgs {
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     #[arg(long, value_enum)]
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+
+    // ---------- issues lane (a009/a010) ----------
+    /// Enable the issues lane (`features.issues.enabled`) in non-interactive
+    /// mode. Default `disabled`, mirroring the conservative interactive gate so
+    /// IaC scripts that predate this flag keep producing a lane-off install.
+    #[arg(long, value_enum)]
+    pub issues_lane: Option<IssuesLaneArg>,
 
     // ---------- canonical-spec RAG (a21) ----------
     /// Canonical-spec RAG provider in non-interactive mode. `none`
@@ -240,6 +248,25 @@ impl AuditCadenceArg {
     }
 }
 
+/// Issues-lane toggle in non-interactive mode (a009/a010). Mirrors the
+/// interactive "Enable the issues lane? [y/N]" gate; `disabled` (the default)
+/// matches the conservative interactive default so IaC scripts that predate the
+/// flag keep producing a lane-off install.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
+pub enum IssuesLaneArg {
+    /// Same as the default: the issues lane stays off.
+    #[default]
+    Disabled,
+    /// Write `features.issues.enabled: true`.
+    Enabled,
+}
+
+impl IssuesLaneArg {
+    fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Slugs of the audits the wizard knows about. The order is the order they
 /// appear in the per-audit walk-through.
 pub const LLM_DRIVEN_SLUGS: &[(&str, Cadence)] = &[
@@ -302,6 +329,7 @@ pub struct WizardPrefill {
     pub audit_missing_tests_audit: Option<AuditCadenceArg>,
     pub audit_security_bug_audit: Option<AuditCadenceArg>,
     pub audit_documentation_audit: Option<AuditCadenceArg>,
+    pub issues_lane: Option<IssuesLaneArg>,
     pub rag_provider: Option<RagProviderArg>,
     pub rag_base_url: Option<String>,
     pub rag_model: Option<String>,
@@ -334,6 +362,10 @@ pub struct WizardAnswers {
     pub audits: HashMap<String, Cadence>,
     /// Canonical-spec RAG block (a21). `None` → no block written.
     pub canonical_rag: Option<RagAnswers>,
+    /// Issues lane (a009/a010) opt-in. `true` → `features.issues.enabled: true`
+    /// in config.yaml; `false` → no `features.issues` entry (the default-off
+    /// representation). Off by default — enabling changes daemon behavior.
+    pub issues_enabled: bool,
 }
 
 /// Wizard-resolved canonical-spec RAG settings. `None` from the wizard
@@ -1004,6 +1036,18 @@ pub async fn run_wizard(
     let audits = run_audit_prompts(io).await?;
     let canonical_rag = run_rag_prompts(io, prefill).await?;
 
+    // Issues lane (a009/a010). Opt-in gate, default NO: unlike the chatops-verb
+    // features, enabling it changes daemon behavior autonomously (per-iteration
+    // unit selection AND read-only triage of public issues), so the prompt
+    // states the effects and the operator chooses informed.
+    io.print("\nIssues lane\n");
+    io.print(
+        "  When enabled, per-iteration unit selection becomes issues > changes > audits,\n  \
+         and (with features.scout.include_issues on) the bot triages open GitHub issues\n  \
+         read-only into chatops candidates you promote with `send it`. Off by default.\n",
+    );
+    let issues_enabled = io.confirm("\n  Enable the issues lane?", false).await?;
+
     Ok(WizardAnswers {
         repo_url,
         base_branch,
@@ -1020,6 +1064,7 @@ pub async fn run_wizard(
         reviewer_api_base_url,
         audits,
         canonical_rag,
+        issues_enabled,
     })
 }
 
@@ -1483,6 +1528,11 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
         })
     };
 
+    // Issues lane (a009/a010). Only the opt-in case writes anything: with the
+    // flag false, `features` stays at its default AND is omitted from the YAML
+    // (the top-level `features` field's `skip_serializing_if = is_default`).
+    cfg.features.issues.enabled = answers.issues_enabled;
+
     // Canonical-spec RAG (a21).
     cfg.canonical_rag = answers.canonical_rag.as_ref().map(|r| {
         crate::config::CanonicalRagConfig {
@@ -1762,6 +1812,7 @@ pub(crate) async fn execute_inner(
         audit_drift_audit: args.audit_drift_audit,
         audit_missing_tests_audit: args.audit_missing_tests_audit,
         audit_security_bug_audit: args.audit_security_bug_audit,
+        issues_lane: args.issues_lane,
         rag_provider: args.rag_provider,
         rag_base_url: args.rag_base_url.clone(),
         rag_model: args.rag_model.clone(),
@@ -2029,6 +2080,7 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
         reviewer_api_base_url: None,
         audits: resolve_non_interactive_audits(p),
         canonical_rag,
+        issues_enabled: p.issues_lane.unwrap_or_default().enabled(),
     })
 }
 
@@ -2588,6 +2640,7 @@ mod tests {
             reviewer_api_base_url: None,
             audits: HashMap::new(),
             canonical_rag: None,
+            issues_enabled: false,
         }
     }
 
@@ -3060,6 +3113,83 @@ mod tests {
 
     fn load_yaml(tmp: &TempDir) -> String {
         std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap()
+    }
+
+    // ---- issues lane (a009/a010) wizard gate ----
+
+    #[tokio::test]
+    async fn non_interactive_no_issues_flag_leaves_lane_off() {
+        // No --issues-lane → lane off, AND the features block is omitted
+        // entirely (IaC scripts that pre-date the flag are unaffected).
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        execute_inner(ni_args_audits(&tmp), &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            !yaml.contains("features:"),
+            "default install must omit the features block:\n{yaml}"
+        );
+        let cfg: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(!cfg.features.issues.enabled);
+    }
+
+    #[tokio::test]
+    async fn non_interactive_issues_lane_enabled_writes_flag() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            issues_lane: Some(IssuesLaneArg::Enabled),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
+        assert!(cfg.features.issues.enabled, "--issues-lane enabled must set the flag");
+    }
+
+    #[tokio::test]
+    async fn non_interactive_issues_lane_disabled_leaves_lane_off() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            issues_lane: Some(IssuesLaneArg::Disabled),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
+        assert!(!cfg.features.issues.enabled);
+    }
+
+    #[tokio::test]
+    async fn assemble_config_writes_issues_flag_when_opted_in() {
+        // The interactive opt-in funnels through assemble_config the same way.
+        let ans = WizardAnswers { issues_enabled: true, ..baseline_answers() };
+        let cfg = assemble_config(&ans).unwrap();
+        assert!(cfg.features.issues.enabled);
+        let yaml = serialize_config(&cfg).unwrap();
+        let round: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(round.features.issues.enabled, "serialized yaml carries the flag:\n{yaml}");
+    }
+
+    #[tokio::test]
+    async fn assemble_config_omits_features_when_issues_declined() {
+        // The interactive default (decline) leaves issues_enabled false → the
+        // features block is omitted (FeaturesConfig::is_default skip).
+        let cfg = assemble_config(&baseline_answers()).unwrap();
+        assert!(!cfg.features.issues.enabled);
+        let yaml = serialize_config(&cfg).unwrap();
+        assert!(
+            !yaml.contains("features:"),
+            "declined issues lane must omit the features block:\n{yaml}"
+        );
     }
 
     #[tokio::test]
