@@ -2586,12 +2586,33 @@ pub fn clamp_max_audits_per_iteration(
     }
 }
 
+/// The model an audit resolves to at config-load (audit-model-selection).
+/// Populated from [`AuditSettings::model`] (a `models:` registry nickname)
+/// during [`Config::load_from`]; `None` when the audit configured no model
+/// and therefore keeps the default `claude` CLI strategy.
+///
+/// The credential is intentionally NOT retained: every periodic audit drives
+/// a CLI strategy, which authenticates from the wrapped CLI's own login /
+/// credential store (a003) and ignores any resolved key. Only the provider
+/// (which selects the CLI strategy + OS-sandbox CLI kind), the concrete model
+/// name, AND the optional API base URL (consumed by the `opencode` strategy's
+/// `--model <provider>/<model>` flag + provider config) are needed downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAuditModel {
+    pub provider: LlmProvider,
+    pub model: String,
+    pub api_base_url: Option<String>,
+}
+
 /// Per-audit settings keyed by audit type name. `prompt_path` overrides
 /// the audit's embedded default LLM prompt template (no LLM audits ship
 /// in the foundation change; the field is laid in for future audits).
 /// `notify_on_clean` toggles a brief "no findings" chatops post for
 /// `Reported(vec![])` outcomes (silence is success by default). `extra`
 /// is a free-form YAML mapping each audit can read its own knobs out of.
+/// `model` (audit-model-selection) is an optional `models:` registry
+/// nickname routing this audit to a specific LLM + CLI strategy; it is
+/// resolved into `resolved_model` at config-load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditSettings {
@@ -2599,6 +2620,18 @@ pub struct AuditSettings {
     pub prompt_path: Option<PathBuf>,
     #[serde(default)]
     pub notify_on_clean: bool,
+    /// Optional `models:` registry nickname (audit-model-selection). When
+    /// set, the audit runner selects the CLI strategy for the resolved
+    /// model's provider AND passes `--model <provider>/<model>`. Resolved
+    /// against the registry at config-load; an unknown nickname fails fast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The `model` nickname resolved against the top-level `models:`
+    /// registry at config-load. Never deserialized from / serialized to the
+    /// config file — it is a derived runtime field. `None` when no `model`
+    /// was configured (preserving the default `claude` CLI behavior).
+    #[serde(skip)]
+    pub resolved_model: Option<ResolvedAuditModel>,
     #[serde(default)]
     pub extra: HashMap<String, serde_yml::Value>,
 }
@@ -3167,6 +3200,31 @@ impl Config {
                 "code_implements_spec_check_llm",
             )?;
         }
+        // audit-model-selection: resolve each audit's optional `model`
+        // nickname against the `models:` registry, mirroring the reviewer
+        // validation above. A nickname naming no registry entry fails
+        // config-load fast (the error names both the nickname AND the
+        // referencing `audits.settings.<audit_type>` block). The credential
+        // is intentionally dropped — audits always drive a CLI strategy,
+        // which authenticates from its own store (a003), so only provider +
+        // model + base URL are retained for strategy + flag selection.
+        if let Some(audits) = cfg.audits.as_mut() {
+            for (audit_type, settings) in audits.settings.iter_mut() {
+                let Some(nickname) = settings.model.clone() else {
+                    continue;
+                };
+                let label = format!("audits.settings.{audit_type}");
+                if let Some(resolved) =
+                    resolve_model_reference(None, &nickname, models.as_ref(), &label)?
+                {
+                    settings.resolved_model = Some(ResolvedAuditModel {
+                        provider: resolved.provider,
+                        model: resolved.model,
+                        api_base_url: resolved.api_base_url,
+                    });
+                }
+            }
+        }
         // a000: reject typo'd author_association entries up front so a
         // misconfigured allowlist fails at startup rather than silently
         // denying every commenter.
@@ -3473,6 +3531,7 @@ pub const KNOWN_AUDIT_TYPES: &[&str] = &[
     "architecture_consultative",
     "documentation_audit",
     "canon_contradiction_audit",
+    "canon_consolidation_audit",
 ];
 
 /// Run every config validation check and return a structured report.
@@ -7775,6 +7834,68 @@ audits:
         );
     }
 
+    /// a76 (task 5.7): `validate_audit_type_names` accepts the new
+    /// `canon_consolidation_audit` slug AND still rejects an unknown one,
+    /// listing the seven registered slugs in the error.
+    #[test]
+    fn validate_audit_type_names_accepts_canon_consolidation_audit() {
+        // The seven slugs the canonical "Registered periodic audits"
+        // enumeration carries after a76 (a75's six + canon_consolidation).
+        let known = &[
+            "architecture_brightline",
+            "architecture_consultative",
+            "drift_audit",
+            "missing_tests_audit",
+            "security_bug_audit",
+            "canon_contradiction_audit",
+            "canon_consolidation_audit",
+        ];
+
+        // Accepts the new slug.
+        let ok_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    canon_consolidation_audit: monthly
+"#;
+        let (_d1, p1) = write_config(ok_yaml);
+        let cfg_ok = Config::load_from(&p1).unwrap();
+        validate_audit_type_names(&cfg_ok, known)
+            .expect("canon_consolidation_audit must be accepted");
+
+        // Rejects an unknown slug, naming it AND listing the registered set.
+        let bad_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    not_a_real_audit: monthly
+"#;
+        let (_d2, p2) = write_config(bad_yaml);
+        let cfg_bad = Config::load_from(&p2).unwrap();
+        let err = validate_audit_type_names(&cfg_bad, known)
+            .expect_err("unknown slug must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not_a_real_audit"), "names the unknown slug: {msg}");
+        assert!(
+            msg.contains("canon_consolidation_audit"),
+            "lists the registered slugs including the new one: {msg}"
+        );
+    }
+
     #[test]
     fn cadence_interval_matches_documented_durations() {
         assert!(Cadence::Disabled.interval().is_none());
@@ -8284,6 +8405,48 @@ audits:
             slug_errs[0].message.contains("typo_audit_name"),
             "error must name the offending slug; got: {}",
             slug_errs[0].message
+        );
+    }
+
+    /// a76 regression: `validate_config`'s audit-slug check (which reads
+    /// `KNOWN_AUDIT_TYPES`) accepts the registered `canon_consolidation_audit`
+    /// slug. The const must stay in lock-step with the `AuditRegistry` built in
+    /// `cli/run.rs`; a drift would make `validate-config` reject a valid
+    /// operator config that enables the audit.
+    #[test]
+    fn validate_config_accepts_canon_consolidation_audit_slug() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+audits:
+  defaults:
+    canon_consolidation_audit: monthly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let slug_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::AuditSlug)
+            .collect();
+        assert!(
+            slug_errs.is_empty(),
+            "canon_consolidation_audit is a registered slug and must not raise an audit-slug error; got: {slug_errs:?}"
+        );
+        // The const is the source of the validator's known set: it must list
+        // the slug the registry registers.
+        assert!(
+            KNOWN_AUDIT_TYPES.contains(&"canon_consolidation_audit"),
+            "KNOWN_AUDIT_TYPES must list canon_consolidation_audit to match the registry"
         );
     }
 
@@ -9847,6 +10010,129 @@ reviewer:
         let msg = format!("{err:#}");
         assert!(msg.contains("typo_nickname"), "must name the nickname: {msg}");
         assert!(msg.contains("reviewer"), "must name the block: {msg}");
+    }
+
+    // ---- audit-model-selection: per-audit `model` registry references ----
+
+    /// An audit configured with a valid `models:` registry nickname resolves
+    /// at config-load to the registry entry's full tuple (provider + model +
+    /// base URL), surfaced on `AuditSettings::resolved_model`.
+    #[test]
+    fn audit_model_nickname_resolves_to_registry_entry() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  beefy_security:
+    provider: openai_compatible
+    model: moonshotai/kimi-k2
+    api_base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_KEY
+audits:
+  defaults:
+    drift_audit: daily
+  settings:
+    drift_audit:
+      model: beefy_security
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("audit nickname must resolve");
+        let audits = cfg.audits.expect("audits block present");
+        let settings = audits
+            .settings
+            .get("drift_audit")
+            .expect("drift_audit settings present");
+        // The unresolved nickname is preserved AND the resolved tuple is set.
+        assert_eq!(settings.model.as_deref(), Some("beefy_security"));
+        let resolved = settings
+            .resolved_model
+            .as_ref()
+            .expect("model nickname resolved at config-load");
+        assert_eq!(resolved.provider, LlmProvider::OpenAiCompatible);
+        assert_eq!(resolved.model, "moonshotai/kimi-k2");
+        assert_eq!(
+            resolved.api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    /// An audit whose `model` names no registry entry fails config-load,
+    /// naming BOTH the missing nickname AND the referencing audit setting.
+    #[test]
+    fn audit_model_unknown_nickname_fails_with_diagnostic() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  fast_local:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    api_base_url: http://localhost:11434
+audits:
+  settings:
+    security_bug_audit:
+      model: nonexistent_model
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("unknown audit model nickname must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent_model"),
+            "must name the missing nickname: {msg}"
+        );
+        assert!(
+            msg.contains("audits.settings.security_bug_audit"),
+            "must name the referencing audit setting: {msg}"
+        );
+    }
+
+    /// An audit with settings but no `model` field resolves to `None`,
+    /// preserving the default `claude` CLI behavior.
+    #[test]
+    fn audit_without_model_field_resolves_to_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+audits:
+  defaults:
+    drift_audit: daily
+  settings:
+    drift_audit:
+      notify_on_clean: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("audit without a model must load");
+        let audits = cfg.audits.expect("audits block present");
+        let settings = audits
+            .settings
+            .get("drift_audit")
+            .expect("drift_audit settings present");
+        assert!(settings.model.is_none(), "no model nickname configured");
+        assert!(
+            settings.resolved_model.is_none(),
+            "no model field must leave resolved_model None (default claude behavior)"
+        );
     }
 
     /// 4.4 / 2.2: a `canonical_rag` block resolving (via the registry) to

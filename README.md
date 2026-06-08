@@ -70,6 +70,7 @@ Once the daemon is running, this is the day-to-day surface.
 | `missing_tests_audit` | Surveys for uncovered error paths; writes `openspec/changes/tests-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 | `security_bug_audit` | Surveys for security issues and bugs; writes `openspec/changes/fix-*` / `secure-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 | `canon_contradiction_audit` | Scans the whole canon for two requirements that cannot both hold (canon-vs-canon). RAG-assisted; read-only sandbox. Default cadence `monthly`. | Yes | Reported findings (chatops `📋`); maintainer heals via audit-thread `send it` |
+| `canon_consolidation_audit` | Scans the canon for redundant requirements expressing one invariant under different titles (canon-vs-canon); drafts a `consolidate-` change merging them. RAG-assisted; OpenSpec-only sandbox. Default cadence `monthly`. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 
 Spec-writing audits enqueue their new proposals into the same iteration's queue walk — implementer commit and audit's creation commit ship in one PR. Generated proposals run through `openspec validate --strict` before commit; invalid proposals are discarded and a `❌` chatops notification fires. See [docs/OPERATIONS.md → Periodic audits](docs/OPERATIONS.md#periodic-audits).
 

@@ -19,7 +19,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{ALLOWED_TOOLS, SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -140,6 +140,8 @@ impl Audit for MissingTestsAudit {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<embedded default>".to_string());
+        // audit-model-selection: route to the configured model (if any).
+        let model = super::audit_resolved_model(&self.settings);
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -152,6 +154,9 @@ impl Audit for MissingTestsAudit {
                 openspec_command: &self.openspec_command,
                 prompt_source: &prompt_source,
                 commit_subject: "missing-tests proposals",
+                allowed_tools: ALLOWED_TOOLS,
+                include_autocoder_tools: false,
+                model: model.as_ref(),
             },
             ctx,
         )
@@ -304,6 +309,7 @@ mod tests {
                 prompt_path: None,
                 notify_on_clean: false,
                 extra,
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -343,6 +349,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");
@@ -368,6 +375,7 @@ mod tests {
                 prompt_path: Some(p),
                 notify_on_clean: false,
                 extra: HashMap::new(),
+                ..Default::default()
             },
         );
         let cfg = executor_cfg("/bin/true");

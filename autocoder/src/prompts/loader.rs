@@ -74,6 +74,9 @@ pub enum PromptId {
     /// `prompts/canon-contradiction-audit.md` — canon-internal
     /// contradiction audit (a75).
     AuditCanonContradiction,
+    /// `prompts/canon-consolidation-audit.md` — canon-consolidation
+    /// audit (a76): proposes merging redundant canonical requirements.
+    AuditCanonConsolidation,
     /// `prompts/brownfield-draft.md` — brownfield-draft handler.
     BrownfieldDraft,
     /// `prompts/brownfield-survey.md` — brownfield-survey handler (a29).
@@ -131,6 +134,8 @@ const PROMPT_DOCUMENTATION_AUDIT: &str =
     include_str!("../../../prompts/documentation-audit.md");
 const PROMPT_CANON_CONTRADICTION_AUDIT: &str =
     include_str!("../../../prompts/canon-contradiction-audit.md");
+const PROMPT_CANON_CONSOLIDATION_AUDIT: &str =
+    include_str!("../../../prompts/canon-consolidation-audit.md");
 const PROMPT_BROWNFIELD_DRAFT: &str = include_str!("../../../prompts/brownfield-draft.md");
 const PROMPT_BROWNFIELD_SURVEY: &str = include_str!("../../../prompts/brownfield-survey.md");
 const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
@@ -159,6 +164,7 @@ impl PromptId {
             Self::AuditSecurityBug => PROMPT_SECURITY_BUG_AUDIT,
             Self::AuditDocumentation => PROMPT_DOCUMENTATION_AUDIT,
             Self::AuditCanonContradiction => PROMPT_CANON_CONTRADICTION_AUDIT,
+            Self::AuditCanonConsolidation => PROMPT_CANON_CONSOLIDATION_AUDIT,
             Self::BrownfieldDraft => PROMPT_BROWNFIELD_DRAFT,
             Self::BrownfieldSurvey => PROMPT_BROWNFIELD_SURVEY,
             Self::Scout => PROMPT_SCOUT,
@@ -187,6 +193,7 @@ impl PromptId {
             Self::AuditSecurityBug => "security-bug-audit.md",
             Self::AuditDocumentation => "documentation-audit.md",
             Self::AuditCanonContradiction => "canon-contradiction-audit.md",
+            Self::AuditCanonConsolidation => "canon-consolidation-audit.md",
             Self::BrownfieldDraft => "brownfield-draft.md",
             Self::BrownfieldSurvey => "brownfield-survey.md",
             Self::Scout => "scout.md",
@@ -213,6 +220,7 @@ impl PromptId {
             Self::AuditSecurityBug => "AuditSecurityBug",
             Self::AuditDocumentation => "AuditDocumentation",
             Self::AuditCanonContradiction => "AuditCanonContradiction",
+            Self::AuditCanonConsolidation => "AuditCanonConsolidation",
             Self::BrownfieldDraft => "BrownfieldDraft",
             Self::BrownfieldSurvey => "BrownfieldSurvey",
             Self::Scout => "Scout",
@@ -240,6 +248,7 @@ impl PromptId {
             Self::AuditSecurityBug,
             Self::AuditDocumentation,
             Self::AuditCanonContradiction,
+            Self::AuditCanonConsolidation,
             Self::BrownfieldDraft,
             Self::BrownfieldSurvey,
             Self::Scout,

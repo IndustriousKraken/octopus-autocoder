@@ -734,7 +734,7 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Seven audits ship today:
+# daemon between regular polling iterations. Eight audits ship today:
 #   - architecture_brightline    — flags files exceeding a line-count threshold
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
@@ -742,6 +742,7 @@ github:
 #   - architecture_consultative  — LLM architectural-health review
 #   - documentation_audit        — LLM docs coverage / stale-reference / organization check
 #   - canon_contradiction_audit  — LLM scan for two canonical requirements that cannot both hold
+#   - canon_consolidation_audit  — LLM scan for redundant canonical requirements; drafts a consolidate- change
 #
 # Cadence vocabulary (per audit; default `disabled`):
 #   disabled | daily | every-N-days | weekly | monthly | quarterly
@@ -761,6 +762,7 @@ github:
 #     architecture_consultative: quarterly
 #     documentation_audit: monthly
 #     canon_contradiction_audit: monthly   # whole-canon scope → heavy default
+#     canon_consolidation_audit: monthly   # rewrites canon → heavy default
 #
 #   # Per-audit knobs. `prompt_path` overrides the audit's embedded LLM
 #   # prompt template. `notify_on_clean` toggles a brief "no findings"
@@ -803,6 +805,12 @@ github:
 #       extra:
 #         retrieval_breadth: 8        # nearest requirements retrieved per requirement (RAG on)
 #         max_findings_per_run: 20    # cap on findings surfaced per run (overflow surfaces later)
+#     canon_consolidation_audit:
+#       # prompt_path: /etc/autocoder/prompts/canon-consolidation-audit.md
+#       notify_on_clean: false
+#       extra:
+#         retrieval_breadth: 8        # nearest requirements retrieved per requirement (RAG on)
+#         max_proposals_per_run: 1    # cap on consolidate- changes drafted per run (dense to review)
 #
 #   # Number of retry attempts after an LLM-driven audit's generated
 #   # proposal fails `openspec validate --strict`. Each retry re-invokes

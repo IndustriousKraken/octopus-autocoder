@@ -6,6 +6,7 @@ use crate::audits::{
     AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    canon_consolidation::CanonConsolidationAudit,
     canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
     drift::DriftAudit,
@@ -694,6 +695,13 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         &audit_settings,
         &cfg.executor,
         &daemon_paths,
+    )));
+    // a76: the canon-consolidation audit drafts a `consolidate-` change
+    // (OpenSpecOnly) merging redundant requirements — the overlap twin of
+    // the contradiction audit's conflict scan.
+    registry.register(Arc::new(CanonConsolidationAudit::new(
+        &audit_settings,
+        &cfg.executor,
     )));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so
