@@ -5488,7 +5488,7 @@ The scout prompt SHALL be loaded via `PromptLoader::load(PromptId::Scout, &works
 3. The workspace's `README.md` contents AND the list of `docs/*.md` filenames.
 4. A code-symbol overview built via `cargo metadata` (Rust workspaces) OR a ripgrep pass for top-level public items (other languages).
 5. `git log --since="<N> days ago" --pretty=oneline` output for recent-activity context, where N is `features.scout.staleness_warn_days * 4`.
-6. The open-issues list via `gh api repos/<owner>/<repo>/issues?state=open --paginate` when `features.scout.include_issues: true`. On `gh` failure (auth, rate limit, network), the handler SHALL log a WARN naming the failure AND continue with an empty issue list.
+6. The open-issues list via the forge provider's authenticated open-issue listing (the same configured credential as PR operations; see the git-workflow-manager forge requirement), NOT the `gh` CLI, when `features.scout.include_issues: true`. On a forge issue-read failure (auth, rate limit, network), the handler SHALL log a WARN naming the failure AND continue with an empty issue list.
 
 The executor's response SHALL be a JSON array of opportunity items. Each item SHALL have:
 
@@ -5504,7 +5504,7 @@ The handler SHALL validate the response: well-formed JSON, every item has all re
 On validation success, the handler SHALL: write `<workspace>/.state/scout_runs/<request_id>.json` with `ScoutRunState { request_id, repo_url, guidance, head_sha_at_run, completed_at, thread_ts, channel, items }`; render the list (grouped by category, compact per-item format) AND post it to the request's thread; append the closing note `Reply with @<bot> spec-it <N> [optional guidance] to scope work on any item.`. When the rendered list exceeds the threaded-notification length limit, the handler SHALL truncate the displayed list AND append `… (truncated; full list in <workspace>/.state/scout_runs/<request_id>.json)`.
 
 #### Scenario: Happy-path scout run
-- **WHEN** the executor returns a valid JSON list of 12 items AND the workspace has no `gh` failure
+- **WHEN** the executor returns a valid JSON list of 12 items AND the issue fetch did not fail
 - **THEN** the handler persists `ScoutRunState` with 12 items
 - **AND** posts a thread reply grouping items by category with the closing spec-it instruction
 - **AND** the thread reply does NOT contain `(truncated; …)`
@@ -5514,9 +5514,9 @@ On validation success, the handler SHALL: write `<workspace>/.state/scout_runs/<
 - **THEN** no state file is written
 - **AND** the thread reply names the validation failure AND points at the daemon log
 
-#### Scenario: gh issues unavailable falls through gracefully
-- **WHEN** `features.scout.include_issues: true` AND `gh api` returns a non-success exit code
-- **THEN** a WARN is logged naming the gh failure
+#### Scenario: Issue fetch unavailable falls through gracefully
+- **WHEN** `features.scout.include_issues: true` AND the forge open-issue listing fails (auth, rate limit, network)
+- **THEN** a WARN is logged naming the failure
 - **AND** the scout proceeds with code-derived items only
 - **AND** the thread reply includes a note that issue-derived items were skipped this run
 
@@ -5609,7 +5609,7 @@ The per-repo config schema SHALL accept an optional `features.scout` block:
 - `enabled: bool` (default `true`) — when `false`, the `scout`, `spec-it`, AND `clear-scout` verbs are refused at parse time.
 - `prompt_path: Option<String>` (default `None`) — per the uniform PromptLoader pattern.
 - `max_items: usize` (default `30`, valid range `1..=50`) — cap on the scout's item list.
-- `include_issues: bool` (default `true`) — controls whether the handler attempts `gh api` for open issues.
+- `include_issues: bool` (default `true`) — controls whether the handler fetches open issues (via the forge provider's authenticated API) for inclusion in the scout input.
 - `staleness_warn_days: u64` (default `7`) — threshold for the staleness warning.
 
 Invalid values (non-bool where bool expected; `max_items` outside `1..=50`) cause config-load to fail-fast with an error naming the offending field.

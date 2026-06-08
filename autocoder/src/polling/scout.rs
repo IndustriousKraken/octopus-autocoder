@@ -34,6 +34,7 @@ const RENDERED_LIST_LIMIT: usize = 7000;
 pub async fn process_pending_scout(
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &crate::config::GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     request: &crate::control_socket::ScoutRequest,
@@ -57,7 +58,7 @@ pub async fn process_pending_scout(
     let symbols_overview = build_symbols_overview(workspace);
     let recent_activity = read_recent_activity(workspace, scout_cfg.staleness_warn_days * 4);
     let (open_issues, issues_failed) = if scout_cfg.include_issues {
-        fetch_open_issues(&request.repo_url)
+        fetch_open_issues(repo.forge.as_ref(), github_cfg, &request.repo_url).await
     } else {
         ("(open-issues fetch disabled by features.scout.include_issues=false)".to_string(), false)
     };
@@ -520,75 +521,41 @@ fn read_recent_activity(workspace: &Path, since_days: u64) -> String {
     }
 }
 
-/// Fetch the raw `gh api repos/<o>/<r>/issues?state=open --paginate`
-/// JSON for `repo_url`, UNCAPPED (the scout-prompt variant caps for
-/// prompt budget; this one returns the full body so callers that PARSE
-/// the issues — e.g. the a010 hybrid-ingestion lane — get the complete
-/// array). Returns the stdout on success; an `Err` string on a parse,
-/// non-zero-status, OR spawn failure. This is the single `gh api` issue
-/// read both scout AND ingestion compose.
-pub(crate) fn fetch_open_issues_json(repo_url: &str) -> std::result::Result<String, String> {
-    let (owner, repo) =
-        crate::github::parse_repo_url(repo_url).map_err(|e| format!("parsing repo URL: {e}"))?;
-    let endpoint = format!("repos/{owner}/{repo}/issues?state=open");
-    let out = std::process::Command::new("gh")
-        .args(["api", "--paginate", &endpoint])
-        .output()
-        .map_err(|e| format!("spawning `gh api`: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(format!(
-            "`gh api` exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
-}
-
-/// Fetch open issues via `gh api`. Returns `(text, failed)` — when
-/// `failed` is true, the caller posts a note saying issue-derived
-/// items were skipped.
-fn fetch_open_issues(repo_url: &str) -> (String, bool) {
-    let parts = match crate::github::parse_repo_url(repo_url) {
-        Ok((o, r)) => (o, r),
-        Err(_) => {
-            return (
-                "(could not parse repo URL for `gh api` call)".to_string(),
-                true,
-            );
-        }
-    };
-    let endpoint = format!("repos/{}/{}/issues?state=open", parts.0, parts.1);
-    let out = std::process::Command::new("gh")
-        .args(["api", "--paginate", &endpoint])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).into_owned();
-            // Cap.
+/// Fetch open issues for the scout prompt via the forge provider's
+/// authenticated API (the same configured token as PR operations — NOT the
+/// `gh` CLI; see `crate::forge::list_open_issues_for`). Returns `(text,
+/// failed)` — when `failed` is true, the caller posts a note saying issue-
+/// derived items were skipped. The issues are serialized as a compact JSON
+/// view AND capped for the prompt budget.
+async fn fetch_open_issues(
+    forge_cfg: Option<&crate::config::ForgeConfig>,
+    github_cfg: &crate::config::GithubConfig,
+    repo_url: &str,
+) -> (String, bool) {
+    match crate::forge::list_open_issues_for(forge_cfg, github_cfg, repo_url).await {
+        Ok(issues) => {
+            let view: Vec<_> = issues
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "number": i.number,
+                        "title": i.title,
+                        "body": i.body,
+                        "url": i.url,
+                    })
+                })
+                .collect();
+            let s = serde_json::to_string_pretty(&view).unwrap_or_else(|_| "[]".to_string());
             let mut capped: String = s.chars().take(8000).collect();
             if s.chars().count() > 8000 {
-                capped.push_str("\n… (truncated; the executor can re-run `gh api` if needed)");
+                capped.push_str("\n… (truncated for prompt budget; full list via the forge API)");
             }
             (capped, false)
         }
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).into_owned();
-            tracing::warn!(
-                "scout: `gh api` open-issues fetch failed: status={}, stderr={err}",
-                o.status
-            );
-            (
-                "(open-issues fetch via `gh api` failed; running with code-derived items only)"
-                    .to_string(),
-                true,
-            )
-        }
         Err(e) => {
-            tracing::warn!("scout: `gh api` command failed to spawn: {e}");
+            tracing::warn!("scout: open-issues fetch via the forge failed: {e}");
             (
-                "(open-issues fetch via `gh api` could not run)".to_string(),
+                "(open-issues fetch failed; running with code-derived items only)".to_string(),
                 true,
             )
         }

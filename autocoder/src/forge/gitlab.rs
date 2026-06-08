@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::github::{CreatedPr, IssueComment, IssueCommentUser, OpenPr, PrRefSummary, PrSummary};
+use super::github::{
+    CreatedPr, ForgeIssue, IssueComment, IssueCommentUser, OpenPr, PrRefSummary, PrSummary,
+};
 use super::{AuthLevel, Forge, ReviewDecision};
 use crate::code_reviewer::ReviewReport;
 use crate::config::CommandAuthorizationConfig;
@@ -402,6 +404,68 @@ impl Forge for GitlabForge {
             ));
         }
         Ok(())
+    }
+
+    async fn list_open_issues(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<ForgeIssue>> {
+        // GitLab issues are a distinct endpoint from merge requests, so (unlike
+        // GitHub) there are no MR entries to filter out. `iid` is the per-
+        // project issue number; GitLab has no `author_association`.
+        #[derive(Deserialize)]
+        struct GlIssue {
+            iid: u64,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            web_url: String,
+        }
+        let id = project_id(owner, repo);
+        let url = format!("{}/projects/{id}/issues", self.api_base);
+        let mut out: Vec<ForgeIssue> = Vec::new();
+        let mut page: u32 = 1;
+        loop {
+            let page_s = page.to_string();
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .query(&[("state", "opened"), ("per_page", "100"), ("page", page_s.as_str())])
+                .header("PRIVATE-TOKEN", token)
+                .header("User-Agent", "openspec-autocoder")
+                .send()
+                .await
+                .map_err(|e| anyhow!("gitlab issue list GET failed: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let snippet = body_snippet(resp).await;
+                return Err(anyhow!(
+                    "gitlab issue list GET {owner}/{repo} returned {status}: {snippet}"
+                ));
+            }
+            let items: Vec<GlIssue> = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("gitlab issue list decode failed: {e}"))?;
+            let count = items.len();
+            for i in items {
+                out.push(ForgeIssue {
+                    number: i.iid,
+                    title: i.title,
+                    body: i.description.unwrap_or_default(),
+                    author_association: None,
+                    url: i.web_url,
+                });
+            }
+            if count < 100 || page >= 50 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
     }
 
     fn authorize(&self, comment: &IssueComment, auth: &CommandAuthorizationConfig) -> AuthLevel {

@@ -175,6 +175,29 @@ Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, w
 
 **Standalone CLI mode.** When no daemon is running, `autocoder audit run` invokes the audit module directly against the named workspace and prints findings to stdout. This bypasses the daemon's scheduler entirely (no `pending_audit_runs` queue is involved) and is intended for prompt-template iteration during audit-prompt development — edit `prompts/<audit>.md`, run the CLI, observe, iterate.
 
+## Issues lane {#issues-lane}
+
+The issues lane is a second work lane for **corrections** — fixes that don't warrant a spec change — running alongside the OpenSpec changes queue. It is **off by default**. Enable it with `features.issues.enabled: true` (the install wizard offers a `[y/N]` gate; `--issues-lane enabled` non-interactively — see [CONFIG.md → features.issues](CONFIG.md#featuresissues)). `features.*` is not part of the `autocoder reload` hot-reload set, so enabling it takes a daemon restart. When the lane is on, per-iteration unit selection is `issues > changes > audits`.
+
+### Two entry points
+
+- **Curated.** A maintainer commits `openspec/issues/<slug>/` to the base branch directly. The next iteration works it into a fix and opens a PR. Always available once the lane is on.
+- **Public ingestion.** Each iteration the daemon reads the repository's open GitHub issues read-only, classifies and dedups each against open and archived issues, and posts a **candidate** to chatops — it queues nothing. A maintainer promotes a candidate by replying `send it` in its thread (the same promotion pattern as audit findings); only then does the daemon write `openspec/issues/<slug>/` and queue it. Public ingestion additionally requires `features.scout.include_issues` (on by default).
+
+Issue **assignee is not consulted** — assigning an issue to the bot account does nothing. Ingestion reads all open issues regardless of assignee.
+
+### Authorization and safety
+
+Promotion is the authorization gate: the public can *report* an issue but cannot *trigger* code work. Issue bodies are untrusted public input, carried as data and never interpreted as instructions; combined with maintainer promotion and human PR merge, an injected issue body can at worst waste compute. See [SECURITY.md](SECURITY.md).
+
+### Setup
+
+Public ingestion reads issues through autocoder's configured GitHub token — the same credential used to open PRs (per-owner-routed where configured). No separate credential or `gh auth login` is required. On a failed read (auth, rate limit, network) the daemon logs a WARN and proceeds with no issue-derived candidates that pass.
+
+### Recovery
+
+A promoted issue that fails repeatedly follows the same perma-stuck handling as a change (`.perma-stuck.json` under `openspec/issues/<slug>/`); delete the marker to retry. A completed issue is archived to `openspec/issues/archive/` — the lane never touches canonical specs in `openspec/specs/`.
+
 ## Revising an open PR via comment
 
 autocoder treats a PR comment of the form `@<bot> revise <free-text>` as a

@@ -1079,6 +1079,27 @@ fn sandbox_settings_dir(settings_dir: Option<&Path>, workspace: &Path) -> PathBu
     }
 }
 
+/// The daemon control-socket path to bind into the OS sandbox, so the
+/// per-execution MCP child can `connect()` to relay outcomes / submissions.
+///
+/// Read from the same `ORCH_DAEMON_CONTROL_SOCKET` env var that is forwarded
+/// into the child. The socket otherwise lives outside the sandbox namespace
+/// whenever it sits in a masked location — under `/tmp` (the sandbox's private
+/// `/tmp`) or a masked `$HOME` (read-only roles) — so without an explicit bind
+/// the relay's `connect()` fails and the run times out instead of recording
+/// its outcome. `None` when the var is unset/empty (tests, or a run with no
+/// relay), in which case no bind is added.
+fn sandbox_control_socket_bind() -> Option<PathBuf> {
+    control_socket_from_env(std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).ok())
+}
+
+/// Pure core of [`sandbox_control_socket_bind`]: a present, non-empty value
+/// becomes the bind path; absent/empty yields `None`. Split out so it is
+/// testable without mutating the process environment.
+fn control_socket_from_env(val: Option<String>) -> Option<PathBuf> {
+    val.filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
 /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
 /// configured timeout, AND return the unified outcome. See the module
 /// docs for the behavior contract.
@@ -1173,7 +1194,15 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
                 let inner = crate::sandbox::InnerCommand::from_command(&inner_cmd);
                 // a013: the program (resolved + bound under an allowlist policy
                 // so the wrapped CLI execs under a masked home) drives the plan.
-                let plan = opts.os_sandbox.build_plan(opts.workspace, &inner.program);
+                let mut plan = opts.os_sandbox.build_plan(opts.workspace, &inner.program);
+                // Bind the daemon control socket into the namespace so the
+                // per-execution MCP child can connect() to relay outcomes /
+                // submissions — even when the socket lives under /tmp or a
+                // masked home. Without this the relay times out: the run does
+                // the work but is never recorded.
+                if let Some(sock) = sandbox_control_socket_bind() {
+                    plan.extra_ro_paths.push(sock);
+                }
                 crate::sandbox::wrap_command(mechanism, &plan, &inner)
             }
             _ => inner_cmd,
@@ -1760,6 +1789,19 @@ mod tests {
             sandbox_settings_dir(Some(override_dir), workspace).as_path(),
             override_dir
         );
+    }
+
+    /// Regression: the daemon control socket is threaded into the sandbox plan
+    /// (so the MCP relay can reach it) when configured, and omitted otherwise.
+    #[test]
+    fn control_socket_bind_resolves_from_env_value() {
+        assert_eq!(
+            control_socket_from_env(Some("/tmp/1000-runtime/autocoder/control.sock".to_string())),
+            Some(PathBuf::from("/tmp/1000-runtime/autocoder/control.sock"))
+        );
+        // Unset or empty → no bind added.
+        assert_eq!(control_socket_from_env(None), None);
+        assert_eq!(control_socket_from_env(Some(String::new())), None);
     }
 
     fn ctx<'a>(

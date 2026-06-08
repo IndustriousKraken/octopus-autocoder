@@ -1009,6 +1009,98 @@ pub async fn list_open_prs_for_head(
     Ok(parsed)
 }
 
+/// A repository issue, forge-neutral (the GitHub issues-endpoint shape parsed
+/// into the fields autocoder consumes). The `body` is UNTRUSTED public input —
+/// callers carry it as data, never as an instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    /// GitHub `author_association` (`OWNER` / `MEMBER` / … / `NONE`); `None`
+    /// when the API omitted it.
+    pub author_association: Option<String>,
+    /// The issue's web URL (used as the scout opportunity item's `source`).
+    pub url: String,
+}
+
+/// List a repository's OPEN issues via the GitHub REST API, authenticated with
+/// the configured `token` (the same credential as PR creation) — NOT the `gh`
+/// CLI. Pages through `?state=open&per_page=100&page=N` until a short page, AND
+/// excludes pull-request entries (the issues endpoint interleaves PRs, marked
+/// by a `pull_request` object).
+pub async fn list_open_issues_at(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<ForgeIssue>> {
+    #[derive(Deserialize)]
+    struct RawIssue {
+        number: u64,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        author_association: Option<String>,
+        #[serde(default)]
+        html_url: String,
+        #[serde(default)]
+        pull_request: Option<serde_json::Value>,
+    }
+    let client = reqwest::Client::new();
+    let url = format!("{api_base}/repos/{owner}/{repo}/issues");
+    let mut out: Vec<ForgeIssue> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let page_s = page.to_string();
+        let resp = client
+            .get(&url)
+            .query(&[("state", "open"), ("per_page", "100"), ("page", page_s.as_str())])
+            .header("Authorization", format!("token {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "openspec-autocoder")
+            .send()
+            .await
+            .map_err(|e| anyhow!("github list-open-issues GET failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_snippet = resp
+                .text()
+                .await
+                .map(|t| t.chars().take(500).collect::<String>())
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "github list-open-issues GET {owner}/{repo} returned {status}: {body_snippet}"
+            ));
+        }
+        let parsed: Vec<RawIssue> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("github list-open-issues response decode failed: {e}"))?;
+        let count = parsed.len();
+        for r in parsed {
+            if r.pull_request.is_some() {
+                continue; // the issues endpoint interleaves PRs; skip them
+            }
+            out.push(ForgeIssue {
+                number: r.number,
+                title: r.title,
+                body: r.body.unwrap_or_default(),
+                author_association: r.author_association,
+                url: r.html_url,
+            });
+        }
+        // A short page is the last page. Cap pagination defensively.
+        if count < 100 || page >= 50 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
+}
+
 /// List issue comments on `pr_number` whose `created_at` is at or after
 /// `since`. GitHub's `since` parameter is inclusive on `updated_at`; for
 /// the purpose of the revision dispatcher we treat it as "new since".
@@ -1216,6 +1308,56 @@ mod tests {
             .expect_err("non-2xx must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("403"), "error must name the HTTP status; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn list_open_issues_excludes_prs_and_parses_fields() {
+        let mut server = mockito::Server::new_async().await;
+        // A single short page (< 100) → one request. Includes a PR entry
+        // (carrying `pull_request`) that must be excluded.
+        let mock = server
+            .mock("GET", "/repos/o/r/issues")
+            .match_query(mockito::Matcher::Any)
+            .match_header("authorization", "token testtoken")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"number":7,"title":"bug A","body":"boom","author_association":"NONE","html_url":"https://x/7"},
+                    {"number":8,"title":"a PR","body":"x","pull_request":{"url":"..."},"html_url":"https://x/8"},
+                    {"number":9,"title":"no body","html_url":"https://x/9"}
+                ]"#,
+            )
+            .create_async()
+            .await;
+
+        let got = list_open_issues_at(&server.url(), "testtoken", "o", "r")
+            .await
+            .expect("issue list ok");
+        mock.assert_async().await;
+        assert_eq!(got.len(), 2, "the PR entry is excluded");
+        assert_eq!(got[0].number, 7);
+        assert_eq!(got[0].body, "boom");
+        assert_eq!(got[0].author_association.as_deref(), Some("NONE"));
+        assert_eq!(got[0].url, "https://x/7");
+        assert_eq!(got[1].number, 9);
+        assert_eq!(got[1].body, "", "absent body deserializes to empty");
+    }
+
+    #[tokio::test]
+    async fn list_open_issues_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/o/r/issues")
+            .match_query(mockito::Matcher::Any)
+            .with_status(401)
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+        let err = list_open_issues_at(&server.url(), "x", "o", "r")
+            .await
+            .expect_err("non-2xx must error so the caller can degrade gracefully");
+        assert!(format!("{err:#}").contains("401"), "error names the HTTP status");
     }
 
     #[tokio::test]

@@ -55,55 +55,31 @@ pub struct IngestedIssue {
     pub author_association: Option<String>,
 }
 
-/// The subset of the GitHub issues-API shape we deserialize. `gh api
-/// .../issues` returns PRs interleaved with issues; an entry carrying a
-/// `pull_request` object is a PR AND is skipped.
-#[derive(Debug, Clone, Deserialize)]
-struct RawGithubIssue {
-    number: u64,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    author_association: Option<String>,
-    #[serde(default)]
-    pull_request: Option<serde_json::Value>,
-}
+// Issue-wire parsing AND pull-request filtering now live in the forge layer
+// (`crate::forge::github::list_open_issues_at`), which returns forge-neutral
+// `ForgeIssue`s; ingestion maps those into `IngestedIssue` in
+// [`fetch_reported_issues`]. There is no `gh`-JSON parsing here anymore.
 
-/// Parse a `gh api repos/<o>/<r>/issues?state=open --paginate` JSON array
-/// into [`IngestedIssue`]s, skipping PR entries (those carrying a
-/// `pull_request` object). Returns an error on non-array / malformed JSON
-/// so the caller can log AND skip the ingestion pass.
-pub fn parse_issues_json(json: &str) -> Result<Vec<IngestedIssue>> {
-    let raw: Vec<RawGithubIssue> =
-        serde_json::from_str(json).context("parsing `gh api .../issues` JSON array")?;
-    Ok(raw
-        .into_iter()
-        .filter(|r| r.pull_request.is_none())
-        .map(|r| IngestedIssue {
-            number: r.number,
-            title: r.title,
-            body: r.body.unwrap_or_default(),
-            author_association: r.author_association,
-        })
-        .collect())
-}
-
-/// Fetch the open reported issues for `repo_url`, reusing scout's `gh api`
-/// read (`crate::polling::scout::fetch_open_issues_json`) AND parsing the
-/// result. Returns an empty list (NOT an error) when the read or parse
-/// fails — ingestion is best-effort AND a fetch failure must not abort the
-/// surrounding pass.
-pub fn fetch_reported_issues(repo_url: &str) -> Vec<IngestedIssue> {
-    match crate::polling::scout::fetch_open_issues_json(repo_url) {
-        Ok(json) => match parse_issues_json(&json) {
-            Ok(issues) => issues,
-            Err(e) => {
-                tracing::warn!(url = %repo_url, "issue ingestion: parsing reported issues failed: {e:#}");
-                Vec::new()
-            }
-        },
+/// Fetch the open reported issues for `repo_url` via the forge provider's
+/// authenticated API (`crate::forge::list_open_issues_for`) — the same
+/// configured credential as PR operations, NOT the `gh` CLI. Returns an empty
+/// list (NOT an error) when the read fails — ingestion is best-effort AND a
+/// fetch failure must not abort the surrounding pass.
+pub async fn fetch_reported_issues(
+    forge_cfg: Option<&crate::config::ForgeConfig>,
+    github_cfg: &crate::config::GithubConfig,
+    repo_url: &str,
+) -> Vec<IngestedIssue> {
+    match crate::forge::list_open_issues_for(forge_cfg, github_cfg, repo_url).await {
+        Ok(issues) => issues
+            .into_iter()
+            .map(|i| IngestedIssue {
+                number: i.number,
+                title: i.title,
+                body: i.body,
+                author_association: i.author_association,
+            })
+            .collect(),
         Err(e) => {
             tracing::warn!(url = %repo_url, "issue ingestion: reading reported issues failed: {e:#}");
             Vec::new()
@@ -839,11 +815,12 @@ pub async fn run_issue_ingestion(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &crate::config::GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     maintainer_assocs: &[String],
 ) -> Vec<ReportOutcome> {
-    let reports = fetch_reported_issues(&repo.url);
+    let reports = fetch_reported_issues(repo.forge.as_ref(), github_cfg, &repo.url).await;
     if reports.is_empty() {
         return Vec::new();
     }
@@ -997,21 +974,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_issues_json_skips_prs_and_reads_fields() {
-        let json = r#"[
-            {"number": 7, "title": "bug A", "body": "boom", "author_association": "NONE"},
-            {"number": 8, "title": "a PR", "body": "x", "pull_request": {"url": "..."}},
-            {"number": 9, "title": "no body"}
-        ]"#;
-        let got = parse_issues_json(json).unwrap();
-        assert_eq!(got.len(), 2, "PR entry skipped");
-        assert_eq!(got[0].number, 7);
-        assert_eq!(got[0].body, "boom");
-        assert_eq!(got[0].author_association.as_deref(), Some("NONE"));
-        assert_eq!(got[1].number, 9);
-        assert_eq!(got[1].body, "");
-    }
+    // Issue-wire parsing + PR filtering moved to the forge layer; see
+    // `forge::github::tests::list_open_issues_*` for that coverage.
 
     #[test]
     fn origin_public_unless_maintainer_association() {

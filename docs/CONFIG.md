@@ -576,7 +576,7 @@ features:
     enabled: true                 # default true; set false to refuse scout/spec-it/clear-scout at parse time
     prompt_path: null             # default null; relative path to a custom scout prompt
     max_items: 30                 # default 30; valid range 1..=50
-    include_issues: true          # default true; controls whether scout attempts `gh api` for open issues
+    include_issues: true          # default true; controls whether scout fetches open issues via the forge API
     staleness_warn_days: 7        # default 7; threshold for the spec-it staleness warning
 ```
 
@@ -585,7 +585,7 @@ features:
 | `enabled`            | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> scout ...`, `@<bot> spec-it ...`, AND `@<bot> clear-scout ...` at parse time with `✗ scout: disabled in this workspace's config (features.scout.enabled=false).` (or the analogous spec-it/clear-scout text). No state file is written.                       |
 | `prompt_path`        | `Option<String>` | `None`  | Workspace-relative path to a custom scout prompt template. Resolved via the uniform [Prompt overrides](#prompt-overrides) table — see the `Scout` row.                                                                                                                                                                              |
 | `max_items`          | `usize`          | `30`    | Maximum number of opportunity items the scout-mode executor may return. **Valid range: `1..=50`**. Values outside this range cause config-load to fail-fast with an error naming `features.scout.max_items` AND the valid range.                                                                                                     |
-| `include_issues`     | `bool`           | `true`  | When `true`, the scout handler attempts `gh api repos/<owner>/<repo>/issues?state=open --paginate` AND interpolates the result into the prompt. On `gh` failure, a WARN logs AND scout proceeds with code-derived items only. When `false`, the call is skipped entirely (use for repos where issues are noise).                       |
+| `include_issues`     | `bool`           | `true`  | When `true`, the scout handler fetches open issues via the forge provider's authenticated API (the same configured token as PRs — no separate `gh auth login`) AND interpolates them into the prompt. On a forge issue-read failure, a WARN logs AND scout proceeds with code-derived items only. When `false`, the fetch is skipped entirely (use for repos where issues are noise).                       |
 | `staleness_warn_days`| `u64`            | `7`     | When `spec-it` is invoked against a scout run whose `completed_at` is older than this many days OR whose `head_sha_at_run` differs from the workspace's current HEAD, the polling handler posts a one-time warning naming the gap BEFORE submitting the propose-request. The warning does NOT block — staleness is operator judgment. |
 
 **Default behaviour.** Omitting the `features.scout` block (or omitting the entire `features:` parent block) is equivalent to all five defaults above. The verb works out of the box on a fresh install.

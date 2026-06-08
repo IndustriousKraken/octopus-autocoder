@@ -365,6 +365,13 @@ pub struct SandboxPlan {
     pub home: PathBuf,
     /// The role-dependent filesystem policy (a013).
     pub policy: FsPolicy,
+    /// Additional host paths bound read-only into the child namespace,
+    /// applied AFTER the policy's masking steps (the private `/tmp`, the
+    /// masked home) so a path under a masked location is re-exposed. The
+    /// daemon control socket goes here so the per-execution MCP child can
+    /// `connect()` to relay outcomes/submissions even when the socket lives
+    /// under `/tmp` or a masked home.
+    pub extra_ro_paths: Vec<PathBuf>,
 }
 
 /// The program + args + explicit env of the strategy-built inner command,
@@ -484,6 +491,14 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
         }
     }
 
+    // Extra read-only binds (the daemon control socket). Applied after the
+    // policy match — systemd applies bind mounts after `PrivateTmp` /
+    // `ProtectHome`, so a socket under `/tmp` or the masked home is re-exposed
+    // and remains connectable.
+    for p in &plan.extra_ro_paths {
+        prop(&mut argv, "BindReadOnlyPaths", p.as_os_str());
+    }
+
     // Forward the strategy's explicit env + the curated passthrough set.
     for (k, v) in &inner.env {
         let mut s = OsString::from("--setenv=");
@@ -594,6 +609,17 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
     push(&mut argv, "--tmpfs");
     push(&mut argv, "/tmp");
 
+    // Extra read-only binds (the daemon control socket). Placed AFTER
+    // `--tmpfs /tmp` (and the policy's home `--tmpfs`) so a socket under
+    // `/tmp` or the masked home is re-exposed over the masking tmpfs.
+    // `--ro-bind-try` tolerates an absent path (the socket may not exist
+    // in a degraded run) the same way the store binds do.
+    for p in &plan.extra_ro_paths {
+        push(&mut argv, "--ro-bind-try");
+        argv.push(p.as_os_str().to_os_string());
+        argv.push(p.as_os_str().to_os_string());
+    }
+
     for cap in DROPPED_CAPS {
         push(&mut argv, "--cap-drop");
         push(&mut argv, cap);
@@ -685,6 +711,15 @@ pub fn seatbelt_profile(plan: &SandboxPlan) -> String {
             out.push_str("(deny process-info*)\n");
             out.push_str("(deny network-inbound)\n");
         }
+    }
+    // Extra read-only paths (the daemon control socket): allow reading the
+    // exact path so a Unix-socket `connect()` reaches it even when it sits
+    // under the masked home (the allowlist denies the home subtree above;
+    // these allows come last and win — Seatbelt is last-match-wins). Outbound
+    // is already permitted, and the denylist's `(allow default)` already covers
+    // these, so the allows are a harmless no-op there.
+    for p in &plan.extra_ro_paths {
+        out.push_str(&format!("(allow file-read* (literal {}))\n", sb_quote(p)));
     }
     out
 }
@@ -999,6 +1034,9 @@ impl RunSandbox {
             workspace_writable: self.workspace_writable,
             home: home.to_path_buf(),
             policy,
+            // Populated by the caller (agentic_run) with the control socket
+            // when the relay is configured; the plan builder itself adds none.
+            extra_ro_paths: Vec::new(),
         }
     }
 
@@ -1227,6 +1265,7 @@ mod tests {
             workspace_writable: writable,
             home: PathBuf::from("/home/u"),
             policy: FsPolicy::Denylist { mask },
+            extra_ro_paths: Vec::new(),
         }
     }
 
@@ -1247,6 +1286,7 @@ mod tests {
                 cli_binary_binds: vec![home.join(".local/bin/claude")],
             },
             home,
+            extra_ro_paths: Vec::new(),
         }
     }
 
@@ -1367,6 +1407,77 @@ mod tests {
         // os_hide on → it is absent.
         let b = osv(&systemd_run_argv(&allow_plan(false, true), &inner()));
         assert!(!b.iter().any(|x| x.contains("opencode")));
+    }
+
+    // sandbox-binds-control-socket: extra_ro_paths (the daemon control socket)
+    // are bound read-only in every mechanism, after the masking steps, so the
+    // per-execution MCP relay can connect() even to a /tmp- or home-resident
+    // socket.
+    const SOCK: &str = "/tmp/1000-runtime/autocoder/control.sock";
+
+    fn deny_plan_with_socket() -> SandboxPlan {
+        let mut p = deny_plan(true, sample_mask());
+        p.extra_ro_paths.push(PathBuf::from(SOCK));
+        p
+    }
+    fn allow_plan_with_socket() -> SandboxPlan {
+        let mut p = allow_plan(false, true);
+        p.extra_ro_paths.push(PathBuf::from(SOCK));
+        p
+    }
+
+    #[test]
+    fn systemd_binds_control_socket_under_both_policies() {
+        for plan in [deny_plan_with_socket(), allow_plan_with_socket()] {
+            let a = osv(&systemd_run_argv(&plan, &inner()));
+            assert!(
+                a.iter().any(|x| x == &format!("--property=BindReadOnlyPaths={SOCK}")),
+                "systemd argv must bind the control socket: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bwrap_binds_control_socket_after_tmpfs_tmp() {
+        for plan in [deny_plan_with_socket(), allow_plan_with_socket()] {
+            let a = osv(&bwrap_argv(&plan, &inner()));
+            let bind_at = a.windows(3).position(|w| w == ["--ro-bind-try", SOCK, SOCK]);
+            assert!(bind_at.is_some(), "bwrap argv must ro-bind the control socket: {a:?}");
+            // The bind must follow `--tmpfs /tmp` so a /tmp socket is re-exposed.
+            let tmpfs_at = a
+                .windows(2)
+                .position(|w| w == ["--tmpfs", "/tmp"])
+                .expect("tmpfs /tmp present");
+            assert!(
+                bind_at.unwrap() > tmpfs_at,
+                "socket bind must come AFTER --tmpfs /tmp: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seatbelt_allowlist_allows_control_socket_after_home_deny() {
+        let profile = seatbelt_profile(&allow_plan_with_socket());
+        let allow = format!("(allow file-read* (literal \"{SOCK}\"))");
+        assert!(
+            profile.contains(&allow),
+            "seatbelt must allow reading the socket: {profile}"
+        );
+        let deny_home = profile
+            .find("(deny file-read* file-write* (subpath \"/home/u\"))")
+            .expect("home deny present");
+        let allow_sock = profile.find(&allow).unwrap();
+        assert!(allow_sock > deny_home, "socket allow must follow the home deny");
+    }
+
+    #[test]
+    fn no_extra_ro_paths_adds_no_control_socket_bind() {
+        let s = osv(&systemd_run_argv(&deny_plan(true, sample_mask()), &inner()));
+        assert!(!s.iter().any(|x| x.contains("control.sock")));
+        let b = osv(&bwrap_argv(&allow_plan(false, true), &inner()));
+        assert!(!b.iter().any(|x| x.contains("control.sock")));
+        let p = seatbelt_profile(&deny_plan(true, sample_mask()));
+        assert!(!p.contains("control.sock"));
     }
 
     // a013: the bwrap executor denylist binds home read-write then masks each
@@ -1787,6 +1898,7 @@ mod tests {
                 extra_ro_stores: vec![],
                 cli_binary_binds: vec![],
             },
+            extra_ro_paths: Vec::new(),
         };
         let p = seatbelt_profile(&plan);
         assert!(p.contains("(deny default)"));

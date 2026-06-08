@@ -424,16 +424,32 @@ fn xdg_logs_default() -> Option<PathBuf> {
 }
 
 fn xdg_runtime_default() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR")
-        && !v.is_empty()
-    {
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").ok().filter(|v| !v.is_empty());
+    runtime_default_from(xdg_runtime, xdg_state_default())
+}
+
+/// Pure core of [`xdg_runtime_default`]: `$XDG_RUNTIME_DIR/autocoder` when the
+/// var is set; otherwise a `runtime/` subdir of the XDG state default.
+///
+/// NEVER `/tmp`. The control socket and transient locks live here; a `/tmp`
+/// runtime is wrong on two counts — `tmpreaper` / `systemd-tmpfiles` can delete
+/// the *live* control socket out from under the daemon, and the OS sandbox's
+/// private `/tmp` (`PrivateTmp=yes` / `--tmpfs /tmp`) hides it from the per-
+/// execution MCP relay (the timeout class of bug). The path-resolution spec's
+/// precedence never sanctions `/tmp` for runtime — its fallback is a standard
+/// location. Server installs still resolve `/run/autocoder` via the systemd
+/// unit's `$RUNTIME_DIRECTORY` (a higher-precedence resolver step); this branch
+/// only governs the no-`$XDG_RUNTIME_DIR`, no-systemd case, where a user-
+/// writable state-dir location is correct (the daemon clears stale locks at
+/// startup). Pure so it is testable without mutating the process environment.
+fn runtime_default_from(
+    xdg_runtime_dir: Option<String>,
+    state_default: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(v) = xdg_runtime_dir {
         return Some(PathBuf::from(v).join("autocoder"));
     }
-    // Per XDG: when $XDG_RUNTIME_DIR is unset, fall back to a per-UID
-    // directory under the system temp. This keeps dev mode functional
-    // on hosts that don't run user-level systemd.
-    let uid = unsafe { libc::getuid() };
-    Some(std::env::temp_dir().join(format!("{uid}-runtime")).join("autocoder"))
+    state_default.map(|s| s.join("runtime"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -487,6 +503,27 @@ mod tests {
         Cadence, Config, DaemonPathsConfig, ExecutorConfig, ExecutorKind, GithubConfig,
     };
     use std::sync::Mutex;
+
+    /// Regression: the runtime fallback NEVER resolves under `/tmp`. With
+    /// `$XDG_RUNTIME_DIR` set it uses it; without, it falls back under the XDG
+    /// state dir — not `/tmp` (where tmpreaper can delete the live control
+    /// socket and the OS sandbox's private `/tmp` hides it from the relay).
+    #[test]
+    fn runtime_default_never_falls_back_to_tmp() {
+        // $XDG_RUNTIME_DIR present → used verbatim (+ /autocoder).
+        assert_eq!(
+            runtime_default_from(Some("/run/user/1000".to_string()), None),
+            Some(PathBuf::from("/run/user/1000/autocoder"))
+        );
+        // Absent → under the state dir, NOT /tmp.
+        let got = runtime_default_from(None, Some(PathBuf::from("/home/u/.local/state/autocoder")))
+            .expect("state default present");
+        assert_eq!(got, PathBuf::from("/home/u/.local/state/autocoder/runtime"));
+        assert!(
+            !got.starts_with("/tmp"),
+            "runtime must never fall back under /tmp: {got:?}"
+        );
+    }
 
     /// Env-var mutation is global; serialize the env-var-touching tests
     /// so concurrent runs do not race.
@@ -646,14 +683,15 @@ mod tests {
         assert_eq!(p.state, PathBuf::from("/home/dev/.local/state/autocoder"));
         assert_eq!(p.cache, PathBuf::from("/home/dev/.cache/autocoder"));
         assert_eq!(p.logs, PathBuf::from("/home/dev/.local/state/autocoder/logs"));
-        // Runtime falls back to system tempdir per-UID even when HOME is
-        // set, because $XDG_RUNTIME_DIR is the only XDG var without a
-        // user-derived fallback.
-        let uid = unsafe { libc::getuid() };
-        let expected_runtime = std::env::temp_dir()
-            .join(format!("{uid}-runtime"))
-            .join("autocoder");
-        assert_eq!(p.runtime, expected_runtime);
+        // Runtime: with no $XDG_RUNTIME_DIR, it falls back UNDER the XDG state
+        // dir (a `runtime/` subdir) — NOT `/tmp`. A `/tmp` runtime is wrong on
+        // two counts: tmpreaper can delete the live control socket, and the OS
+        // sandbox's private `/tmp` hides it from the per-execution MCP relay.
+        assert_eq!(
+            p.runtime,
+            PathBuf::from("/home/dev/.local/state/autocoder/runtime")
+        );
+        assert!(!p.runtime.starts_with("/tmp"), "runtime must never be under /tmp");
         clear_env_vars();
     }
 

@@ -232,6 +232,7 @@ async fn run_issues_lane(
             paths,
             workspace,
             repo,
+            github_cfg,
             executor,
             chatops_ctx,
             &github_cfg.command_authorization.allowed_associations,

@@ -52,6 +52,8 @@ Once the daemon is running, this is the day-to-day surface.
 
 **Implement specs autonomously.** Drop an OpenSpec change into `openspec/changes/<slug>/`, push to the base branch. The next polling iteration drives the wrapped agent through it, opens a PR with the diff, and archives the change on merge. Failures surface via chatops; per-change `.perma-stuck.json` and `.needs-spec-revision.json` markers signal when human action is needed.
 
+**Fix corrections via the issues lane** *(opt-in; `features.issues.enabled`)*. A second work lane for *corrections* — small fixes that don't warrant a spec change — running alongside the changes queue. Two entry points: a maintainer commits `openspec/issues/<slug>/` directly (curated), or the bot triages the repo's open GitHub issues read-only and posts each as a chatops *candidate* a maintainer promotes with `send it` (public ingestion). Promotion is the authorization gate — the public can report but never trigger code work, and issue bodies are carried as untrusted data, never instructions. Promoted issues are worked into a `fix:` PR. Off by default; enabling it sets per-iteration precedence `issues > changes > audits`. See [docs/OPERATIONS.md → Issues lane](docs/OPERATIONS.md#issues-lane).
+
 **Talk to autocoder in chat** (Slack officially supported; Discord, Teams, Mattermost, Matrix [experimental](docs/CHATOPS.md#experimental-chatops-backends)). With Slack Socket Mode wired in:
 
 | Verb | What it does |

@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 
 use crate::code_reviewer::ReviewReport;
 use crate::config::CommandAuthorizationConfig;
-use github::{CreatedPr, IssueComment, OpenPr, PrSummary};
+use github::{CreatedPr, ForgeIssue, IssueComment, OpenPr, PrSummary};
 
 /// How a posted review maps onto the forge (a008). The reviewer's verdict is
 /// provider-agnostic; each provider lowers it onto its own primitives.
@@ -161,6 +161,17 @@ pub trait Forge: Send + Sync {
         upstream_repo: &str,
         token: &str,
     ) -> Result<()>;
+
+    /// List the repository's OPEN issues, authenticated with the same
+    /// configured credential as the other trait operations (NOT a separate
+    /// CLI). The shared issue read for the scout handler AND the hybrid
+    /// issue-ingestion triage. `GithubForge` excludes pull-request entries.
+    async fn list_open_issues(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<ForgeIssue>>;
 
     /// Decide whether a comment-sourced command from `comment` is authorized,
     /// per `auth`. `GithubForge` applies the GitHub `author_association` gate
@@ -299,6 +310,15 @@ impl Forge for GithubForge {
         github::create_fork_at(&self.api_base, upstream_owner, upstream_repo, token).await
     }
 
+    async fn list_open_issues(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<ForgeIssue>> {
+        github::list_open_issues_at(&self.api_base, token, owner, repo).await
+    }
+
     fn authorize(&self, comment: &IssueComment, auth: &CommandAuthorizationConfig) -> AuthLevel {
         // Ported verbatim from the pre-extraction `revisions::is_comment_authorized`:
         // authorized when EITHER the author's `login` is in `allowed_users`
@@ -412,6 +432,22 @@ pub(crate) fn resolve_forge(
     } else {
         Err(no_provider_error(&host, url))
     }
+}
+
+/// Resolve the forge for `repo_url`, resolve the per-owner token, AND list the
+/// repository's open issues through the trait. This is the single authenticated
+/// issue read shared by the scout handler AND the hybrid issue-ingestion triage
+/// — replacing the prior `gh` CLI read, so issue reads use the same configured
+/// credential as PR operations (no separate `gh auth login`).
+pub async fn list_open_issues_for(
+    forge_cfg: Option<&crate::config::ForgeConfig>,
+    github_cfg: &crate::config::GithubConfig,
+    repo_url: &str,
+) -> Result<Vec<ForgeIssue>> {
+    let forge = resolve_forge(forge_cfg, repo_url)?;
+    let (owner, repo) = forge.parse_repo(repo_url)?;
+    let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    forge.list_open_issues(&token, &owner, &repo).await
 }
 
 /// The clear no-provider error for an unregistered host. Names the host AND

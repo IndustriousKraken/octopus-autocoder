@@ -312,6 +312,7 @@ pub(crate) async fn drain_oss_and_scout_queues(
         && let Err(error) = crate::polling::scout::process_pending_scout(
             workspace,
             snapshot_ref,
+            github_snap,
             executor,
             chatops_ctx,
             &req,
