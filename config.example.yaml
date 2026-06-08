@@ -934,6 +934,38 @@ github:
 #     # Cap on the survey's returned proposed-capability list. Valid
 #     # range 1..=50. Default: 20.
 #     # max_capabilities: 20
+#
+#   issues:
+#     # The issues lane (a009/a010). UNLIKE the chatops-verb features above —
+#     # which are inert until explicitly invoked — enabling this changes the
+#     # daemon's behavior autonomously, so it is OFF by default and opt-in.
+#     #
+#     # When `true`, two things turn on:
+#     #   1. Lane processing. Per-iteration unit selection becomes
+#     #      `issues > changes > audits`: any ready `openspec/issues/<slug>/`
+#     #      directory is worked into a fix PR before the changes queue. With no
+#     #      issues present this is a no-op. The CURATED entry is a maintainer
+#     #      committing `openspec/issues/<slug>/` directly.
+#     #   2. Public ingestion (only when `features.scout.include_issues` is also
+#     #      true — the default). Each pass the bot reads open GitHub issues
+#     #      read-only via `gh api`, runs each through an LLM triage (the body is
+#     #      UNTRUSTED public input, carried as data, never as an instruction),
+#     #      dedups against open + archived issues, and posts a CANDIDATE to
+#     #      chatops. It queues NOTHING — a maintainer reply of `send it` in the
+#     #      candidate's thread is the promotion gate that writes
+#     #      `openspec/issues/<slug>/` and authorizes the work. Issue ASSIGNEE
+#     #      is not consulted; assigning an issue to the bot does nothing.
+#     #
+#     # `features.*` is not hot-reloadable: enabling this needs a daemon
+#     # restart, not `autocoder reload`. Ingestion also needs `gh` authenticated
+#     # on the host; on a failed read a WARN logs and the pass proceeds.
+#     # Default: false.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom issue-flavored implementer prompt
+#     # template. Resolved via the uniform Prompt overrides table.
+#     # Default: null (use the embedded `prompts/implementer-issue.md`).
+#     # prompt_path: ./prompts/implementer-issue-custom.md
 
 
 # Canonical-spec RAG (a21). Optional top-level block. When absent OR
