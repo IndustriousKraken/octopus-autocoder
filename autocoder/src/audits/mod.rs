@@ -441,7 +441,12 @@ impl Drop for SandboxSettingsGuard {
 ///
 /// `settings_dir` selects the directory the file is written to. Pass
 /// `None` to use `std::env::temp_dir()`; tests pass a per-test
-/// `TempDir` so concurrent runs do not collide on filename probes.
+/// `TempDir` so concurrent runs do not collide on filename probes. The
+/// production caller ([`crate::agentic_run::agentic_run`]) passes the run
+/// workspace's `.git` directory via `sandbox_settings_dir`, because the host
+/// temp dir is NOT visible inside the OS sandbox's mount namespace — only the
+/// workspace is bound in, and `.git` rides along inside it without ever being
+/// staged, reported, or cleaned by git.
 ///
 /// Returns the path and an RAII guard. Drop the guard AFTER the
 /// spawned CLI has exited.
@@ -477,7 +482,7 @@ pub fn write_sandbox_settings(
     let dir: PathBuf = settings_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(std::env::temp_dir);
-    let path = dir.join(format!("autocoder-audit-settings-{pid}-{stamp}.json"));
+    let path = dir.join(format!(".autocoder-sandbox-settings-{pid}-{stamp}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&json)?)
         .with_context(|| format!("writing audit sandbox settings to {}", path.display()))?;
     Ok((path.clone(), SandboxSettingsGuard(path)))

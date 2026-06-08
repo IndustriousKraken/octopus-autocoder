@@ -1053,6 +1053,32 @@ pub struct AgenticRunOpts<'a> {
     pub os_sandbox: crate::sandbox::RunSandbox,
 }
 
+/// The directory the per-run OS-sandbox `--settings` file is written into.
+///
+/// Defaults to the run workspace's `.git` directory. The OS sandbox (a006)
+/// gives the child a private `/tmp` (systemd `PrivateTmp=yes`, bwrap
+/// `--tmpfs /tmp`) and, for read-only roles, a masked `$HOME` — so a settings
+/// file written to the host temp dir is invisible inside the child's mount
+/// namespace and the wrapped CLI fails with `Settings file not found:
+/// /tmp/...`. The workspace is the one path every mechanism binds into the
+/// namespace, and `.git` rides along inside it.
+///
+/// `.git` (rather than the workspace root) is deliberate: it is reachable by
+/// the sandboxed CLI, but git never stages (`add -A`), reports (`status`), or
+/// `clean`s files under `.git`, so this purely per-run file (regenerated each
+/// run, RAII-deleted on exit) can never leak into a PR, trip the dirty-
+/// workspace check, or linger as gitignored litter — and it needs no
+/// `.git/info/exclude` entry. Keeping it out of the working tree also matches
+/// the a16 rule that daemon bookkeeping never lives in the managed repo tree.
+///
+/// Tests pass an explicit `settings_dir` (a per-test `TempDir`) to override.
+fn sandbox_settings_dir(settings_dir: Option<&Path>, workspace: &Path) -> PathBuf {
+    match settings_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => workspace.join(".git"),
+    }
+}
+
 /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
 /// configured timeout, AND return the unified outcome. See the module
 /// docs for the behavior contract.
@@ -1087,9 +1113,10 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
         disallowed_bash_patterns: opts.sandbox.disallowed_bash_patterns.clone(),
         disallowed_read_paths,
     };
+    let settings_dir = sandbox_settings_dir(opts.settings_dir, opts.workspace);
     let (settings_path, _settings_guard) = crate::audits::write_sandbox_settings(
         &resolved_sandbox,
-        opts.settings_dir,
+        Some(&settings_dir),
         opts.sandbox.deny_writes,
     )
     .context("generating sandbox settings file")?;
@@ -1712,6 +1739,27 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Regression: the OS-sandbox `--settings` file must default to the run
+    /// workspace's `.git` dir (reachable inside the sandbox, but never staged,
+    /// reported, or cleaned by git), never the host temp dir. Under the OS
+    /// sandbox the child gets a private `/tmp`, so a settings file in the host
+    /// temp dir is invisible in the namespace and the CLI dies with "Settings
+    /// file not found".
+    #[test]
+    fn sandbox_settings_dir_defaults_to_git_dir_not_temp() {
+        let workspace = Path::new("/cache/workspaces/example");
+        // No override → the workspace's `.git` (bound into the child namespace).
+        assert_eq!(sandbox_settings_dir(None, workspace), workspace.join(".git"));
+        // And explicitly NOT the host temp dir that caused the original bug.
+        assert_ne!(sandbox_settings_dir(None, workspace), std::env::temp_dir());
+        // An explicit override (the per-test TempDir path) still wins.
+        let override_dir = Path::new("/tmp/per-test-override");
+        assert_eq!(
+            sandbox_settings_dir(Some(override_dir), workspace).as_path(),
+            override_dir
+        );
     }
 
     fn ctx<'a>(
