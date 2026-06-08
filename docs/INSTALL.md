@@ -28,8 +28,8 @@ On the machine where the daemon will run:
 ## 2. Clone and configure
 
 ```bash
-git clone https://github.com/IndustriousKraken/openspec-autocoder.git
-cd openspec-autocoder
+git clone https://github.com/IndustriousKraken/octopus-autocoder.git
+cd octopus-autocoder
 cp config.example.yaml config.yaml
 ```
 

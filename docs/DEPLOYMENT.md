@@ -4,7 +4,7 @@ For production, run autocoder as a systemd service on a dedicated Linux host. Th
 
 ## Recommended: install from a binary release
 
-For most operators, the [Quick install](../README.md#quick-install) one-liner is the right path. It downloads a pre-built binary from the [GitHub Releases](https://github.com/IndustriousKraken/openspec-autocoder/releases) page (per tag, for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`), verifies its SHA-256, and then runs `autocoder install` to set up the systemd service and configuration. Releases are versioned with SemVer tags (`vX.Y.Z`); dash-suffixed tags such as `vX.Y.Z-rc1` are pre-releases that the installer skips by default. The rest of this section covers the manual / source-build path for operators who specifically want to avoid downloaded binaries.
+For most operators, the [Quick install](../README.md#quick-install) one-liner is the right path. It downloads a pre-built binary from the [GitHub Releases](https://github.com/IndustriousKraken/octopus-autocoder/releases) page (per tag, for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`), verifies its SHA-256, and then runs `autocoder install` to set up the systemd service and configuration. Releases are versioned with SemVer tags (`vX.Y.Z`); dash-suffixed tags such as `vX.Y.Z-rc1` are pre-releases that the installer skips by default. The rest of this section covers the manual / source-build path for operators who specifically want to avoid downloaded binaries.
 
 ## Dependencies, `autocoder doctor`, and the assisted installer
 
@@ -34,7 +34,7 @@ If your existing autocoder deployment was built from source — typically the la
 Run the standard one-liner, passing `--config-dir` pointing at where your existing `config.yaml` lives:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/main/install.sh \
   | bash -s -- --config-dir /home/autocoder/autocoder
 ```
 
@@ -51,7 +51,7 @@ If you'd rather skip the bash wrapper entirely, replicate what `install.sh` does
 ```bash
 TAG=v0.5.0
 TRIPLE=x86_64-unknown-linux-gnu
-BASE=https://github.com/IndustriousKraken/openspec-autocoder/releases/download/${TAG}
+BASE=https://github.com/IndustriousKraken/octopus-autocoder/releases/download/${TAG}
 curl -fsSL -o autocoder "${BASE}/autocoder-${TAG}-${TRIPLE}"
 curl -fsSL -o autocoder.sha256 "${BASE}/autocoder-${TAG}-${TRIPLE}.sha256"
 sha256sum -c autocoder.sha256
@@ -366,7 +366,7 @@ For single-host SBC, indie VPS, and homelab deployments where set-and-forget is 
 **Stage the script.** Place `update.sh` somewhere the autocoder user can run it. The conventional location is `/home/autocoder/update.sh`:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/update.sh \
+sudo curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/main/update.sh \
   -o /home/autocoder/update.sh
 sudo chown autocoder:autocoder /home/autocoder/update.sh
 sudo chmod 0755 /home/autocoder/update.sh

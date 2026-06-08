@@ -1,13 +1,17 @@
-# autocoder
+# Octopus Autocoder
 
-**autocoder** is an autonomous daemon that reads OpenSpec implementation proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review. It's "OpenSpec change at the top, working code in a PR at the bottom" wired into a single long-running process.
+<p align="center">
+  <img src="octopus-autocoder.jpg" alt="Octopus Autocoder — an octopus at the keyboard" width="320">
+</p>
+
+**Octopus Autocoder** is an autonomous daemon that reads OpenSpec implementation proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review. It's "OpenSpec change at the top, working code in a PR at the bottom" wired into a single long-running process.
 
 ---
 
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/master/install.sh | bash
 ```
 
 The one-liner downloads a pre-built binary, verifies its SHA-256, places it at `/usr/local/bin/autocoder` (or `~/.local/bin/autocoder` if `sudo` is unavailable or `--user` is passed), then execs `autocoder install`. **The bootstrap script is intentionally tiny (~75 lines, no operator prompts).** Everything else — the configuration wizard, `useradd`/`systemctl`/`apt-get`, optional Claude CLI bootstrap — lives in the `autocoder install` Rust subcommand which ships with `cargo test` coverage.

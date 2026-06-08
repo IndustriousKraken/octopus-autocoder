@@ -4,7 +4,7 @@
 set -euo pipefail
 
 OWNER="IndustriousKraken"
-REPO="openspec-autocoder"
+REPO="octopus-autocoder"
 STEP="init"
 trap 'echo "update.sh failed during step: ${STEP}" >&2' ERR
 
