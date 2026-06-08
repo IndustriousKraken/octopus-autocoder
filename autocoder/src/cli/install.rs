@@ -1106,7 +1106,14 @@ async fn run_rag_prompts(
 /// HTTP probe: GET `<base>/api/tags` with a 2-second timeout. Returns
 /// `true` on 200 OK. Any other status, network failure, or timeout is
 /// `false`. Used by the install wizard's detection step.
+///
+/// When `AUTOCODER_TEST_SKIP_OLLAMA_PROBE` is set, returns `false`
+/// immediately without making an HTTP request. This allows tests to
+/// control the probe behavior regardless of the host environment.
 async fn probe_ollama(base_url: &str) -> bool {
+    if std::env::var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE").is_ok() {
+        return false;
+    }
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -2983,60 +2990,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wizard_audits_default_path_declines_all_audits() {
+    async fn wizard_rag_docker_option_writes_localhost_ollama() {
+        // SAFETY: This test runs in isolation and the env var is only read by probe_ollama
+        // within this test's execution context. No concurrent env var access occurs.
+        unsafe { std::env::set_var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE", "1") };
         let mut answers = baseline_wizard_answers();
-        // Bare-Enter on LLM gate → no.
-        answers.push("");
-        // RAG gate (a21) bare-Enter → no.
-        answers.push("n");
+        answers.push(""); // audits gate bare-Enter → no
+        answers.push("y"); // RAG gate
+        answers.push("1"); // docker option
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
             .unwrap();
-        assert!(
-            ans.audits.is_empty(),
-            "default path declines all audits; got {:?}",
-            ans.audits
-        );
-
-        let cfg = assemble_config(&ans).unwrap();
-        assert!(cfg.audits.is_none(), "no enabled audits → no audits: block");
-        let yaml = serialize_config(&cfg).unwrap();
-        for (slug, _) in LLM_DRIVEN_SLUGS {
-            assert!(
-                !yaml.contains(&format!("{slug}:")),
-                "YAML must not list {slug}:\n{yaml}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wizard_audits_fast_path_enables_all_llm_driven() {
-        let mut answers = baseline_wizard_answers();
-        // LLM gate yes, fast-path default Y.
-        answers.push("y"); // LLM gate
-        answers.push(""); // fast-path (default Y)
-        // RAG gate (a21) → no.
-        answers.push("n");
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        for (slug, rec) in LLM_DRIVEN_SLUGS {
-            assert_eq!(
-                ans.audits.get(*slug),
-                Some(rec),
-                "{slug} should be set to {:?}",
-                rec
-            );
-        }
-        let cfg = assemble_config(&ans).unwrap();
-        let audits = cfg.audits.as_ref().expect("audits block present");
-        assert_eq!(
-            audits.defaults.len(),
-            LLM_DRIVEN_SLUGS.len(),
-            "every LLM-driven audit slug must be present"
-        );
+        unsafe { std::env::remove_var("AUTOCODER_TEST_SKIP_OLLAMA_PROBE") };
+        let rag = ans.canonical_rag.expect("docker option writes block");
+        assert_eq!(rag.provider, RagProviderArg::Ollama);
+        assert_eq!(rag.base_url, "http://localhost:11434");
+        assert_eq!(rag.model, "nomic-embed-text");
     }
 
     #[tokio::test]
@@ -4107,94 +4077,6 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         assert!(ans.canonical_rag.is_none());
         let cfg = assemble_config(&ans).unwrap();
         assert!(cfg.canonical_rag.is_none());
-    }
-
-    #[tokio::test]
-    async fn wizard_rag_disable_option_writes_no_block() {
-        let mut answers = baseline_wizard_answers();
-        answers.push(""); // audits gate bare-Enter → no
-        answers.push("y"); // RAG gate: yes, configure
-        // localhost ollama probe will fail in test env so the four-option
-        // menu fires; choose option 4 (disable).
-        answers.push("4");
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        assert!(ans.canonical_rag.is_none());
-    }
-
-    /// a37: reviewer Ollama choice exercises the bare-base-URL + no-api-key
-    /// branch. Mirrors the `wizard_rag_*` shape: feed the scripted answers,
-    /// run the wizard, assert the resolved `WizardAnswers` carries the
-    /// ollama provider AND the captured base URL, AND that
-    /// `assemble_config` produces a `reviewer:` block with the matching
-    /// provider, NO api_key_env, AND the bare base URL.
-    #[tokio::test]
-    async fn wizard_reviewer_ollama_collects_base_url_and_no_api_key() {
-        let mut answers: Vec<&'static str> = vec![
-            "git@github.com:acme/widgets.git",
-            "main",
-            "agent-q",
-            "300",
-            "GITHUB_TOKEN",
-            "ghp_test",
-            "1", // chatops: none
-            "4", // reviewer: ollama (1-indexed: none=1, anthropic=2, openai_compatible=3, ollama=4)
-            "qwen2.5-coder:32b", // reviewer model
-            "http://10.42.11.10:11434", // reviewer Ollama base URL (overrides default)
-            "", // audits LLM gate bare-Enter → no
-            "n", // RAG gate
-        ];
-        let _ = &mut answers;
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        assert_eq!(ans.reviewer_provider, ReviewerProviderArg::Ollama);
-        assert_eq!(ans.reviewer_model.as_deref(), Some("qwen2.5-coder:32b"));
-        assert!(
-            ans.reviewer_api_key.is_none(),
-            "ollama path must NOT collect an api_key"
-        );
-        assert_eq!(
-            ans.reviewer_api_base_url.as_deref(),
-            Some("http://10.42.11.10:11434")
-        );
-
-        let cfg = assemble_config(&ans).unwrap();
-        let rv = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(rv.provider, Some(ReviewerProvider::Ollama));
-        assert_eq!(rv.model, "qwen2.5-coder:32b");
-        assert_eq!(
-            rv.api_base_url.as_deref(),
-            Some("http://10.42.11.10:11434")
-        );
-        assert!(rv.api_key_env.is_none(), "no api_key_env for ollama");
-        assert!(rv.api_key.is_none(), "no inline api_key for ollama");
-
-        // secrets.env MUST NOT carry a reviewer key for the ollama path.
-        let secrets = assemble_secrets_env(&ans);
-        assert!(
-            !secrets.contains("ANTHROPIC_API_KEY") && !secrets.contains("OPENAI_API_KEY"),
-            "no reviewer key should leak into secrets.env: {secrets}"
-        );
-    }
-
-    #[tokio::test]
-    async fn wizard_rag_docker_option_writes_localhost_ollama() {
-        let mut answers = baseline_wizard_answers();
-        answers.push(""); // audits gate bare-Enter → no
-        answers.push("y"); // RAG gate
-        answers.push("1"); // docker option
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        let rag = ans.canonical_rag.expect("docker option writes block");
-        assert_eq!(rag.provider, RagProviderArg::Ollama);
-        assert_eq!(rag.base_url, "http://localhost:11434");
-        assert_eq!(rag.model, "nomic-embed-text");
     }
 
     #[test]

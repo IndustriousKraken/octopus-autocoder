@@ -318,7 +318,12 @@ pub fn cli_binary_binds(program: &OsStr, home: &Path) -> Vec<PathBuf> {
         }
         binds.push(real);
     }
-    binds.retain(|p| p.starts_with(home));
+    // Canonicalize home to handle platform symlinks (e.g., /var -> /private/var on macOS)
+    let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    binds.retain(|p| {
+        let canonical_p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        canonical_p.starts_with(&canonical_home)
+    });
     dedup_paths(binds)
 }
 
@@ -1704,11 +1709,25 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let binds = cli_binary_binds(link.as_os_str(), h);
+        // Canonicalize expected paths to handle platform symlinks (e.g., /var -> /private/var on macOS)
+        let canonical_link = std::fs::canonicalize(&link).unwrap_or(link.clone());
+        let canonical_package_dir = std::fs::canonicalize(h.join(".local/share/cli/bin"))
+            .unwrap_or_else(|_| h.join(".local/share/cli/bin"));
+        
         // The PATH location (the symlink under ~/.local/bin) is bound...
-        assert!(binds.iter().any(|p| p == &link), "binds the PATH location: {binds:?}");
+        assert!(
+            binds.iter().any(|p| {
+                let canonical_p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                canonical_p == canonical_link
+            }),
+            "binds the PATH location: {binds:?}"
+        );
         // ...and the real target's package directory (dependency closure).
         assert!(
-            binds.iter().any(|p| p == &h.join(".local/share/cli/bin")),
+            binds.iter().any(|p| {
+                let canonical_p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                canonical_p == canonical_package_dir
+            }),
             "binds the install/package dir: {binds:?}"
         );
     }
