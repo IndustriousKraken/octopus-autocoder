@@ -3531,6 +3531,7 @@ pub const KNOWN_AUDIT_TYPES: &[&str] = &[
     "architecture_consultative",
     "documentation_audit",
     "canon_contradiction_audit",
+    "canon_consolidation_audit",
 ];
 
 /// Run every config validation check and return a structured report.
@@ -8404,6 +8405,48 @@ audits:
             slug_errs[0].message.contains("typo_audit_name"),
             "error must name the offending slug; got: {}",
             slug_errs[0].message
+        );
+    }
+
+    /// a76 regression: `validate_config`'s audit-slug check (which reads
+    /// `KNOWN_AUDIT_TYPES`) accepts the registered `canon_consolidation_audit`
+    /// slug. The const must stay in lock-step with the `AuditRegistry` built in
+    /// `cli/run.rs`; a drift would make `validate-config` reject a valid
+    /// operator config that enables the audit.
+    #[test]
+    fn validate_config_accepts_canon_consolidation_audit_slug() {
+        let _g = VALIDATE_ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token: { value: "x" }
+audits:
+  defaults:
+    canon_consolidation_audit: monthly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let report = validate_config(&cfg);
+        let slug_errs: Vec<&Finding> = report
+            .errors
+            .iter()
+            .filter(|f| f.category == FindingCategory::AuditSlug)
+            .collect();
+        assert!(
+            slug_errs.is_empty(),
+            "canon_consolidation_audit is a registered slug and must not raise an audit-slug error; got: {slug_errs:?}"
+        );
+        // The const is the source of the validator's known set: it must list
+        // the slug the registry registers.
+        assert!(
+            KNOWN_AUDIT_TYPES.contains(&"canon_consolidation_audit"),
+            "KNOWN_AUDIT_TYPES must list canon_consolidation_audit to match the registry"
         );
     }
 

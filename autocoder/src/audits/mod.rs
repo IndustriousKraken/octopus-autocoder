@@ -1019,18 +1019,34 @@ pub(crate) async fn run_audit_cli(
 }
 
 /// Resolve the CLI strategy for an audit run (audit-model-selection). When a
-/// model is configured, select the strategy for its provider via
-/// [`crate::agentic_run::strategy_for_provider`] — the same `provider → CLI`
-/// rule the reviewer and executor use (e.g. `openai_compatible` →
-/// `OpencodeStrategy`). With no model, default to the `claude` strategy with
-/// no `--model` override, preserving backward compatibility.
+/// model is configured, select the strategy for its provider's default CLI —
+/// the same `provider → CLI` rule the reviewer and executor use (e.g.
+/// `openai_compatible` → `OpencodeStrategy`). With no model, default to the
+/// `claude` strategy with no `--model` override, preserving backward
+/// compatibility.
+///
+/// The `command` passed here is the GLOBAL `executor.command`, which defaults
+/// to `claude`. That default binary is wrong for a non-Claude provider — an
+/// `opencode` strategy spawning the `claude` binary cannot run — so for a
+/// non-Claude CLI we resolve the provider's own default binary
+/// ([`crate::config::CliKind::default_command`]) UNLESS the operator set a
+/// custom `executor.command`, which we honor as an escape hatch. This mirrors
+/// the implementer's a70 command resolution in `ClaudeCliExecutor`.
 fn audit_strategy(
     command: &str,
     model: Option<&crate::agentic_run::ResolvedModel>,
 ) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
     match model {
         Some(m) => {
-            crate::agentic_run::strategy_for_provider(m.provider, command.to_string(), Vec::new())
+            let cli = crate::config::default_cli_for(m.provider);
+            let resolved_command = if cli != crate::config::CliKind::Claude
+                && command == crate::config::default_executor_command()
+            {
+                cli.default_command().to_string()
+            } else {
+                command.to_string()
+            };
+            crate::agentic_run::strategy_for_cli(cli, resolved_command, Vec::new())
         }
         None => Ok(Box::new(crate::agentic_run::ClaudeStrategy::new(
             command.to_string(),
@@ -1711,8 +1727,11 @@ mod tests {
         };
         // The OS-sandbox CLI kind follows the provider's default CLI.
         assert_eq!(audit_cli_kind(Some(&model)), CliKind::Opencode);
-        // And the resolved strategy builds an `opencode` invocation.
-        let strat = audit_strategy("opencode", Some(&model))
+        // The audit's command is the GLOBAL `executor.command` (default
+        // `claude`); for an openai_compatible provider the strategy must
+        // resolve the correct `opencode` binary from the provider, NOT spawn
+        // the wrong `claude` binary. Feeding the default here proves that.
+        let strat = audit_strategy(&crate::config::default_executor_command(), Some(&model))
             .expect("openai_compatible resolves to the opencode strategy");
         let tmp = TempDir::new().unwrap();
         let allowed = vec!["Read".to_string()];
