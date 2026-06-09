@@ -244,7 +244,10 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
              reviewer.kind: agentic"
         )),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
-            let api_key = resolve_reviewer_api_key(cfg)?;
+            // Agentic reviewer → key optional (CLI self-auths; this client is the
+            // oneshot fallback). Oneshot reviewer → key required (it IS the path).
+            let optional = matches!(cfg.kind, crate::config::ReviewerKind::Agentic);
+            let api_key = resolve_reviewer_api_key(cfg, optional)?;
             Ok(match provider {
                 LlmProvider::Anthropic => Box::new(AnthropicClient::new(
                     base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
@@ -265,7 +268,12 @@ pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
     }
 }
 
-fn resolve_reviewer_api_key(cfg: &ReviewerConfig) -> Result<String> {
+/// Resolve the reviewer's key. `optional` is set for the **agentic** reviewer:
+/// its primary path is the CLI (which self-authenticates), so the HTTP client
+/// built here is only the oneshot fallback — an absent key resolves to empty
+/// (the fallback is then unavailable) rather than a startup error. The
+/// **oneshot** reviewer genuinely needs the key, so it passes `optional = false`.
+fn resolve_reviewer_api_key(cfg: &ReviewerConfig, optional: bool) -> Result<String> {
     match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
         (Some(inline), env_name_opt) => {
             let key = inline.resolve("reviewer.api_key")?;
@@ -281,6 +289,7 @@ fn resolve_reviewer_api_key(cfg: &ReviewerConfig) -> Result<String> {
         }
         (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
             .resolve(&format!("reviewer.api_key_env={env_name}")),
+        (None, None) if optional => Ok(String::new()),
         (None, None) => Err(anyhow!(
             "reviewer config has neither `api_key` (inline) nor `api_key_env` (env var name) set"
         )),
@@ -369,9 +378,11 @@ fn resolve_contradiction_check_api_key(
             .resolve(&format!(
                 "executor.change_internal_contradiction_check_llm.api_key_env={env_name}"
             )),
-        (None, None) => Err(anyhow!(
-            "executor.change_internal_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
-        )),
+        // No key configured → empty: this agentic gate's CLI self-authenticates
+        // from its own login/store. `api_key` is OPTIONAL for CLI/agentic roles;
+        // a supplied key is passed to the CLI (see the strategy's
+        // `apply_model_selection`), an empty one means "use the CLI's own auth."
+        (None, None) => Ok(String::new()),
     }
 }
 
@@ -445,9 +456,9 @@ fn resolve_canon_contradiction_check_api_key(
             .resolve(&format!(
                 "executor.change_canonical_contradiction_check_llm.api_key_env={env_name}"
             )),
-        (None, None) => Err(anyhow!(
-            "executor.change_canonical_contradiction_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
-        )),
+        // No key configured → empty (CLI self-auth). `api_key` is OPTIONAL for
+        // CLI/agentic roles; a supplied key is passed to the CLI.
+        (None, None) => Ok(String::new()),
     }
 }
 
@@ -520,9 +531,9 @@ fn resolve_code_implements_spec_check_api_key(
             .resolve(&format!(
                 "executor.code_implements_spec_check_llm.api_key_env={env_name}"
             )),
-        (None, None) => Err(anyhow!(
-            "executor.code_implements_spec_check_llm has neither `api_key` (inline) nor `api_key_env` (env var name) set"
-        )),
+        // No key configured → empty (CLI self-auth). `api_key` is OPTIONAL for
+        // CLI/agentic roles; a supplied key is passed to the CLI.
+        (None, None) => Ok(String::new()),
     }
 }
 
@@ -560,6 +571,65 @@ mod tests {
             msg.contains("api_key") && msg.contains("api_key_env"),
             "error must name both fields; got: {msg}"
         );
+    }
+
+    #[test]
+    fn build_from_config_agentic_reviewer_succeeds_without_key() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        // The agentic reviewer authenticates via its CLI → api_key OPTIONAL.
+        // (The oneshot path above still requires it.) Regression: a keyless
+        // agentic reviewer must not fail to build.
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: Some(ReviewerProvider::Anthropic),
+            model: "claude-sonnet-4-6".into(),
+            api_key_env: None,
+            api_key: None,
+            api_base_url: None,
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: crate::config::AutoRevise::Off,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: Some(5),
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Agentic,
+            command: "claude".to_string(),
+        };
+        build_from_config(&cfg).expect("agentic reviewer needs no api_key");
+    }
+
+    // Regression for the runtime model-resolution check missed in Part 1: an
+    // agentic gate with no configured key resolves to an EMPTY key (CLI
+    // self-auth), NOT a startup error. (The crash was the `[canon]` gate.)
+    fn keyless_gate_cfg(provider: LlmProvider) -> ContradictionCheckLlmConfig {
+        ContradictionCheckLlmConfig {
+            provider: Some(provider),
+            model: "the-model".into(),
+            api_key_env: None,
+            api_key: None,
+            api_base_url: Some("https://api.anthropic.com".into()),
+        }
+    }
+
+    #[test]
+    fn gate_models_resolve_without_key_to_empty() {
+        for provider in [LlmProvider::Anthropic, LlmProvider::OpenAiCompatible] {
+            let cfg = keyless_gate_cfg(provider);
+            for (label, resolved) in [
+                ("[in]", resolve_contradiction_check_model(&cfg)),
+                ("[canon]", resolve_canon_contradiction_check_model(&cfg)),
+                ("[out]", resolve_code_implements_spec_check_model(&cfg)),
+            ] {
+                let m = resolved
+                    .unwrap_or_else(|e| panic!("{label} gate ({provider:?}) must resolve keyless: {e:#}"));
+                assert!(
+                    m.api_key.is_empty(),
+                    "{label} gate ({provider:?}): no key → empty (CLI self-auth)"
+                );
+            }
+        }
     }
 
     #[tokio::test]
