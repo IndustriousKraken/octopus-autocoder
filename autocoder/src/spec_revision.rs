@@ -16,17 +16,31 @@ use std::path::{Path, PathBuf};
 const MARKER_FILE: &str = ".needs-spec-revision.json";
 const OPERATOR_ACTION: &str = "Edit openspec/changes/<change>/tasks.md to remove or revise the flagged tasks, commit + push, then delete this marker file.";
 const OPERATOR_ACTION_UNARCHIVABLE: &str = "Edit openspec/changes/<change>/specs/<capability>/spec.md so each delta block's `### Requirement:` header matches the canonical openspec/specs/<capability>/spec.md. Commit + push, then `@<bot> clear-revision <repo> <change>` from chat (or delete this marker file directly).";
+const OPERATOR_ACTION_GATE_ERROR: &str = "A verifier gate could NOT run — the change is held because it was NOT evaluated, NOT because a problem was found. Fix the gate (e.g. install/authenticate the configured CLI, check the daemon control socket), then `@<bot> clear-revision <repo> <change>` to retry. Clearing without fixing the gate will re-hold on the next attempt.";
 
-/// Outcome details captured at the moment the marker is written. Either
-/// `unimplementable_tasks` (from the executor's `SpecNeedsRevision`) OR
-/// `unarchivable_deltas` (from the pre-executor pipeline's spec-delta
-/// archivability check) may be populated; in practice exactly one
-/// non-empty array per write, but the schema permits both.
+/// A verifier gate that could not be evaluated (a fail-CLOSED hold). Distinct
+/// from a finding: the gate did not determine the change is wrong, it could not
+/// run at all, so the change is held rather than waved through (gatekeepers fail
+/// closed). `gate` is the gate label (`[in]` / `[canon]`); `cause` is the
+/// human-readable reason (CLI unavailable, session error, no submission, …).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateErrorRecord {
+    pub gate: String,
+    pub cause: String,
+}
+
+/// Outcome details captured at the moment the marker is written. Exactly one
+/// population is non-empty per write (the schema permits several):
+/// `unimplementable_tasks` (executor `SpecNeedsRevision`), `unarchivable_deltas`
+/// (pre-executor archivability check), OR `gate_error` (a verifier gate that
+/// could not run — a fail-closed hold). `revision_suggestion` always carries the
+/// human-readable narrative.
 #[derive(Debug, Clone, Default)]
 pub struct SpecNeedsRevisionDetail {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     pub unarchivable_deltas: Vec<UnarchivableDelta>,
     pub revision_suggestion: String,
+    pub gate_error: Option<GateErrorRecord>,
 }
 
 /// JSON-friendly mirror of [`UnarchivableDelta`]. The on-disk JSON
@@ -60,6 +74,8 @@ pub struct SpecNeedsRevisionMarker {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unarchivable_deltas: Vec<UnarchivableDeltaRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_error: Option<GateErrorRecord>,
     pub revision_suggestion: String,
     pub operator_action: String,
 }
@@ -99,11 +115,12 @@ pub fn write_marker(
         .iter()
         .map(UnarchivableDeltaRecord::from)
         .collect();
-    // Pre-flight failures (unarchivable_deltas) need a spec-file edit,
-    // not a tasks.md edit; pick the operator_action string that matches.
-    let operator_action = if !unarchivable_records.is_empty()
-        && detail.unimplementable_tasks.is_empty()
-    {
+    // Pick the operator_action that matches the populated case: a gate that
+    // could not run (fix the gate, retry), an unarchivable delta (spec-file
+    // edit), else the default tasks.md edit.
+    let operator_action = if detail.gate_error.is_some() {
+        OPERATOR_ACTION_GATE_ERROR
+    } else if !unarchivable_records.is_empty() && detail.unimplementable_tasks.is_empty() {
         OPERATOR_ACTION_UNARCHIVABLE
     } else {
         OPERATOR_ACTION
@@ -113,6 +130,7 @@ pub fn write_marker(
         marked_at: Utc::now(),
         unimplementable_tasks: detail.unimplementable_tasks.clone(),
         unarchivable_deltas: unarchivable_records,
+        gate_error: detail.gate_error.clone(),
         revision_suggestion: detail.revision_suggestion.clone(),
         operator_action: operator_action.to_string(),
     };
@@ -162,6 +180,7 @@ mod tests {
             unarchivable_deltas: Vec::new(),
             revision_suggestion:
                 "Replace 5.2 with a CI gate. Drop 15.3 — the workflow's own first real run is the integration test.".into(),
+            gate_error: None,
         }
     }
 
@@ -225,7 +244,38 @@ mod tests {
                 reason: "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)".into(),
             }],
             revision_suggestion: "Pre-flight check found 1 unarchivable spec delta:\n- capability=code-reviewer kind=Modified header=\"...\" reason=\"...\"".into(),
+            gate_error: None,
         }
+    }
+
+    #[test]
+    fn write_marker_gate_error_serialises_and_sets_gate_operator_action() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "held");
+        let detail = SpecNeedsRevisionDetail {
+            unimplementable_tasks: Vec::new(),
+            unarchivable_deltas: Vec::new(),
+            revision_suggestion: "the [verifier:in] gate could not run".into(),
+            gate_error: Some(GateErrorRecord {
+                gate: "[verifier:in]".into(),
+                cause: "CLI strategy unavailable".into(),
+            }),
+        };
+        write_marker(ws, "held", &detail).unwrap();
+        let raw = std::fs::read_to_string(ws.join("openspec/changes/held/.needs-spec-revision.json"))
+            .unwrap();
+        let parsed: SpecNeedsRevisionMarker = serde_json::from_str(&raw).unwrap();
+        let ge = parsed.gate_error.expect("gate_error must serialize");
+        assert_eq!(ge.gate, "[verifier:in]");
+        assert_eq!(ge.cause, "CLI strategy unavailable");
+        // The held marker's operator_action explains the gate failure (fix +
+        // clear to retry), NOT a tasks.md/spec edit.
+        assert!(
+            parsed.operator_action.contains("could NOT run"),
+            "operator_action explains the gate failure: {}",
+            parsed.operator_action
+        );
     }
 
     #[test]
@@ -295,6 +345,7 @@ mod tests {
                 reason: "from-title not found".into(),
             }],
             revision_suggestion: "fix both".into(),
+            gate_error: None,
         };
         write_marker(ws, "mixed", &detail).unwrap();
         let raw = std::fs::read_to_string(

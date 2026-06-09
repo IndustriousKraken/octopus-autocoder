@@ -217,6 +217,56 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
     .await;
 }
 
+/// Alert for a verifier gate that could NOT run (a fail-closed hold). Distinct
+/// from a findings alert: the change is held because the gate was NOT evaluated,
+/// NOT because a problem was found. Shares the `SpecNeedsRevision` throttle +
+/// channel so all held-change notifications stream together, but the body makes
+/// the failed-to-run state explicit so an operator can tell it apart from a real
+/// finding. Works for either blocking gate (`[in]` / `[canon]`).
+pub(crate) async fn maybe_post_gate_error_alert(
+    paths: &DaemonPaths,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    gate: crate::verifier_gate::VerifierGate,
+    cause: &str,
+    attribution: Option<&str>,
+) {
+    let label = gate.label();
+    post_throttled_change_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        ThrottleMap::SpecRevision,
+        truncate_reason(cause),
+        &format!("{label} gate-failed-to-run"),
+        |workspace| {
+            let marker_path = workspace
+                .join("openspec/changes")
+                .join(change)
+                .join(".needs-spec-revision.json");
+            let attribution_suffix = attribution
+                .map(|a| {
+                    format!(
+                        "\n\n{}",
+                        crate::attribution::attribution_line("Verifier-gate", a)
+                    )
+                })
+                .unwrap_or_default();
+            gate.label_line(&format!(
+                "⚠️ `{repo_url}`: {label} gate FAILED TO RUN on `{change}` — change HELD (NOT evaluated; this is NOT a finding)\n\nThe gate could not run, so the change is held rather than waved through (gatekeepers fail closed).\nCause: {cause}\n\nOperator action:\n  1. Fix the gate — e.g. install/authenticate the configured CLI, or check the daemon control socket.\n  2. `@<bot> clear-revision <repo> <change>` to retry (clearing without fixing the gate will re-hold).\n\nmarker: {marker}{attribution_suffix}",
+                repo_url = repo.url,
+                label = label,
+                change = change,
+                cause = cause,
+                marker = marker_path.display(),
+            ))
+        },
+    )
+    .await;
+}
+
 /// Sibling of `maybe_post_contradiction_findings_alert` for the a62 `[canon]`
 /// gate. Same throttle state, channel, and gating flag as the existing alert
 /// so a single stream of `AlertCategory::SpecNeedsRevision` notifications

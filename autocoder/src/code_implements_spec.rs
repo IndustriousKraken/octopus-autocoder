@@ -338,12 +338,14 @@ pub enum SpecVerificationOutcome {
     /// A schema-valid verdict was consumed; render the `## Spec Verification`
     /// section (AND post a chatops note when [`SpecVerification::has_gaps`]).
     Verified(SpecVerification),
-    /// The gate failed (session error, unregistered strategy, never-corrected
-    /// schema rejection, OR no submission). This module already logged a WARN
-    /// carrying the `[verifier:out]` label with the specific reason; the caller
-    /// omits the section AND never blocks. A unit variant: no information is
-    /// lost (the detail is in the WARN), so the caller needs only "omit".
-    Unavailable,
+    /// The gate could NOT run (session error, unregistered strategy,
+    /// never-corrected schema rejection, OR no submission). Advisory gates fail
+    /// CLOSED to a VISIBLE state, not silence (gatekeepers-fail-closed standard):
+    /// the caller renders an explicit `## Spec Verification: FAILED TO RUN`
+    /// section — it still NEVER blocks PR creation — so an absent gate is
+    /// distinguishable from one that ran AND found nothing. `cause` is the
+    /// human-readable reason (also logged with the `[verifier:out]` label).
+    FailedToRun { cause: String },
 }
 
 /// Outcome of one code-implements-spec session at the runner boundary: the
@@ -470,12 +472,12 @@ impl VerdictSessionRunner for CannedVerdictRunner {
 /// loop AFTER the executor implements the change(s), before PR-body assembly.
 ///
 /// Resolves the CLI strategy from the model's provider (a56); a provider whose
-/// CLI has no registered strategy yet returns [`SpecVerificationOutcome::Unavailable`]
+/// CLI has no registered strategy yet returns [`SpecVerificationOutcome::FailedToRun`]
 /// (a WARN, no subprocess spawned). Otherwise runs one agentic session in the
 /// read-only sandbox, drains the `submit_verdict` submission, AND maps it to a
 /// [`SpecVerification`] stamped with the gate's attribution.
 ///
-/// EVERY failure path yields [`SpecVerificationOutcome::Unavailable`]:
+/// EVERY failure path yields [`SpecVerificationOutcome::FailedToRun`]:
 /// strategy-not-registered, session error (spawn/timeout), a never-corrected
 /// schema rejection, OR a session that ends with no submission. The advisory
 /// no-block policy is the caller's; this function never errors out the gate.
@@ -512,11 +514,12 @@ pub async fn run_code_implements_spec_check(
         Ok(s) => s,
         Err(e) => {
             let label = VerifierGate::Out.label();
+            let cause = format!("CLI strategy unavailable: {e:#}");
             tracing::warn!(
                 changes = %change_slugs.join(","),
-                "{label} code-implements-spec CLI strategy unavailable: {e:#}; omitting the Spec Verification section (advisory, never blocks)"
+                "{label} code-implements-spec could not run ({cause}); rendering FAILED TO RUN (advisory, never blocks)"
             );
-            return SpecVerificationOutcome::Unavailable;
+            return SpecVerificationOutcome::FailedToRun { cause };
         }
     };
     let runner = CliVerdictSessionRunner {
@@ -540,7 +543,7 @@ pub async fn run_code_implements_spec_check(
 /// Orchestration shared by production AND tests. Builds the prompt, runs one
 /// session via `runner`, AND applies the advisory policy uniformly: a session
 /// error, a missing submission, OR a submission that fails re-mapping each WARN
-/// (labeled `[verifier:out]`) AND yield [`SpecVerificationOutcome::Unavailable`].
+/// (labeled `[verifier:out]`) AND yield [`SpecVerificationOutcome::FailedToRun`].
 /// A schema-valid submission is mapped AND stamped with the gate's attribution.
 async fn run_code_implements_spec_check_with_runner(
     ctx: &CodeImplementsSpecCheckCtx,
@@ -563,20 +566,24 @@ async fn run_code_implements_spec_check_with_runner(
     let changes = change_slugs.join(",");
     match runner.run_session(&prompt).await {
         Err(e) => {
+            let cause = format!("session failed: {e:#}");
             tracing::warn!(
                 changes = %changes,
-                "{label} code-implements-spec session failed: {e:#}; omitting the Spec Verification section (advisory, never blocks)"
+                "{label} code-implements-spec could not run ({cause}); rendering FAILED TO RUN (advisory, never blocks)"
             );
-            SpecVerificationOutcome::Unavailable
+            SpecVerificationOutcome::FailedToRun { cause }
         }
         Ok(outcome) => match outcome.submission {
             None => {
-                tracing::warn!(
-                    changes = %changes,
-                    "{label} code-implements-spec session ended with no submit_verdict submission; omitting the Spec Verification section (advisory, never blocks). Session output excerpt: {}",
+                let cause = format!(
+                    "session ended with no submit_verdict submission (excerpt: {})",
                     outcome.stdout_excerpt
                 );
-                SpecVerificationOutcome::Unavailable
+                tracing::warn!(
+                    changes = %changes,
+                    "{label} code-implements-spec could not run ({cause}); rendering FAILED TO RUN (advisory, never blocks)"
+                );
+                SpecVerificationOutcome::FailedToRun { cause }
             }
             Some(payload) => match payload_to_verification(&payload) {
                 Ok(mut verification) => {
@@ -584,15 +591,16 @@ async fn run_code_implements_spec_check_with_runner(
                     SpecVerificationOutcome::Verified(verification)
                 }
                 Err(e) => {
-                    // The payload already passed `record_submission`'s
-                    // validator, so a re-map failure is an internal invariant
-                    // violation — but the gate is advisory, so WARN AND omit
-                    // the section rather than propagate.
+                    // The payload passed `record_submission`'s validator, so a
+                    // re-map failure is an internal invariant violation — the
+                    // gate is advisory, so render FAILED TO RUN (visible, never
+                    // blocks) rather than silently omit.
+                    let cause = format!("submission failed re-validation: {e}");
                     tracing::warn!(
                         changes = %changes,
-                        "{label} code-implements-spec submission failed re-validation: {e}; omitting the Spec Verification section (advisory, never blocks)"
+                        "{label} code-implements-spec could not run ({cause}); rendering FAILED TO RUN (advisory, never blocks)"
                     );
-                    SpecVerificationOutcome::Unavailable
+                    SpecVerificationOutcome::FailedToRun { cause }
                 }
             },
         },
@@ -700,6 +708,17 @@ fn spec_delta_paths(workspace_root: &Path, change_slugs: &[String]) -> Vec<Strin
         }
     }
     out
+}
+
+/// Render the advisory `## Spec Verification` section for the FAIL-CLOSED case:
+/// the gate could not run, so it reports FAILED TO RUN (NOT a pass) rather than
+/// being silently omitted (gatekeepers-fail-closed standard — an advisory gate
+/// fails to a VISIBLE state). The gate still never blocks PR creation; the
+/// `cause` lets an operator distinguish an un-run gate from a clean verdict.
+pub fn render_spec_verification_failed_section(cause: &str) -> String {
+    format!(
+        "## Spec Verification\n\nVerdict: FAILED TO RUN — the spec-verification gate could not evaluate this change, so it is NOT verified (this is NOT a pass).\n\nCause: {cause}\n\nThis gate is advisory, so PR creation was not blocked. Fix the gate (install/authenticate the configured CLI, or check the daemon control socket) to get a verdict on the next run.\n"
+    )
 }
 
 /// Render the advisory `## Spec Verification` PR-body section from a consumed
@@ -995,7 +1014,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(out, SpecVerificationOutcome::Unavailable),
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
             "no submission must be Unavailable: {out:?}"
         );
     }
@@ -1018,7 +1037,7 @@ mod tests {
             &runner,
         )
         .await;
-        assert!(matches!(out, SpecVerificationOutcome::Unavailable));
+        assert!(matches!(out, SpecVerificationOutcome::FailedToRun { .. }));
         assert!(
             logs_contain("[verifier:out]"),
             "the advisory WARN must carry the [verifier:out] gate identifier"
@@ -1041,7 +1060,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(out, SpecVerificationOutcome::Unavailable),
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
             "session error must be Unavailable: {out:?}"
         );
     }
@@ -1064,7 +1083,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(out, SpecVerificationOutcome::Unavailable),
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
             "unregistered strategy must be Unavailable: {out:?}"
         );
     }

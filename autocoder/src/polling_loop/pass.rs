@@ -532,10 +532,11 @@ pub(crate) async fn run_spec_verification_gate(
             }
             Some(crate::code_implements_spec::render_spec_verification_section(&verification))
         }
-        crate::code_implements_spec::SpecVerificationOutcome::Unavailable => {
-            // The module already WARNed (labeled `[verifier:out]`); omit the
-            // section. The gate never blocks PR creation.
-            None
+        crate::code_implements_spec::SpecVerificationOutcome::FailedToRun { cause } => {
+            // gatekeepers-fail-closed: the advisory gate fails to a VISIBLE
+            // state, not silence — render an explicit FAILED TO RUN section so an
+            // un-run gate is not mistaken for a clean pass. Still never blocks.
+            Some(crate::code_implements_spec::render_spec_verification_failed_section(&cause))
         }
     }
 }
