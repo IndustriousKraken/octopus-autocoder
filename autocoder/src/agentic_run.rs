@@ -68,6 +68,28 @@ pub struct AgenticRunOutcome {
     pub session_handle: Option<String>,
 }
 
+/// A truncated excerpt of a finished session's output, for a failure diagnostic
+/// (e.g. a verifier gate's "could not run" cause). Leads with STDERR: a wrapped
+/// CLI such as `opencode` (a Node app) writes its real error there while leaving
+/// stdout empty, so a stdout-only excerpt is blank exactly when the cause matters
+/// most. Returns up to `max` chars.
+pub fn failure_excerpt(outcome: &AgenticRunOutcome, max: usize) -> String {
+    let raw = match (
+        outcome.stdout.trim().is_empty(),
+        outcome.stderr.trim().is_empty(),
+    ) {
+        (true, true) => String::new(),
+        (false, true) => outcome.stdout.trim().to_string(),
+        (true, false) => format!("stderr: {}", outcome.stderr.trim()),
+        (false, false) => format!(
+            "stderr: {} | stdout: {}",
+            outcome.stderr.trim(),
+            outcome.stdout.trim()
+        ),
+    };
+    raw.chars().take(max).collect()
+}
+
 /// Output handling for a run. `Streaming` adds `--verbose --output-format
 /// stream-json`, parses each event, and writes the structured log
 /// incrementally. `Capture` reads stdout/stderr at exit with no parsing.
@@ -1789,6 +1811,31 @@ fn format_tool_input_summary(input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_excerpt_leads_with_stderr() {
+        let mk = |out: &str, err: &str| AgenticRunOutcome {
+            stdout: out.into(),
+            stderr: err.into(),
+            ..Default::default()
+        };
+        // opencode's case: empty stdout, real error on stderr → surfaced.
+        assert_eq!(
+            failure_excerpt(&mk("", "Error: connect ECONNREFUSED"), 200),
+            "stderr: Error: connect ECONNREFUSED"
+        );
+        // stdout-only → as-is.
+        assert_eq!(failure_excerpt(&mk("hello", ""), 200), "hello");
+        // both → stderr leads.
+        assert_eq!(
+            failure_excerpt(&mk("out", "err"), 200),
+            "stderr: err | stdout: out"
+        );
+        // nothing → empty.
+        assert_eq!(failure_excerpt(&mk("", ""), 200), "");
+        // truncation honored.
+        assert_eq!(failure_excerpt(&mk("", "abcdefgh"), 3).chars().count(), 3);
+    }
     use crate::config::{CliKind, LlmProvider};
     use std::collections::HashMap;
 
