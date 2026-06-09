@@ -1097,6 +1097,11 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             Arc::new(ArcSwap::from_pointee(repo));
         let cancel_for_task = child_cancel.clone();
         let config_for_task = config_holder.clone();
+        // Identity sentinel for the task's exit-path self-removal: the same
+        // outer `Arc` the handle holds (config swaps via the inner ArcSwap do
+        // NOT change this pointer), so the removal can confirm the entry under
+        // this URL is still ours before removing it.
+        let config_for_removal = config_holder.clone();
         let map_for_task = deps.task_map.clone();
         let map_changed_for_task = deps.task_map_changed.clone();
         let url_for_task = url.clone();
@@ -1235,7 +1240,19 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             crate::lanes::gate::scope(issues_ctx_for_task, out_scoped).await;
             {
                 let mut guard = map_for_task.lock().unwrap();
-                guard.remove(&url_for_task);
+                // Identity-guarded self-removal: remove ONLY the entry this task
+                // owns (its config `Arc` sentinel). Today the spawn path refuses
+                // to re-insert a still-present URL (`contains_key` →
+                // AlreadyPresent), so a fresh handle never coexists with a
+                // not-yet-exited cancelled task — but guarding locally keeps this
+                // correct if that non-local invariant ever changes: a cancelled
+                // task must never clobber a freshly respawned handle.
+                if guard
+                    .get(&url_for_task)
+                    .is_some_and(|h| Arc::ptr_eq(&h.config, &config_for_removal))
+                {
+                    guard.remove(&url_for_task);
+                }
             }
             map_changed_for_task.notify_waiters();
         });

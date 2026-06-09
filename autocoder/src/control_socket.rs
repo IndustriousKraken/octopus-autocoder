@@ -2787,11 +2787,24 @@ mod tests {
             let map_for_task = task_map.clone();
             let map_changed_for_task = task_map_changed.clone();
             let url_for_task = url.clone();
+            // Identity sentinel: this task owns exactly the entry whose `config`
+            // is this `Arc`; the removal below is guarded on it.
+            let config_for_task = config.clone();
             let join: JoinHandle<()> = tokio::spawn(async move {
                 cancel_for_task.cancelled().await;
                 {
                     let mut g = map_for_task.lock().unwrap();
-                    g.remove(&url_for_task);
+                    // Identity-guarded removal: remove ONLY if the entry under
+                    // this URL is STILL the one this task created. If a test (or
+                    // a respawn) replaced the entry under the same URL key, leave
+                    // it — otherwise a cancelled task's deferred remove clobbers
+                    // the fresh handle, which under parallel load surfaces as the
+                    // "URL went missing → reported as added" flake.
+                    if g.get(&url_for_task)
+                        .is_some_and(|h| Arc::ptr_eq(&h.config, &config_for_task))
+                    {
+                        g.remove(&url_for_task);
+                    }
                 }
                 map_changed_for_task.notify_waiters();
             });
@@ -2879,7 +2892,12 @@ mod tests {
         if !action_json.ends_with('\n') {
             write_half.write_all(b"\n").await.unwrap();
         }
-        write_half.shutdown().await.unwrap();
+        // The request is newline-terminated, so the server has the full line
+        // and may respond AND close before we shut down our write half. Under
+        // heavy parallel load that close-race surfaces as `ENOTCONN` here —
+        // benign (the request was already sent), so ignore the shutdown result
+        // rather than `.unwrap()`-panicking on it.
+        let _ = write_half.shutdown().await;
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
