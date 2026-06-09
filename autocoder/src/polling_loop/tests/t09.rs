@@ -1,9 +1,10 @@
 use super::*;
 
-/// Enabled mode + a session that records NO submission → fail open,
-/// executor IS invoked, no marker written (a59).
+/// Enabled mode + a session that records NO submission → FAIL CLOSED: the gate
+/// could not evaluate the change, so the executor is NOT invoked AND a held
+/// marker with a structured `gate_error` is written (gatekeepers-fail-closed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn contradiction_preflight_no_submission_fails_open() {
+async fn contradiction_preflight_no_submission_holds_fail_closed() {
     // `Some(None)` = the agentic session ran but recorded no
     // `submit_contradictions` submission.
     let ctx = cc_test_ctx(None, None);
@@ -40,13 +41,24 @@ async fn contradiction_preflight_no_submission_fails_open() {
         crate::preflight::change_contradiction::scope(Some(std::sync::Arc::new(ctx)), fut).await;
     assert_eq!(
         invocations.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "fail-open: executor must be invoked when the session records no submission"
+        0,
+        "fail-closed: the executor must NOT run when the gate could not evaluate the change"
     );
+    let marker_path = ws.join("openspec/changes/transport-err/.needs-spec-revision.json");
     assert!(
-        !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")
-            .exists(),
-        "no marker on fail-open"
+        marker_path.exists(),
+        "fail-closed: a held marker must be written when the gate could not run"
+    );
+    let marker: crate::spec_revision::SpecNeedsRevisionMarker =
+        serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+    let ge = marker
+        .gate_error
+        .expect("the held marker must carry a structured gate_error (not a finding)");
+    assert_eq!(ge.gate, "[verifier:in]", "gate_error names the [in] gate");
+    assert!(
+        ge.cause.contains("no submit_contradictions"),
+        "gate_error cause names the failure: {}",
+        ge.cause
     );
 }
 
@@ -251,10 +263,11 @@ async fn canon_preflight_findings_write_marker_and_skip_executor() {
     );
 }
 
-/// Task 4.4: enabled mode + a session that records NO submission → fail
-/// open, executor IS invoked, no marker written.
+/// Enabled mode + a session that records NO submission → FAIL CLOSED: the gate
+/// could not evaluate the change, so the executor is NOT invoked AND a held
+/// marker with a structured `gate_error` is written (gatekeepers-fail-closed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn canon_preflight_no_submission_fails_open() {
+async fn canon_preflight_no_submission_holds_fail_closed() {
     // `None` = the agentic session ran but recorded no
     // `submit_canon_contradictions` submission.
     let ctx = canon_test_ctx(None, None);
@@ -290,13 +303,24 @@ async fn canon_preflight_no_submission_fails_open() {
     let _ = crate::preflight::canon_contradiction::scope(Some(std::sync::Arc::new(ctx)), fut).await;
     assert_eq!(
         invocations.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "fail-open: executor must be invoked when the session records no submission"
+        0,
+        "fail-closed: the executor must NOT run when the gate could not evaluate the change"
     );
+    let marker_path = ws.join("openspec/changes/transport-err/.needs-spec-revision.json");
     assert!(
-        !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")
-            .exists(),
-        "no marker on fail-open"
+        marker_path.exists(),
+        "fail-closed: a held marker must be written when the gate could not run"
+    );
+    let marker: crate::spec_revision::SpecNeedsRevisionMarker =
+        serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+    let ge = marker
+        .gate_error
+        .expect("the held marker must carry a structured gate_error (not a finding)");
+    assert_eq!(ge.gate, "[verifier:canon]", "gate_error names the [canon] gate");
+    assert!(
+        ge.cause.contains("no submit_canon_contradictions"),
+        "gate_error cause names the failure: {}",
+        ge.cause
     );
 }
 

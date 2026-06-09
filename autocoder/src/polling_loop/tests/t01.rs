@@ -538,11 +538,12 @@ async fn out_gate_gaps_found_renders_section_and_posts_chatops() {
     );
 }
 
-/// Task 4.5: a session that yields no verdict (advisory failure) → no
-/// section AND no chatops note. The gate returns None (never errors), so the
-/// caller still creates the PR.
+/// A session that yields no verdict (the gate could not run) → FAIL CLOSED to a
+/// VISIBLE state: render an explicit `## Spec Verification: FAILED TO RUN`
+/// section (NOT silence, NOT a pass). Still advisory — no chatops note, and the
+/// caller still creates the PR (the gate never blocks).
 #[tokio::test]
-async fn out_gate_no_submission_omits_section() {
+async fn out_gate_no_submission_renders_failed_to_run() {
     let (_dir, ws) = fixture_workspace_with_remote();
     seed_agent_branch_with_change(&ws);
     let repo = fixture_repo(&ws);
@@ -557,10 +558,19 @@ async fn out_gate_no_submission_omits_section() {
         run_spec_verification_gate(&ws, &repo, &["c1".to_string()], Some(&ctx)),
     )
     .await;
-    assert!(section.is_none(), "no submission omits the section");
+    let section =
+        section.expect("fail-closed: the [out] gate renders FAILED TO RUN, not silence");
+    assert!(
+        section.contains("FAILED TO RUN"),
+        "section reports the gate could not run: {section}"
+    );
+    assert!(
+        section.contains("NOT verified"),
+        "section makes clear it is NOT a pass: {section}"
+    );
     assert!(
         chatops.notifications.lock().unwrap().is_empty(),
-        "no chatops note when the gate is unavailable"
+        "no chatops note for a failed-to-run advisory gate (it's surfaced in the PR section)"
     );
 }
 

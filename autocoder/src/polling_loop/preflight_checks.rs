@@ -31,6 +31,7 @@ pub(crate) async fn handle_archivability_preflight(
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: violations.clone(),
         revision_suggestion: suggestion.clone(),
+        gate_error: None,
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -98,17 +99,32 @@ pub(crate) async fn handle_contradiction_preflight(
     change: &str,
     cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
 ) -> Result<Option<QueueStep>> {
-    // a59: the check runs agentically through `agentic_run` AND is fail-open
-    // by contract — it returns an empty `Vec` (with a WARN) on any session
-    // error, missing submission, OR re-validation failure, so there is no
-    // `Result` to propagate here.
-    let findings = crate::preflight::change_contradiction::run_agentic_contradiction_check(
+    // The gate FAILS CLOSED (gatekeepers-fail-closed standard): `Clean` →
+    // proceed; `Found` → block with the findings marker; `Errored` → hold the
+    // change in an explicit failed-to-run state (it was NOT evaluated), never
+    // wave it through.
+    use crate::preflight::change_contradiction::ContradictionCheckOutcome;
+    let findings = match crate::preflight::change_contradiction::run_agentic_contradiction_check(
         cc_ctx, workspace, change,
     )
-    .await;
-    if findings.is_empty() {
-        return Ok(None);
-    }
+    .await
+    {
+        ContradictionCheckOutcome::Clean => return Ok(None),
+        ContradictionCheckOutcome::Errored { cause } => {
+            return handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                crate::verifier_gate::VerifierGate::In,
+                &cause,
+                cc_ctx.attribution.as_deref(),
+            )
+            .await;
+        }
+        ContradictionCheckOutcome::Found(findings) => findings,
+    };
     let suggestion = build_contradiction_revision_suggestion(&findings);
     // a61: this is the `[in]` verifier gate; its diagnostics carry the label.
     let label = crate::verifier_gate::VerifierGate::In.label();
@@ -122,6 +138,7 @@ pub(crate) async fn handle_contradiction_preflight(
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
+        gate_error: None,
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -173,6 +190,57 @@ pub(crate) fn build_contradiction_revision_suggestion(
     out
 }
 
+/// Hold a change because a blocking verifier gate (`[in]` / `[canon]`) could
+/// NOT run — the fail-CLOSED path (gatekeepers-fail-closed standard). Writes the
+/// `.needs-spec-revision.json` marker with a structured `gate_error` (so the
+/// held state is distinct from a findings-based revision), posts the distinct
+/// "gate FAILED TO RUN" alert, AND returns `Ok(Some(QueueStep::SpecRevisionMarked))`
+/// so the caller halts the queue walk — the change was NOT evaluated, so it is
+/// NOT waved through.
+async fn handle_gate_error(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    gate: crate::verifier_gate::VerifierGate,
+    cause: &str,
+    attribution: Option<&str>,
+) -> Result<Option<QueueStep>> {
+    let label = gate.label();
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        "{label} gate FAILED TO RUN; holding the change (fail-closed): {cause}"
+    );
+    let suggestion = format!(
+        "The {label} verifier gate could NOT run, so this change is HELD — it was NOT \
+         evaluated (this is NOT a finding that something is wrong with the change).\n\n\
+         Cause: {cause}\n\n\
+         Fix the gate (install/authenticate the configured CLI, check the daemon control \
+         socket), then clear this marker via `@<bot> clear-revision <repo> <change>` to retry. \
+         Clearing without fixing the gate will re-hold on the next attempt.\n"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion,
+        gate_error: Some(crate::spec_revision::GateErrorRecord {
+            gate: label.to_string(),
+            cause: cause.to_string(),
+        }),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to write gate-error hold marker: {e:#}"
+        );
+    }
+    maybe_post_gate_error_alert(paths, chatops_ctx, repo, change, gate, cause, attribution).await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
 /// Run the change-vs-canonical contradiction pre-flight — the `[canon]` gate
 /// (a62) — against `change`. On clean result (the agent returned an empty
 /// array OR the gate failed open): returns `Ok(None)` and the caller proceeds
@@ -192,17 +260,31 @@ pub(crate) async fn handle_canon_contradiction_preflight(
     change: &str,
     canon_ctx: &crate::preflight::canon_contradiction::CanonContradictionCheckCtx,
 ) -> Result<Option<QueueStep>> {
-    // a62: the check runs agentically through `agentic_run` AND is fail-open
-    // by contract — it returns an empty `Vec` (with a WARN) on any session
-    // error, missing submission, OR re-validation failure, so there is no
-    // `Result` to propagate here.
-    let findings = crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
+    // Fails CLOSED (gatekeepers-fail-closed standard): `Clean` → proceed;
+    // `Found` → block with the findings marker; `Errored` → hold the change in
+    // an explicit failed-to-run state, never wave it through.
+    use crate::preflight::canon_contradiction::CanonContradictionCheckOutcome;
+    let findings = match crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
         canon_ctx, workspace, change,
     )
-    .await;
-    if findings.is_empty() {
-        return Ok(None);
-    }
+    .await
+    {
+        CanonContradictionCheckOutcome::Clean => return Ok(None),
+        CanonContradictionCheckOutcome::Errored { cause } => {
+            return handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                crate::verifier_gate::VerifierGate::Canon,
+                &cause,
+                canon_ctx.attribution.as_deref(),
+            )
+            .await;
+        }
+        CanonContradictionCheckOutcome::Found(findings) => findings,
+    };
     let suggestion = build_canon_contradiction_revision_suggestion(&findings);
     // a61: this is the `[canon]` verifier gate; its diagnostics carry the label.
     let label = crate::verifier_gate::VerifierGate::Canon.label();
@@ -216,6 +298,7 @@ pub(crate) async fn handle_canon_contradiction_preflight(
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
+        gate_error: None,
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(

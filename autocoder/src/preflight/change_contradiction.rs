@@ -363,11 +363,26 @@ impl ContradictionSessionRunner for CannedContradictionRunner {
 /// session error (spawn/timeout), a never-corrected schema rejection, OR a
 /// session that ends with no submission. WARN logs name the specific failure
 /// so operators can investigate via journalctl.
+/// Outcome of the `[in]` gate. The gate FAILS CLOSED: an inability to run is
+/// `Errored`, NEVER `Clean` — see the project-documentation standard
+/// "Control-plane gatekeepers fail closed". The caller holds the change on
+/// `Errored` (it was not evaluated), blocks on `Found`, and proceeds on `Clean`.
+#[derive(Debug)]
+pub enum ContradictionCheckOutcome {
+    /// Ran successfully; no contradictions. Proceed.
+    Clean,
+    /// Ran successfully; found contradictions. Block (needs revision).
+    Found(Vec<ContradictionFinding>),
+    /// Could NOT run (CLI unavailable, session error, no submission, or a
+    /// re-map failure). Hold the change — never treat as `Clean`.
+    Errored { cause: String },
+}
+
 pub async fn run_agentic_contradiction_check(
     ctx: &ContradictionCheckCtx,
     workspace_root: &Path,
     change_slug: &str,
-) -> Vec<ContradictionFinding> {
+) -> ContradictionCheckOutcome {
     // Test seam: an injected submission stands in for the CLI + control
     // socket so the orchestration is exercised without spawning a process.
     #[cfg(test)]
@@ -392,11 +407,12 @@ pub async fn run_agentic_contradiction_check(
         Ok(s) => s,
         Err(e) => {
             let label = VerifierGate::In.label();
+            let cause = format!("CLI strategy unavailable: {e:#}");
             tracing::warn!(
                 change = %change_slug,
-                "{label} change-contradiction-check CLI strategy unavailable; treating as no contradictions found (fail-open): {e:#}"
+                "{label} change-contradiction-check could not run ({cause}); holding the change (fail-closed)"
             );
-            return Vec::new();
+            return ContradictionCheckOutcome::Errored { cause };
         }
     };
     let runner = CliContradictionSessionRunner {
@@ -418,40 +434,46 @@ async fn run_agentic_contradiction_check_with_runner(
     workspace_root: &Path,
     change_slug: &str,
     runner: &dyn ContradictionSessionRunner,
-) -> Vec<ContradictionFinding> {
+) -> ContradictionCheckOutcome {
     let prompt = build_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
-    // a61: every fail-open diagnostic this gate emits carries the `[in]`
-    // verifier-gate label so the finding is attributable to the gate.
+    // a61: every diagnostic this gate emits carries the `[in]` verifier-gate
+    // label so it is attributable to the gate. The gate FAILS CLOSED: any
+    // could-not-run path is `Errored` (the change is held), never `Clean`.
     let label = VerifierGate::In.label();
     match runner.run_session(&prompt).await {
         Err(e) => {
+            let cause = format!("session failed: {e:#}");
             tracing::warn!(
                 change = %change_slug,
-                "{label} change-contradiction-check session failed; treating as no contradictions found (fail-open): {e:#}"
+                "{label} change-contradiction-check could not run ({cause}); holding the change (fail-closed)"
             );
-            Vec::new()
+            ContradictionCheckOutcome::Errored { cause }
         }
         Ok(outcome) => match outcome.submission {
             None => {
-                tracing::warn!(
-                    change = %change_slug,
-                    "{label} change-contradiction-check session ended with no submit_contradictions submission; treating as no contradictions found (fail-open). Session output excerpt: {}",
+                let cause = format!(
+                    "session ended with no submit_contradictions submission (excerpt: {})",
                     outcome.stdout_excerpt
                 );
-                Vec::new()
+                tracing::warn!(
+                    change = %change_slug,
+                    "{label} change-contradiction-check could not run ({cause}); holding the change (fail-closed)"
+                );
+                ContradictionCheckOutcome::Errored { cause }
             }
             Some(payload) => match payload_to_contradictions(&payload) {
-                Ok(findings) => findings,
+                Ok(findings) if findings.is_empty() => ContradictionCheckOutcome::Clean,
+                Ok(findings) => ContradictionCheckOutcome::Found(findings),
                 Err(e) => {
-                    // The payload already passed `record_submission`'s
-                    // validator, so a re-map failure is an internal invariant
-                    // violation — but the check is fail-open, so WARN AND
-                    // proceed rather than propagate.
+                    // The payload passed `record_submission`'s validator, so a
+                    // re-map failure is an internal invariant violation — hold
+                    // (fail-closed), do NOT silently treat as clean.
+                    let cause = format!("submission failed re-validation: {e}");
                     tracing::warn!(
                         change = %change_slug,
-                        "{label} change-contradiction-check submission failed re-validation; treating as no contradictions found (fail-open): {e}"
+                        "{label} change-contradiction-check could not run ({cause}); holding the change (fail-closed)"
                     );
-                    Vec::new()
+                    ContradictionCheckOutcome::Errored { cause }
                 }
             },
         },
@@ -655,13 +677,18 @@ mod tests {
         };
         let out =
             run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].requirement_a, "A");
+        match out {
+            ContradictionCheckOutcome::Found(f) => {
+                assert_eq!(f.len(), 1);
+                assert_eq!(f[0].requirement_a, "A");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
     }
 
-    /// An empty submission yields an empty finding set (proceed-to-executor).
+    /// An empty submission is a CLEAN run (proceed-to-executor).
     #[tokio::test]
-    async fn empty_submission_yields_no_findings() {
+    async fn empty_submission_is_clean() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         let ctx = test_ctx();
@@ -670,46 +697,52 @@ mod tests {
         };
         let out =
             run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
-        assert!(out.is_empty());
-    }
-
-    /// A session that records NO submission fails open (empty Vec).
-    #[tokio::test]
-    async fn no_submission_fails_open() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        let ctx = test_ctx();
-        let runner = CannedContradictionRunner { submission: None };
-        let out =
-            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
-        assert!(out.is_empty(), "no submission must fail open: {out:?}");
-    }
-
-    /// a61 (task 4.1): the `[in]` gate runs the a59 contradiction check
-    /// UNCHANGED in what it decides (a no-submission session still fails open
-    /// to an empty `Vec`), AND its emitted diagnostics carry the
-    /// `[verifier:in]` gate identifier so the finding is attributable to the
-    /// gate that produced it.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn fail_open_diagnostics_carry_the_in_gate_label() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        let ctx = test_ctx();
-        // A session that records no submission takes the fail-open WARN path.
-        let runner = CannedContradictionRunner { submission: None };
-        let out =
-            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
-        assert!(out.is_empty(), "decision unchanged: fail-open yields no findings");
         assert!(
-            logs_contain("[verifier:in]"),
-            "the fail-open WARN must carry the [verifier:in] gate identifier"
+            matches!(out, ContradictionCheckOutcome::Clean),
+            "empty submission is clean: {out:?}"
         );
     }
 
-    /// A session error (spawn/timeout/strategy) fails open (empty Vec).
+    /// A session that records NO submission FAILS CLOSED (Errored → held).
     #[tokio::test]
-    async fn session_error_fails_open() {
+    async fn no_submission_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = CannedContradictionRunner { submission: None };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Errored { .. }),
+            "no submission must fail CLOSED (held): {out:?}"
+        );
+    }
+
+    /// The fail-CLOSED diagnostics carry the `[verifier:in]` gate identifier so
+    /// the held change is attributable to the gate that could not run.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn fail_closed_diagnostics_carry_the_in_gate_label() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        // A session that records no submission takes the fail-CLOSED hold path.
+        let runner = CannedContradictionRunner { submission: None };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Errored { .. }),
+            "no submission fails CLOSED (held)"
+        );
+        assert!(
+            logs_contain("[verifier:in]"),
+            "the fail-closed WARN must carry the [verifier:in] gate identifier"
+        );
+    }
+
+    /// A session error (spawn/timeout/strategy) FAILS CLOSED (Errored).
+    #[tokio::test]
+    async fn session_error_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         let ctx = test_ctx();
@@ -720,20 +753,26 @@ mod tests {
             &ErrorContradictionRunner,
         )
         .await;
-        assert!(out.is_empty(), "session error must fail open: {out:?}");
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Errored { .. }),
+            "session error must fail CLOSED (held): {out:?}"
+        );
     }
 
     /// A non-`claude` provider resolves to a CLI with no registered strategy
-    /// (a60), so the production entry point fails open with no spawn.
+    /// (a60), so the production entry point FAILS CLOSED with no spawn.
     #[tokio::test]
-    async fn unregistered_strategy_fails_open() {
+    async fn unregistered_strategy_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         let mut ctx = test_ctx();
         ctx.model.provider = LlmProvider::Ollama;
         ctx.command = "opencode".into();
         let out = run_agentic_contradiction_check(&ctx, ws, "c1").await;
-        assert!(out.is_empty(), "unregistered strategy must fail open: {out:?}");
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Errored { .. }),
+            "unregistered strategy must fail CLOSED (held): {out:?}"
+        );
     }
 
     // ---- prompt construction ----
