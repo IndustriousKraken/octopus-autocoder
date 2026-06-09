@@ -10,21 +10,29 @@
 //!
 //! ## Role-dependent filesystem policy (a013)
 //!
-//! The filesystem view depends on the role, because the executor must run the
-//! project's build toolchain while read-only roles only read:
+//! The default policy is the **exposed-home denylist** for every role, because
+//! a wrapped CLI (and the toolchains it drives) lives under `$HOME` — node,
+//! pyenv, rbenv, cargo, and the CLI's own runtime/session all do. Roles differ
+//! only in **workspace** writability:
 //!
-//! - **Executor — exposed home, default-deny mask-list (denylist).** `$HOME`
-//!   is present AND writable (so `~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.pyenv`,
-//!   caches, … work without enumeration), EXCEPT a bounded **mask-list** of
-//!   sensitive paths which is masked (empty/inaccessible) even inside an
-//!   otherwise-exposed tool tree (deny-overrides-allow — `~/.cargo` is exposed
-//!   but `~/.cargo/credentials.toml` is masked). See [`DEFAULT_MASK_RELATIVE`].
-//! - **Read-only roles (audits, agentic reviewer) — masked-home allowlist.**
-//!   `$HOME` is masked; only the read-only workspace, the role's own CLI store,
-//!   the **resolved CLI binary + its home-resident dependency closure** (the
-//!   folded a012 binding, [`cli_binary_binds`]), and the minimal runtime are
-//!   bound back. **Strict mode** offers this same allowlist as an opt-in for
-//!   the executor on high-compliance hosts; it is NOT the default.
+//! - **Exposed home, default-deny mask-list (denylist) — executor AND read-only
+//!   roles.** `$HOME` is present AND writable (so `~/.cargo`, `~/.rustup`,
+//!   `~/.nvm`, `~/.pyenv`, the CLI's own install + session, caches, … work
+//!   without enumeration), EXCEPT a bounded **mask-list** of sensitive paths
+//!   which is masked (empty/inaccessible) even inside an otherwise-exposed tool
+//!   tree (deny-overrides-allow — `~/.cargo` is exposed but
+//!   `~/.cargo/credentials.toml` is masked). See [`DEFAULT_MASK_RELATIVE`]. The
+//!   **executor** gets a read-write workspace; **read-only roles** (audits,
+//!   agentic reviewer, verifier gates) get a read-only workspace — that is the
+//!   only difference, and the meaningful "read-only" (they may read the home but
+//!   cannot modify the repo / specs / PR branch).
+//! - **Masked-home allowlist — strict mode only.** `$HOME` is masked; only the
+//!   read-only workspace, the role's own CLI store, the **resolved CLI binary +
+//!   its home-resident dependency closure** (the folded a012 binding,
+//!   [`cli_binary_binds`]), and the minimal runtime are bound back. This is an
+//!   explicit high-compliance opt-in ([`crate::config`] `strict_mode`); it
+//!   accepts that a toolchain-heavy CLI (e.g. a Node app whose runtime sprawls
+//!   under `$HOME`) may be unable to start under the mask. It is NOT the default.
 //!
 //! ## Mechanisms (probed on the daemon host)
 //!
@@ -34,22 +42,26 @@
 //!   applies the filesystem + namespace properties; stdout/stderr are captured
 //!   with `--pipe --wait --collect`. The properties used
 //!   (`man systemd.exec`): `ProtectSystem=strict` (whole fs read-only); for the
-//!   executor `ReadWritePaths=$HOME` + `InaccessiblePaths=<mask entry>`; for
-//!   read-only roles + strict mode `ProtectHome=tmpfs` + `BindReadOnlyPaths=`
-//!   (the allowlist); `PrivateTmp`, `PrivateDevices`, `ProtectProc=invisible` +
+//!   denylist (executor + read-only roles) `ReadWritePaths=$HOME` +
+//!   `InaccessiblePaths=<mask entry>`, with the workspace in `ReadWritePaths`
+//!   (executor) or `BindReadOnlyPaths` (read-only roles); for strict mode
+//!   `ProtectHome=tmpfs` + `BindReadOnlyPaths=` (the allowlist); `PrivateTmp`,
+//!   `PrivateDevices`, `ProtectProc=invisible` +
 //!   `ProcSubset=pid` (no other process's `environ`/`mem`), `NoNewPrivileges`,
 //!   `CapabilityBoundingSet=~…` (drop `CAP_NET_RAW`/`CAP_NET_ADMIN`/
 //!   `CAP_SYS_PTRACE`), `RestrictAddressFamilies=~AF_PACKET`.
 //! - **Linux `bwrap` (bubblewrap) fallback** for unprivileged / non-systemd /
-//!   in-container hosts: `--ro-bind / /` then, for the executor, `--bind
-//!   <home>` rw + `--tmpfs`/`--ro-bind /dev/null` over each mask entry; for
-//!   read-only roles + strict mode `--tmpfs <home>` + `--ro-bind-try` the
+//!   in-container hosts: `--ro-bind / /` then, for the denylist (executor +
+//!   read-only roles), `--bind <home>` rw + `--tmpfs`/`--ro-bind /dev/null` over
+//!   each mask entry, with the workspace `--bind` (executor) or `--ro-bind`
+//!   (read-only roles); for strict mode `--tmpfs <home>` + `--ro-bind-try` the
 //!   allowlist; `--proc /proc`, `--dev /dev`, `--tmpfs /tmp`, `--unshare-*`,
 //!   `--cap-drop`, `--die-with-parent`.
 //! - **macOS `sandbox-exec` (Seatbelt)** with a generated profile realizing the
 //!   same policy ([`seatbelt_profile`]): `(allow default)` minus the mask
-//!   subpaths for the executor; `(deny default)` plus the allowlist for
-//!   read-only roles. Ships with the OS, so the gate is normally satisfied.
+//!   subpaths for the denylist (executor + read-only roles), with the workspace
+//!   write-denied for read-only roles; `(deny default)` plus the allowlist for
+//!   strict mode. Ships with the OS, so the gate is normally satisfied.
 //!
 //! Outbound network egress is **deliberately not restricted** here (no
 //! `--unshare-net`, no `RestrictAddressFamilies` beyond `AF_PACKET`): egress
@@ -465,10 +477,13 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
     // Role-dependent filesystem policy (a013).
     match &plan.policy {
         FsPolicy::Denylist { mask } => {
-            // Exposed home: bind it read-write (so toolchains + caches work),
-            // then mask each entry inaccessible. `InaccessiblePaths` overrides
-            // the `ReadWritePaths=$HOME` for that subpath (deny-overrides-allow)
-            // and works for both directories and single files.
+            // Exposed home, read-WRITE, so toolchains + their caches/session
+            // work (node/pyenv/rbenv/cargo all live under $HOME, and CLIs write
+            // session/cache there during a run). This applies to read-only roles
+            // too — their "read-only" is the workspace (above), not the home.
+            // Each mask entry is then masked inaccessible; `InaccessiblePaths`
+            // overrides `ReadWritePaths=$HOME` for that subpath
+            // (deny-overrides-allow), for both directories and single files.
             prop(&mut argv, "ReadWritePaths", plan.home.as_os_str());
             for e in mask {
                 prop(&mut argv, "InaccessiblePaths", e.path.as_os_str());
@@ -555,11 +570,13 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
     // Role-dependent filesystem policy (a013).
     match &plan.policy {
         FsPolicy::Denylist { mask } => {
-            // Exposed home: bind it read-write over the read-only root, then
-            // mask each entry. A directory becomes an empty tmpfs; a single
-            // file is shadowed by an inaccessible read-only bind of /dev/null
-            // (so masking `~/.cargo/credentials.toml` leaves the rest of the
-            // exposed `~/.cargo` toolchain intact). Masks come AFTER the home
+            // Exposed home, read-WRITE: bind it rw over the read-only root so
+            // toolchains + their caches/session work (node/pyenv/rbenv/cargo all
+            // live under $HOME, and CLIs write session/cache there). This applies
+            // to read-only roles too — their "read-only" is the workspace (below),
+            // not the home. A masked directory becomes an empty tmpfs; a masked
+            // file is shadowed by /dev/null (so masking `~/.cargo/credentials.toml`
+            // leaves the rest of `~/.cargo` intact). Masks come AFTER the home
             // bind so they override it (deny-overrides-allow).
             push(&mut argv, "--bind");
             argv.push(plan.home.as_os_str().to_os_string());
@@ -657,6 +674,16 @@ pub fn seatbelt_profile(plan: &SandboxPlan) -> String {
     match &plan.policy {
         FsPolicy::Denylist { mask } => {
             out.push_str("(allow default)\n");
+            // Read-only roles get a read-only workspace: `(allow default)` would
+            // leave it writable, so deny writes to the workspace subtree (it sits
+            // under the exposed read-write home). Last-match-wins, so this comes
+            // after the default allow and is not re-enabled below.
+            if !plan.workspace_writable {
+                out.push_str(&format!(
+                    "(deny file-write* (subpath {}))\n",
+                    sb_quote(&plan.workspace)
+                ));
+            }
             // Mask the sensitive set even inside exposed tool trees.
             for e in mask {
                 out.push_str(&format!(
@@ -938,10 +965,18 @@ impl RunSandbox {
     }
 
     /// Whether this run uses the exposed-home **denylist** (a013): the executor
-    /// under its default policy. Read-only roles (`!workspace_writable`) AND the
-    /// executor under strict mode use the masked-home allowlist instead.
+    /// AND read-only roles (audits, agentic reviewer, verifier gates) under the
+    /// default policy. `$HOME` is exposed **read-write** with the credential
+    /// mask-list masked — so a wrapped CLI both finds AND can write its toolchain
+    /// runtime (node/pyenv/rbenv/cargo + their caches and session state all live
+    /// under `$HOME`), which a masked home breaks. The roles differ ONLY in
+    /// **workspace** writability: the executor gets a read-write workspace;
+    /// read-only roles get a read-only workspace — the meaningful "read-only"
+    /// (they may read home but cannot modify the repo / specs / PR branch). ONLY
+    /// **strict mode** uses the masked-home allowlist (an explicit high-compliance
+    /// opt-in that accepts the CLI-runtime limitation).
     pub fn uses_denylist(&self) -> bool {
-        self.workspace_writable && !self.strict_mode
+        !self.strict_mode
     }
 
     /// The effective filesystem mask-list for the executor's denylist: the
@@ -1683,7 +1718,7 @@ mod tests {
     // executor's denylist mask; with os_hide off it is admitted read-only and
     // dropped from the mask, while engine_deny still denies it at the CLI layer.
     #[test]
-    fn os_hide_controls_other_store_presence_in_allowlist() {
+    fn os_hide_controls_other_store_presence_across_policies() {
         // A temp HOME with BOTH a claude and an opencode store present.
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
@@ -1692,7 +1727,9 @@ mod tests {
         let ws = home.path().join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
 
-        // Read-only role (allowlist), os_hide ON.
+        // A read-only role now uses the DENYLIST, so os_hide governs the
+        // mask-list (the other CLI's store is masked from the exposed home).
+        // os_hide ON → opencode's store is masked.
         let run_on = RunSandbox::for_role(
             Some(SandboxMechanism::Bwrap),
             false,
@@ -1700,8 +1737,52 @@ mod tests {
             false,
             crate::config::SandboxToggles::default(),
         );
-        let plan_on = run_on.build_plan_with_home(&ws, home.path(), OsStr::new("claude"));
-        match &plan_on.policy {
+        assert!(run_on.uses_denylist());
+        let mask_on = run_on.resolve_mask_list(home.path());
+        assert!(
+            mask_on
+                .iter()
+                .any(|e| e.path.to_string_lossy().contains("opencode")),
+            "os_hide on: the other CLI store is masked for a read-only role: {mask_on:?}"
+        );
+
+        // os_hide OFF → opencode's store is NOT masked (a nested opencode could auth).
+        let off = crate::config::SandboxToggles {
+            os_hide: false,
+            ..Default::default()
+        };
+        let run_off = RunSandbox::for_role(
+            Some(SandboxMechanism::Bwrap),
+            false,
+            CliKind::Claude,
+            false,
+            off.clone(),
+        );
+        let mask_off = run_off.resolve_mask_list(home.path());
+        assert!(
+            !mask_off
+                .iter()
+                .any(|e| e.path.to_string_lossy().contains("opencode")),
+            "os_hide off: the other CLI store is not masked: {mask_off:?}"
+        );
+
+        // Strict mode keeps the ALLOWLIST, where os_hide instead governs the
+        // admitted extra_ro_stores. os_hide ON → none admitted.
+        let strict_on = crate::config::SandboxToggles {
+            strict_mode: true,
+            ..Default::default()
+        };
+        let run_strict_on = RunSandbox::for_role(
+            Some(SandboxMechanism::Bwrap),
+            false,
+            CliKind::Claude,
+            false,
+            strict_on,
+        );
+        match &run_strict_on
+            .build_plan_with_home(&ws, home.path(), OsStr::new("claude"))
+            .policy
+        {
             FsPolicy::Allowlist {
                 self_stores,
                 extra_ro_stores,
@@ -1713,23 +1794,25 @@ mod tests {
                     "os_hide on: no other CLI store is admitted: {extra_ro_stores:?}"
                 );
             }
-            other => panic!("a read-only role must use the allowlist, got {other:?}"),
+            other => panic!("strict mode must use the allowlist, got {other:?}"),
         }
-
-        let off = crate::config::SandboxToggles {
+        // Strict mode + os_hide OFF → the other store is admitted read-only.
+        let strict_off = crate::config::SandboxToggles {
+            strict_mode: true,
             os_hide: false,
             ..Default::default()
         };
-        // Read-only role with os_hide OFF → the other store is admitted.
-        let run_off = RunSandbox::for_role(
+        let run_strict_off = RunSandbox::for_role(
             Some(SandboxMechanism::Bwrap),
             false,
             CliKind::Claude,
             false,
-            off.clone(),
+            strict_off,
         );
-        let plan_off = run_off.build_plan_with_home(&ws, home.path(), OsStr::new("claude"));
-        match &plan_off.policy {
+        match &run_strict_off
+            .build_plan_with_home(&ws, home.path(), OsStr::new("claude"))
+            .policy
+        {
             FsPolicy::Allowlist { extra_ro_stores, .. } => assert!(
                 extra_ro_stores
                     .iter()
@@ -1738,14 +1821,7 @@ mod tests {
             ),
             other => panic!("expected allowlist, got {other:?}"),
         }
-        // Executor denylist with os_hide OFF → the other store is NOT masked.
-        let exec_off =
-            RunSandbox::for_role(Some(SandboxMechanism::Bwrap), false, CliKind::Claude, true, off);
-        let mask = exec_off.resolve_mask_list(home.path());
-        assert!(
-            !mask.iter().any(|e| e.path.to_string_lossy().contains("opencode")),
-            "os_hide off removes the other CLI store from the executor mask: {mask:?}"
-        );
+
         // engine_deny still covers every store (self + others) at the CLI layer.
         let deny = run_off.engine_deny_paths();
         assert!(deny.iter().any(|p| p.contains("/.claude/**")));
@@ -2002,7 +2078,9 @@ mod tests {
             FsPolicy::Denylist { .. }
         ));
 
-        // Read-only role → allowlist.
+        // Read-only role → denylist too (exposed home so the CLI's toolchain
+        // runtime works); the only difference from the executor is a read-only
+        // workspace.
         let ro = RunSandbox::for_role(
             Some(SandboxMechanism::Bwrap),
             false,
@@ -2010,11 +2088,13 @@ mod tests {
             false,
             crate::config::SandboxToggles::default(),
         );
-        assert!(!ro.uses_denylist());
-        assert!(matches!(
-            ro.build_plan_with_home(&ws, h, OsStr::new("claude")).policy,
-            FsPolicy::Allowlist { .. }
-        ));
+        assert!(ro.uses_denylist());
+        let ro_plan = ro.build_plan_with_home(&ws, h, OsStr::new("claude"));
+        assert!(matches!(ro_plan.policy, FsPolicy::Denylist { .. }));
+        assert!(
+            !ro_plan.workspace_writable,
+            "a read-only role gets a read-only workspace"
+        );
 
         // Executor strict → allowlist (home masked), workspace still writable.
         let strict_toggles = crate::config::SandboxToggles {
@@ -2167,11 +2247,12 @@ mod tests {
         );
     }
 
-    // task 5.3: a read-only role runs under the home-masked allowlist with its
-    // CLI binary bound (resolved from ~/.local/bin, symlinks followed); a
-    // workspace write fails AND the masked home is unreadable.
+    // task 5.3: a read-only role runs under the exposed-home denylist — its CLI
+    // binary + toolchain runtime under $HOME are present (so a Node-style CLI can
+    // start), the home is readable AND writable (CLIs write session/cache there),
+    // the credential mask-list is still masked, and the workspace is read-only.
     #[test]
-    fn enforced_readonly_role_binds_cli_binary_blocks_workspace_write() {
+    fn enforced_readonly_role_exposes_home_masks_creds_blocks_workspace_write() {
         if detect_mechanism().is_none() {
             eprintln!("skipping 5.3: no sandbox mechanism");
             return;
@@ -2190,7 +2271,12 @@ mod tests {
         std::fs::set_permissions(&target, perm).unwrap();
         let link = h.join(".local/bin/cli");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        std::fs::write(h.join("secret"), "SECRET").unwrap();
+        // A generic home file (readable under the exposed home) + a masked
+        // credential store: the OTHER CLI's store, masked for a Claude role by
+        // os_hide.
+        std::fs::write(h.join("toolrc"), "TOOLCONF").unwrap();
+        std::fs::create_dir_all(h.join(".config/opencode")).unwrap();
+        std::fs::write(h.join(".config/opencode/auth.json"), "SECRET").unwrap();
 
         let run = RunSandbox::for_role(
             detect_mechanism(),
@@ -2201,17 +2287,40 @@ mod tests {
         );
         let plan = run.build_plan_with_home(&ws, h, link.as_os_str());
 
-        // The bound CLI binary (symlink under ~/.local/bin, target followed)
-        // execs under the masked-home allowlist.
+        // The CLI binary execs (the exposed home carries it + its runtime).
         let exec = run_wrapped(&plan, link.to_str().unwrap(), &[]);
         assert!(
             exec.status.success() && out_text(&exec).contains("CLI_RAN"),
-            "the bound CLI binary must exec under the masked-home allowlist: {:?}",
+            "the CLI binary must exec under the exposed-home denylist: {:?}",
             String::from_utf8_lossy(&exec.stderr)
         );
-        // Home is masked: the secret is unreadable.
-        let sec = run_wrapped(&plan, "cat", &[h.join("secret").to_str().unwrap()]);
-        assert!(!sec.status.success(), "a masked-home secret must be unreadable");
+        // A generic home file IS readable (exposed home — toolchains work).
+        let rc = run_wrapped(&plan, "cat", &[h.join("toolrc").to_str().unwrap()]);
+        assert!(
+            rc.status.success() && out_text(&rc).contains("TOOLCONF"),
+            "the exposed home must be readable so toolchains/CLIs find their runtime"
+        );
+        // The credential mask-list is STILL masked even under the exposed home.
+        let sec = run_wrapped(
+            &plan,
+            "cat",
+            &[h.join(".config/opencode/auth.json").to_str().unwrap()],
+        );
+        assert!(
+            !sec.status.success(),
+            "a masked credential store must be unreadable even under the exposed home"
+        );
+        // Home is WRITABLE so the CLI can write its own session/cache.
+        let hw = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo Y > {}", h.join("session").display())],
+        );
+        assert!(
+            hw.status.success(),
+            "a read-only role must be able to write its home caches/session: {:?}",
+            String::from_utf8_lossy(&hw.stderr)
+        );
         // The workspace is read-only.
         let w = run_wrapped(
             &plan,
