@@ -16,11 +16,15 @@
 //! reads the change's spec-delta files on demand AND returns its findings by
 //! calling `submit_contradictions` instead of emitting JSON on stdout.
 //!
-//! The check is **fail-open by contract**: a session error (spawn, timeout,
-//! a resolved CLI strategy that is not registered yet), a schema-rejected
-//! submission the agent never corrects, OR a session that ends with no
-//! submission all log a WARN and yield an empty `Vec` ("no contradictions
-//! found"). The daemon never gates iteration progress on the check.
+//! The check is **fail-CLOSED by contract** (gatekeepers-fail-closed standard):
+//! a session error (spawn, timeout, a resolved CLI strategy that is not
+//! registered yet), a schema-rejected submission the agent never corrects, OR a
+//! session that ends with no submission all log a WARN AND yield an `Errored`
+//! outcome — NOT "no contradictions found." The `[in]` gate then HOLDS the change
+//! in an explicit failed-to-run state (it was NOT evaluated). The hold is
+//! enforced structurally by the default-deny verdict ledger
+//! (verifier-gates-fail-closed): the gate's runner records `FAILED_TO_RUN`, and
+//! the executor runs only when every blocking gate is `PASS`/`DISABLED`.
 
 use crate::agentic_run::ResolvedModel;
 use crate::verifier_gate::VerifierGate;

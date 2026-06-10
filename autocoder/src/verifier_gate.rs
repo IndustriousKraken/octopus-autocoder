@@ -29,9 +29,10 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// Where a gate runs relative to the executor. The `[in]` and `[canon]`
-/// gates run BEFORE the executor (fail-open posture — a gate's own failure
-/// never blocks the iteration); the `[out]` gate runs AFTER (advisory
-/// posture — it annotates operator surfaces, it never auto-acts).
+/// gates run BEFORE the executor (fail-CLOSED posture — a gate that cannot run
+/// HOLDS the change, enforced structurally by the default-deny verdict ledger);
+/// the `[out]` gate runs AFTER (advisory posture — it annotates operator
+/// surfaces AND fails to a VISIBLE state, it never auto-acts).
 #[cfg_attr(not(test), allow(dead_code))] // queried by a62/a63 when they realize [canon]/[out].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecyclePosition {
@@ -218,8 +219,8 @@ mod tests {
 
     #[test]
     fn label_line_prefixes_the_message() {
-        let line = VerifierGate::In.label_line("session failed (fail-open)");
-        assert_eq!(line, "[verifier:in] session failed (fail-open)");
+        let line = VerifierGate::In.label_line("session failed (fail-closed)");
+        assert_eq!(line, "[verifier:in] session failed (fail-closed)");
         // The identifier leads the line so the finding is attributable.
         assert!(line.starts_with("[verifier:in]"));
     }

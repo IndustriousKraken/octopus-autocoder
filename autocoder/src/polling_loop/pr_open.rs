@@ -132,6 +132,7 @@ pub(crate) async fn open_pull_request(
     chatops_ctx: Option<&ChatOpsContext>,
     workspace: &Path,
     spec_verification_section: Option<&str>,
+    gate_verdicts_section: Option<&str>,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
@@ -148,6 +149,7 @@ pub(crate) async fn open_pull_request(
         includes_self_heal,
         workspace,
         spec_verification_section,
+        gate_verdicts_section,
     );
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
@@ -286,6 +288,7 @@ fn build_open_pr_title_body(
     includes_self_heal: bool,
     workspace: &Path,
     spec_verification_section: Option<&str>,
+    gate_verdicts_section: Option<&str>,
 ) -> (String, String) {
     let (title, mut body) = if changes.is_empty() {
         let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
@@ -300,6 +303,17 @@ fn build_open_pr_title_body(
             build_pr_body(workspace, changes, includes_self_heal),
         )
     };
+    // verifier-gates-fail-closed §6: splice the `## Gate verdicts` ledger
+    // section into the PR body as a compliance record — per gate (AND the
+    // reviewer): identifier, model, verdict. A `PASS` is VISIBLE here rather
+    // than inferred from the silent absence of an alert. Absent for audit-only
+    // iterations (no implementer changes were gated).
+    if let Some(section) = gate_verdicts_section
+        && !section.trim().is_empty()
+    {
+        body.push_str("\n\n");
+        body.push_str(section.trim_end());
+    }
     // a63: splice the advisory `## Spec Verification` section (the `[out]`
     // gate's verdict) into the PR body, parallel to the reviewer's
     // `## Code Review` block (which is appended downstream from
