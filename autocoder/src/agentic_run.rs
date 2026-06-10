@@ -426,6 +426,22 @@ fn delete_session_file(path: &Path) -> Result<bool> {
 /// (the run's working directory, set by [`agentic_run`]).
 const OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 
+/// The per-run CLI artifact files/dirs the strategies write into the workspace
+/// ROOT — auto-discovered configs that (unlike the claude settings file) cannot
+/// live under `.git/`: claude's `.mcp.json`, opencode's `opencode.json` + its
+/// `.opencode/` project scratch, agy's `mcp_config.json`. [`crate::git::add_all`]
+/// adds these to the workspace's `.git/info/exclude` before every `git add -A`
+/// so a per-run, server-specific config never gets committed into a PR (a16:
+/// daemon bookkeeping stays out of the managed tree). `.git/info/exclude` only
+/// affects UNTRACKED files, so a repo that legitimately tracks one of these is
+/// unaffected — only autocoder's generated copy is skipped.
+pub const WORKSPACE_CLI_ARTIFACT_EXCLUDES: &[&str] = &[
+    ".mcp.json",
+    OPENCODE_CONFIG_FILENAME,
+    ".opencode/",
+    ANTIGRAVITY_MCP_CONFIG_FILENAME,
+];
+
 /// Env var carrying a SUPPLIED provider key for the `opencode` strategy. The
 /// workspace `opencode.json` references it as `{env:...}` (so the raw secret is
 /// never written into that committed file); the strategy sets the variable to

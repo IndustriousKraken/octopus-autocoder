@@ -277,7 +277,58 @@ pub fn recreate_branch(workspace: &Path, branch: &str) -> Result<()> {
 }
 
 pub fn add_all(workspace: &Path) -> Result<()> {
+    // Keep per-run, server-specific CLI artifacts (autocoder-generated configs at
+    // the workspace root) out of commits. `.git/info/exclude` only affects
+    // UNTRACKED files, so a repo that legitimately tracks one of these is
+    // unaffected — only autocoder's generated copy is skipped. Best-effort: an
+    // exclude-write failure must not block staging.
+    let _ = ensure_local_excludes(
+        workspace,
+        crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES,
+    );
     run_git(workspace, "add -A", &["add", "-A"])?;
+    Ok(())
+}
+
+/// Header line marking autocoder's appended block in `.git/info/exclude`.
+const LOCAL_EXCLUDE_HEADER: &str = "# autocoder: per-run CLI artifacts (not committed)";
+
+/// Idempotently add `patterns` to the workspace's `.git/info/exclude` so git
+/// never stages them. Only UNTRACKED files are affected (a tracked file is
+/// unchanged). Best-effort: a non-repo workspace, or a worktree whose `.git` is
+/// a gitdir-pointer file rather than a directory, is a no-op.
+pub fn ensure_local_excludes(workspace: &Path, patterns: &[&str]) -> Result<()> {
+    let git_dir = workspace.join(".git");
+    if !git_dir.is_dir() {
+        return Ok(());
+    }
+    let info_dir = git_dir.join("info");
+    std::fs::create_dir_all(&info_dir)
+        .with_context(|| format!("creating {}", info_dir.display()))?;
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let missing: Vec<&str> = patterns
+        .iter()
+        .copied()
+        .filter(|p| !existing.lines().any(|l| l.trim() == *p))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.lines().any(|l| l.trim() == LOCAL_EXCLUDE_HEADER) {
+        out.push_str(LOCAL_EXCLUDE_HEADER);
+        out.push('\n');
+    }
+    for p in missing {
+        out.push_str(p);
+        out.push('\n');
+    }
+    std::fs::write(&exclude_path, out)
+        .with_context(|| format!("writing {}", exclude_path.display()))?;
     Ok(())
 }
 
@@ -1511,6 +1562,91 @@ mod tests {
         assert_eq!(sha.len(), 40, "expected 40-char SHA, got {sha:?}");
         let head = rev_parse(&path, "HEAD").unwrap();
         assert_eq!(sha, head, "commit_in_tree SHA must match HEAD post-commit");
+    }
+
+    fn tracked_files(path: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["ls-files"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ensure_local_excludes_is_idempotent() {
+        let (_dir, path) = fixture_repo();
+        ensure_local_excludes(&path, &["opencode.json", ".opencode/"]).unwrap();
+        ensure_local_excludes(&path, &["opencode.json", ".opencode/"]).unwrap();
+        let content = std::fs::read_to_string(path.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            content.matches("opencode.json").count(),
+            1,
+            "no duplicate entries on a second call: {content}"
+        );
+        assert!(content.contains(".opencode/"));
+    }
+
+    #[test]
+    fn add_all_excludes_untracked_cli_artifacts() {
+        let (_dir, path) = fixture_repo();
+        // A real change file plus the per-run CLI artifacts that must NOT commit.
+        std::fs::write(path.join("real_change.txt"), "spec").unwrap();
+        std::fs::write(path.join("opencode.json"), "{generated}").unwrap();
+        std::fs::write(path.join(".mcp.json"), "{generated}").unwrap();
+        std::fs::create_dir_all(path.join(".opencode")).unwrap();
+        std::fs::write(path.join(".opencode/.gitignore"), "x").unwrap();
+
+        add_all(&path).unwrap();
+        commit(&path, "impl").unwrap();
+
+        let tracked = tracked_files(&path);
+        assert!(
+            tracked.iter().any(|f| f == "real_change.txt"),
+            "the change file is committed: {tracked:?}"
+        );
+        assert!(
+            !tracked.iter().any(|f| f == "opencode.json"),
+            "opencode.json must not be committed: {tracked:?}"
+        );
+        assert!(
+            !tracked.iter().any(|f| f == ".mcp.json"),
+            ".mcp.json must not be committed: {tracked:?}"
+        );
+        assert!(
+            !tracked.iter().any(|f| f.starts_with(".opencode/")),
+            ".opencode/ scratch must not be committed: {tracked:?}"
+        );
+    }
+
+    #[test]
+    fn add_all_exclude_does_not_hide_a_tracked_config() {
+        let (_dir, path) = fixture_repo();
+        // A repo that legitimately TRACKS opencode.json (force past the exclude).
+        std::fs::write(path.join("opencode.json"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "-f", "opencode.json"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        commit(&path, "track opencode.json").unwrap();
+        // A later edit must still be staged — exclude only affects UNTRACKED files.
+        std::fs::write(path.join("opencode.json"), "v2").unwrap();
+        add_all(&path).unwrap();
+        commit(&path, "update opencode.json").unwrap();
+        let out = Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            names.contains("opencode.json"),
+            "a tracked opencode.json must still be committed: {names}"
+        );
     }
 
     /// `push_in_tree` with `force: true` pushes the branch to the named
