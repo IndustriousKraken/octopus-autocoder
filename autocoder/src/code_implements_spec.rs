@@ -436,7 +436,9 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
                 self.timeout.as_secs()
             ));
         }
-        let stdout_excerpt: String = outcome.stdout.chars().take(RESPONSE_EXCERPT_MAX).collect();
+        // Include stderr — opencode/agy write their real failure there, leaving
+        // stdout empty, so a stdout-only excerpt is blank when it matters most.
+        let stdout_excerpt = crate::agentic_run::failure_excerpt(&outcome, RESPONSE_EXCERPT_MAX);
         let submission =
             crate::audits::try_consume_submission(self.workspace, CODE_IMPLEMENTS_SPEC_ROLE).await;
         Ok(VerdictSessionOutcome {

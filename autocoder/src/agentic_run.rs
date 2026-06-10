@@ -68,6 +68,28 @@ pub struct AgenticRunOutcome {
     pub session_handle: Option<String>,
 }
 
+/// A truncated excerpt of a finished session's output, for a failure diagnostic
+/// (e.g. a verifier gate's "could not run" cause). Leads with STDERR: a wrapped
+/// CLI such as `opencode` (a Node app) writes its real error there while leaving
+/// stdout empty, so a stdout-only excerpt is blank exactly when the cause matters
+/// most. Returns up to `max` chars.
+pub fn failure_excerpt(outcome: &AgenticRunOutcome, max: usize) -> String {
+    let raw = match (
+        outcome.stdout.trim().is_empty(),
+        outcome.stderr.trim().is_empty(),
+    ) {
+        (true, true) => String::new(),
+        (false, true) => outcome.stdout.trim().to_string(),
+        (true, false) => format!("stderr: {}", outcome.stderr.trim()),
+        (false, false) => format!(
+            "stderr: {} | stdout: {}",
+            outcome.stderr.trim(),
+            outcome.stdout.trim()
+        ),
+    };
+    raw.chars().take(max).collect()
+}
+
 /// Output handling for a run. `Streaming` adds `--verbose --output-format
 /// stream-json`, parses each event, and writes the structured log
 /// incrementally. `Capture` reads stdout/stderr at exit with no parsing.
@@ -403,6 +425,22 @@ fn delete_session_file(path: &Path) -> Result<bool> {
 /// workspace. opencode auto-discovers `opencode.json` from the project root
 /// (the run's working directory, set by [`agentic_run`]).
 const OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
+
+/// The per-run CLI artifact files/dirs the strategies write into the workspace
+/// ROOT — auto-discovered configs that (unlike the claude settings file) cannot
+/// live under `.git/`: claude's `.mcp.json`, opencode's `opencode.json` + its
+/// `.opencode/` project scratch, agy's `mcp_config.json`. [`crate::git::add_all`]
+/// adds these to the workspace's `.git/info/exclude` before every `git add -A`
+/// so a per-run, server-specific config never gets committed into a PR (a16:
+/// daemon bookkeeping stays out of the managed tree). `.git/info/exclude` only
+/// affects UNTRACKED files, so a repo that legitimately tracks one of these is
+/// unaffected — only autocoder's generated copy is skipped.
+pub const WORKSPACE_CLI_ARTIFACT_EXCLUDES: &[&str] = &[
+    ".mcp.json",
+    OPENCODE_CONFIG_FILENAME,
+    ".opencode/",
+    ANTIGRAVITY_MCP_CONFIG_FILENAME,
+];
 
 /// Env var carrying a SUPPLIED provider key for the `opencode` strategy. The
 /// workspace `opencode.json` references it as `{env:...}` (so the raw secret is
@@ -1255,6 +1293,16 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
         cmd
     };
 
+    // Clean up the host mountpoint dirs pre-created for the read-only-role
+    // workspace-scratch overlay. The tmpfs CONTENT is freed by namespace
+    // teardown on exit; this removes the now-empty mountpoint dir we left on the
+    // host (which `git clean -fd` skips when `.opencode` is gitignored). Fires on
+    // every exit path (success / error / timeout). `remove_dir` is empty-only, so
+    // a workspace that legitimately tracks the path (non-empty) is never deleted.
+    let _scratch_guard = ScratchCleanup {
+        dirs: opts.os_sandbox.workspace_scratch_dirs(opts.workspace),
+    };
+
     let mut child = if opts.etxtbsy_retry_spawn {
         crate::audits::spawn_with_etxtbsy_retry(build)
             .await
@@ -1638,6 +1686,25 @@ impl Drop for SubprocessMarkerGuard {
     }
 }
 
+/// RAII guard that removes the (now-empty) project-scratch mountpoint dirs
+/// pre-created on the host for the read-only-role workspace-scratch overlay. The
+/// tmpfs CONTENT is freed by mount-namespace teardown when the subprocess exits;
+/// this clears the empty mountpoint dir left on the host. `remove_dir` is
+/// empty-only, so a workspace that legitimately tracks the path (non-empty) is
+/// never deleted, and a CLI run unsandboxed (no overlay, real writes) leaves a
+/// non-empty dir that this safely skips.
+struct ScratchCleanup {
+    dirs: Vec<std::path::PathBuf>,
+}
+
+impl Drop for ScratchCleanup {
+    fn drop(&mut self) {
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming-JSON event dispatch (moved from `executor::claude_cli`).
 // ---------------------------------------------------------------------------
@@ -1789,6 +1856,48 @@ fn format_tool_input_summary(input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_excerpt_leads_with_stderr() {
+        let mk = |out: &str, err: &str| AgenticRunOutcome {
+            stdout: out.into(),
+            stderr: err.into(),
+            ..Default::default()
+        };
+        // opencode's case: empty stdout, real error on stderr → surfaced.
+        assert_eq!(
+            failure_excerpt(&mk("", "Error: connect ECONNREFUSED"), 200),
+            "stderr: Error: connect ECONNREFUSED"
+        );
+        // stdout-only → as-is.
+        assert_eq!(failure_excerpt(&mk("hello", ""), 200), "hello");
+        // both → stderr leads.
+        assert_eq!(
+            failure_excerpt(&mk("out", "err"), 200),
+            "stderr: err | stdout: out"
+        );
+        // nothing → empty.
+        assert_eq!(failure_excerpt(&mk("", ""), 200), "");
+        // truncation honored.
+        assert_eq!(failure_excerpt(&mk("", "abcdefgh"), 3).chars().count(), 3);
+    }
+
+    #[test]
+    fn scratch_cleanup_removes_empty_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let nonempty = tmp.path().join("nonempty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&nonempty).unwrap();
+        std::fs::write(nonempty.join("f"), "x").unwrap();
+        drop(ScratchCleanup {
+            dirs: vec![empty.clone(), nonempty.clone()],
+        });
+        // The empty mountpoint dir (tmpfs content already freed) is removed.
+        assert!(!empty.exists(), "empty scratch mountpoint is removed");
+        // A non-empty dir (e.g. a workspace that tracks the path) is preserved.
+        assert!(nonempty.exists(), "a non-empty (tracked) dir is preserved");
+    }
     use crate::config::{CliKind, LlmProvider};
     use std::collections::HashMap;
 
