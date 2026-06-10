@@ -14,3 +14,6 @@ target/
 
 # Application Config
 config.yaml
+
+# Local tooling config (agent/CLI configs with machine-specific paths)
+opencode.json
