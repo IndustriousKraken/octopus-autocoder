@@ -307,6 +307,24 @@ pub fn resolve_program_path(program: &OsStr) -> Option<PathBuf> {
     })
 }
 
+/// The project-local scratch directory (relative to the workspace) a CLI writes
+/// inside its working directory. A read-only role's workspace is read-only, but
+/// the CLI still expects to write this scratch — opencode writes
+/// `<workspace>/.opencode/` (a project instance dir + an auto-generated
+/// `.gitignore`) and crashes (`EROFS`) if it cannot. The sandbox overlays this
+/// subtree with a writable, ephemeral tmpfs: the repo files stay read-only while
+/// the CLI's project scratch works and is discarded after the run. `None` for a
+/// CLI that writes no project-local scratch.
+pub fn cli_workspace_scratch(cli: CliKind) -> Option<&'static str> {
+    match cli {
+        CliKind::Opencode => Some(".opencode"),
+        // claude drives its per-run config via a `--settings` file (no project
+        // write) and agy has no observed project-local write; extend here if one
+        // surfaces (the held-marker stderr names the offending path).
+        CliKind::Claude | CliKind::Antigravity => None,
+    }
+}
+
 /// The read-only/executable binds the running role's CLI binary needs to exec
 /// under an allowlist policy where `$HOME` is masked (the folded a012 binding).
 /// Resolves the binary (`$PATH` search + symlink follow) and returns its
@@ -384,6 +402,13 @@ pub struct SandboxPlan {
     /// `connect()` to relay outcomes/submissions even when the socket lives
     /// under `/tmp` or a masked home.
     pub extra_ro_paths: Vec<PathBuf>,
+    /// Writable, ephemeral (tmpfs) subtrees overlaid on top of the read-only
+    /// workspace, so a CLI can write its project-local scratch
+    /// ([`cli_workspace_scratch`]) without the repo files becoming writable.
+    /// Empty for the executor (its workspace is already read-write) and for a
+    /// CLI with no project scratch. Applied AFTER the workspace bind so the
+    /// overlay wins.
+    pub workspace_scratch: Vec<PathBuf>,
 }
 
 /// The program + args + explicit env of the strategy-built inner command,
@@ -506,6 +531,14 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
         }
     }
 
+    // Writable, ephemeral project scratch overlaid on the read-only workspace
+    // (a CLI's `<workspace>/.opencode`-style dir). systemd depth-sorts mounts,
+    // so this tmpfs lands on top of the workspace `BindReadOnlyPaths` above; the
+    // repo files stay read-only.
+    for p in &plan.workspace_scratch {
+        prop(&mut argv, "TemporaryFileSystem", p.as_os_str());
+    }
+
     // Extra read-only binds (the daemon control socket). Applied after the
     // policy match — systemd applies bind mounts after `PrivateTmp` /
     // `ProtectHome`, so a socket under `/tmp` or the masked home is re-exposed
@@ -618,6 +651,14 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
     push(&mut argv, if plan.workspace_writable { "--bind" } else { "--ro-bind" });
     argv.push(plan.workspace.as_os_str().to_os_string());
     argv.push(plan.workspace.as_os_str().to_os_string());
+
+    // Writable, ephemeral project scratch on top of the read-only workspace (a
+    // CLI's `<workspace>/.opencode`-style dir). Placed AFTER the workspace bind
+    // so the tmpfs wins for that subtree; the repo files stay read-only.
+    for p in &plan.workspace_scratch {
+        push(&mut argv, "--tmpfs");
+        argv.push(p.as_os_str().to_os_string());
+    }
 
     push(&mut argv, "--proc");
     push(&mut argv, "/proc");
@@ -748,6 +789,15 @@ pub fn seatbelt_profile(plan: &SandboxPlan) -> String {
     for p in &plan.extra_ro_paths {
         out.push_str(&format!("(allow file-read* (literal {}))\n", sb_quote(p)));
     }
+    // Writable project scratch on top of the read-only workspace (a CLI's
+    // `<workspace>/.opencode`-style dir). Last-match-wins, so this re-allows
+    // writes to the scratch subtree after the workspace write-deny above; the
+    // rest of the workspace stays read-only. (Seatbelt has no tmpfs overlay, so
+    // these writes hit the real dir and are cleaned by the workspace's `git
+    // clean`; macOS is the dev mechanism.)
+    for p in &plan.workspace_scratch {
+        out.push_str(&format!("(allow file-write* (subpath {}))\n", sb_quote(p)));
+    }
     out
 }
 
@@ -778,6 +828,14 @@ pub fn wrap_command(
     plan: &SandboxPlan,
     inner: &InnerCommand,
 ) -> tokio::process::Command {
+    // Pre-create the writable project-scratch mountpoints on the host so the
+    // tmpfs overlay has a target inside the read-only workspace bind (systemd
+    // will not create a mountpoint under a read-only bind). Best-effort: the
+    // workspace is host-writable here; the dir ends up empty (writes land on the
+    // tmpfs) and the workspace's `git clean` removes it.
+    for p in &plan.workspace_scratch {
+        let _ = std::fs::create_dir_all(p);
+    }
     let argv = match mechanism {
         SandboxMechanism::SystemdRun => systemd_run_argv(plan, inner),
         SandboxMechanism::Bwrap => bwrap_argv(plan, inner),
@@ -1030,6 +1088,21 @@ impl RunSandbox {
         self.build_plan_with_home(workspace, &home_dir(), program)
     }
 
+    /// The writable project-scratch subtrees this run overlays on the workspace
+    /// ([`cli_workspace_scratch`]). Empty for the executor (its workspace is
+    /// already read-write) and for a CLI with no project scratch. Exposed so the
+    /// caller can pre-create the host mountpoint AND clean it up after the run
+    /// without rebuilding the whole plan.
+    pub fn workspace_scratch_dirs(&self, workspace: &Path) -> Vec<PathBuf> {
+        if self.workspace_writable {
+            Vec::new()
+        } else {
+            cli_workspace_scratch(self.cli)
+                .map(|rel| vec![workspace.join(rel)])
+                .unwrap_or_default()
+        }
+    }
+
     /// [`build_plan`](Self::build_plan) against an explicit `home` (so the
     /// policy construction is testable without mutating `$HOME`).
     pub fn build_plan_with_home(
@@ -1064,6 +1137,9 @@ impl RunSandbox {
                 cli_binary_binds,
             }
         };
+        // A read-only role's workspace is read-only, but its CLI may need a
+        // project-local scratch dir; overlay that subtree writable+ephemeral.
+        let workspace_scratch = self.workspace_scratch_dirs(workspace);
         SandboxPlan {
             workspace: workspace.to_path_buf(),
             workspace_writable: self.workspace_writable,
@@ -1072,6 +1148,7 @@ impl RunSandbox {
             // Populated by the caller (agentic_run) with the control socket
             // when the relay is configured; the plan builder itself adds none.
             extra_ro_paths: Vec::new(),
+            workspace_scratch,
         }
     }
 
@@ -1301,6 +1378,7 @@ mod tests {
             home: PathBuf::from("/home/u"),
             policy: FsPolicy::Denylist { mask },
             extra_ro_paths: Vec::new(),
+            workspace_scratch: Vec::new(),
         }
     }
 
@@ -1322,6 +1400,7 @@ mod tests {
             },
             home,
             extra_ro_paths: Vec::new(),
+            workspace_scratch: Vec::new(),
         }
     }
 
@@ -2040,6 +2119,7 @@ mod tests {
                 cli_binary_binds: vec![],
             },
             extra_ro_paths: Vec::new(),
+            workspace_scratch: Vec::new(),
         };
         let p = seatbelt_profile(&plan);
         assert!(p.contains("(deny default)"));
@@ -2117,6 +2197,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_only_opencode_role_gets_writable_ephemeral_scratch() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let ws = h.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let scratch = ws.join(".opencode");
+
+        // A read-only opencode role gets a scratch overlay at <ws>/.opencode.
+        let ro = RunSandbox::for_role(
+            Some(SandboxMechanism::Bwrap),
+            false,
+            CliKind::Opencode,
+            false,
+            crate::config::SandboxToggles::default(),
+        );
+        let plan = ro.build_plan_with_home(&ws, h, OsStr::new("opencode"));
+        assert_eq!(plan.workspace_scratch, vec![scratch.clone()]);
+
+        // It surfaces as a writable overlay in every mechanism, on top of the
+        // read-only workspace.
+        let inner = InnerCommand {
+            program: "opencode".into(),
+            args: vec![],
+            env: vec![],
+        };
+        let bw = bwrap_argv(&plan, &inner);
+        assert!(
+            bw.windows(2)
+                .any(|w| w[0] == OsStr::new("--tmpfs") && w[1] == scratch.as_os_str()),
+            "bwrap overlays the scratch as a tmpfs: {bw:?}"
+        );
+        let sd = systemd_run_argv(&plan, &inner);
+        assert!(
+            sd.iter().any(|a| {
+                let s = a.to_string_lossy();
+                s.contains("TemporaryFileSystem=") && s.contains(".opencode")
+            }),
+            "systemd overlays the scratch as a tmpfs: {sd:?}"
+        );
+        let sb = seatbelt_profile(&plan);
+        assert!(
+            sb.lines()
+                .any(|l| l.contains("allow file-write*") && l.contains(".opencode")),
+            "seatbelt re-allows writes to the scratch: {sb}"
+        );
+
+        // A read-only CLAUDE role gets no scratch (claude writes no project dir).
+        let ro_claude = RunSandbox::for_role(
+            Some(SandboxMechanism::Bwrap),
+            false,
+            CliKind::Claude,
+            false,
+            crate::config::SandboxToggles::default(),
+        );
+        assert!(
+            ro_claude
+                .build_plan_with_home(&ws, h, OsStr::new("claude"))
+                .workspace_scratch
+                .is_empty()
+        );
+
+        // The executor (writable workspace) gets no scratch — its workspace is
+        // already read-write.
+        let exec = RunSandbox::for_role(
+            Some(SandboxMechanism::Bwrap),
+            false,
+            CliKind::Opencode,
+            true,
+            crate::config::SandboxToggles::default(),
+        );
+        assert!(
+            exec.build_plan_with_home(&ws, h, OsStr::new("opencode"))
+                .workspace_scratch
+                .is_empty()
+        );
+    }
+
     // ----- Gated enforcement integration tests (tasks 5.1–5.3, 5.5) -----
     // These exercise REAL kernel enforcement and so run only where a mechanism
     // is usable; elsewhere (e.g. unprivileged CI) they skip so `cargo test`
@@ -2125,6 +2283,10 @@ mod tests {
 
     fn run_wrapped(plan: &SandboxPlan, program: &str, args: &[&str]) -> std::process::Output {
         let mech = detect_mechanism().expect("caller checked a mechanism is available");
+        // Mirror `wrap_command`: pre-create the scratch mountpoints on the host.
+        for p in &plan.workspace_scratch {
+            let _ = std::fs::create_dir_all(p);
+        }
         let inner = InnerCommand {
             program: OsString::from(program),
             args: args.iter().map(OsString::from).collect(),
@@ -2328,6 +2490,59 @@ mod tests {
             &["-c", &format!("echo Y > {}", ws.join("out").display())],
         );
         assert!(!w.status.success(), "a read-only role must not write the workspace");
+    }
+
+    // A read-only opencode role: the project-scratch dir (`<ws>/.opencode`) is
+    // writable (so opencode's project instance works), while the rest of the
+    // workspace stays read-only.
+    #[test]
+    fn enforced_readonly_role_scratch_is_writable_repo_stays_readonly() {
+        if detect_mechanism().is_none() {
+            eprintln!("skipping: no sandbox mechanism");
+            return;
+        }
+        let home = test_home();
+        let h = home.path();
+        let ws = h.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("repo_file"), "REPO").unwrap();
+
+        let run = RunSandbox::for_role(
+            detect_mechanism(),
+            false,
+            CliKind::Opencode,
+            false,
+            crate::config::SandboxToggles::default(),
+        );
+        let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
+
+        // The scratch dir is writable (opencode's project instance).
+        let s = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo Y > {}", ws.join(".opencode/.gitignore").display())],
+        );
+        assert!(
+            s.status.success(),
+            "the project-scratch dir must be writable: {:?}",
+            String::from_utf8_lossy(&s.stderr)
+        );
+        // A real repo file is NOT writable (the workspace stays read-only).
+        let r = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo X > {}", ws.join("repo_file").display())],
+        );
+        assert!(!r.status.success(), "a repo file must stay read-only");
+        // On the tmpfs mechanisms the scratch is ephemeral: the write did not
+        // reach the host workspace. (Seatbelt has no tmpfs overlay, so it writes
+        // the real dir — exercised but not asserted ephemeral here.)
+        if detect_mechanism() != Some(SandboxMechanism::SandboxExec) {
+            assert!(
+                !ws.join(".opencode/.gitignore").exists(),
+                "scratch writes must be ephemeral (tmpfs), not persisted to the host"
+            );
+        }
     }
 
     // task 5.5: strict mode masks ALL of home for the executor (even the

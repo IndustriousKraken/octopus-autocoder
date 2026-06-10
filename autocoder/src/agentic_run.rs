@@ -1277,6 +1277,16 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
         cmd
     };
 
+    // Clean up the host mountpoint dirs pre-created for the read-only-role
+    // workspace-scratch overlay. The tmpfs CONTENT is freed by namespace
+    // teardown on exit; this removes the now-empty mountpoint dir we left on the
+    // host (which `git clean -fd` skips when `.opencode` is gitignored). Fires on
+    // every exit path (success / error / timeout). `remove_dir` is empty-only, so
+    // a workspace that legitimately tracks the path (non-empty) is never deleted.
+    let _scratch_guard = ScratchCleanup {
+        dirs: opts.os_sandbox.workspace_scratch_dirs(opts.workspace),
+    };
+
     let mut child = if opts.etxtbsy_retry_spawn {
         crate::audits::spawn_with_etxtbsy_retry(build)
             .await
@@ -1660,6 +1670,25 @@ impl Drop for SubprocessMarkerGuard {
     }
 }
 
+/// RAII guard that removes the (now-empty) project-scratch mountpoint dirs
+/// pre-created on the host for the read-only-role workspace-scratch overlay. The
+/// tmpfs CONTENT is freed by mount-namespace teardown when the subprocess exits;
+/// this clears the empty mountpoint dir left on the host. `remove_dir` is
+/// empty-only, so a workspace that legitimately tracks the path (non-empty) is
+/// never deleted, and a CLI run unsandboxed (no overlay, real writes) leaves a
+/// non-empty dir that this safely skips.
+struct ScratchCleanup {
+    dirs: Vec<std::path::PathBuf>,
+}
+
+impl Drop for ScratchCleanup {
+    fn drop(&mut self) {
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming-JSON event dispatch (moved from `executor::claude_cli`).
 // ---------------------------------------------------------------------------
@@ -1835,6 +1864,23 @@ mod tests {
         assert_eq!(failure_excerpt(&mk("", ""), 200), "");
         // truncation honored.
         assert_eq!(failure_excerpt(&mk("", "abcdefgh"), 3).chars().count(), 3);
+    }
+
+    #[test]
+    fn scratch_cleanup_removes_empty_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let nonempty = tmp.path().join("nonempty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&nonempty).unwrap();
+        std::fs::write(nonempty.join("f"), "x").unwrap();
+        drop(ScratchCleanup {
+            dirs: vec![empty.clone(), nonempty.clone()],
+        });
+        // The empty mountpoint dir (tmpfs content already freed) is removed.
+        assert!(!empty.exists(), "empty scratch mountpoint is removed");
+        // A non-empty dir (e.g. a workspace that tracks the path) is preserved.
+        assert!(nonempty.exists(), "a non-empty (tracked) dir is preserved");
     }
     use crate::config::{CliKind, LlmProvider};
     use std::collections::HashMap;
