@@ -545,19 +545,64 @@ impl OpencodeStrategy {
     /// The `provider` block for the resolved model, keyed by the provider's
     /// id (`openai_compatible` / `ollama`) so it matches the `--model
     /// <provider>/<model>` selection. `None` when no model is configured
-    /// (opencode uses its own default).
+    /// (opencode uses its own default) OR when a model is configured but
+    /// carries NO `api_key` (see below).
     ///
     /// The raw `api_key` is NEVER written here as a literal: `opencode.json`
     /// lives at the workspace root and is not git-excluded, so a committed
-    /// secret would leak. When NO key is supplied (the default), only the
-    /// provider's model + base URL are written AND opencode authenticates from
-    /// its own out-of-band provider config / login (e.g. opencode → OpenRouter).
-    /// When a key IS supplied, `apiKey` is written as an `{env:...}` REFERENCE
-    /// (not the secret); the secret rides the subprocess env (set in
-    /// [`OpencodeStrategy::apply_model_selection`]) AND opencode interpolates it
-    /// at run time. (Ollama never authenticates, so a key there is inert.)
+    /// secret would leak.
+    ///
+    /// Auth split (the bugfix behind the `[out]`-gate "No cookie auth
+    /// credentials found" failure):
+    ///
+    /// - **A key IS supplied** → write the provider block with `apiKey` as an
+    ///   `{env:...}` REFERENCE (not the secret); the secret rides the subprocess
+    ///   env (set in [`OpencodeStrategy::apply_model_selection`]) AND opencode
+    ///   interpolates it at run time.
+    /// - **NO key is supplied for an AUTHENTICATING provider**
+    ///   (`openai_compatible` — the default for a registry model whose provider
+    ///   the operator authenticated out-of-band via `opencode auth login`) →
+    ///   write NO provider block at all. A workspace provider block that names
+    ///   the provider but omits `apiKey` SHADOWS opencode's own stored
+    ///   credentials for that provider id: opencode treats the explicit config
+    ///   as authoritative, finds no `apiKey`, falls back to its login/cookie
+    ///   store keyed by the (now config-overridden) provider, and errors with
+    ///   "No cookie auth credentials found". Omitting the block lets opencode
+    ///   resolve the provider entirely from its own global config + login —
+    ///   identical to the reviewer path (which passes `model: None`, so no
+    ///   provider block is ever written). In this case the operator's `model`
+    ///   field MUST be the REAL opencode id verbatim (e.g.
+    ///   `openrouter/qwen/qwen3-max`) — `apply_model_selection` passes it as
+    ///   `--model` unchanged. Autocoder's `openai_compatible` API-type is NOT an
+    ///   opencode provider; using it as `--model openai_compatible/...` resolves
+    ///   to "Provider not found".
+    /// - **Ollama** never authenticates (api_key is always empty/forbidden) but
+    ///   DOES need its base URL written so opencode can reach the local daemon —
+    ///   the operator configures it through autocoder, not `opencode auth login`.
+    ///   So an Ollama model always gets its block (baseURL, no apiKey), the
+    ///   pre-existing behavior.
+    /// Whether this strategy WRITES a `provider` block into `opencode.json` for
+    /// `m` — i.e. autocoder DEFINES the opencode provider (so `--model` uses
+    /// autocoder's provider id, `<LlmProvider::as_str()>/<model>`). True for
+    /// Ollama (always — it needs its baseURL; the operator does not
+    /// `opencode auth login` a local daemon) AND for an authenticating provider
+    /// (`openai_compatible`) WHEN a key is supplied (autocoder injects it). False
+    /// for a keyless authenticating provider: autocoder DEFERS to opencode's own
+    /// provider config + login, and `--model` must then be the operator-supplied
+    /// REAL opencode id (e.g. `openrouter/qwen/qwen3-max`) verbatim — NOT
+    /// `openai_compatible/...`, which is autocoder's API-type, not an opencode
+    /// provider, and resolves to "Provider not found".
+    fn writes_provider_block(m: &ResolvedModel) -> bool {
+        matches!(m.provider, crate::config::LlmProvider::Ollama) || !m.api_key.is_empty()
+    }
+
     fn provider_block(model: Option<&ResolvedModel>) -> Option<serde_json::Value> {
         let m = model?;
+        // No block for a keyless authenticating provider: defer entirely to
+        // opencode's own auth + provider config (see `writes_provider_block`).
+        if !Self::writes_provider_block(m) {
+            return None;
+        }
         let provider_id = m.provider.as_str();
         let mut options = serde_json::Map::new();
         options.insert(
@@ -565,7 +610,7 @@ impl OpencodeStrategy {
             serde_json::Value::String(m.api_base_url.clone()),
         );
         // A supplied key is referenced via `{env:VAR}` — never written raw into
-        // this workspace file. No key → omit (opencode uses its own auth).
+        // this workspace file. No key (Ollama) → omit `apiKey`.
         if !m.api_key.is_empty() {
             options.insert(
                 "apiKey".to_string(),
@@ -671,8 +716,20 @@ impl CliStrategy for OpencodeStrategy {
 
     fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>) {
         if let Some(m) = model {
-            cmd.arg("--model")
-                .arg(format!("{}/{}", m.provider.as_str(), m.model));
+            // `--model` must name an opencode provider. When autocoder writes the
+            // provider block (Ollama, or a keyed openai_compatible) it DEFINES the
+            // provider under `m.provider`'s id, so select `<id>/<model>`. When it
+            // does NOT write a block (keyless authenticating), it defers to
+            // opencode's own provider/login — `m.model` is then the operator's
+            // REAL opencode id (e.g. `openrouter/qwen/qwen3-max`), passed verbatim.
+            // (Prefixing autocoder's `openai_compatible` API-type here is what
+            // produced `--model openai_compatible/...` → "Provider not found".)
+            let model_arg = if Self::writes_provider_block(m) {
+                format!("{}/{}", m.provider.as_str(), m.model)
+            } else {
+                m.model.clone()
+            };
+            cmd.arg("--model").arg(model_arg);
             // A supplied key rides the subprocess env; `opencode.json` carries
             // only the `{env:...}` reference (see `provider_block`). No key →
             // set nothing (opencode uses its own auth). The secret reaches the
@@ -2205,15 +2262,21 @@ mod tests {
     // provider — `--model <provider>/<model>` + the opencode.json provider
     // entry (model + base URL) — AND sets none of the ANTHROPIC_* env vars.
     // a003: the keyed model's `api_key` is NEVER written into opencode.json
-    // (the provider `options` carry the base URL but no `apiKey`), and the key
-    // value appears nowhere in the file.
+    // (no provider block is written at all — an `apiKey`-less provider block
+    // would shadow opencode's own login/cookie store for the provider id and
+    // break the run with "No cookie auth credentials found"; see
+    // `provider_block`). `--model` still selects the model against opencode's
+    // global provider config, and the key value appears nowhere in the file.
     #[test]
-    fn opencode_strategy_without_key_writes_no_api_key() {
+    fn opencode_strategy_without_key_writes_no_provider_block() {
         let tmp = tempfile::tempdir().unwrap();
         let allowed = vec!["Read".to_string()];
         let model = ResolvedModel {
             provider: LlmProvider::OpenAiCompatible,
-            model: "gpt-4o-mini".into(),
+            // Keyless → the operator supplies the REAL opencode id (provider it
+            // authed via `opencode auth login`), which is passed to `--model`
+            // verbatim — autocoder's `openai_compatible` API-type is NOT prefixed.
+            model: "openrouter/openai/gpt-4o-mini".into(),
             api_base_url: "https://api.example.invalid/v1".into(),
             api_key: String::new(), // no key → opencode uses its own auth
         };
@@ -2229,22 +2292,20 @@ mod tests {
 
         let a = args(&cmd);
         let pos = a.iter().position(|x| x == "--model").expect("--model present");
-        assert_eq!(a[pos + 1], "openai_compatible/gpt-4o-mini");
+        // Verbatim — the operator's opencode id, NOT `openai_compatible/...`.
+        assert_eq!(a[pos + 1], "openrouter/openai/gpt-4o-mini");
 
         let v = read_opencode_json(tmp.path());
-        // The MCP, permission, and provider-base-URL blocks are all present.
+        // The MCP and permission blocks are present.
         assert!(v["mcp"][crate::mcp_askuser_server::SERVER_NAME].is_object());
         assert!(v["permission"].is_object());
-        let provider = &v["provider"]["openai_compatible"];
-        assert_eq!(provider["options"]["baseURL"], "https://api.example.invalid/v1");
-        // No key supplied → no `apiKey` reference at all (opencode self-auths).
+        // No key supplied → NO provider block at all (opencode self-auths from
+        // its own login + global provider config, exactly like the reviewer's
+        // `model: None` path). A baseURL-only / apiKey-less provider block would
+        // shadow that working auth.
         assert!(
-            provider["options"].get("apiKey").is_none(),
-            "no key → no apiKey in opencode.json"
-        );
-        assert!(
-            provider["models"]["gpt-4o-mini"].is_object(),
-            "the resolved model is registered under the provider"
+            v.get("provider").is_none(),
+            "no key → no provider block in opencode.json: {v}"
         );
 
         let e = envs(&cmd);

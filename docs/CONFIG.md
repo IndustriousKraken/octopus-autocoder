@@ -188,6 +188,39 @@ Each entry is validated at config-load via the same per-provider auth rules
 as an inline block — e.g. an `ollama` entry with an `api_key` fails load even
 if no block references it.
 
+**`model:` for opencode-driven entries (`openai_compatible` / `ollama`).** These
+providers run through the **opencode** CLI, whose `--model` selector is
+`<opencode-provider-id>/<model>`, where `<opencode-provider-id>` is a provider
+opencode actually knows — NOT autocoder's `provider:` value (`openai_compatible`
+is an API *type*, not an opencode provider; `opencode models <id>` returns
+"Provider not found" for it). What you put in `model:` therefore depends on how
+opencode authenticates the model — three cases:
+
+- **You authenticated the provider with `opencode auth login`** (OpenRouter,
+  Groq, etc.) — leave `api_key` unset and set `model:` to the **full opencode
+  id**, e.g. `openrouter/qwen/qwen3-max`. autocoder passes it to `--model`
+  verbatim and writes **no** provider block, so opencode resolves the provider
+  and credentials from its own login + global config. `api_base_url` is **unused**
+  in this case. Run `opencode models` to see the exact ids you are authed to —
+  the provider segment (e.g. `openrouter`) is yours, autocoder never assumes one.
+- **A custom OpenAI-compatible endpoint autocoder should inject a key into**
+  (not in opencode's login) — set `api_base_url` (including its path, e.g.
+  `/v1`), set `model:` to the **bare model id**, and supply `api_key` /
+  `api_key_env`. autocoder defines an opencode provider named `openai_compatible`
+  from the base URL + key (key written as an `{env:…}` reference, never raw) and
+  selects `--model openai_compatible/<model>`.
+- **Ollama** (local, never authenticates) — set `api_base_url` (e.g.
+  `http://host:11434/v1`), set `model:` to the **bare model id**, no key.
+  autocoder defines the `ollama` provider from the base URL and selects
+  `--model ollama/<model>`.
+
+Rule of thumb: **keyless `openai_compatible` → `model:` is the full opencode id
+(provider included); `ollama` and keyed `openai_compatible` → `model:` is the
+bare model id** (autocoder supplies the provider). The `api_base_url` (and the
+path-less-base check above) matter only when autocoder writes the provider block
+— i.e. ollama and keyed `openai_compatible`; for a login-authed (keyless)
+`openai_compatible` model the base URL is ignored.
+
 **Tool-capability probe (startup).** A registry model drives an agentic CLI, and
 the verifier gates / agentic reviewer require the model to emit **tool calls**
 (read the change, then call a `submit_*` tool). At startup the daemon sends one
