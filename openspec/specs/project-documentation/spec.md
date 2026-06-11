@@ -42,9 +42,11 @@ The reference is NOT a user-facing spec — it does not describe runtime behavio
 - **AND** the report MAY note that the originally-named test was unlocatable, so future operators don't reopen the same investigation looking for the same ghost
 
 ### Requirement: config.example.yaml is the canonical operator reference for the YAML schema
-The repository SHALL maintain `config.example.yaml` at the repo root as the operator-facing reference for every configurable field accepted by `Config` and its nested types. Every YAML-deserializable field — including fields whose default behavior makes them safe to omit — SHALL appear in the example, either as an active default value or as a commented annotation explaining what it does and what values are accepted. When a change ships a new configurable field, the change's commit MUST also update `config.example.yaml` so the example never lags the schema.
+The repository SHALL maintain `config.example.yaml` at the repo root as the operator-facing reference for every configurable field accepted by `Config` and its nested types. Every YAML-deserializable field — including fields whose default behavior makes them safe to omit — SHALL appear in the example, either as an active default value or as a commented annotation explaining what it does and what values are accepted, EXCEPT a field marked **deprecated** in the source. When a change ships a new configurable field, the change's commit MUST also update `config.example.yaml` so the example never lags the schema.
 
-A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail when a documented field name does not appear as a substring in the example file. This catches omissions at build time rather than at operator-onboarding time.
+A field marked deprecated in the source (a `DEPRECATED:` doc comment on the field) is **intentionally absent** from the operator-facing surfaces: it SHALL be removed from `config.example.yaml` AND from `docs/CONFIG.md`, so those references carry no cruft. A deprecated field SHALL remain **accepted by the deserializer AND honored** (no behavior change) so existing configs do not break; it is simply no longer advertised. New operators are steered to the supported alternative in the relevant docs section.
+
+A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail when a NON-deprecated documented field name does not appear as a substring in the example file. This catches omissions at build time rather than at operator-onboarding time. A deprecated field is NOT required to appear; when its name is not shared with a live field, it SHALL be removed from the check's field-name list (when the name is still live via another field, it MAY remain).
 
 #### Scenario: Adding a new configurable field
 - **WHEN** an implementing agent adds a new YAML-deserializable field
@@ -91,6 +93,12 @@ A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail 
 - **AND** each nested field within the commented block SHALL appear
   at least once so an operator who uncomments the block sees every
   knob the feature exposes
+
+#### Scenario: A deprecated field is undocumented
+- **WHEN** a configurable field is marked deprecated in the source (a `DEPRECATED:` doc comment)
+- **THEN** it is removed from `config.example.yaml` AND from `docs/CONFIG.md`, so neither operator-facing reference advertises it
+- **AND** it remains accepted by the deserializer AND honored at runtime, so an existing config that sets it does NOT break
+- **AND** the coverage test does NOT require it to appear in the example (it is removed from the field-name list unless the name is still live via another, non-deprecated field)
 
 ### Requirement: Install script is a thin bootstrap for `autocoder install`
 The repository SHALL ship `install.sh` at the repo root as a minimal bootstrap (target ≤ 80 lines including comments) whose sole responsibilities are: detect OS + architecture, resolve a binary version (default latest production tag from the GitHub Releases API; overridable via `--version` flag or `AUTOCODER_VERSION` env var), download the binary and its SHA-256 checksum, verify the checksum, place the binary on PATH, and `exec autocoder install "$@"`. All wizard logic, system-user creation, config generation, systemd unit rendering, and optional Claude-CLI bootstrap SHALL live in the `autocoder install` subcommand (a tested Rust subcommand), NOT in bash.
