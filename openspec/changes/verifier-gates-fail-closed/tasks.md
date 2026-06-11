@@ -25,7 +25,23 @@ The implementation is complete; this change reconciles the canonical spec with i
 
 - [x] 4.1 `docs/OPERATIONS.md` (Pre-flight checks + SpecNeedsRevision section): a gate that cannot run HOLDS the change (failed-to-run alert + `gate_error` marker) rather than failing open; `[out]` renders FAILED TO RUN. (`docs/CHATOPS.md` clear-revision wording already covers the operator path.)
 
-## 5. Acceptance
+## 5. Structural fail-closed: default-deny verdict ledger (TODO)
 
-- [x] 5.1 `cargo test` passes (only the pre-existing parallel-load flakes intermittently fail; all pass isolated).
-- [x] 5.2 `openspec validate verifier-gates-fail-closed --strict` passes.
+The sections above achieve fail-closed by *inspection* (interim). This section makes it fail-closed by *construction* — the default-deny ledger that supersedes the inspect-and-branch dispatch.
+
+- [x] 5.1 Per-change gate-verdict ledger type: a verdict per gate slot (`[in]`/`[canon]`/`[out]`), each defaulting to `PENDING`; verdict set `PENDING | PASS | FAIL | FAILED_TO_RUN | DISABLED`. Persisted per change under `.git/autocoder-gate-ledger/<change>.json` (a16: out of the managed tree). (`src/gate_ledger.rs`)
+- [x] 5.2 No-skip dispatch: every gate slot runs a runner that affirmatively writes a verdict — a disabled gate runs a STUB writing `DISABLED` (the `if let Some(ctx)…` skip path in `queue_walk.rs` is replaced by `run_in_gate`/`run_canon_gate`). A runner that returns without writing leaves `PENDING`.
+- [x] 5.3 Gating by construction: the executor runs ONLY when every blocking gate (`[in]`/`[canon]`) is `PASS`/`DISABLED` (`ledger.blocking_ok()` defensive proceed-gate); `PENDING`/`FAIL`/`FAILED_TO_RUN` holds. Replaces the per-arm `Ok(Some)/Ok(None)/Err` branching.
+- [x] 5.4 Tests: a runner that never records → `PENDING` → held; a disabled gate → `DISABLED` → proceeds; executor invoked only when all blocking gates `PASS`/`DISABLED` (`gate_ledger` unit tests + `polling_loop/tests/t20.rs`).
+
+## 6. Gate verdicts rendered in the PR (TODO)
+
+- [x] 6.1 Render the gate-verdict ledger into the PR body (`## Gate verdicts` section, `render_gate_verdicts_with_reviewer` in `pass.rs`): per gate — identifier, model, verdict (+ one-line summary for `FAIL`/`FAILED_TO_RUN`); the agentic reviewer's verdict is folded in. A `PASS` is visible, not inferred from silence.
+- [x] 6.2 Thread the pre-executor `[in]`/`[canon]` verdicts (recorded at pre-flight, persisted under `.git/`) through to PR-body construction via `seed_ledger_from_processed`; the `[out]` gate records into the same ledger AND its `## Spec Verification` section renders alongside it.
+- [x] 6.3 Tests: the PR body contains a gate-verdict section naming each gate, its model, and its verdict (`polling_loop/tests/t20.rs`).
+
+## 7. Acceptance
+
+- [x] 7.1 `cargo test` passes (inspect-and-branch interim; only the pre-existing parallel-load flakes intermittently fail).
+- [x] 7.2 `cargo test` passes after the ledger lands (ledger + PR-render tests green).
+- [x] 7.3 `openspec validate verifier-gates-fail-closed --strict` passes.

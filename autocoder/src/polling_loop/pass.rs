@@ -116,6 +116,14 @@ pub async fn execute_one_pass(
     )
     .await?;
 
+    // Default-deny gate-verdict ledger (verifier-gates-fail-closed §6): the
+    // PR-level ledger renders the verifier gates' verdicts as a compliance
+    // record. The pre-executor `[in]`/`[canon]` verdicts were recorded per change
+    // during the queue walk (persisted under `.git/`); seed the PR ledger from
+    // the processed changes so a `PASS` is VISIBLE in the PR (not inferred from
+    // the silent absence of an alert).
+    let mut gate_ledger = seed_ledger_from_processed(workspace, &processed);
+
     // a63: the `[out]` gate — code-implements-spec verification. Runs AFTER
     // the executor implemented the change(s) (the agent branch carries the
     // implementation), before PR-body assembly, when the operator opted in
@@ -123,9 +131,29 @@ pub async fn execute_one_pass(
     // implementer-processed changes to verify. Advisory: it renders a
     // `## Spec Verification` PR-body section AND posts a chatops note ONLY when
     // gaps are found; it NEVER opens a revision AND NEVER blocks PR creation. A
-    // gate failure WARNs (labeled `[verifier:out]`) AND omits the section.
-    let spec_verification_section =
-        run_spec_verification_gate(workspace, repo, &processed, chatops_ctx).await;
+    // gate failure renders an explicit FAILED TO RUN section (labeled
+    // `[verifier:out]`). Its verdict is ALSO recorded into the ledger above.
+    let spec_verification_section = run_spec_verification_gate_recording(
+        workspace,
+        repo,
+        &processed,
+        chatops_ctx,
+        Some(&mut gate_ledger),
+    )
+    .await;
+
+    // §6: render the `## Gate verdicts` ledger section into the PR body. It folds
+    // in the agentic reviewer's verdict (when a reviewer ran) so the PR record
+    // shows, per gate AND for the reviewer: identifier, model, verdict. Omitted
+    // for audit-only iterations (no implementer changes were gated).
+    let gate_verdicts_section = if processed.is_empty() {
+        None
+    } else {
+        Some(render_gate_verdicts_with_reviewer(
+            &gate_ledger,
+            review_report.as_ref(),
+        ))
+    };
 
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
@@ -163,6 +191,7 @@ pub async fn execute_one_pass(
         chatops_ctx,
         workspace,
         spec_verification_section.as_deref(),
+        gate_verdicts_section.as_deref(),
     )
     .await?;
     // End-of-pass success: push and PR creation both succeeded. Clear the
@@ -498,20 +527,57 @@ pub(crate) async fn run_spec_verification_gate(
     processed: &[String],
     chatops_ctx: Option<&ChatOpsContext>,
 ) -> Option<String> {
-    let ctx = crate::code_implements_spec::current()?;
+    run_spec_verification_gate_recording(workspace, repo, processed, chatops_ctx, None).await
+}
+
+/// As [`run_spec_verification_gate`], but ALSO records the `[out]` gate's
+/// [`crate::gate_ledger::GateVerdict`] into `ledger` (verifier-gates-fail-closed
+/// §6): an `implemented` verdict → `Pass`, `gaps_found` → `Fail`, `FailedToRun`
+/// → `FailedToRun`, a disabled gate (no scoped ctx) → `Disabled`, audit-only →
+/// left as the caller seeded it (no implementer changes to verify). The recorded
+/// verdict feeds the PR's `## Gate verdicts` ledger section so the `[out]` verdict
+/// is VISIBLE there, not inferred from the absence of a section.
+pub(crate) async fn run_spec_verification_gate_recording(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    processed: &[String],
+    chatops_ctx: Option<&ChatOpsContext>,
+    mut ledger: Option<&mut crate::gate_ledger::GateLedger>,
+) -> Option<String> {
+    use crate::gate_ledger::GateVerdict;
+    let Some(ctx) = crate::code_implements_spec::current() else {
+        // Disabled `[out]` gate STUB: record `Disabled` (non-blocking, advisory),
+        // NOT an absence — same no-skip discipline as the pre-executor gates.
+        if let Some(l) = ledger.as_deref_mut() {
+            l.set_out(GateVerdict::Disabled, None, None);
+        }
+        return None;
+    };
     if processed.is_empty() {
-        // Audit-only iteration: no implementer-touched files to verify.
+        // Audit-only iteration: no implementer-touched files to verify. The
+        // `[out]` slot keeps whatever the caller seeded; the PR is audit-only so
+        // the ledger section is not rendered.
         return None;
     }
+    let model = ctx
+        .attribution
+        .clone()
+        .or_else(|| Some(ctx.model.model.clone()));
     let label = crate::verifier_gate::VerifierGate::Out.label();
     let diff = match git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
-                "{label} could not compute diff for the code-implements-spec gate; omitting the Spec Verification section (advisory, never blocks): {e:#}"
+                "{label} could not compute diff for the code-implements-spec gate; rendering FAILED TO RUN (advisory, never blocks): {e:#}"
             );
-            return None;
+            let cause = format!("could not compute diff: {e:#}");
+            if let Some(l) = ledger.as_deref_mut() {
+                l.set_out(GateVerdict::FailedToRun, model.clone(), Some(cause.clone()));
+            }
+            return Some(
+                crate::code_implements_spec::render_spec_verification_failed_section(&cause),
+            );
         }
     };
     let changed_files = git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)
@@ -530,13 +596,75 @@ pub(crate) async fn run_spec_verification_gate(
             if verification.has_gaps() {
                 post_spec_verification_gaps_alert(chatops_ctx, repo, &verification).await;
             }
+            if let Some(l) = ledger.as_deref_mut() {
+                let (verdict, summary) = if verification.has_gaps() {
+                    (
+                        GateVerdict::Fail,
+                        Some(format!("{} gap(s) found", verification.gaps.len())),
+                    )
+                } else {
+                    (GateVerdict::Pass, None)
+                };
+                l.set_out(verdict, model.clone(), summary);
+            }
             Some(crate::code_implements_spec::render_spec_verification_section(&verification))
         }
         crate::code_implements_spec::SpecVerificationOutcome::FailedToRun { cause } => {
             // gatekeepers-fail-closed: the advisory gate fails to a VISIBLE
             // state, not silence — render an explicit FAILED TO RUN section so an
             // un-run gate is not mistaken for a clean pass. Still never blocks.
+            if let Some(l) = ledger.as_deref_mut() {
+                l.set_out(GateVerdict::FailedToRun, model.clone(), Some(cause.clone()));
+            }
             Some(crate::code_implements_spec::render_spec_verification_failed_section(&cause))
         }
     }
+}
+
+/// Seed a PR-level [`crate::gate_ledger::GateLedger`] from the pre-executor
+/// verdicts recorded per change during the queue walk (verifier-gates-fail-closed
+/// §6). Every change in `processed` reached the executor, so its blocking
+/// `[in]`/`[canon]` verdicts are `Pass` or `Disabled`; the persisted per-change
+/// ledger (under `.git/`) carries the EXACT verdict + model that ran. We read the
+/// first processed change's ledger as the representative for the PR's blocking-gate
+/// rows (the gates run identically across changes in one pass). When no ledger
+/// file is found (e.g. a resumed waiting change that never went through the
+/// pre-executor dispatch), the blocking slots stay `Pending` AND the `[out]` gate
+/// records itself downstream; the render then honestly shows what is known.
+pub(crate) fn seed_ledger_from_processed(
+    workspace: &Path,
+    processed: &[String],
+) -> crate::gate_ledger::GateLedger {
+    for change in processed {
+        if let Some(l) = crate::gate_ledger::read_ledger(workspace, change) {
+            return l;
+        }
+    }
+    crate::gate_ledger::GateLedger::new()
+}
+
+/// Render the `## Gate verdicts` PR section from the ledger AND fold in the
+/// agentic reviewer's verdict (verifier-gates-fail-closed §6) so the PR record
+/// shows, for each verifier gate AND the reviewer: identifier, model, verdict.
+/// The reviewer is a separate quality check (not a verifier gate), so it is
+/// appended as its own row beneath the three gate rows.
+pub(crate) fn render_gate_verdicts_with_reviewer(
+    ledger: &crate::gate_ledger::GateLedger,
+    review_report: Option<&ReviewReport>,
+) -> String {
+    let mut out = ledger.render_pr_section();
+    if let Some(report) = review_report {
+        let verdict = match report.verdict {
+            ReviewVerdict::Pass => "PASS",
+            ReviewVerdict::Concerns => "CONCERNS",
+            ReviewVerdict::Block => "BLOCK",
+        };
+        out.push_str("- reviewer ");
+        out.push_str(verdict);
+        if let Some(model) = report.attribution.as_deref().filter(|m| !m.trim().is_empty()) {
+            out.push_str(&format!(" — model: {model}"));
+        }
+        out.push('\n');
+    }
+    out
 }

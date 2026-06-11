@@ -82,15 +82,18 @@ fn build_unarchivable_revision_suggestion(
     out
 }
 
-/// Run the change-internal contradiction pre-flight (a19) against
-/// `change`. On clean result (LLM returned an empty array OR failed
-/// open): returns `Ok(None)` and the caller proceeds to the executor.
-/// On non-empty findings: writes the `.needs-spec-revision.json`
-/// marker with `revision_suggestion` populated from the contradictions
-/// narrative, posts the existing `AlertCategory::SpecNeedsRevision`
-/// chatops alert (subject to 24h throttle), AND returns
-/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the
-/// queue walk without invoking the executor.
+/// Run the change-internal contradiction pre-flight — the `[in]` gate — against
+/// `change`, returning the gate's [`GateVerdict`] (verifier-gates-fail-closed
+/// §5). The verdict is what the default-deny ledger records:
+///   - `Clean` → [`GateVerdict::Pass`] (logs the positive "gate passed" line,
+///     proceed);
+///   - `Found` → [`GateVerdict::Fail`] (writes the findings marker + alert);
+///   - `Errored` → [`GateVerdict::FailedToRun`] (calls [`handle_gate_error`] for
+///     the `gate_error` hold marker + the distinct "gate FAILED TO RUN" alert).
+///
+/// ALL existing side effects (markers, alerts, logs) are preserved; only the
+/// return type changed from `Option<QueueStep>` to `GateVerdict` so the
+/// structural fail-closed ledger — not per-arm branching — decides the hold.
 pub(crate) async fn handle_contradiction_preflight(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -98,20 +101,29 @@ pub(crate) async fn handle_contradiction_preflight(
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
     cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
-) -> Result<Option<QueueStep>> {
-    // The gate FAILS CLOSED (gatekeepers-fail-closed standard): `Clean` →
-    // proceed; `Found` → block with the findings marker; `Errored` → hold the
-    // change in an explicit failed-to-run state (it was NOT evaluated), never
-    // wave it through.
+) -> Result<crate::gate_ledger::GateVerdict> {
+    use crate::gate_ledger::GateVerdict;
     use crate::preflight::change_contradiction::ContradictionCheckOutcome;
     let findings = match crate::preflight::change_contradiction::run_agentic_contradiction_check(
         cc_ctx, workspace, change,
     )
     .await
     {
-        ContradictionCheckOutcome::Clean => return Ok(None),
+        ContradictionCheckOutcome::Clean => {
+            // Positive signal: a clean pass is logged, so an operator can verify
+            // the gate RAN and PASSED rather than inferring it from silence.
+            let label = crate::verifier_gate::VerifierGate::In.label();
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "{label} gate passed: no change-internal contradictions; proceeding to executor"
+            );
+            return Ok(GateVerdict::Pass);
+        }
         ContradictionCheckOutcome::Errored { cause } => {
-            return handle_gate_error(
+            // FailedToRun: the gate could not evaluate the change. The marker +
+            // alert are written by `handle_gate_error`; the verdict holds.
+            handle_gate_error(
                 paths,
                 workspace,
                 repo,
@@ -121,7 +133,8 @@ pub(crate) async fn handle_contradiction_preflight(
                 &cause,
                 cc_ctx.attribution.as_deref(),
             )
-            .await;
+            .await?;
+            return Ok(GateVerdict::FailedToRun);
         }
         ContradictionCheckOutcome::Found(findings) => findings,
     };
@@ -157,7 +170,7 @@ pub(crate) async fn handle_contradiction_preflight(
         cc_ctx.attribution.as_deref(),
     )
     .await;
-    Ok(Some(QueueStep::SpecRevisionMarked))
+    Ok(GateVerdict::Fail)
 }
 
 /// Compose the auto-generated `revision_suggestion` text written into
@@ -197,7 +210,7 @@ pub(crate) fn build_contradiction_revision_suggestion(
 /// "gate FAILED TO RUN" alert, AND returns `Ok(Some(QueueStep::SpecRevisionMarked))`
 /// so the caller halts the queue walk — the change was NOT evaluated, so it is
 /// NOT waved through.
-async fn handle_gate_error(
+pub(crate) async fn handle_gate_error(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -242,16 +255,15 @@ async fn handle_gate_error(
 }
 
 /// Run the change-vs-canonical contradiction pre-flight — the `[canon]` gate
-/// (a62) — against `change`. On clean result (the agent returned an empty
-/// array OR the gate failed open): returns `Ok(None)` and the caller proceeds
-/// to the executor. On non-empty findings: writes the
-/// `.needs-spec-revision.json` marker with `revision_suggestion` populated
-/// from the canon-contradiction narrative (empty structural arrays — this
-/// case is semantic), posts the existing `AlertCategory::SpecNeedsRevision`
-/// chatops alert (subject to the 24h throttle), AND returns
-/// `Ok(Some(QueueStep::SpecRevisionMarked))` so the caller halts the queue
-/// walk without invoking the executor. Disposition is identical to the `[in]`
-/// gate's; the gates differ only in what they read AND what each finding names.
+/// (a62) — against `change`, returning the gate's [`GateVerdict`]
+/// (verifier-gates-fail-closed §5). Disposition is identical to the `[in]`
+/// gate's; the gates differ only in what they read AND what each finding names:
+///   - `Clean` → [`GateVerdict::Pass`] (logs the positive line, proceed);
+///   - `Found` → [`GateVerdict::Fail`] (writes the findings marker + alert);
+///   - `Errored` → [`GateVerdict::FailedToRun`] (calls [`handle_gate_error`]).
+///
+/// ALL existing side effects (markers, alerts, logs) are preserved; only the
+/// return type changed from `Option<QueueStep>` to `GateVerdict`.
 pub(crate) async fn handle_canon_contradiction_preflight(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -259,19 +271,27 @@ pub(crate) async fn handle_canon_contradiction_preflight(
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
     canon_ctx: &crate::preflight::canon_contradiction::CanonContradictionCheckCtx,
-) -> Result<Option<QueueStep>> {
-    // Fails CLOSED (gatekeepers-fail-closed standard): `Clean` → proceed;
-    // `Found` → block with the findings marker; `Errored` → hold the change in
-    // an explicit failed-to-run state, never wave it through.
+) -> Result<crate::gate_ledger::GateVerdict> {
+    use crate::gate_ledger::GateVerdict;
     use crate::preflight::canon_contradiction::CanonContradictionCheckOutcome;
     let findings = match crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
         canon_ctx, workspace, change,
     )
     .await
     {
-        CanonContradictionCheckOutcome::Clean => return Ok(None),
+        CanonContradictionCheckOutcome::Clean => {
+            // Positive signal: a clean pass is logged, so an operator can verify
+            // the gate RAN and PASSED rather than inferring it from silence.
+            let label = crate::verifier_gate::VerifierGate::Canon.label();
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "{label} gate passed: no change-vs-canon contradictions; proceeding to executor"
+            );
+            return Ok(GateVerdict::Pass);
+        }
         CanonContradictionCheckOutcome::Errored { cause } => {
-            return handle_gate_error(
+            handle_gate_error(
                 paths,
                 workspace,
                 repo,
@@ -281,7 +301,8 @@ pub(crate) async fn handle_canon_contradiction_preflight(
                 &cause,
                 canon_ctx.attribution.as_deref(),
             )
-            .await;
+            .await?;
+            return Ok(GateVerdict::FailedToRun);
         }
         CanonContradictionCheckOutcome::Found(findings) => findings,
     };
@@ -317,7 +338,7 @@ pub(crate) async fn handle_canon_contradiction_preflight(
         canon_ctx.attribution.as_deref(),
     )
     .await;
-    Ok(Some(QueueStep::SpecRevisionMarked))
+    Ok(GateVerdict::Fail)
 }
 
 /// Compose the auto-generated `revision_suggestion` text written into the

@@ -212,6 +212,14 @@ pub struct CodeReviewer {
     /// applies (file `800`, function `200`).
     file_lines_threshold: u64,
     function_lines_threshold: u64,
+    /// The reviewer's fully-resolved model (provider, model id, base URL,
+    /// resolved key), threaded to the agentic session so the wrapped CLI runs
+    /// the OPERATOR-configured model — not the CLI's own default. `Some` when
+    /// built via [`CodeReviewer::from_config`] (resolved from the reviewer
+    /// config exactly like the verifier gates); `None` for the test-only
+    /// [`CodeReviewer::new`] path. When `None`, the agentic session passes
+    /// `model: None` (legacy behavior: the CLI picks its default).
+    resolved_model: Option<crate::agentic_run::ResolvedModel>,
 }
 
 impl CodeReviewer {
@@ -235,6 +243,7 @@ impl CodeReviewer {
             provider: LlmProvider::Anthropic,
             file_lines_threshold: crate::audits::brightline::DEFAULT_FILE_LINES_THRESHOLD,
             function_lines_threshold: crate::audits::brightline::DEFAULT_FUNCTION_LINES_THRESHOLD,
+            resolved_model: None,
         }
     }
 
@@ -272,6 +281,19 @@ impl CodeReviewer {
     /// the agentic CLI strategy via the a55 `provider → CLI` rule.
     pub fn with_provider(mut self, provider: LlmProvider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Builder-style setter for the reviewer's fully-resolved model, threaded
+    /// into the agentic session so the wrapped CLI runs the operator-configured
+    /// model. `from_config` sets this from the reviewer config (resolved via
+    /// [`crate::llm::resolve_reviewer_model`], identical to the verifier gates);
+    /// agentic tests use it directly to assert the `--model` selection.
+    pub fn with_resolved_model(
+        mut self,
+        model: Option<crate::agentic_run::ResolvedModel>,
+    ) -> Self {
+        self.resolved_model = model;
         self
     }
 
@@ -395,6 +417,12 @@ impl CodeReviewer {
             // unwrap default mirrors the field's documented post-load
             // invariant.
             .with_provider(cfg.provider.unwrap_or(LlmProvider::Anthropic))
+            // Resolve the reviewer's model exactly like the verifier gates, so
+            // the agentic session runs the operator-configured model instead of
+            // the wrapped CLI's own default (the bug this fixes). The api_key is
+            // resolved `optional` inside the resolver: keyless → EMPTY (opencode
+            // keyless path), configured → the resolved key passed to the CLI.
+            .with_resolved_model(Some(llm::resolve_reviewer_model(cfg)?))
             .with_attribution(Some(crate::attribution::AttributionSurface::attribution(cfg))))
     }
 
@@ -1146,6 +1174,11 @@ struct CliReviewSessionRunner<'a> {
     cli: crate::config::CliKind,
     settings_dir: Option<&'a Path>,
     timeout: Duration,
+    /// The reviewer's fully-resolved model, passed to `agentic_run` so the
+    /// wrapped CLI runs the operator-configured model (not the CLI's own
+    /// default). `None` only on the test-only path where no config was
+    /// resolved; production always carries `Some`.
+    model: Option<&'a crate::agentic_run::ResolvedModel>,
 }
 
 #[async_trait]
@@ -1174,7 +1207,15 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
                 disallowed_read_paths: Vec::new(),
                 deny_writes: true,
             },
-            model: None,
+            // a006-followup: pass the reviewer's RESOLVED model so the wrapped
+            // CLI runs the operator-configured model — NOT the CLI's own
+            // default (the bug). The strategy handles it per-CLI: a keyless
+            // `openai_compatible` reviewer (empty api_key) → NO opencode
+            // provider block + verbatim `--model <m.model>`; a keyed one or
+            // Ollama → provider block + `--model <provider>/<model>`; a `claude`
+            // reviewer → `ANTHROPIC_MODEL`/`ANTHROPIC_BASE_URL`. `None` only on
+            // the test-only no-config path (CLI falls back to its default).
+            model: self.model,
             output_mode: crate::agentic_run::OutputMode::Capture,
             timeout: self.timeout,
             paths: None,
@@ -1350,6 +1391,9 @@ pub async fn run_agentic_review(
         cli: crate::config::default_cli_for(reviewer.provider),
         settings_dir: None,
         timeout: AGENTIC_REVIEW_TIMEOUT,
+        // Pass the reviewer's resolved model so the wrapped CLI runs the
+        // operator-configured model, mirroring the verifier gates.
+        model: reviewer.resolved_model.as_ref(),
     };
     run_agentic_review_with_runner(reviewer, ctx, &runner).await
 }
@@ -2843,6 +2887,84 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(
             reviewer.template, DEFAULT_TEMPLATE,
             "default template must be used when prompt_template_path is None (symbol identity)"
+        );
+    }
+
+    /// The bug fix: `from_config` resolves the reviewer's model (exactly like
+    /// the verifier gates) AND threads it onto the reviewer, so the agentic
+    /// session passes `model: Some(_)` to the wrapped CLI — running the
+    /// OPERATOR-configured model, not the CLI's own default. A KEYLESS
+    /// `openai_compatible` reviewer resolves to an EMPTY key (opencode's keyless
+    /// path) AND carries the operator's real opencode id verbatim.
+    #[test]
+    fn from_config_threads_keyless_resolved_model_onto_reviewer() {
+        use crate::config::{ReviewerConfig, ReviewerProvider};
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: Some(ReviewerProvider::OpenAiCompatible),
+            model: "openrouter/qwen/qwen3-max".into(),
+            api_key_env: None,
+            api_key: None,
+            api_base_url: Some("https://api.example.invalid/v1".into()),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: crate::config::AutoRevise::Off,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: None,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Agentic,
+            command: "opencode".to_string(),
+        };
+        let reviewer = CodeReviewer::from_config(&cfg).expect("agentic reviewer builds");
+        let m = reviewer
+            .resolved_model
+            .as_ref()
+            .expect("from_config must resolve and thread the reviewer model (no more model: None)");
+        assert_eq!(m.provider, LlmProvider::OpenAiCompatible);
+        // Verbatim opencode id — fed to `--model` unchanged on the keyless path.
+        assert_eq!(m.model, "openrouter/qwen/qwen3-max");
+        assert!(
+            m.api_key.is_empty(),
+            "keyless reviewer → empty key so opencode takes its keyless path"
+        );
+    }
+
+    /// A KEYED `openai_compatible` reviewer threads its resolved key into the
+    /// reviewer's model (NON-empty), which drives the opencode strategy's keyed
+    /// path (provider block + `<provider>/<model>` selection).
+    #[test]
+    fn from_config_threads_keyed_resolved_model_onto_reviewer() {
+        use crate::config::{ReviewerConfig, ReviewerProvider, SecretSource};
+        let cfg = ReviewerConfig {
+            enabled: true,
+            provider: Some(ReviewerProvider::OpenAiCompatible),
+            model: "qwen3-max".into(),
+            api_key_env: None,
+            api_key: Some(SecretSource::Inline {
+                value: "sk-reviewer-secret".into(),
+            }),
+            api_base_url: Some("https://api.example.invalid/v1".into()),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: crate::config::AutoRevise::Off,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: None,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Agentic,
+            command: "opencode".to_string(),
+        };
+        let reviewer = CodeReviewer::from_config(&cfg).expect("keyed agentic reviewer builds");
+        let m = reviewer
+            .resolved_model
+            .as_ref()
+            .expect("from_config must thread the keyed reviewer model");
+        assert_eq!(
+            m.api_key, "sk-reviewer-secret",
+            "keyed reviewer threads its key (opencode keyed path: block + <provider>/<model>)"
         );
     }
 

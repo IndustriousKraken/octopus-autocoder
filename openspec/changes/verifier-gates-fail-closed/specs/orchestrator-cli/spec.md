@@ -195,3 +195,36 @@ The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` de
 - **AND** `executor.code_implements_spec_check_llm` is unset
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
 - **AND** the operator sees the error on stderr AND in journalctl
+
+## ADDED Requirements
+
+### Requirement: Gate dispositions are enforced by a default-deny verdict ledger rendered in the PR
+The verifier gates' fail-closed disposition SHALL be enforced **structurally** — by a per-change gate-verdict ledger whose default is non-passing — NOT by per-path inspection of a gate's result. Inspection requires every code path (every result arm, every error, every future early-return) to be classified correctly; a single missed path inherits whatever the fall-through is, which is how a gate silently fails open. A default-deny ledger removes that class of bug: "open" requires an affirmative, completed `PASS`, so a crash, an unhandled path, or a runner that never ran leaves the change held by construction.
+
+For each change under gate evaluation, every gate slot (`[in]`, `[canon]`, `[out]`) SHALL have a verdict in the ledger, INITIALIZED to `PENDING` (a non-passing state). A verdict SHALL become `PASS` ONLY by an explicit, completed clean result. The verdict set is: `PENDING` (default — a runner that never recorded a verdict; treated as held), `PASS` (ran, clean), `FAIL` (ran, findings), `FAILED_TO_RUN` (ran, could not produce a verdict), `DISABLED` (gate not configured; non-blocking).
+
+There SHALL be no skip/absent code path for a gate slot: every slot — whether its gate is enabled OR disabled — SHALL run a runner that affirmatively writes a verdict. A disabled gate's runner is a STUB that writes `DISABLED`. This eliminates the disabled-vs-failed ambiguity at the structural level — "disabled" is an explicit recorded verdict, never an absence that a reader must remember to treat as a pass.
+
+The executor SHALL be invoked ONLY when every BLOCKING gate (`[in]`, `[canon]`) is `PASS` or `DISABLED`. A blocking gate that is `PENDING`, `FAIL`, or `FAILED_TO_RUN` SHALL hold the change. Because the default is `PENDING`, any failure to affirmatively record `PASS` holds the change without the holding code having to anticipate the specific failure.
+
+The ledger SHALL be rendered into the PR body as a compliance record: per gate, its identifier, the model that ran it, AND its verdict (with a one-line summary for `FAIL` / `FAILED_TO_RUN`). A `PASS` is therefore VISIBLE in the PR — the operator can see which gate ran, with which model, and that it passed — rather than inferred from the silent absence of an alert. The agentic reviewer's verdict SHALL likewise appear in the PR record.
+
+#### Scenario: A blocking gate left PENDING holds the change
+- **WHEN** a blocking gate's runner does not record a verdict (it crashes, an unhandled path is taken, or it never runs) so the ledger entry remains `PENDING`
+- **THEN** the change is HELD (the executor is NOT invoked) — `PENDING` is non-passing by construction
+- **AND** no code path needs to anticipate the specific failure for the hold to occur
+
+#### Scenario: A disabled gate records DISABLED via a stub
+- **WHEN** a gate is not configured (disabled)
+- **THEN** its slot's stub runner records `DISABLED` (a non-blocking verdict), NOT an absence
+- **AND** the executor proceeds (a disabled gate does not hold the change)
+
+#### Scenario: The executor runs only when blocking gates are PASS or DISABLED
+- **WHEN** the gate ledger for a change is evaluated before the executor
+- **THEN** the executor is invoked ONLY if every blocking gate (`[in]`, `[canon]`) is `PASS` or `DISABLED`
+- **AND** any blocking gate that is `PENDING`, `FAIL`, or `FAILED_TO_RUN` holds the change
+
+#### Scenario: The PR body renders the gate ledger as a compliance record
+- **WHEN** a change reaches PR creation
+- **THEN** the PR body contains a gate-verdict section listing, per gate, its identifier, the model that ran it, AND its verdict
+- **AND** a `PASS` is visible there (not inferred from silence), so an operator can judge whether a verdict came from a model they trust

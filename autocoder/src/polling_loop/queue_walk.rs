@@ -394,76 +394,62 @@ pub(crate) async fn process_one_pending_change(
         }
     }
 
-    // Verifier-gate framework (a61): the change-lifecycle consistency checks
-    // are organized as named gates positioned around the executor. The `[in]`
-    // gate IS the change-internal contradiction pre-flight (a19; agentic a59);
-    // it is resolved through the registry so a62/a63 register `[canon]`/`[out]`
-    // the same way. An unrealized gate resolves to "no installed gate" AND the
-    // framework invokes nothing for it.
-    //
-    // Opt-in via `executor.change_internal_contradiction_check: enabled`: the
-    // scoped context is `None` until daemon startup installs one, so tests AND
-    // default-off operators short-circuit here without touching the LLM.
-    // Failures inside the gate fail-open (no contradictions reported, executor
-    // proceeds).
-    if let Some(cc_ctx) = crate::preflight::change_contradiction::current()
-        && let Some(crate::verifier_gate::GateImpl::ContradictionCheck) =
-            crate::verifier_gate::GateRegistry::standard()
-                .resolve(crate::verifier_gate::VerifierGate::In)
-    {
-        match handle_contradiction_preflight(paths, workspace, repo, chatops_ctx, change, &cc_ctx)
-            .await
-        {
-            Ok(Some(step)) => return Ok(step),
-            Ok(None) => {}
-            Err(e) => {
-                let label = crate::verifier_gate::VerifierGate::In.label();
-                tracing::warn!(
-                    url = %repo.url,
-                    change = %change,
-                    "{label} change-contradiction pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
-                );
-            }
-        }
+    // Verifier-gate framework (a61) + default-deny verdict ledger
+    // (verifier-gates-fail-closed §5): the pre-executor `[in]`/`[canon]` gates'
+    // fail-closed disposition is enforced STRUCTURALLY, not by per-arm
+    // inspection. Every gate slot starts `Pending` (a non-passing state); a
+    // runner ALWAYS records a verdict — an enabled gate records its
+    // `Pass`/`Fail`/`FailedToRun`, a disabled gate records `Disabled` via a
+    // stub. The executor runs ONLY when `ledger.blocking_ok()` (every blocking
+    // gate `Pass` or `Disabled`); any `Pending` left by a runner that never
+    // recorded holds the change by construction. There is NO skip/absent code
+    // path — that is the thing that used to let a gate silently fail open.
+    let mut ledger = crate::gate_ledger::GateLedger::new();
+
+    // `[in]` gate: run its runner (enabled → handler verdict; disabled → stub
+    // `Disabled`), record the verdict + model in the ledger. A short-circuit
+    // holds the change immediately on a blocking-fail so we do NOT run `[canon]`
+    // on a change already held (preserving the single-marker behavior).
+    run_in_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.r#in.verdict, &ledger) {
+        return Ok(step);
     }
 
-    // The `[canon]` gate (a62): the change-vs-canonical contradiction
-    // pre-flight, the natural sibling of the `[in]` gate above. Same lifecycle
-    // position (pre-executor) AND disposition (non-empty findings write the
-    // marker + alert + halt the walk). Resolved through the same registry; an
-    // unrealized gate resolves to "no installed gate" AND nothing runs.
-    //
-    // Opt-in via `executor.change_canonical_contradiction_check: enabled`: the
-    // scoped context is `None` until daemon startup installs one, so tests AND
-    // default-off operators short-circuit here without touching the LLM.
-    // Failures inside the gate fail-open (no contradictions reported, executor
-    // proceeds).
-    if let Some(canon_ctx) = crate::preflight::canon_contradiction::current()
-        && let Some(crate::verifier_gate::GateImpl::CanonContradictionCheck) =
-            crate::verifier_gate::GateRegistry::standard()
-                .resolve(crate::verifier_gate::VerifierGate::Canon)
-    {
-        match handle_canon_contradiction_preflight(
-            paths,
-            workspace,
-            repo,
-            chatops_ctx,
-            change,
-            &canon_ctx,
-        )
-        .await
-        {
-            Ok(Some(step)) => return Ok(step),
-            Ok(None) => {}
-            Err(e) => {
-                let label = crate::verifier_gate::VerifierGate::Canon.label();
-                tracing::warn!(
-                    url = %repo.url,
-                    change = %change,
-                    "{label} change-vs-canonical pre-flight check errored unexpectedly; proceeding to executor: {e:#}"
-                );
-            }
-        }
+    // `[canon]` gate: same no-skip runner + record.
+    run_canon_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.canon.verdict, &ledger) {
+        return Ok(step);
+    }
+
+    // DEFENSIVE proceed-gate (the structural fail-closed guarantee): read the
+    // ledger. If any blocking gate is NOT `Pass`/`Disabled` — including a
+    // `Pending` left by a runner that returned without recording — HOLD. This
+    // catches the "missed path" class the inspect-and-branch dispatch was prone
+    // to: the hold happens without this code anticipating the specific failure.
+    if !ledger.blocking_ok() {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            in_verdict = ledger.r#in.verdict.as_str(),
+            canon_verdict = ledger.canon.verdict.as_str(),
+            "gate ledger is not blocking-ok; HOLDING the change (fail-closed by construction)"
+        );
+        // Persist the ledger so the PR-render path (if reached) sees the held
+        // state; best-effort.
+        let _ = crate::gate_ledger::write_ledger(workspace, change, &ledger);
+        return Ok(QueueStep::SpecRevisionMarked);
+    }
+
+    // Every blocking gate is `Pass`/`Disabled`: persist the ledger for the PR
+    // render AND proceed to the executor. Best-effort — the in-memory ledger
+    // already gated the executor; only the PR-render record is at risk on a
+    // write failure.
+    if let Err(e) = crate::gate_ledger::write_ledger(workspace, change, &ledger) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to persist gate ledger (PR will render only the post-executor verdict): {e:#}"
+        );
     }
 
     queue::lock(workspace, change).with_context(|| format!("locking change `{change}`"))?;
@@ -501,6 +487,160 @@ pub(crate) async fn process_one_pending_change(
     // dir, so the lock is gone, but `queue::unlock` is idempotent).
     let _ = queue::unlock(workspace, change);
     result
+}
+
+/// Run the `[in]` gate's runner AND record its verdict in `ledger` (no-skip
+/// dispatch, verifier-gates-fail-closed §5). When the gate is enabled (the
+/// scoped context is `Some` AND the registry installs `ContradictionCheck`),
+/// the handler runs and its [`crate::gate_ledger::GateVerdict`] is recorded; a
+/// Rust `Err` from the dispatch maps to `FailedToRun` and STILL holds (the
+/// marker/alert are written here via [`handle_gate_error`]). When the gate is
+/// disabled, a STUB records `Disabled` — never an absence. Either way the slot
+/// is left with an affirmatively-recorded verdict, never `Pending`.
+async fn run_in_gate(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    ledger: &mut crate::gate_ledger::GateLedger,
+) -> Result<()> {
+    use crate::gate_ledger::GateVerdict;
+    let gate = crate::verifier_gate::VerifierGate::In;
+    let enabled = crate::preflight::change_contradiction::current().filter(|_| {
+        matches!(
+            crate::verifier_gate::GateRegistry::standard().resolve(gate),
+            Some(crate::verifier_gate::GateImpl::ContradictionCheck)
+        )
+    });
+    let Some(cc_ctx) = enabled else {
+        // Disabled-gate STUB: record `Disabled` (a non-blocking verdict), NOT an
+        // absence a reader must remember to treat as a pass.
+        ledger.set_in(GateVerdict::Disabled, None, None);
+        return Ok(());
+    };
+    let model = Some(cc_ctx.model.model.clone());
+    let verdict = match handle_contradiction_preflight(
+        paths, workspace, repo, chatops_ctx, change, &cc_ctx,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // A Rust `Err` from the dispatch maps to FailedToRun and STILL
+            // holds: write the marker/alert here (the handler's own error
+            // paths already did so on their `Errored` arm; this covers the
+            // unexpected-dispatch-error case).
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "{} change-contradiction pre-flight errored unexpectedly; recording FAILED TO RUN (fail-closed): {e:#}",
+                gate.label()
+            );
+            let _ = handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                gate,
+                &format!("gate dispatch errored: {e:#}"),
+                cc_ctx.attribution.as_deref(),
+            )
+            .await;
+            GateVerdict::FailedToRun
+        }
+    };
+    ledger.set_in(verdict, model, gate_verdict_summary(verdict));
+    Ok(())
+}
+
+/// Run the `[canon]` gate's runner AND record its verdict (no-skip dispatch).
+/// Mirrors [`run_in_gate`]: enabled → handler verdict; disabled → `Disabled`
+/// stub; dispatch `Err` → `FailedToRun` + hold marker.
+async fn run_canon_gate(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    ledger: &mut crate::gate_ledger::GateLedger,
+) -> Result<()> {
+    use crate::gate_ledger::GateVerdict;
+    let gate = crate::verifier_gate::VerifierGate::Canon;
+    let enabled = crate::preflight::canon_contradiction::current().filter(|_| {
+        matches!(
+            crate::verifier_gate::GateRegistry::standard().resolve(gate),
+            Some(crate::verifier_gate::GateImpl::CanonContradictionCheck)
+        )
+    });
+    let Some(canon_ctx) = enabled else {
+        ledger.set_canon(GateVerdict::Disabled, None, None);
+        return Ok(());
+    };
+    let model = Some(canon_ctx.model.model.clone());
+    let verdict = match handle_canon_contradiction_preflight(
+        paths, workspace, repo, chatops_ctx, change, &canon_ctx,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "{} change-vs-canonical pre-flight errored unexpectedly; recording FAILED TO RUN (fail-closed): {e:#}",
+                gate.label()
+            );
+            let _ = handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                gate,
+                &format!("gate dispatch errored: {e:#}"),
+                canon_ctx.attribution.as_deref(),
+            )
+            .await;
+            GateVerdict::FailedToRun
+        }
+    };
+    ledger.set_canon(verdict, model, gate_verdict_summary(verdict));
+    Ok(())
+}
+
+/// A one-line PR summary for a blocking-gate verdict. `Fail`/`FailedToRun`
+/// carry a terse cause for the PR row; `Pass`/`Disabled`/`Pending` carry none.
+fn gate_verdict_summary(verdict: crate::gate_ledger::GateVerdict) -> Option<String> {
+    use crate::gate_ledger::GateVerdict;
+    match verdict {
+        GateVerdict::Fail => Some("contradiction findings written to .needs-spec-revision.json".into()),
+        GateVerdict::FailedToRun => {
+            Some("gate could not run — change held (see .needs-spec-revision.json)".into())
+        }
+        GateVerdict::Pass | GateVerdict::Disabled | GateVerdict::Pending => None,
+    }
+}
+
+/// Short-circuit hold: if `verdict` is a blocking-fail (`Fail`/`FailedToRun`),
+/// persist the ledger AND return the held step so the caller stops immediately —
+/// the handler already wrote the marker/alert, AND we do NOT run a later gate on
+/// a change already held (single-marker behavior). Returns `None` to proceed.
+fn hold_if_blocking_fail(
+    workspace: &Path,
+    change: &str,
+    verdict: crate::gate_ledger::GateVerdict,
+    ledger: &crate::gate_ledger::GateLedger,
+) -> Option<QueueStep> {
+    use crate::gate_ledger::GateVerdict;
+    if matches!(verdict, GateVerdict::Fail | GateVerdict::FailedToRun) {
+        // Best-effort persist so the PR-render path (if it is ever reached for a
+        // held change) sees the recorded verdict.
+        let _ = crate::gate_ledger::write_ledger(workspace, change, ledger);
+        return Some(QueueStep::SpecRevisionMarked);
+    }
+    None
 }
 
 #[derive(Debug)]

@@ -296,6 +296,67 @@ fn resolve_reviewer_api_key(cfg: &ReviewerConfig, optional: bool) -> Result<Stri
     }
 }
 
+/// Resolve the agentic reviewer's already-resolved config (a55 registry
+/// nickname or legacy inline form — both fully resolved by
+/// [`crate::config::Config::load_from`]) into a
+/// [`crate::agentic_run::ResolvedModel`] for the agentic transport. The
+/// reviewer session passes the result as `model: Some(_)` so the wrapped CLI
+/// runs the operator-configured model instead of the CLI's own default. The
+/// `opencode` strategy keys off `provider` + `api_key` to decide the
+/// `--model` form (verbatim opencode id for a keyless authenticating provider,
+/// `<provider>/<model>` + provider block for a keyed one or Ollama); the
+/// `claude` strategy sets `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL`.
+///
+/// Parallel to [`resolve_code_implements_spec_check_model`]; the only
+/// differences are the config-label strings AND that the api_key is resolved
+/// `optional` (the agentic reviewer's CLI self-authenticates, so a keyless
+/// reviewer yields an EMPTY key — which triggers opencode's keyless path: NO
+/// provider block + verbatim `--model`). A supplied key resolves and is
+/// threaded to the CLI exactly like the gates.
+pub fn resolve_reviewer_model(
+    cfg: &ReviewerConfig,
+) -> Result<crate::agentic_run::ResolvedModel> {
+    let provider = cfg
+        .provider
+        .expect("reviewer.provider resolved at config-load");
+    let model = cfg.model.clone();
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        // Defense-in-depth: config-load validation already requires
+        // `api_base_url` for these providers, but resolve it through an
+        // explicit error rather than silently defaulting to `""` — mirrors the
+        // gate resolvers AND the oneshot `build_from_config`.
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!("reviewer.api_base_url is required when provider=openai_compatible")
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!("reviewer.api_base_url is required when provider=ollama")
+        })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
+    };
+    let api_key = match provider {
+        // a69: `agy`/Ollama authenticate from their own login/store; no
+        // per-model credential is threaded through the agentic reviewer.
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
+        // The agentic reviewer's CLI self-authenticates, so the key is
+        // OPTIONAL: a keyless reviewer resolves to EMPTY (triggering opencode's
+        // keyless path), a configured one resolves and is passed to the CLI.
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            resolve_reviewer_api_key(cfg, true)?
+        }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
+}
+
 /// Resolve the change-internal contradiction pre-flight's LLM config (a19)
 /// into a [`crate::agentic_run::ResolvedModel`] (a56) for the agentic
 /// transport (a59). The `claude` CLI strategy reads the resulting tuple to
@@ -630,6 +691,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Regression for the `[out]`-gate opencode auth failure: when a gate's
+    // config carries an api_key (as it does after a registry nickname with a
+    // key is resolved back into the block at config-load), every gate threads a
+    // NON-EMPTY `ResolvedModel.api_key`. A non-empty key is what makes the
+    // opencode strategy write the `{env:...}` apiKey reference + set the
+    // subprocess env; an empty one would write an apiKey-less provider block
+    // that shadows opencode's own login → "No cookie auth credentials found".
+    #[test]
+    fn gate_models_resolve_inline_key_to_non_empty() {
+        let inline_cfg = ContradictionCheckLlmConfig {
+            provider: Some(LlmProvider::OpenAiCompatible),
+            model: "qwen3.7-max".into(),
+            api_key_env: None,
+            api_key: Some(crate::config::SecretSource::Inline {
+                value: "sk-gate-secret".into(),
+            }),
+            api_base_url: Some("https://api.example.invalid/v1".into()),
+        };
+        for (label, resolved) in [
+            ("[in]", resolve_contradiction_check_model(&inline_cfg)),
+            ("[canon]", resolve_canon_contradiction_check_model(&inline_cfg)),
+            ("[out]", resolve_code_implements_spec_check_model(&inline_cfg)),
+        ] {
+            let m = resolved
+                .unwrap_or_else(|e| panic!("{label} gate must resolve with key: {e:#}"));
+            assert_eq!(
+                m.api_key, "sk-gate-secret",
+                "{label} gate must thread the configured key into ResolvedModel.api_key"
+            );
+        }
+    }
+
+    // A `ReviewerConfig` skeleton for the agentic reviewer (defaults the
+    // agentic transport so the api_key is OPTIONAL — the bug-fix path).
+    fn reviewer_cfg(
+        provider: LlmProvider,
+        model: &str,
+        api_base_url: Option<&str>,
+        api_key: Option<crate::config::SecretSource>,
+    ) -> crate::config::ReviewerConfig {
+        crate::config::ReviewerConfig {
+            enabled: true,
+            provider: Some(provider),
+            model: model.into(),
+            api_key_env: None,
+            api_key,
+            api_base_url: api_base_url.map(str::to_string),
+            prompt_template_path: None,
+            code_review: None,
+            auto_revise: crate::config::AutoRevise::Off,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
+            max_code_reviews_per_pr: None,
+            suggest_rereview_threshold: None,
+            skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Agentic,
+            command: "opencode".to_string(),
+        }
+    }
+
+    // The bug: the agentic reviewer ran the CLI's OWN default model because it
+    // passed `model: None`. After the fix the reviewer resolves its model
+    // exactly like the gates. A KEYLESS `openai_compatible` reviewer resolves to
+    // an EMPTY key (so the opencode strategy takes its keyless path: NO provider
+    // block + verbatim `--model`) AND carries the operator's real opencode id
+    // verbatim.
+    #[test]
+    fn reviewer_model_keyless_openai_compatible_resolves_empty_key_verbatim_model() {
+        let cfg = reviewer_cfg(
+            LlmProvider::OpenAiCompatible,
+            "openrouter/qwen/qwen3-max",
+            Some("https://api.example.invalid/v1"),
+            None,
+        );
+        let m = resolve_reviewer_model(&cfg).expect("keyless reviewer must resolve");
+        assert_eq!(m.provider, LlmProvider::OpenAiCompatible);
+        // Verbatim — fed to opencode `--model` unchanged (the keyless path).
+        assert_eq!(m.model, "openrouter/qwen/qwen3-max");
+        assert!(
+            m.api_key.is_empty(),
+            "keyless reviewer → empty key (opencode self-auth keyless path)"
+        );
+        // The empty key is what drives the opencode strategy's keyless path (NO
+        // provider block + verbatim `--model`); that strategy behavior is
+        // asserted end-to-end in `agentic_run.rs`'s OpencodeStrategy tests.
+    }
+
+    // A KEYED `openai_compatible` reviewer threads its resolved key into
+    // `ResolvedModel.api_key` (NON-empty), which makes the opencode strategy
+    // write the provider block + the `<provider>/<model>` selection form.
+    #[test]
+    fn reviewer_model_keyed_openai_compatible_resolves_non_empty_key() {
+        let cfg = reviewer_cfg(
+            LlmProvider::OpenAiCompatible,
+            "qwen3-max",
+            Some("https://api.example.invalid/v1"),
+            Some(crate::config::SecretSource::Inline {
+                value: "sk-reviewer-secret".into(),
+            }),
+        );
+        let m = resolve_reviewer_model(&cfg).expect("keyed reviewer must resolve");
+        assert_eq!(
+            m.api_key, "sk-reviewer-secret",
+            "keyed reviewer threads its key into ResolvedModel.api_key"
+        );
+        // A non-empty key drives the opencode strategy's KEYED path (provider
+        // block + `<provider>/<model>` selection), asserted end-to-end in the
+        // OpencodeStrategy tests in `agentic_run.rs`.
+    }
+
+    // An Anthropic (claude) reviewer also resolves its model — the claude
+    // strategy sets `ANTHROPIC_MODEL` from it. A keyless one is empty (CLI
+    // self-auth) and defaults the Anthropic base URL.
+    #[test]
+    fn reviewer_model_anthropic_keyless_resolves_with_default_base() {
+        let cfg = reviewer_cfg(LlmProvider::Anthropic, "claude-opus-4-8", None, None);
+        let m = resolve_reviewer_model(&cfg).expect("anthropic reviewer must resolve");
+        assert_eq!(m.provider, LlmProvider::Anthropic);
+        assert_eq!(m.model, "claude-opus-4-8");
+        assert!(m.api_key.is_empty(), "keyless anthropic reviewer → empty key");
+        assert_eq!(m.api_base_url, DEFAULT_ANTHROPIC_BASE);
     }
 
     #[tokio::test]

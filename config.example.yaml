@@ -507,23 +507,39 @@ github:
 # the `claude` CLI; `openai_compatible` / `ollama` → the `opencode` CLI; the
 # optional per-entry `cli:` overrides that default.
 #
+# opencode-driven entries (openai_compatible / ollama): `model:` is the opencode
+# `--model` selector, whose shape depends on how opencode authenticates. The three
+# cases below — see docs/CONFIG.md "models:" for the full rule.
+#
 # models:
+#   # CASE 1 — provider you authed with `opencode auth login` (the common case).
+#   # KEYLESS: `model` is the FULL opencode id (provider INCLUDED); autocoder
+#   # passes it to `--model` verbatim and writes no provider block, so opencode
+#   # uses its own login. `api_base_url` is unused. Run `opencode models` to see
+#   # the ids you are authed to — the provider (here `openrouter`) is YOURS.
+#   hosted_login:
+#     provider: openai_compatible
+#     model: openrouter/qwen/qwen3-max        # <opencode-provider>/<model>, verbatim
+#     # no api_key, no api_base_url — opencode authenticates from its own login
+#
+#   # CASE 2 — a custom OpenAI-compatible endpoint autocoder injects a key into
+#   # (NOT in opencode's login). KEYED: `model` is the BARE model id; autocoder
+#   # defines an opencode provider named `openai_compatible` from the base + key
+#   # and selects `--model openai_compatible/<model>`. Base MUST include its path.
 #   beefy_security:
 #     provider: openai_compatible
-#     model: moonshotai/kimi-k2
-#     api_base_url: https://openrouter.ai/api/v1
-#     api_key_env: OPENROUTER_KEY
-#     # cli: opencode                     # optional; default for openai_compatible
+#     model: moonshotai/kimi-k2               # bare model id
+#     api_base_url: https://some-host/v1      # full base, including /v1
+#     api_key_env: SOME_PROVIDER_KEY          # written as an {env:…} ref, never raw
+#
+#   # CASE 3 — Ollama (local; never authenticates). `model` is the BARE model id;
+#   # autocoder defines the `ollama` provider from the base. Base includes /v1
+#   # (opencode appends /chat/completions; a path-less base 404s — check-config
+#   # WARNs). No api_key.
 #   fast_local:
 #     provider: ollama
-#     model: qwen2.5-coder:32b
-#     # Full OpenAI-compatible base INCLUDING the path. A registry model drives an
-#     # agentic CLI (opencode), which appends `/chat/completions` to this base — so
-#     # a path-less base (`http://localhost:11434`) hits the wrong path and 404s.
-#     # Ollama serves the OpenAI-compatible API under /v1. (check-config WARNs on a
-#     # path-less openai_compatible/ollama base.)
+#     model: qwen2.5-coder:32b                # bare model id
 #     api_base_url: http://localhost:11434/v1
-#     # no api_key — Ollama does not authenticate
 #
 # With the registry above, a role can reference a nickname (no `provider:`)…
 # reviewer:
