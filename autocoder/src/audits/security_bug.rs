@@ -666,6 +666,7 @@ mod tests {
             AuditOutcome::SpecsWritten {
                 changes,
                 retries_used,
+                ..
             } => {
                 assert_eq!(changes, vec!["fix-retry-me".to_string()]);
                 assert_eq!(retries_used, 1);
@@ -708,8 +709,14 @@ mod tests {
     #[tokio::test]
     async fn zero_change_dirs_is_no_findings_and_does_not_retry() {
         let (_t, ws) = init_workspace_with(&[]);
-        // CLI produces nothing.
-        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        // Genuine no-findings run: the agent surveys and concludes there is
+        // nothing to fix, emitting that conclusion (so it is an evidenced
+        // no-findings run, not a degenerate did-nothing session).
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the codebase for security and bug issues; found nothing confident to report.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
 
         let cfg = executor_cfg(&script.to_string_lossy());
@@ -733,12 +740,55 @@ mod tests {
             AuditOutcome::SpecsWritten {
                 changes,
                 retries_used,
+                ..
             } => {
                 assert!(changes.is_empty());
                 assert_eq!(retries_used, 0, "zero proposals must not consume retries");
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
         }
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Fail closed: a clean exit-0 session that produced NO output AND no
+    /// change dirs is a degenerate "did nothing" run — it MUST resolve to
+    /// `DidNotComplete { NoTerminalVerdict }`, never a silent `SpecsWritten([])`
+    /// (the `gatekeepers-fail-closed` standard). Contrast with
+    /// `zero_change_dirs_is_no_findings_and_does_not_retry`, where the session
+    /// emits a conclusion and is therefore an evidenced no-findings run.
+    #[tokio::test]
+    async fn degenerate_empty_session_fails_closed_to_did_not_complete() {
+        let (_t, ws) = init_workspace_with(&[]);
+        // Exits 0 with no stdout AND writes nothing.
+        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 3,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(
+                outcome,
+                AuditOutcome::DidNotComplete {
+                    cause: crate::audits::AuditFailureCause::NoTerminalVerdict,
+                    ..
+                }
+            ),
+            "degenerate empty session must fail closed, got {outcome:?}"
+        );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
@@ -794,7 +844,7 @@ mod tests {
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten { changes, retries_used } => {
+            AuditOutcome::SpecsWritten { changes, retries_used, .. } => {
                 assert_eq!(changes, vec!["secure-fire-on-success".to_string()]);
                 assert_eq!(retries_used, 0);
             }

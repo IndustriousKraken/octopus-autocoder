@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use super::{
-    AuditContext, AuditLogWriter, AuditOutcome, WritePolicy, build_validation_addendum,
+    AuditContext, AuditFailureCause, AuditLogWriter, AuditOutcome, WritePolicy, build_validation_addendum,
     post_proposal_created_notification, post_validation_exhausted_notification,
     read_proposal_why_first_line, workspace_is_valid, workspace_unavailable_outcome,
 };
@@ -235,13 +235,24 @@ pub(crate) async fn run_specs_writing_audit(
             },
         );
 
-        if let Some(err) = outcome_to_terminal_err(
+        if outcome_to_terminal_err(
             &outcome,
             &mut ctx.log_writer,
             audit_type,
             params.executor_timeout_secs,
-        ) {
-            return Err(err);
+        )
+        .is_some()
+        {
+            // Fail closed: a terminal session error (timeout, non-zero exit,
+            // OR an uncaptured exit status) is a did-not-complete outcome —
+            // surfaced to chatops and cadence-preserving, never a silent
+            // "0 findings". `outcome_to_terminal_err` has already logged the
+            // specific cause to the run log.
+            return Ok(AuditOutcome::DidNotComplete {
+                audit_type: audit_type.to_string(),
+                cause: AuditFailureCause::SessionErrored,
+                examined_summary: None,
+            });
         }
 
         let after = snapshot_change_dirs(ctx.workspace);
@@ -273,16 +284,38 @@ pub(crate) async fn run_specs_writing_audit(
         }
 
         if new_dirs.is_empty() {
-            // Zero proposals — legitimate "no findings", not a
-            // validation failure. Exit the retry loop with empty list.
-            let _ = ctx.log_writer.write_section(
-                &format!("{audit_type}_outcome"),
-                &format!("kind: SpecsWritten\nvalidated_count: 0\nretries_used: {attempt}"),
-            );
-            return Ok(AuditOutcome::SpecsWritten {
-                changes: Vec::new(),
-                retries_used: attempt,
-            });
+            // Zero proposals. Fail closed on a degenerate session: a clean
+            // exit that produced NO real output is "did not complete", NOT a
+            // silent "no findings" (the `gatekeepers-fail-closed` standard).
+            // A session that produced substantive output but no change dirs is
+            // an evidenced genuine no-findings run, carrying that output as the
+            // examined-summary.
+            match summarize_session_output(&outcome.stdout) {
+                None => {
+                    let _ = ctx.log_writer.write_section(
+                        &format!("{audit_type}_outcome"),
+                        &format!(
+                            "kind: DidNotComplete\ncause: no_terminal_verdict\nretries_used: {attempt}"
+                        ),
+                    );
+                    return Ok(AuditOutcome::DidNotComplete {
+                        audit_type: audit_type.to_string(),
+                        cause: AuditFailureCause::NoTerminalVerdict,
+                        examined_summary: None,
+                    });
+                }
+                examined @ Some(_) => {
+                    let _ = ctx.log_writer.write_section(
+                        &format!("{audit_type}_outcome"),
+                        &format!("kind: SpecsWritten\nvalidated_count: 0\nretries_used: {attempt}"),
+                    );
+                    return Ok(AuditOutcome::SpecsWritten {
+                        changes: Vec::new(),
+                        retries_used: attempt,
+                        examined_summary: examined,
+                    });
+                }
+            }
         }
 
         let mut validated: Vec<String> = Vec::new();
@@ -371,6 +404,7 @@ pub(crate) async fn run_specs_writing_audit(
             return Ok(AuditOutcome::SpecsWritten {
                 changes: validated,
                 retries_used: attempt,
+                examined_summary: summarize_session_output(&outcome.stdout),
             });
         }
 
@@ -508,11 +542,35 @@ fn git_add_openspec_changes(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Length cap for an audit's `examined_summary` (the agent's account of what
+/// it looked at, distilled from the session transcript). Keeps the on-demand
+/// chatops completion notification bounded.
+const EXAMINED_SUMMARY_CAP: usize = 1500;
+
+/// Distill an `examined_summary` from a session's captured output. Returns
+/// `None` for an empty/whitespace-only transcript — the fail-closed signal
+/// that a clean exit did NO real work, distinct from a substantive run that
+/// genuinely found nothing. A non-empty transcript is trimmed AND tail-capped
+/// (the agent's conclusion sits at the end) to `EXAMINED_SUMMARY_CAP` chars.
+fn summarize_session_output(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let count = trimmed.chars().count();
+    if count <= EXAMINED_SUMMARY_CAP {
+        Some(trimmed.to_string())
+    } else {
+        let tail: String = trimmed.chars().skip(count - EXAMINED_SUMMARY_CAP).collect();
+        Some(format!("…{tail}"))
+    }
+}
+
 /// Pure transformation: given an [`crate::agentic_run::AgenticRunOutcome`],
-/// return Some(error) if the outcome is terminal (timed out OR non-zero
-/// exit). Returns None when the caller should continue processing. Mirrors
-/// the same-named helpers in the `architecture_consultative` and `drift`
-/// audit modules.
+/// return Some(error) if the outcome is terminal (timed out, non-zero exit,
+/// OR an uncaptured exit status). Returns None when the caller should continue
+/// processing. Mirrors the same-named helpers in the `architecture_consultative`
+/// and `drift` audit modules.
 fn outcome_to_terminal_err(
     outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
@@ -528,16 +586,28 @@ fn outcome_to_terminal_err(
             "{audit_type}: CLI exceeded the {timeout_secs}s timeout"
         ));
     }
-    if let Some(status) = outcome.exit_status
-        && !status.success()
-    {
-        let _ = log_writer.write_section(
-            &format!("{audit_type}_outcome"),
-            &format!("kind: Err\nreason: exit {status}"),
-        );
-        return Some(anyhow!("{audit_type}: CLI exited {status}"));
+    match outcome.exit_status {
+        Some(status) if status.success() => None,
+        Some(status) => {
+            let _ = log_writer.write_section(
+                &format!("{audit_type}_outcome"),
+                &format!("kind: Err\nreason: exit {status}"),
+            );
+            Some(anyhow!("{audit_type}: CLI exited {status}"))
+        }
+        None => {
+            // Fail closed: an uncaptured exit status (e.g. a signal kill) must
+            // NOT fall through as a clean exit. Without this, a killed session
+            // reaches the disk-diff and reports a silent "0 findings".
+            let _ = log_writer.write_section(
+                &format!("{audit_type}_outcome"),
+                "kind: Err\nreason: exit status not captured",
+            );
+            Some(anyhow!(
+                "{audit_type}: CLI exit status was not captured (likely signal-killed)"
+            ))
+        }
     }
-    None
 }
 
 #[cfg(test)]
@@ -617,6 +687,29 @@ mod outcome_tests {
         assert!(
             outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 30).is_none()
         );
+    }
+
+    #[test]
+    fn outcome_to_terminal_err_treats_uncaptured_exit_status_as_failure() {
+        // Fail closed: a session whose exit status was never captured (e.g. a
+        // signal kill) must be a terminal error, NOT a clean fall-through that
+        // the disk-diff would report as a silent "0 findings".
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        let mut log_writer = make_log_writer(workspace);
+        let log_path = log_writer.path().to_path_buf();
+        let outcome = crate::agentic_run::AgenticRunOutcome {
+            timed_out: false,
+            exit_status: None,
+            stdout: "partial work".into(),
+            stderr: String::new(),
+            ..Default::default()
+        };
+        let err = outcome_to_terminal_err(&outcome, &mut log_writer, "security_bug_audit", 30)
+            .expect("uncaptured exit status must produce Err");
+        assert!(format!("{err:#}").contains("not captured"));
+        let log = std::fs::read_to_string(&log_path).expect("log readable");
+        assert!(log.contains("reason: exit status not captured"));
     }
 }
 

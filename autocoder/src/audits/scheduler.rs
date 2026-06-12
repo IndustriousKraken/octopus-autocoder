@@ -564,14 +564,16 @@ async fn drive_one_audit(
         AuditOutcome::SpecsWritten {
             changes: names,
             retries_used,
+            examined_summary,
         } => {
             let retry_clause = format_retry_clause(*retries_used, max_validation_retries);
             log_writer.write_section(
                 "audit_run_outcome",
                 &format!(
-                    "kind: SpecsWritten{retry_clause}\nend: {}\nretries_used: {}\nspecs:\n{}",
+                    "kind: SpecsWritten{retry_clause}\nend: {}\nretries_used: {}\nexamined_summary:\n{}\nspecs:\n{}",
                     end_ts.to_rfc3339(),
                     retries_used,
+                    examined_summary.as_deref().unwrap_or("<none>"),
                     names.join("\n")
                 ),
             )?;
@@ -608,6 +610,51 @@ async fn drive_one_audit(
                 "audit `{at}` produced an invalid proposal; discarded after {retries_attempted} retries",
             );
             history_excerpt = Some(truncate_chars(final_error, VALIDATION_ERROR_HISTORY_EXCERPT));
+        }
+        AuditOutcome::DidNotComplete {
+            audit_type: at,
+            cause,
+            examined_summary,
+        } => {
+            // Fail closed: the audit could not reach an evidenced terminal
+            // verdict. Log it, surface it to chatops, AND return WITHOUT
+            // advancing the cadence state so the next iteration re-evaluates
+            // and may retry (mirrors the `WorkspaceUnavailable` posture, but
+            // here the audit DID consume an attempt and is operator-visible).
+            log_writer.write_section(
+                "audit_run_outcome",
+                &format!(
+                    "kind: DidNotComplete\nend: {}\ncause: {}\nexamined_summary:\n{}",
+                    end_ts.to_rfc3339(),
+                    cause.as_str(),
+                    examined_summary.as_deref().unwrap_or("<none>"),
+                ),
+            )?;
+            tracing::error!(
+                url = %repo.url,
+                audit_type = at.as_str(),
+                cause = cause.as_str(),
+                "audit `{at}` did not complete ({}); failing closed — cadence NOT advanced",
+                cause.as_str(),
+            );
+            if let Some(ctx) = chatops_ctx {
+                if let Err(e) = super::post_did_not_complete_notification(
+                    ctx,
+                    &repo.url,
+                    at.as_str(),
+                    *cause,
+                    examined_summary.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        url = %repo.url,
+                        audit_type = at.as_str(),
+                        "did-not-complete chatops post failed: {e:#}"
+                    );
+                }
+            }
+            return Ok(true);
         }
         AuditOutcome::WorkspaceUnavailable { .. } => {
             // Handled by the early-return above. Unreachable here, but

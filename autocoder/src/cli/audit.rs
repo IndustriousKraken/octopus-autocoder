@@ -295,6 +295,7 @@ fn print_standalone_outcome(audit_name: &str, outcome: &AuditOutcome) {
         AuditOutcome::SpecsWritten {
             changes,
             retries_used,
+            ..
         } => {
             println!(
                 "🔍 {audit_name}: wrote {} spec(s){}",
@@ -328,6 +329,21 @@ fn print_standalone_outcome(audit_name: &str, outcome: &AuditOutcome) {
                 "⏭ {audit_name}: workspace unavailable ({reason}) at {}",
                 workspace_path.display()
             );
+        }
+        AuditOutcome::DidNotComplete {
+            cause,
+            examined_summary,
+            ..
+        } => {
+            println!(
+                "🚫 {audit_name}: did NOT complete — {} (failed-to-run, not \"no findings\")",
+                cause.as_str()
+            );
+            if let Some(s) = examined_summary {
+                if !s.trim().is_empty() {
+                    println!("   examined: {s}");
+                }
+            }
         }
     }
 }

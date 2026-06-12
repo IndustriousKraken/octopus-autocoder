@@ -625,7 +625,11 @@ mod tests {
     async fn run_logs_best_effort_when_rag_off() {
         let (_t, ws) = init_workspace();
         // Agent finds nothing → no change dir created.
-        let _script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let _script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the canon for redundant requirements; found nothing to consolidate.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
@@ -714,7 +718,11 @@ mod tests {
     #[tokio::test]
     async fn empty_result_is_silent_no_commit() {
         let (_t, ws) = init_workspace();
-        let _script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let _script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the canon for redundant requirements; found nothing to consolidate.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
         let settings_dir = TempDir::new().unwrap();

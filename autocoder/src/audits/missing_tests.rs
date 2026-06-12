@@ -712,8 +712,14 @@ mod tests {
     #[tokio::test]
     async fn empty_findings_no_commit_no_chatops_post() {
         let (_t, ws) = init_workspace_with(&[]);
-        // CLI exits cleanly without creating any change directory.
-        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        // Genuine no-findings run: the agent surveys and concludes there are
+        // no coverage gaps, emitting that conclusion — an evidenced clean run,
+        // not a degenerate did-nothing session.
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Surveyed for uncovered error paths; found no meaningful coverage gaps.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "fake-openspec-ok.sh", "#!/bin/sh\nexit 0\n");
 
         let cfg = executor_cfg(&script.to_string_lossy());

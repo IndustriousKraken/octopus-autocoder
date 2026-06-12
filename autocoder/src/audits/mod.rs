@@ -129,6 +129,35 @@ pub struct Finding {
     pub anchor: Option<String>,
 }
 
+/// Why an audit failed to reach an evidenced terminal verdict. Carried by
+/// [`AuditOutcome::DidNotComplete`] and surfaced to operators so an inability
+/// to run is explicit and actionable, never a silent pass (the
+/// `gatekeepers-fail-closed` standard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFailureCause {
+    /// The wrapped session errored: it timed out, exited non-zero, OR its
+    /// exit status could not be captured (e.g. a signal kill).
+    SessionErrored,
+    /// The session ended without the agent declaring a terminal verdict, so
+    /// there is no evidence it ran to a conclusion.
+    NoTerminalVerdict,
+    /// The agent declared findings but none could be persisted as a valid
+    /// change directory.
+    FoundButCouldNotPersist,
+}
+
+impl AuditFailureCause {
+    /// Short operator-facing phrase for log lines and chatops alerts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionErrored => "session errored or exit status not captured",
+            Self::NoTerminalVerdict => "session produced no terminal verdict",
+            Self::FoundButCouldNotPersist => "findings could not be persisted",
+        }
+    }
+}
+
 /// Outcome of one audit's `run`. The scheduler dispatches on the variant:
 /// `NoFindings` → silent; `Reported` → chatops post unless empty + clean
 /// (controlled by `notify_on_clean`); `SpecsWritten` → info log only;
@@ -154,6 +183,10 @@ pub enum AuditOutcome {
     SpecsWritten {
         changes: Vec<String>,
         retries_used: u32,
+        /// The agent's account of what it examined, captured from the session
+        /// transcript. Surfaced by the on-demand completion notification so
+        /// even a clean (zero-proposal) run carries evidence the audit ran.
+        examined_summary: Option<String>,
     },
     /// The audit's LLM produced a proposal that failed
     /// `openspec validate --strict` after exhausting the configured
@@ -177,6 +210,17 @@ pub enum AuditOutcome {
         workspace_path: PathBuf,
         reason: String,
     },
+    /// The audit could not produce an evidenced terminal verdict, so it fails
+    /// closed rather than reporting a passing / no-findings result (the
+    /// `gatekeepers-fail-closed` standard). The scheduler treats this like the
+    /// audit-failure path: it does NOT advance the cadence state and surfaces
+    /// the failure. `examined_summary` carries whatever the agent reported
+    /// about what it looked at, when available.
+    DidNotComplete {
+        audit_type: String,
+        cause: AuditFailureCause,
+        examined_summary: Option<String>,
+    },
 }
 
 impl AuditOutcome {
@@ -197,6 +241,7 @@ impl AuditOutcome {
         Self::SpecsWritten {
             changes,
             retries_used: 0,
+            examined_summary: None,
         }
     }
 
@@ -207,6 +252,7 @@ impl AuditOutcome {
             Self::SpecsWritten { .. } => AuditOutcomeKind::SpecsWritten,
             Self::ValidationExhausted { .. } => AuditOutcomeKind::ValidationExhausted,
             Self::WorkspaceUnavailable { .. } => AuditOutcomeKind::WorkspaceUnavailable,
+            Self::DidNotComplete { .. } => AuditOutcomeKind::DidNotComplete,
         }
     }
 
@@ -224,6 +270,7 @@ impl AuditOutcome {
                 retries_attempted, ..
             } => *retries_attempted,
             Self::WorkspaceUnavailable { .. } => 0,
+            Self::DidNotComplete { .. } => 0,
         }
     }
 }
@@ -239,6 +286,7 @@ pub enum AuditOutcomeKind {
     SpecsWritten,
     ValidationExhausted,
     WorkspaceUnavailable,
+    DidNotComplete,
 }
 
 impl AuditOutcomeKind {
@@ -250,6 +298,7 @@ impl AuditOutcomeKind {
             Self::SpecsWritten => "SpecsWritten",
             Self::ValidationExhausted => "ValidationExhausted",
             Self::WorkspaceUnavailable => "WorkspaceUnavailable",
+            Self::DidNotComplete => "DidNotComplete",
         }
     }
 }
@@ -796,6 +845,38 @@ pub async fn post_validation_exhausted_notification(
             final_error,
         );
         ctx.chatops.post_notification(&ctx.channel, &text).await
+    }
+}
+
+/// Post the `🚫` did-not-complete notification: the audit could not reach an
+/// evidenced terminal verdict, so it fails closed rather than reporting a
+/// passing / no-findings result (the `gatekeepers-fail-closed` standard). The
+/// top-line names the repo, audit type, and cause; the examined-summary (when
+/// present) goes in the thread body so an operator sees what, if anything, the
+/// audit looked at before it failed.
+pub async fn post_did_not_complete_notification(
+    ctx: &ChatOpsContext,
+    repo_url: &str,
+    audit_type: &str,
+    cause: AuditFailureCause,
+    examined_summary: Option<&str>,
+) -> Result<()> {
+    let top_line = format!(
+        "🚫 {audit_type} did NOT complete for {repo_url} — {cause}. Treated as failed-to-run (NOT \"no findings\"); cadence unchanged, the audit re-runs next cadence.",
+        cause = cause.as_str(),
+    );
+    match examined_summary {
+        Some(s) if !s.trim().is_empty() => {
+            let body = format!(
+                "What the audit examined before failing:\n{}",
+                truncate_chars(s, VALIDATION_ERROR_NOTIFICATION_CAP)
+            );
+            ctx.chatops
+                .post_notification_with_thread(&ctx.channel, &top_line, &body)
+                .await
+                .map(|_| ())
+        }
+        _ => ctx.chatops.post_notification(&ctx.channel, &top_line).await,
     }
 }
 
@@ -2123,7 +2204,8 @@ mod tests {
         assert_eq!(
             AuditOutcome::SpecsWritten {
                 changes: vec![],
-                retries_used: 3
+                retries_used: 3,
+                examined_summary: None,
             }
             .retries_used(),
             3
