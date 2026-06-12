@@ -633,7 +633,7 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** the section cross-links back to OPERATIONS.md for the underlying queue-blocking model
 
 ### Requirement: CONFIG.md and OPERATIONS.md document the contradiction-check fields and cost model
-`docs/CONFIG.md`'s `executor:` table SHALL include rows for the three new fields (`change_internal_contradiction_check`, `change_internal_contradiction_check_prompt_path`, `change_internal_contradiction_check_llm`). `docs/OPERATIONS.md` SHALL include a "Pre-flight checks" section enumerating the layered pre-executor checks (validate → archivability → contradiction) AND noting the contradiction check's opt-in posture, LLM cost, AND fail-open behavior.
+`docs/CONFIG.md`'s `executor:` table SHALL include rows for the three new fields (`change_internal_contradiction_check`, `change_internal_contradiction_check_prompt_path`, `change_internal_contradiction_check_llm`). `docs/OPERATIONS.md` SHALL include a "Pre-flight checks" section enumerating the layered pre-executor checks (validate → archivability → contradiction) AND noting the contradiction check's opt-in posture, LLM cost, AND its **fail-CLOSED** behavior (a blocking gate that cannot run HOLDS the change rather than letting work proceed — superseding the original fail-open posture, per the "Control-plane gatekeepers fail closed, never to a passing verdict" requirement).
 
 #### Scenario: CONFIG.md documents all three new fields
 - **WHEN** an operator reads `docs/CONFIG.md`'s `executor:` table
@@ -643,13 +643,13 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 #### Scenario: OPERATIONS.md enumerates the pre-flight layers
 - **WHEN** an operator reads `docs/OPERATIONS.md`'s pre-flight-checks section
 - **THEN** the section enumerates the three layered checks: `openspec validate --strict` (well-formedness, free), `a17`'s archivability check (mechanical, free), AND `a19`'s contradiction check (LLM, opt-in, small per-change cost)
-- **AND** each layer's purpose is named AND the failure mode (marker + chatops alert + executor-skip) is described
+- **AND** each layer's purpose is named AND the failure mode (marker + chatops alert + change held) is described
 - **AND** the contradiction check's opt-in posture is explained: operators trading a small per-change LLM cost for the catch of semantic self-contradictions enable it; default-off operators see no behavior change
 
-#### Scenario: OPERATIONS.md describes the fail-open posture
+#### Scenario: OPERATIONS.md describes the fail-closed posture
 - **WHEN** an operator reads the contradiction-check description in OPERATIONS.md
-- **THEN** the section notes that LLM failures (transport, parse, etc.) fail OPEN — the executor proceeds, the operator sees a WARN in journalctl
-- **AND** the section explains why: a failed check should not block work; operators decide whether to investigate based on the WARN cadence
+- **THEN** the section notes that a gate that cannot run (transport/parse error, unavailable CLI, OR no submission) fails CLOSED — the change is HELD with a `.needs-spec-revision.json` failed-to-run marker AND a chatops alert naming the gate AND the cause, NOT waved through with a WARN
+- **AND** the section explains why: a control-plane gatekeeper that cannot run must not let work proceed as if it passed (gatekeepers fail closed); the operator fixes the gate AND clears the marker to retry
 
 ### Requirement: DEPLOYMENT.md and CHATOPS.md explain the version-string format and the source-vs-binary distinction
 `docs/DEPLOYMENT.md` SHALL include a "Version-string format" section explaining how the daemon resolves its version string at build time, what operators see in different build contexts (clean tag, dev commit past tag, dirty working tree, source tarball without `.git/`), AND the Cargo.toml-bump convention. `docs/CHATOPS.md` SHALL update the `🆙` startup-notification example to show both the clean-tag form AND the development-build form.
@@ -1173,4 +1173,38 @@ This requirement gives the project's largest historical bloat hotspot a durable 
 - **WHEN** the polling-loop test suite is evaluated against the `Tests assert behavior or derivation, never message wording` requirement
 - **THEN** no test asserts a hand-authored substring of a shipped alert, notification, PR-body, OR marker message
 - **AND** message-content intent is carried by requirement prose (verified by the drift audit), not by unit-test substring checks
+
+### Requirement: Control-plane gatekeepers fail closed, never to a passing verdict
+
+A **control-plane gatekeeper** — any component whose role is to decide whether work may proceed OR to attest that work meets a standard (the pre-flight contradiction gates `[in]` AND `[canon]`, the code-implements-spec gate `[out]`, the code reviewer, any future verifier, AND audits that gate an operator's `send it`) — SHALL NOT represent an inability to run as a passing OR permissive outcome. The absence of a SUCCESSFUL evaluation SHALL be a distinct, surfaced, non-passing state. A control that fails open is not a control.
+
+This invariant SHALL hold by inspection — so the periodic `drift_audit` AND the `[canon]`/`[out]` gates can flag a violation — and applies across every gatekeeper:
+
+- **Verdict defaults AND initializers SHALL be the non-passing state.** A verdict variable, accumulator, or struct default SHALL initialize to blocked / errored / unknown — NEVER to approve / pass. An aggregation over zero evaluated items SHALL NOT yield a passing result.
+- **Error paths SHALL NOT collapse into pass.** A spawn OR timeout failure, an unavailable or unregistered CLI / tool, a missing or unparseable result, a schema-rejected submission the agent never corrects, OR "no result recorded" SHALL be treated as ERRORED — never as "no findings" / "approved" / "verified".
+- **The errored state SHALL be operator-visible**, surfaced via chatops AND/OR the artifact the gatekeeper writes, naming the gatekeeper AND the cause — so "ran AND passed" is distinguishable from "could not run".
+- **The action on error follows the gatekeeper's role, but none is silent-pass.** A BLOCKING gatekeeper SHALL NOT let the gated work proceed as if it passed: it holds the work in an explicit failed-to-run state an operator clears (distinct from a "found a problem" verdict). An ADVISORY gatekeeper SHALL render an explicit "failed to run" result rather than omit its output OR report success.
+- **Transient-failure tolerance is bounded retry, NOT fail-open.** Where a gatekeeper retries transient failures to avoid wedging on a blip, it SHALL — after exhausting the retry bound — enter the errored state, never pass.
+
+A developer-facing standards doc SHALL record this invariant so contributors apply it to new gatekeepers.
+
+#### Scenario: A gatekeeper that cannot run does not pass
+- **WHEN** a gatekeeper's evaluation cannot complete (CLI/tool unavailable, spawn/timeout error, no result recorded, OR an uncorrected schema-rejected submission)
+- **THEN** the outcome is the errored state, surfaced with the gatekeeper name AND the cause
+- **AND** it is NOT reported as passed / approved / verified / "no findings"
+
+#### Scenario: A blocking gatekeeper holds rather than waving work through
+- **WHEN** a blocking gatekeeper (e.g. an `[in]` or `[canon]` pre-flight) enters the errored state
+- **THEN** the gated work does NOT proceed as if the gate passed
+- **AND** the work is held in an explicit failed-to-run state an operator clears, distinct from a "found a problem" verdict
+
+#### Scenario: An advisory gatekeeper reports "failed to run", not success
+- **WHEN** an advisory gatekeeper (e.g. the `[out]` gate) enters the errored state
+- **THEN** it renders an explicit "failed to run" result naming the cause
+- **AND** it does NOT omit its output NOR report success / verified
+
+#### Scenario: Verdict defaults and zero-item aggregations are non-passing
+- **WHEN** a gatekeeper initializes a verdict OR aggregates a verdict over zero evaluated items
+- **THEN** the initial / default / zero-item result is a non-passing state (blocked / errored / unknown)
+- **AND** no code path yields approve / pass from a default OR from zero evaluated items
 
