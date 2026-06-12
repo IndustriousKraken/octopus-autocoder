@@ -1184,7 +1184,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let pending_triages: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_triages_for_task = pending_triages.clone();
-        let pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>> =
+        let pending_audit_runs: Arc<std::sync::Mutex<Vec<crate::polling_loop::QueuedAudit>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_audit_runs_for_task = pending_audit_runs.clone();
         let pending_proposal_requests: Arc<

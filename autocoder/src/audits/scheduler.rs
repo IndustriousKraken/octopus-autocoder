@@ -62,7 +62,7 @@ pub async fn run_due_audits(
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
-    queued_audit_types: &HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<crate::polling_loop::QueuedAudit>>,
 ) -> Result<()> {
     if registry.is_empty() {
         return Ok(());
@@ -88,19 +88,24 @@ pub async fn run_due_audits(
         return Ok(());
     }
 
-    // 1. Run queued audits first (unconditional — bypass cadence). Each
-    //    run increments the counter; once the bound is reached the
-    //    remaining queued entries defer to the next iteration.
+    // 1. Run queued on-demand audits first (unconditional — bypass cadence),
+    //    WITHOUT draining the shared queue up-front. A snapshot is taken for
+    //    this iteration; entries are removed from the shared handle only after
+    //    they actually run (below), so a bound-reached deferral, a registry
+    //    miss, an early return, OR a busy-skipped pass (which never calls this
+    //    function) never silently drops an acknowledged request.
+    let queued_snapshot: Vec<crate::polling_loop::QueuedAudit> =
+        queued_audit_types.lock().unwrap().clone();
     let mut ran_via_queue: HashSet<String> = HashSet::new();
-    if !queued_audit_types.is_empty() {
+    if !queued_snapshot.is_empty() {
         for audit in registry.iter() {
             if audits_run_this_iteration >= bound {
                 break;
             }
             let name = audit.audit_type();
-            if !queued_audit_types.contains(name) {
+            let Some(queued) = queued_snapshot.iter().find(|q| q.audit_type == name) else {
                 continue;
-            }
+            };
             match run_one_audit_unconditional(
                 paths,
                 audit.as_ref(),
@@ -110,6 +115,7 @@ pub async fn run_due_audits(
                 audit_settings,
                 chatops_ctx,
                 &mut state,
+                queued.origin.as_ref(),
             )
             .await
             {
@@ -132,19 +138,28 @@ pub async fn run_due_audits(
             }
             ran_via_queue.insert(name.to_string());
         }
-        // Log any queued names that didn't match a registered audit so
-        // an operator typo doesn't disappear silently. Names that DID
-        // match but were deferred because the bound was reached are NOT
-        // logged here — they remain in the queue for next iteration.
-        for q in queued_audit_types {
-            if !ran_via_queue.contains(q)
-                && !registry.iter().any(|a| a.audit_type() == q)
+        // Log any queued names that didn't match a registered audit so an
+        // operator typo doesn't disappear silently; these are pruned below.
+        for q in &queued_snapshot {
+            if !ran_via_queue.contains(&q.audit_type)
+                && !registry.iter().any(|a| a.audit_type() == q.audit_type)
             {
                 tracing::warn!(
                     url = %repo.url,
-                    "queued audit `{q}` is not a registered audit type; skipping"
+                    "queued audit `{}` is not a registered audit type; skipping",
+                    q.audit_type
                 );
             }
+        }
+        // Prune the shared queue: drop entries that ran this iteration AND
+        // unregistered typos (which would otherwise re-log every iteration).
+        // Registered-but-bound-deferred entries remain for the next iteration.
+        {
+            let mut g = queued_audit_types.lock().unwrap();
+            g.retain(|q| {
+                registry.iter().any(|a| a.audit_type() == q.audit_type)
+                    && !ran_via_queue.contains(&q.audit_type)
+            });
         }
     }
 
@@ -217,6 +232,8 @@ async fn run_one_audit(
         chatops_ctx,
         state,
         /*bypass_cadence=*/ false,
+        // Cadence-driven runs are not operator-triggered: no completion post.
+        /*completion_origin=*/ None,
     )
     .await
 }
@@ -238,6 +255,7 @@ async fn run_one_audit_unconditional(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
+    completion_origin: Option<&crate::polling_loop::ChatOrigin>,
 ) -> Result<bool> {
     drive_one_audit(
         paths,
@@ -249,6 +267,7 @@ async fn run_one_audit_unconditional(
         chatops_ctx,
         state,
         /*bypass_cadence=*/ true,
+        completion_origin,
     )
     .await
 }
@@ -274,6 +293,7 @@ async fn drive_one_audit(
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
     bypass_cadence: bool,
+    completion_origin: Option<&crate::polling_loop::ChatOrigin>,
 ) -> Result<bool> {
     let audit_type = audit.audit_type();
     let cadence = resolved_cadence(repo, audits_cfg, audit_type);
@@ -494,6 +514,14 @@ async fn drive_one_audit(
         // audit DID consume an attempt though (it ran far enough to
         // violate the write policy), so it counts toward the bound.
         return Ok(true);
+    }
+
+    // Operator-triggered runs get a terminal completion notification in their
+    // originating thread — including a clean "0 findings" (with the examined
+    // summary) AND the did-not-complete states — so the request and its result
+    // are connected. Cadence-driven runs carry no origin and post nothing here.
+    if let Some(origin) = completion_origin {
+        post_on_demand_audit_completion(chatops_ctx, &repo.url, audit_type, origin, &outcome).await;
     }
 
     // Outcome dispatch.
@@ -754,6 +782,105 @@ pub(crate) fn detect_write_policy_violation(
     }
 }
 
+/// Post the terminal completion notification for an OPERATOR-TRIGGERED audit
+/// to the thread the request originated from, falling back to a channel-level
+/// post when the backend does not support threaded replies (graceful
+/// degradation). Renders the outcome so the operator who asked always gets a
+/// terminal result — proposals written, no findings (with the examined
+/// summary), or did-not-complete (with the cause) — never silence.
+async fn post_on_demand_audit_completion(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo_url: &str,
+    audit_type: &str,
+    origin: &crate::polling_loop::ChatOrigin,
+    outcome: &AuditOutcome,
+) {
+    let Some(ctx) = chatops_ctx else {
+        return;
+    };
+    let text = format_on_demand_completion(repo_url, audit_type, outcome);
+    if let Some(thread_ts) = &origin.thread_ts
+        && ctx
+            .chatops
+            .post_threaded_reply(&origin.channel, thread_ts, &text)
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    if let Err(e) = ctx.chatops.post_notification(&origin.channel, &text).await {
+        tracing::warn!(
+            url = %repo_url,
+            audit_type,
+            "on-demand audit completion notification failed: {e:#}"
+        );
+    }
+}
+
+/// Render the operator-facing terminal result for an on-demand audit run.
+fn format_on_demand_completion(repo_url: &str, audit_type: &str, outcome: &AuditOutcome) -> String {
+    match outcome {
+        AuditOutcome::SpecsWritten {
+            changes,
+            examined_summary,
+            ..
+        } => {
+            let mut s = if changes.is_empty() {
+                format!("✅ {audit_type} for {repo_url}: completed — 0 proposals (no findings).")
+            } else {
+                format!(
+                    "🔍 {audit_type} for {repo_url}: completed — wrote {} proposal(s):\n{}",
+                    changes.len(),
+                    changes
+                        .iter()
+                        .map(|c| format!("• {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            if let Some(sum) = examined_summary {
+                s.push_str(&format!("\n\nExamined:\n{sum}"));
+            }
+            s
+        }
+        AuditOutcome::NoFindings => {
+            format!("✅ {audit_type} for {repo_url}: completed — no findings.")
+        }
+        AuditOutcome::Reported { findings, .. } => {
+            if findings.is_empty() {
+                format!("✅ {audit_type} for {repo_url}: completed — no findings.")
+            } else {
+                format!(
+                    "📋 {audit_type} for {repo_url}: completed — {} finding(s) (posted to the channel).",
+                    findings.len()
+                )
+            }
+        }
+        AuditOutcome::DidNotComplete {
+            cause,
+            examined_summary,
+            ..
+        } => {
+            let mut s = format!(
+                "🚫 {audit_type} for {repo_url}: did NOT complete — {} (failed-to-run, NOT \"no findings\"; cadence unchanged).",
+                cause.as_str()
+            );
+            if let Some(sum) = examined_summary {
+                s.push_str(&format!("\n\nExamined before failing:\n{sum}"));
+            }
+            s
+        }
+        AuditOutcome::ValidationExhausted {
+            retries_attempted, ..
+        } => format!(
+            "❌ {audit_type} for {repo_url}: produced an invalid proposal after {retries_attempted} retries; discarded."
+        ),
+        AuditOutcome::WorkspaceUnavailable { reason, .. } => {
+            format!("⏭ {audit_type} for {repo_url}: workspace unavailable ({reason}).")
+        }
+    }
+}
+
 async fn dispatch_reported_to_chatops(
     paths: &crate::paths::DaemonPaths,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -898,6 +1025,23 @@ mod tests {
     use crate::config::{AuditsConfig, Cadence, RepositoryConfig};
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
+
+    /// Build the on-demand audit-run queue handle `run_due_audits` now takes,
+    /// from a set of audit-type names. Origin is omitted — these tests exercise
+    /// the run / drain / durability paths, not the chatops completion notice.
+    fn to_queue(
+        names: &std::collections::HashSet<String>,
+    ) -> std::sync::Mutex<Vec<crate::polling_loop::QueuedAudit>> {
+        std::sync::Mutex::new(
+            names
+                .iter()
+                .map(|n| crate::polling_loop::QueuedAudit {
+                    audit_type: n.clone(),
+                    origin: None,
+                })
+                .collect(),
+        )
+    }
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
@@ -1081,7 +1225,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a1");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "audit should have run");
@@ -1106,7 +1250,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a2");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "audit must NOT run within cadence");
@@ -1131,7 +1275,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a3");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0, "HEAD unchanged → skip");
@@ -1155,7 +1299,7 @@ mod tests {
         state.save(&ws).unwrap();
         let cfg = audits_cfg_daily("a4");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 1, "SHA differs → audit must run");
@@ -1169,7 +1313,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         // No AuditsConfig at all → cadence resolves to Disabled.
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1181,7 +1325,7 @@ mod tests {
             settings: HashMap::new(),
             ..AuditsConfig::default()
         };
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         assert_eq!(*counter.lock().unwrap(), 0);
@@ -1198,7 +1342,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a6");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         // After the violation handler, the workspace should be clean
@@ -1227,7 +1371,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         // After the OpenSpecOnly violation, src/forbidden.rs must be gone
@@ -1256,7 +1400,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("a7b");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         // The path is inside the allowed prefix → no revert.
@@ -1292,7 +1436,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .expect("scheduler must not propagate audit errors");
         // af2 (later in registry) MUST have run despite af1 erroring.
@@ -1375,7 +1519,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             Some(&ctx),
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -1410,7 +1554,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             Some(&ctx),
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -1450,7 +1594,7 @@ mod tests {
             Some(&cfg2),
             &settings,
             Some(&ctx),
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -1486,7 +1630,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             Some(&ctx),
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -1517,7 +1661,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("logged1");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         let log_dir = test_paths().audit_logs_dir(&basename);
@@ -1569,7 +1713,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("wsu1");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
 
@@ -1621,7 +1765,7 @@ mod tests {
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .expect("scheduler must keep going");
         assert_eq!(
@@ -1678,7 +1822,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         no_post.assert_async().await;
@@ -1699,7 +1843,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("ve1");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         // State + history updated.
@@ -1737,7 +1881,7 @@ mod tests {
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("rep_retry");
         let repo = fixture_repo();
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         let state = AuditState::load_or_default(&ws);
@@ -1783,7 +1927,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1854,7 +1998,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -1898,7 +2042,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &settings, Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -1924,7 +2068,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         silent_mock.assert_async().await;
@@ -1966,7 +2110,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         post_mock.assert_async().await;
@@ -2019,7 +2163,7 @@ mod tests {
             .create_async()
             .await;
         let ctx = make_ctx(chatops);
-        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &HashSet::new())
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), Some(&ctx), &std::sync::Mutex::new(Vec::new()))
             .await
             .unwrap();
         top_mock.assert_async().await;
@@ -2115,7 +2259,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2162,7 +2306,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2183,7 +2327,7 @@ mod tests {
         let repo = fixture_repo();
         let mut queued = HashSet::new();
         queued.insert("q3".to_string());
-        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &queued)
+        run_due_audits(test_paths(), &registry, &ws, &repo, None, &HashMap::new(), None, &to_queue(&queued))
             .await
             .unwrap();
         assert_eq!(
@@ -2214,7 +2358,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2245,7 +2389,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2298,7 +2442,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2331,7 +2475,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2346,7 +2490,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -2396,7 +2540,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -2433,7 +2577,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -2463,7 +2607,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -2490,7 +2634,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();
@@ -2516,7 +2660,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2525,6 +2669,107 @@ mod tests {
             0,
             "bound=0 must also defer on-demand queued audits"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_audit_pruned_only_after_running_else_retained() {
+        // Durability: a queued entry is removed ONLY once its audit actually
+        // runs. A bounded-out pass leaves it in place for a later iteration.
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("dur-a").with_rhc(false));
+        let ca = a.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![a.clone()]);
+        let repo = fixture_repo();
+        let queue = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit {
+            audit_type: "dur-a".to_string(),
+            origin: None,
+        }]);
+
+        // bound=0 → the audit does NOT run AND the entry is RETAINED.
+        let cfg0 = audits_cfg_bounded(&["dur-a"], 0);
+        run_due_audits(
+            test_paths(), &registry, &ws, &repo, Some(&cfg0), &HashMap::new(), None, &queue,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 0, "bound=0 must not run the audit");
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "a bounded-out queued audit must be RETAINED, not discarded"
+        );
+
+        // bound=1 → the audit runs AND its entry is pruned.
+        let cfg1 = audits_cfg_bounded(&["dur-a"], 1);
+        run_due_audits(
+            test_paths(), &registry, &ws, &repo, Some(&cfg1), &HashMap::new(), None, &queue,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 1, "the audit must run when not bounded out");
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a queued audit must be pruned ONLY after it actually runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_queued_audit_is_pruned() {
+        // A typo'd audit name matches no registered audit; it must be pruned
+        // so it does not re-log "not a registered audit type" every iteration.
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("reg-a").with_rhc(false));
+        let registry = AuditRegistry::with_audits(vec![a.clone()]);
+        let cfg = audits_cfg_bounded(&["reg-a"], 4);
+        let repo = fixture_repo();
+        let queue = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit {
+            audit_type: "typo_audit".to_string(),
+            origin: None,
+        }]);
+        run_due_audits(
+            test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &queue,
+        )
+        .await
+        .unwrap();
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "an unregistered (typo) queued audit must be pruned"
+        );
+    }
+
+    #[test]
+    fn on_demand_completion_renders_each_terminal_outcome() {
+        use crate::audits::AuditFailureCause;
+        // Clean no-findings: reports 0 proposals AND carries the examined summary.
+        let clean = AuditOutcome::SpecsWritten {
+            changes: vec![],
+            retries_used: 0,
+            examined_summary: Some("walked the payment flow".to_string()),
+        };
+        let t = format_on_demand_completion("acme/widgets", "security_bug_audit", &clean);
+        assert!(t.contains("0 proposals"), "{t}");
+        assert!(t.contains("walked the payment flow"), "{t}");
+
+        // Proposals written: names the proposals.
+        let wrote = AuditOutcome::SpecsWritten {
+            changes: vec!["secure-totp-replay".to_string()],
+            retries_used: 0,
+            examined_summary: None,
+        };
+        let t = format_on_demand_completion("acme/widgets", "security_bug_audit", &wrote);
+        assert!(t.contains("wrote 1 proposal"), "{t}");
+        assert!(t.contains("secure-totp-replay"), "{t}");
+
+        // Did-not-complete: surfaced as failed-to-run with the cause, NOT clean.
+        let dnc = AuditOutcome::DidNotComplete {
+            audit_type: "security_bug_audit".to_string(),
+            cause: AuditFailureCause::NoTerminalVerdict,
+            examined_summary: None,
+        };
+        let t = format_on_demand_completion("acme/widgets", "security_bug_audit", &dnc);
+        assert!(t.contains("did NOT complete"), "{t}");
+        assert!(t.contains(AuditFailureCause::NoTerminalVerdict.as_str()), "{t}");
+        assert!(t.contains("failed-to-run"), "must be surfaced as failed-to-run: {t}");
     }
 
     #[tokio::test]
@@ -2556,7 +2801,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2600,7 +2845,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &queued,
+            &to_queue(&queued),
         )
         .await
         .unwrap();
@@ -2641,7 +2886,7 @@ mod tests {
             Some(&cfg),
             &HashMap::new(),
             None,
-            &HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .unwrap();

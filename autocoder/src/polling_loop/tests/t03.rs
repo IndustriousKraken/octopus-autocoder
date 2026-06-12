@@ -95,7 +95,7 @@ async fn resume_with_empty_workspace_is_failed() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -241,7 +241,7 @@ async fn same_repo_block_skips_pending_when_still_waiting() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds without running pending");
@@ -355,7 +355,7 @@ async fn queue_resumes_after_waiting_set_empties() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -494,7 +494,7 @@ async fn execute_one_pass_resumed_change_counts_toward_cap() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");

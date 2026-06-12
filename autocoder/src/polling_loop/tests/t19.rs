@@ -85,7 +85,7 @@ async fn walk_yields_after_one_change_when_changelog_pending() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         ),
     )
     .await
@@ -140,7 +140,7 @@ async fn walk_yields_after_one_change_when_proposal_pending() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         ),
     )
     .await
@@ -192,7 +192,7 @@ async fn walk_yields_after_one_change_when_triage_pending() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         ),
     )
     .await
@@ -246,7 +246,7 @@ async fn walk_processes_full_batch_when_no_operator_request_pending() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         ),
     )
     .await
@@ -335,7 +335,7 @@ async fn walk_finishes_current_change_before_yielding() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         ),
     )
     .await

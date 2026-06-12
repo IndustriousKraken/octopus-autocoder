@@ -34,7 +34,7 @@ async fn self_heal_falls_through_when_openspec_validate_fails() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass returns Failed via fall-through, not Err");
@@ -105,7 +105,7 @@ async fn walk_queue_stops_at_max_changes() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -155,7 +155,7 @@ async fn walk_queue_cap_of_1_ships_one_per_pass() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -227,7 +227,7 @@ async fn walk_queue_halts_on_failed_change() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -333,7 +333,7 @@ async fn walk_queue_halts_on_escalated_change() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -386,7 +386,7 @@ async fn archived_change_leaves_clean_working_tree() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -427,7 +427,7 @@ async fn commit_contains_both_impl_and_archive_rename() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -540,7 +540,7 @@ async fn dirty_workspace_recovers_and_iteration_proceeds() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(

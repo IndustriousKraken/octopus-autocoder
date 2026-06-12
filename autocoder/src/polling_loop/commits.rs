@@ -18,7 +18,7 @@ pub async fn run_pass_through_commits(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
-    queued_audit_types: &std::collections::HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
 ) -> Result<(Vec<String>, bool)> {
     prepare_workspace_for_pass(paths, workspace, repo, github_cfg, chatops_ctx).await?;
 
@@ -486,7 +486,7 @@ async fn handle_blocking_markers_gate(
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
-    queued_audit_types: &std::collections::HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
     committed_count: usize,
 ) -> Result<bool> {
     let blocking_markers = queue::find_queue_blocking_markers(workspace)?;

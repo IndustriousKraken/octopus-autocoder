@@ -91,6 +91,30 @@ pub struct ChatOpsContext {
     pub pr_opened_enabled: bool,
 }
 
+/// The chat context an on-demand audit request originated from, so the daemon
+/// can post the terminal completion notification back to the operator's
+/// thread (a cadence-driven run carries `None` and emits no completion post).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChatOrigin {
+    pub channel: String,
+    /// The originating message's thread id, when the backend supports
+    /// threading. `None` → the completion notification posts channel-level.
+    pub thread_ts: Option<String>,
+}
+
+/// One entry in a repo's on-demand audit-run queue (`pending_audit_runs`).
+/// Carries the audit-type name AND the originating chat context so the
+/// scheduler can reply where the request came from. Kept in the queue until
+/// the audit has actually run, so a skipped, early-returning, or bounded-out
+/// pass never silently drops an acknowledged request. (Serialize/Deserialize
+/// are derived for a future cross-restart persistence pass.)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueuedAudit {
+    pub audit_type: String,
+    #[serde(default)]
+    pub origin: Option<ChatOrigin>,
+}
+
 /// Run the polling loop for a single repository. Each iteration is wrapped in
 /// `execute_one_pass`; failures inside a pass are logged and do not break the
 /// loop. Cancellation is checked between iterations and during the sleep.
@@ -124,7 +148,7 @@ pub async fn run(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
-    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<QueuedAudit>>>,
     pending_proposal_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>>,
     pending_changelog_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>>,
     pending_brownfield_requests: Arc<
@@ -240,7 +264,7 @@ pub async fn run_with_hooks(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
-    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<QueuedAudit>>>,
     pending_proposal_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>>,
     pending_changelog_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>>,
     pending_brownfield_requests: Arc<
@@ -323,13 +347,13 @@ pub async fn run_with_hooks(
 
         run_state_housekeeping(&paths);
 
-        // Drain the per-repo on-demand audit-run queue; the HashSet collapses
-        // any duplicates that survived the control-socket-level de-dup.
-        let queued_audit_types: std::collections::HashSet<String> = {
-            let mut g = pending_audit_runs.lock().unwrap();
-            std::mem::take(&mut *g).into_iter().collect()
-        };
-
+        // The on-demand audit-run queue is NOT drained here. Its handle is
+        // passed into the iteration work so the scheduler consumes only the
+        // audits it actually runs: a pass that skips (busy marker), returns
+        // early (workspace-init failure), or is bounded out
+        // (`max_audits_per_iteration: 0`) leaves queued entries intact for a
+        // later iteration rather than silently discarding an acknowledged
+        // request (durability).
         drain_chat_and_triage_queues(
             &paths,
             &workspace,
@@ -385,7 +409,7 @@ pub async fn run_with_hooks(
                 reviewer_snap.as_deref(),
                 chatops_ctx.as_ref(),
                 want_rebuild,
-                &queued_audit_types,
+                &pending_audit_runs,
                 stuck_threshold_secs,
                 perma_stuck_threshold,
                 max_changes_per_pr,

@@ -69,7 +69,7 @@ async fn dirty_workspace_recovery_failure_still_alerts() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(result.is_err(), "recovery failure must surface as Err");
@@ -230,7 +230,7 @@ async fn dirty_workspace_recovers_without_chatops() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(result.is_ok(), "iteration should succeed: {result:?}");

@@ -45,8 +45,8 @@ When an audit is triggered on demand — via the chatops `audit` verb or the CLI
 - **THEN** no on-demand completion notification is posted
 - **AND** the audit's existing findings / failure notification behavior is unchanged
 
-### Requirement: On-demand audit-run queue survives pass-skip, early-return, and daemon restart
-A queued on-demand audit SHALL be removed from the `pending_audit_runs` queue ONLY after the audit has actually run. When the polling pass that would run it is skipped (busy marker), returns early before the audit phase (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`), the queued entry SHALL remain for a later iteration rather than being discarded. The queue SHALL additionally be persisted such that a daemon restart between the enqueue acknowledgement and the run does not lose the queued audit.
+### Requirement: On-demand audit-run queue survives pass-skip, early-return, and bound-zero
+A queued on-demand audit SHALL be removed from the `pending_audit_runs` queue ONLY after the audit has actually run. When the polling pass that would run it is skipped (busy marker), returns early before the audit phase (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`), the queued entry SHALL remain for a later iteration rather than being discarded.
 
 #### Scenario: A busy-skipped pass does not lose the queued audit
 - **WHEN** an audit is queued AND the next pass skips because a busy marker is held
@@ -60,10 +60,6 @@ A queued on-demand audit SHALL be removed from the `pending_audit_runs` queue ON
 #### Scenario: An audit bound of zero defers rather than discards
 - **WHEN** an audit is queued AND `max_audits_per_iteration` is `0`
 - **THEN** the audit phase runs no audits this iteration AND the queued entry is retained for a later iteration
-
-#### Scenario: A restart between enqueue and run preserves the queued audit
-- **WHEN** an audit is queued AND the daemon restarts before the audit has run
-- **THEN** the queued audit is restored on startup AND runs on a subsequent iteration
 
 ## MODIFIED Requirements
 

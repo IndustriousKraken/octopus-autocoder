@@ -296,7 +296,7 @@ pub(crate) async fn run_one_pass_no_push(
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await?;
     Ok(processed)
@@ -473,7 +473,7 @@ pub(crate) async fn run_one_pass_with_threshold(
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await?;
     Ok(processed)

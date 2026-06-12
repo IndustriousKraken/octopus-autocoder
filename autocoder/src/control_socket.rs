@@ -232,11 +232,14 @@ pub struct RepoTaskHandle {
     /// (`chatops-on-demand-audit-trigger`). The chatops `audit` verb and
     /// the CLI `audit run` subcommand push canonical audit-type names
     /// onto this list via the `queue_audit` control-socket action; the
-    /// polling loop drains it at the start of each iteration's audit
-    /// phase and runs each one unconditionally (bypassing cadence). The
-    /// queue is de-duplicated on insert so multiple `audit` commands
-    /// before a single iteration collapse to one run.
-    pub pending_audit_runs: Arc<Mutex<Vec<String>>>,
+    /// polling loop consumes an entry ONLY once it has actually run
+    /// (bypassing cadence), so a skipped, early-returning, or bounded-out
+    /// pass never drops an acknowledged request (in-memory durability;
+    /// cross-restart persistence is a planned follow-on). Each entry carries
+    /// the originating chat context so the scheduler can post a terminal
+    /// completion notification back to the operator. De-duplicated on insert
+    /// so multiple `audit` commands collapse to one run.
+    pub pending_audit_runs: Arc<Mutex<Vec<crate::polling_loop::QueuedAudit>>>,
     /// Queue of chat-driven proposal requests awaiting triage
     /// (`chat-request-triage`). The chatops dispatcher's `propose` verb
     /// pushes here via the `queue_proposal_request` control-socket
@@ -1573,10 +1576,27 @@ fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
             });
         }
     };
+    // Carry the originating chat context (when present) so the scheduler can
+    // post the terminal completion notification back to the operator's thread.
+    let origin = parsed
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|channel| crate::polling_loop::ChatOrigin {
+            channel: channel.to_string(),
+            thread_ts: parsed
+                .get("thread_ts")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+        });
     {
         let mut g = queue.lock().unwrap();
-        if !g.iter().any(|a| a == &audit_type) {
-            g.push(audit_type.clone());
+        if !g.iter().any(|a| a.audit_type == audit_type) {
+            g.push(crate::polling_loop::QueuedAudit {
+                audit_type: audit_type.clone(),
+                origin,
+            });
         }
     }
     json!({
@@ -4493,7 +4513,10 @@ github:
         let guard = state.repo_tasks.lock().unwrap();
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
-        assert_eq!(*q, vec!["security_bug_audit".to_string()]);
+        assert_eq!(
+            q.iter().map(|a| a.audit_type.clone()).collect::<Vec<_>>(),
+            vec!["security_bug_audit".to_string()]
+        );
         drop(q);
         drop(guard);
         cancel.cancel();
@@ -4519,7 +4542,7 @@ github:
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
         assert_eq!(
-            *q,
+            q.iter().map(|a| a.audit_type.clone()).collect::<Vec<_>>(),
             vec!["security_bug_audit".to_string()],
             "duplicate audit_type must collapse to one entry"
         );
@@ -4543,8 +4566,8 @@ github:
         let guard = state.repo_tasks.lock().unwrap();
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
-        assert!(q.contains(&"security_bug_audit".to_string()));
-        assert!(q.contains(&"drift_audit".to_string()));
+        assert!(q.iter().any(|a| a.audit_type == "security_bug_audit"));
+        assert!(q.iter().any(|a| a.audit_type == "drift_audit"));
         assert_eq!(q.len(), 2);
         drop(q);
         drop(guard);

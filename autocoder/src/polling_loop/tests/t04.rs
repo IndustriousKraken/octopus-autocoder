@@ -89,7 +89,7 @@ async fn reviewer_verdict_drives_pr_shape() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .expect("commits step succeeds");

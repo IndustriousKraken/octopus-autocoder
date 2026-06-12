@@ -77,7 +77,7 @@ async fn failure_alert_cleared_on_subsequent_success() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
@@ -563,7 +563,7 @@ async fn transient_error_does_not_increment_counter() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(result.is_err(), "pre-executor failure must propagate");

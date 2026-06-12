@@ -20,7 +20,7 @@ pub async fn execute_one_pass(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
-    queued_audit_types: &std::collections::HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.

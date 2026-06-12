@@ -355,6 +355,10 @@ The ETA is `~Nm` where `N` is `poll_interval_sec` rounded to minutes, or `immine
 
 **Cadence interaction.** A queued audit's `last_run_at` is updated on success, so the next cadence-scheduled fire moves forward by the cadence interval from the on-demand timestamp — an on-demand run "consumes" one cycle of the cadence. Audits configured `cadence: disabled` can still be triggered on-demand; the audit's `last_run_at` is still updated, but with no cadence interval the "next scheduled fire" remains in the past, so the audit stays effectively disabled for cadence-driven scheduling.
 
+**Completion notification.** When the queued audit reaches a terminal outcome the daemon posts a result back to the channel you triggered it from, so the request and its result are connected instead of the `✓ Queued` ack being the last word. The notification distinguishes the terminal states: proposals written (it lists them), a clean run (`completed — 0 proposals (no findings)`) **with a short summary of what the audit examined**, and — critically — `did NOT complete` when the audit could not run to a verdict (a session error, an uncaptured exit status, or a degenerate empty session). A did-not-complete result is surfaced as **failed-to-run, never as "no findings"** (the `gatekeepers-fail-closed` standard): the cadence is left unchanged so the audit retries on its next cycle, and the operator sees the cause rather than a false all-clear.
+
+**Durability.** A queued audit is removed from the per-repo queue only once it has actually run. A polling pass that skips (busy marker), returns early (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`) leaves the queued entry in place for a later iteration instead of silently dropping an acknowledged request. (The queue lives in memory; cross-restart persistence is a planned follow-on.)
+
 **CLI variant.** `autocoder audit run --workspace <path> --audit <name>` does the same job from the command line (no substring matching — the audit-type slug must match exactly). See [CLI.md → audit run](CLI.md#audit-run).
 
 ### Generating a changelog: `changelog`

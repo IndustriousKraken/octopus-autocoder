@@ -11,7 +11,7 @@ This change brings the audit framework into conformance with the `gatekeepers-fa
 - **Fail-closed audit outcome initialization.** An audit run begins in an explicit "did not complete" state. Only a session that demonstrably ran to completion AND produced its expected artifact (or genuinely concluded no-findings with positive evidence of a survey) may resolve to a passing or no-findings outcome. A specs-writing session that produced output but persisted zero change directories, OR whose exit status was not captured, OR that shows no evidence of a real survey, resolves to a **surfaced failure** — chatops alert, cadence state NOT advanced — not "0 findings." Transient conditions get bounded retry, then errored; never fail-open.
 - **Survey-evidence capture.** The audit session's final-answer summary (what it examined and its conclusion) is captured and carried on the outcome, so even a legitimate zero-findings run ships with evidence that the audit actually looked.
 - **On-demand completion notification.** The chatops `audit` verb (and the CLI `audit run`) thread the originating channel and thread through the `queue_audit` action into the scheduler, which posts a terminal result back to that thread — "completed, N findings, here is what I examined" on success, and the explicit failed-to-run states above on failure.
-- **On-demand queue durability.** A queued on-demand audit is no longer lost when the pass it would run in is skipped (busy marker), returns early (workspace-init failure), is bounded out (`max_audits_per_iteration: 0`), or the daemon restarts. A queued entry is removed only once its audit has actually run; otherwise it survives to a later iteration.
+- **On-demand queue durability.** A queued on-demand audit is no longer lost when the pass it would run in is skipped (busy marker), returns early (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`). A queued entry is removed only once its audit has actually run; otherwise it survives to a later iteration. (Cross-restart persistence is split into its own change, `persist-on-demand-audit-queue`.)
 
 ## Capabilities
 
@@ -19,7 +19,7 @@ This change brings the audit framework into conformance with the `gatekeepers-fa
 <!-- none -->
 
 ### Modified Capabilities
-- `orchestrator-cli`: audit-framework outcome semantics (fail-closed initialization; "could not run" / "could not persist" / "no evidence of survey" become surfaced non-passing outcomes, distinct from "no findings"); survey-evidence capture on the outcome; the `queue_audit` control-socket action carries the originating chat channel/thread and an on-demand completion notification is emitted; the on-demand audit-run queue is durable across pass-skip, early-return, bound-zero, and restart.
+- `orchestrator-cli`: audit-framework outcome semantics (fail-closed initialization; "could not run" / "could not persist" / "no evidence of survey" become surfaced non-passing outcomes, distinct from "no findings"); survey-evidence capture on the outcome; the `queue_audit` control-socket action carries the originating chat channel/thread and an on-demand completion notification is emitted; the on-demand audit-run queue is durable across pass-skip, early-return, and bound-zero (cross-restart persistence is its own change, `persist-on-demand-audit-queue`).
 - `chatops-manager`: an on-demand audit completion notification (success with examined-summary, and the failed-to-run states) delivered to the thread the `audit` request originated from.
 
 ## Impact

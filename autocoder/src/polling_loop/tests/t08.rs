@@ -388,7 +388,7 @@ async fn preflight_failure_posts_chatops_alert_with_deltas_body() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
 

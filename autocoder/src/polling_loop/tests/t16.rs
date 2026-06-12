@@ -35,7 +35,7 @@ async fn pending_only_iteration_runs_no_audit_work() {
         &registry,
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -294,8 +294,7 @@ async fn audit_only_iteration_pushes_and_opens_pr() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("security_bug".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "security_bug".to_string(), origin: None }]);
 
     // Serialize: tests sharing the github-api-base test hook must not
     // race on the process-wide static.
@@ -458,8 +457,7 @@ async fn audit_only_pr_suppressed_when_iteration_pending_marker_present() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("security_bug".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "security_bug".to_string(), origin: None }]);
 
     // Mockito: GET /pulls is the iteration's open-PR pre-check
     // (runs BEFORE the audit + commit-count gate, must return []

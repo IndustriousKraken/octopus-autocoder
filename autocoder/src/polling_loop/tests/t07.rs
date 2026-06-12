@@ -82,7 +82,7 @@ async fn audit_scheduler_not_invoked_when_ensure_initialized_fails() {
         &registry,
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(
@@ -174,7 +174,7 @@ async fn iteration_auto_recovers_partial_clone_without_failure() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     let (processed, _self_heal) = result.expect(
@@ -257,7 +257,7 @@ async fn perma_stuck_alert_posts_to_chatops() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
 
@@ -329,7 +329,7 @@ async fn perma_stuck_alert_body_contains_log_path() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     alert_mock.assert_async().await;
@@ -399,7 +399,7 @@ async fn spec_needs_revision_writes_marker_and_alerts_and_halts_queue() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
 

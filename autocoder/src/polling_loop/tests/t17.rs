@@ -119,8 +119,7 @@ async fn audit_only_pr_suppressed_mixed_audit_and_iteration_wip() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("security_bug".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "security_bug".to_string(), origin: None }]);
 
     let _hook_guard = test_hooks::lock();
     let mut server = mockito::Server::new_async().await;

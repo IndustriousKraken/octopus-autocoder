@@ -1743,11 +1743,15 @@ autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit fra
   chatops alert posted, audit re-runs next iteration)
 - **AND** no OpenSpec changes are committed from this run
 
-#### Scenario: Empty findings produce no spec changes and no chatops post
-- **WHEN** the audit identifies zero meaningful coverage gaps
-- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])`
-- **AND** no commit is made, no chatops post is sent (per
-  framework behavior for spec-writing audits)
+#### Scenario: Genuine no-findings is declared, not inferred from absence
+- **WHEN** the audit's session runs to completion AND the agent positively declares that it examined the code and identified zero meaningful coverage gaps
+- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])` carrying the agent's examined-summary
+- **AND** no commit is made, AND no chatops post is sent for this clean periodic run (per framework behavior for spec-writing audits)
+
+#### Scenario: A run with no terminal declaration is surfaced, never reported as no-findings
+- **WHEN** the audit's session ends without the agent positively declaring a survey conclusion (it errored, its exit status was not captured, or it produced output but persisted no valid change directory)
+- **THEN** the audit returns `AuditOutcome::DidNotComplete { .. }`, NOT `SpecsWritten(vec![])`
+- **AND** the cadence state is NOT advanced AND a chatops alert is posted
 
 ### Requirement: Security & bug audit
 autocoder SHALL register a `security_bug_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with an OpenSpec-only sandbox and a security-and-bug-detection prompt; it creates new OpenSpec change directories under `openspec/changes/` describing proposed fixes, commits them, and returns the change names so the same iteration implements them. The audit is `requires_head_change = true` and `WritePolicy::OpenSpecOnly`.
@@ -1824,12 +1828,15 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
 - **AND** the audit is treated as failed; chatops alert posted;
   the audit re-runs next iteration
 
-#### Scenario: Empty findings produce no spec changes and no chatops post
-- **WHEN** the agent identifies zero confident security or bug
-  issues
-- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])`
-- **AND** no commit, no chatops post, the iteration proceeds
-  normally
+#### Scenario: Genuine no-findings is declared, not inferred from absence
+- **WHEN** the audit's session runs to completion AND the agent positively declares that it examined the code and identified zero confident security or bug issues
+- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])` carrying the agent's examined-summary
+- **AND** no commit is made, no chatops post is sent, AND the iteration proceeds normally
+
+#### Scenario: A run with no terminal declaration is surfaced, never reported as no-findings
+- **WHEN** the audit's session ends without the agent positively declaring a survey conclusion (it errored, its exit status was not captured, or it identified an issue it could not persist as a change directory)
+- **THEN** the audit returns `AuditOutcome::DidNotComplete { .. }`, NOT `SpecsWritten(vec![])`
+- **AND** the cadence state is NOT advanced AND a chatops alert is posted so the inability to run is visible
 
 ### Requirement: Architecture consultative audit
 autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The agent SHALL return those findings by calling the `submit_findings` MCP tool — validated against the architecture finding schema, which caps the array at 5 entries, and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
@@ -7641,4 +7648,65 @@ The `autocoder install` wizard SHALL prompt operators about the issues lane duri
 #### Scenario: Non-interactive explicit disable
 - **WHEN** an operator passes `--issues-lane disabled`
 - **THEN** the rendered config.yaml contains no `features.issues` entry (same as the default)
+
+### Requirement: Audit runs fail closed to a non-passing did-not-complete outcome
+Every audit run SHALL initialize its outcome to an explicit non-passing "did not complete" state, conforming to the project-documentation `gatekeepers-fail-closed` standard. That initial state SHALL be overwritten ONLY by an evidenced terminal verdict: a session that demonstrably ran to completion AND either produced its expected artifact OR positively declared a survey conclusion. A run that cannot produce such evidence SHALL resolve to a surfaced did-not-complete outcome — never to a passing `NoFindings` / empty `SpecsWritten` result.
+
+The audit framework SHALL expose a `DidNotComplete { audit_type, cause, examined_summary }` outcome variant. `cause` distinguishes at least: a session error (timeout, non-zero exit, **OR an exit status that was not captured**); a session that ended without declaring any terminal verdict; and a session that declared findings it could not persist. The scheduler SHALL treat `DidNotComplete` like the existing audit-failure path — it SHALL NOT advance the audit's cadence state AND it SHALL surface the failure (chatops alert when a backend is configured) — and SHALL keep it distinct from `NoFindings`, `SpecsWritten`, and `WorkspaceUnavailable`.
+
+For a specs-writing audit, "no findings" SHALL be backed by the agent's positive declaration that it examined the code and reached that conclusion; the mere absence of new change directories SHALL NOT by itself be reported as "no findings." A specs-writing audit's terminal outcome — its written-proposals result OR its did-not-complete result — SHALL carry an `examined_summary` (the agent's account of what it looked at) so that even a clean run is accompanied by evidence the audit actually ran, and so the on-demand completion notification can report it.
+
+#### Scenario: Outcome is non-passing until an evidenced verdict overwrites it
+- **WHEN** an audit run begins
+- **THEN** its outcome is initialized to a non-passing did-not-complete state
+- **AND** only a session that ran to completion AND produced its expected artifact OR positively declared a survey conclusion may overwrite that state with a passing outcome
+
+#### Scenario: Uncaptured exit status is a failure, not a pass
+- **WHEN** an audit's wrapped session ends AND no exit status was captured (e.g. the process was signal-killed)
+- **THEN** the audit resolves to `DidNotComplete { cause: <session-errored>, .. }`
+- **AND** the scheduler does NOT advance the cadence state AND surfaces the failure
+- **AND** the outcome is NOT `NoFindings` or empty `SpecsWritten`
+
+#### Scenario: Findings that cannot be persisted are surfaced, not dropped
+- **WHEN** a specs-writing audit's agent declares it found one or more issues but no valid change directory was persisted for them
+- **THEN** the audit resolves to `DidNotComplete { cause: <found-but-could-not-persist>, .. }`
+- **AND** a chatops alert is posted AND the cadence state is NOT advanced
+- **AND** the run is NOT reported as "0 findings"
+
+#### Scenario: A specs-writing outcome carries an examined summary
+- **WHEN** a specs-writing audit reaches a terminal outcome (proposals written, no findings, or did-not-complete)
+- **THEN** the outcome carries an `examined_summary` describing what the audit looked at, available to the on-demand completion notification and its conclusion
+
+### Requirement: On-demand audit triggers carry their chat origin and receive a terminal completion notification
+When an audit is triggered on demand — via the chatops `audit` verb or the CLI `audit run` subcommand against a running daemon — the originating chat context (channel and thread identifiers, when present) SHALL be carried through the `queue_audit` control-socket action and onto the queued entry, so the daemon can reply to the operator who asked. After the queued audit reaches a terminal outcome, the scheduler SHALL post a terminal completion notification to that origin. A cadence-driven (not operator-triggered) run carries no origin and SHALL NOT emit this completion notification (its existing findings / failure notifications are unchanged).
+
+#### Scenario: queue_audit carries the originating chat context
+- **WHEN** an operator triggers `@<bot> audit <type> <repo>` from a chat thread
+- **THEN** the submitted `queue_audit` action includes the originating channel and thread identifiers
+- **AND** the queued entry retains that origin until the audit runs
+
+#### Scenario: A completed on-demand audit replies to the operator's thread
+- **WHEN** an operator-triggered audit reaches a terminal outcome
+- **THEN** the scheduler posts a completion notification to the originating thread reporting the terminal result (findings, no-findings with the examined summary, OR a did-not-complete failure with its cause)
+
+#### Scenario: A cadence-driven run emits no completion notification
+- **WHEN** an audit runs because its cadence came due (no operator trigger, no origin)
+- **THEN** no on-demand completion notification is posted
+- **AND** the audit's existing findings / failure notification behavior is unchanged
+
+### Requirement: On-demand audit-run queue survives pass-skip, early-return, and bound-zero
+A queued on-demand audit SHALL be removed from the `pending_audit_runs` queue ONLY after the audit has actually run. When the polling pass that would run it is skipped (busy marker), returns early before the audit phase (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`), the queued entry SHALL remain for a later iteration rather than being discarded.
+
+#### Scenario: A busy-skipped pass does not lose the queued audit
+- **WHEN** an audit is queued AND the next pass skips because a busy marker is held
+- **THEN** the queued entry is still present for the following iteration
+- **AND** the audit runs once a non-skipped pass reaches the audit phase
+
+#### Scenario: A workspace-init failure does not lose the queued audit
+- **WHEN** an audit is queued AND the next pass returns early because `ensure_initialized` failed
+- **THEN** the queued entry is still present for the following iteration
+
+#### Scenario: An audit bound of zero defers rather than discards
+- **WHEN** an audit is queued AND `max_audits_per_iteration` is `0`
+- **THEN** the audit phase runs no audits this iteration AND the queued entry is retained for a later iteration
 

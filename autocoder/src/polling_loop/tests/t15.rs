@@ -394,8 +394,7 @@ async fn pending_changes_process_before_audits() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("ordering_probe_a".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "ordering_probe_a".to_string(), origin: None }]);
 
     let test_github = GithubConfig {
         token_env: "DOES_NOT_EXIST".into(),
@@ -480,8 +479,7 @@ async fn audit_generated_changes_wait_one_iteration_for_implementer() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("ordering_probe_b".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "ordering_probe_b".to_string(), origin: None }]);
 
     let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
     let test_github = GithubConfig {

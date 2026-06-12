@@ -44,12 +44,10 @@ The harness keeps the disk diff as the source of *what* was written, and adds a 
 ### D3 — On-demand origin threading + completion notification
 `queue_audit` accepts optional `{ channel, thread_ts, request_id }`. The queue element becomes `QueuedAudit { audit_type, origin: Option<ChatOrigin> }`. After a queued audit resolves, the scheduler posts a terminal notification to `origin` via the chatops backend: success-with-`examined_summary` (and findings/PR pointer), or the D1 failed-to-run state with its `cause`. The CLI `audit run` path supplies `origin: None` and prints the terminal result to stdout instead.
 
-### D4 — Queue durability: re-queue-on-skip + persist across restart
-Two mechanisms:
-1. **No drain-and-discard.** Replace the top-of-pass `mem::take` with: snapshot the queued set for this pass, and remove an entry from the shared queue only once its audit has actually run. A pass that skips (busy), returns early (init failure), or is bound out (`max_audits_per_iteration: 0`) leaves entries in place for the next iteration.
-2. **Persist across restart.** Mirror the queued set to a small JSON file under the daemon state dir (atomic tempfile+rename), loaded into `pending_audit_runs` at task spawn. An entry is removed from both memory and disk only on actual run. This honors the "✓ Queued, will run" promise across a restart.
+### D4 — Queue durability: re-queue-on-skip (in-memory)
+**No drain-and-discard.** Instead of threading a snapshot down and discarding it, the shared queue handle is threaded into `run_due_audits`, which snapshots the queued set for the pass and removes an entry from the shared queue only once its audit has actually run. A pass that skips (busy), returns early (init failure), or is bound out (`max_audits_per_iteration: 0`) never calls `run_due_audits`, so the handle is untouched and entries stay in place for the next iteration. This delivers durability *within a daemon lifetime*.
 
-*Alternative considered:* re-queue only (no persistence). Rejected — a restart between ack and run is exactly an "initialize-to-failed-then-lose-it" hole the operator called out; persistence is small and closes it.
+**Cross-restart persistence is split out** into its own change, `persist-on-demand-audit-queue` — it needs `paths` reachable from the `queue_audit` control-socket handler (a `ControlState` field), which is a separable control-plane change. `QueuedAudit` derives `Serialize`/`Deserialize` here so that follow-on is purely additive. The restart scenario was correspondingly removed from this change's spec so it stays self-consistent.
 
 ### D5 — Surfacing policy differs by trigger
 - **On-demand** (operator asked): always post a terminal result — including a clean "0 findings, examined X."

@@ -2671,6 +2671,7 @@ impl OperatorCommandDispatcher {
                 self.dispatch_audit_now(
                     &audit_substring,
                     &repo_substring,
+                    channel_id,
                     repositories,
                     submitter,
                 )
@@ -3604,6 +3605,7 @@ impl OperatorCommandDispatcher {
         &self,
         audit_substring: &str,
         repo_substring: &str,
+        channel_id: &str,
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> String {
@@ -3635,6 +3637,9 @@ impl OperatorCommandDispatcher {
                 "action": "queue_audit",
                 "url": repo.url,
                 "audit_type": audit_name,
+                // Carry the originating channel so the daemon can post the
+                // terminal completion notification back to the operator.
+                "channel": channel_id,
             }))
             .await;
         if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {

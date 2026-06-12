@@ -493,7 +493,7 @@ pub(crate) async fn run_iteration_work(
     reviewer_snap: Option<&CodeReviewer>,
     chatops_ctx: Option<&ChatOpsContext>,
     want_rebuild: bool,
-    queued_audit_types: &std::collections::HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
