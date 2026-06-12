@@ -334,6 +334,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 model,
                 prompt_template,
                 attribution: Some(attribution),
+                retries: cfg.executor.verifier_gate_retries,
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -391,6 +392,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 model,
                 prompt_template,
                 attribution: Some(attribution),
+                retries: cfg.executor.verifier_gate_retries,
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -448,6 +450,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 model,
                 prompt_template,
                 attribution: Some(attribution),
+                retries: cfg.executor.verifier_gate_retries,
                 #[cfg(test)]
                 test_submission: None,
             },
