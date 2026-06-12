@@ -401,6 +401,9 @@ mod tests {
         assert_eq!(audit.audit_type(), "missing_tests_audit");
         assert!(audit.requires_head_change());
         assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
+        // Writes openspec/changes/ proposals — MUST run writable (a read-only
+        // mount silently yields 0 proposals).
+        assert!(audit.write_policy().workspace_writable());
     }
 
     // ------------- Pre-run snapshot -------------

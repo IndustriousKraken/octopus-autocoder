@@ -302,6 +302,10 @@ mod tests {
         assert_eq!(audit.audit_type(), "security_bug_audit");
         assert!(audit.requires_head_change());
         assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
+        // The audit's whole job is to write openspec/changes/ proposals, so it
+        // MUST run with a writable workspace. Regression: a read-only mount
+        // silently discarded a real finding as "0 proposals".
+        assert!(audit.write_policy().workspace_writable());
     }
 
     #[test]

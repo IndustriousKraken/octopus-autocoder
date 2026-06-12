@@ -187,6 +187,10 @@ impl Audit for ArchitectureConsultativeAudit {
             self.settings_dir.as_deref(),
             Self::TYPE,
             model.as_ref(),
+            // Writability derives from the declared WritePolicy (None →
+            // read-only) so the mount can never drift from the policy the
+            // post-hoc check enforces.
+            self.write_policy().workspace_writable(),
         )
         .await
         .context("spawning architecture-consultative CLI subprocess")?;
