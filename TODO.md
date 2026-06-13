@@ -32,6 +32,27 @@ The `a21` install wizard offers "install Ollama via docker" as option 1 but stop
 
 The pre-flight gates have now shipped (`a59`, `a62`), so this is unblocked. Hold until we have real false-positive rates from them in use — the value, and the right ergonomics for the ignore file, depend on how noisy the gates actually are.
 
+## Deep-architecture audit (Level 3 — corpus-level rot)
+
+The `architecture-advisory-redesign` change covers the Level 1–2 problems a
+per-file pass can see: oversized files and low-cohesion "junk drawer" files.
+It deliberately does NOT cover Level 3 — the cross-file rot that a narrowly
+focused, one-file-at-a-time reviewer is blind to: parallel implementations of
+the same intent, dead code, abandoned alternative code paths (fallthroughs,
+race-only branches, orphaned logic gates), and the discoverability failure
+where neither an agent nor a person can find a function they are sure exists,
+so they write a new one and the duplication compounds.
+
+Detecting this needs a different mechanism than the advisory's cheap selector:
+a high-context agent reading MANY files together, and/or a corpus-level
+semantic-similarity pass (embeddings/dedup over the whole tree — the
+signature-duplication check was a crude, wrong-metric stab at this; signatures
+catch idioms and miss real semantic twins) plus dead-code / call-graph
+analysis. Larger lift; rides on the RAG work (`a21`). The Level 1–2 advisor
+helps PREVENT descent into Level 3, but once a codebase is already there, only
+a corpus-level pass surfaces it. Build after the advisory redesign ships and we
+see whether the per-file pass is holding the line.
+
 ## Audits fail-closed — minor follow-ons
 
 Small items left after `audits-fail-closed-and-report` shipped (fail-closed audit outcomes, the on-demand completion notification, in-memory queue durability). None blocking; pick up opportunistically. Cross-restart queue persistence is already its own change (`persist-on-demand-audit-queue`) and is NOT in this list.
