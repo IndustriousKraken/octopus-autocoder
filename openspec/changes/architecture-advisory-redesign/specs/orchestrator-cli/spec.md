@@ -411,15 +411,15 @@ When an operator acts on an advisory audit finding via `send it`, the audit-repl
 - **THEN** triage drafts an `openspec/changes/<derived-slug>/` spec proposal instead of an issue
 - **AND** the issues lane is not used for that finding
 
-### Requirement: Audit metrics do not become canonical requirements
-No audit, AND no triage acting on an audit's findings, SHALL author a canonical requirement (a `SHALL`-bearing spec requirement) whose content is an audit's own selection or detection metric — a file-size threshold, a function-length threshold, a duplication count, OR a similar heuristic. Such metrics are signals for where to apply judgment, not contracts. Engineering discipline of this kind, where the project chooses to record it at all, belongs as advisory guidance in project documentation, NOT as an enforceable requirement that the change-vs-canonical gate AND future audits treat as binding.
+### Requirement: Audit findings do not mint new canonical metric requirements
+No audit, AND no triage acting on an audit's findings, SHALL author a NEW canonical requirement that re-encodes an audit's selection or detection metric — a file-size threshold, a function-length threshold, a duplication count, OR a similar heuristic — as a binding constraint a future change is measured against. A project's size/structure budget has a SINGLE canonical home: the `Source files and functions stay within a size budget` requirement, which is explicitly advisory AND non-gating (a size finding never blocks a pull request or a change from archiving). Triage that acts on an architectural finding SHALL produce a behavior-preserving refactor (an issue), NOT a spec requirement restating the threshold. The metric remains a signal the audit uses to select candidates, never a contract.
 
-#### Scenario: An audit threshold is not promoted to a requirement
+#### Scenario: An audit threshold is not restated as a new requirement
 - **WHEN** an audit surfaces files or functions exceeding a size threshold AND an operator acts on the finding
-- **THEN** no resulting spec requirement states that files or functions SHALL stay within that threshold
-- **AND** the threshold remains a heuristic the audit uses to select candidates
+- **THEN** no new spec requirement is authored that states files or functions SHALL stay within that threshold
+- **AND** the resulting work is a behavior-preserving refactor (an issue), not a spec encoding the metric
 
-#### Scenario: Recorded discipline lives in documentation, not canon
-- **WHEN** the project wants to record a size or organization convention
-- **THEN** it is captured as advisory guidance in project documentation
-- **AND** it is NOT written as a `SHALL` requirement enforced against future changes
+#### Scenario: The size budget keeps a single advisory home
+- **WHEN** the project records a size or structure budget
+- **THEN** it lives in the single advisory `Source files and functions stay within a size budget` requirement
+- **AND** it is NOT duplicated into per-change specs NOR promoted to a pull-request-blocking gate

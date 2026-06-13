@@ -40,6 +40,9 @@ the `chatops-manager` emoji top-line + doc-audit-emoji requirements; the removed
 - [ ] 5.3 Validate-proposal + proposal-created-notification: `architecture_advisor` is advisory (writes no change dir), so it is excluded from both the validate list and the `🔍 created proposal` list; `architecture_consultative` is removed from both.
 - [ ] 5.4 `audit`-verb substring matching: the registered-name list and ambiguity/unknown replies reflect the six-slug set; `arch` no longer matches two architecture audits.
 - [ ] 5.5 Chatops top-line formatter: `architecture_advisor` uses the `🏛 … <N> refactor recommendation(s)` form; the `📐` brightline and `📋` consultative forms and the stale-ignore clause are removed.
+- [ ] 5.6 Advisory-audit MCP transport: `architecture_advisor` advertises `submit_findings` with the architecture finding schema (`{subject, body, anchor, severity}`, cap 5) under `ORCH_MCP_ROLE = architecture_advisor`, replacing `architecture_consultative` in the advisory-role set; a clean run submits an empty array (→ `Reported(vec![])`), no submission is still a failure.
+- [ ] 5.7 Code reviewer: the size-observation thresholds reference the `Source files and functions stay within a size budget` requirement's configured values, not "the values the architecture-brightline audit applies"; reviewer behavior (advisory, non-blocking) is unchanged.
+- [ ] 5.8 Docs/standards prose: the `Source files and functions stay within a size budget` and `The orchestrator polling loop is decomposed by responsibility` requirements now name the `architecture_advisor` (+ drift / code review) as the surfacing mechanism; update any code comments / doc generators that echo the old audit names. The size budget remains the single advisory, non-gating home — the new "Audit findings do not mint new canonical metric requirements" guard defers to it rather than forbidding it.
 
 ## 5a. Deliberately out of scope (noted, not done here)
 

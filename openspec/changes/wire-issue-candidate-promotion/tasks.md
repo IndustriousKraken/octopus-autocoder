@@ -21,6 +21,7 @@
 - [ ] 3.3 On a posted match, resolve the candidate's repo url, submit `promote_issue_candidate { url, candidate_id, channel, thread_ts }`, and return the success reply naming the written `issues/<slug>/` and the queue. On a handler error, return `✗ send it: could not promote candidate: <error>`.
 - [ ] 3.4 On an already-promoted match, return the already-promoted reply and submit nothing.
 - [ ] 3.5 Update `SEND_IT_REFUSE_UNTRACKED` to name all three valid contexts (audit thread, brownfield-survey thread, issue-candidate thread).
+- [ ] 3.6 Update `send it`'s `help` text to name all three valid thread contexts (the `help` verb output, per the reconciled clear-survey help scenario).
 
 ## 4. Reachability cleanup
 
