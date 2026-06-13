@@ -26,21 +26,25 @@
 - [ ] 4.2 Treat "content in either subtree" as success; only "no content in either subtree" flips the audit-thread to `TriageFailed`.
 - [ ] 4.3 Update the `audit-triage.md` prompt: issue-by-default routing for behavior-preserving work (write `issues/<slug>/` with `issue.md` + `tasks.md`, no `specs/`); spec only for a contract change or a genuine new capability; and the guard that triage SHALL NOT author a requirement whose content is an audit metric/threshold. Permit `issues/<slug>/` in the prompt's scope restriction.
 
-## 5. Peripheral canonical name-purge (remove the two slugs / name the advisor)
+## 5. Name-purge: code changes behind the peripheral spec deltas
 
-These canonical requirements reference the removed slugs and must be updated in
-the same change so canon stays internally consistent (the spec deltas in this
-change cover the load-bearing requirements; these are the mechanical
-follow-through):
+The spec deltas in this change already purge the two slugs from canon (the
+`orchestrator-cli` cadence-schema, subprocess-timeout, install-wizard,
+validate-proposal, proposal-created-notification, and `audit`-verb requirements;
+the `chatops-manager` emoji top-line + doc-audit-emoji requirements; the removed
+`chatops-manager` stale-ignore-clause and `project-documentation`
+`.brightline-ignore` requirements). These tasks are the corresponding code:
 
-- [ ] 5.1 `orchestrator-cli` "Audit cadence config schema" — the example scenario uses `architecture_brightline`; reword to a surviving slug.
-- [ ] 5.2 `orchestrator-cli` "Periodic audits enforce their per-audit subprocess timeout" — the audit list names `architecture_consultative_audit`; replace with `architecture_advisor` and update the matching scenario.
-- [ ] 5.3 `orchestrator-cli` "Install wizard configures periodic audits" — the wizard's audit defaults/flags reference both slugs; replace with `architecture_advisor`.
-- [ ] 5.4 `orchestrator-cli` "LLM-driven audits validate their proposal" (the `openspec validate <slug> --strict` requirement) — drop `architecture_consultative` from the list; `architecture_advisor` is advisory and writes no change dir, so it is not added.
-- [ ] 5.5 `orchestrator-cli` "Audit proposal-created notification" — drop `architecture_consultative`/`architecture_brightline` from the proposal-creating list.
-- [ ] 5.6 `orchestrator-cli` audit-substring-match scenarios (the `arch` ambiguity + the "registered:" list) — update to the six-slug set; `arch` no longer matches two architecture audits.
-- [ ] 5.7 `chatops-manager` — remove the `architecture_brightline` `📐` top-line, the brightline stale-ignore-clause requirement, and the `📋` consultative entry from the emoji conventions; add the advisor's notification form.
-- [ ] 5.8 `project-documentation` — remove the "OPERATIONS.md describes the `.brightline-ignore` file" requirement; replace the OPERATIONS.md/CHATOPS.md architecture-audit sections with the advisor.
+- [ ] 5.1 Subprocess-timeout: the CLI-spawning audit set in code now includes `architecture_advisor` and drops `architecture_consultative`; the timeout error/log names `architecture_advisor`.
+- [ ] 5.2 Install wizard: the audit defaults/flags offer `architecture_advisor` (one slug) in place of `architecture_brightline` + `architecture_consultative`; the `--audit-architecture-advisor` flag replaces the two old flags; the fast-path enables five audits (spec-sync + four LLM-driven).
+- [ ] 5.3 Validate-proposal + proposal-created-notification: `architecture_advisor` is advisory (writes no change dir), so it is excluded from both the validate list and the `🔍 created proposal` list; `architecture_consultative` is removed from both.
+- [ ] 5.4 `audit`-verb substring matching: the registered-name list and ambiguity/unknown replies reflect the six-slug set; `arch` no longer matches two architecture audits.
+- [ ] 5.5 Chatops top-line formatter: `architecture_advisor` uses the `🏛 … <N> refactor recommendation(s)` form; the `📐` brightline and `📋` consultative forms and the stale-ignore clause are removed.
+
+## 5a. Deliberately out of scope (noted, not done here)
+
+- [ ] 5a.1 `chatops-manager` "Status reply always shows live workspace snapshot" uses `architecture_consultative` only as an illustrative example log filename inside one of its ~15 scenarios. It is cosmetic (the scenario exercises status-line parsing, not the audit's existence) and reproducing that large requirement to swap one example string is not worth it here; swap the example slug opportunistically in a later docs/cleanup pass.
+- [ ] 5a.2 The "Install wizard configures periodic audits" requirement is independently drifted from the registered set (it offers the unregistered `spec_sync_audit` and omits `canon_contradiction_audit` / `canon_consolidation_audit`). This change only purges the two architecture slugs it deletes; the wizard's broader drift is its own cleanup.
 
 ## 6. Docs
 

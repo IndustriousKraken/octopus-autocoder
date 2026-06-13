@@ -137,6 +137,234 @@ When the discard step leaves content in the kept subtree, the daemon SHALL creat
 - **THEN** the daemon increments a suffix (`-2`, `-3`, ...) until it finds a free path
 - **AND** the resulting directory uses the suffixed slug
 
+### Requirement: Audit cadence config schema
+autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (global) and per-repository `audits:` overrides. Each entry maps an audit type name to a `Cadence`. The `Cadence` enum SHALL accept the literal strings `disabled`, `daily`, `every-N-days` (where `N` is a positive integer), `weekly`, `monthly`, `quarterly`. Every audit defaults to `disabled` when unset in both global defaults and per-repo overrides.
+
+#### Scenario: Per-repo cadence overrides global default
+- **WHEN** `audits.defaults.architecture_advisor: weekly` AND a
+  repository sets `audits.architecture_advisor: every-3-days`
+- **THEN** the effective cadence for that repository is
+  `every-3-days`
+
+#### Scenario: Audit absent from both global and per-repo is disabled
+- **WHEN** the operator's config has no entry for an audit type
+  in either `audits.defaults` or any `repositories[].audits`
+- **THEN** the audit's effective cadence is `disabled` AND the
+  framework never invokes it
+
+#### Scenario: every-N-days requires a positive integer
+- **WHEN** a config entry uses `every-N-days` where N is `0` OR
+  negative OR non-integer
+- **THEN** config load fails at startup with an error naming the
+  offending field path AND the parsed value
+
+#### Scenario: Unknown audit type names fail config load
+- **WHEN** a config entry under `audits.defaults` or
+  `audits` (per-repo) uses a name that does not match a
+  registered audit type
+- **THEN** config load fails at startup with an error naming
+  the field path AND the unknown audit type AND listing the
+  known audit type names
+- **AND** the daemon does NOT start
+
+### Requirement: Periodic audits enforce their per-audit subprocess timeout
+Every audit that spawns the wrapped agent CLI as a child process (`drift_audit`, `architecture_advisor`, `missing_tests_audit`, `security_bug_audit`) SHALL kill the child and return `Err(_)` once the elapsed wall-clock time exceeds `executor.timeout_secs`. The error message SHALL name both the audit type and the timeout condition so the operator can tell from a single log line which audit hung and why. The audit log file SHALL record the timeout outcome before the error returns so post-mortem inspection of `/tmp/autocoder/logs/<basename>/audits/<audit_type>-<ts>.log` is conclusive.
+
+#### Scenario: drift_audit subprocess exceeds timeout
+- **WHEN** `DriftAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured `executor.command` is a script that sleeps longer than the timeout
+- **THEN** the call returns `Err(_)` whose `format!("{err:#}")` contains the substring `drift_audit` AND the substring `timeout`
+- **AND** the audit log file written via the audit's `AuditLogWriter` contains a `kind: Err` section together with the substring `reason: timeout`
+- **AND** the spawned child process does not survive past the call's return (no orphaned `sleep` left behind)
+
+#### Scenario: architecture_advisor subprocess exceeds timeout
+- **WHEN** `ArchitectureAdvisorAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured command sleeps longer than the timeout
+- **THEN** the call returns `Err(_)` whose message contains `architecture_advisor` AND `timeout`
+- **AND** the audit log file contains a `kind: Err` / `reason: timeout` section
+
+#### Scenario: specs-writing audit (via missing_tests) subprocess exceeds timeout
+- **WHEN** `MissingTestsAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured command sleeps longer than the timeout
+- **THEN** the call returns `Err(_)` whose message contains `missing_tests_audit` AND `timeout`
+- **AND** no new directory is created under `<workspace>/openspec/changes/` as a side-effect of the timed-out run (defense-in-depth against the spec-writing audit's commit step running on a child that never finished)
+
+### Requirement: Install wizard configures periodic audits
+The `autocoder install` wizard SHALL prompt operators about periodic audits during first-time install, after the reviewer prompt and before the config-assembly step. The wizard offers a three-tier UX: (1) inline prompt for `spec_sync_audit` with default ON at daily cadence (cheap, defensive, no LLM cost); (2) a single yes/no gate for the LLM-driven audits (default no — operators who don't want a tour answer once and move on); (3) a fast-path "enable all at recommended cadences" question for operators who answered yes to the gate, with per-audit walk-through as the fallback when the fast path is declined. The non-interactive mode SHALL mirror this with flags whose defaults match the conservative interactive defaults so existing IaC scripts that don't know about the new flags continue to work without behavior change.
+
+#### Scenario: Default interactive path enables spec_sync_audit only
+- **WHEN** an operator runs `autocoder install` AND accepts
+  every audit-related default (bare-Enter on the spec-sync
+  cadence prompt → `daily`; bare-Enter on the LLM-driven
+  gate → `no`)
+- **THEN** the wizard writes `audits.defaults.spec_sync_audit: daily`
+  to config.yaml AND no other audit entries
+- **AND** the operator's total interaction with the audits
+  section is two prompts (cadence + gate)
+
+#### Scenario: Operator declines spec_sync_audit
+- **WHEN** the operator answers `n` (never) to the spec-sync
+  cadence prompt
+- **THEN** the wizard skips the LLM-driven-audits gate
+  AND any subsequent per-audit prompts
+- **AND** the rendered config.yaml omits the `audits:`
+  block entirely (matching the `Option<AuditsConfig>`
+  schema's `None` representation)
+
+#### Scenario: Fast-path enables all five audits
+- **WHEN** the operator chose a non-disabled cadence for
+  spec-sync AND answered `y` to the LLM-driven-audits gate
+  AND accepted the fast-path default `Y` on the "enable all
+  at recommended cadences" prompt
+- **THEN** config.yaml contains all five audits at their
+  recommended cadences:
+  - `spec_sync_audit`: per the operator's spec-sync answer
+  - `architecture_advisor`: weekly
+  - `drift_audit`: weekly
+  - `missing_tests_audit`: monthly
+  - `security_bug_audit`: weekly
+- **AND** total wizard interaction in this branch is three
+  prompts (spec-sync cadence + LLM gate + fast-path
+  acceptance)
+
+#### Scenario: Individual cadence walk-through after declining fast-path
+- **WHEN** the operator answered `y` to the LLM-driven gate
+  AND `n` to the fast-path prompt
+- **THEN** the wizard prompts for each of the four LLM-driven
+  audits individually: slug + description + cadence choice
+  (with the recommended cadence as the default)
+- **AND** each audit's chosen cadence appears in
+  `audits.defaults` UNLESS the operator chose `never`
+  (those audits are omitted)
+- **AND** the resulting config.yaml's audit count matches
+  the operator's non-disabled choices (spec-sync + each LLM
+  audit the operator did NOT decline)
+
+#### Scenario: Non-interactive defaults match conservative interactive defaults
+- **WHEN** an operator runs `autocoder install --non-interactive`
+  with all the existing-spec's required flags AND NO new
+  `--audits-*` flags
+- **THEN** config.yaml contains exactly
+  `audits.defaults.spec_sync_audit: daily` (the
+  conservative default matching the interactive default-default)
+- **AND** existing IaC scripts (Ansible playbooks, cloud-init,
+  etc.) that pre-date this change continue to produce a
+  working install without surprise behavior change
+
+#### Scenario: Non-interactive recommended preset
+- **WHEN** an operator runs
+  `autocoder install --non-interactive --audits-llm-driven recommended`
+  with all other required flags
+- **THEN** config.yaml contains all five audits at their
+  recommended cadences (same as the interactive fast-path)
+- **AND** no per-audit `--audit-<slug>` flag is required
+
+#### Scenario: Non-interactive per-audit override within recommended preset
+- **WHEN** the operator passes
+  `--audits-llm-driven recommended --audit-security-bug-audit disabled`
+- **THEN** three of the four LLM-driven audits get their
+  recommended cadences AND `security_bug_audit` is omitted
+  from config.yaml (treated as disabled)
+- **AND** spec-sync follows its own `--audits-spec-sync`
+  flag (or default `daily` if unset)
+
+#### Scenario: --audits-llm-driven none master switch overrides per-audit flags
+- **WHEN** the operator passes
+  `--audits-llm-driven none --audit-architecture-advisor weekly`
+- **THEN** architecture_advisor is NOT enabled (the
+  master switch wins)
+- **AND** the rendered config.yaml has no
+  architecture_advisor entry
+- **AND** the wizard emits a one-line stdout note explaining
+  that the per-audit flag was overridden by the master
+  switch (so IaC logs distinguish "operator opted-out
+
+### Requirement: LLM-driven audits validate their generated proposals before committing
+Every LLM-driven audit that writes a proposal (currently `drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL invoke `openspec validate <slug> --strict` against its just-written `openspec/changes/<slug>/` directory before returning success. The advisory `architecture_advisor` audit, which generates no spec proposal, is unaffected by this requirement. When validation passes, the audit returns its existing outcome variant. When validation fails AND the configured retry budget is not exhausted, the audit SHALL re-invoke its LLM with the validation error appended to the prompt and overwrite the change directory with the new response. When validation fails AND the retry budget IS exhausted, the audit SHALL discard the change directory AND post a chatops failure notification AND return a `ValidationExhausted` outcome.
+
+#### Scenario: Valid proposal on first attempt
+- **WHEN** an LLM-driven audit writes a proposal and `openspec validate <slug> --strict` exits 0 on first invocation
+- **THEN** the audit returns its existing success outcome with `retries_used == 0`
+- **AND** no retry is attempted
+- **AND** no chatops failure notification fires
+
+#### Scenario: Validation passes after one retry
+- **WHEN** an LLM-driven audit writes an invalid proposal on attempt 0 AND `audits.max_validation_retries` is 1 AND the LLM produces a valid proposal on attempt 1 (with the prior validation error appended to its prompt)
+- **THEN** the audit returns its existing success outcome with `retries_used == 1`
+- **AND** the chatops notification (when `notify_on_clean=true` for this audit) includes the clause `validated on retry 1 of 1`
+- **AND** the change directory at `openspec/changes/<slug>/` contains the second (valid) proposal, not the first
+
+#### Scenario: Retry budget exhausted
+- **WHEN** an LLM-driven audit writes invalid proposals on both attempt 0 and attempt 1 with `audits.max_validation_retries == 1`
+- **THEN** the audit returns `AuditOutcome::ValidationExhausted { audit_type, retries_attempted: 1, final_error }`
+- **AND** the `openspec/changes/<slug>/` directory does NOT exist after the call
+- **AND** no commit is made to git
+- **AND** a chatops `❌` notification is posted to the repo's resolved channel containing the audit type, the retry count, and a truncated excerpt of the final validation error
+
+#### Scenario: max_validation_retries = 0 disables retries
+- **WHEN** an LLM-driven audit writes an invalid proposal on the first attempt AND `audits.max_validation_retries == 0`
+- **THEN** the audit returns `ValidationExhausted { retries_attempted: 0, .. }` immediately
+- **AND** no second LLM call is made
+- **AND** the discard-and-notify path runs the same as the exhausted case above
+
+#### Scenario: Validation retry passes validation error in addendum
+- **WHEN** the retry path invokes the LLM on attempt N > 0
+- **THEN** the LLM prompt contains an addendum naming the previous attempt's openspec validation error verbatim
+- **AND** the LLM's response replaces the change directory entirely (delete-and-rewrite, not patch)
+
+### Requirement: Audit posts a chatops notification when it creates a queue-bound proposal
+Every LLM-driven audit that writes a proposal (`drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL post a chatops notification immediately after `openspec validate <slug> --strict` passes for its just-written proposal AND before the audit function returns to the scheduler. The notification names the audit type, the change slug, and a one-line excerpt of the proposal's `## Why` section, so operators have clear provenance when the next polling iteration begins implementing the change. The notification fires regardless of the audit's `notify_on_clean` setting, since it signals "something was found" rather than "nothing was found." The advisory `architecture_advisor` audit, which generates no LLM proposal, is unaffected.
+
+#### Scenario: Validated proposal fires the notification on first attempt
+- **WHEN** an LLM-driven audit's proposal passes `openspec validate <slug> --strict` on the first attempt (`retries_used == 0`)
+- **THEN** the audit posts exactly one chatops notification whose text matches `🔍 <repo_url>: <audit_type> created proposal \`<change_slug>\` — <why_excerpt>`
+- **AND** the notification text does NOT contain a parenthetical about retries
+
+#### Scenario: Validated proposal after retry includes the retry-count parenthetical
+- **WHEN** an LLM-driven audit's proposal passes validation after one or more retries (`retries_used > 0`)
+- **THEN** the notification text appends ` (validated on retry <retries_used> of <max_validation_retries>)`
+
+#### Scenario: ValidationExhausted does NOT fire the proposal-created notification
+- **WHEN** an LLM-driven audit's proposal fails validation through every retry and the audit returns `ValidationExhausted`
+- **THEN** the `🔍 created proposal` notification SHALL NOT fire
+- **AND** the existing `❌ <audit-type> produced an invalid proposal` notification (from `a01-audit-proposal-self-validation`) fires instead
+
+#### Scenario: notify_on_clean=false does not suppress this notification
+- **WHEN** an LLM-driven audit configured with `notify_on_clean: false` produces a valid proposal
+- **THEN** the `🔍 created proposal` notification still fires
+- **AND** the existing `notify_on_clean=false` semantics still suppress only the empty-findings success message
+
+#### Scenario: architecture_advisor produces no proposal-created notification
+- **WHEN** the `architecture_advisor` audit runs to completion AND produces any number of recommendations
+- **THEN** no `🔍 created proposal` notification fires from this audit
+- **AND** the audit's existing notification behaviour (if any) is unchanged
+
+#### Scenario: chatops backend absent does not affect audit outcome
+- **WHEN** the daemon has no chatops backend configured AND an LLM-driven audit produces a valid proposal
+- **THEN** the audit returns its `Reported` outcome normally
+- **AND** the missing notification does NOT affect the proposal commit, the queue insertion, or the iteration's overall success
+
+#### Scenario: chatops post_notification failure does not affect audit outcome
+- **WHEN** the chatops backend is configured AND `post_notification` returns Err during the `🔍` notification post
+- **THEN** the failure is logged at WARN
+- **AND** the audit's `Reported` outcome is unaffected
+- **AND** the proposal commit proceeds normally
+
+### Requirement: Chatops `audit` verb queues an on-demand audit run for the next polling iteration
+The chatops listener SHALL recognize `@<bot> audit <audit-substring> <repo-substring>` as the `AuditNow` command. The audit-substring SHALL be matched case-insensitively against the registered audit-type names by substring (same rule the repo-substring uses against configured repository URLs). The repo-substring SHALL be matched per the existing repo-substring rules. On a unique match in both, the dispatcher SHALL submit a `queue_audit` control-socket action AND post a one-line ack naming the resolved audit-type and repo URL. On ambiguous or no-match, the dispatcher SHALL reply with the candidate list (mirroring the existing `match_repo` reply shapes).
+
+#### Scenario: Unique substring matches queue the audit
+- **WHEN** an operator posts `@<bot> audit sec myrepo` AND `sec` uniquely matches `security_bug_audit` AND `myrepo` uniquely matches a configured repo URL
+- **THEN** the dispatcher submits a `queue_audit` action with both resolved names
+- **AND** the bot posts a threaded reply whose first line is `✓ Queued security_bug_audit for <repo_url>. Will run on the next polling iteration (~Nm).` (where `~Nm` is the per-repo poll interval rounded to minutes, OR `imminently` when the next iteration is <30 seconds away)
+
+#### Scenario: Ambiguous audit substring lists candidates
+- **WHEN** an operator posts `@<bot> audit canon myrepo` AND `canon` matches both `canon_contradiction_audit` and `canon_consolidation_audit`
+- **THEN** the bot replies `✗ audit substring \`canon\` matches multiple: canon_consolidation_audit, canon_contradiction_audit. Be more specific.`
+- **AND** no audit is queued
+
+#### Scenario: Unknown audit substring lists all registered names
+- **WHEN** an operator posts `@<bot> audit gibberish myrepo`
+- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_advisor, drift_audit, missing_tests_audit, security_bug_audit, canon_contradiction_audit, canon_consolidation_audit.`
+- **AND** no audit is queued
+
 ## ADDED Requirements
 
 ### Requirement: Architecture advisory audit
