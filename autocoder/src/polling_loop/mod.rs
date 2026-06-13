@@ -120,8 +120,10 @@ pub struct QueuedAudit {
 /// Derive the workspace basename used to key a repo's durable
 /// `pending_audit_runs` file. Mirrors `alert_state`'s convention: the
 /// workspace path's final component, or `"unknown"` if absent (which
-/// should never happen for a resolved workspace path).
-fn pending_audit_runs_basename(workspace: &Path) -> String {
+/// should never happen for a resolved workspace path). `pub(crate)` so the
+/// spawn/orphan-sweep sites in `cli/run.rs` derive the basename through this
+/// single helper rather than re-implementing it (load and save agree).
+pub(crate) fn pending_audit_runs_basename(workspace: &Path) -> String {
     workspace
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

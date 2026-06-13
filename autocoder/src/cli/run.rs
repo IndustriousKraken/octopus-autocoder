@@ -829,10 +829,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .repositories
             .iter()
             .map(|r| {
-                workspace::resolve_path(&daemon_paths, r)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".to_string())
+                polling_loop::pending_audit_runs_basename(&workspace::resolve_path(
+                    &daemon_paths,
+                    r,
+                ))
             })
             .collect();
         polling_loop::reconcile_pending_audit_runs(&daemon_paths, &configured_basenames);
@@ -1176,14 +1176,12 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         // and the audit's run does not lose the request
         // (persist-on-demand-audit-queue). Best-effort: a missing or corrupt
         // file degrades to an empty queue. Resolve the basename the same way
-        // `save_pending_audit_runs` does (the resolved workspace's final
-        // component) so load and save agree.
+        // `save_pending_audit_runs` does (via the shared
+        // `pending_audit_runs_basename` helper) so load and save agree.
         let initial_pending_audit_runs = {
             let workspace_for_load = workspace::resolve_path(&deps.paths, &repo);
-            let basename = workspace_for_load
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown".to_string());
+            let basename =
+                crate::polling_loop::pending_audit_runs_basename(&workspace_for_load);
             crate::polling_loop::load_pending_audit_runs(&deps.paths, &basename)
         };
         let child_cancel = deps.global_cancel.child_token();
