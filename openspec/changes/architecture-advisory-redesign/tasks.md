@@ -15,8 +15,8 @@
 
 ## 3. Registry, validator, config, README
 
-- [ ] 3.1 In `AuditRegistry` startup registration, remove `architecture_brightline` and `architecture_consultative`; add `architecture_advisor`. The registered set is now six.
-- [ ] 3.2 Update `validate_audit_type_names`' known-slug list to the six slugs; the two removed slugs (plus `dependency_update_triage`) are rejected at startup with the existing error.
+- [ ] 3.1 In `AuditRegistry` startup registration, remove `architecture_brightline` and `architecture_consultative`; add `architecture_advisor`. The pre-existing `documentation_audit` and the two canon audits stay registered, so the registered set is now seven (`architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`).
+- [ ] 3.2 Update `validate_audit_type_names`' known-slug list to the seven slugs; the two removed slugs (plus `dependency_update_triage`) are rejected at startup with the existing error.
 - [ ] 3.3 Update `config.example.yaml` audit defaults: drop the two slugs, add `architecture_advisor` with a sensible cadence and its settings keys.
 - [ ] 3.4 Update the README audit table: one `architecture_advisor` row (advisory, recommendation-based, issues-by-default) replacing the two old rows.
 
@@ -38,7 +38,7 @@ the `chatops-manager` emoji top-line + doc-audit-emoji requirements; the removed
 - [ ] 5.1 Subprocess-timeout: the CLI-spawning audit set in code now includes `architecture_advisor` and drops `architecture_consultative`; the timeout error/log names `architecture_advisor`.
 - [ ] 5.2 Install wizard: the audit defaults/flags offer `architecture_advisor` (one slug) in place of `architecture_brightline` + `architecture_consultative`; the `--audit-architecture-advisor` flag replaces the two old flags; the fast-path enables five audits (spec-sync + four LLM-driven).
 - [ ] 5.3 Validate-proposal + proposal-created-notification: `architecture_advisor` is advisory (writes no change dir), so it is excluded from both the validate list and the `🔍 created proposal` list; `architecture_consultative` is removed from both.
-- [ ] 5.4 `audit`-verb substring matching: the registered-name list and ambiguity/unknown replies reflect the six-slug set; `arch` no longer matches two architecture audits.
+- [ ] 5.4 `audit`-verb substring matching: the registered-name list and ambiguity/unknown replies reflect the seven-slug set (including `documentation_audit`); `arch` no longer matches two architecture audits.
 - [ ] 5.5 Chatops top-line formatter: `architecture_advisor` uses the `🏛 … <N> refactor recommendation(s)` form; the `📐` brightline and `📋` consultative forms and the stale-ignore clause are removed.
 - [ ] 5.6 Advisory-audit MCP transport: `architecture_advisor` advertises `submit_findings` with the architecture finding schema (`{subject, body, anchor, severity}`, cap 5) under `ORCH_MCP_ROLE = architecture_advisor`, replacing `architecture_consultative` in the advisory-role set; a clean run submits an empty array (→ `Reported(vec![])`), no submission is still a failure.
 - [ ] 5.7 Code reviewer: the size-observation thresholds reference the `Source files and functions stay within a size budget` requirement's configured values, not "the values the architecture-brightline audit applies"; reviewer behavior (advisory, non-blocking) is unchanged.
@@ -57,6 +57,6 @@ the `chatops-manager` emoji top-line + doc-audit-emoji requirements; the removed
 
 - [ ] 7.1 Selector: the advisor picks only the longest files over the threshold, capped; a short file with a long-ish function is not separately flagged (no function-length metric); the line count never appears as a finding.
 - [ ] 7.2 Output: findings are capped at 5, carry an anchor, and a clean run returns `Reported(vec![])` with the examined set logged.
-- [ ] 7.3 Registry: startup registers exactly the six slugs; each removed slug (`architecture_brightline`, `architecture_consultative`, `dependency_update_triage`) fails `validate_audit_type_names`.
+- [ ] 7.3 Registry: startup registers exactly the seven slugs (`documentation_audit` remains registered); each removed slug (`architecture_brightline`, `architecture_consultative`, `dependency_update_triage`) fails `validate_audit_type_names`.
 - [ ] 7.4 Triage routing: a behavior-preserving refactor triage keeps `issues/<slug>/` and opens an issue PR with no `specs/`; a contract-changing cleanup keeps `openspec/changes/<slug>/`; "no content in either subtree" flips to `TriageFailed`; the out-of-scope revert mechanics are unchanged (regression on the existing scenarios).
 - [ ] 7.5 No build/test references the removed `architecture_brightline` / `architecture_consultative` / `.brightline-ignore` symbols.

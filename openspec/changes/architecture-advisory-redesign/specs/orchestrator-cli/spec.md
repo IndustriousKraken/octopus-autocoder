@@ -29,21 +29,21 @@ is removed.
 ## MODIFIED Requirements
 
 ### Requirement: Registered periodic audits
-autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slugs `dependency_update_triage`, `architecture_brightline`, AND `architecture_consultative` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
+autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slugs `dependency_update_triage`, `architecture_brightline`, AND `architecture_consultative` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
 
 This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming an unregistered slug is a startup-time failure with a clear list of valid slugs.
 
 #### Scenario: Startup with default config registers the canonical set
 - **WHEN** autocoder starts with a config whose `audits:` block is
   absent OR present but with all-`disabled` cadences
-- **THEN** the in-memory `AuditRegistry` contains exactly the six
+- **THEN** the in-memory `AuditRegistry` contains exactly the seven
   audits enumerated above
 - **AND** no audit runs (all are `Disabled` by effective cadence),
   preserving prior daemon behavior
 
 #### Scenario: Operator configures a registered audit
 - **WHEN** an operator sets a non-`disabled` cadence under
-  `audits.defaults.<slug>` for any of the six registered slugs
+  `audits.defaults.<slug>` for any of the seven registered slugs
   OR under `repositories[].audits.<slug>`
 - **THEN** config validation succeeds AND the scheduler invokes
   that audit per its cadence on the appropriate iteration
@@ -362,7 +362,7 @@ The chatops listener SHALL recognize `@<bot> audit <audit-substring> <repo-subst
 
 #### Scenario: Unknown audit substring lists all registered names
 - **WHEN** an operator posts `@<bot> audit gibberish myrepo`
-- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_advisor, drift_audit, missing_tests_audit, security_bug_audit, canon_contradiction_audit, canon_consolidation_audit.`
+- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_advisor, drift_audit, missing_tests_audit, security_bug_audit, documentation_audit, canon_contradiction_audit, canon_consolidation_audit.`
 - **AND** no audit is queued
 
 ## ADDED Requirements
