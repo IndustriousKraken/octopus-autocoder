@@ -168,7 +168,7 @@ autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (g
 - **AND** the daemon does NOT start
 
 ### Requirement: Periodic audits enforce their per-audit subprocess timeout
-Every audit that spawns the wrapped agent CLI as a child process (`drift_audit`, `architecture_advisor`, `missing_tests_audit`, `security_bug_audit`) SHALL kill the child and return `Err(_)` once the elapsed wall-clock time exceeds `executor.timeout_secs`. The error message SHALL name both the audit type and the timeout condition so the operator can tell from a single log line which audit hung and why. The audit log file SHALL record the timeout outcome before the error returns so post-mortem inspection of `/tmp/autocoder/logs/<basename>/audits/<audit_type>-<ts>.log` is conclusive.
+Every audit that spawns the wrapped agent CLI as a child process — including `drift_audit`, `architecture_advisor`, `missing_tests_audit`, `security_bug_audit`, AND `documentation_audit` — SHALL kill the child and return `Err(_)` once the elapsed wall-clock time exceeds `executor.timeout_secs`. The error message SHALL name both the audit type and the timeout condition so the operator can tell from a single log line which audit hung and why. The audit log file SHALL record the timeout outcome before the error returns so post-mortem inspection of `/tmp/autocoder/logs/<basename>/audits/<audit_type>-<ts>.log` is conclusive.
 
 #### Scenario: drift_audit subprocess exceeds timeout
 - **WHEN** `DriftAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured `executor.command` is a script that sleeps longer than the timeout
