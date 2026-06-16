@@ -68,6 +68,32 @@ fn build_audit_only_pr_title_aggregates_multiple_audits() {
     );
 }
 
+/// a01: the planning-lanes `unit(s)` commit subject is recognized as an
+/// audit-produced commit — counted in the title summary AND listed in the
+/// audit-only body — exactly like the legacy `change(s)` form. (The
+/// bug/gap audits now emit `(N unit(s))` because a finding can land in
+/// either planning lane.)
+#[test]
+fn build_audit_only_pr_title_recognizes_unit_count_form() {
+    let subjects = vec![
+        "audit: security_bug proposals (1 unit(s))".to_string(),
+        "audit: missing_tests proposals (2 change(s))".to_string(),
+    ];
+    // Both forms count toward the audit-only total (1 + 2 = 3) AND both are
+    // bucketed as audit (not "other"), so the title takes the audit-only
+    // shape rather than the mixed "across categories" fallback.
+    let title = build_audit_only_pr_title(&subjects);
+    assert_eq!(
+        title,
+        "audit-only: 3 proposal(s) from security_bug, missing_tests"
+    );
+    let body = build_audit_only_pr_body(&subjects);
+    assert!(
+        body.contains("- audit: security_bug proposals (1 unit(s))"),
+        "the unit(s) subject must be listed verbatim in the audit-only body: {body}"
+    );
+}
+
 /// Body explicitly states this is an audit-only PR, lists every
 /// agent-branch commit subject, AND notes that the produced
 /// directories will be picked up by the next iteration.

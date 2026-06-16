@@ -242,6 +242,10 @@ impl Audit for CanonConsolidationAudit {
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: true,
                 model: model.as_ref(),
+                // a01: consolidation is spec-lane by definition — it evolves
+                // canon — so it stays OpenSpecOnly with no issue-lane choice.
+                planning_lanes: false,
+                issues_lane_enabled: false,
             },
             ctx,
         )

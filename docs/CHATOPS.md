@@ -797,6 +797,8 @@ This **always fires** when an LLM-driven audit produces a valid proposal; it is 
 
 The pure-data `architecture_brightline` audit does NOT fire this notification (it does not generate an LLM proposal). The advisory `architecture_consultative` and `drift_audit` audits also do not fire it — they emit findings via the existing `📋` chatops dispatch and never write `openspec/changes/<slug>/`.
 
+**Lane choice (a01).** `missing_tests_audit` and `security_bug_audit` now choose each finding's output lane by canon judgment: a fix that changes an observable contract becomes a spec-lane change (`openspec/changes/<slug>/`), while a behavior-preserving fix to already-correctly-specified code becomes an issue-lane unit (`openspec/issues/<slug>/`). **Issues are a first-class audit output.** The issue lane is offered to the agent ONLY when `features.issues` is enabled for the repository; with it disabled, these audits behave exactly as before (spec lane only). The `🔍` notification fires for **spec-lane proposals only** — it reports a validated `openspec validate --strict` proposal, which an issue-lane unit (carrying no spec delta) does not have; issue-lane units are committed silently and surface when the issues walker works them on the next iteration.
+
 If the chatops backend is unconfigured OR `post_notification` errors when this notification is posted, the failure is logged at WARN and the audit's success outcome (proposal commit, queue insertion) is unaffected.
 
 ### Audit-finding threaded notifications (`📐` / `🧭` / `📚` / `📋` / `✅`)

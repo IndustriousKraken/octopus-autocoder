@@ -75,6 +75,20 @@ pub enum WritePolicy {
     /// `openspec/changes/`. Violations revert the entire diff via
     /// `git reset --hard HEAD` + `git clean -fd` + chatops alert.
     OpenSpecOnly,
+    /// Planning-lanes audit (a01). Sandbox allows `Write`/`Edit`. The
+    /// audit may write under EITHER planning lane — `openspec/changes/`
+    /// (the spec lane) OR the issues lane (the path the issues walker
+    /// reads via [`crate::lanes::issues::ISSUES_SUBDIR`], today
+    /// `openspec/issues/`). The post-hoc check accepts any modified/new
+    /// path under either prefix AND reverts anything else (a source edit,
+    /// a doc edit, a config change) via `git reset --hard HEAD` +
+    /// `git clean -fd` + chatops alert — exactly the `OpenSpecOnly`
+    /// revert, only the set of allowed prefixes widens. The two bug/gap
+    /// audits (`security_bug_audit`, `missing_tests_audit`) run under this
+    /// policy so they can choose their output lane per finding;
+    /// `canon_consolidation_audit` stays `OpenSpecOnly` (spec-lane by
+    /// definition).
+    PlanningLanes,
     /// Full write access. Reserved for future audits with broader
     /// scope; not used by any audit landing in the foundation.
     Approved,
@@ -83,8 +97,9 @@ pub enum WritePolicy {
 impl WritePolicy {
     /// Whether an audit with this policy needs a read-write workspace so its
     /// wrapped agent can persist output. `OpenSpecOnly` audits create change
-    /// dirs under `openspec/changes/`; `Approved` may write anywhere; `None`
-    /// audits are strictly advisory and run read-only.
+    /// dirs under `openspec/changes/`; `PlanningLanes` audits create units
+    /// under `openspec/changes/` OR the issues lane; `Approved` may write
+    /// anywhere; `None` audits are strictly advisory and run read-only.
     ///
     /// This is the SINGLE source from which the audit CLI runners derive BOTH
     /// the OS-sandbox workspace mount AND the CLI-settings `deny_writes` flag,
@@ -96,7 +111,7 @@ impl WritePolicy {
     pub fn workspace_writable(self) -> bool {
         match self {
             WritePolicy::None => false,
-            WritePolicy::OpenSpecOnly | WritePolicy::Approved => true,
+            WritePolicy::OpenSpecOnly | WritePolicy::PlanningLanes | WritePolicy::Approved => true,
         }
     }
 }

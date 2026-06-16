@@ -1,19 +1,24 @@
-//! Missing-tests audit. Invokes the wrapped agent CLI with an
-//! `OpenSpecOnly` sandbox and a missing-tests prompt. The agent
-//! surveys the source tree, identifies uncovered behavior, and writes
-//! up to `max_proposals_per_run` new OpenSpec change directories under
-//! `openspec/changes/` proposing tests to fill those gaps.
+//! Missing-tests audit. Invokes the wrapped agent CLI with a
+//! `PlanningLanes` sandbox and a missing-tests prompt. The agent
+//! surveys the source tree, identifies uncovered behavior, and (a01)
+//! routes each coverage gap to its output lane by canon judgment: a gap
+//! implying a new/changed invariant → a spec-lane change under
+//! `openspec/changes/<slug>/`; a behavior-preserving gap in
+//! already-correctly-specified code → an issue-lane unit under
+//! `openspec/issues/<slug>/` (when `features.issues` is enabled).
 //!
 //! The audit itself does NOT decide which gaps matter — that's the
 //! agent's job. The shared [`super::specs_writing::run_specs_writing_audit`]
 //! helper handles the sandbox, snapshot diff, validation, over-cap
 //! pruning, and commit. This module's only responsibilities are
-//! reading settings, resolving the prompt, and delegating.
+//! reading settings, resolving the prompt, resolving the
+//! `features.issues` flag, and delegating.
 //!
 //! `requires_head_change = true` — there is no point re-surveying the
-//! same code state for new coverage gaps. `WritePolicy::OpenSpecOnly`
-//! — the agent may write under `openspec/changes/` but nowhere else;
-//! a write outside that prefix triggers the framework's revert.
+//! same code state for new coverage gaps. `WritePolicy::PlanningLanes`
+//! — the agent may write under EITHER planning lane (`openspec/changes/`
+//! OR the issues lane) but nowhere else; a write outside both prefixes
+//! triggers the framework's revert.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,6 +53,11 @@ pub struct MissingTestsAudit {
     /// means `openspec`. Tests point at a shell script so the audit
     /// can be exercised without the real CLI on PATH.
     openspec_command: String,
+    /// Test-only override for the resolved `features.issues` flag (which
+    /// production reads from the task-local issues-lane gate). Mirrors
+    /// `canon_consolidation`'s `test_rag_enabled`.
+    #[cfg(test)]
+    test_issues_enabled: Option<bool>,
 }
 
 impl MissingTestsAudit {
@@ -76,6 +86,8 @@ impl MissingTestsAudit {
             sandbox,
             settings_dir: None,
             openspec_command: "openspec".to_string(),
+            #[cfg(test)]
+            test_issues_enabled: None,
         }
     }
 
@@ -83,6 +95,24 @@ impl MissingTestsAudit {
     pub(crate) fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_issues_enabled(mut self, enabled: bool) -> Self {
+        self.test_issues_enabled = Some(enabled);
+        self
+    }
+
+    /// Resolve `features.issues` for the repository this audit targets.
+    /// Production reads the task-local issues-lane gate
+    /// ([`crate::lanes::gate::current`]); tests force the value via
+    /// [`Self::with_issues_enabled`].
+    fn issues_lane_enabled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(o) = self.test_issues_enabled {
+            return o;
+        }
+        crate::lanes::gate::current().is_some()
     }
 
     #[cfg(test)]
@@ -129,7 +159,10 @@ impl Audit for MissingTestsAudit {
     }
 
     fn write_policy(&self) -> WritePolicy {
-        WritePolicy::OpenSpecOnly
+        // a01: the audit may write under EITHER planning lane
+        // (`openspec/changes/` OR the issues lane) so it can route each
+        // coverage gap by canon judgment.
+        WritePolicy::PlanningLanes
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
@@ -157,6 +190,8 @@ impl Audit for MissingTestsAudit {
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: false,
                 model: model.as_ref(),
+                planning_lanes: true,
+                issues_lane_enabled: self.issues_lane_enabled(),
             },
             ctx,
         )
@@ -400,9 +435,11 @@ mod tests {
         let audit = MissingTestsAudit::new(&HashMap::new(), &cfg);
         assert_eq!(audit.audit_type(), "missing_tests_audit");
         assert!(audit.requires_head_change());
-        assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
-        // Writes openspec/changes/ proposals — MUST run writable (a read-only
-        // mount silently yields 0 proposals).
+        // a01: the bug/gap audit now chooses its lane, so it runs under the
+        // two-prefix PlanningLanes policy (NOT OpenSpecOnly).
+        assert!(matches!(audit.write_policy(), WritePolicy::PlanningLanes));
+        // Writes planning-lane units — MUST run writable (a read-only mount
+        // silently yields 0 proposals).
         assert!(audit.write_policy().workspace_writable());
     }
 
@@ -701,7 +738,7 @@ mod tests {
             .unwrap();
         let log_str = String::from_utf8_lossy(&log.stdout);
         assert!(
-            log_str.contains("missing-tests proposals") && log_str.contains("1 change(s)"),
+            log_str.contains("missing-tests proposals") && log_str.contains("1 unit(s)"),
             "commit message must reflect the validated count: {log_str}"
         );
         if let Some(parent) = log_path.parent() {
