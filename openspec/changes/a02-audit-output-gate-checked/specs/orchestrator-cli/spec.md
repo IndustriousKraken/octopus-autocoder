@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Spec-writing audits gate-check their output and self-heal before commit
-After a spec-writing audit (`security_bug_audit`, `missing_tests_audit`) writes a spec-lane change AND it passes `openspec validate --strict`, the audit SHALL run the `[in]` (change-internal) AND `[canon]` (change-vs-canonical) verifier-gate checks against that change BEFORE committing it, for each gate that is enabled. These authoring-time checks reuse the verifier framework's existing checks unchanged — the same prompts, the same `submit_contradictions` / `submit_canon_contradictions` MCP tools, AND the same opt-in flags (`executor.change_internal_contradiction_check`, `executor.change_canonical_contradiction_check`) that govern the implement-time gates. A gate that is disabled runs at neither authoring nor implement time; a gate that is enabled runs at BOTH — early (here, self-healing) AND at implement time (the unchanged backstop).
+After a spec-writing audit (`security_bug_audit`, `missing_tests_audit`) writes a spec-lane change AND it passes `openspec validate --strict`, the audit SHALL run the `[in]` (change-internal) AND `[canon]` (change-vs-canonical) verifier-gate checks against that change BEFORE committing it, for each gate that is enabled. These authoring-time checks reuse the verifier framework's existing checks unchanged — the same prompts, the same `submit_contradictions` / `submit_canon_contradictions` MCP tools, AND the same opt-in flags (`executor.change_internal_contradiction_check`, `executor.change_canonical_contradiction_check`) that govern the implement-time gates. A verifier gate that is disabled runs at neither authoring nor implement time; an enabled one runs at BOTH — early (here, self-healing) AND at implement time (the unchanged pre-executor gate). These verifier gates are distinct from the issue-lane implementer kick-back (`Issue-flavored implementer prompt verifies against existing canon`), which is an always-on property of the issue implementer — NOT one of these gates AND NOT governed by their flags; disabling a gate does not affect it.
 
 A contradiction finding from `[in]` OR `[canon]` SHALL feed the audit's existing validation-retry loop: the authoring agent is re-invoked with the findings appended to its prompt AND rewrites the unit (delete-and-rewrite), bounded by the same `max_validation_retries` budget that governs `--strict` retries. The agent MAY resolve a finding by aligning the change to canon (reusing canonical vocabulary), by writing a `MODIFIED` delta of the contradicted canonical requirement, OR by converting the unit to an issue. A resolution SHALL NOT dissolve a `[canon]` finding by silently bending the contradicted requirement to fit: a canon-changing resolution SHALL be a legible `MODIFIED` delta whose contract change is stated plainly in the proposal's rationale.
 
@@ -40,7 +40,7 @@ On exhausting the retry budget with the contradiction unresolved, the audit SHAL
 #### Scenario: A disabled gate is not run at authoring time
 - **WHEN** the `[canon]` gate is disabled (`executor.change_canonical_contradiction_check` unset)
 - **THEN** the audit does NOT run a `[canon]` check at authoring time
-- **AND** the change is committed on `--strict` success as before (with no implement-time `[canon]` backstop either, consistent with the gate being disabled)
+- **AND** the change is committed on `--strict` success as before (the `[canon]` verifier gate likewise does not run at implement time for this change, consistent with the gate being disabled)
 
 #### Scenario: A clean change commits unchanged
 - **WHEN** the written change passes `--strict` AND every enabled gate returns no contradictions
@@ -70,4 +70,4 @@ If implementing the issue would require a contract change, the audit SHALL re-ro
 #### Scenario: Disabled canon gate skips the authoring-time issue check
 - **WHEN** the `[canon]` gate is disabled
 - **THEN** the audit does NOT run the authoring-time contract-change check
-- **AND** the issue is committed on its structural validity (an `issue.md` and `tasks.md`, no `specs/`), with the implement-time kick-back remaining as the backstop
+- **AND** the issue is committed on its structural validity (an `issue.md` and `tasks.md`, no `specs/`), with the implement-time issue kick-back — a separate always-on mechanism, NOT the `[canon]` gate — remaining as the backstop
