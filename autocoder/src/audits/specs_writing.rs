@@ -1,15 +1,23 @@
-//! Shared helper for `OpenSpecOnly` "spec-writing" audits — those that
-//! invoke the wrapped agent CLI with a prompt, expect zero or more new
-//! `openspec/changes/<name>/` directories to appear, validate each via
+//! Shared helper for the "spec-writing" audits — those that invoke the
+//! wrapped agent CLI with a prompt, expect zero or more new planning-lane
+//! units to appear, validate the spec-lane ones via
 //! `openspec validate <name> --strict`, drop ones over the cap, commit
 //! the validated set on the agent branch, and return
 //! `AuditOutcome::SpecsWritten(validated_names)` so the same iteration's
-//! `walk_queue` picks them up.
+//! lane walkers pick them up.
 //!
-//! `missing_tests_audit` and `security_bug_audit` differ only in their
-//! prompt, their per-run cap source, and their human-readable commit
-//! subject — everything else (sandbox shape, snapshot diff, validation,
-//! over-cap pruning, commit) is identical. They both delegate to
+//! Two write policies share this harness, selected by
+//! [`SpecsWritingAuditParams::planning_lanes`]: `canon_consolidation_audit`
+//! runs spec-lane-only (`OpenSpecOnly`) and produces only
+//! `openspec/changes/<name>/` directories, while the two bug/gap audits
+//! (`missing_tests_audit`, `security_bug_audit`) run under `PlanningLanes`
+//! (a01) and route each finding to the spec lane (`openspec/changes/`) OR
+//! the issues lane (`openspec/issues/`) by canon judgment.
+//!
+//! The audits differ only in their prompt, their per-run cap source, their
+//! human-readable commit subject, and whether they choose a lane —
+//! everything else (sandbox shape, snapshot diff, validation, over-cap
+//! pruning, commit) is identical. They all delegate to
 //! [`run_specs_writing_audit`] so the algorithm lives in one place and
 //! cannot drift across audits.
 
@@ -86,6 +94,23 @@ pub(crate) struct SpecsWritingAuditParams<'a> {
     /// `--model <provider>/<model>`), or `None` to keep the default `claude`
     /// strategy with no model override.
     pub model: Option<&'a crate::agentic_run::ResolvedModel>,
+    /// a01: when `true`, this audit chooses its output lane per finding —
+    /// the harness snapshots, validates, stages, and commits BOTH planning
+    /// lanes (`openspec/changes/` AND the issues lane), and its commit
+    /// subject counts produced UNITS (`audit: <subject> (N unit(s))`). The
+    /// two bug/gap audits (`security_bug_audit`, `missing_tests_audit`) set
+    /// this. When `false` the harness is spec-lane-only and counts CHANGES
+    /// (`audit: <subject> (N change(s))`) — the unchanged
+    /// `canon_consolidation_audit` behavior.
+    pub planning_lanes: bool,
+    /// a01: the resolved `features.issues` flag for the repository this run
+    /// targets. Only meaningful when `planning_lanes` is `true`: it gates
+    /// whether the issue lane is OFFERED to the agent (when `false`, the
+    /// daemon's lane-availability addendum tells the agent only the spec
+    /// lane is available, preserving pre-a01 behavior). The harness still
+    /// permits issue-lane writes structurally (the `PlanningLanes`
+    /// `WritePolicy`) — the flag governs the prompt, not the post-hoc check.
+    pub issues_lane_enabled: bool,
 }
 
 /// Execute one spec-writing audit run. Returns the outcome the framework
@@ -123,6 +148,18 @@ pub(crate) async fn run_specs_writing_audit(
     let max_retries = ctx.max_validation_retries;
     let total_attempts = max_retries.saturating_add(1);
 
+    // a01: the `WritePolicy` this harness actually serves this run — the
+    // two-prefix `PlanningLanes` policy for the lane-choosing bug/gap audits,
+    // else the single-prefix `OpenSpecOnly` policy (canon_consolidation). The
+    // CLI's writable-mount flag derives from it below; both are writable
+    // today, but deriving from the real policy keeps the mount correct if the
+    // two ever diverge (a read-only mount would silently yield 0 proposals).
+    let write_policy = if params.planning_lanes {
+        WritePolicy::PlanningLanes
+    } else {
+        WritePolicy::OpenSpecOnly
+    };
+
     let mut sandbox = params.sandbox.clone();
     sandbox.allowed_tools = params.allowed_tools.iter().map(|s| (*s).to_string()).collect();
 
@@ -130,7 +167,7 @@ pub(crate) async fn run_specs_writing_audit(
     let _ = ctx.log_writer.write_section(
         &format!("{audit_type}_preamble"),
         &format!(
-            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nallowed_tools: {}\ninclude_autocoder_tools: {}\npre_run_change_dirs: {}",
+            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nallowed_tools: {}\ninclude_autocoder_tools: {}\nplanning_lanes: {}\nissues_lane_enabled: {}\npre_run_change_dirs: {}",
             params.executor_command,
             params.executor_timeout_secs,
             params.prompt_source,
@@ -138,9 +175,25 @@ pub(crate) async fn run_specs_writing_audit(
             max_retries,
             sandbox.allowed_tools.join(","),
             params.include_autocoder_tools,
+            params.planning_lanes,
+            params.issues_lane_enabled,
             initial_before.len(),
         ),
     );
+
+    // a01: for a planning-lanes audit, append the per-run lane-availability
+    // addendum so the agent knows whether the issue lane is offered AND the
+    // exact lane paths. Spec-lane-only audits (canon_consolidation) use the
+    // prompt verbatim.
+    let base_prompt: String = if params.planning_lanes {
+        format!(
+            "{}{}",
+            params.prompt,
+            compose_lane_availability(params.issues_lane_enabled)
+        )
+    } else {
+        params.prompt.to_string()
+    };
 
     // Per-attempt state: dirs created on the prior attempt that we
     // need to clear before the next LLM call (we ran into validation
@@ -152,20 +205,29 @@ pub(crate) async fn run_specs_writing_audit(
 
     for attempt in 0..total_attempts {
         // Clean up dirs produced by the prior failed attempt so they do
-        // not pollute this attempt's diff.
+        // not pollute this attempt's diff. `prior_attempt_dirs` holds only
+        // spec-lane names (per the validation invariant below), so resolving
+        // them under `openspec/changes/` is exhaustive.
         for name in &prior_attempt_dirs {
             let path = ctx.workspace.join("openspec/changes").join(name);
             let _ = std::fs::remove_dir_all(&path);
         }
         prior_attempt_dirs.clear();
 
-        let before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
+        let before_changes: HashSet<String> = snapshot_change_dirs(ctx.workspace);
+        // a01: only a planning-lanes audit observes the issues lane; for a
+        // spec-lane-only audit this stays empty so its behavior is unchanged.
+        let before_issues: HashSet<String> = if params.planning_lanes {
+            snapshot_issue_dirs(ctx.workspace)
+        } else {
+            HashSet::new()
+        };
 
         let effective_prompt = match &last_addendum_body {
-            None => params.prompt.to_string(),
+            None => base_prompt.clone(),
             Some(err) => format!(
                 "{}\n\n{}",
-                params.prompt,
+                base_prompt,
                 build_validation_addendum(err)
             ),
         };
@@ -195,9 +257,10 @@ pub(crate) async fn run_specs_writing_audit(
                 audit_type,
                 params.model,
                 // Writability derives from the WritePolicy this harness serves
-                // (OpenSpecOnly → writable) so the agent can create the change
-                // dir; a read-only mount would silently yield 0 proposals.
-                WritePolicy::OpenSpecOnly.workspace_writable(),
+                // this run (OpenSpecOnly OR PlanningLanes → writable) so the
+                // agent can create the unit dir; a read-only mount would
+                // silently yield 0 proposals.
+                write_policy.workspace_writable(),
             )
             .await
         } else {
@@ -210,9 +273,10 @@ pub(crate) async fn run_specs_writing_audit(
                 params.settings_dir,
                 params.model,
                 // Writability derives from the WritePolicy this harness serves
-                // (OpenSpecOnly → writable) so the agent can create the change
-                // dir; a read-only mount would silently yield 0 proposals.
-                WritePolicy::OpenSpecOnly.workspace_writable(),
+                // this run (OpenSpecOnly OR PlanningLanes → writable) so the
+                // agent can create the unit dir; a read-only mount would
+                // silently yield 0 proposals.
+                write_policy.workspace_writable(),
             )
             .await
         }
@@ -255,21 +319,44 @@ pub(crate) async fn run_specs_writing_audit(
             });
         }
 
-        let after = snapshot_change_dirs(ctx.workspace);
-        let mut new_dirs: Vec<String> = after.difference(&before).cloned().collect();
-        new_dirs.sort();
+        // a01: collect new units across BOTH planning lanes. Issue-lane
+        // units appear only for a planning-lanes audit whose agent actually
+        // wrote there; a spec-lane-only audit sees the changes lane alone
+        // (before_issues is empty, so the issues branch adds nothing).
+        let after_changes = snapshot_change_dirs(ctx.workspace);
+        let mut new_units: Vec<ProducedUnit> = after_changes
+            .difference(&before_changes)
+            .map(|name| ProducedUnit {
+                lane: Lane::Changes,
+                name: name.clone(),
+            })
+            .collect();
+        if params.planning_lanes {
+            let after_issues = snapshot_issue_dirs(ctx.workspace);
+            new_units.extend(
+                after_issues
+                    .difference(&before_issues)
+                    .map(|name| ProducedUnit {
+                        lane: Lane::Issues,
+                        name: name.clone(),
+                    }),
+            );
+        }
+        // Deterministic order across lanes: by name, then lane (Changes <
+        // Issues) so the per-run cap drops the same units on every run.
+        new_units.sort_by(|a, b| a.name.cmp(&b.name).then(a.lane.cmp(&b.lane)));
 
         let cap = params.max_proposals as usize;
-        if new_dirs.len() > cap {
-            let dropped: Vec<String> = new_dirs.split_off(cap);
-            for d in &dropped {
-                let path = ctx.workspace.join("openspec/changes").join(d);
+        if new_units.len() > cap {
+            let dropped: Vec<ProducedUnit> = new_units.split_off(cap);
+            for u in &dropped {
+                let path = unit_path(ctx.workspace, u.lane, &u.name);
                 if let Err(e) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(
                         url = %ctx.repo.url,
                         audit_type = audit_type,
                         path = %path.display(),
-                        "failed to remove over-cap change dir: {e}"
+                        "failed to remove over-cap unit dir: {e}"
                     );
                 }
             }
@@ -278,12 +365,16 @@ pub(crate) async fn run_specs_writing_audit(
                 &format!(
                     "cap: {}\ndropped:\n{}",
                     params.max_proposals,
-                    dropped.join("\n")
+                    dropped
+                        .iter()
+                        .map(ProducedUnit::label)
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ),
             );
         }
 
-        if new_dirs.is_empty() {
+        if new_units.is_empty() {
             // Zero proposals. Fail closed on a degenerate session: a clean
             // exit that produced NO real output is "did not complete", NOT a
             // silent "no findings" (the `gatekeepers-fail-closed` standard).
@@ -318,17 +409,32 @@ pub(crate) async fn run_specs_writing_audit(
             }
         }
 
-        let mut validated: Vec<String> = Vec::new();
+        // a01: validate SPEC-lane units via `openspec validate --strict`.
+        // Issue-lane units carry NO spec delta (no `specs/` directory), so
+        // there is nothing for openspec to validate — they are accepted as
+        // produced (the issues walker validates their `issue.md`/`tasks.md`
+        // shape when it works them next iteration). INVARIANT: only the
+        // `Lane::Changes` arm can push to `failures`, so `failures` (and the
+        // `prior_attempt_dirs` derived from it for retry cleanup) names ONLY
+        // spec-lane units — every cleanup below resolves them under
+        // `openspec/changes/`, never the issues lane.
+        let mut validated: Vec<ProducedUnit> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
-        for name in &new_dirs {
-            match validate_change(params.openspec_command, ctx.workspace, name).await {
-                Ok(()) => validated.push(name.clone()),
-                Err(e) => failures.push((name.clone(), format!("{e:#}"))),
+        for u in &new_units {
+            match u.lane {
+                Lane::Issues => validated.push(u.clone()),
+                Lane::Changes => {
+                    match validate_change(params.openspec_command, ctx.workspace, &u.name).await {
+                        Ok(()) => validated.push(u.clone()),
+                        Err(e) => failures.push((u.name.clone(), format!("{e:#}"))),
+                    }
+                }
             }
         }
 
         // Log every per-change validation failure so operators can audit
-        // exactly what the LLM produced and why.
+        // exactly what the LLM produced and why. (Spec lane only — issue
+        // units are not openspec-validated.)
         for (name, err) in &failures {
             let _ = ctx.log_writer.write_section(
                 &format!("{audit_type}_validation_failure_{name}_attempt_{attempt}"),
@@ -344,7 +450,8 @@ pub(crate) async fn run_specs_writing_audit(
         }
 
         if !validated.is_empty() {
-            // Mixed run: keep valid, drop invalid, commit, return.
+            // Mixed run: keep valid units, drop invalid spec-lane dirs,
+            // commit, return.
             for (name, _) in &failures {
                 let path = ctx.workspace.join("openspec/changes").join(name);
                 if let Err(rm_err) = std::fs::remove_dir_all(&path) {
@@ -362,47 +469,70 @@ pub(crate) async fn run_specs_writing_audit(
             // that ships the proposal, so operators see the audit's
             // signal in the channel ahead of the implementer's
             // `🚀 starting work on …` message on the next iteration.
-            // One notification per validated change; failures are
-            // logged inside the helper and do not affect the audit's
-            // `SpecsWritten` outcome.
-            for name in &validated {
-                let why_excerpt = read_proposal_why_first_line(ctx.workspace, name);
+            // One notification per validated SPEC-lane unit; an issue-lane
+            // unit carries no `proposal.md` `## Why`, AND the a02 signal is
+            // the spec-proposal counterpart, so issue units are committed
+            // silently and surface when the issues walker works them.
+            for u in &validated {
+                if u.lane != Lane::Changes {
+                    continue;
+                }
+                let why_excerpt = read_proposal_why_first_line(ctx.workspace, &u.name);
                 post_proposal_created_notification(
                     ctx.chatops_ctx,
                     &ctx.repo.url,
                     audit_type,
-                    name,
+                    &u.name,
                     &why_excerpt,
                     attempt,
                     max_retries,
                 )
                 .await;
             }
-            git_add_openspec_changes(ctx.workspace)
-                .with_context(|| format!("staging {audit_type}'s openspec/changes/ for commit"))?;
+            // a01: stage BOTH planning lanes for a planning-lanes audit;
+            // a spec-lane-only audit (canon_consolidation) stages just
+            // `openspec/changes/`.
+            if params.planning_lanes {
+                git_add_planning_lanes(ctx.workspace)
+                    .with_context(|| format!("staging {audit_type}'s planning lanes for commit"))?;
+            } else {
+                git_add_openspec_changes(ctx.workspace).with_context(|| {
+                    format!("staging {audit_type}'s openspec/changes/ for commit")
+                })?;
+            }
+            // a01: a planning-lanes audit counts UNITS (it can span both
+            // lanes); a spec-lane-only audit counts CHANGES (unchanged).
+            let unit_noun = if params.planning_lanes { "unit" } else { "change" };
             let commit_msg = format!(
-                "audit: {} ({} change(s))",
+                "audit: {} ({} {unit_noun}(s))",
                 params.commit_subject,
                 validated.len()
             );
             crate::git::commit(ctx.workspace, &commit_msg).with_context(|| {
-                format!(
-                    "committing {audit_type}'s {} change(s)",
-                    validated.len()
-                )
+                format!("committing {audit_type}'s {} {unit_noun}(s)", validated.len())
             })?;
 
+            // `SpecsWritten` carries unit directory NAMES regardless of which
+            // lane produced them, so the same iteration's lane walkers (the
+            // changes walker AND the issues walker) pick them up under the
+            // established `issues > changes` precedence.
+            let validated_names: Vec<String> =
+                validated.iter().map(|u| u.name.clone()).collect();
             let _ = ctx.log_writer.write_section(
                 &format!("{audit_type}_outcome"),
                 &format!(
-                    "kind: SpecsWritten\nvalidated_count: {}\nretries_used: {attempt}\nchanges:\n{}",
+                    "kind: SpecsWritten\nvalidated_count: {}\nretries_used: {attempt}\nunits:\n{}",
                     validated.len(),
-                    validated.join("\n")
+                    validated
+                        .iter()
+                        .map(ProducedUnit::label)
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ),
             );
 
             return Ok(AuditOutcome::SpecsWritten {
-                changes: validated,
+                changes: validated_names,
                 retries_used: attempt,
                 examined_summary: summarize_session_output(&outcome.stdout),
             });
@@ -425,7 +555,9 @@ pub(crate) async fn run_specs_writing_audit(
             continue;
         }
 
-        // Exhausted budget. Clean up and notify.
+        // Exhausted budget. Clean up and notify. `prior_attempt_dirs` is
+        // spec-lane-only (validation invariant), so `openspec/changes/` covers
+        // every entry.
         for name in &prior_attempt_dirs {
             let path = ctx.workspace.join("openspec/changes").join(name);
             let _ = std::fs::remove_dir_all(&path);
@@ -501,6 +633,102 @@ pub(crate) fn snapshot_change_dirs(workspace: &Path) -> HashSet<String> {
     out
 }
 
+/// Enumerate the immediate child directory names under the issues lane
+/// (`<workspace>/openspec/issues/`, the path the issues walker reads via
+/// [`crate::lanes::issues::ISSUES_SUBDIR`]). Mirrors [`snapshot_change_dirs`]:
+/// returns an empty set when the directory is absent, AND filters the
+/// `archive/` subdirectory so archived issues never count as newly created.
+pub(crate) fn snapshot_issue_dirs(workspace: &Path) -> HashSet<String> {
+    let issues = workspace.join(crate::lanes::issues::ISSUES_SUBDIR);
+    let Ok(entries) = std::fs::read_dir(&issues) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if name == "archive" {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// Which planning lane a produced unit landed in. Ordered so `Changes <
+/// Issues` — the tie-break the per-run cap uses for deterministic dropping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Lane {
+    Changes,
+    Issues,
+}
+
+/// A unit the agent produced this run, tagged with the lane it landed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProducedUnit {
+    lane: Lane,
+    name: String,
+}
+
+impl ProducedUnit {
+    /// `<lane>/<name>` label used in the run-log's dropped/units sections.
+    fn label(&self) -> String {
+        let lane = match self.lane {
+            Lane::Changes => "openspec/changes",
+            Lane::Issues => crate::lanes::issues::ISSUES_SUBDIR,
+        };
+        format!("{lane}/{}", self.name)
+    }
+}
+
+/// Absolute path to a produced unit's directory, in its lane.
+fn unit_path(workspace: &Path, lane: Lane, name: &str) -> std::path::PathBuf {
+    match lane {
+        Lane::Changes => workspace.join("openspec/changes").join(name),
+        Lane::Issues => workspace
+            .join(crate::lanes::issues::ISSUES_SUBDIR)
+            .join(name),
+    }
+}
+
+/// a01: the per-run lane-availability addendum the daemon appends to a
+/// planning-lanes audit's prompt. It states whether the issue lane is
+/// offered (resolved `features.issues`) AND names the exact lane paths so
+/// the agent writes where the walkers actually read. This is operational
+/// guidance the daemon resolves at run time — distinct from the durable
+/// lane-choice rule baked into the prompt template, which (per the project's
+/// `Tests assert behavior or derivation, never message wording` standard) is
+/// NOT pinned by a unit test; a01's behavior is verified through the lane the
+/// audit selects and the artifacts it produces.
+fn compose_lane_availability(issues_enabled: bool) -> String {
+    let issues_subdir = crate::lanes::issues::ISSUES_SUBDIR;
+    if issues_enabled {
+        format!(
+            "\n\n---\n\n## Output-lane availability for this run (set by the daemon)\n\n\
+             `features.issues` is ENABLED for this repository: BOTH planning lanes are \
+             available. Apply the lane-choice rule per finding — never default to the spec \
+             lane.\n\
+             - Spec-lane unit (the fix changes an observable contract) → write \
+             `openspec/changes/<slug>/`.\n\
+             - Issue-lane unit (a behavior-preserving fix to already-correctly-specified \
+             code) → write `{issues_subdir}/<slug>/`, containing `issue.md` (acceptance \
+             stated against the EXISTING specification) AND `tasks.md`, with NO `specs/` \
+             directory.\n"
+        )
+    } else {
+        format!(
+            "\n\n---\n\n## Output-lane availability for this run (set by the daemon)\n\n\
+             `features.issues` is DISABLED for this repository: ONLY the spec lane is \
+             available. Write every unit as `openspec/changes/<slug>/`; do NOT write to the \
+             issues lane (`{issues_subdir}/`) this run.\n"
+        )
+    }
+}
+
 async fn validate_change(
     openspec_command: &str,
     workspace: &Path,
@@ -538,6 +766,32 @@ fn git_add_openspec_changes(workspace: &Path) -> Result<()> {
         .context("spawning `git add openspec/changes/`")?;
     if !status.success() {
         return Err(anyhow!("`git add openspec/changes/` exited {status}"));
+    }
+    Ok(())
+}
+
+/// a01: stage BOTH planning lanes for a planning-lanes audit's commit —
+/// `openspec/changes/` AND the issues lane (`openspec/issues/`). Each lane
+/// dir is staged only when it exists on disk (`git add <missing>` errors
+/// with "pathspec did not match any files"); the caller only commits when
+/// at least one lane produced a validated unit, so this always stages at
+/// least one path. A relative lane dir that is absent is simply skipped.
+fn git_add_planning_lanes(workspace: &Path) -> Result<()> {
+    let lanes = ["openspec/changes", crate::lanes::issues::ISSUES_SUBDIR];
+    for lane in lanes {
+        if !workspace.join(lane).is_dir() {
+            continue;
+        }
+        let pathspec = format!("{lane}/");
+        let status = std::process::Command::new("git")
+            .arg("add")
+            .arg(&pathspec)
+            .current_dir(workspace)
+            .status()
+            .with_context(|| format!("spawning `git add {pathspec}`"))?;
+        if !status.success() {
+            return Err(anyhow!("`git add {pathspec}` exited {status}"));
+        }
     }
     Ok(())
 }

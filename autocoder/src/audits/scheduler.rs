@@ -464,8 +464,8 @@ async fn drive_one_audit(
             ),
         )?;
         // Revert the unexpected diff. None → reset --hard HEAD.
-        // OpenSpecOnly → reset --hard HEAD + clean -fd (to also drop
-        // untracked files outside the allowed prefix).
+        // OpenSpecOnly / PlanningLanes → reset --hard HEAD + clean -fd (to
+        // also drop untracked files outside the allowed prefix(es)).
         match policy {
             WritePolicy::None => {
                 if let Err(e) = git::reset_hard_head(workspace) {
@@ -487,19 +487,24 @@ async fn drive_one_audit(
                     );
                 }
             }
-            WritePolicy::OpenSpecOnly => {
+            WritePolicy::OpenSpecOnly | WritePolicy::PlanningLanes => {
+                // Both prefix-allowlist policies revert identically: the
+                // diff carried a path outside the allowed lane(s), so drop
+                // the whole diff (`reset --hard HEAD`) AND the untracked
+                // remainder (`clean -fd`). Only the allowed-prefix SET
+                // differs between them (see `detect_write_policy_violation`).
                 if let Err(e) = git::reset_hard_head(workspace) {
                     tracing::error!(
                         url = %repo.url,
                         audit_type,
-                        "failed `git reset --hard HEAD` after WritePolicy::OpenSpecOnly violation: {e:#}"
+                        "failed `git reset --hard HEAD` after WritePolicy::{policy:?} violation: {e:#}"
                     );
                 }
                 if let Err(e) = git::clean_force(workspace) {
                     tracing::error!(
                         url = %repo.url,
                         audit_type,
-                        "failed `git clean -fd` after WritePolicy::OpenSpecOnly violation: {e:#}"
+                        "failed `git clean -fd` after WritePolicy::{policy:?} violation: {e:#}"
                     );
                 }
             }
@@ -786,6 +791,30 @@ pub(crate) fn detect_write_policy_violation(
                 Some(PolicyViolation {
                     reason: format!(
                         "diff includes path(s) outside openspec/changes/: {}",
+                        bad_paths.join(", ")
+                    ),
+                })
+            }
+        }
+        WritePolicy::PlanningLanes => {
+            // a01: two-prefix allowlist — the spec lane (`openspec/changes/`)
+            // OR the issues lane (`openspec/issues/`, the path the issues
+            // walker reads via `ISSUES_SUBDIR`). Any other path (source,
+            // docs, config) is a violation that reverts the whole diff.
+            let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
+            let bad_paths: Vec<String> = entries
+                .iter()
+                .map(|e| e.path.clone())
+                .filter(|p| {
+                    !p.starts_with("openspec/changes/") && !p.starts_with(&issues_prefix)
+                })
+                .collect();
+            if bad_paths.is_empty() {
+                None
+            } else {
+                Some(PolicyViolation {
+                    reason: format!(
+                        "diff includes path(s) outside the planning lanes (openspec/changes/, {issues_prefix}): {}",
                         bad_paths.join(", ")
                     ),
                 })
@@ -1424,6 +1453,121 @@ mod tests {
         // State updated.
         let state = AuditState::load_or_default(&ws);
         assert!(state.runs.contains_key("a7b"));
+    }
+
+    // ---- a01: PlanningLanes two-prefix allowlist enforcement ----
+
+    /// a01 (task 4.1): a PlanningLanes run whose only writes are under the
+    /// issues lane (`openspec/issues/`) survives the post-hoc check (the
+    /// artifact remains) AND advances cadence state.
+    #[tokio::test]
+    async fn planning_lanes_allows_issues_lane_write() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("pl_issues")
+                .with_policy(WritePolicy::PlanningLanes)
+                .writes_file("openspec/issues/fix-thing/issue.md")
+                .with_outcome(AuditOutcome::specs_written(vec!["fix-thing".into()])),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("pl_issues");
+        let repo = fixture_repo();
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            ws.join("openspec/issues/fix-thing/issue.md").exists(),
+            "issues-lane artifact must survive the PlanningLanes post-hoc check"
+        );
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            state.runs.contains_key("pl_issues"),
+            "a non-violating planning-lanes run must record state"
+        );
+    }
+
+    /// a01 (task 4.1): a PlanningLanes run whose only writes are under the
+    /// spec lane (`openspec/changes/`) survives.
+    #[tokio::test]
+    async fn planning_lanes_allows_changes_lane_write() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("pl_changes")
+                .with_policy(WritePolicy::PlanningLanes)
+                .writes_file("openspec/changes/fix-thing/proposal.md")
+                .with_outcome(AuditOutcome::specs_written(vec!["fix-thing".into()])),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("pl_changes");
+        let repo = fixture_repo();
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            ws.join("openspec/changes/fix-thing/proposal.md").exists(),
+            "spec-lane path must be preserved under PlanningLanes"
+        );
+        let state = AuditState::load_or_default(&ws);
+        assert!(state.runs.contains_key("pl_changes"));
+    }
+
+    /// a01 (task 4.1): a PlanningLanes write to ANY path outside both
+    /// planning lanes triggers the revert (the untracked artifact is
+    /// removed by `clean -fd`) AND the run is treated as failed (state NOT
+    /// advanced).
+    #[tokio::test]
+    async fn planning_lanes_reverts_write_outside_both_lanes() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("pl_bad")
+                .with_policy(WritePolicy::PlanningLanes)
+                .writes_file("src/forbidden.rs"),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("pl_bad");
+        let repo = fixture_repo();
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            !ws.join("src/forbidden.rs").exists(),
+            "out-of-lane write must be removed by reset + clean -fd"
+        );
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            !state.runs.contains_key("pl_bad"),
+            "a violating planning-lanes run must NOT record state (failed run)"
+        );
+    }
+
+    /// a01 (task 4.4) regression: `OpenSpecOnly` is unchanged — a write
+    /// under the issues lane is OUTSIDE its single allowed prefix
+    /// (`openspec/changes/`), so it is reverted. This proves the issues
+    /// lane is allowed ONLY by the new two-prefix `PlanningLanes` policy,
+    /// never by `OpenSpecOnly` (which `canon_consolidation_audit` keeps).
+    #[tokio::test]
+    async fn openspec_only_reverts_issues_lane_write() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("co_issues")
+                .with_policy(WritePolicy::OpenSpecOnly)
+                .writes_file("openspec/issues/fix-thing/issue.md"),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("co_issues");
+        let repo = fixture_repo();
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            !ws.join("openspec/issues/fix-thing/issue.md").exists(),
+            "OpenSpecOnly must revert an issues-lane write (it is outside openspec/changes/)"
+        );
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            !state.runs.contains_key("co_issues"),
+            "OpenSpecOnly issues-lane violation must NOT record state"
+        );
     }
 
     #[tokio::test]

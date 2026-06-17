@@ -1,9 +1,13 @@
 MAX_PROPOSALS: {{MAX_PROPOSALS}}
 
 You are auditing this repository for security issues AND likely bugs.
-Your output is zero or more new OpenSpec change directories under
-`openspec/changes/`, each describing one confirmed issue AND proposing
-a fix.
+Your output is zero or more new planning-lane units, each describing one
+confirmed issue AND proposing a fix. Each finding goes to ONE of two
+lanes — the spec lane (`openspec/changes/<slug>/`) or the issue lane
+(`openspec/issues/<slug>/`) — chosen by canon judgment per the
+"Choosing the output lane" section below. The daemon appends a block to
+the END of this prompt naming which lanes are available this run AND the
+exact paths; obey it.
 
 OpenSpec format reference: https://github.com/Fission-AI/OpenSpec/tree/main/docs
 (`concepts.md` for scenario syntax `GIVEN`/`WHEN`/`THEN`, delta blocks
@@ -73,6 +77,52 @@ A finding is "high confidence" when:
 
 If any is missing, drop the finding.
 
+## Ground every fix in canon, then choose its lane
+
+Before you propose ANY fix, read the canonical spec(s) for the
+capability the finding touches (`openspec/specs/<capability>/spec.md`).
+This is mandatory — it tells you whether the defective behavior is
+already specified (so the fix is a correction) or not yet specified (so
+the fix changes a contract), AND it gives you the exact vocabulary canon
+already uses.
+
+- **Reuse canonical vocabulary.** Never coin a new term — a new state
+  name, a new noun — for a concept canon already names. If canon calls
+  it a "pending change", do not invent "queued proposal".
+- **Prefer a `MODIFIED` delta of the existing requirement** over an
+  `ADDED` requirement that introduces a parallel term for the same
+  concept. An `ADDED` requirement that restates an invariant canon
+  already implies inflates the corpus AND collides with the existing
+  requirement at the change-vs-canonical gate.
+
+Then choose the lane by ONE question: **does fixing this require
+changing an observable contract?** Do NOT default to the spec lane —
+make the call:
+
+- **No — the code is already correctly specified AND the fix preserves
+  the observed behavior** (an unhandled error path, a leak, a race, a
+  mishandled `None` that canon already forbids). → **ISSUE lane.** Write
+  `openspec/issues/<slug>/` containing `issue.md` (the issue, the source
+  location, AND acceptance criteria stated against the EXISTING
+  specification) AND `tasks.md`, with NO `specs/` directory. The absence
+  of `specs/` is the contract that the fix changes no spec.
+- **Yes — the fix needs new or changed behavior at an observable
+  boundary** (public API, serialized/wire format, CLI surface, a state
+  machine, a new/changed invariant), OR canon itself permits/mandates
+  the defective behavior and must be corrected. → **SPEC lane.** Write
+  `openspec/changes/<slug>/` with the usual deltas; a contract-correcting
+  fix uses a `MODIFIED` delta of the exact canonical requirement.
+
+The issue lane is offered ONLY when the daemon's end-of-prompt block says
+`features.issues` is ENABLED. When it is DISABLED, the issue lane does
+not exist this run: write every unit to the spec lane.
+
+**Legibility — never bury a contract change inside an issue.** When a fix
+genuinely requires changing a canonical contract, write a spec-lane
+change AND state the contract change plainly in the proposal's `## Why`
+/ rationale. The issue lane is an honest "no contract change" claim; do
+not smuggle a contract change through it to avoid writing a spec.
+
 ## Cap on proposals per run
 
 `MAX_PROPOSALS` is the maximum. Order by severity:
@@ -82,9 +132,25 @@ If any is missing, drop the finding.
 3. Crashes on attacker-controlled input.
 4. Resource leaks, silent error swallowing, off-by-one (lowest).
 
-## OpenSpec format
+## Issue-lane unit format
 
-Each change is `openspec/changes/<change_name>/`. Required files:
+An issue-lane unit is `openspec/issues/<slug>/`. Required files:
+
+- `issue.md` — the issue, the source location (cite `path/to/file.rs:123`),
+  AND acceptance criteria stated against the EXISTING specification (name
+  the canonical requirement the fix makes the code conform to).
+- `tasks.md` — numbered, bracketed-checkbox implementation steps (same
+  shape as below).
+- NO `specs/` directory. An issue carries no spec delta; the absence of
+  `specs/` is the contract. (A unit with a `specs/` directory is
+  malformed and will be rejected by the issues walker.)
+
+The issue lane is NOT validated by `openspec validate` (it has no delta).
+
+## OpenSpec (spec-lane change) format
+
+Each spec-lane change is `openspec/changes/<change_name>/`. Required
+files:
 
 - `proposal.md` — `## Why` (cite `path/to/file.rs:123`, describe the
   issue concretely, name the harm), `## What Changes` (the fix),
@@ -123,7 +189,8 @@ spec back for revision.
 
 ## Naming convention
 
-Use `fix-` for bug fixes AND `secure-` for security hardening:
+Use `fix-` for bug fixes AND `secure-` for security hardening, in
+whichever lane the unit lands:
 
 - `secure-sanitize-user-paths`
 - `secure-validate-upload-mime-type`
@@ -135,14 +202,16 @@ not its location.
 
 ## Hard constraints
 
-- Do NOT modify any file outside `openspec/changes/`. Sandbox
-  WritePolicy is `OpenSpecOnly`.
-- Do NOT fix bugs directly — propose them as changes for the
-  implementer.
+- Do NOT modify any file outside the two planning lanes
+  (`openspec/changes/` AND `openspec/issues/`). The sandbox WritePolicy
+  is `PlanningLanes`; a write anywhere else (a source edit, a doc edit, a
+  config change) is reverted AND the run fails.
+- Do NOT fix bugs directly — propose them as a spec-lane change OR an
+  issue-lane unit for the implementer.
 - Do NOT propose stylistic changes that don't address a concrete
   security issue or bug.
 - Do NOT exceed `MAX_PROPOSALS`.
 - Do NOT post chatops messages, run git commits, OR push branches.
 
-Zero high-confidence findings is a valid outcome. Create zero change
-directories AND exit cleanly.
+Zero high-confidence findings is a valid outcome. Create zero units
+AND exit cleanly.
