@@ -1,15 +1,23 @@
-//! Shared helper for `OpenSpecOnly` "spec-writing" audits — those that
-//! invoke the wrapped agent CLI with a prompt, expect zero or more new
-//! `openspec/changes/<name>/` directories to appear, validate each via
+//! Shared helper for the "spec-writing" audits — those that invoke the
+//! wrapped agent CLI with a prompt, expect zero or more new planning-lane
+//! units to appear, validate the spec-lane ones via
 //! `openspec validate <name> --strict`, drop ones over the cap, commit
 //! the validated set on the agent branch, and return
 //! `AuditOutcome::SpecsWritten(validated_names)` so the same iteration's
-//! `walk_queue` picks them up.
+//! lane walkers pick them up.
 //!
-//! `missing_tests_audit` and `security_bug_audit` differ only in their
-//! prompt, their per-run cap source, and their human-readable commit
-//! subject — everything else (sandbox shape, snapshot diff, validation,
-//! over-cap pruning, commit) is identical. They both delegate to
+//! Two write policies share this harness, selected by
+//! [`SpecsWritingAuditParams::planning_lanes`]: `canon_consolidation_audit`
+//! runs spec-lane-only (`OpenSpecOnly`) and produces only
+//! `openspec/changes/<name>/` directories, while the two bug/gap audits
+//! (`missing_tests_audit`, `security_bug_audit`) run under `PlanningLanes`
+//! (a01) and route each finding to the spec lane (`openspec/changes/`) OR
+//! the issues lane (`openspec/issues/`) by canon judgment.
+//!
+//! The audits differ only in their prompt, their per-run cap source, their
+//! human-readable commit subject, and whether they choose a lane —
+//! everything else (sandbox shape, snapshot diff, validation, over-cap
+//! pruning, commit) is identical. They all delegate to
 //! [`run_specs_writing_audit`] so the algorithm lives in one place and
 //! cannot drift across audits.
 
@@ -140,6 +148,18 @@ pub(crate) async fn run_specs_writing_audit(
     let max_retries = ctx.max_validation_retries;
     let total_attempts = max_retries.saturating_add(1);
 
+    // a01: the `WritePolicy` this harness actually serves this run — the
+    // two-prefix `PlanningLanes` policy for the lane-choosing bug/gap audits,
+    // else the single-prefix `OpenSpecOnly` policy (canon_consolidation). The
+    // CLI's writable-mount flag derives from it below; both are writable
+    // today, but deriving from the real policy keeps the mount correct if the
+    // two ever diverge (a read-only mount would silently yield 0 proposals).
+    let write_policy = if params.planning_lanes {
+        WritePolicy::PlanningLanes
+    } else {
+        WritePolicy::OpenSpecOnly
+    };
+
     let mut sandbox = params.sandbox.clone();
     sandbox.allowed_tools = params.allowed_tools.iter().map(|s| (*s).to_string()).collect();
 
@@ -185,7 +205,9 @@ pub(crate) async fn run_specs_writing_audit(
 
     for attempt in 0..total_attempts {
         // Clean up dirs produced by the prior failed attempt so they do
-        // not pollute this attempt's diff.
+        // not pollute this attempt's diff. `prior_attempt_dirs` holds only
+        // spec-lane names (per the validation invariant below), so resolving
+        // them under `openspec/changes/` is exhaustive.
         for name in &prior_attempt_dirs {
             let path = ctx.workspace.join("openspec/changes").join(name);
             let _ = std::fs::remove_dir_all(&path);
@@ -235,9 +257,10 @@ pub(crate) async fn run_specs_writing_audit(
                 audit_type,
                 params.model,
                 // Writability derives from the WritePolicy this harness serves
-                // (OpenSpecOnly → writable) so the agent can create the change
-                // dir; a read-only mount would silently yield 0 proposals.
-                WritePolicy::OpenSpecOnly.workspace_writable(),
+                // this run (OpenSpecOnly OR PlanningLanes → writable) so the
+                // agent can create the unit dir; a read-only mount would
+                // silently yield 0 proposals.
+                write_policy.workspace_writable(),
             )
             .await
         } else {
@@ -250,9 +273,10 @@ pub(crate) async fn run_specs_writing_audit(
                 params.settings_dir,
                 params.model,
                 // Writability derives from the WritePolicy this harness serves
-                // (OpenSpecOnly → writable) so the agent can create the change
-                // dir; a read-only mount would silently yield 0 proposals.
-                WritePolicy::OpenSpecOnly.workspace_writable(),
+                // this run (OpenSpecOnly OR PlanningLanes → writable) so the
+                // agent can create the unit dir; a read-only mount would
+                // silently yield 0 proposals.
+                write_policy.workspace_writable(),
             )
             .await
         }
@@ -389,7 +413,11 @@ pub(crate) async fn run_specs_writing_audit(
         // Issue-lane units carry NO spec delta (no `specs/` directory), so
         // there is nothing for openspec to validate — they are accepted as
         // produced (the issues walker validates their `issue.md`/`tasks.md`
-        // shape when it works them next iteration).
+        // shape when it works them next iteration). INVARIANT: only the
+        // `Lane::Changes` arm can push to `failures`, so `failures` (and the
+        // `prior_attempt_dirs` derived from it for retry cleanup) names ONLY
+        // spec-lane units — every cleanup below resolves them under
+        // `openspec/changes/`, never the issues lane.
         let mut validated: Vec<ProducedUnit> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
         for u in &new_units {
@@ -527,7 +555,9 @@ pub(crate) async fn run_specs_writing_audit(
             continue;
         }
 
-        // Exhausted budget. Clean up and notify.
+        // Exhausted budget. Clean up and notify. `prior_attempt_dirs` is
+        // spec-lane-only (validation invariant), so `openspec/changes/` covers
+        // every entry.
         for name in &prior_attempt_dirs {
             let path = ctx.workspace.join("openspec/changes").join(name);
             let _ = std::fs::remove_dir_all(&path);
