@@ -139,22 +139,31 @@ pub enum VerifierGate {
     In,
     /// Change-vs-canonical consistency, pre-executor. Realized by a62.
     Canon,
+    /// Change-vs-global-rules consistency, pre-executor. Realized by
+    /// global-rules-gate.
+    Rules,
     /// Code-implements-spec, post-executor. Realized by a63.
     Out,
 }
 
 impl VerifierGate {
     /// Every gate in the fixed vocabulary, in lifecycle order.
-    #[cfg_attr(not(test), allow(dead_code))] // iterated by tests and by a62/a63 startup wiring.
-    pub const ALL: [VerifierGate; 3] = [VerifierGate::In, VerifierGate::Canon, VerifierGate::Out];
+    #[cfg_attr(not(test), allow(dead_code))] // iterated by tests and by startup wiring.
+    pub const ALL: [VerifierGate; 4] = [
+        VerifierGate::In,
+        VerifierGate::Canon,
+        VerifierGate::Rules,
+        VerifierGate::Out,
+    ];
 
-    /// The gate's stable identifier (`in` / `canon` / `out`). Keys the
+    /// The gate's stable identifier (`in` / `canon` / `rules` / `out`). Keys the
     /// registry AND forms the diagnostic label.
     #[cfg_attr(not(test), allow(dead_code))] // asserted by tests; the framework keys the registry on the enum directly.
     pub const fn id(self) -> &'static str {
         match self {
             VerifierGate::In => "in",
             VerifierGate::Canon => "canon",
+            VerifierGate::Rules => "rules",
             VerifierGate::Out => "out",
         }
     }
@@ -163,7 +172,9 @@ impl VerifierGate {
     #[cfg_attr(not(test), allow(dead_code))] // dispatched on by a62/a63 when they realize their gates.
     pub const fn position(self) -> LifecyclePosition {
         match self {
-            VerifierGate::In | VerifierGate::Canon => LifecyclePosition::PreExecutor,
+            VerifierGate::In | VerifierGate::Canon | VerifierGate::Rules => {
+                LifecyclePosition::PreExecutor
+            }
             VerifierGate::Out => LifecyclePosition::PostExecutor,
         }
     }
@@ -177,6 +188,7 @@ impl VerifierGate {
         match self {
             VerifierGate::In => "[verifier:in]",
             VerifierGate::Canon => "[verifier:canon]",
+            VerifierGate::Rules => "[verifier:rules]",
             VerifierGate::Out => "[verifier:out]",
         }
     }
@@ -208,6 +220,10 @@ pub enum GateImpl {
     /// point:
     /// [`crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check`].
     CanonContradictionCheck,
+    /// The change-vs-global-rules pre-flight check (global-rules-gate) — the
+    /// pre-executor `[rules]` gate. Entry point:
+    /// [`crate::preflight::global_rules::run_agentic_global_rules_check`].
+    GlobalRulesCheck,
     /// The code-implements-spec verification check (a63) — the post-executor
     /// `[out]` gate. Entry point:
     /// [`crate::code_implements_spec::run_code_implements_spec_check`].
@@ -248,6 +264,7 @@ impl GateRegistry {
             let mut reg = GateRegistry::default();
             reg.register(VerifierGate::In, GateImpl::ContradictionCheck);
             reg.register(VerifierGate::Canon, GateImpl::CanonContradictionCheck);
+            reg.register(VerifierGate::Rules, GateImpl::GlobalRulesCheck);
             reg.register(VerifierGate::Out, GateImpl::CodeImplementsSpecCheck);
             reg
         })
@@ -285,14 +302,16 @@ mod tests {
     fn ids_are_stable_and_distinct() {
         assert_eq!(VerifierGate::In.id(), "in");
         assert_eq!(VerifierGate::Canon.id(), "canon");
+        assert_eq!(VerifierGate::Rules.id(), "rules");
         assert_eq!(VerifierGate::Out.id(), "out");
     }
 
     #[test]
     fn lifecycle_positions_match_the_framework() {
-        // Two pre-executor gates, one post-executor gate.
+        // Three pre-executor gates, one post-executor gate.
         assert_eq!(VerifierGate::In.position(), LifecyclePosition::PreExecutor);
         assert_eq!(VerifierGate::Canon.position(), LifecyclePosition::PreExecutor);
+        assert_eq!(VerifierGate::Rules.position(), LifecyclePosition::PreExecutor);
         assert_eq!(VerifierGate::Out.position(), LifecyclePosition::PostExecutor);
     }
 
@@ -300,6 +319,7 @@ mod tests {
     fn labels_carry_the_stable_identifier() {
         assert_eq!(VerifierGate::In.label(), "[verifier:in]");
         assert_eq!(VerifierGate::Canon.label(), "[verifier:canon]");
+        assert_eq!(VerifierGate::Rules.label(), "[verifier:rules]");
         assert_eq!(VerifierGate::Out.label(), "[verifier:out]");
     }
 
@@ -312,10 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn all_lists_exactly_the_three_gates() {
+    fn all_lists_exactly_the_four_gates() {
         assert_eq!(
             VerifierGate::ALL,
-            [VerifierGate::In, VerifierGate::Canon, VerifierGate::Out]
+            [
+                VerifierGate::In,
+                VerifierGate::Canon,
+                VerifierGate::Rules,
+                VerifierGate::Out
+            ]
         );
     }
 
@@ -341,6 +366,12 @@ mod tests {
             "the [canon] gate must map to the a62 change-vs-canonical check"
         );
         assert!(reg.is_installed(VerifierGate::Canon));
+        assert_eq!(
+            reg.resolve(VerifierGate::Rules),
+            Some(GateImpl::GlobalRulesCheck),
+            "the [rules] gate must map to the global-rules check"
+        );
+        assert!(reg.is_installed(VerifierGate::Rules));
         assert_eq!(
             reg.resolve(VerifierGate::Out),
             Some(GateImpl::CodeImplementsSpecCheck),

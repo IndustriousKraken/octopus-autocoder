@@ -585,6 +585,10 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             change_canonical_contradiction_check_prompt_path: None,
             change_canonical_contradiction_check_llm: None,
+            global_rules_check: crate::config::ContradictionCheckMode::Disabled,
+            global_rules_check_prompt_path: None,
+            global_rules_check_llm: None,
+            global_rules: crate::config::GlobalRulesConfig::default(),
             code_implements_spec_check:
                 crate::config::ContradictionCheckMode::Disabled,
             code_implements_spec_check_prompt_path: None,

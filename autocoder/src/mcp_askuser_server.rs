@@ -467,6 +467,7 @@ fn handle_request<W: Write>(
                 // a57 `submit_findings` (advisory audits), a58 `submit_review`
                 // (agentic reviewer), a59 `submit_contradictions` (the [in]
                 // gate), a62 `submit_canon_contradictions` (the [canon] gate),
+                // global-rules-gate `submit_rule_violations` (the [rules] gate),
                 // AND a63 `submit_verdict` (the [out] gate) share the per-role
                 // relay path: the role selects the daemon-side schema, the
                 // tool's full arguments object IS the submission payload, AND a
@@ -476,6 +477,7 @@ fn handle_request<W: Write>(
                 | "submit_contradictions"
                 | "submit_canon_contradictions"
                 | "submit_canon_internal_contradictions"
+                | "submit_rule_violations"
                 | "submit_verdict") => {
                     let role = std::env::var(ENV_ROLE)
                         .ok()
@@ -500,6 +502,9 @@ fn handle_request<W: Write>(
                                 | "submit_canon_contradictions"
                                 | "submit_canon_internal_contradictions" => {
                                     "Contradictions submitted and recorded as this check's result. You may stop now."
+                                }
+                                "submit_rule_violations" => {
+                                    "Rule violations submitted and recorded as this check's result. You may stop now."
                                 }
                                 "submit_verdict" => {
                                     "Verdict submitted and recorded as this check's result. You may stop now."
@@ -888,6 +893,10 @@ pub fn submission_tool_name_for_role(role: &str) -> Option<&'static str> {
         // a62: the `[canon]` gate returns its findings via
         // `submit_canon_contradictions`.
         Some("submit_canon_contradictions")
+    } else if role == crate::preflight::global_rules::GLOBAL_RULES_CHECK_ROLE {
+        // global-rules-gate: the `[rules]` gate returns its findings via
+        // `submit_rule_violations`.
+        Some("submit_rule_violations")
     } else if role == crate::code_implements_spec::CODE_IMPLEMENTS_SPEC_ROLE {
         // a63: the `[out]` gate returns its verdict via `submit_verdict`.
         Some("submit_verdict")
@@ -921,6 +930,12 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
     // the `[in]` gate's within-change requirement pair.
     if role == crate::preflight::canon_contradiction::CANON_CONTRADICTION_CHECK_ROLE {
         return Some(submit_canon_contradictions_tool());
+    }
+    // global-rules-gate: the `[rules]` gate's `submit_rule_violations` tool
+    // names the violated rule by its stable id, distinct from a62's
+    // `submit_canon_contradictions` (which names a canonical requirement).
+    if role == crate::preflight::global_rules::GLOBAL_RULES_CHECK_ROLE {
+        return Some(submit_rule_violations_tool());
     }
     // a63: the `[out]` gate's `submit_verdict` tool returns the
     // code-implements-spec verdict (implemented | gaps_found + per-gap detail),
@@ -1093,6 +1108,38 @@ fn submit_canon_contradictions_tool() -> serde_json::Value {
                 }
             },
             "required": ["contradictions"]
+        }
+    })
+}
+
+/// The `submit_rule_violations` tool definition advertised for the
+/// global-rules-check role — the `[rules]` gate (global-rules-gate). Each entry
+/// names the violated rule by its stable id (per the rule protocol) AND a
+/// one-line summary of how the change violates it; an empty `violations` array
+/// means "no violations found". The daemon-side validator
+/// ([`crate::preflight::global_rules::payload_to_rule_violations`]) deserializes
+/// the payload into the finding shape, surfacing a malformed payload as a
+/// correctable tool error.
+fn submit_rule_violations_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "submit_rule_violations",
+        "description": "Return the global-rule violations you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `violations` array (an empty array means \"no violations found\" — the common case). Each entry names the violated rule by its stable `rule_id` (the id shown beside each rule in the prompt) AND a one-line `summary` of how this change violates it. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "violations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rule_id": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["rule_id", "summary"]
+                    }
+                }
+            },
+            "required": ["violations"]
         }
     })
 }
@@ -1468,6 +1515,11 @@ mod tests {
             submission_tool_name_for_role("canon_contradiction_check"),
             Some("submit_canon_contradictions")
         );
+        // global-rules-gate: the `[rules]` gate gets `submit_rule_violations`.
+        assert_eq!(
+            submission_tool_name_for_role("global_rules_check"),
+            Some("submit_rule_violations")
+        );
         // a75: the canon-internal contradiction AUDIT gets the symmetric
         // `submit_canon_internal_contradictions` (distinct from a62's
         // change-vs-canon tool).
@@ -1525,6 +1577,59 @@ mod tests {
                     .map(|t| t["name"] != "submit_review")
                     .unwrap_or(true),
                 "role `{role}` must NOT advertise submit_review"
+            );
+        }
+    }
+
+    // global-rules-gate task 6.6: `submit_rule_violations` is advertised ONLY
+    // when `ORCH_MCP_ROLE = global_rules_check`, with the `{ rule_id, summary }`
+    // schema, alongside the common tools — AND NOT for any other role.
+    #[test]
+    fn submit_rule_violations_advertised_only_for_global_rules_check_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_ROLE, "global_rules_check");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#],
+        );
+        unsafe {
+            std::env::remove_var(ENV_ROLE);
+        }
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        let submit = tools
+            .iter()
+            .find(|t| t["name"] == "submit_rule_violations")
+            .expect("global_rules_check role must advertise submit_rule_violations");
+        let item_props =
+            &submit["inputSchema"]["properties"]["violations"]["items"]["properties"];
+        for field in ["rule_id", "summary"] {
+            assert!(
+                item_props.get(field).is_some(),
+                "rule-violation item schema must define `{field}`: {submit}"
+            );
+        }
+        // Sibling gates' tools are NOT present for this role.
+        assert!(
+            !tools.iter().any(|t| t["name"] == "submit_canon_contradictions"),
+            "the [rules] role must not advertise submit_canon_contradictions"
+        );
+        // Other roles do NOT advertise submit_rule_violations.
+        for role in [
+            "implementer",
+            "reviewer",
+            "contradiction_check",
+            "canon_contradiction_check",
+            "drift_audit",
+        ] {
+            assert!(
+                submission_tool_for_role(role)
+                    .map(|t| t["name"] != "submit_rule_violations")
+                    .unwrap_or(true),
+                "role `{role}` must NOT advertise submit_rule_violations"
             );
         }
     }

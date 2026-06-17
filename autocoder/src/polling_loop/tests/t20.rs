@@ -61,7 +61,14 @@ async fn disabled_blocking_gates_record_disabled_and_proceed() {
         crate::gate_ledger::GateVerdict::Disabled,
         "[canon] slot records Disabled via a stub, not an absence"
     );
-    assert!(ledger.blocking_ok(), "two Disabled blocking gates are blocking-ok");
+    // global-rules-gate task 6.1: default-disabled → no `[rules]` session; the
+    // stub records `Disabled` (not an absence) AND the executor proceeds.
+    assert_eq!(
+        ledger.rules.verdict,
+        crate::gate_ledger::GateVerdict::Disabled,
+        "[rules] slot records Disabled via a stub, not an absence"
+    );
+    assert!(ledger.blocking_ok(), "all Disabled blocking gates are blocking-ok");
 
     // a16: the ledger lives under .git/, never the managed working tree.
     assert!(
@@ -212,4 +219,174 @@ fn seed_ledger_reads_persisted_pre_executor_verdicts() {
     let fresh = seed_ledger_from_processed(ws, &["never-ran".to_string()]);
     assert_eq!(fresh.r#in.verdict, GateVerdict::Pending);
     assert_eq!(fresh.canon.verdict, GateVerdict::Pending);
+}
+
+/// Seed a tiny global rule corpus in a standalone tempdir (outside the managed
+/// workspace) AND return it; the caller keeps the `TempDir` alive.
+fn seeded_rule_corpus() -> tempfile::TempDir {
+    let corpus = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        corpus.path().join("no-secrets.md"),
+        "Secrets are never committed to the repository.",
+    )
+    .unwrap();
+    corpus
+}
+
+/// global-rules-gate task 6.2: enabled `[rules]` gate + a change that violates a
+/// seeded rule → the agent submits `submit_rule_violations` naming the rule id,
+/// the marker is written naming the rule, the executor is NOT invoked, AND the
+/// queue walk halts. (Behavior + ledger state asserted.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rules_violation_writes_marker_and_halts() {
+    let corpus = seeded_rule_corpus();
+    let submission = serde_json::json!({
+        "violations": [
+            { "rule_id": "no-secrets", "summary": "the change stores an API key in a tracked config file" }
+        ]
+    });
+    let ctx = gr_test_ctx(
+        Some(submission),
+        Some("anthropic/claude-opus-4-8".into()),
+        corpus.path().to_path_buf(),
+    );
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change_with_spec(
+        &ws,
+        "leaks-secret",
+        "security",
+        "## ADDED Requirements\n\n### Requirement: Store key\nThe system SHALL store the API key in config.yaml.\n",
+    );
+    // A clean sibling that sorts AFTER; it must NOT run (the walk halts).
+    add_committed_change(&ws, "z-runs-if-not-halted", "fixture");
+
+    let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = CountingCompletingExecutor(invocations.clone());
+    let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+    let _ = crate::preflight::global_rules::scope(Some(std::sync::Arc::new(ctx)), fut).await;
+
+    assert_eq!(
+        invocations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "executor must NOT be invoked when a global-rule violation is found (queue walk halts)"
+    );
+    let marker_path = ws.join("openspec/changes/leaks-secret/.needs-spec-revision.json");
+    assert!(marker_path.exists(), "marker must be written");
+    let raw = std::fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        raw.contains("no-secrets"),
+        "revision_suggestion must name the violated rule by id; got: {raw}"
+    );
+    let parsed: crate::spec_revision::SpecNeedsRevisionMarker = serde_json::from_str(&raw).unwrap();
+    assert!(
+        parsed.unimplementable_tasks.is_empty() && parsed.unarchivable_deltas.is_empty(),
+        "semantic-finding shape: unimplementable_tasks AND unarchivable_deltas empty"
+    );
+    assert!(
+        parsed.gate_error.is_none(),
+        "a findings marker carries NO gate_error (that is the could-not-run shape)"
+    );
+
+    let ledger = crate::gate_ledger::read_ledger(&ws, "leaks-secret").expect("ledger persisted");
+    assert_eq!(ledger.rules.verdict, crate::gate_ledger::GateVerdict::Fail);
+    assert!(!ledger.blocking_ok(), "a Fail [rules] verdict holds the change");
+    // The PR-body ledger summary for a `[rules]` Fail names "rule violations",
+    // NOT the `[in]`/`[canon]` gates' "contradiction findings" noun.
+    let summary = ledger
+        .rules
+        .summary
+        .as_deref()
+        .expect("a [rules] Fail row carries a one-line summary");
+    assert!(
+        summary.contains("rule violations"),
+        "the [rules] Fail summary must read 'rule violations', not 'contradiction findings'; got: {summary}"
+    );
+}
+
+/// global-rules-gate task 6.3: enabled `[rules]` gate + a clean change (empty
+/// `violations`) → proceeds to the executor, no marker, `[rules]` records Pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rules_clean_change_proceeds_no_marker() {
+    let corpus = seeded_rule_corpus();
+    let ctx = gr_test_ctx(
+        Some(serde_json::json!({ "violations": [] })),
+        Some("anthropic/claude-opus-4-8".into()),
+        corpus.path().to_path_buf(),
+    );
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change_with_spec(
+        &ws,
+        "clean-rules",
+        "newcap",
+        "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+    );
+
+    let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = CountingCompletingExecutor(invocations.clone());
+    let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+    crate::preflight::global_rules::scope(Some(std::sync::Arc::new(ctx)), fut)
+        .await
+        .expect("pass succeeds");
+
+    assert_eq!(
+        invocations.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a clean [rules] gate (empty violations → Pass) lets the executor proceed"
+    );
+    assert!(
+        !ws.join("openspec/changes/clean-rules/.needs-spec-revision.json").exists(),
+        "no marker is written on a clean global-rules result"
+    );
+    let ledger = crate::gate_ledger::read_ledger(&ws, "clean-rules").expect("ledger persisted");
+    assert_eq!(ledger.rules.verdict, crate::gate_ledger::GateVerdict::Pass);
+    assert_eq!(
+        ledger.rules.model.as_deref(),
+        Some("claude-test"),
+        "the [rules] row records the model that ran the gate"
+    );
+}
+
+/// global-rules-gate task 6.4: enabled `[rules]` gate + a session that records NO
+/// submission → FAIL CLOSED: the executor is NOT invoked, a held marker with a
+/// structured `gate_error` labeled `[verifier:rules]` is written — never "no
+/// violations".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rules_no_submission_holds_fail_closed() {
+    let corpus = seeded_rule_corpus();
+    // `None` = the agentic session ran but recorded no submission.
+    let ctx = gr_test_ctx(None, None, corpus.path().to_path_buf());
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change_with_spec(
+        &ws,
+        "rules-transport-err",
+        "newcap",
+        "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+    );
+
+    let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = CountingCompletingExecutor(invocations.clone());
+    let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+    let _ = crate::preflight::global_rules::scope(Some(std::sync::Arc::new(ctx)), fut).await;
+
+    assert_eq!(
+        invocations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "fail-closed: the executor must NOT run when the [rules] gate could not evaluate the change"
+    );
+    let marker_path = ws.join("openspec/changes/rules-transport-err/.needs-spec-revision.json");
+    assert!(marker_path.exists(), "fail-closed: a held marker must be written");
+    let marker: crate::spec_revision::SpecNeedsRevisionMarker =
+        serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+    let ge = marker
+        .gate_error
+        .expect("the held marker must carry a structured gate_error (not a finding)");
+    assert_eq!(ge.gate, "[verifier:rules]", "gate_error names the [rules] gate");
+    let ledger = crate::gate_ledger::read_ledger(&ws, "rules-transport-err").expect("ledger");
+    assert_eq!(
+        ledger.rules.verdict,
+        crate::gate_ledger::GateVerdict::FailedToRun
+    );
 }
