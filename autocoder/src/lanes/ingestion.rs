@@ -309,6 +309,18 @@ pub fn slug_from_title(title: &str) -> String {
     slugify(title)
 }
 
+/// The slug a report takes: the verdict's derived slug, or the title-derived
+/// slug when the verdict gave none. Shared by the candidate route (via
+/// [`draft_candidate`]) AND the behavior-change route's dedup, so both dedup
+/// against the SAME slug the candidate would claim.
+pub fn report_slug(report: &IngestedIssue, verdict: &TriageVerdict) -> String {
+    if verdict.slug.is_empty() {
+        slug_from_title(&report.title)
+    } else {
+        verdict.slug.clone()
+    }
+}
+
 /// The existing issue-unit slugs in the workspace: `(open, archived)`.
 /// `open` is every direct subdirectory of `issues/` except
 /// `archive` AND dotfiles (regardless of well-formedness, so a malformed
@@ -415,11 +427,7 @@ pub fn draft_candidate(
     verdict: &TriageVerdict,
     origin: IssueOrigin,
 ) -> IssueCandidate {
-    let slug = if verdict.slug.is_empty() {
-        slug_from_title(&report.title)
-    } else {
-        verdict.slug.clone()
-    };
+    let slug = report_slug(report, verdict);
     let origin_line = if origin.is_public() {
         "Origin: PUBLIC report (untrusted). The reporter's raw body is carried as quarantined DATA in `report-body.md`; the task below is the maintainer-approved diagnosis, NOT the reporter's text."
     } else {
@@ -561,8 +569,10 @@ pub fn read_candidate(state_root: &Path, id: &str) -> Result<Option<CandidateSta
         .with_context(|| format!("parsing {}", path.display()))
 }
 
-/// True when a candidate has already been recorded for this report (so the
-/// ingestion pass does not re-triage / re-post it).
+/// True when a posted/promoted candidate has already been recorded for this
+/// report. This covers ONLY the candidate route; [`already_dispositioned`]
+/// combines it with the non-candidate disposition marker to give the
+/// ingestion pass its full "triage each report at most once" gate.
 fn candidate_exists(state_root: &Path, id: &str) -> bool {
     candidate_path(state_root, id).exists()
 }
@@ -594,6 +604,99 @@ pub fn find_candidate_by_thread(state_root: &Path, thread_ts: &str) -> Option<Ca
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Disposition marker (non-candidate routes).
+// ---------------------------------------------------------------------------
+//
+// The `IssueCandidate` route records its terminal disposition by writing a
+// `CandidateState` (`<id>.json`) via `post_candidate`. The OTHER routes —
+// behavior-change, declined, AND deduped — drafted no candidate, so without
+// a marker of their own a still-open report would be re-fetched, re-triaged,
+// AND re-notified every ingestion pass. A lightweight sibling marker
+// (`<id>.disposition.json`, alongside the candidate file in `candidates_dir`)
+// records THEIR terminal disposition so the same already-intended idempotency
+// the `candidate_exists` gate gives the candidate route extends to every
+// route. The marker is keyed by [`candidate_id`], like the candidate file.
+
+/// The terminal disposition of a reported issue that did NOT become a posted
+/// candidate. (Candidate routes persist a [`CandidateState`] instead.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    /// Classified as a behavior change. The report needs a
+    /// maintainer-authored proposal in the changes lane; autocoder does NOT
+    /// auto-draft a changes-lane candidate from a public report (that is a
+    /// separate, future capability).
+    RoutedToChanges,
+    /// Declined — a question or an invalid / not-actionable report.
+    Declined,
+    /// Deduped against an existing open OR archived issue unit.
+    Duplicate,
+}
+
+/// Persisted marker for a reported issue's terminal NON-candidate
+/// disposition. Written once, keyed by [`candidate_id`]; consulted (by file
+/// existence) by the ingestion gate so the report is triaged at most once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispositionRecord {
+    pub id: String,
+    pub repo_url: String,
+    pub source_issue: u64,
+    pub disposition: Disposition,
+    pub decided_at: DateTime<Utc>,
+}
+
+/// Path of a disposition marker: `<state>/issue-candidates/<id>.disposition.json`.
+/// Distinct from [`candidate_path`]'s `<id>.json`, so the two never collide
+/// AND a malformed marker cannot be mistaken for a candidate by
+/// [`find_candidate_by_thread`] (which only parses `CandidateState`).
+fn disposition_path(state_root: &Path, id: &str) -> PathBuf {
+    candidates_dir(state_root).join(format!("{id}.disposition.json"))
+}
+
+/// Atomically write a disposition marker (tempfile-then-rename, like
+/// [`write_candidate`]).
+pub fn write_disposition(state_root: &Path, record: &DispositionRecord) -> Result<()> {
+    let dir = candidates_dir(state_root);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating issue-candidates dir {}", dir.display()))?;
+    let path = disposition_path(state_root, &record.id);
+    let tmp = tempfile::NamedTempFile::new_in(&dir)
+        .with_context(|| format!("creating tempfile in {}", dir.display()))?;
+    serde_json::to_writer_pretty(&tmp, record)
+        .with_context(|| format!("serializing disposition for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Read a disposition marker. `Ok(None)` when absent (the report is not yet
+/// dispositioned). An unparseable marker yields an error — but the gate
+/// ([`already_dispositioned`]) keys on file existence, not parseability, so a
+/// corrupt marker still suppresses re-triage rather than re-spamming.
+pub fn read_disposition(state_root: &Path, id: &str) -> Result<Option<DispositionRecord>> {
+    let path = disposition_path(state_root, id);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("reading {}: {e}", path.display())),
+    };
+    serde_json::from_str::<DispositionRecord>(&raw)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+/// True when ANY terminal disposition has already been recorded for this
+/// report — EITHER a posted/promoted candidate ([`candidate_exists`]) OR a
+/// non-candidate disposition marker ([`disposition_path`]). The ingestion
+/// pass uses this to triage each report at most once: a still-open report
+/// that already reached a terminal disposition is skipped (no re-triage, no
+/// re-notification). Keys on file existence so a corrupt marker still
+/// suppresses re-spam.
+fn already_dispositioned(state_root: &Path, id: &str) -> bool {
+    candidate_exists(state_root, id) || disposition_path(state_root, id).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -841,8 +944,41 @@ pub struct ReportOutcome {
     pub action: ReportAction,
 }
 
+/// Record a NON-candidate terminal disposition for `report` (best-effort).
+/// A write failure is logged AND swallowed — it is not fatal to the pass,
+/// though the report may be re-triaged on a later pass if the marker did not
+/// land. (The candidate routes persist via `post_candidate` instead.)
+fn record_disposition(
+    state_root: &Path,
+    repo_url: &str,
+    report: &IngestedIssue,
+    disposition: Disposition,
+) {
+    let record = DispositionRecord {
+        id: candidate_id(repo_url, report.number),
+        repo_url: repo_url.to_string(),
+        source_issue: report.number,
+        disposition,
+        decided_at: Utc::now(),
+    };
+    if let Err(e) = write_disposition(state_root, &record) {
+        tracing::warn!(
+            repo_url = %repo_url,
+            source_issue = report.number,
+            "issue ingestion: recording disposition failed; report may be re-triaged next pass: {e:#}"
+        );
+    }
+}
+
 /// Decide-and-act on one already-classified report. Pure of the executor:
-/// dedups, drafts, posts (or routes / declines). Returns the action taken.
+/// dedups, drafts, posts (or routes / declines), AND records a terminal
+/// disposition so a later pass over the same still-open report is skipped.
+/// Returns the action taken.
+///
+/// Every terminal route records a disposition: the candidate route via
+/// `post_candidate` (its `CandidateState` IS the marker), every other route
+/// via [`record_disposition`]. Only the transient `TriageFailed` paths record
+/// NOTHING — those are retried next pass.
 async fn act_on_verdict(
     workspace: &Path,
     state_root: &Path,
@@ -867,6 +1003,7 @@ async fn act_on_verdict(
                     ),
                 )
                 .await;
+                record_disposition(state_root, repo_url, report, Disposition::Duplicate);
                 return ReportAction::Declined {
                     reason: format!("duplicate of existing issue `{}`", candidate.slug),
                 };
@@ -875,26 +1012,58 @@ async fn act_on_verdict(
                 Ok(_) => ReportAction::PostedCandidate {
                     slug: candidate.slug,
                 },
+                // No disposition recorded on a post failure → retried next pass.
                 Err(e) => ReportAction::TriageFailed {
                     reason: format!("posting candidate failed: {e:#}"),
                 },
             }
         }
         TriageRoute::ChangesProposal => {
+            // Dedup the behavior-change route too (the existing "dedup each
+            // against open AND archived issues" contract): a report that
+            // duplicates an existing issue is deduped, not routed.
+            let slug = report_slug(report, verdict);
+            let (open, archived) = existing_issue_slugs(workspace);
+            if is_duplicate(&slug, &open, &archived) {
+                shared::notify(
+                    chatops_ctx,
+                    &format!(
+                        "🔁 `{repo_url}`: reported issue #{} duplicates existing issue `{}`; deduped (no routing).",
+                        report.number, slug
+                    ),
+                )
+                .await;
+                record_disposition(state_root, repo_url, report, Disposition::Duplicate);
+                return ReportAction::Declined {
+                    reason: format!("duplicate of existing issue `{slug}`"),
+                };
+            }
+            // Honest message: autocoder does NOT route or create a proposal —
+            // a behavior change needs a maintainer-authored changes-lane
+            // proposal. The disposition marker below makes this post once.
             shared::notify(
                 chatops_ctx,
                 &format!(
-                    "↪️ `{repo_url}`: reported issue #{} wants a behavior change — routing to the \
-                     changes lane (`openspec/changes/`) as a proposal, NOT an issue.",
+                    "↪️ `{repo_url}`: reported issue #{} appears to want a behavior change. This \
+                     needs a maintainer-authored proposal in the changes lane (`openspec/changes/`); \
+                     autocoder does not auto-draft change proposals from public reports.",
                     report.number
                 ),
             )
             .await;
+            record_disposition(state_root, repo_url, report, Disposition::RoutedToChanges);
             ReportAction::RoutedToChanges
         }
-        TriageRoute::Declined => ReportAction::Declined {
-            reason: "question / invalid / duplicate — no work queued".to_string(),
-        },
+        TriageRoute::Declined => {
+            let disposition = match verdict.classification {
+                ReportClassification::Duplicate => Disposition::Duplicate,
+                _ => Disposition::Declined,
+            };
+            record_disposition(state_root, repo_url, report, disposition);
+            ReportAction::Declined {
+                reason: "question / invalid / duplicate — no work queued".to_string(),
+            }
+        }
     }
 }
 
@@ -923,7 +1092,7 @@ pub async fn run_issue_ingestion(
 
     for report in &reports {
         let id = candidate_id(&repo.url, report.number);
-        if candidate_exists(state_root, &id) {
+        if already_dispositioned(state_root, &id) {
             outcomes.push(ReportOutcome {
                 number: report.number,
                 action: ReportAction::AlreadyHandled,
@@ -1331,11 +1500,15 @@ mod tests {
         assert!(issues::list_ready(ws).unwrap().is_empty());
         let id = candidate_id(&repo_cfg().url, 7);
         assert!(read_candidate(&paths.state, &id).unwrap().is_none());
+        // A disposition IS recorded so the report is not re-triaged next pass.
+        assert!(already_dispositioned(&paths.state, &id));
     }
 
     #[tokio::test]
     async fn run_issue_ingestion_skips_already_handled() {
-        // The driver does not re-post a report that already has a candidate.
+        // 4.4 (regression): the candidate route still writes its candidate
+        // state AND is then already-dispositioned, so the driver skips it on
+        // the next pass (existing idempotency unchanged).
         let td = TempDir::new().unwrap();
         let ws = td.path();
         let (_sd, paths) = crate::testing::test_daemon_paths();
@@ -1346,6 +1519,11 @@ mod tests {
         let id = candidate_id(&repo_cfg().url, 3);
         assert!(candidate_exists(&paths.state, &id));
         assert!(read_candidate(&paths.state, &id).unwrap().is_some());
+        // The candidate route feeds the same gate the other routes do.
+        assert!(already_dispositioned(&paths.state, &id));
+        // The candidate route does NOT also write a sibling disposition
+        // marker — its CandidateState is the marker.
+        assert!(read_disposition(&paths.state, &id).unwrap().is_none());
     }
 
     #[test]
@@ -1529,5 +1707,184 @@ mod tests {
         promote_candidate(ws, &paths.state, &found).unwrap();
         let after = find_candidate_by_thread(&paths.state, "1755.abc").unwrap();
         assert_eq!(after.status, CandidateStatus::Promoted);
+    }
+
+    // ----- disposition idempotency for the non-candidate routes (a010) -----
+
+    /// Chatops backend that counts plain `post_notification` calls (the path
+    /// `shared::notify` takes), so a route's notification count is observable
+    /// without asserting message text.
+    #[derive(Default)]
+    struct NotifyCountingBackend {
+        notifications: Mutex<usize>,
+    }
+
+    impl NotifyCountingBackend {
+        fn notify_count(&self) -> usize {
+            *self.notifications.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl crate::chatops::ChatOpsBackend for NotifyCountingBackend {
+        fn provider_name(&self) -> &'static str {
+            "notify-counting"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _c: &str, _ch: &str, _q: &str) -> Result<String> {
+            unreachable!("ingestion routing is notification-only")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _c: &str,
+            _h: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            unreachable!("ingestion routing is notification-only")
+        }
+        async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
+            *self.notifications.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn post_notification_with_thread(
+            &self,
+            _channel: &str,
+            _top_line: &str,
+            _thread_body: &str,
+        ) -> Result<Option<String>> {
+            unreachable!("the non-candidate routes do not post threaded candidates")
+        }
+    }
+
+    fn notify_ctx(
+        backend: std::sync::Arc<NotifyCountingBackend>,
+        channel: &str,
+    ) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: backend,
+            channel: channel.to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    fn behavior_change_verdict(slug: &str) -> TriageVerdict {
+        TriageVerdict {
+            classification: ReportClassification::BehaviorChange,
+            slug: slug.to_string(),
+            summary: "wants new behavior".to_string(),
+            tasks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn behavior_change_dispositioned_and_notified_once_across_passes() {
+        // 4.1: a behavior-change report records a disposition on pass 1 and is
+        // then already-dispositioned — so a later pass short-circuits to
+        // `AlreadyHandled` BEFORE any triage executor run or notification.
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = std::sync::Arc::new(NotifyCountingBackend::default());
+        let ctx = notify_ctx(backend.clone(), "C_ISSUES");
+        let r = report(20, "Add a --json flag", "please add JSON output", Some("NONE"));
+        let v = behavior_change_verdict("add-json-flag");
+
+        // Pass 1: routed; exactly one notification; disposition recorded.
+        let action =
+            act_on_verdict(ws, &paths.state, Some(&ctx), &repo_cfg().url, &r, &v, &maintainers())
+                .await;
+        assert_eq!(action, ReportAction::RoutedToChanges);
+        assert_eq!(backend.notify_count(), 1, "exactly one routing notification");
+        let id = candidate_id(&repo_cfg().url, 20);
+        assert_eq!(
+            read_disposition(&paths.state, &id).unwrap().unwrap().disposition,
+            Disposition::RoutedToChanges
+        );
+        // It is NOT a candidate.
+        assert!(read_candidate(&paths.state, &id).unwrap().is_none());
+
+        // Pass 2's gate: `already_dispositioned` is what `run_issue_ingestion`
+        // checks BEFORE running triage or `act_on_verdict`, so a true result
+        // means the report is skipped (`AlreadyHandled`) with no further
+        // executor run AND no further notification.
+        assert!(already_dispositioned(&paths.state, &id));
+        assert_eq!(backend.notify_count(), 1, "no further notification on pass 2");
+    }
+
+    #[tokio::test]
+    async fn behavior_change_duplicate_is_deduped_not_routed() {
+        // 4.2: a behavior-change report whose slug duplicates an existing
+        // issue is deduped — declined (not routed) AND a Duplicate disposition
+        // is recorded.
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        // An existing OPEN issue with the slug the report would take.
+        std::fs::create_dir_all(issues::issue_dir(ws, "add-json-flag")).unwrap();
+        let backend = std::sync::Arc::new(NotifyCountingBackend::default());
+        let ctx = notify_ctx(backend.clone(), "C_ISSUES");
+        let r = report(21, "Add a --json flag", "please add JSON output", Some("NONE"));
+        let v = behavior_change_verdict("add-json-flag");
+
+        let action =
+            act_on_verdict(ws, &paths.state, Some(&ctx), &repo_cfg().url, &r, &v, &maintainers())
+                .await;
+        // Declined (deduped), NOT routed to changes — the behavioral signature
+        // of dedup (we do not assert message wording).
+        assert!(matches!(action, ReportAction::Declined { .. }), "got {action:?}");
+        let id = candidate_id(&repo_cfg().url, 21);
+        assert_eq!(
+            read_disposition(&paths.state, &id).unwrap().unwrap().disposition,
+            Disposition::Duplicate
+        );
+        // No candidate stored, nothing queued.
+        assert!(read_candidate(&paths.state, &id).unwrap().is_none());
+        assert!(issues::list_ready(ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn disposition_round_trips_and_absent_is_not_dispositioned() {
+        // 4.3: each non-candidate disposition round-trips (write then read);
+        // an absent record reads as None (not yet dispositioned); a corrupt
+        // record is handled gracefully (the gate still suppresses re-spam).
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        for (n, disp) in [
+            Disposition::RoutedToChanges,
+            Disposition::Declined,
+            Disposition::Duplicate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = candidate_id(&repo_cfg().url, 100 + n as u64);
+            let record = DispositionRecord {
+                id: id.clone(),
+                repo_url: repo_cfg().url.clone(),
+                source_issue: 100 + n as u64,
+                disposition: disp,
+                decided_at: Utc::now(),
+            };
+            write_disposition(&paths.state, &record).unwrap();
+            let round = read_disposition(&paths.state, &id).unwrap().unwrap();
+            assert_eq!(round, record);
+            assert_eq!(round.disposition, disp);
+            assert!(already_dispositioned(&paths.state, &id));
+        }
+
+        // Absent → Ok(None), and not dispositioned.
+        let missing = candidate_id(&repo_cfg().url, 999);
+        assert!(read_disposition(&paths.state, &missing).unwrap().is_none());
+        assert!(!already_dispositioned(&paths.state, &missing));
+
+        // Corrupt marker present → the gate still treats it as handled (so it
+        // does NOT re-spam), and reading it errors rather than panicking.
+        let corrupt = candidate_id(&repo_cfg().url, 1000);
+        std::fs::create_dir_all(candidates_dir(&paths.state)).unwrap();
+        std::fs::write(disposition_path(&paths.state, &corrupt), "not json").unwrap();
+        assert!(already_dispositioned(&paths.state, &corrupt));
+        assert!(read_disposition(&paths.state, &corrupt).is_err());
     }
 }
