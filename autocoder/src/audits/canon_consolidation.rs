@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{ScopedGateChecker, SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -227,6 +227,10 @@ impl Audit for CanonConsolidationAudit {
 
         // audit-model-selection: route to the configured model (if any).
         let model = super::audit_resolved_model(&self.settings);
+        // a02: the production gate checker reads the scoped `[in]`/`[canon]`
+        // verifier-gate contexts. Consolidation is spec-lane only, so only the
+        // spec-lane `[in]`/`[canon]` checks can fire (and only when enabled).
+        let gate_checker = ScopedGateChecker;
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -246,6 +250,7 @@ impl Audit for CanonConsolidationAudit {
                 // canon — so it stays OpenSpecOnly with no issue-lane choice.
                 planning_lanes: false,
                 issues_lane_enabled: false,
+                gate_checker: &gate_checker,
             },
             ctx,
         )

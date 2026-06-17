@@ -110,6 +110,15 @@ pub enum PromptId {
     /// loader by a future change.
     #[allow(dead_code)]
     CodeImplementsSpecCheck,
+    /// `prompts/issue-contract-change-check.md` — the authoring-time issue
+    /// contract-change check (a02): does implementing this issue require a
+    /// canonical contract change?
+    ///
+    /// Registered for registry-completeness only; the audit's issue-check call
+    /// site uses the embedded constant directly via
+    /// `crate::preflight::canon_contradiction::ISSUE_CONTRACT_CHANGE_EMBEDDED_PROMPT`.
+    #[allow(dead_code)]
+    IssueContractChangeCheck,
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
@@ -145,6 +154,8 @@ const PROMPT_CHANGE_VS_CANONICAL_CHECK: &str =
     include_str!("../../../prompts/change-vs-canonical-check.md");
 const PROMPT_CODE_IMPLEMENTS_SPEC_CHECK: &str =
     include_str!("../../../prompts/code-implements-spec-check.md");
+const PROMPT_ISSUE_CONTRACT_CHANGE_CHECK: &str =
+    include_str!("../../../prompts/issue-contract-change-check.md");
 
 impl PromptId {
     /// Embedded default template content, loaded at compile time.
@@ -171,6 +182,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
             Self::ChangeVsCanonicalCheck => PROMPT_CHANGE_VS_CANONICAL_CHECK,
             Self::CodeImplementsSpecCheck => PROMPT_CODE_IMPLEMENTS_SPEC_CHECK,
+            Self::IssueContractChangeCheck => PROMPT_ISSUE_CONTRACT_CHANGE_CHECK,
         }
     }
 
@@ -200,6 +212,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
             Self::ChangeVsCanonicalCheck => "change-vs-canonical-check.md",
             Self::CodeImplementsSpecCheck => "code-implements-spec-check.md",
+            Self::IssueContractChangeCheck => "issue-contract-change-check.md",
         }
     }
 
@@ -227,6 +240,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
             Self::ChangeVsCanonicalCheck => "ChangeVsCanonicalCheck",
             Self::CodeImplementsSpecCheck => "CodeImplementsSpecCheck",
+            Self::IssueContractChangeCheck => "IssueContractChangeCheck",
         }
     }
 
@@ -255,6 +269,7 @@ impl PromptId {
             Self::ChangeContradictionCheck,
             Self::ChangeVsCanonicalCheck,
             Self::CodeImplementsSpecCheck,
+            Self::IssueContractChangeCheck,
         ]
     }
 }
