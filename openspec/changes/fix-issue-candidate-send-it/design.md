@@ -12,9 +12,12 @@ and `read_candidate` are implemented and unit-tested but unreachable.
 The `send it` verb fires only on an `@<bot>` `app_mention` carrying a non-empty
 `thread_ts`. The dispatcher (`dispatch_send_it_on_audit`) resolves the thread
 against the audit-thread set first, then the brownfield-survey set
-(`try_send_it_on_survey`), and refuses with `SEND_IT_REFUSE_UNTRACKED` when
-neither matches. The survey fallback is the model: scan per-record state for a
-`thread_ts` match, branch on the record's status, and on a fresh match submit a
+(`try_send_it_on_survey`), then the spec-revision set (`try_send_it_on_revision`),
+and refuses with `SEND_IT_REFUSE_UNTRACKED` when none match. Canon already
+enumerates a fourth context — issue-candidate — between survey and revision, and
+the refusal/help strings already name it; only the branch is missing. The survey
+fallback is the model for the new branch: scan per-record state for a `thread_ts`
+match, branch on the record's status, and on a fresh match submit a
 control-socket action carrying `channel`/`thread_ts`.
 
 The candidate store lives in the daemon state root. The dispatcher already
@@ -70,9 +73,10 @@ neither (no executor, no merge-conflict serialization — writing the unit is th
 only side effect, and the lane walker already serializes downstream work).
 
 ### D3 — Dispatcher branch on candidate status
-The issue-candidate lookup runs as the THIRD context, after audit and survey
-lookups miss (preserving their precedence; a `thread_ts` is unique to one
-record across the three sets). On a match:
+The issue-candidate lookup runs after the audit and survey lookups miss and
+BEFORE the spec-revision lookup (matching canon's stated context order; a
+`thread_ts` is unique to one record across the four sets, so the order is for
+spec-conformance, not correctness). On a match:
 - `Posted` → submit `promote_issue_candidate`; on `ok` reply
   `✓ Promoted issue candidate \`<slug>\` — wrote issues/<slug>/ AND queued it
   for the issues lane.`; on a handler error reply `✗ send it: could not
@@ -80,8 +84,9 @@ record across the three sets). On a match:
 - `Promoted` → reply `✗ send it: issue candidate \`<slug>\` is already
   promoted. No new action taken.` and submit nothing (idempotent).
 
-A non-matching thread still falls through to the untracked refusal, whose text
-is updated to name all three contexts.
+A non-matching thread still falls through to `try_send_it_on_revision` and then
+the untracked refusal, whose text already names all four contexts (it shipped
+ahead of this branch — no edit needed).
 
 ### D4 — Corrected notification instruction
 The candidate notification instructs `@<bot> send it` (the form that actually
