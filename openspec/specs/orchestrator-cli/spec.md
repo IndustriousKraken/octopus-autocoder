@@ -7164,6 +7164,8 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 ### Requirement: Triage routing classifies each report
 Triage SHALL classify each report AND route it accordingly: a **Bug** (code has drifted from a specification that is itself correct) becomes an issues-lane candidate; a **Behavior change** (the report wants new or changed behavior) is routed to the changes lane as a proposal, NOT an issue; a **Question, invalid report, or duplicate** is declined or deduped with no work queued.
 
+Parsing the triage agent's verdict SHALL be total over arbitrary agent output: the parser SHALL NOT panic on any byte sequence the agent produces, including non-ASCII (multi-byte UTF-8) text such as accented Latin, CJK, or emoji. Because the agent's output is steered by an untrusted, public-author report, a verdict containing such characters SHALL be parsed (yielding a verdict or `None`) without crashing the issue-ingestion lane.
+
 #### Scenario: A bug becomes an issue candidate
 - **WHEN** triage classifies a report as a bug against a correct spec
 - **THEN** it is drafted as an issues-lane candidate
@@ -7176,6 +7178,11 @@ Triage SHALL classify each report AND route it accordingly: a **Bug** (code has 
 #### Scenario: A question or duplicate is declined
 - **WHEN** triage classifies a report as a question, invalid, or a duplicate
 - **THEN** no work is queued
+
+#### Scenario: Non-ASCII verdict output is parsed without panicking
+- **WHEN** the triage agent's verdict text contains a multi-byte UTF-8 character at a byte offset that falls inside a label-prefix match (e.g. a line of CJK or emoji text)
+- **THEN** the verdict parser returns normally (a parsed verdict or `None`)
+- **AND** the issue-ingestion lane does not crash
 
 ### Requirement: Dependency preflight reports all dependencies; doctor subcommand
 The daemon SHALL run a dependency preflight that checks every REQUIRED dependency AND every dependency implied by the active configuration, reporting the status of all of them together rather than failing on the first. Required dependencies — at minimum `openspec`, `git`, AND a usable platform sandbox mechanism — SHALL fail the preflight when missing. Configuration-implied dependencies — the agent-CLI binary for each configured strategy, a forge/scout CLI when those features are enabled, AND an embedding backend when RAG is enabled — SHALL be reported AND warned when missing, fatal only when their feature is active. The same check SHALL be available on demand as an `autocoder doctor` subcommand that prints the full report AND exits non-zero when a required dependency is missing. The sandbox-mechanism check SHALL verify the mechanism is USABLE — e.g. `bwrap` actually runs under the host's user-namespace policy — not merely present, complementing (not replacing) the spawn-time fail-closed sandbox gate. This extends the existing openspec-availability preflight to cover the full dependency set.
