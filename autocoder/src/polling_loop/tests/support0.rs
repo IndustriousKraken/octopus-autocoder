@@ -599,3 +599,29 @@ pub(crate) fn canon_test_ctx(
         test_submission: Some(submission),
     }
 }
+
+/// global-rules-gate: build a `[rules]`-gate context whose agentic session is
+/// short-circuited by an injected `submit_rule_violations` submission
+/// (`Some(payload)`), a no-submission session (`None`), bypassing the CLI
+/// subprocess AND the control socket entirely. `corpus_dir` points at a (real)
+/// directory the prompt builder reads — callers seed it with rule files.
+pub(crate) fn gr_test_ctx(
+    submission: Option<serde_json::Value>,
+    attribution: Option<String>,
+    corpus_dir: std::path::PathBuf,
+) -> crate::preflight::global_rules::GlobalRulesCheckCtx {
+    crate::preflight::global_rules::GlobalRulesCheckCtx {
+        command: "claude".into(),
+        model: crate::agentic_run::ResolvedModel {
+            provider: crate::config::LlmProvider::Anthropic,
+            model: "claude-test".into(),
+            api_base_url: "https://example.invalid".into(),
+            api_key: "sk-test".into(),
+        },
+        prompt_template: "TEST_PROMPT".into(),
+        attribution,
+        retries: 0,
+        corpus_dir,
+        test_submission: Some(submission),
+    }
+}

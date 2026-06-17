@@ -243,7 +243,7 @@ pub fn register_contradiction_submission_schema(
 
 /// Outcome of one contradiction-check session: the consumed submission (or
 /// `None` when the agent recorded nothing valid) AND a truncated stdout
-/// excerpt for the no-submission fail-open WARN.
+/// excerpt for the no-submission fail-closed WARN.
 struct ContradictionSessionOutcome {
     submission: Option<serde_json::Value>,
     stdout_excerpt: String,
@@ -372,15 +372,15 @@ impl ContradictionSessionRunner for CannedContradictionRunner {
 /// (a59). Production entry point invoked from the polling loop's pre-flight.
 ///
 /// Resolves the CLI strategy from the model's provider (a56); a provider
-/// whose CLI has no registered strategy yet (a60) fails open here with a
-/// WARN AND no subprocess is spawned. Otherwise runs one agentic session in
-/// the read-only sandbox, drains the `submit_contradictions` submission, AND
-/// maps it to findings.
+/// whose CLI has no registered strategy yet (a60) FAILS CLOSED here with a
+/// WARN AND no subprocess is spawned (the change is held). Otherwise runs one
+/// agentic session in the read-only sandbox, drains the `submit_contradictions`
+/// submission, AND maps it to findings.
 ///
-/// Returns an empty `Vec` on EVERY fail-open path: strategy-not-registered,
-/// session error (spawn/timeout), a never-corrected schema rejection, OR a
-/// session that ends with no submission. WARN logs name the specific failure
-/// so operators can investigate via journalctl.
+/// HOLDS the change (`Errored`) on EVERY fail-closed path: strategy-not-
+/// registered, session error (spawn/timeout), a never-corrected schema
+/// rejection, OR a session that ends with no submission. WARN logs name the
+/// specific failure so operators can investigate via journalctl.
 /// Outcome of the `[in]` gate. The gate FAILS CLOSED: an inability to run is
 /// `Errored`, NEVER `Clean` — see the project-documentation standard
 /// "Control-plane gatekeepers fail closed". The caller holds the change on
@@ -444,9 +444,9 @@ pub async fn run_agentic_contradiction_check(
 }
 
 /// Orchestration shared by production AND tests. Builds the prompt, runs one
-/// session via `runner`, AND applies the fail-open policy uniformly: a
+/// session via `runner`, AND applies the fail-CLOSED policy uniformly: a
 /// session error, a missing submission, OR a submission that fails re-mapping
-/// each WARN AND yield an empty `Vec`.
+/// each WARN AND HOLD the change (an `Errored` outcome).
 async fn run_agentic_contradiction_check_with_runner(
     ctx: &ContradictionCheckCtx,
     workspace_root: &Path,

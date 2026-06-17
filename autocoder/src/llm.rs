@@ -523,6 +523,67 @@ fn resolve_canon_contradiction_check_api_key(
     }
 }
 
+/// Resolve the global-rules `[rules]` gate's LLM config (global-rules-gate) into
+/// a [`crate::agentic_run::ResolvedModel`] (a56) for the agentic transport.
+/// Parallel to [`resolve_canon_contradiction_check_model`]; the only differences
+/// are the config-label strings in error messages.
+pub fn resolve_global_rules_check_model(
+    cfg: &ContradictionCheckLlmConfig,
+) -> Result<crate::agentic_run::ResolvedModel> {
+    let provider = cfg
+        .provider
+        .expect("global_rules_check_llm.provider resolved at config-load");
+    let model = cfg.model.clone();
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.global_rules_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!("executor.global_rules_check_llm.api_base_url is required when provider=ollama")
+        })?,
+        // a69: `agy` (Antigravity) manages its own endpoint; base URL optional.
+        LlmProvider::Google => cfg.api_base_url.clone().unwrap_or_default(),
+    };
+    let api_key = match provider {
+        LlmProvider::Ollama | LlmProvider::Google => String::new(),
+        LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
+            resolve_global_rules_check_api_key(cfg)?
+        }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
+}
+
+fn resolve_global_rules_check_api_key(cfg: &ContradictionCheckLlmConfig) -> Result<String> {
+    match (cfg.api_key.as_ref(), cfg.api_key_env.as_ref()) {
+        (Some(inline), env_name_opt) => {
+            let key = inline.resolve("executor.global_rules_check_llm.api_key")?;
+            if inline.is_inline()
+                && let Some(env_name) = env_name_opt
+                && std::env::var(env_name).is_ok()
+            {
+                tracing::warn!(
+                    "executor.global_rules_check_llm.api_key (inline) takes precedence; env var `{env_name}` is being ignored"
+                );
+            }
+            Ok(key)
+        }
+        (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
+            .resolve(&format!("executor.global_rules_check_llm.api_key_env={env_name}")),
+        (None, None) => Ok(String::new()),
+    }
+}
+
 /// Resolve the code-implements-spec `[out]` gate's LLM config (a63) into a
 /// [`crate::agentic_run::ResolvedModel`] (a56) for the agentic transport.
 /// Parallel to [`resolve_canon_contradiction_check_model`]; the only
@@ -681,6 +742,7 @@ mod tests {
             for (label, resolved) in [
                 ("[in]", resolve_contradiction_check_model(&cfg)),
                 ("[canon]", resolve_canon_contradiction_check_model(&cfg)),
+                ("[rules]", resolve_global_rules_check_model(&cfg)),
                 ("[out]", resolve_code_implements_spec_check_model(&cfg)),
             ] {
                 let m = resolved
@@ -714,6 +776,7 @@ mod tests {
         for (label, resolved) in [
             ("[in]", resolve_contradiction_check_model(&inline_cfg)),
             ("[canon]", resolve_canon_contradiction_check_model(&inline_cfg)),
+            ("[rules]", resolve_global_rules_check_model(&inline_cfg)),
             ("[out]", resolve_code_implements_spec_check_model(&inline_cfg)),
         ] {
             let m = resolved

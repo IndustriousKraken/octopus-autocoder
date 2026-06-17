@@ -397,6 +397,44 @@ executor:
   #                                     # self-authenticates; a key is required only for an
   #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
   #
+  # Change-vs-global-rules pre-flight — the `[rules]` gate of the verifier
+  # framework (global-rules-gate). The corpus-parameterized sibling of the
+  # `[canon]` gate: SAME read-only agentic machinery, but it compares the
+  # change's deltas against a corpus of project-AGNOSTIC GLOBAL RULES instead
+  # of this project's canonical specs, AND a finding names the violated rule by
+  # its stable id. Runs BEFORE the executor, fail-CLOSED (a violation OR an
+  # inability to run holds the change). See `docs/GLOBAL-RULES.md` for the rule
+  # protocol and corpus layout.
+  #
+  # Disabled by default. To enable, set the mode below AND configure BOTH the
+  # LLM block AND a resolvable `global_rules.corpus`. Enabling without either is
+  # a fail-fast startup error.
+  # global_rules_check: disabled   # | enabled
+  #
+  # Optional override for the embedded prompt template. Unset → the prompt
+  # compiled into the binary from `prompts/global-rules-check.md` is used. An
+  # empty override file is rejected at use time.
+  # global_rules_check_prompt_path: /etc/autocoder/prompts/global-rules-check.md
+  #
+  # Required when the check is enabled. Same surface as the [canon] gate's LLM
+  # block (provider | model | api_key_env | api_key | api_base_url).
+  # global_rules_check_llm:
+  #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
+  #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
+  #   api_key_env: ANTHROPIC_API_KEY    # OPTIONAL for these CLI/agentic gates — the CLI
+  #                                     # self-authenticates; a key is required only for an
+  #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
+  #
+  # The global rule corpus location. A local directory path OR a git repo URL
+  # the daemon clones at startup (reused on later restarts). Required (and
+  # resolvable) when `global_rules_check` is enabled. The directory holds rule
+  # files — flat, OR grouped into register subdirectories — each a one-sentence
+  # rule + optional rationale; the file's path (without extension) is the rule's
+  # stable id. See `docs/GLOBAL-RULES.md`.
+  # global_rules:
+  #   corpus: /etc/autocoder/global-rules           # a local path …
+  #   # corpus: https://github.com/acme/eng-rules.git  # … OR a git repo URL
+  #
   # Code-implements-spec verification — the `[out]` gate of the verifier
   # framework (a63). Runs AFTER the executor implements a change, in a
   # read-only sandbox, AND judges — requirement by requirement, scenario by

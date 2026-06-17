@@ -403,6 +403,72 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         None
     };
 
+    // Build the change-vs-global-rules pre-flight context — the `[rules]` gate
+    // (global-rules-gate). Disabled by default → no context produced; the
+    // polling loop short-circuits at the `global_rules::current()` read.
+    // Enabled-without-(LLM-config AND resolvable-corpus) already failed
+    // validation above; here we ALSO resolve the corpus (cloning a configured
+    // git repo), so a resolution failure fails daemon startup before polling.
+    let global_rules_ctx: Option<Arc<crate::preflight::global_rules::GlobalRulesCheckCtx>> =
+        if matches!(
+            cfg.executor.global_rules_check,
+            ContradictionCheckMode::Enabled
+        ) {
+            let llm_cfg = cfg
+                .executor
+                .global_rules_check_llm
+                .as_ref()
+                .expect("validate_config guarantees the llm block is set when enabled");
+            let model = crate::llm::resolve_global_rules_check_model(llm_cfg)
+                .context("resolving global-rules-check model from config")?;
+            if let Some(warn) = crate::agentic_run::cli_role_key_exposure_warning(
+                "executor.global_rules_check_llm",
+                !model.api_key.is_empty(),
+            ) {
+                tracing::warn!("{warn}");
+            }
+            let prompt_template = crate::preflight::global_rules::load_prompt_template(
+                cfg.executor.global_rules_check_prompt_path.as_deref(),
+            )
+            .context("loading global-rules-check prompt template")?;
+            let corpus = cfg
+                .executor
+                .global_rules
+                .corpus
+                .as_deref()
+                .expect("validate_config guarantees the corpus is set when enabled");
+            let corpus_cache = daemon_paths.cache.join("global-rules-corpus");
+            let corpus_dir = crate::preflight::global_rules::resolve_corpus(corpus, &corpus_cache)
+                .context("resolving global rule corpus (executor.global_rules.corpus)")?;
+            tracing::info!(
+                provider = ?llm_cfg.provider,
+                model = llm_cfg.model.as_str(),
+                corpus = %corpus_dir.display(),
+                "change-vs-global-rules pre-flight enabled (the [rules] gate, global-rules-gate)"
+            );
+            let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
+            Some(Arc::new(
+                crate::preflight::global_rules::GlobalRulesCheckCtx {
+                    command: crate::config::resolve_cli_command(
+                        &cfg.executor.command,
+                        crate::config::default_cli_for(model.provider),
+                    ),
+                    model,
+                    prompt_template,
+                    attribution: Some(attribution),
+                    retries: cfg.executor.verifier_gate_retries,
+                    corpus_dir,
+                    #[cfg(test)]
+                    test_submission: None,
+                },
+            ))
+        } else {
+            tracing::info!(
+                "change-vs-global-rules pre-flight disabled (the [rules] gate, global-rules-gate; opt-in via executor.global_rules_check)"
+            );
+            None
+        };
+
     // Build the code-implements-spec verification context — the `[out]` gate
     // (a63). Disabled by default → no context produced; the polling loop
     // short-circuits at the `code_implements_spec::current()` read post-
@@ -808,6 +874,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audit_settings: audit_settings_arc.clone(),
         contradiction_ctx: contradiction_ctx.clone(),
         canon_contradiction_ctx: canon_contradiction_ctx.clone(),
+        global_rules_ctx: global_rules_ctx.clone(),
         code_implements_spec_ctx: code_implements_spec_ctx.clone(),
         issues_ctx: issues_ctx.clone(),
         global_cancel: cancel.clone(),
@@ -928,6 +995,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // a62: register the `[canon]` gate's `submit_canon_contradictions` payload
     // schema on the same store so its MCP child's submissions are validated.
     crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
+    // global-rules-gate: register the `[rules]` gate's `submit_rule_violations`
+    // payload schema on the same store so its MCP child's submissions are
+    // validated.
+    crate::preflight::global_rules::register_rule_violations_submission_schema(
         &control_state.submission_store,
     );
     // a63: register the `[out]` gate's `submit_verdict` payload schema on the
@@ -1139,6 +1212,7 @@ struct SpawnDeps {
         Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
     canon_contradiction_ctx:
         Option<Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>>,
+    global_rules_ctx: Option<Arc<crate::preflight::global_rules::GlobalRulesCheckCtx>>,
     code_implements_spec_ctx:
         Option<Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>>,
     issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>>,
@@ -1276,6 +1350,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let iteration_drained_for_task = iteration_drained.clone();
         let contradiction_ctx_for_task = deps.contradiction_ctx.clone();
         let canon_contradiction_ctx_for_task = deps.canon_contradiction_ctx.clone();
+        let global_rules_ctx_for_task = deps.global_rules_ctx.clone();
         let code_implements_spec_ctx_for_task = deps.code_implements_spec_ctx.clone();
         let issues_ctx_for_task = deps.issues_ctx.clone();
         let paths_for_task = deps.paths.clone();
@@ -1314,20 +1389,24 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_drained_for_task,
                 cancel_for_task,
             );
-            // Nest the verifier-gate scopes around the polling future: the two
-            // pre-executor gates (a59 `[in]`, a62 `[canon]`) AND the
-            // post-executor gate (a63 `[out]`). Each gate reads its own
-            // task-local via `current()`; any may be `None` (disabled)
-            // independently.
+            // Nest the verifier-gate scopes around the polling future: the three
+            // pre-executor gates (a59 `[in]`, a62 `[canon]`, global-rules-gate
+            // `[rules]`) AND the post-executor gate (a63 `[out]`). Each gate
+            // reads its own task-local via `current()`; any may be `None`
+            // (disabled) independently.
             let in_scoped =
                 crate::preflight::change_contradiction::scope(contradiction_ctx_for_task, fut);
             let canon_scoped = crate::preflight::canon_contradiction::scope(
                 canon_contradiction_ctx_for_task,
                 in_scoped,
             );
+            let rules_scoped = crate::preflight::global_rules::scope(
+                global_rules_ctx_for_task,
+                canon_scoped,
+            );
             let out_scoped = crate::code_implements_spec::scope(
                 code_implements_spec_ctx_for_task,
-                canon_scoped,
+                rules_scoped,
             );
             // Issues lane gate (a009): bind the `features.issues` context
             // for the whole polling future; the pass reads it via

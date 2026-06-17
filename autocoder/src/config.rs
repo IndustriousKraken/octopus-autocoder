@@ -344,6 +344,10 @@ pub enum SubsystemKind {
     /// (`executor.change_canonical_contradiction_check_llm:`, a62). All three
     /// providers valid.
     CanonContradictionCheck,
+    /// Change-vs-global-rules check — the `[rules]` gate
+    /// (`executor.global_rules_check_llm:`, global-rules-gate). All providers
+    /// valid (it runs agentically, like the other gates).
+    GlobalRulesCheck,
     /// Code-implements-spec verification — the `[out]` gate
     /// (`executor.code_implements_spec_check_llm:`, a63). All three providers
     /// valid.
@@ -357,6 +361,7 @@ impl SubsystemKind {
             Self::CanonicalRag => "canonical_rag",
             Self::ContradictionCheck => "change_internal_contradiction_check_llm",
             Self::CanonContradictionCheck => "change_canonical_contradiction_check_llm",
+            Self::GlobalRulesCheck => "global_rules_check_llm",
             Self::CodeImplementsSpecCheck => "code_implements_spec_check_llm",
         }
     }
@@ -366,6 +371,7 @@ impl SubsystemKind {
             Self::Reviewer
             | Self::ContradictionCheck
             | Self::CanonContradictionCheck
+            | Self::GlobalRulesCheck
             | Self::CodeImplementsSpecCheck => &[
                 LlmProvider::Anthropic,
                 LlmProvider::OpenAiCompatible,
@@ -1335,6 +1341,33 @@ pub struct ExecutorConfig {
     /// operators can pick a model independently.
     #[serde(default)]
     pub change_canonical_contradiction_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Opt-in gate for the change-vs-global-rules pre-flight — the `[rules]`
+    /// gate of the verifier framework (global-rules-gate). `Disabled` (the
+    /// default) skips the LLM call entirely. `Enabled` runs the check alongside
+    /// the `[in]`/`[canon]` gates, BEFORE the executor, comparing the change's
+    /// deltas against the global rule corpus; a violation writes
+    /// `.needs-spec-revision.json` and halts the queue walk. Enabling without
+    /// BOTH `global_rules_check_llm` AND a resolvable `global_rules.corpus` is a
+    /// fail-fast startup error.
+    #[serde(default)]
+    pub global_rules_check: ContradictionCheckMode,
+    /// Optional path to a custom global-rules-check prompt template. When unset,
+    /// the binary uses the template embedded at compile time from
+    /// `prompts/global-rules-check.md`. An empty override file is rejected at
+    /// use time so the daemon does not feed an empty prompt to the session.
+    #[serde(default)]
+    pub global_rules_check_prompt_path: Option<PathBuf>,
+    /// LLM configuration for the change-vs-global-rules check. Required when
+    /// `global_rules_check` is `Enabled`. Parallel to the `[canon]` gate's
+    /// `change_canonical_contradiction_check_llm` block.
+    #[serde(default)]
+    pub global_rules_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Global rule corpus location for the `[rules]` gate (global-rules-gate).
+    /// Holds `corpus`: a local directory path OR a git repo URL the daemon
+    /// clones at startup. Required (resolvable) when `global_rules_check` is
+    /// `Enabled`.
+    #[serde(default)]
+    pub global_rules: GlobalRulesConfig,
     /// Opt-in gate for the code-implements-spec verification — the `[out]`
     /// gate of the verifier framework (a63). `Disabled` (the default) skips
     /// the LLM call entirely AND spawns no post-executor session. `Enabled`
@@ -1389,6 +1422,21 @@ pub enum ContradictionCheckMode {
     #[default]
     Disabled,
     Enabled,
+}
+
+/// Global rule corpus location for the `[rules]` gate (global-rules-gate). The
+/// corpus is a collection of project-agnostic rule files (flat OR grouped into
+/// register subdirectories); see `docs/GLOBAL-RULES.md`. `corpus` is `None` by
+/// default (the gate's fail-fast validation requires it when the gate is
+/// enabled).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalRulesConfig {
+    /// A local directory path OR a git repo URL the daemon clones at startup.
+    /// The daemon (and the spec-box) read the rule corpus from the resolved
+    /// directory.
+    #[serde(default)]
+    pub corpus: Option<String>,
 }
 
 /// LLM configuration block for the contradiction-check pre-flight.
@@ -3275,6 +3323,34 @@ impl Config {
                 "change_canonical_contradiction_check_llm",
             )?;
         }
+        if let Some(llm) = cfg.executor.global_rules_check_llm.as_mut() {
+            // a55: resolve a nickname reference (no inline `provider`) against
+            // the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "global_rules_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("global_rules_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::GlobalRulesCheck)?;
+            let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
+            // The verifier gates are always CLI/agentic → api_key optional.
+            validate_llm_provider_config_cli(
+                provider,
+                key_present,
+                llm.api_base_url.as_deref(),
+                "global_rules_check_llm",
+            )?;
+        }
         if let Some(llm) = cfg.executor.code_implements_spec_check_llm.as_mut() {
             // a55: resolve a nickname reference (no inline `provider`)
             // against the registry; an inline block is untouched.
@@ -3813,6 +3889,51 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some("executor/change_canonical_contradiction_check_llm".into()),
         );
     }
+    // global-rules-gate: opting into the global-rules check (the `[rules]` gate)
+    // requires BOTH an LLM block AND a resolvable corpus location. Fail fast at
+    // startup so the misconfig surfaces before polling (mirrors the `[canon]`
+    // fail-fast; the corpus is the gate's extra input).
+    if matches!(
+        config.executor.global_rules_check,
+        ContradictionCheckMode::Enabled
+    ) {
+        if config.executor.global_rules_check_llm.is_none() {
+            report.push_error(
+                FindingCategory::Schema,
+                "executor.global_rules_check is enabled but executor.global_rules_check_llm is not configured",
+                Some("executor/global_rules_check_llm".into()),
+            );
+        }
+        match config.executor.global_rules.corpus.as_deref() {
+            None | Some("") => {
+                report.push_error(
+                    FindingCategory::Schema,
+                    "executor.global_rules_check is enabled but executor.global_rules.corpus is not configured",
+                    Some("executor/global_rules/corpus".into()),
+                );
+            }
+            Some(corpus) => {
+                // A local-path corpus is validated to exist NOW (a git-repo
+                // corpus is resolved/cloned at daemon startup, where a clone
+                // failure is itself a fail-fast). The `is_git_url` heuristic
+                // matches the resolver's.
+                let looks_like_git = corpus.starts_with("http://")
+                    || corpus.starts_with("https://")
+                    || corpus.starts_with("git@")
+                    || corpus.starts_with("ssh://")
+                    || corpus.ends_with(".git");
+                if !looks_like_git && !std::path::Path::new(corpus).is_dir() {
+                    report.push_error(
+                        FindingCategory::Schema,
+                        format!(
+                            "executor.global_rules.corpus path is not a readable directory: {corpus}"
+                        ),
+                        Some("executor/global_rules/corpus".into()),
+                    );
+                }
+            }
+        }
+    }
     // a63: opting into the code-implements-spec check (the `[out]` gate)
     // requires configuring its LLM block, exactly as the pre-executor gates
     // do. Fail fast at startup so the misconfig surfaces before the first
@@ -4200,6 +4321,36 @@ fn check_secret_sources(config: &Config, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(rules_llm) = config.executor.global_rules_check_llm.as_ref() {
+        let has_inline = rules_llm
+            .api_key
+            .as_ref()
+            .map(|s| s.is_inline())
+            .unwrap_or(false);
+        if !has_inline
+            && let Some(name) = rules_llm.api_key_env.as_deref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.global_rules_check_llm.api_key_env references `{name}` which is not set in the calling environment"
+                ),
+                Some("executor/global_rules_check_llm/api_key_env".into()),
+            );
+        }
+        if let Some(SecretSource::EnvVar(name)) = rules_llm.api_key.as_ref()
+            && std::env::var(name).is_err()
+        {
+            report.push_warn(
+                FindingCategory::SecretSource,
+                format!(
+                    "executor.global_rules_check_llm.api_key references env var `{name}` which is not set"
+                ),
+                Some("executor/global_rules_check_llm/api_key".into()),
+            );
+        }
+    }
     if let Some(cis_llm) = config.executor.code_implements_spec_check_llm.as_ref() {
         let has_inline = cis_llm
             .api_key
@@ -4448,6 +4599,11 @@ github:
             "change_canonical_contradiction_check",
             "change_canonical_contradiction_check_prompt_path",
             "change_canonical_contradiction_check_llm",
+            "global_rules_check",
+            "global_rules_check_prompt_path",
+            "global_rules_check_llm",
+            "global_rules",
+            "corpus",
             "code_implements_spec_check",
             "code_implements_spec_check_prompt_path",
             "code_implements_spec_check_llm",
@@ -5139,6 +5295,80 @@ github:
                 "executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured"
             ),
             "expected fail-fast error message; got: {msg}"
+        );
+    }
+
+    /// global-rules-gate task 6.5: enabling `global_rules_check` without an LLM
+    /// block fails validation fast (the corpus error also fires; we assert the
+    /// model one here).
+    #[test]
+    fn global_rules_check_enabled_without_llm_config_fails_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  global_rules_check: enabled
+  global_rules:
+    corpus: /tmp/some-rules-corpus-that-need-not-exist-for-this-assertion
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses even when llm is missing");
+        let report = validate_config(&cfg);
+        let msg = report
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains(
+                "executor.global_rules_check is enabled but executor.global_rules_check_llm is not configured"
+            ),
+            "expected fail-fast error message for missing model; got: {msg}"
+        );
+    }
+
+    /// global-rules-gate task 6.5: enabling `global_rules_check` without a
+    /// configured corpus fails validation fast (even when the model IS set).
+    #[test]
+    fn global_rules_check_enabled_without_corpus_fails_validation() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  global_rules_check: enabled
+  global_rules_check_llm:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+github:
+  token:
+    value: ghp_test
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses even when corpus is missing");
+        let report = validate_config(&cfg);
+        let msg = report
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains(
+                "executor.global_rules_check is enabled but executor.global_rules.corpus is not configured"
+            ),
+            "expected fail-fast error message for missing corpus; got: {msg}"
         );
     }
 

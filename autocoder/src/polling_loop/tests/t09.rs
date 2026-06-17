@@ -318,8 +318,8 @@ async fn canon_preflight_no_submission_holds_fail_closed() {
         .expect("the held marker must carry a structured gate_error (not a finding)");
     assert_eq!(ge.gate, "[verifier:canon]", "gate_error names the [canon] gate");
     assert!(
-        ge.cause.contains("no submit_canon_contradictions"),
-        "gate_error cause names the failure: {}",
+        ge.cause.contains("no submission"),
+        "gate_error cause names the failure (shared corpus-check core message): {}",
         ge.cause
     );
 }
