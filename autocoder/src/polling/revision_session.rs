@@ -706,11 +706,20 @@ pub async fn process_pending_revision_execute(
     // The discussed direction lives in the thread; re-fetch it so the edit
     // session is grounded in the conversation (best-effort).
     let transcript = match chatops_ctx {
-        Some(ctx) => ctx
+        Some(ctx) => match ctx
             .chatops
             .fetch_thread_transcript(&request.channel, &request.thread_ts)
             .await
-            .unwrap_or_default(),
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    change = %request.change_slug,
+                    "revision-execute: transcript fetch failed (degrading to transcript-less): {e:#}"
+                );
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
     let edit = CliEditRunner {
@@ -773,7 +782,9 @@ async fn run_revision_execute(
 
     // Work on a dedicated revision branch off base — never the base branch.
     let branch = revision_branch_name(&repo.agent_branch, change_slug);
-    let _ = git::checkout(workspace, &repo.base_branch);
+    if let Err(e) = git::checkout(workspace, &repo.base_branch) {
+        tracing::warn!("revision-execute: checkout of base branch failed: {e:#}");
+    }
     if let Err(e) = git::recreate_branch(workspace, &branch) {
         post_reply(
             chatops_ctx,
