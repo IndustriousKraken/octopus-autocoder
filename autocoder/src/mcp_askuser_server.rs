@@ -865,7 +865,7 @@ fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
 /// absent: the executor reports via the `outcome_*` tools AND the
 /// specs-writing audits produce on-disk proposals, not findings.
 pub const ADVISORY_AUDIT_ROLES: &[&str] =
-    &["drift_audit", "architecture_consultative", "documentation_audit"];
+    &["drift_audit", "architecture_advisor", "documentation_audit"];
 
 /// Name of the per-role structured-submission (`submit_*`) tool a role
 /// advertises, or `None` when the role has no registered submission tool.
@@ -948,13 +948,13 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
             },
             "required": ["capability", "requirement", "severity", "divergence"]
         }),
-        "architecture_consultative" => serde_json::json!({
+        "architecture_advisor" => serde_json::json!({
             "type": "object",
             "properties": {
                 "subject": { "type": "string" },
                 "body": { "type": "string" },
                 "anchor": { "type": "string" },
-                "severity": { "type": "string", "enum": ["low", "medium"] }
+                "severity": { "type": "string", "enum": ["low", "medium", "high"] }
             },
             "required": ["subject", "body", "anchor", "severity"]
         }),
@@ -977,7 +977,7 @@ fn submission_tool_for_role(role: &str) -> Option<serde_json::Value> {
         "type": "array",
         "items": finding_schema,
     });
-    if role == "architecture_consultative" {
+    if role == "architecture_advisor" {
         findings_schema["maxItems"] = serde_json::json!(5);
     }
     Some(serde_json::json!({
@@ -1353,7 +1353,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         for (role, required_field) in [
             ("drift_audit", "capability"),
-            ("architecture_consultative", "subject"),
+            ("architecture_advisor", "subject"),
             ("documentation_audit", "category"),
         ] {
             // SAFETY: env writes are serialized via ENV_LOCK.
@@ -1400,7 +1400,7 @@ mod tests {
     fn submit_findings_architecture_schema_caps_array_at_five() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
-            std::env::set_var(ENV_ROLE, "architecture_consultative");
+            std::env::set_var(ENV_ROLE, "architecture_advisor");
         }
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("openspec/changes/x/.askuser-pending.json");
@@ -1449,7 +1449,7 @@ mod tests {
     fn submission_tool_name_for_role_covers_only_advisory_roles() {
         assert_eq!(submission_tool_name_for_role("drift_audit"), Some("submit_findings"));
         assert_eq!(
-            submission_tool_name_for_role("architecture_consultative"),
+            submission_tool_name_for_role("architecture_advisor"),
             Some("submit_findings")
         );
         assert_eq!(
@@ -1919,8 +1919,8 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_CONTROL_SOCKET, socket_path.to_string_lossy().to_string());
             std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
-            std::env::set_var(ENV_CHANGE, "architecture_consultative");
-            std::env::set_var(ENV_ROLE, "architecture_consultative");
+            std::env::set_var(ENV_CHANGE, "architecture_advisor");
+            std::env::set_var(ENV_ROLE, "architecture_advisor");
         }
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("x/.askuser-pending.json");

@@ -1,76 +1,6 @@
 use super::*;
 
 #[test]
-fn brightline_triage_scope_accepts_only_ignore_file() {
-    let changed = vec![".brightline-ignore".to_string()];
-    assert!(
-        validate_brightline_triage_scope(
-            "architecture_brightline",
-            &changed,
-            "openspec/changes/architecture-brightline-abcd1234/",
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn brightline_triage_scope_accepts_ignore_plus_spec_dir() {
-    let changed = vec![
-        ".brightline-ignore".to_string(),
-        "openspec/changes/architecture-brightline-abcd1234/proposal.md".to_string(),
-    ];
-    assert!(
-        validate_brightline_triage_scope(
-            "architecture_brightline",
-            &changed,
-            "openspec/changes/architecture-brightline-abcd1234/",
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn brightline_triage_scope_rejects_ignore_mixed_with_code() {
-    let changed = vec![".brightline-ignore".to_string(), "src/foo.rs".to_string()];
-    let err = validate_brightline_triage_scope(
-        "architecture_brightline",
-        &changed,
-        "openspec/changes/architecture-brightline-abcd1234/",
-    )
-    .expect_err("mixed-scope diff must be rejected");
-    assert_eq!(err, vec!["src/foo.rs".to_string()]);
-}
-
-#[test]
-fn brightline_triage_scope_accepts_pure_fixes_diff_without_ignore_file() {
-    // No `.brightline-ignore` write → the LLM took the fix path.
-    // That path is unconstrained.
-    let changed = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
-    assert!(
-        validate_brightline_triage_scope(
-            "architecture_brightline",
-            &changed,
-            "openspec/changes/architecture-brightline-abcd1234/",
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn brightline_triage_scope_noop_for_other_audits() {
-    // Non-brightline audits are unaffected: a mixed diff is fine.
-    let changed = vec![".brightline-ignore".to_string(), "src/foo.rs".to_string()];
-    assert!(
-        validate_brightline_triage_scope(
-            "drift_audit",
-            &changed,
-            "openspec/changes/drift-audit-abcd1234/",
-        )
-        .is_ok()
-    );
-}
-
-#[test]
 fn discard_non_spec_writes_spec_only_returns_empty() {
     let (_d, ws) = dnsw_repo();
     std::fs::create_dir_all(ws.join("openspec/changes/foo")).unwrap();
@@ -566,6 +496,152 @@ async fn a43_audit_spec_only_opens_pr_without_warning() {
     assert!(
         replies.iter().any(|r| r.contains("Spec PR:")),
         "spec PR URL must be surfaced, got {replies:?}"
+    );
+}
+
+/// The discard step keeps the issues lane (`openspec/issues/<slug>/`) AND
+/// drops out-of-lane code. (architecture-advisory-redesign task 7.4.)
+#[test]
+fn discard_non_spec_writes_keeps_issues_lane_drops_code() {
+    let (_d, ws) = dnsw_repo();
+    let slug = "advisor-refactor";
+    let issue_dir = ws.join(crate::lanes::issues::ISSUES_SUBDIR).join(slug);
+    std::fs::create_dir_all(&issue_dir).unwrap();
+    std::fs::write(issue_dir.join("issue.md"), "# Refactor\nx\n").unwrap();
+    std::fs::write(ws.join("src/bar.rs"), "MUTATED\n").unwrap();
+    let dropped = discard_non_spec_writes(&ws, slug).unwrap();
+    assert_eq!(dropped, vec!["src/bar.rs".to_string()]);
+    assert!(
+        issue_dir.join("issue.md").exists(),
+        "issues-lane content must survive the discard"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("src/bar.rs")).unwrap(),
+        "orig\n"
+    );
+}
+
+/// 7.4: a behavior-preserving refactor triage writes the issues lane +
+/// out-of-lane code → ONE issue PR, code discarded, NO `openspec/changes/`
+/// content, status Acted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_issue_lane_triage_opens_one_issue_pr() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td, paths) = crate::testing::test_daemon_paths();
+    // Executor's writes: an issues-lane dir + an out-of-lane code file.
+    write_fake_issue(&ws, "advisor-decompose");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+    let _hook = test_hooks::lock();
+    let mut server = mockito::Server::new_async().await;
+    let pr_mock = server
+        .mock("POST", "/repos/owner/fixture/pulls")
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/11","number":11}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    test_hooks::set_github_api_base(Some(server.url()));
+
+    let chatops = Arc::new(RecordingChatOps {
+        replies: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = recording_ctx(&chatops);
+    let mut state = audit_state();
+    state.audit_type = "architecture_advisor".into();
+    let res = process_completed_triage(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &triage_github_cfg(),
+        Some(&ctx),
+        &mut state,
+        None,
+    )
+    .await;
+    test_hooks::set_github_api_base(None);
+    res.expect("handler must succeed");
+
+    pr_mock.assert_async().await;
+    assert_eq!(
+        state.status,
+        crate::audits::threads::AuditThreadStatus::Acted
+    );
+    assert!(!ws.join("src/foo.rs").exists(), "code write must be discarded");
+    // The PR branch carries ONLY issues-lane paths — no `openspec/changes/`.
+    let files = crate::git::diff_files_changed(&ws, "main", "agent-q-triage-spec").unwrap();
+    assert!(!files.is_empty(), "issue branch must carry a diff");
+    let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
+    assert!(
+        files.iter().all(|f| f.starts_with(&issues_prefix)),
+        "issue PR diff must be issues-lane-only, got {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.starts_with("openspec/changes/")),
+        "no spec proposal must be produced, got {files:?}"
+    );
+    let replies = chatops.replies.lock().unwrap().clone();
+    assert!(
+        replies.iter().any(|r| r.contains("Issue PR:")),
+        "the issue PR URL must be surfaced, got {replies:?}"
+    );
+}
+
+/// 7.4: no content in EITHER lane (only code, now dropped) → no PR, the
+/// audit-thread flips to TriageFailed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_code_only_triage_flips_to_triage_failed() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td, paths) = crate::testing::test_daemon_paths();
+    // Only an out-of-lane code write — no spec, no issue.
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/foo.rs"), "agent code\n").unwrap();
+
+    let _hook = test_hooks::lock();
+    let mut server = mockito::Server::new_async().await;
+    // No PR must be created.
+    let pr_mock = server
+        .mock("POST", "/repos/owner/fixture/pulls")
+        .with_status(201)
+        .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/99","number":99}"#)
+        .expect(0)
+        .create_async()
+        .await;
+    test_hooks::set_github_api_base(Some(server.url()));
+
+    let chatops = Arc::new(RecordingChatOps {
+        replies: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = recording_ctx(&chatops);
+    let mut state = audit_state();
+    state.audit_type = "architecture_advisor".into();
+    let res = process_completed_triage(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &triage_github_cfg(),
+        Some(&ctx),
+        &mut state,
+        None,
+    )
+    .await;
+    test_hooks::set_github_api_base(None);
+    res.expect("handler must succeed");
+
+    pr_mock.assert_async().await;
+    assert_eq!(
+        state.status,
+        crate::audits::threads::AuditThreadStatus::TriageFailed
+    );
+    assert!(!ws.join("src/foo.rs").exists(), "code write must be discarded");
+    let replies = chatops.replies.lock().unwrap().clone();
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("no spec or issue content produced")),
+        "a no-content reply must be posted, got {replies:?}"
     );
 }
 

@@ -255,7 +255,7 @@ loop prevents the proposal from entering the queue in the first place.
    you can confirm whether the failures are concentrated in one audit
    or spread across the LLM-driven set (`drift_audit`,
    `missing_tests_audit`, `security_bug_audit`,
-   `architecture_consultative`).
+   `architecture_advisor`).
 4. **If you want to disable retries entirely** (e.g. during a known
    LLM-side outage to stop burning calls): set
    `audits.max_validation_retries: 0`. The first failure becomes
@@ -525,7 +525,7 @@ doing when the cancel signal arrived. Common findings:
 
 **Symptom.** A few minutes after a host reboot, the chatops channel
 fills up with audit notifications — `🔍 created proposal`,
-`🔍 architecture-brightline reported N findings`, etc. — for audits
+`🏛 architecture_advisor reported N refactor recommendation(s)`, etc. — for audits
 that ran recently and were not due for hours or days.
 
 **Root cause.** Pre-`state-paths-out-of-tmp`, autocoder wrote audit-

@@ -61,7 +61,7 @@ Commands run:
 
 ```
 $ rg 'weekly|creates.*occurrences|about_52' autocoder/src/
-autocoder/src/audits/architecture_consultative.rs:14://! cadence. Daily/weekly invocations produce noise.
+autocoder/src/audits/architecture_advisor.rs://! re-judging the same SHA wastes CLI invocations (cadence intent).
 autocoder/src/config.rs:503:/// `weekly`, `monthly`, `quarterly`.
 autocoder/src/config.rs:556:            "weekly" => Ok(Self::Weekly),
 ... (only comment and parse-table matches; no fn weekly_creates_…)
@@ -207,7 +207,7 @@ Hard-coded `/tmp` paths in source:
 - `config.rs:760` — assert on a path construction result. No write.
 - `busy_marker.rs:677,809` — assert on `marker_path()`'s return value.
   No write.
-- `audits/drift.rs:552,559` and `audits/architecture_consultative.rs:583,592`
+- `audits/drift.rs:552,559` and `audits/architecture_advisor.rs`
   — `prompt_path` config field stored as a `PathBuf`. No write.
 - `audits/mod.rs:175` — `AuditLogWriter::open` writes to
   `/tmp/autocoder/logs/<workspace-basename>/audits/`. The basename
@@ -223,7 +223,7 @@ test could collide with. Disposition: `not-flaky-on-inspection`.
 ### ETXTBSY from concurrent audit-CLI fixtures
 
 The audit tests in `audits/drift.rs`, `audits/missing_tests.rs`, and
-`audits/architecture_consultative.rs` write a small `fake-claude.sh`
+`audits/architecture_advisor.rs` write a small `fake-claude.sh`
 shell script into a per-test `TempDir` and immediately spawn it via
 `tokio::process::Command::spawn`. Under default parallelism on a
 48-CPU host, two of the 20 baseline runs of this audit failed with
@@ -253,10 +253,10 @@ Fix (in this change): added `audits::spawn_with_etxtbsy_retry` —
 takes a closure that builds a fresh `tokio::process::Command` and
 retries the `spawn` up to 8 times with linear backoff (20–140 ms),
 but only on `Err(ETXTBSY)`; any other error is returned immediately.
-Wired into the three audit-CLI subprocess helpers
-(`audits/drift.rs`, `audits/specs_writing.rs` — which serves both
-`missing_tests` and `architecture_brightline` indirectly, and
-`audits/architecture_consultative.rs`).
+Wired into the audit-CLI subprocess helpers
+(`audits/drift.rs`, `audits/specs_writing.rs` — which serves
+`missing_tests` and `security_bug` — and
+`audits/architecture_advisor.rs`).
 
 Production impact: negligible. ETXTBSY in production only happens if
 something else on the host is mid-write to the very binary
@@ -321,7 +321,7 @@ section for the architectural detail.
 | `weekly_creates_about_52_occurrences` | — | (unlocatable) | `not-flaky-on-inspection` | Test does not exist in current tree or git history (see "Test name lookup"). Per-spec, documented as a ghost so future operators don't reopen the search. |
 | `audits::missing_tests::tests::post_run_detects_only_new_change_dirs` | `audits/missing_tests.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |
 | `audits::drift::tests::sandbox_settings_file_cleaned_up_after_run` | `audits/drift.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |
-| `audits::architecture_consultative::tests::*` (CLI-spawning tests) | `audits/architecture_consultative.rs` | filesystem (fork-after-write) | `fixed-in-this-change` (preventive) | Same pattern as drift/missing_tests; helper applied here too even though no failure was observed in 30 runs. |
+| `audits::architecture_advisor::tests::*` (CLI-spawning tests) | `audits/architecture_advisor.rs` | filesystem (fork-after-write) | `fixed-in-this-change` (preventive) | Same pattern as drift/missing_tests; helper applied here too even though no failure was observed in 30 runs. |
 | `polling_loop::tests::cancellation_in_startup_jitter_window` | `polling_loop.rs` | timing (narrow window) | `not-flaky-on-inspection` | Asserts `elapsed < 500 ms` after cancel. Did not flake in this audit's 30 runs. Future fix if it surfaces: relax the bound to e.g. 1500 ms, since the test's purpose is "cancel won the select", not "cancel is fast". |
 | `llm::tests::inline_api_key_takes_precedence_over_env_var` | `llm.rs` | env mutation (no `ENV_LOCK`) | `mitigated` | Unique env-var name per test prevents direct collision. Glibc `setenv`/`getenv` not strictly thread-safe; if a flake surfaces, add `static ENV_LOCK: Mutex<()>` per module. |
 | `code_reviewer::tests::from_config_*` (3 tests) | `code_reviewer.rs` | env mutation (no `ENV_LOCK`) | `mitigated` | Same — unique env-var names. |

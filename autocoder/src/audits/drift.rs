@@ -368,7 +368,7 @@ fn excerpt(s: &str) -> String {
 /// return Some(error) if the outcome is terminal (timed out OR non-zero
 /// exit). Returns None when the caller should continue processing (parse
 /// stdout into findings). Mirrors
-/// `architecture_consultative::outcome_to_terminal_err`.
+/// `architecture_advisor::outcome_to_terminal_err`.
 fn outcome_to_terminal_err(
     outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
@@ -820,7 +820,7 @@ mod tests {
     /// Pure-data test: feed a synthesized `AgenticRunOutcome` with
     /// `timed_out: true` directly into `outcome_to_terminal_err` and
     /// assert the resulting error + log entries. No subprocess, no
-    /// timer, no race — see architecture_consultative's equivalent
+    /// timer, no race — see architecture_advisor's equivalent
     /// test for the architectural rationale.
     #[test]
     fn outcome_to_terminal_err_translates_timed_out_to_error() {

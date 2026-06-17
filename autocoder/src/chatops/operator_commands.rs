@@ -4724,7 +4724,7 @@ mod tests {
     fn match_audit_type_unique() {
         let registered = &[
             "security_bug_audit",
-            "architecture_brightline",
+            "architecture_advisor",
             "drift_audit",
         ];
         match match_audit_type("sec", registered) {
@@ -4733,18 +4733,35 @@ mod tests {
         }
     }
 
+    /// `arch` now resolves uniquely to the single architecture audit — the
+    /// two old architecture slugs collapsed into `architecture_advisor`.
     #[test]
-    fn match_audit_type_multiple() {
+    fn match_audit_type_arch_resolves_uniquely() {
         let registered = &[
-            "architecture_brightline",
-            "architecture_consultative",
+            "architecture_advisor",
+            "drift_audit",
             "security_bug_audit",
         ];
         match match_audit_type("arch", registered) {
+            AuditMatch::Unique(n) => assert_eq!(n, "architecture_advisor"),
+            other => panic!("expected Unique, got {other:?}"),
+        }
+    }
+
+    /// A substring matching multiple registered slugs (the two canon audits)
+    /// still reports `Multiple`.
+    #[test]
+    fn match_audit_type_multiple() {
+        let registered = &[
+            "canon_contradiction_audit",
+            "canon_consolidation_audit",
+            "security_bug_audit",
+        ];
+        match match_audit_type("canon", registered) {
             AuditMatch::Multiple(ms) => {
                 assert_eq!(ms.len(), 2);
-                assert!(ms.contains(&"architecture_brightline"));
-                assert!(ms.contains(&"architecture_consultative"));
+                assert!(ms.contains(&"canon_contradiction_audit"));
+                assert!(ms.contains(&"canon_consolidation_audit"));
             }
             other => panic!("expected Multiple, got {other:?}"),
         }
@@ -5559,10 +5576,10 @@ mod tests {
         // branch is what we're asserting here.
         let mut b = busy("executor", "", 13 * 60);
         b.stale_threshold_secs = 3600;
-        b.audit_type = Some("architecture_consultative".into());
+        b.audit_type = Some("architecture_advisor".into());
         assert_eq!(
             format_currently_line(Some(&b)),
-            "currently: running audit architecture_consultative (started 13m ago)"
+            "currently: running audit architecture_advisor (started 13m ago)"
         );
     }
 
@@ -6384,11 +6401,13 @@ mod tests {
 
     fn audit_types() -> Vec<&'static str> {
         vec![
-            "architecture_brightline",
-            "architecture_consultative",
+            "architecture_advisor",
             "drift_audit",
             "missing_tests_audit",
             "security_bug_audit",
+            "documentation_audit",
+            "canon_contradiction_audit",
+            "canon_consolidation_audit",
         ]
     }
 
@@ -6464,7 +6483,7 @@ mod tests {
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
-                &format!("{BOT} audit arch myrepo"),
+                &format!("{BOT} audit canon myrepo"),
                 "C1",
                 BOT,
                 &fixture_repos(),
@@ -6474,8 +6493,8 @@ mod tests {
             .unwrap();
         let text = unwrap_sync(reply);
         assert!(text.starts_with("✗"), "{text}");
-        assert!(text.contains("architecture_brightline"), "{text}");
-        assert!(text.contains("architecture_consultative"), "{text}");
+        assert!(text.contains("canon_contradiction_audit"), "{text}");
+        assert!(text.contains("canon_consolidation_audit"), "{text}");
         assert!(text.contains("Be more specific"), "{text}");
         assert!(submitter.calls().is_empty(), "no action submitted");
     }
@@ -7072,8 +7091,8 @@ mod tests {
             thread_ts: thread_ts.to_string(),
             channel: "C_OPS".to_string(),
             repo_url: "git@github.com:acme/myrepo.git".to_string(),
-            audit_type: "architecture_brightline".to_string(),
-            findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
+            audit_type: "architecture_advisor".to_string(),
+            findings_excerpt: "  • split src/foo.rs".to_string(),
             posted_at,
             status,
             reason: None,

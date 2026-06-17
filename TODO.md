@@ -26,9 +26,17 @@ Worth considering only if `a21`'s on-demand surface proves under-used (the imple
 
 The `a21` install wizard offers "install Ollama via docker" as option 1 but stops short of auto-running `docker compose up`. A more aggressive quick-start would: detect docker; offer to run the compose file as part of the install wizard; wait for Ollama to come up; pull the embedding model; verify the embed pipeline end-to-end. Trade-off: more wizard surface area, more failure modes. Worth doing only if operators report friction with the manual `docker compose up` step.
 
-## Brightline-ignore extension to the contradiction checks
+## Ignore-file pattern for the contradiction checks
 
-`a15` adds `.brightline-ignore` for intentional code duplication. The same concept applies to the contradiction checks now in canon — the `[in]` change-internal gate (`a19`/`a59`) and the `[canon]` change-vs-canonical gate (`a62`): a `.contradiction-ignore.yaml` lists requirement pairs the operator has reviewed AND confirmed are not actually contradictory. The check honors entries and stops flagging known-good pairs. Same architecture (file at workspace root, LLM-populated via `send it`, audit-time stale-pruning).
+`a15` introduced `.brightline-ignore` for intentional code duplication; the
+`architecture-advisory-redesign` change later removed it along with the
+duplicate-signature metric that was its only consumer. The same *pattern* — a
+workspace-root ignore file, LLM-populated via `send it`, audit-time
+stale-pruning — could still apply to the contradiction checks now in canon: the
+`[in]` change-internal gate (`a19`/`a59`) and the `[canon]` change-vs-canonical
+gate (`a62`). A `.contradiction-ignore.yaml` would list requirement pairs the
+operator has reviewed AND confirmed are not actually contradictory; the check
+honors entries and stops flagging known-good pairs.
 
 The pre-flight gates have now shipped (`a59`, `a62`), so this is unblocked. Hold until we have real false-positive rates from them in use — the value, and the right ergonomics for the ignore file, depend on how noisy the gates actually are.
 
@@ -57,7 +65,7 @@ see whether the per-file pass is holding the line.
 
 Small items left after `audits-fail-closed-and-report` shipped (fail-closed audit outcomes, the on-demand completion notification, in-memory queue durability). None blocking; pick up opportunistically. Cross-restart queue persistence is already its own change (`persist-on-demand-audit-queue`) and is NOT in this list.
 
-- **Advisory audits should surface session errors via `DidNotComplete`, not bare `Err`.** The specs-writing harness now maps a terminal session error (timeout / non-zero exit / uncaptured `exit_status == None`) to `AuditOutcome::DidNotComplete { SessionErrored }`, which the scheduler surfaces as a chatops failure alert with the cadence left unchanged. The advisory audits (`drift_audit`, `architecture_consultative`, `canon_contradiction_audit`, `documentation_audit`) still `return Err` from their own `outcome_to_terminal_err` copies on the same conditions — logged and cadence-preserving, but NOT chatops-surfaced as a fail-closed state, and their copies still have the `exit_status == None` fall-through hole that `specs_writing.rs` closed. Bring them onto the same `DidNotComplete` path so an advisory audit that can't run is operator-visible, not just a log line.
+- **Advisory audits should surface session errors via `DidNotComplete`, not bare `Err`.** The specs-writing harness now maps a terminal session error (timeout / non-zero exit / uncaptured `exit_status == None`) to `AuditOutcome::DidNotComplete { SessionErrored }`, which the scheduler surfaces as a chatops failure alert with the cadence left unchanged. The advisory audits (`drift_audit`, `architecture_advisor`, `canon_contradiction_audit`, `documentation_audit`) still `return Err` from their own `outcome_to_terminal_err` copies on the same conditions — logged and cadence-preserving, but NOT chatops-surfaced as a fail-closed state, and their copies still have the `exit_status == None` fall-through hole that `specs_writing.rs` closed. Bring them onto the same `DidNotComplete` path so an advisory audit that can't run is operator-visible, not just a log line.
 
 - **On-demand completion notification should reply in the operator's thread (`thread_ts`), not just channel-level.** The completion post currently goes to the originating channel (the spec's documented graceful-degradation path) because the `dispatch` method doesn't carry `thread_ts`. Threading it through `dispatch` and its callers — or having the `AuditNow` command carry `thread_ts` the way `SendItOnAudit` already does — would let `post_threaded_reply` group the result under the operator's `@<bot> audit …` message instead of posting a new channel-level message.
 

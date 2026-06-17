@@ -329,8 +329,6 @@ This is intentional: stale audit findings probably no longer reflect the current
 
 **Revising the produced PR.** The spec PR is a normal autocoder-opened PR that participates in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment). `@<bot> revise <text>` on it re-runs the executor against the spec diff (which by construction is spec-only), so revisions stay scoped to the proposal. If the spec under-specifies the work, revise it to add or sharpen `tasks.md` items before merging — the implementer acts on those tasks on the next iteration.
 
-**Brightline findings can also produce `.brightline-ignore` updates.** When `send it` runs on an `architecture_brightline` thread, the triage LLM classifies each duplicate-signature finding as **Fix**, **Spec-worthy**, or **Mark as intentional**. The third path produces a diff that touches ONLY `.brightline-ignore` (one entry per constituent site of the finding, with the LLM's reasoning recorded in each entry's `reason` field). `.brightline-ignore` is the one exception to a43's spec-only rule — it is a suppression-config write with no implementer-pipeline equivalent, so it ships directly in a single PR rather than being discarded. The triage handler enforces brightline-specific diff scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (only `.brightline-ignore` and `openspec/changes/<slug>/` are permitted in the brightline triage output). See [OPERATIONS.md → `.brightline-ignore`](OPERATIONS.md#brightline-ignore) for the full file format, match-suppression rules, and stale-entry handling.
-
 ### Discussing AND revising a contradiction-flagged change: `send it` in a spec-revision thread
 
 When the `[in]` (change-internal) or `[canon]` (change-vs-canonical) verifier gate finds a **contradiction** at implement time, autocoder writes a `.needs-spec-revision.json` marker AND posts a `SpecNeedsRevision` alert. For a contradiction marker (one whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty — a semantic finding, NOT the executor's unimplementable-tasks flag NOR a gate-error hold), that alert is an **interactive revision thread** (a03):
@@ -656,7 +654,7 @@ The `currently:` line surfaces the daemon's live busy-marker contents. It distin
 ```
 currently: idle
 currently: working on a36-expense-tracking (started 3m ago)
-currently: running audit architecture_consultative (started 14m ago)
+currently: running audit architecture_advisor (started 14m ago)
 currently: commit in progress (started 12s ago)
 currently: push in progress (started 8s ago)
 currently: stale marker from pid 490170 (age 9m, recovery in 1m)
@@ -813,17 +811,17 @@ When the proposal validated only after one or more retries, the text gains the s
 
 This **always fires** when an LLM-driven audit produces a valid proposal; it is **not** gated by `notify_on_clean`. The two switches operate on opposite signal classes: `notify_on_clean` suppresses "nothing to do" messages, whereas `🔍` is the "audit found something worth doing" signal — suppressing it would defeat the purpose. The operator's next chatops message about that change is the existing `🚀 starting work on …` line; the `🔍` provides the provenance for it.
 
-The pure-data `architecture_brightline` audit does NOT fire this notification (it does not generate an LLM proposal). The advisory `architecture_consultative` and `drift_audit` audits also do not fire it — they emit findings via the existing `📋` chatops dispatch and never write `openspec/changes/<slug>/`.
+The advisory audits `architecture_advisor`, `drift_audit`, and `documentation_audit` do NOT fire this notification — they emit findings via their own chatops dispatch and never write `openspec/changes/<slug>/`.
 
 **Lane choice (a01).** `missing_tests_audit` and `security_bug_audit` now choose each finding's output lane by canon judgment: a fix that changes an observable contract becomes a spec-lane change (`openspec/changes/<slug>/`), while a behavior-preserving fix to already-correctly-specified code becomes an issue-lane unit (`openspec/issues/<slug>/`). **Issues are a first-class audit output.** The issue lane is offered to the agent ONLY when `features.issues` is enabled for the repository; with it disabled, these audits behave exactly as before (spec lane only). The `🔍` notification fires for **spec-lane proposals only** — it reports a validated `openspec validate --strict` proposal, which an issue-lane unit (carrying no spec delta) does not have; issue-lane units are committed silently and surface when the issues walker works them on the next iteration.
 
 If the chatops backend is unconfigured OR `post_notification` errors when this notification is posted, the failure is logged at WARN and the audit's success outcome (proposal commit, queue insertion) is unaffected.
 
-### Audit-finding threaded notifications (`📐` / `🧭` / `📚` / `📋` / `✅`)
+### Audit-finding threaded notifications (`🏛` / `🧭` / `📚` / `📋` / `✅`)
 
-Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
+Audit results from the advisory audits (`architecture_advisor`, `drift_audit`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
 
-- `📐 architecture_brightline on <repo-url>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+- `🏛 architecture_advisor on <repo-url>: <N> refactor recommendation(s)`
 - `🧭 drift_audit on <repo-url>: <N> spec/code divergence(s) detected`
 - `📚 documentation_audit on <repo-url>: <N> finding(s)` — documentation coverage / stale-reference / organization findings. The thread body groups findings by category (`Coverage` / `Stale references` / `Organization`); each finding renders as `- <severity> at <anchor>: <body>`.
 - `📋 <audit-type> on <repo-url>: <N> finding(s)` — generic fallback for any other `Reported`-outcome audit.

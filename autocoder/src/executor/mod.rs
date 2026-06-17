@@ -209,7 +209,7 @@ pub struct TriageContext {
     /// The full findings excerpt (capped at 35,000 chars) the operator
     /// saw in the audit's reply thread.
     pub findings: String,
-    /// The audit's slug (e.g. `architecture_brightline`,
+    /// The audit's slug (e.g. `architecture_advisor`,
     /// `drift_audit`, `security_bug_audit`).
     pub audit_type: String,
     /// The repository URL the audit ran against.
