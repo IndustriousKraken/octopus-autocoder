@@ -288,13 +288,16 @@ pub(crate) fn build_pr_body(
 }
 
 /// Parse audit-produced commit subjects of shape
-/// `audit: <type> proposals (<N> change(s))` and return `(total, types)`:
-/// the sum of `N` across all matching subjects AND the deduplicated list
-/// of audit types preserving first-seen order. Subjects not matching the
-/// canonical shape contribute nothing to the totals (they are listed
-/// verbatim in the PR body, but the title summary skips them).
+/// `audit: <type> proposals (<N> change(s))` OR (a01, the planning-lanes
+/// bug/gap audits) `audit: <type> proposals (<N> unit(s))`, and return
+/// `(total, types)`: the sum of `N` across all matching subjects AND the
+/// deduplicated list of audit types preserving first-seen order. Subjects
+/// not matching either shape contribute nothing to the totals (they are
+/// listed verbatim in the PR body, but the title summary skips them).
 fn summarize_audit_commit_subjects(subjects: &[String]) -> (u32, Vec<String>) {
-    let re = match regex::Regex::new(r"^audit: (?P<type>\S+) proposals \((?P<n>\d+) change\(s\)\)$")
+    let re = match regex::Regex::new(
+        r"^audit: (?P<type>\S+) proposals \((?P<n>\d+) (?:change|unit)\(s\)\)$",
+    )
     {
         Ok(r) => r,
         Err(_) => return (0, Vec::new()),
@@ -321,7 +324,10 @@ fn summarize_audit_commit_subjects(subjects: &[String]) -> (u32, Vec<String>) {
 /// category's section AND only emits a section for non-empty buckets.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct CommitCategories {
-    /// `audit: <type> proposals (<N> change(s))` subjects (a20a3).
+    /// `audit: <type> proposals (<N> change(s))` subjects (a20a3), AND
+    /// (a01) the planning-lanes `audit: <type> proposals (<N> unit(s))`
+    /// form emitted by the bug/gap audits when a finding can land in
+    /// either planning lane.
     pub(crate) audit: Vec<String>,
     /// `iteration <N> of <change>: <reason>` subjects (a27a1).
     pub(crate) iteration_wip: Vec<String>,
@@ -366,7 +372,10 @@ pub(crate) fn categorize_commit_subjects(subjects: &[String]) -> CommitCategorie
     // Lazily compile each pattern once per call. The renderer is a
     // hot-ish path (every PR opens), but not so hot that a static
     // OnceLock-cached regex pays its weight; keep it simple.
-    let audit_re = regex::Regex::new(r"^audit: \S+ proposals \(\d+ change\(s\)\)$")
+    // a01: accept BOTH the legacy `change(s)` count AND the planning-lanes
+    // `unit(s)` count the bug/gap audits now emit. The canonical partition
+    // keys off the `audit: <type>` prefix, so both shapes are audit-produced.
+    let audit_re = regex::Regex::new(r"^audit: \S+ proposals \(\d+ (?:change|unit)\(s\)\)$")
         .expect("static audit regex compiles");
     let iteration_re =
         regex::Regex::new(r"^iteration \d+ of \S+:").expect("static iteration regex compiles");

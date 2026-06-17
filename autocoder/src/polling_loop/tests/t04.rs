@@ -89,7 +89,7 @@ async fn reviewer_verdict_drives_pr_shape() {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .expect("commits step succeeds");
@@ -360,6 +360,7 @@ async fn iteration_error_continues() {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            crate::control_socket::RevisionRequestQueues::new(),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,

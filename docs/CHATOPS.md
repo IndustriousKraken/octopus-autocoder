@@ -294,22 +294,26 @@ Staleness warns but does NOT block. Operators who want fresh results re-run `@<b
 
 ### Acting on audit findings AND batch-generating from a brownfield-survey: `send it`
 
-The `send it` verb has **two** valid posting contexts:
+The `send it` verb has several valid posting contexts:
 
 1. **Inside an audit-notification thread** (the canonical case). The daemon stamps an audit-thread state file on disk when an audit posts findings; replying with `send it` triggers triage of those findings.
 2. **Inside a brownfield-survey lifecycle thread** (a29). The survey handler stamps a `BrownfieldSurveyState` on disk; replying with `send it` triggers batch generation of one spec PR per surveyed capability.
+3. **Inside an issue-candidate thread.** Replying with `send it` promotes the candidate into the issues lane.
+4. **Inside a spec-revision thread** (a03). When the `[in]` / `[canon]` contradiction gate flags a change at implement time, autocoder posts a `SpecNeedsRevision` alert AND stamps a `RevisionThreadState`; replying with `send it` revises the change's spec deltas, re-runs the gates, AND opens a PR. See [Discussing AND revising a contradiction-flagged change](#discussing-and-revising-a-contradiction-flagged-change-send-it-in-a-spec-revision-thread).
 
 ```
-@<bot> send it       (posted as a reply inside the audit OR brownfield-survey thread)
+@<bot> send it       (posted as a reply inside the audit, brownfield-survey, issue-candidate, OR spec-revision thread)
 ```
 
-Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names both valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second; whichever matches dictates the action.
+Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names all four valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second, the issue-candidate set third, the spec-revision set fourth; whichever matches dictates the action (a `thread_ts` resolves to at most one record across the four sets).
 
 **Audit-thread context (canonical).** Inside a tracked, fresh, open audit thread `send it` spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** or **spec-worthy**, and writes a new `openspec/changes/<slug>/` proposal capturing the work as `tasks.md` items (quick fixes included — the agent does NOT touch source code). The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced spec PR within one polling cycle.
 
 **Brownfield-survey-thread context (a29).** Inside a brownfield-survey thread whose `BrownfieldSurveyState.status` is `Pending`, `send it` submits a `BrownfieldBatchAction` AND the bot replies `✓ Queued <N> capability spec generations. The first will start on the next iteration.` Subsequent iterations drain ONE survey item per iteration, each invoking the canonical brownfield-generation flow from [`brownfield`](#drafting-a-spec-for-existing-behavior-brownfield) for that capability. Per-item status replies (`✅ Spec PR opened for \`<slug>\` (M/N done): <pr-url>` on success; `✗ Spec for \`<slug>\` failed: <reason> (continuing with next)` on failure; `⏭ Skipped \`<slug>\` (M/N done): spec already exists.` when the spec file appears mid-batch) land in the same lifecycle thread. When every item reaches a terminal state, the bot posts the batch-complete summary `✅ Brownfield batch complete. <X> succeeded, <Y> skipped (already specced), <Z> failed.`
 
 The one-item-per-iteration discipline is deliberate: each brownfield run gets its own fresh executor invocation, eliminating mid-batch context compression as a failure mode. If a `send it` lands on a survey whose `status` is already `InProgress` OR `Completed`, the bot rejects with `✗ send it: a brownfield batch is already <in progress | completed> for survey <request_id>.` Only ONE survey may be `InProgress` per workspace at a time — a second `send it` against a different survey gets `✗ send it: a brownfield batch is already in progress for this workspace (survey <prior-request_id>). Wait for it to finish OR run @<bot> clear-survey <repo> to abort.`
+
+**Issue-candidate-thread context (a010).** When the issue-ingestion pass triages a reported GitHub issue as a bug, it drafts a candidate `issues/<slug>/`, records its state, AND posts the candidate to chatops — but writes NOTHING to `issues/` and queues NOTHING. The candidate notification is posted in a way that captures the message's `thread_ts` AND `channel` on the candidate's stored state, and it instructs you to reply `@<bot> send it` in that thread; nothing is written OR queued until you do (promotion is the authorization gate that keeps public reporters from triggering code work). Replying `@<bot> send it` in that thread **promotes** the candidate: the daemon writes `issues/<slug>/` (its `issue.md` + `tasks.md`, plus the quarantined `report-body.md` for a public-origin candidate), flips the candidate's stored status to promoted, AND the bot replies `✓ Promoted issue candidate \`<slug>\` — wrote issues/<slug>/ AND queued it for the issues lane.` Writing the unit IS the queue: the issues-lane walker picks up any ready `issues/<slug>/` on its next iteration. Promotion is idempotent — a `send it` on a candidate that is **already promoted** takes no new action and the bot replies `✗ send it: issue candidate \`<slug>\` is already promoted. No new action taken.` A candidate whose thread was not captured at post time (a degraded, non-threaded post) is simply not reply-matchable — re-trigger ingestion or promote it by committing the unit directly (the curated path).
 
 **Spec-only output shape (a43).** autocoder keeps only the paths under the new `openspec/changes/<slug>/` directory and discards everything else (code, docs, any non-spec write) before committing, so the produced **spec PR** carries spec content only. The PR is created on a branch off `base_branch`; its body has no cross-link (there is no companion fixes PR). If the agent wrote code despite the restriction, the daemon restores those paths, logs a WARN, and posts a chatops warning naming what was dropped — directing the operator to capture load-bearing fixes as `tasks.md` items. If the triage diff has only code and no spec, NO PR is created and the bot replies `no spec content produced; retry with a clearer directive` (status flips to `triage-failed`, so the operator can `send it` again). If it's empty (the LLM decided nothing was actionable), no PR is created and the bot posts the agent's reasoning back into the audit thread. After the operator merges the spec PR, the next polling iteration's implementer writes the code fixes through the standard pipeline.
 
@@ -327,7 +331,21 @@ This is intentional: stale audit findings probably no longer reflect the current
 
 **Revising the produced PR.** The spec PR is a normal autocoder-opened PR that participates in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment). `@<bot> revise <text>` on it re-runs the executor against the spec diff (which by construction is spec-only), so revisions stay scoped to the proposal. If the spec under-specifies the work, revise it to add or sharpen `tasks.md` items before merging — the implementer acts on those tasks on the next iteration.
 
-**Brightline findings can also produce `.brightline-ignore` updates.** When `send it` runs on an `architecture_brightline` thread, the triage LLM classifies each duplicate-signature finding as **Fix**, **Spec-worthy**, or **Mark as intentional**. The third path produces a diff that touches ONLY `.brightline-ignore` (one entry per constituent site of the finding, with the LLM's reasoning recorded in each entry's `reason` field). `.brightline-ignore` is the one exception to a43's spec-only rule — it is a suppression-config write with no implementer-pipeline equivalent, so it ships directly in a single PR rather than being discarded. The triage handler enforces brightline-specific diff scope: a brightline triage diff that mixes `.brightline-ignore` writes with arbitrary code edits is rejected (only `.brightline-ignore` and `openspec/changes/<slug>/` are permitted in the brightline triage output). See [OPERATIONS.md → `.brightline-ignore`](OPERATIONS.md#brightline-ignore) for the full file format, match-suppression rules, and stale-entry handling.
+### Discussing AND revising a contradiction-flagged change: `send it` in a spec-revision thread
+
+When the `[in]` (change-internal) or `[canon]` (change-vs-canonical) verifier gate finds a **contradiction** at implement time, autocoder writes a `.needs-spec-revision.json` marker AND posts a `SpecNeedsRevision` alert. For a contradiction marker (one whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty — a semantic finding, NOT the executor's unimplementable-tasks flag NOR a gate-error hold), that alert is an **interactive revision thread** (a03):
+
+- **Reply in the thread to discuss.** Any `@<bot>` reply that is *not* `send it` routes to a read-only **revision advisor**: a fresh agentic session reconstructed from the change's spec deltas, the relevant canon, the marker's contradiction narrative, AND the thread transcript so far. It answers the operator's question — typically "is canon wrong here, or should the change align to canon's existing term, and how?" — and **writes nothing** to the workspace. The session is stateless: each reply rebuilds the context from on-disk artifacts plus the thread, so a daemon restart mid-discussion loses nothing, AND a second reply includes the first exchange via the transcript.
+- **`@<bot> send it` to revise AND open a PR.** This runs the **spec-revision executor**: a write-scoped agentic session that edits the flagged change's spec deltas along the discussed direction (scoped to that change's `openspec/changes/<slug>/` directory), then re-runs the `[in]` and `[canon]` checks against the revised change. On a clean re-gate it opens a PR carrying the spec-delta revision AND reports the PR link in the thread. On a re-gate that still finds a contradiction it opens **no** PR AND reports the remaining contradiction in the thread, so the operator can discuss further AND `send it` again.
+
+The operator directs the approach (the discussion) AND reviews the result (the PR): the agent drafts under human direction and human review, never autonomously. The executor does NOT commit the revision to the base branch outside the PR, AND it does NOT auto-edit `tasks.md` to dodge a flag — the marching-orders invariant ("no AI process modifies its own marching orders without human review") is preserved by construction.
+
+Two markers are pointedly **out of scope** for this thread, keeping their existing operator-authored flows:
+
+- The executor's **unimplementable-tasks** marker (non-empty `unimplementable_tasks`) is NOT tracked as a revision thread: the agent flags, the operator edits `tasks.md`. Its alert does not advertise the thread.
+- The **gate-error hold** marker (populated `gate_error`) is NOT tracked either: the gate could not run, so the operator fixes the gate AND clears the marker.
+
+`@<bot> clear-revision <repo> <change>` remains the unchanged manual escape for every marker kind (edit by hand, push, clear). See [OPERATIONS.md → Interactive revision thread for contradiction markers](OPERATIONS.md#interactive-revision-thread-for-contradiction-markers-a03).
 
 ### On-demand audit: `audit`
 
@@ -354,6 +372,10 @@ becomes:
 The ETA is `~Nm` where `N` is `poll_interval_sec` rounded to minutes, or `imminently` when the next iteration is <30 seconds away. Queuing the same audit twice before the iteration fires collapses to a single run.
 
 **Cadence interaction.** A queued audit's `last_run_at` is updated on success, so the next cadence-scheduled fire moves forward by the cadence interval from the on-demand timestamp — an on-demand run "consumes" one cycle of the cadence. Audits configured `cadence: disabled` can still be triggered on-demand; the audit's `last_run_at` is still updated, but with no cadence interval the "next scheduled fire" remains in the past, so the audit stays effectively disabled for cadence-driven scheduling.
+
+**Completion notification.** When the queued audit reaches a terminal outcome the daemon posts a result back to the channel you triggered it from, so the request and its result are connected instead of the `✓ Queued` ack being the last word. The notification distinguishes the terminal states: proposals written (it lists them), a clean run (`completed — 0 proposals (no findings)`) **with a short summary of what the audit examined**, and — critically — `did NOT complete` when the audit could not run to a verdict (a session error, an uncaptured exit status, or a degenerate empty session). A did-not-complete result is surfaced as **failed-to-run, never as "no findings"** (the `gatekeepers-fail-closed` standard): the cadence is left unchanged so the audit retries on its next cycle, and the operator sees the cause rather than a false all-clear.
+
+**Durability.** A queued audit is removed from the per-repo queue only once it has actually run. A polling pass that skips (busy marker), returns early (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`) leaves the queued entry in place for a later iteration instead of silently dropping an acknowledged request. The queue now **survives a daemon restart**: every enqueue and post-run prune is mirrored to a per-repo state file (`<state_dir>/pending-audit-runs/<workspace-basename>.json`, atomic tempfile + rename) and reloaded when the repo's polling task is spawned, so a restart between the `✓ Queued` ack and the run preserves the request. Persistence is best-effort (a read/write failure is logged and never aborts a run; the in-memory queue stays authoritative), and a persisted entry for a repo that is no longer configured is reconciled away at startup.
 
 **CLI variant.** `autocoder audit run --workspace <path> --audit <name>` does the same job from the command line (no substring matching — the audit-type slug must match exactly). See [CLI.md → audit run](CLI.md#audit-run).
 
@@ -634,7 +656,7 @@ The `currently:` line surfaces the daemon's live busy-marker contents. It distin
 ```
 currently: idle
 currently: working on a36-expense-tracking (started 3m ago)
-currently: running audit architecture_consultative (started 14m ago)
+currently: running audit architecture_advisor (started 14m ago)
 currently: commit in progress (started 12s ago)
 currently: push in progress (started 8s ago)
 currently: stale marker from pid 490170 (age 9m, recovery in 1m)
@@ -791,15 +813,17 @@ When the proposal validated only after one or more retries, the text gains the s
 
 This **always fires** when an LLM-driven audit produces a valid proposal; it is **not** gated by `notify_on_clean`. The two switches operate on opposite signal classes: `notify_on_clean` suppresses "nothing to do" messages, whereas `🔍` is the "audit found something worth doing" signal — suppressing it would defeat the purpose. The operator's next chatops message about that change is the existing `🚀 starting work on …` line; the `🔍` provides the provenance for it.
 
-The pure-data `architecture_brightline` audit does NOT fire this notification (it does not generate an LLM proposal). The advisory `architecture_consultative` and `drift_audit` audits also do not fire it — they emit findings via the existing `📋` chatops dispatch and never write `openspec/changes/<slug>/`.
+The advisory audits `architecture_advisor`, `drift_audit`, and `documentation_audit` do NOT fire this notification — they emit findings via their own chatops dispatch and never write `openspec/changes/<slug>/`.
+
+**Lane choice (a01).** `missing_tests_audit` and `security_bug_audit` now choose each finding's output lane by canon judgment: a fix that changes an observable contract becomes a spec-lane change (`openspec/changes/<slug>/`), while a behavior-preserving fix to already-correctly-specified code becomes an issue-lane unit (`openspec/issues/<slug>/`). **Issues are a first-class audit output.** The issue lane is offered to the agent ONLY when `features.issues` is enabled for the repository; with it disabled, these audits behave exactly as before (spec lane only). The `🔍` notification fires for **spec-lane proposals only** — it reports a validated `openspec validate --strict` proposal, which an issue-lane unit (carrying no spec delta) does not have; issue-lane units are committed silently and surface when the issues walker works them on the next iteration.
 
 If the chatops backend is unconfigured OR `post_notification` errors when this notification is posted, the failure is logged at WARN and the audit's success outcome (proposal commit, queue insertion) is unaffected.
 
-### Audit-finding threaded notifications (`📐` / `🧭` / `📚` / `📋` / `✅`)
+### Audit-finding threaded notifications (`🏛` / `🧭` / `📚` / `📋` / `✅`)
 
-Audit results from the advisory audits (`architecture_brightline`, `drift_audit`, `architecture_consultative`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
+Audit results from the advisory audits (`architecture_advisor`, `drift_audit`, `documentation_audit`) are posted as a **one-line top-level message** in the channel with the full findings carried in a **Slack thread reply** to that message. Channel watchers see a clean feed of summary lines; clicking into a thread surfaces the per-finding detail. Per-audit-type emoji conventions:
 
-- `📐 architecture_brightline on <repo-url>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+- `🏛 architecture_advisor on <repo-url>: <N> refactor recommendation(s)`
 - `🧭 drift_audit on <repo-url>: <N> spec/code divergence(s) detected`
 - `📚 documentation_audit on <repo-url>: <N> finding(s)` — documentation coverage / stale-reference / organization findings. The thread body groups findings by category (`Coverage` / `Stale references` / `Organization`); each finding renders as `- <severity> at <anchor>: <body>`.
 - `📋 <audit-type> on <repo-url>: <N> finding(s)` — generic fallback for any other `Reported`-outcome audit.

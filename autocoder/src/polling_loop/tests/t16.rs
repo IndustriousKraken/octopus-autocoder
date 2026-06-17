@@ -35,7 +35,7 @@ async fn pending_only_iteration_runs_no_audit_work() {
         &registry,
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -65,6 +65,32 @@ fn build_audit_only_pr_title_aggregates_multiple_audits() {
     assert_eq!(
         title,
         "audit-only: 5 proposal(s) from security_bug, missing_tests"
+    );
+}
+
+/// a01: the planning-lanes `unit(s)` commit subject is recognized as an
+/// audit-produced commit — counted in the title summary AND listed in the
+/// audit-only body — exactly like the legacy `change(s)` form. (The
+/// bug/gap audits now emit `(N unit(s))` because a finding can land in
+/// either planning lane.)
+#[test]
+fn build_audit_only_pr_title_recognizes_unit_count_form() {
+    let subjects = vec![
+        "audit: security_bug proposals (1 unit(s))".to_string(),
+        "audit: missing_tests proposals (2 change(s))".to_string(),
+    ];
+    // Both forms count toward the audit-only total (1 + 2 = 3) AND both are
+    // bucketed as audit (not "other"), so the title takes the audit-only
+    // shape rather than the mixed "across categories" fallback.
+    let title = build_audit_only_pr_title(&subjects);
+    assert_eq!(
+        title,
+        "audit-only: 3 proposal(s) from security_bug, missing_tests"
+    );
+    let body = build_audit_only_pr_body(&subjects);
+    assert!(
+        body.contains("- audit: security_bug proposals (1 unit(s))"),
+        "the unit(s) subject must be listed verbatim in the audit-only body: {body}"
     );
 }
 
@@ -294,8 +320,7 @@ async fn audit_only_iteration_pushes_and_opens_pr() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("security_bug".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "security_bug".to_string(), origin: None }]);
 
     // Serialize: tests sharing the github-api-base test hook must not
     // race on the process-wide static.
@@ -458,8 +483,7 @@ async fn audit_only_pr_suppressed_when_iteration_pending_marker_present() {
     let registry = crate::audits::AuditRegistry::with_audits(vec![
         Arc::new(probe) as Arc<dyn crate::audits::Audit>
     ]);
-    let mut queued = std::collections::HashSet::new();
-    queued.insert("security_bug".to_string());
+    let queued = std::sync::Mutex::new(vec![crate::polling_loop::QueuedAudit { audit_type: "security_bug".to_string(), origin: None }]);
 
     // Mockito: GET /pulls is the iteration's open-PR pre-check
     // (runs BEFORE the audit + commit-count gate, must return []

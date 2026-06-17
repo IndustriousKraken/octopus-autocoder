@@ -145,10 +145,10 @@ autocoder audit run --workspace /tmp/workspaces/github_com_acme_myrepo --audit s
 
 # Without the daemon: invoke the audit module directly against the workspace
 # and print findings to stdout. Useful for prompt-template iteration.
-autocoder audit run --workspace /path/to/checkout --audit architecture_brightline
+autocoder audit run --workspace /path/to/checkout --audit architecture_advisor
 ```
 
-**`--audit`** is the exact `audit_type` slug (e.g. `security_bug_audit`, `drift_audit`, `architecture_brightline`). The chatops verb does substring matching against the operator's argument; the CLI does NOT — typing `--audit sec` is rejected with an `unknown audit` error listing the registered names. This is a deliberate asymmetry: a CLI call may be running inside a script where a substring match that suddenly resolves differently after a registry change would be surprising.
+**`--audit`** is the exact `audit_type` slug (e.g. `security_bug_audit`, `drift_audit`, `architecture_advisor`). The chatops verb does substring matching against the operator's argument; the CLI does NOT — typing `--audit sec` is rejected with an `unknown audit` error listing the registered names. This is a deliberate asymmetry: a CLI call may be running inside a script where a substring match that suddenly resolves differently after a registry change would be surprising.
 
 **Daemon-present path.** The CLI probes for the control socket at `/tmp/autocoder/control/control.sock`. When the socket is reachable, the CLI sends a `queue_audit` action with the workspace path; the daemon resolves the workspace to a managed repo and appends the audit-type to that repo's `pending_audit_runs` queue. The CLI prints the daemon's ack (`✓ Queued <audit> for <url>. Will run on the next polling iteration (~Nm).`) and exits 0. When the workspace is NOT in the daemon's repo list, the CLI prints an error naming the workspace and the daemon's known repos and exits non-zero — the CLI does NOT fall back to standalone mode in that case, because the daemon owns the workspace's lifecycle when present and a standalone invocation would race the daemon.
 

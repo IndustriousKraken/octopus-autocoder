@@ -199,7 +199,7 @@ mod tests {
             thread_ts: thread_ts.to_string(),
             channel: "C_OPS".to_string(),
             repo_url: "git@github.com:owner/repo.git".to_string(),
-            audit_type: "architecture_brightline".to_string(),
+            audit_type: "architecture_advisor".to_string(),
             findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
             posted_at: Utc::now(),
             status: AuditThreadStatus::Open,

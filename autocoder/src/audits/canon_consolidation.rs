@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{ScopedGateChecker, SpecsWritingAuditParams, run_specs_writing_audit};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -227,6 +227,10 @@ impl Audit for CanonConsolidationAudit {
 
         // audit-model-selection: route to the configured model (if any).
         let model = super::audit_resolved_model(&self.settings);
+        // a02: the production gate checker reads the scoped `[in]`/`[canon]`
+        // verifier-gate contexts. Consolidation is spec-lane only, so only the
+        // spec-lane `[in]`/`[canon]` checks can fire (and only when enabled).
+        let gate_checker = ScopedGateChecker;
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -242,6 +246,11 @@ impl Audit for CanonConsolidationAudit {
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: true,
                 model: model.as_ref(),
+                // a01: consolidation is spec-lane by definition — it evolves
+                // canon — so it stays OpenSpecOnly with no issue-lane choice.
+                planning_lanes: false,
+                issues_lane_enabled: false,
+                gate_checker: &gate_checker,
             },
             ctx,
         )
@@ -625,7 +634,11 @@ mod tests {
     async fn run_logs_best_effort_when_rag_off() {
         let (_t, ws) = init_workspace();
         // Agent finds nothing → no change dir created.
-        let _script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let _script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the canon for redundant requirements; found nothing to consolidate.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
@@ -714,7 +727,11 @@ mod tests {
     #[tokio::test]
     async fn empty_result_is_silent_no_commit() {
         let (_t, ws) = init_workspace();
-        let _script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let _script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the canon for redundant requirements; found nothing to consolidate.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
         let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
         let settings_dir = TempDir::new().unwrap();

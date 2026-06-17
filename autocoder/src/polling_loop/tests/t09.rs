@@ -447,7 +447,7 @@ async fn self_heal_archives_when_preconditions_met() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("self-heal pass succeeds");
@@ -531,7 +531,7 @@ async fn self_heal_falls_through_to_failed_when_tasks_incomplete() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass returns Failed via fall-through, not Err");

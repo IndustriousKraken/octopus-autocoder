@@ -4,8 +4,7 @@
 
 use crate::audits::{
     AuditRegistry,
-    architecture_consultative::ArchitectureConsultativeAudit,
-    brightline::ArchitectureBrightlineAudit,
+    architecture_advisor::ArchitectureAdvisorAudit,
     canon_consolidation::CanonConsolidationAudit,
     canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
@@ -714,9 +713,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     }
 
     // Build the audit registry once at startup. Operators wire the
-    // architecture-brightline audit by listing its slug under
+    // architecture-advisor audit by listing its slug under
     // `audits.defaults` (and optionally setting `extra` knobs under
-    // `audits.settings.architecture_brightline`); the cadence resolver
+    // `audits.settings.architecture_advisor`); the cadence resolver
     // returns `Disabled` for absent entries so the registry can stay
     // populated without forcing any audit to run.
     let audit_settings: HashMap<String, AuditSettings> = cfg
@@ -725,17 +724,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         .map(|a| a.settings.clone())
         .unwrap_or_default();
     let mut registry = AuditRegistry::new();
-    registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
+    registry.register(Arc::new(ArchitectureAdvisorAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
     registry.register(Arc::new(MissingTestsAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
     registry.register(Arc::new(SecurityBugAudit::new(
-        &audit_settings,
-        &cfg.executor,
-    )));
-    registry.register(Arc::new(ArchitectureConsultativeAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
@@ -816,6 +814,27 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
     });
+
+    // Startup orphan reconciliation for the durable on-demand audit-run
+    // queue (persist-on-demand-audit-queue): drop any persisted
+    // `pending-audit-runs/<basename>.json` whose workspace is no longer in
+    // the configured set, so a removed repo's stale queue never resurrects
+    // work. Matches the other startup marker sweeps above; best-effort. A
+    // repo that IS configured keeps its file so the per-repo spawn below
+    // loads it.
+    {
+        let configured_basenames: std::collections::HashSet<String> = cfg
+            .repositories
+            .iter()
+            .map(|r| {
+                polling_loop::pending_audit_runs_basename(&workspace::resolve_path(
+                    &daemon_paths,
+                    r,
+                ))
+            })
+            .collect();
+        polling_loop::reconcile_pending_audit_runs(&daemon_paths, &configured_basenames);
+    }
 
     for repo in cfg.repositories.iter().cloned() {
         if skip_fork_urls.contains(&repo.url) {
@@ -1150,6 +1169,19 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         if !repo_passes_startup_check(&deps.paths, &repo, &github_snap) {
             return SpawnOutcome::StartupCheckFailed;
         }
+        // Restore any durably-persisted on-demand audit-run queue for this
+        // repo so a restart between an operator's enqueue acknowledgement
+        // and the audit's run does not lose the request
+        // (persist-on-demand-audit-queue). Best-effort: a missing or corrupt
+        // file degrades to an empty queue. Resolve the basename the same way
+        // `save_pending_audit_runs` does (via the shared
+        // `pending_audit_runs_basename` helper) so load and save agree.
+        let initial_pending_audit_runs = {
+            let workspace_for_load = workspace::resolve_path(&deps.paths, &repo);
+            let basename =
+                crate::polling_loop::pending_audit_runs_basename(&workspace_for_load);
+            crate::polling_loop::load_pending_audit_runs(&deps.paths, &basename)
+        };
         let child_cancel = deps.global_cancel.child_token();
         let config_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
@@ -1184,8 +1216,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let pending_triages: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_triages_for_task = pending_triages.clone();
-        let pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending_audit_runs: Arc<std::sync::Mutex<Vec<crate::polling_loop::QueuedAudit>>> =
+            Arc::new(std::sync::Mutex::new(initial_pending_audit_runs));
         let pending_audit_runs_for_task = pending_audit_runs.clone();
         let pending_proposal_requests: Arc<
             std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,
@@ -1233,6 +1265,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let pending_brownfield_batch_requests_for_task =
             pending_brownfield_batch_requests.clone();
+        // a03: the spec-revision advisor + executor request queues, bundled.
+        let pending_revision_requests =
+            crate::control_socket::RevisionRequestQueues::new();
+        let pending_revision_requests_for_task = pending_revision_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -1273,6 +1309,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_sync_upstream_requests_for_task,
                 pending_brownfield_survey_requests_for_task,
                 pending_brownfield_batch_requests_for_task,
+                pending_revision_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -1339,6 +1376,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_sync_upstream_requests,
                     pending_brownfield_survey_requests,
                     pending_brownfield_batch_requests,
+                    pending_revision_requests,
                     iteration_cancel,
                     iteration_drained,
                 },

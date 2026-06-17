@@ -14,44 +14,38 @@ indirection without reducing complexity — the test is **cohesion, not the
 line count**. A large file that does exactly one thing is fine; a smaller
 file that mixes three unrelated concerns is not.
 
-### When it becomes a defect
+### When it becomes a concern
 
-Past the **brightline thresholds** — file `800` lines, function `200` lines,
-both operator-configurable — a file or function is treated as a **structural
-defect to address**, and the concern **escalates the further over it goes**.
-The `architecture-brightline` audit grades the overage:
+When a file or function grows well past the budget AND mixes unrelated
+responsibilities, treat it as a refactor worth doing — and the concern grows
+the further over it goes and the more concerns it mixes. The test is always
+cohesion, not the raw line count: a long file that does one thing is fine; a
+shorter file that mixes three unrelated concerns is the one to split.
 
-| Size vs. threshold | Severity |
-| ------------------ | -------- |
-| `1×` – `<1.5×`     | low      |
-| `1.5×` – `<2.5×`   | medium   |
-| `≥ 2.5×`           | high     |
+**Duplicated logic is likewise a concern.** Near-identical function bodies, or
+one intent reimplemented across files, are worth collapsing — in an LLM-grown
+codebase the bloat is *reachable* (it passes a dead-code linter), so prefer one
+parameterized helper over a family of copy-paste clones. Because duplication
+spans the whole tree rather than one file, surfacing it is a corpus-level
+concern, not the per-file advisor's.
 
-**Duplicated logic is likewise a defect.** Near-identical function bodies, or
-the same signature repeated across files, are flagged — because in an
-LLM-grown codebase the bloat is *reachable* (it passes a dead-code linter) and
-only a size/duplication signal catches it. Prefer one parameterized helper
-over a family of copy-paste clones.
+### Surfacing is advisory, never a gate
 
-### Enforcement is advisory, never a gate
+Size and structure are surfaced in two places, neither of which blocks:
 
-Size and duplication are surfaced in three places, none of which block:
+- **`architecture_advisor` audit** — samples the longest files over a
+  configurable pain threshold and, by cohesion judgment, recommends refactoring
+  the worst offenders (a ranked, anchored list — the line count is a selector,
+  never a finding). Acting on a recommendation via `@<bot> send it` drafts a
+  behavior-preserving **issue** by default.
+- **Code review** — adds an advisory note when a pass enlarges an over-budget
+  file or function (it does not penalize a pass that shrinks one).
 
-- **`architecture-brightline` audit** — grades file/function length and
-  duplication mechanically (graduated severity above).
-- **`architecture-consultative` audit** — reasons about cohesion (not raw
-  lines) and raises the worst over-sized, least-cohesive code as a "should
-  this split, and along what seams?" question.
-- **Code review** — adds an advisory note when a pass enlarges an
-  over-budget file or function (it does not penalize a pass that shrinks
-  one).
-
-A size or duplication finding **never, on its own, blocks a pull request or a
-change from archiving**. It is a maintainability signal that informs
-prioritization, not a correctness gate. When you legitimately exceed a
-threshold for a cohesive reason, record an intentional duplicate in
-`.brightline-ignore` (for duplicate signatures/bodies) or simply leave the
-cohesive file as-is — the audits surface it, the operator decides.
+A size finding **never, on its own, blocks a pull request or a change from
+archiving**. It is a maintainability signal that informs prioritization, not a
+correctness gate. The size budget has a single advisory home (this section);
+audits and triage do NOT mint a new requirement that restates the threshold —
+a behavior-preserving refactor is an issue, not a spec encoding a metric.
 
 ## Control-plane gatekeepers fail closed
 

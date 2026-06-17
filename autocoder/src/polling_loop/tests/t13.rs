@@ -31,7 +31,7 @@ async fn multi_change_pass_clean_after_each() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -207,6 +207,7 @@ async fn run_exits_during_startup_jitter() {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            crate::control_socket::RevisionRequestQueues::new(),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             task_cancel,

@@ -1,10 +1,12 @@
 use super::*;
 
-/// a43: discard every working-tree change OUTSIDE the OpenSpec change
-/// root (`openspec/changes/`), reverting each non-spec path to its
-/// committed (HEAD) state so the spec-PR commit is genuinely spec-only.
-/// Returns the sorted, de-duplicated list of discarded paths so the caller
-/// can log them AND surface them to chatops.
+/// a43 / architecture-advisory-redesign: discard every working-tree change
+/// OUTSIDE the two planning lanes — the spec lane (`openspec/changes/`) AND
+/// the issues lane (`openspec/issues/`, the path the issues walker reads via
+/// [`crate::lanes::issues::ISSUES_SUBDIR`]) — reverting each out-of-scope
+/// path to its committed (HEAD) state so the triage PR's commit is genuinely
+/// lane-only. Returns the sorted, de-duplicated list of discarded paths so
+/// the caller can log them AND surface them to chatops.
 ///
 /// Revert strategy per non-spec path, chosen by where the path lives:
 ///   - **Untracked addition** (`??`): removed from disk — it has no HEAD
@@ -24,19 +26,25 @@ use super::*;
 ///     versions, which would abort the whole triage flow exactly when the
 ///     executor `git add`ed a new code file — the common case.
 ///
-/// Triage executor runs are spec-only under a43: any code-path write the
+/// Triage executor runs are planning-lane-only: any code-path write the
 /// agent made despite the prompt restriction is dropped here BEFORE the
-/// spec-PR commit so the PR diff is genuinely spec-only. Spec content is
-/// kept regardless of the executor's chosen slug — the keep boundary is
-/// the change root rather than a single `openspec/changes/<slug>/` path,
-/// because the executor picks its own (LLM-chosen) slug AND a single
-/// triage may produce several change directories. `spec_slug` is the
-/// handler's derived slug, threaded for diagnostic logging. A clean
-/// working tree (and a spec-only diff) both return an empty list with no
+/// triage-PR commit so the PR diff carries only planning-lane content. Both
+/// lanes' content is kept regardless of the executor's chosen slug — the
+/// keep boundary is each lane's root rather than a single
+/// `<lane>/<slug>/` path, because the executor picks its own (LLM-chosen)
+/// slug AND a single triage may produce several directories. `spec_slug` is
+/// the handler's derived slug, threaded for diagnostic logging. A clean
+/// working tree (and a lane-only diff) both return an empty list with no
 /// side effects.
 pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<String>> {
-    const KEEP_PREFIX: &str = "openspec/changes/";
-    tracing::debug!(spec_slug = %spec_slug, "discard_non_spec_writes: keeping openspec/changes/ content");
+    const SPEC_PREFIX: &str = "openspec/changes/";
+    // The issues lane the issues walker reads (today `openspec/issues/`).
+    let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
+    let keep = |path: &str| path.starts_with(SPEC_PREFIX) || path.starts_with(&issues_prefix);
+    tracing::debug!(
+        spec_slug = %spec_slug,
+        "discard_non_spec_writes: keeping openspec/changes/ AND issues-lane content"
+    );
     let mut discarded: Vec<String> = Vec::new();
     // `status_entries` yields one record per change with the rename/copy
     // source in `orig_path`; flatten back to `(is_untracked, path)` pairs
@@ -51,7 +59,7 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
             std::iter::once((is_untracked, e.path)).chain(e.orig_path.map(|o| (false, o)))
         })
     {
-        if path.starts_with(KEEP_PREFIX) {
+        if keep(&path) {
             continue;
         }
         if is_untracked {

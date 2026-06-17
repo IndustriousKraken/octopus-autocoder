@@ -533,6 +533,181 @@ async fn run_agentic_canon_contradiction_check_with_runner(
     }
 }
 
+/// Embedded prompt for the authoring-time issue contract-change check (a02).
+/// Frames the same judgment the implement-time issue kick-back applies
+/// (`prompts/implementer-issue.md`: "if the fix needs a behavior change it
+/// belongs in the changes lane"), so authoring-time AND implement-time judge an
+/// issue's hidden-contract-change question by the same criteria.
+pub const ISSUE_CONTRACT_CHANGE_EMBEDDED_PROMPT: &str =
+    include_str!("../../../prompts/issue-contract-change-check.md");
+
+/// Run the authoring-time issue contract-change check for `issue_slug` (a02).
+///
+/// An issue carries NO spec delta, so the delta-reading `[canon]` gate does not
+/// apply to it directly. This check instead reads the issue's `issue.md` AND
+/// the canonical specs AND judges whether implementing the issue would require
+/// changing a canonical contract — the SAME judgment the implement-time issue
+/// kick-back applies ("Issue-flavored implementer prompt verifies against
+/// existing canon"), pulled forward to authoring time so a unit that smuggles a
+/// contract change is re-routed to the spec lane BEFORE it is committed.
+///
+/// It reuses the `[canon]` gate's context (model / command / retries) AND its
+/// `submit_canon_contradictions` MCP tool: an EMPTY submission means "no
+/// contract change required" (an honest issue → `Clean`); a non-empty
+/// submission names the canonical requirement(s) the fix would force a change
+/// to (`Found` → re-route to the spec lane). Mirrors
+/// [`run_agentic_canon_contradiction_check`]'s fail-closed posture — any
+/// could-not-run path is `Errored` (the unit is held), never `Clean`.
+pub async fn run_agentic_issue_contract_change_check(
+    ctx: &CanonContradictionCheckCtx,
+    workspace_root: &Path,
+    issue_slug: &str,
+) -> CanonContradictionCheckOutcome {
+    // Test seam: an injected submission stands in for the CLI + control socket.
+    #[cfg(test)]
+    if let Some(injected) = &ctx.test_submission {
+        let runner = CannedCanonContradictionRunner {
+            submission: injected.clone(),
+        };
+        return run_agentic_issue_contract_change_check_with_runner(
+            ctx,
+            workspace_root,
+            issue_slug,
+            &runner,
+        )
+        .await;
+    }
+
+    let strategy = match crate::agentic_run::strategy_for_provider(
+        ctx.model.provider,
+        ctx.command.clone(),
+        Vec::new(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let label = VerifierGate::Canon.label();
+            let cause = format!("CLI strategy unavailable: {e:#}");
+            tracing::warn!(
+                issue = %issue_slug,
+                "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
+            );
+            return CanonContradictionCheckOutcome::Errored { cause };
+        }
+    };
+    let runner = CliCanonContradictionSessionRunner {
+        workspace: workspace_root,
+        strategy: strategy.as_ref(),
+        model: &ctx.model,
+        settings_dir: None,
+        timeout: AGENTIC_CANON_CONTRADICTION_TIMEOUT,
+    };
+    run_agentic_issue_contract_change_check_with_runner(ctx, workspace_root, issue_slug, &runner)
+        .await
+}
+
+/// Orchestration shared by production AND tests for the issue contract-change
+/// check. Builds the issue-flavored prompt, runs one session via `runner`, AND
+/// applies the SAME fail-closed policy as the `[canon]` gate.
+async fn run_agentic_issue_contract_change_check_with_runner(
+    ctx: &CanonContradictionCheckCtx,
+    workspace_root: &Path,
+    issue_slug: &str,
+    runner: &dyn CanonContradictionSessionRunner,
+) -> CanonContradictionCheckOutcome {
+    let prompt = build_issue_contract_change_prompt(workspace_root, issue_slug);
+    let label = VerifierGate::Canon.label();
+    let session = crate::verifier_gate::run_session_with_retry(
+        VerifierGate::Canon,
+        issue_slug,
+        ctx.retries,
+        || runner.run_session(&prompt),
+    )
+    .await;
+    match session {
+        Err(e) => {
+            let cause = format!("session failed: {e:#}");
+            tracing::warn!(
+                issue = %issue_slug,
+                "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
+            );
+            CanonContradictionCheckOutcome::Errored { cause }
+        }
+        Ok(outcome) => match outcome.submission {
+            None => {
+                let cause = format!(
+                    "session ended with no submit_canon_contradictions submission (excerpt: {})",
+                    outcome.stdout_excerpt
+                );
+                tracing::warn!(
+                    issue = %issue_slug,
+                    "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
+                );
+                CanonContradictionCheckOutcome::Errored { cause }
+            }
+            Some(payload) => match payload_to_canon_contradictions(&payload) {
+                Ok(findings) if findings.is_empty() => CanonContradictionCheckOutcome::Clean,
+                Ok(findings) => CanonContradictionCheckOutcome::Found(findings),
+                Err(e) => {
+                    let cause = format!("submission failed re-validation: {e}");
+                    tracing::warn!(
+                        issue = %issue_slug,
+                        "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
+                    );
+                    CanonContradictionCheckOutcome::Errored { cause }
+                }
+            },
+        },
+    }
+}
+
+/// Build the issue contract-change session prompt: the embedded issue-flavored
+/// framing, the issue's `issue.md` PATH (read on demand), the canonical-spec
+/// file PATHS, AND the `submit_canon_contradictions` instruction. The issue
+/// path binds to [`crate::lanes::issues::ISSUES_SUBDIR`] so it tracks the lane
+/// the issues walker actually reads.
+fn build_issue_contract_change_prompt(workspace_root: &Path, issue_slug: &str) -> String {
+    let issue_path = format!(
+        "{}/{issue_slug}/issue.md",
+        crate::lanes::issues::ISSUES_SUBDIR
+    );
+    let canon_paths = canonical_spec_paths(workspace_root);
+    let mut out = String::new();
+    out.push_str(ISSUE_CONTRACT_CHANGE_EMBEDDED_PROMPT.trim_end());
+    out.push_str(PROMPT_DELIMITER);
+
+    out.push_str("# This issue's report\n\n");
+    out.push_str(&format!(
+        "Read this file with the `Read` tool — it is the issue's report, diagnosis, AND \
+         acceptance criteria (stated against the EXISTING specification):\n\n- {issue_path}\n"
+    ));
+
+    out.push_str("\n# The project's canonical specs\n\n");
+    if canon_paths.is_empty() {
+        out.push_str(
+            "(the project has no canonical specs under openspec/specs/<capability>/spec.md — \
+             there is no contract for this issue to change)\n",
+        );
+    } else {
+        out.push_str(
+            "Read the canonical specs that cover the behavior the issue touches (via `Read`, \
+             or via `query_canonical_specs` when that tool is available), then judge whether \
+             implementing the issue would require changing any of them:\n\n",
+        );
+        for p in &canon_paths {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+
+    out.push_str(
+        "\nWhen your analysis is complete, call the `submit_canon_contradictions` MCP tool \
+         exactly once with `{ contradictions: [{ change_requirement, canonical_capability, \
+         canonical_requirement, summary }] }`. Pass an EMPTY array when the issue is honest \
+         (no contract change required) — the common case. Do NOT print the result to stdout — \
+         the daemon reads it ONLY from `submit_canon_contradictions`.\n",
+    );
+    out
+}
+
 /// Build the session prompt: the resolved template body, the change's
 /// spec-delta file PATHS, the canonical-spec file PATHS (the agent reads them
 /// on demand via `Read` — contents are NOT inlined), AND the
@@ -1024,6 +1199,115 @@ mod tests {
             matches!(out, CanonContradictionCheckOutcome::Errored { .. }),
             "unregistered strategy must fail CLOSED (held): {out:?}"
         );
+    }
+
+    // ---- issue contract-change check (a02) ----
+
+    fn write_issue(workspace: &Path, slug: &str, body: &str) {
+        write(
+            &workspace
+                .join(crate::lanes::issues::ISSUES_SUBDIR)
+                .join(slug)
+                .join("issue.md"),
+            body,
+        );
+    }
+
+    /// An honest issue (no contract change) → empty submission → `Clean`.
+    #[tokio::test]
+    async fn issue_check_empty_submission_is_clean() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_issue(ws, "fix-drift", "## Report\nReturns the wrong value.\n");
+        let ctx = test_ctx();
+        let runner = CannedCanonContradictionRunner {
+            submission: Some(serde_json::json!({ "contradictions": [] })),
+        };
+        let out =
+            run_agentic_issue_contract_change_check_with_runner(&ctx, ws, "fix-drift", &runner)
+                .await;
+        assert!(
+            matches!(out, CanonContradictionCheckOutcome::Clean),
+            "an honest issue's empty submission is clean: {out:?}"
+        );
+    }
+
+    /// An issue that would require a contract change → non-empty submission →
+    /// `Found` (the harness re-routes it to the spec lane).
+    #[tokio::test]
+    async fn issue_check_contract_change_is_found() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_issue(ws, "fix-retry", "## Report\nWants 5 retries.\n");
+        let ctx = test_ctx();
+        let runner = CannedCanonContradictionRunner {
+            submission: Some(serde_json::json!({
+                "contradictions": [
+                    {
+                        "change_requirement": "retry 5 times",
+                        "canonical_capability": "executor",
+                        "canonical_requirement": "Retries are capped at 3",
+                        "summary": "the fix cannot be implemented without changing the cap"
+                    }
+                ]
+            })),
+        };
+        let out =
+            run_agentic_issue_contract_change_check_with_runner(&ctx, ws, "fix-retry", &runner)
+                .await;
+        match out {
+            CanonContradictionCheckOutcome::Found(f) => {
+                assert_eq!(f.len(), 1);
+                assert_eq!(f[0].canonical_requirement, "Retries are capped at 3");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    /// A session that records NO submission FAILS CLOSED (held), exactly like
+    /// the `[canon]` gate.
+    #[tokio::test]
+    async fn issue_check_no_submission_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = CannedCanonContradictionRunner { submission: None };
+        let out =
+            run_agentic_issue_contract_change_check_with_runner(&ctx, ws, "fix-x", &runner).await;
+        assert!(
+            matches!(out, CanonContradictionCheckOutcome::Errored { .. }),
+            "no submission must fail CLOSED (held): {out:?}"
+        );
+    }
+
+    /// The issue prompt lists the issue's `issue.md` path (bound to
+    /// `ISSUES_SUBDIR`), the canonical-spec paths, AND the submit instruction;
+    /// it does NOT inline file contents.
+    #[tokio::test]
+    async fn issue_contract_change_prompt_lists_issue_and_canon_paths() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_issue(ws, "fix-thing", "## Report\nbody.\n");
+        write_canonical_spec(
+            ws,
+            "executor",
+            "## Requirements\n\n### Requirement: Runs changes\nBody.\n",
+        );
+        let prompt = build_issue_contract_change_prompt(ws, "fix-thing");
+        assert!(
+            prompt.contains(&format!(
+                "{}/fix-thing/issue.md",
+                crate::lanes::issues::ISSUES_SUBDIR
+            )),
+            "prompt must name the issue's issue.md path: {prompt}"
+        );
+        assert!(prompt.contains("openspec/specs/executor/spec.md"));
+        assert!(
+            prompt.contains("submit_canon_contradictions"),
+            "prompt must instruct the submit tool"
+        );
+        // Contents are read on demand, not inlined.
+        assert!(!prompt.contains("Runs changes\nBody"));
     }
 
     // ---- prompt construction ----

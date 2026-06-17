@@ -75,7 +75,7 @@ async fn archive_collision_excludes_change_and_alerts() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("iteration should complete Ok with the change excluded");
@@ -177,7 +177,7 @@ async fn archive_collision_does_not_block_other_changes() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("iteration should succeed");
@@ -250,7 +250,7 @@ async fn archive_collision_two_iterations_throttle_alert_and_zero_executor_invoc
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(Vec::new()),
         )
         .await
         .expect("iteration succeeds");
@@ -338,7 +338,7 @@ async fn post_executor_archive_failure_increments_counter() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
 
@@ -419,7 +419,7 @@ async fn iteration_level_failure_does_not_increment_per_change_counter() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(

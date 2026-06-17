@@ -69,7 +69,7 @@ async fn dirty_workspace_recovery_failure_still_alerts() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(result.is_err(), "recovery failure must surface as Err");
@@ -230,7 +230,7 @@ async fn dirty_workspace_recovers_without_chatops() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     assert!(result.is_ok(), "iteration should succeed: {result:?}");
@@ -543,4 +543,160 @@ async fn end_of_rebuild_success_with_drift_posts_pr_url_message() {
     )
     .await;
     mock.assert_async().await;
+}
+
+// ---- a03: contradiction alerts are tracked revision threads (task 5.1) ----
+
+/// A threading-capable fake backend: `post_notification_with_thread` returns a
+/// canned `thread_ts` so the contradiction poster can stamp a
+/// `RevisionThreadState`. All other trait methods are minimal/unreachable.
+struct TrackingThreadBackend {
+    thread_ts: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::chatops::ChatOpsBackend for TrackingThreadBackend {
+    fn provider_name(&self) -> &'static str {
+        "tracking-fake"
+    }
+    fn is_experimental(&self) -> bool {
+        true
+    }
+    async fn post_question(&self, _: &str, _: &str, _: &str) -> Result<String> {
+        unreachable!()
+    }
+    async fn poll_thread_for_human_reply(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::chatops::HumanReply>> {
+        Ok(None)
+    }
+    async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn post_notification_with_thread(
+        &self,
+        _channel: &str,
+        _top_line: &str,
+        _thread_body: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.thread_ts.clone())
+    }
+}
+
+fn tracking_ctx(thread_ts: Option<&str>) -> (Arc<TrackingThreadBackend>, ChatOpsContext) {
+    let backend = Arc::new(TrackingThreadBackend {
+        thread_ts: thread_ts.map(|s| s.to_string()),
+    });
+    let ctx = ChatOpsContext {
+        chatops: backend.clone(),
+        channel: "C_REV".to_string(),
+        start_work_enabled: true,
+        failure_alerts_enabled: true,
+        pr_opened_enabled: true,
+    };
+    (backend, ctx)
+}
+
+#[tokio::test]
+async fn contradiction_alert_records_revision_thread_state() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (_backend, ctx) = tracking_ctx(Some("1748.revthread"));
+
+    let findings = vec![crate::preflight::change_contradiction::ContradictionFinding {
+        requirement_a: "A".into(),
+        requirement_b: "B".into(),
+        summary: "A and B cannot both hold".into(),
+    }];
+    maybe_post_contradiction_findings_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "a03-demo-change",
+        &findings,
+        "align the change to canon",
+        None,
+    )
+    .await;
+
+    // A RevisionThreadState is recorded under the daemon state_dir, keyed by
+    // the alert's thread_ts, carrying channel/repo/slug.
+    let state = crate::revision_thread::read_state(&paths.state, "1748.revthread")
+        .unwrap()
+        .expect("a contradiction alert must record a RevisionThreadState");
+    assert_eq!(state.channel, "C_REV");
+    assert_eq!(state.repo_url, repo.url);
+    assert_eq!(state.change_slug, "a03-demo-change");
+    assert_eq!(
+        state.status,
+        crate::revision_thread::RevisionThreadStatus::Open
+    );
+}
+
+#[tokio::test]
+async fn degraded_contradiction_alert_records_no_revision_thread_state() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    // Backend returns no thread_ts (no native threading) → not reply-matchable.
+    let (_backend, ctx) = tracking_ctx(None);
+
+    let findings = vec![crate::preflight::change_contradiction::ContradictionFinding {
+        requirement_a: "A".into(),
+        requirement_b: "B".into(),
+        summary: "x".into(),
+    }];
+    maybe_post_contradiction_findings_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "a03-degraded",
+        &findings,
+        "suggestion",
+        None,
+    )
+    .await;
+
+    let dir = crate::revision_thread::state_dir(&paths.state);
+    let count = std::fs::read_dir(&dir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(count, 0, "a degraded post records no RevisionThreadState");
+}
+
+#[tokio::test]
+async fn unimplementable_tasks_alert_records_no_revision_thread_state() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (_backend, ctx) = tracking_ctx(Some("1748.unimpl"));
+
+    let tasks = vec![crate::executor::UnimplementableTask {
+        task_id: "6.4".into(),
+        task_text: "ssh into prod".into(),
+        reason: "no prod access".into(),
+    }];
+    // The executor's unimplementable-tasks marker keeps its operator-authored
+    // flow: its alert is NOT tracked as a revision thread.
+    maybe_post_spec_revision_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "a03-unimpl",
+        &tasks,
+        "drop task 6.4",
+    )
+    .await;
+
+    let dir = crate::revision_thread::state_dir(&paths.state);
+    let count = std::fs::read_dir(&dir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "an unimplementable-tasks alert must not record a RevisionThreadState"
+    );
 }

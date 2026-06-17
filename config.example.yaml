@@ -35,7 +35,7 @@ repositories:
     # global `audits.defaults` cadence for this repo only. Cadence values:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
-    #   architecture_brightline: weekly
+    #   architecture_advisor: weekly
     #
     # a006 per-repo OS-sandbox credential toggles (override executor.sandbox;
     # both default ON). A repo that develops CLI wrappers needs `os_hide` off
@@ -778,12 +778,13 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Eight audits ship today:
-#   - architecture_brightline    — flags files exceeding a line-count threshold
+# daemon between regular polling iterations. Seven audits ship today:
+#   - architecture_advisor       — selects the longest files over a pain
+#                                  threshold and returns ranked, anchored
+#                                  refactor recommendations (no metric findings)
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
 #   - security_bug_audit         — LLM scan for security smells
-#   - architecture_consultative  — LLM architectural-health review
 #   - documentation_audit        — LLM docs coverage / stale-reference / organization check
 #   - canon_contradiction_audit  — LLM scan for two canonical requirements that cannot both hold
 #   - canon_consolidation_audit  — LLM scan for redundant canonical requirements; drafts a consolidate- change
@@ -799,11 +800,10 @@ github:
 # audits:
 #   # Global default cadence per audit type. Omitted entries → `Disabled`.
 #   defaults:
-#     architecture_brightline: weekly
+#     architecture_advisor: weekly
 #     drift_audit: weekly
 #     missing_tests_audit: monthly
 #     security_bug_audit: weekly
-#     architecture_consultative: quarterly
 #     documentation_audit: monthly
 #     canon_contradiction_audit: monthly   # whole-canon scope → heavy default
 #     canon_consolidation_audit: monthly   # rewrites canon → heavy default
@@ -814,11 +814,12 @@ github:
 #   # default). `extra` is a free-form mapping each audit reads its own
 #   # thresholds out of — keys documented per audit below.
 #   settings:
-#     architecture_brightline:
-#       # prompt_path: /etc/autocoder/prompts/brightline.md
+#     architecture_advisor:
+#       # prompt_path: /etc/autocoder/prompts/architecture-advisor.md
 #       notify_on_clean: false
 #       extra:
-#         file_lines_threshold: 500   # WARN any file with > N lines
+#         selector_threshold: 500   # only examine files longer than N lines
+#         candidate_cap: 8          # examine at most the N longest candidates
 #     drift_audit:
 #       # prompt_path: /etc/autocoder/prompts/drift.md
 #       notify_on_clean: false
@@ -833,10 +834,6 @@ github:
 #       notify_on_clean: false
 #       extra:
 #         max_proposals_per_run: 3
-#     architecture_consultative:
-#       # prompt_path: /etc/autocoder/prompts/arch-consult.md
-#       notify_on_clean: false
-#       extra: {}
 #     documentation_audit:
 #       # prompt_path: /etc/autocoder/prompts/documentation-audit.md
 #       notify_on_clean: false

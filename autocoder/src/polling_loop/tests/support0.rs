@@ -87,6 +87,20 @@ pub(crate) fn write_fake_spec(ws: &Path, slug: &str) {
     std::fs::write(dir.join("tasks.md"), "- [ ] do the thing\n").unwrap();
 }
 
+/// Write a fake issue dir under the issues lane (mimics the executor's
+/// issue write for a behavior-preserving refactor triage — `issue.md` +
+/// `tasks.md`, NO `specs/` directory).
+pub(crate) fn write_fake_issue(ws: &Path, slug: &str) {
+    let dir = ws.join(crate::lanes::issues::ISSUES_SUBDIR).join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("issue.md"),
+        "# Refactor\nDecompose the oversized file into cohesive modules.\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("tasks.md"), "- [ ] split the file\n").unwrap();
+}
+
 /// Build a fixture remote repo with one commit on `main` AND a cloned
 /// workspace whose `origin` points to the remote. Returns the temp dir
 /// guard (drop = cleanup) plus the workspace path.
@@ -296,7 +310,7 @@ pub(crate) async fn run_one_pass_no_push(
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await?;
     Ok(processed)
@@ -473,7 +487,7 @@ pub(crate) async fn run_one_pass_with_threshold(
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await?;
     Ok(processed)

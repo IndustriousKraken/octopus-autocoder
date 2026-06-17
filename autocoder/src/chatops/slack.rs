@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
-use super::{ChatOpsBackend, HumanReply, urlencode};
+use super::{ChatOpsBackend, HumanReply, ThreadMessage, urlencode};
 use crate::chatops::event_dedup::{CheckResult, DedupKey, EventDedupCache};
 use crate::chatops::operator_commands::{
     OperatorCommandDispatcher, RepoIdentityProvider, Reply,
@@ -415,6 +415,58 @@ impl ChatOpsBackend for SlackBackend {
             ));
         }
         Ok(())
+    }
+
+    async fn fetch_thread_transcript(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+    ) -> Result<Vec<ThreadMessage>> {
+        // `conversations.replies` returns the whole thread oldest-first
+        // (the parent first, then each reply in order). Unlike
+        // `poll_thread_for_human_reply`, we keep EVERY message — including
+        // the bot's own — so the advisor sees both sides of the discussion.
+        let url = format!(
+            "{}/conversations.replies?channel={}&ts={}",
+            self.api_base.trim_end_matches('/'),
+            urlencode(channel),
+            urlencode(thread_ts),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .send()
+            .await
+            .map_err(|e| anyhow!("slack transcript request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("slack transcript http {status}"));
+        }
+        let parsed: ConversationsRepliesResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("slack transcript decode failed: {e}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "slack transcript failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Ok(parsed
+            .messages
+            .into_iter()
+            .map(|m| {
+                let from_bot =
+                    m.bot_id.is_some() || m.user.as_deref() == Some(&self.bot_user_id);
+                ThreadMessage {
+                    from_bot,
+                    user_id: m.user.unwrap_or_default(),
+                    text: m.text.unwrap_or_default(),
+                    ts: m.ts.unwrap_or_default(),
+                }
+            })
+            .collect())
     }
 
     async fn post_message_capturing_ts(
@@ -1589,7 +1641,7 @@ mod tests {
         let top_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"channel":"C0FOO","text":"📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)"}"#
+                r#"{"channel":"C0FOO","text":"🏛 architecture_advisor on r: 1 refactor recommendation(s)"}"#
                     .to_string(),
             ))
             .with_status(200)
@@ -1603,7 +1655,7 @@ mod tests {
         let reply_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"channel":"C0FOO","text":"file foo.rs is 1234 lines","thread_ts":"9999.5555"}"#
+                r#"{"channel":"C0FOO","text":"split src/foo.rs into cohesive modules","thread_ts":"9999.5555"}"#
                     .to_string(),
             ))
             .with_status(200)
@@ -1615,8 +1667,8 @@ mod tests {
         let outcome = backend
             .post_notification_with_thread(
                 "C0FOO",
-                "📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)",
-                "file foo.rs is 1234 lines",
+                "🏛 architecture_advisor on r: 1 refactor recommendation(s)",
+                "split src/foo.rs into cohesive modules",
             )
             .await
             .expect("happy path returns Ok");
@@ -1630,6 +1682,55 @@ mod tests {
 
         top_mock.assert_async().await;
         reply_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_thread_transcript_returns_both_sides_oldest_first() {
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server).await;
+        // A thread: the bot's alert (user == bot), an operator reply, AND a
+        // bot reply (bot_id present). All three are returned, oldest-first,
+        // with `from_bot` set correctly.
+        let _mock = server
+            .mock("GET", mockito::Matcher::Regex("/conversations.replies.*".into()))
+            .with_status(200)
+            .with_body(
+                r#"{"ok":true,"messages":[
+                    {"user":"U_BOT","text":"alert body","ts":"1.0"},
+                    {"user":"U_OP","text":"align to canon?","ts":"1.1"},
+                    {"bot_id":"B1","text":"prior advisor answer","ts":"1.2"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+        let transcript = backend
+            .fetch_thread_transcript("C0FOO", "1.0")
+            .await
+            .expect("transcript fetch ok");
+        assert_eq!(transcript.len(), 3);
+        assert!(transcript[0].from_bot, "the bot's own alert is from_bot");
+        assert_eq!(transcript[0].text, "alert body");
+        assert!(!transcript[1].from_bot, "operator reply is not from_bot");
+        assert_eq!(transcript[1].text, "align to canon?");
+        assert!(transcript[2].from_bot, "a bot_id message is from_bot");
+        assert_eq!(transcript[2].text, "prior advisor answer");
+    }
+
+    #[tokio::test]
+    async fn fetch_thread_transcript_propagates_api_error() {
+        let mut server = mockito::Server::new_async().await;
+        let backend = fixture_backend(&mut server).await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Regex("/conversations.replies.*".into()))
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"thread_not_found"}"#)
+            .create_async()
+            .await;
+        let err = backend
+            .fetch_thread_transcript("C0FOO", "1.0")
+            .await
+            .expect_err("ok:false must error");
+        assert!(format!("{err:#}").contains("thread_not_found"), "{err:#}");
     }
 
     #[tokio::test]
@@ -1937,8 +2038,8 @@ mod tests {
             thread_ts: thread_ts.to_string(),
             channel: "C_OPS".to_string(),
             repo_url: "git@github.com:acme/myrepo.git".to_string(),
-            audit_type: "architecture_brightline".to_string(),
-            findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
+            audit_type: "architecture_advisor".to_string(),
+            findings_excerpt: "  • split src/foo.rs".to_string(),
             posted_at: chrono::Utc::now() - chrono::Duration::minutes(30),
             status: crate::audits::threads::AuditThreadStatus::Open,
             reason: None,

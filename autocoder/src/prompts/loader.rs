@@ -61,8 +61,8 @@ pub enum PromptId {
     /// `prompts/issue-report-triage.md` — read-only triage of a reported
     /// GitHub issue for the a010 hybrid issues-lane ingestion.
     IssueReportTriage,
-    /// `prompts/architecture-consultative.md` — consultative audit.
-    AuditArchitectureConsultative,
+    /// `prompts/architecture-advisor.md` — architecture advisory audit.
+    AuditArchitectureAdvisor,
     /// `prompts/drift-audit.md` — drift audit.
     AuditDrift,
     /// `prompts/missing-tests-audit.md` — missing-tests audit.
@@ -110,6 +110,15 @@ pub enum PromptId {
     /// loader by a future change.
     #[allow(dead_code)]
     CodeImplementsSpecCheck,
+    /// `prompts/issue-contract-change-check.md` — the authoring-time issue
+    /// contract-change check (a02): does implementing this issue require a
+    /// canonical contract change?
+    ///
+    /// Registered for registry-completeness only; the audit's issue-check call
+    /// site uses the embedded constant directly via
+    /// `crate::preflight::canon_contradiction::ISSUE_CONTRACT_CHANGE_EMBEDDED_PROMPT`.
+    #[allow(dead_code)]
+    IssueContractChangeCheck,
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
@@ -123,8 +132,8 @@ const PROMPT_CHAT_REQUEST_TRIAGE: &str =
     include_str!("../../../prompts/chat-request-triage.md");
 const PROMPT_ISSUE_REPORT_TRIAGE: &str =
     include_str!("../../../prompts/issue-report-triage.md");
-const PROMPT_ARCHITECTURE_CONSULTATIVE: &str =
-    include_str!("../../../prompts/architecture-consultative.md");
+const PROMPT_ARCHITECTURE_ADVISOR: &str =
+    include_str!("../../../prompts/architecture-advisor.md");
 const PROMPT_DRIFT_AUDIT: &str = include_str!("../../../prompts/drift-audit.md");
 const PROMPT_MISSING_TESTS_AUDIT: &str =
     include_str!("../../../prompts/missing-tests-audit.md");
@@ -145,6 +154,8 @@ const PROMPT_CHANGE_VS_CANONICAL_CHECK: &str =
     include_str!("../../../prompts/change-vs-canonical-check.md");
 const PROMPT_CODE_IMPLEMENTS_SPEC_CHECK: &str =
     include_str!("../../../prompts/code-implements-spec-check.md");
+const PROMPT_ISSUE_CONTRACT_CHANGE_CHECK: &str =
+    include_str!("../../../prompts/issue-contract-change-check.md");
 
 impl PromptId {
     /// Embedded default template content, loaded at compile time.
@@ -158,7 +169,7 @@ impl PromptId {
             Self::AuditTriage => PROMPT_AUDIT_TRIAGE,
             Self::ChatRequestTriage => PROMPT_CHAT_REQUEST_TRIAGE,
             Self::IssueReportTriage => PROMPT_ISSUE_REPORT_TRIAGE,
-            Self::AuditArchitectureConsultative => PROMPT_ARCHITECTURE_CONSULTATIVE,
+            Self::AuditArchitectureAdvisor => PROMPT_ARCHITECTURE_ADVISOR,
             Self::AuditDrift => PROMPT_DRIFT_AUDIT,
             Self::AuditMissingTests => PROMPT_MISSING_TESTS_AUDIT,
             Self::AuditSecurityBug => PROMPT_SECURITY_BUG_AUDIT,
@@ -171,6 +182,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
             Self::ChangeVsCanonicalCheck => PROMPT_CHANGE_VS_CANONICAL_CHECK,
             Self::CodeImplementsSpecCheck => PROMPT_CODE_IMPLEMENTS_SPEC_CHECK,
+            Self::IssueContractChangeCheck => PROMPT_ISSUE_CONTRACT_CHANGE_CHECK,
         }
     }
 
@@ -187,7 +199,7 @@ impl PromptId {
             Self::AuditTriage => "audit-triage.md",
             Self::ChatRequestTriage => "chat-request-triage.md",
             Self::IssueReportTriage => "issue-report-triage.md",
-            Self::AuditArchitectureConsultative => "architecture-consultative.md",
+            Self::AuditArchitectureAdvisor => "architecture-advisor.md",
             Self::AuditDrift => "drift-audit.md",
             Self::AuditMissingTests => "missing-tests-audit.md",
             Self::AuditSecurityBug => "security-bug-audit.md",
@@ -200,6 +212,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
             Self::ChangeVsCanonicalCheck => "change-vs-canonical-check.md",
             Self::CodeImplementsSpecCheck => "code-implements-spec-check.md",
+            Self::IssueContractChangeCheck => "issue-contract-change-check.md",
         }
     }
 
@@ -214,7 +227,7 @@ impl PromptId {
             Self::AuditTriage => "AuditTriage",
             Self::ChatRequestTriage => "ChatRequestTriage",
             Self::IssueReportTriage => "IssueReportTriage",
-            Self::AuditArchitectureConsultative => "AuditArchitectureConsultative",
+            Self::AuditArchitectureAdvisor => "AuditArchitectureAdvisor",
             Self::AuditDrift => "AuditDrift",
             Self::AuditMissingTests => "AuditMissingTests",
             Self::AuditSecurityBug => "AuditSecurityBug",
@@ -227,6 +240,7 @@ impl PromptId {
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
             Self::ChangeVsCanonicalCheck => "ChangeVsCanonicalCheck",
             Self::CodeImplementsSpecCheck => "CodeImplementsSpecCheck",
+            Self::IssueContractChangeCheck => "IssueContractChangeCheck",
         }
     }
 
@@ -242,7 +256,7 @@ impl PromptId {
             Self::AuditTriage,
             Self::ChatRequestTriage,
             Self::IssueReportTriage,
-            Self::AuditArchitectureConsultative,
+            Self::AuditArchitectureAdvisor,
             Self::AuditDrift,
             Self::AuditMissingTests,
             Self::AuditSecurityBug,
@@ -255,6 +269,7 @@ impl PromptId {
             Self::ChangeContradictionCheck,
             Self::ChangeVsCanonicalCheck,
             Self::CodeImplementsSpecCheck,
+            Self::IssueContractChangeCheck,
         ]
     }
 }

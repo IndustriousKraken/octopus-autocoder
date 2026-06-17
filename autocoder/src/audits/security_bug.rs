@@ -1,28 +1,33 @@
-//! Security & bug audit. Invokes the wrapped agent CLI with an
-//! `OpenSpecOnly` sandbox and a security-and-bug-detection prompt.
+//! Security & bug audit. Invokes the wrapped agent CLI with a
+//! `PlanningLanes` sandbox and a security-and-bug-detection prompt.
 //! The agent surveys the source tree for high-confidence security
-//! issues and likely bugs, then writes up to `max_proposals_per_run`
-//! new OpenSpec change directories under `openspec/changes/` proposing
-//! a fix per finding. The shared
-//! [`super::specs_writing::run_specs_writing_audit`] helper handles
-//! the sandbox, snapshot diff, validation, over-cap pruning, and
+//! issues and likely bugs, then (a01) chooses each finding's output
+//! lane by canon judgment: a contract-changing fix → a spec-lane change
+//! under `openspec/changes/<slug>/`; a behavior-preserving fix to
+//! already-correctly-specified code → an issue-lane unit under
+//! `openspec/issues/<slug>/` (when `features.issues` is enabled). The
+//! shared [`super::specs_writing::run_specs_writing_audit`] helper
+//! handles the sandbox, snapshot diff, validation, over-cap pruning, and
 //! commit; this module's only responsibilities are reading settings,
-//! resolving the prompt, and delegating.
+//! resolving the prompt, resolving the `features.issues` flag, and
+//! delegating.
 //!
 //! `requires_head_change = true` — re-surveying the same SHA finds
-//! the same issues. `WritePolicy::OpenSpecOnly` — the agent may write
-//! under `openspec/changes/` but nowhere else; the framework reverts
-//! anything else.
+//! the same issues. `WritePolicy::PlanningLanes` — the agent may write
+//! under EITHER planning lane (`openspec/changes/` OR the issues lane)
+//! but nowhere else; the framework reverts anything else.
 //!
-//! Naming convention: proposed change directories are prefixed with
-//! `fix-` for bug fixes and `secure-` for security hardening so
-//! operators can recognize audit-produced changes at a glance.
+//! Naming convention: produced units are prefixed with `fix-` for bug
+//! fixes and `secure-` for security hardening (in whichever lane they
+//! land) so operators can recognize audit-produced units at a glance.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{ALLOWED_TOOLS, SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{
+    ALLOWED_TOOLS, ScopedGateChecker, SpecsWritingAuditParams, run_specs_writing_audit,
+};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -51,6 +56,11 @@ pub struct SecurityBugAudit {
     /// means `openspec`. Tests point at a shell script so the audit
     /// can be exercised without the real CLI on PATH.
     openspec_command: String,
+    /// Test-only override for the resolved `features.issues` flag (which
+    /// production reads from the task-local issues-lane gate). Mirrors
+    /// `canon_consolidation`'s `test_rag_enabled`.
+    #[cfg(test)]
+    test_issues_enabled: Option<bool>,
 }
 
 impl SecurityBugAudit {
@@ -79,6 +89,8 @@ impl SecurityBugAudit {
             sandbox,
             settings_dir: None,
             openspec_command: "openspec".to_string(),
+            #[cfg(test)]
+            test_issues_enabled: None,
         }
     }
 
@@ -86,6 +98,25 @@ impl SecurityBugAudit {
     pub(crate) fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_issues_enabled(mut self, enabled: bool) -> Self {
+        self.test_issues_enabled = Some(enabled);
+        self
+    }
+
+    /// Resolve `features.issues` for the repository this audit targets.
+    /// Production reads the task-local issues-lane gate
+    /// ([`crate::lanes::gate::current`]) — `Some` when the daemon scoped the
+    /// polling task with the lane enabled, `None` otherwise. Tests force the
+    /// value via [`Self::with_issues_enabled`].
+    fn issues_lane_enabled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(o) = self.test_issues_enabled {
+            return o;
+        }
+        crate::lanes::gate::current().is_some()
     }
 
     #[cfg(test)]
@@ -132,7 +163,10 @@ impl Audit for SecurityBugAudit {
     }
 
     fn write_policy(&self) -> WritePolicy {
-        WritePolicy::OpenSpecOnly
+        // a01: the audit may write under EITHER planning lane
+        // (`openspec/changes/` OR the issues lane) so it can route each
+        // finding by canon judgment.
+        WritePolicy::PlanningLanes
     }
 
     async fn run(&self, ctx: &mut AuditContext<'_>) -> Result<AuditOutcome> {
@@ -145,6 +179,9 @@ impl Audit for SecurityBugAudit {
             .unwrap_or_else(|| "<embedded default>".to_string());
         // audit-model-selection: route to the configured model (if any).
         let model = super::audit_resolved_model(&self.settings);
+        // a02: the production gate checker reads the scoped `[in]`/`[canon]`
+        // verifier-gate contexts (enabled gates run at authoring time too).
+        let gate_checker = ScopedGateChecker;
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -160,6 +197,9 @@ impl Audit for SecurityBugAudit {
                 allowed_tools: ALLOWED_TOOLS,
                 include_autocoder_tools: false,
                 model: model.as_ref(),
+                planning_lanes: true,
+                issues_lane_enabled: self.issues_lane_enabled(),
+                gate_checker: &gate_checker,
             },
             ctx,
         )
@@ -301,9 +341,11 @@ mod tests {
         let audit = SecurityBugAudit::new(&HashMap::new(), &cfg);
         assert_eq!(audit.audit_type(), "security_bug_audit");
         assert!(audit.requires_head_change());
-        assert!(matches!(audit.write_policy(), WritePolicy::OpenSpecOnly));
-        // The audit's whole job is to write openspec/changes/ proposals, so it
-        // MUST run with a writable workspace. Regression: a read-only mount
+        // a01: the bug/gap audit now chooses its lane, so it runs under the
+        // two-prefix PlanningLanes policy (NOT OpenSpecOnly).
+        assert!(matches!(audit.write_policy(), WritePolicy::PlanningLanes));
+        // The audit's whole job is to write planning-lane units, so it MUST
+        // run with a writable workspace. Regression: a read-only mount
         // silently discarded a real finding as "0 proposals".
         assert!(audit.write_policy().workspace_writable());
     }
@@ -402,7 +444,7 @@ mod tests {
         let log_str = String::from_utf8_lossy(&log.stdout);
         assert!(
             log_str.contains("security-bug proposals")
-                && log_str.contains("1 change(s)"),
+                && log_str.contains("1 unit(s)"),
             "commit message must reflect the validated count: {log_str}"
         );
         if let Some(parent) = log_path.parent() {
@@ -459,7 +501,7 @@ mod tests {
         let log_str = String::from_utf8_lossy(&log.stdout);
         assert!(
             log_str.contains("security-bug proposals")
-                && log_str.contains("1 change(s)"),
+                && log_str.contains("1 unit(s)"),
             "commit message must reflect the validated count: {log_str}"
         );
         if let Some(parent) = log_path.parent() {
@@ -666,6 +708,7 @@ mod tests {
             AuditOutcome::SpecsWritten {
                 changes,
                 retries_used,
+                ..
             } => {
                 assert_eq!(changes, vec!["fix-retry-me".to_string()]);
                 assert_eq!(retries_used, 1);
@@ -680,7 +723,7 @@ mod tests {
             .unwrap();
         let log_str = String::from_utf8_lossy(&head.stdout);
         assert!(
-            log_str.contains("security-bug proposals") && log_str.contains("1 change(s)"),
+            log_str.contains("security-bug proposals") && log_str.contains("1 unit(s)"),
             "commit message must reflect the validated count: {log_str}"
         );
         // Audit log contains the addendum-bearing prompt on attempt 1.
@@ -708,8 +751,14 @@ mod tests {
     #[tokio::test]
     async fn zero_change_dirs_is_no_findings_and_does_not_retry() {
         let (_t, ws) = init_workspace_with(&[]);
-        // CLI produces nothing.
-        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        // Genuine no-findings run: the agent surveys and concludes there is
+        // nothing to fix, emitting that conclusion (so it is an evidenced
+        // no-findings run, not a degenerate did-nothing session).
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            "#!/bin/sh\necho 'Examined the codebase for security and bug issues; found nothing confident to report.'\nexit 0\n",
+        );
         let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
 
         let cfg = executor_cfg(&script.to_string_lossy());
@@ -733,12 +782,55 @@ mod tests {
             AuditOutcome::SpecsWritten {
                 changes,
                 retries_used,
+                ..
             } => {
                 assert!(changes.is_empty());
                 assert_eq!(retries_used, 0, "zero proposals must not consume retries");
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
         }
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Fail closed: a clean exit-0 session that produced NO output AND no
+    /// change dirs is a degenerate "did nothing" run — it MUST resolve to
+    /// `DidNotComplete { NoTerminalVerdict }`, never a silent `SpecsWritten([])`
+    /// (the `gatekeepers-fail-closed` standard). Contrast with
+    /// `zero_change_dirs_is_no_findings_and_does_not_retry`, where the session
+    /// emits a conclusion and is therefore an evidenced no-findings run.
+    #[tokio::test]
+    async fn degenerate_empty_session_fails_closed_to_did_not_complete() {
+        let (_t, ws) = init_workspace_with(&[]);
+        // Exits 0 with no stdout AND writes nothing.
+        let script = write_script(&ws, "fake-claude.sh", "#!/bin/sh\nexit 0\n");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 3,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(
+                outcome,
+                AuditOutcome::DidNotComplete {
+                    cause: crate::audits::AuditFailureCause::NoTerminalVerdict,
+                    ..
+                }
+            ),
+            "degenerate empty session must fail closed, got {outcome:?}"
+        );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
@@ -794,7 +886,7 @@ mod tests {
 
         let outcome = audit.run(&mut ctx).await.expect("run succeeds");
         match outcome {
-            AuditOutcome::SpecsWritten { changes, retries_used } => {
+            AuditOutcome::SpecsWritten { changes, retries_used, .. } => {
                 assert_eq!(changes, vec!["secure-fire-on-success".to_string()]);
                 assert_eq!(retries_used, 0);
             }
@@ -1096,6 +1188,258 @@ mod tests {
             "proposal commit must land without chatops: {log_str}"
         );
 
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    // ------------- a01: lane routing (derived from produced artifacts) -------------
+    //
+    // These tests drive a fake CLI that simulates the agent's lane choice
+    // and assert the resulting on-disk artifacts + commit — never prompt
+    // substrings (per `Tests assert behavior or derivation, never message
+    // wording`). The contrast across the tests demonstrates the routing the
+    // a01 lane-choice requirement specifies.
+
+    /// Fake `claude` that writes a well-formed issue-lane unit:
+    /// `openspec/issues/<slug>/issue.md` + `tasks.md`, NO `specs/`.
+    fn write_issue_unit_script(ws: &Path, slug: &str) -> PathBuf {
+        let dir = ws.join("openspec/issues").join(slug).display().to_string();
+        write_script(
+            ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{dir}'\nprintf '## Report\\nbug\\n' > '{dir}/issue.md'\nprintf '## 1. fix\\n- [ ] 1.1 fix it\\n' > '{dir}/tasks.md'\necho 'Behavior-preserving defect; routing to the issue lane.'\nexit 0\n"
+            ),
+        )
+    }
+
+    /// Fake `claude` that writes a spec-lane change: `openspec/changes/<slug>/proposal.md`.
+    fn write_change_unit_script(ws: &Path, slug: &str) -> PathBuf {
+        let dir = ws.join("openspec/changes").join(slug).display().to_string();
+        write_script(
+            ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{dir}'\necho '# proposal' > '{dir}/proposal.md'\nexit 0\n"
+            ),
+        )
+    }
+
+    /// 4.2: with `features.issues` enabled, a behavior-preserving finding
+    /// yields an `openspec/issues/<slug>/` unit with NO `specs/` directory
+    /// (AND no spec-lane unit).
+    #[tokio::test]
+    async fn issues_enabled_behavior_preserving_finding_yields_issue_unit() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let _script = write_issue_unit_script(&ws, "fix-unhandled-error");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string())
+            .with_issues_enabled(true);
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-unhandled-error".to_string()]);
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        let issue_dir = ws.join("openspec/issues/fix-unhandled-error");
+        assert!(issue_dir.join("issue.md").is_file(), "issue.md present");
+        assert!(issue_dir.join("tasks.md").is_file(), "tasks.md present");
+        assert!(
+            !issue_dir.join("specs").exists(),
+            "an issue-lane unit carries NO specs/ directory"
+        );
+        assert!(
+            !ws.join("openspec/changes/fix-unhandled-error").exists(),
+            "a behavior-preserving finding produces NO spec-lane unit"
+        );
+        // The unit loads as a well-formed issue (the issues walker will work it).
+        assert!(
+            crate::lanes::issues::load(&ws, "fix-unhandled-error").is_ok(),
+            "produced issue unit must load as well-formed"
+        );
+        let git_log = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "3"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&git_log.stdout);
+        assert!(
+            log_str.contains("security-bug proposals") && log_str.contains("1 unit(s)"),
+            "commit subject counts produced units: {log_str}"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// 4.2: with `features.issues` enabled, a contract-changing finding
+    /// still routes to the spec lane (`openspec/changes/<slug>/`) and
+    /// produces NO issue-lane unit.
+    #[tokio::test]
+    async fn issues_enabled_contract_finding_yields_change_unit() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let _script = write_change_unit_script(&ws, "fix-wire-format");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string())
+            .with_issues_enabled(true);
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-wire-format".to_string()]);
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        assert!(ws.join("openspec/changes/fix-wire-format").exists());
+        assert!(
+            !ws.join("openspec/issues/fix-wire-format").exists(),
+            "a contract-changing finding produces NO issue-lane unit"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// 4.2: with `features.issues` disabled, only `openspec/changes/` units
+    /// are produced — the issues lane is never created.
+    #[tokio::test]
+    async fn issues_disabled_produces_only_change_units() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let _script = write_change_unit_script(&ws, "fix-only-changes");
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string())
+            .with_issues_enabled(false);
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-only-changes".to_string()]);
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        assert!(ws.join("openspec/changes/fix-only-changes").exists());
+        assert!(
+            !ws.join("openspec/issues").exists(),
+            "issues lane must be untouched when features.issues is disabled"
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// 4.3: the commit stages BOTH lanes AND `SpecsWritten` carries unit
+    /// names regardless of which lane produced them. The agent writes one
+    /// unit per lane in a single run.
+    #[tokio::test]
+    async fn commit_stages_both_lanes_and_names_carry_across() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let change = ws
+            .join("openspec/changes/fix-contract")
+            .display()
+            .to_string();
+        let issue = ws.join("openspec/issues/fix-defect").display().to_string();
+        let _script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{change}' '{issue}'\necho '# proposal' > '{change}/proposal.md'\nprintf '## Report\\nbug\\n' > '{issue}/issue.md'\nprintf '## 1\\n- [ ] 1.1 fix\\n' > '{issue}/tasks.md'\nexit 0\n"
+            ),
+        );
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&ws.join("fake-claude.sh").to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string())
+            .with_issues_enabled(true)
+            .with_max_proposals(2);
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten { mut changes, .. } => {
+                changes.sort();
+                assert_eq!(
+                    changes,
+                    vec!["fix-contract".to_string(), "fix-defect".to_string()],
+                    "SpecsWritten carries names from BOTH lanes"
+                );
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        // Both lanes were staged AND committed (tracked by git after commit).
+        let tracked = |path: &str| {
+            let out = StdCommand::new("git")
+                .args(["ls-files", path])
+                .current_dir(&ws)
+                .output()
+                .unwrap();
+            !out.stdout.is_empty()
+        };
+        assert!(
+            tracked("openspec/changes/fix-contract"),
+            "spec-lane unit must be committed"
+        );
+        assert!(
+            tracked("openspec/issues/fix-defect"),
+            "issue-lane unit must be committed"
+        );
+        let git_log = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "3"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&git_log.stdout);
+        assert!(
+            log_str.contains("security-bug proposals") && log_str.contains("2 unit(s)"),
+            "commit subject counts units across BOTH lanes: {log_str}"
+        );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }

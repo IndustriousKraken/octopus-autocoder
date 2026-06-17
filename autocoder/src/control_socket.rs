@@ -208,6 +208,64 @@ pub struct BrownfieldBatchRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight spec-revision ADVISOR request (a03). The chatops
+/// dispatcher's non-`send it` `@<bot>` reply in a revision thread pushes
+/// here via the `revision_advise` control-socket action. The polling loop
+/// drains at most ONE per iteration AND runs a read-only agentic session
+/// reconstructed from the change deltas, the canon, the marker's
+/// contradiction, AND the thread transcript so far — replying in the thread
+/// without writing anything. `reply_text` is the operator's current message
+/// (the transcript is re-fetched from chat at drain time).
+#[derive(Debug, Clone)]
+pub struct RevisionAdviseRequest {
+    pub repo_url: String,
+    pub change_slug: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub reply_text: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One in-flight spec-revision EXECUTOR request (a03). The chatops
+/// dispatcher's `@<bot> send it` in a revision thread pushes here via the
+/// `revision_execute` control-socket action. The polling loop drains at most
+/// ONE per iteration AND runs a write-scoped session that edits the change's
+/// spec deltas, re-runs the `[in]` / `[canon]` gates, AND opens a PR on a
+/// clean re-gate.
+#[derive(Debug, Clone)]
+pub struct RevisionExecuteRequest {
+    pub repo_url: String,
+    pub change_slug: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The two revision-thread request queues (a03), bundled so they thread
+/// through the polling loop as a single unit AND sit on the
+/// [`RepoTaskHandle`] for the control-socket handlers to push onto. Drained
+/// one-per-iteration each (mirroring the brownfield-batch drain).
+#[derive(Clone)]
+pub struct RevisionRequestQueues {
+    pub advise: Arc<Mutex<std::collections::VecDeque<RevisionAdviseRequest>>>,
+    pub execute: Arc<Mutex<std::collections::VecDeque<RevisionExecuteRequest>>>,
+}
+
+impl RevisionRequestQueues {
+    pub fn new() -> Self {
+        Self {
+            advise: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            execute: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+}
+
+impl Default for RevisionRequestQueues {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -232,11 +290,17 @@ pub struct RepoTaskHandle {
     /// (`chatops-on-demand-audit-trigger`). The chatops `audit` verb and
     /// the CLI `audit run` subcommand push canonical audit-type names
     /// onto this list via the `queue_audit` control-socket action; the
-    /// polling loop drains it at the start of each iteration's audit
-    /// phase and runs each one unconditionally (bypassing cadence). The
-    /// queue is de-duplicated on insert so multiple `audit` commands
-    /// before a single iteration collapse to one run.
-    pub pending_audit_runs: Arc<Mutex<Vec<String>>>,
+    /// polling loop consumes an entry ONLY once it has actually run
+    /// (bypassing cadence), so a skipped, early-returning, or bounded-out
+    /// pass never drops an acknowledged request. The queue is mirrored to
+    /// `<state>/pending-audit-runs/<workspace-basename>.json` on every
+    /// mutation (enqueue + post-run prune) AND reloaded at task spawn, so it
+    /// also survives a daemon restart (persist-on-demand-audit-queue). Each
+    /// entry carries the originating chat context so the scheduler can post a
+    /// terminal
+    /// completion notification back to the operator. De-duplicated on insert
+    /// so multiple `audit` commands collapse to one run.
+    pub pending_audit_runs: Arc<Mutex<Vec<crate::polling_loop::QueuedAudit>>>,
     /// Queue of chat-driven proposal requests awaiting triage
     /// (`chat-request-triage`). The chatops dispatcher's `propose` verb
     /// pushes here via the `queue_proposal_request` control-socket
@@ -303,6 +367,13 @@ pub struct RepoTaskHandle {
     /// the batch handler.
     pub pending_brownfield_batch_requests:
         Arc<Mutex<std::collections::VecDeque<BrownfieldBatchRequest>>>,
+    /// Queues of chat-driven spec-revision thread requests (a03). The
+    /// chatops dispatcher's `revision_advise` action (a non-`send it` reply
+    /// in a revision thread) pushes onto `advise`; its `revision_execute`
+    /// action (`send it` in a revision thread) pushes onto `execute`. The
+    /// polling loop drains at most ONE of EACH per iteration AFTER the
+    /// brownfield-batch drain.
+    pub pending_revision_requests: RevisionRequestQueues,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -559,7 +630,10 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_sync_upstream_request" => handle_queue_sync_upstream_request(&parsed, state),
         "queue_brownfield_survey_request" => handle_queue_brownfield_survey_request(&parsed, state),
         "queue_brownfield_batch_request" => handle_queue_brownfield_batch_request(&parsed, state),
+        "revision_advise" => handle_revision_advise(&parsed, state),
+        "revision_execute" => handle_revision_execute(&parsed, state),
         "queue_clear_survey" => handle_queue_clear_survey(&parsed, state),
+        "promote_issue_candidate" => handle_promote_issue_candidate(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
@@ -1573,10 +1647,43 @@ fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
             });
         }
     };
+    // Carry the originating chat context (when present) so the scheduler can
+    // post the terminal completion notification back to the operator's thread.
+    let origin = parsed
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|channel| crate::polling_loop::ChatOrigin {
+            channel: channel.to_string(),
+            thread_ts: parsed
+                .get("thread_ts")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+        });
+    // Resolve the repo's workspace so the mutated queue can be mirrored to
+    // its durable `pending-audit-runs/<basename>.json` file the instant the
+    // enqueue is acknowledged below — closing the enqueue→restart window
+    // (persist-on-demand-audit-queue).
+    let workspace = workspace::resolve_path(&state.paths, &repo);
     {
         let mut g = queue.lock().unwrap();
-        if !g.iter().any(|a| a == &audit_type) {
-            g.push(audit_type.clone());
+        if !g.iter().any(|a| a.audit_type == audit_type) {
+            g.push(crate::polling_loop::QueuedAudit {
+                audit_type: audit_type.clone(),
+                origin,
+            });
+        }
+        // Persist on every mutation. Best-effort: a write failure is logged
+        // and never fails the enqueue (the in-memory queue stays
+        // authoritative for the live process).
+        if let Err(e) =
+            crate::polling_loop::save_pending_audit_runs(&state.paths, &workspace, g.as_slice())
+        {
+            tracing::warn!(
+                url = %url,
+                "queue_audit: failed to persist pending-audit-runs queue (in-memory queue remains authoritative): {e:#}"
+            );
         }
     }
     json!({
@@ -2182,6 +2289,138 @@ fn handle_queue_brownfield_batch_request(parsed: &Value, state: &ControlState) -
     })
 }
 
+/// Queue a spec-revision ADVISOR request (a03). A non-`send it` `@<bot>`
+/// reply in a tracked revision thread routes here; the polling loop drains
+/// it AND runs a read-only agentic session that discusses the revision in
+/// the thread. De-duplicated on `(change_slug, reply_text)` so a doubly-
+/// delivered mention event does not run the advisor twice for the same
+/// message.
+fn handle_revision_advise(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let reply_text = parsed
+        .get("reply_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_revision_requests.advise.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g
+            .iter()
+            .any(|r| r.change_slug == change && r.reply_text == reply_text)
+        {
+            g.push_back(RevisionAdviseRequest {
+                repo_url: url.clone(),
+                change_slug: change.clone(),
+                channel,
+                thread_ts,
+                reply_text,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "change": change,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Queue a spec-revision EXECUTOR request (a03). `@<bot> send it` in a
+/// tracked revision thread routes here; the polling loop drains it AND runs
+/// a write-scoped session that revises the change's spec deltas, re-runs the
+/// `[in]` / `[canon]` gates, AND opens a PR on a clean re-gate. De-duplicated
+/// on `change_slug` so a doubly-delivered `send it` enqueues only one run.
+fn handle_revision_execute(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_revision_requests.execute.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.change_slug == change) {
+            g.push_back(RevisionExecuteRequest {
+                repo_url: url.clone(),
+                change_slug: change.clone(),
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "change": change,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Handle the `queue_clear_survey` action (a29). Synchronously deletes
 /// every `BrownfieldSurveyState` file in the matched repo's workspace
 /// AND returns the count cleared. The chatops dispatcher posts the
@@ -2210,6 +2449,77 @@ fn handle_queue_clear_survey(parsed: &Value, state: &ControlState) -> Value {
         "url": url,
         "cleared": cleared,
     })
+}
+
+/// Handle the `promote_issue_candidate` action (a010). Synchronously
+/// promotes a posted issue-lane candidate the chatops `send it` dispatcher
+/// matched to a maintainer's in-thread reply: resolves the repo AND its
+/// workspace, loads the candidate, AND — when it is still `Posted` — writes
+/// `issues/<slug>/` (its `issue.md` + `tasks.md`, plus the quarantined
+/// `report-body.md` for a public-origin candidate) AND flips the candidate's
+/// status to `Promoted`. Writing the unit IS the queue (the issues-lane
+/// walker picks up any ready `issues/<slug>/`). Idempotent: an already-
+/// `Promoted` candidate writes nothing further AND reports `already_promoted`
+/// so the dispatcher can word its reply without re-writing. Mirrors
+/// [`handle_queue_clear_survey`]'s synchronous-filesystem-work shape.
+///
+/// `channel` AND `thread_ts` are required so the request identifies the
+/// originating thread (matching the survey/audit action contract); the
+/// promotion itself is a pure filesystem write that needs neither.
+fn handle_promote_issue_candidate(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let candidate_id = match require_str(parsed, "candidate_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    if let Err(e) = require_str(parsed, "channel") {
+        return json!({"ok": false, "error": e});
+    }
+    if let Err(e) = require_str(parsed, "thread_ts") {
+        return json!({"ok": false, "error": e});
+    }
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = crate::workspace::resolve_path(&state.paths, &repo);
+    let candidate =
+        match crate::lanes::ingestion::read_candidate(&state.paths.state, &candidate_id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("no issue candidate `{candidate_id}` recorded"),
+                });
+            }
+            Err(e) => {
+                return json!({"ok": false, "error": format!("reading issue candidate: {e:#}")});
+            }
+        };
+    match candidate.status {
+        crate::lanes::ingestion::CandidateStatus::Promoted => json!({
+            "ok": true,
+            "already_promoted": true,
+            "slug": candidate.slug,
+        }),
+        crate::lanes::ingestion::CandidateStatus::Posted => {
+            match crate::lanes::ingestion::promote_candidate(
+                &workspace,
+                &state.paths.state,
+                &candidate,
+            ) {
+                Ok(dir) => json!({
+                    "ok": true,
+                    "slug": candidate.slug,
+                    "path": dir.display().to_string(),
+                }),
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
+    }
 }
 
 /// Handle the `query_canonical_specs` action (a21). Looks up the
@@ -2831,6 +3141,7 @@ mod tests {
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_revision_requests: RevisionRequestQueues::new(),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -2968,6 +3279,76 @@ github:
                 "section `{section}` missing from unchanged: {unchanged:?}"
             );
         }
+        cancel.cancel();
+    }
+
+    /// a03: the `revision_advise` action queues a [`RevisionAdviseRequest`]
+    /// onto the matched repo's handle, carrying the operator's reply text for
+    /// the read-only advisor session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_advise_action_queues_request() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"revision_advise","url":"git@github.com:owner/repo.git","change":"a03-x","channel":"C1","thread_ts":"9.9","reply_text":"align to canon?"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let q = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard
+                .get("git@github.com:owner/repo.git")
+                .unwrap()
+                .pending_revision_requests
+                .advise
+                .clone()
+        };
+        let g = q.lock().unwrap();
+        assert_eq!(g.len(), 1, "advise queue should have one entry");
+        assert_eq!(g[0].change_slug, "a03-x");
+        assert_eq!(g[0].reply_text, "align to canon?");
+        assert_eq!(g[0].thread_ts, "9.9");
+        cancel.cancel();
+    }
+
+    /// a03: the `revision_execute` action queues a [`RevisionExecuteRequest`]
+    /// onto the matched repo's handle. De-duplicated on `change_slug` so a
+    /// doubly-delivered `send it` enqueues only one run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_execute_action_queues_request_deduped() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = r#"{"action":"revision_execute","url":"git@github.com:owner/repo.git","change":"a03-x","channel":"C1","thread_ts":"9.9"}"#;
+        let resp = send_request(&socket, req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        // A second identical request must not enqueue a duplicate.
+        let resp2 = send_request(&socket, req).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true), "resp: {resp2}");
+        let q = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard
+                .get("git@github.com:owner/repo.git")
+                .unwrap()
+                .pending_revision_requests
+                .execute
+                .clone()
+        };
+        let g = q.lock().unwrap();
+        assert_eq!(g.len(), 1, "execute queue should de-dupe on change_slug");
+        assert_eq!(g[0].change_slug, "a03-x");
+        cancel.cancel();
+    }
+
+    /// a03: a revision action for an unconfigured repo is refused (no live
+    /// polling task to queue onto).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_execute_unknown_repo_is_refused() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"revision_execute","url":"git@github.com:owner/nope.git","change":"a03-x","channel":"C1","thread_ts":"9.9"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
         cancel.cancel();
     }
 
@@ -3649,6 +4030,98 @@ github:
         });
         let resp = send_request(&socket, &req.to_string()).await;
         assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        cancel.cancel();
+    }
+
+    /// Seed a posted, public-origin issue candidate under the daemon state
+    /// root so the `promote_issue_candidate` handler can act on it.
+    fn seed_posted_candidate(
+        state_root: &Path,
+        url: &str,
+        number: u64,
+        slug: &str,
+    ) -> String {
+        let id = crate::lanes::ingestion::candidate_id(url, number);
+        let candidate = crate::lanes::ingestion::CandidateState {
+            id: id.clone(),
+            repo_url: url.to_string(),
+            source_issue: number,
+            slug: slug.to_string(),
+            origin: crate::lanes::ingestion::IssueOrigin::Public,
+            issue_md: "## Report\nmaintainer-approved diagnosis\n".to_string(),
+            tasks_md: "- [ ] 1.1 fix the code to conform to the spec\n".to_string(),
+            report_body: "raw public reporter body {{x}}".to_string(),
+            posted_at: chrono::Utc::now(),
+            status: crate::lanes::ingestion::CandidateStatus::Posted,
+            thread_ts: Some("1755.cand".to_string()),
+            channel: Some("C_OPS".to_string()),
+        };
+        crate::lanes::ingestion::write_candidate(state_root, &candidate).unwrap();
+        id
+    }
+
+    /// 5.3: the `promote_issue_candidate` handler writes `issues/<slug>/`
+    /// (public origin includes `report-body.md`), flips the candidate to
+    /// promoted, is idempotent on a second invocation, AND errors on a
+    /// missing candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promote_issue_candidate_writes_queues_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+
+        let url = "git@github.com:owner/myrepo.git";
+        let id = seed_posted_candidate(&state.paths.state, url, 7, "drop-newline");
+
+        let req = serde_json::json!({
+            "action": "promote_issue_candidate",
+            "url": url,
+            "candidate_id": id,
+            "channel": "C_OPS",
+            "thread_ts": "1755.cand",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["slug"], "drop-newline");
+
+        // The unit is written under issues/<slug>/ — its bot-authored files
+        // plus the quarantined report-body for a public-origin candidate.
+        let issue_dir = workspace.join("openspec/issues/drop-newline");
+        assert!(issue_dir.join("issue.md").exists(), "issue.md written");
+        assert!(issue_dir.join("tasks.md").exists(), "tasks.md written");
+        assert!(
+            issue_dir.join("report-body.md").exists(),
+            "public-origin report-body.md quarantined"
+        );
+
+        // The candidate is flipped to Promoted.
+        let after = crate::lanes::ingestion::read_candidate(&state.paths.state, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            crate::lanes::ingestion::CandidateStatus::Promoted
+        );
+
+        // Second invocation is idempotent: reports already_promoted, no
+        // re-write (and no already-exists error).
+        let resp2 = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true), "resp2: {resp2}");
+        assert_eq!(resp2["already_promoted"], serde_json::Value::Bool(true));
+        assert_eq!(resp2["slug"], "drop-newline");
+
+        // A missing candidate returns an error.
+        let missing = serde_json::json!({
+            "action": "promote_issue_candidate",
+            "url": url,
+            "candidate_id": "owner-myrepo-999",
+            "channel": "C_OPS",
+            "thread_ts": "1755.none",
+        });
+        let resp3 = send_request(&socket, &missing.to_string()).await;
+        assert_eq!(resp3["ok"], serde_json::Value::Bool(false), "resp3: {resp3}");
         cancel.cancel();
     }
 
@@ -4428,6 +4901,7 @@ github:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_revision_requests: RevisionRequestQueues::new(),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -4493,7 +4967,10 @@ github:
         let guard = state.repo_tasks.lock().unwrap();
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
-        assert_eq!(*q, vec!["security_bug_audit".to_string()]);
+        assert_eq!(
+            q.iter().map(|a| a.audit_type.clone()).collect::<Vec<_>>(),
+            vec!["security_bug_audit".to_string()]
+        );
         drop(q);
         drop(guard);
         cancel.cancel();
@@ -4519,7 +4996,7 @@ github:
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
         assert_eq!(
-            *q,
+            q.iter().map(|a| a.audit_type.clone()).collect::<Vec<_>>(),
             vec!["security_bug_audit".to_string()],
             "duplicate audit_type must collapse to one entry"
         );
@@ -4543,8 +5020,8 @@ github:
         let guard = state.repo_tasks.lock().unwrap();
         let handle = guard.get("git@github.com:owner/repo.git").expect("repo present");
         let q = handle.pending_audit_runs.lock().unwrap();
-        assert!(q.contains(&"security_bug_audit".to_string()));
-        assert!(q.contains(&"drift_audit".to_string()));
+        assert!(q.iter().any(|a| a.audit_type == "security_bug_audit"));
+        assert!(q.iter().any(|a| a.audit_type == "drift_audit"));
         assert_eq!(q.len(), 2);
         drop(q);
         drop(guard);

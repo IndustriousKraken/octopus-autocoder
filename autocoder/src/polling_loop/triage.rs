@@ -243,46 +243,14 @@ pub(crate) async fn process_completed_triage(
 
     // A stable slug derived from `<audit_type>-<short_hash>`, retained
     // purely as a diagnostic label for logs (the executor picks its own
-    // change-directory name; the spec/code boundary is the universal
-    // `openspec/changes/` root, NOT this slug).
+    // output-directory name; the keep boundary is each planning lane's
+    // root, NOT this slug).
     let new_slug = derive_unique_triage_slug(workspace, &state.audit_type, &state.findings_excerpt);
 
-    // Brightline-specific diff-scope validation: the `Mark as
-    // intentional` triage output writes ONLY `.brightline-ignore`. The
-    // overall brightline-triage diff must therefore be limited to
-    // `.brightline-ignore` plus `openspec/changes/`. A diff touching
-    // arbitrary code AND `.brightline-ignore` indicates a confused LLM
-    // run; we refuse rather than ship a half-valid PR.
-    if let Err(violations) =
-        validate_brightline_triage_scope(&state.audit_type, &changed, "openspec/changes/")
-    {
-        tracing::warn!(
-            thread_ts = %state.thread_ts,
-            "audit-triage: brightline diff scope violation; rejecting. Out-of-scope paths: {violations:?}"
-        );
-        if let Some(ctx) = chatops_ctx {
-            let body = format!(
-                "✗ Triage for `{audit_type}` on `{repo_url}` rejected: out-of-scope diff. \
-                Brightline triages may only write `.brightline-ignore` or `openspec/changes/<slug>/`. \
-                Offending paths:\n{violations}",
-                audit_type = state.audit_type,
-                repo_url = state.repo_url,
-                violations = violations.join("\n"),
-            );
-            let _ = ctx
-                .chatops
-                .post_threaded_reply(&state.channel, &state.thread_ts, &body)
-                .await;
-        }
-        state.status = AuditThreadStatus::TriageFailed;
-        let _ = threads::write_state(&state_root, state);
-        return Ok(());
-    }
-
-    // a43: triage produces a SPEC-ONLY PR. Code-path writes outside
-    // `openspec/changes/<slug>/` are discarded before commit;
-    // implementation flows through the standard implementer pipeline on a
-    // later iteration after the operator merges the spec PR.
+    // Triage produces ONE PR — the spec PR OR the issue PR (whichever lane
+    // the run wrote for). Out-of-lane writes (code, docs, config) are
+    // discarded before commit; implementation flows through the standard
+    // pipeline on a later iteration after the operator merges the PR.
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
     } else {
@@ -291,64 +259,46 @@ pub(crate) async fn process_completed_triage(
     let agent_branch = &repo.agent_branch;
     let base_branch = &repo.base_branch;
 
-    // Brightline `Mark as intentional` is the one exception to the
-    // spec-only rule: its sole deliverable is the `.brightline-ignore`
-    // suppression file, which has no implementer-pipeline equivalent, so
-    // ship it directly the way the pre-a43 single-PR path did.
-    // `validate_brightline_triage_scope` (run above) already guarantees a
-    // brightline diff carrying `.brightline-ignore` contains nothing but
-    // that file plus `openspec/changes/<slug>/`, so a straight commit is
-    // safe.
-    let brightline_intentional = state.audit_type == "architecture_brightline"
-        && changed.iter().any(|p| p == ".brightline-ignore");
-    if brightline_intentional {
-        return ship_brightline_intentional(
-            paths,
-            workspace,
-            repo,
-            github_cfg,
-            chatops_ctx,
-            state,
-            &state_root,
-            push_remote,
-            agent_branch,
-            base_branch,
-        )
-        .await;
-    }
-
-    // --- Generic a43 spec-only path ---
     let was_empty = changed.is_empty();
+    let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
     let has_spec = changed.iter().any(|p| p.starts_with("openspec/changes/"));
+    let has_issue = changed.iter().any(|p| p.starts_with(&issues_prefix));
 
-    // Discard every non-spec write so the spec PR's diff is spec-only.
+    // Discard every out-of-lane write so the PR's diff carries only
+    // planning-lane content (spec lane OR issues lane).
     let discarded = discard_non_spec_writes(workspace, &new_slug)
-        .with_context(|| "audit-triage: discarding non-spec writes".to_string())?;
+        .with_context(|| "audit-triage: discarding out-of-lane writes".to_string())?;
     if !discarded.is_empty() {
         tracing::warn!(
             url = %repo.url,
             audit_type = %state.audit_type,
             slug = %new_slug,
             dropped = ?discarded,
-            "audit-triage: discarded non-spec writes (a43 spec-only enforcement)"
+            "audit-triage: discarded out-of-lane writes (planning-lane-only enforcement)"
         );
     }
 
-    if !has_spec {
-        triage_reply_no_spec(chatops_ctx, state, &state_root, was_empty, final_summary).await;
+    // No content in EITHER lane → no PR. Distinguish "nothing produced"
+    // (empty diff → Acted) from "only code, now dropped" (→ TriageFailed).
+    if !has_spec && !has_issue {
+        triage_reply_no_content(chatops_ctx, state, &state_root, was_empty, final_summary).await;
         return Ok(());
     }
 
-    // Spec content exists → open exactly one PR (the spec PR). If the
-    // agent also wrote code (now discarded), warn the operator so the
-    // dropped fixes can be captured as tasks.md items if load-bearing.
+    // Spec lane takes priority if both were (unexpectedly) written; the
+    // default for a behavior-preserving refactor is the issue lane.
+    let lane_is_spec = has_spec;
+    let lane_label = if lane_is_spec { "spec" } else { "issue" };
+
+    // If the agent also wrote out-of-lane paths (now discarded), warn the
+    // operator so the dropped fixes can be captured as tasks.md items.
     if !discarded.is_empty()
         && let Some(ctx) = chatops_ctx
     {
         let body = format!(
-            "⚠️ The triage agent attempted to write {n} path(s) outside `openspec/changes/`: {list}. \
-            Per a43, code fixes go through the standard implementer pipeline. The spec PR has been opened; \
-            if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items.",
+            "⚠️ The triage agent attempted to write {n} path(s) outside the planning lanes: {list}. \
+            Code fixes go through the standard implementer pipeline. The {lane_label} PR has been opened; \
+            if the dropped fixes were load-bearing, revise the {lane_label} to capture them as tasks.md items.",
             n = discarded.len(),
             list = discarded.join(", "),
         );
@@ -366,46 +316,61 @@ pub(crate) async fn process_completed_triage(
 
     git::checkout(workspace, base_branch)
         .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
-    let spec_branch = format!("{agent_branch}-triage-spec");
-    git::recreate_branch(workspace, &spec_branch)
-        .with_context(|| format!("audit-triage: recreate `{spec_branch}`"))?;
-    git::add_all(workspace).with_context(|| "audit-triage: staging spec paths".to_string())?;
-    let subject = format!("audit-triage spec proposal from {}", state.audit_type);
+    let branch = format!("{agent_branch}-triage-spec");
+    git::recreate_branch(workspace, &branch)
+        .with_context(|| format!("audit-triage: recreate `{branch}`"))?;
+    git::add_all(workspace).with_context(|| "audit-triage: staging planning-lane paths".to_string())?;
+    let subject = if lane_is_spec {
+        format!("audit-triage spec proposal from {}", state.audit_type)
+    } else {
+        format!("audit-triage issue from {}", state.audit_type)
+    };
     git::commit(workspace, &subject)
-        .with_context(|| "audit-triage: commit spec branch".to_string())?;
-    if let Err(e) = git::push_force_with_lease(workspace, &spec_branch, push_remote) {
-        return Err(anyhow!("audit-triage: pushing spec branch failed: {e:#}"));
+        .with_context(|| "audit-triage: commit triage branch".to_string())?;
+    if let Err(e) = git::push_force_with_lease(workspace, &branch, push_remote) {
+        return Err(anyhow!("audit-triage: pushing triage branch failed: {e:#}"));
     }
-    let body = format!(
-        "This PR carries the new spec change(s) from the `{at}` audit on `{ru}`. \
-        After merge, the next polling iteration's implementer will produce the code fixes through the standard pipeline.",
-        at = state.audit_type,
-        ru = state.repo_url,
-    );
-    let spec_pr_url = match open_triage_pull_request(
+    let body = if lane_is_spec {
+        format!(
+            "This PR carries the new spec change(s) from the `{at}` audit on `{ru}`. \
+            After merge, the next polling iteration's implementer will produce the code fixes through the standard pipeline.",
+            at = state.audit_type,
+            ru = state.repo_url,
+        )
+    } else {
+        format!(
+            "This PR carries the new issue(s) from the `{at}` audit on `{ru}` — a behavior-preserving refactor. \
+            After merge, the issues-lane walker picks up the issue and implements it through the standard pipeline.",
+            at = state.audit_type,
+            ru = state.repo_url,
+        )
+    };
+    let pr_title = format!("audit-triage {lane_label} ({})", state.audit_type);
+    let pr_url = match open_triage_pull_request(
         paths,
         repo,
         github_cfg,
-        &spec_branch,
+        &branch,
         base_branch,
-        &format!("audit-triage spec ({})", state.audit_type),
+        &pr_title,
         &body,
     )
     .await
     {
         Ok(url) => Some(url),
         Err(e) => {
-            tracing::error!(url = %repo.url, "audit-triage: spec PR creation failed: {e:#}");
+            tracing::error!(url = %repo.url, "audit-triage: {lane_label} PR creation failed: {e:#}");
             None
         }
     };
 
     if let Some(ctx) = chatops_ctx
-        && let Some(u) = &spec_pr_url
+        && let Some(u) = &pr_url
     {
         let reply = format!(
-            "✓ Triage for `{}` complete.\nSpec PR: {u}",
-            state.audit_type
+            "✓ Triage for `{}` complete.\n{} PR: {u}",
+            state.audit_type,
+            if lane_is_spec { "Spec" } else { "Issue" },
         );
         let _ = ctx
             .chatops
@@ -418,81 +383,9 @@ pub(crate) async fn process_completed_triage(
     Ok(())
 }
 
-/// Ship the brightline `Mark as intentional` triage directly (its sole
-/// deliverable is `.brightline-ignore`, which has no implementer-pipeline
-/// equivalent). Extracted from `process_completed_triage` (a68 split).
-#[allow(clippy::too_many_arguments)]
-async fn ship_brightline_intentional(
-    paths: &DaemonPaths,
-    workspace: &Path,
-    repo: &RepositoryConfig,
-    github_cfg: &GithubConfig,
-    chatops_ctx: Option<&ChatOpsContext>,
-    state: &mut crate::audits::threads::AuditThreadState,
-    state_root: &std::path::Path,
-    push_remote: &str,
-    agent_branch: &str,
-    base_branch: &str,
-) -> Result<()> {
-    use crate::audits::threads::{self, AuditThreadStatus};
-    git::checkout(workspace, base_branch)
-        .with_context(|| format!("audit-triage: checkout base branch `{base_branch}`"))?;
-    let branch = format!("{agent_branch}-triage-spec");
-    git::recreate_branch(workspace, &branch)
-        .with_context(|| format!("audit-triage: recreate `{branch}`"))?;
-    git::add_all(workspace)
-        .with_context(|| "audit-triage: staging brightline-intentional diff".to_string())?;
-    let subject = format!("audit-triage intentional-marks from {}", state.audit_type);
-    git::commit(workspace, &subject)
-        .with_context(|| "audit-triage: commit brightline-intentional branch".to_string())?;
-    if let Err(e) = git::push_force_with_lease(workspace, &branch, push_remote) {
-        return Err(anyhow!(
-            "audit-triage: pushing brightline-intentional branch failed: {e:#}"
-        ));
-    }
-    let body = format!(
-        "This PR marks brightline duplicate-signature findings from the `{audit_type}` audit on `{repo_url}` as intentional by adding `.brightline-ignore` entries. No code changes are included.",
-        audit_type = state.audit_type,
-        repo_url = state.repo_url,
-    );
-    let pr_url = match open_triage_pull_request(
-        paths,
-        repo,
-        github_cfg,
-        &branch,
-        base_branch,
-        &format!("audit-triage intentional-marks ({})", state.audit_type),
-        &body,
-    )
-    .await
-    {
-        Ok(url) => Some(url),
-        Err(e) => {
-            tracing::error!(
-                url = %repo.url,
-                "audit-triage: brightline-intentional PR creation failed: {e:#}"
-            );
-            None
-        }
-    };
-    if let Some(ctx) = chatops_ctx {
-        let mut reply = format!("✓ Triage for `{}` complete.", state.audit_type);
-        if let Some(u) = &pr_url {
-            reply.push_str(&format!("\nPR: {u}"));
-        }
-        let _ = ctx
-            .chatops
-            .post_threaded_reply(&state.channel, &state.thread_ts, &reply)
-            .await;
-    }
-    state.status = AuditThreadStatus::Acted;
-    let _ = threads::write_state(state_root, state);
-    Ok(())
-}
-
-/// Post the "no actionable / no spec content" triage thread reply and set
-/// the terminal status. Extracted from `process_completed_triage` (a68 split).
-async fn triage_reply_no_spec(
+/// Post the "no actionable / no planning-lane content" triage thread reply
+/// and set the terminal status. Extracted from `process_completed_triage`.
+async fn triage_reply_no_content(
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut crate::audits::threads::AuditThreadState,
     state_root: &std::path::Path,
@@ -500,8 +393,8 @@ async fn triage_reply_no_spec(
     final_summary: Option<&str>,
 ) {
     use crate::audits::threads::{self, AuditThreadStatus};
-    // No spec content survived the discard. Distinguish "nothing was
-    // produced" (empty diff → Acted) from "only code, now dropped"
+    // No spec OR issue content survived the discard. Distinguish "nothing
+    // was produced" (empty diff → Acted) from "only code, now dropped"
     // (code-only → TriageFailed, retryable).
     if let Some(ctx) = chatops_ctx {
         let body = if was_empty {
@@ -519,7 +412,7 @@ async fn triage_reply_no_spec(
             }
         } else {
             format!(
-                "ℹ️ Triage for `{at}` on `{ru}` produced no spec content; retry with a clearer directive.",
+                "ℹ️ Triage for `{at}` on `{ru}`: no spec or issue content produced; retry with a clearer directive.",
                 at = state.audit_type,
                 ru = state.repo_url,
             )
@@ -590,47 +483,3 @@ pub(crate) fn short_findings_hash(findings: &str) -> String {
     format!("{:08x}", h as u32)
 }
 
-/// Diff-scope check applied to `architecture_brightline` triage diffs.
-/// The brightline `send it` LLM emits one of three output shapes per
-/// finding:
-///
-/// 1. **Fix** — touches arbitrary source files.
-/// 2. **Spec-worthy** — touches files under `openspec/changes/<slug>/`.
-/// 3. **Mark as intentional** — touches ONLY `.brightline-ignore`.
-///
-/// Per the spec, a brightline triage diff is permitted to touch
-/// `.brightline-ignore` and/or `openspec/changes/<slug>/` — but if
-/// `.brightline-ignore` writes mix with arbitrary code edits, the run
-/// is confused and we refuse to ship it (the caller posts a chatops
-/// rejection and flips state to `TriageFailed`).
-///
-/// For non-brightline audits this function is a no-op: every other
-/// audit's triage diff is unconstrained beyond the spec/fixes
-/// partition that happens downstream.
-///
-/// Returns `Ok(())` when the diff passes. Returns `Err(violations)`
-/// listing the offending paths when it fails.
-pub(crate) fn validate_brightline_triage_scope(
-    audit_type: &str,
-    changed: &[String],
-    slug_prefix: &str,
-) -> Result<(), Vec<String>> {
-    if audit_type != "architecture_brightline" {
-        return Ok(());
-    }
-    if !changed.iter().any(|p| p == ".brightline-ignore") {
-        // No `.brightline-ignore` write in this diff → the brightline
-        // triage took the fix/spec path, which is unconstrained.
-        return Ok(());
-    }
-    let violations: Vec<String> = changed
-        .iter()
-        .filter(|p| p.as_str() != ".brightline-ignore" && !p.starts_with(slug_prefix))
-        .cloned()
-        .collect();
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations)
-    }
-}

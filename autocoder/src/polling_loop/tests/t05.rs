@@ -96,6 +96,7 @@ async fn cancellation_during_sleep_exits() {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            crate::control_socket::RevisionRequestQueues::new(),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,
@@ -370,7 +371,7 @@ async fn start_of_work_notification_posted_on_dequeue() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -425,7 +426,7 @@ async fn start_of_work_suppressed_when_disabled() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await
     .expect("pass succeeds");
@@ -503,7 +504,7 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &std::sync::Mutex::new(Vec::new()),
     )
     .await;
     let basename = ws.file_name().unwrap().to_string_lossy().into_owned();

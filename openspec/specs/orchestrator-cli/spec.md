@@ -1329,8 +1329,8 @@ autocoder SHALL include a periodic audit framework that runs registered audit ta
 autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (global) and per-repository `audits:` overrides. Each entry maps an audit type name to a `Cadence`. The `Cadence` enum SHALL accept the literal strings `disabled`, `daily`, `every-N-days` (where `N` is a positive integer), `weekly`, `monthly`, `quarterly`. Every audit defaults to `disabled` when unset in both global defaults and per-repo overrides.
 
 #### Scenario: Per-repo cadence overrides global default
-- **WHEN** `audits.defaults.architecture_brightline: weekly` AND a
-  repository sets `audits.architecture_brightline: every-3-days`
+- **WHEN** `audits.defaults.architecture_advisor: weekly` AND a
+  repository sets `audits.architecture_advisor: every-3-days`
 - **THEN** the effective cadence for that repository is
   `every-3-days`
 
@@ -1354,108 +1354,6 @@ autocoder SHALL accept an optional top-level `audits:` block with `defaults:` (g
   the field path AND the unknown audit type AND listing the
   known audit type names
 - **AND** the daemon does NOT start
-
-### Requirement: Architecture-brightline audit
-autocoder SHALL ship an `architecture-brightline` audit in the periodic audit framework. The audit is pure-code (no LLM invocation), `requires_head_change = true`, AND `WritePolicy::None`. It SHALL produce `AuditOutcome::Reported(findings)` containing structural metrics that exceed configured (or default) thresholds: whole-file length, function length, duplicate function signatures, AND duplicate function bodies.
-
-**Graduated severity.** For the size metrics (file length AND function length), the finding's severity SHALL be determined by the ratio of the measured line count `N` to the applicable threshold `T`: `low` when `N` is at least `T` but below `1.5 × T`, `medium` when `N` is at least `1.5 × T` but below `2.5 × T`, AND `high` when `N` is at or above `2.5 × T`. This replaces the previous flat `medium` severity for the file-size metric, so a file barely over threshold reads as `low` while a file many multiples over reads as `high`.
-
-**Function-size metric.** In addition to whole-file length, the audit SHALL measure the line span of each function definition (its signature line through its closing delimiter) outside test-only regions — e.g. Rust `#[cfg(test)]` modules, consistent with the duplicate-signature metric's exclusion of `mod tests {}` blocks — AND report any function whose span exceeds the function-line threshold. The file-line threshold defaults to `800` AND the function-line threshold defaults to `200`; both are operator-configurable via the audit's settings (`file_lines_threshold`, `function_lines_threshold`).
-
-**Production/test split.** Where the audit can identify test-only regions within a flagged file (e.g. `#[cfg(test)]` modules), the file-size finding's body SHALL report the production-line AND test-line breakdown alongside the total, so the operator can tell a file that needs its tests extracted from one that needs its production code decomposed. Where no test-only region is identifiable, the body reports the total only.
-
-**Duplicate-body metric.** Beyond identical signatures, the audit SHALL detect groups of two or more functions in different files (outside test-only regions) whose normalized bodies are identical — normalization strips comments, collapses whitespace, AND canonicalizes local identifier and string-literal spellings, so that rename-only clones (e.g. a family of helpers that differ only in a constant name and a few words of message) are matched despite differing function names. Each group emits one finding of severity `low` listing the sites. Duplicate-body findings participate in `.brightline-ignore` suppression on the same `file` / `function` / `signature_match` basis as duplicate-signature findings. This is the metric that catches copy-paste families, which the signature metric — keyed on the interface, not the body — cannot.
-
-**Signature metric uses the function's I/O profile.** The duplicate-signature metric SHALL key on the function's interface — its name, the sequence of parameter *types* (parameter names normalized away), AND, where the language exposes it, the return type — rather than the verbatim parameter text, so two declarations with the same interface but different parameter names are recognized as the same signature AND cosmetic naming differences do not split a genuine collision. For languages without static parameter types, the key falls back to name plus parameter arity.
-
-The audit SHALL load a per-workspace `.brightline-ignore` file (if present) AND apply match-suppression to duplicate-signature findings whose constituent sites are all listed in the ignore file. The audit SHALL also validate ignore entries against the current workspace state AND report stale entries via the chatops top-line (informational; the audit does NOT modify the ignore file itself given its `WritePolicy::None`).
-
-The ignore file's YAML schema:
-
-```yaml
-ignore:
-  - file: <workspace-relative path>
-    function: <function or method name>
-    signature_match: <substring of the function's signature line>
-    reason: <one-line operator-readable explanation>
-```
-
-All four fields are required per entry. An entry with a missing field triggers a WARN log AND the entry is skipped.
-
-Match-suppression rule: a duplicate-signature finding is suppressed in full when EVERY constituent site matches an ignore entry. A partial match (some sites match, some don't) emits the finding with only the unmatched sites listed in the body. No match → the finding is emitted in full (today's behavior).
-
-Stale-entry rule: each ignore entry is validated against the current workspace at audit time. Validation fails when (a) the named file doesn't exist, (b) the file doesn't contain a function with the named name, OR (c) the function's signature no longer contains `signature_match`. The audit collects the stale entries AND adds a trailing clause to the chatops top-line:
-
-```
-📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <P> function(s) over line threshold; <M> duplicate signature(s); <Q> duplicate body group(s); <K> stale ignore entries to clean up
-```
-
-The threaded body lists each stale entry's `file + function + reason` so the operator knows what to remove. The audit does NOT modify `.brightline-ignore` on disk (given `WritePolicy::None`); cleanup is operator-driven.
-
-#### Scenario: Reports files exceeding the size threshold with graduated severity
-- **WHEN** the audit runs AND a tracked file under the repository's source root has more lines than the file-line threshold (default `800`)
-- **THEN** a finding is included with `subject = "file <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:1")`
-- **AND** its severity is `low` when `N < 1.5 × T`, `medium` when `1.5 × T ≤ N < 2.5 × T`, AND `high` when `N ≥ 2.5 × T`
-- **AND** where the audit can identify test-only regions in the file, the finding body reports the production-line / test-line split alongside the total
-
-#### Scenario: Reports functions exceeding the function-line threshold
-- **WHEN** the audit runs AND a function defined outside any test-only region spans more lines than the function-line threshold (default `200`)
-- **THEN** a finding is included with `subject = "function <name> in <path> is <N> lines (threshold: <T>)"` AND `anchor = Some("<path>:<start-line>")`
-- **AND** its severity follows the same graduated scale (`low` / `medium` / `high` at `1× / 1.5× / 2.5×` the threshold)
-- **AND** a function defined inside a `#[cfg(test)]` module is NOT measured
-
-#### Scenario: Reports identical function signatures across files
-- **WHEN** the audit detects two or more functions in different files (excluding `mod tests {}` blocks) whose I/O-profile signatures match — same name, same parameter-type sequence (parameter names normalized away), AND same return type where the language exposes it
-- **AND** no ignore entry suppresses the finding (see the ignore scenarios below)
-- **THEN** a finding of severity `low` lists each occurrence
-
-#### Scenario: Reports near-identical function bodies across files
-- **WHEN** two or more functions in different files (excluding `mod tests {}` blocks) have identical normalized bodies, differing only in their names AND in renamed local identifiers or string literals
-- **AND** no ignore entry suppresses the finding
-- **THEN** a finding of severity `low` lists each occurrence
-- **AND** the duplicate-body group is counted in the `<Q> duplicate body group(s)` clause of the chatops top-line
-
-#### Scenario: Reports dead public items
-- **WHEN** the audit (or a static-analysis subprocess it invokes) identifies public items with zero references in the repository
-- **THEN** a finding of severity `low` lists the items
-
-#### Scenario: No findings produces silent outcome
-- **WHEN** no metric exceeds its threshold AND no ignore entries are stale
-- **THEN** the audit returns `AuditOutcome::Reported(vec![])`
-- **AND** unless `notify_on_clean: true` is set, no chatops message is posted (per the framework-level scenario)
-
-#### Scenario: Ignore entry suppresses a fully-matching finding
-- **WHEN** a duplicate-signature finding involves 3 sites (file1.ts, file2.ts, file3.ts with function `foo` AND signature substring `async function foo(req`)
-- **AND** `.brightline-ignore` contains entries for all 3 sites with matching `file`, `function`, AND `signature_match`
-- **THEN** the audit does NOT emit the finding
-- **AND** the `<M> duplicate signature(s)` count in the chatops top-line does NOT include this finding
-
-#### Scenario: Partial ignore matches still emit with the unmatched sites
-- **WHEN** a duplicate-signature finding involves 3 sites
-- **AND** `.brightline-ignore` contains entries for 2 of the 3 sites
-- **THEN** the audit emits the finding listing only the 1 unmatched site
-- **AND** the chatops body for that finding names the unmatched site AND notes that 2 sites were suppressed by ignore entries
-
-#### Scenario: Stale ignore entries are reported but not removed
-- **WHEN** `.brightline-ignore` contains an entry for `examples/site-x/auth.ts:handleAuthCallback`
-- **AND** that file has been deleted from the workspace
-- **THEN** the audit marks the entry as stale
-- **AND** the chatops top-line gains the trailing `; <K> stale ignore entries to clean up` clause
-- **AND** the threaded body lists the stale entry with its `file + function + reason`
-- **AND** the audit does NOT modify `.brightline-ignore` on disk
-
-#### Scenario: Malformed entries WARN and are skipped
-- **WHEN** `.brightline-ignore` contains an entry missing the `reason` field
-- **THEN** the audit logs a WARN naming the offending entry AND skips it (treats it as if it didn't exist for the run)
-- **AND** other valid entries continue to apply
-- **AND** the on-disk file is unchanged
-
-#### Scenario: Missing `.brightline-ignore` behaves identically to today
-- **WHEN** the workspace has no `.brightline-ignore` file
-- **THEN** the audit loads an empty ignore list
-- **AND** no suppression occurs
-- **AND** no stale-cleanup clause appears in the chatops output
-- **AND** behavior is byte-identical to pre-spec runs
 
 ### Requirement: Dependency update triage audit
 autocoder SHALL register a `dependency_update_triage` audit in the periodic-audit framework. The audit SHALL list Dependabot pull requests on the bot's fork (or upstream when no fork is configured), classify each by a strict "safe shape" filter, approve the safe ones via the GitHub Reviews API, and report unsafe ones via chatops. The audit is `requires_head_change = false` and `WritePolicy::None`.
@@ -1667,9 +1565,9 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
   consult this log to see exactly what the agent produced
 
 ### Requirement: Missing-tests audit
-autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with an OpenSpec-only sandbox and a missing-tests prompt; it creates new OpenSpec change directories under `openspec/changes/`, commits them to the agent branch, and returns the created change names so the same iteration's queue walk implements them. The audit is `requires_head_change = true` and `WritePolicy::OpenSpecOnly`.
+autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a writable planning-lanes sandbox and a missing-tests prompt. Per the `Spec-writing bug/gap audits choose their output lane by canon judgment` requirement, it reads the relevant canonical specs and routes each finding to the spec lane (`openspec/changes/<slug>/`) OR, when `features.issues` is enabled and the fix carries no contract change, the issues lane (`issues/<slug>/`); it commits the produced units to the agent branch and returns the created unit names so the same iteration's queue walk works them. The audit is `requires_head_change = true` and `WritePolicy::PlanningLanes`.
 
-#### Scenario: Invokes the CLI with an OpenSpec-only sandbox
+#### Scenario: Invokes the CLI with a writable planning-lanes sandbox
 - **WHEN** the audit runs
 - **THEN** autocoder spawns the configured `executor.command` with
   a sandbox whose `allowed_tools` includes `Write` and `Edit`
@@ -1692,65 +1590,91 @@ autocoder SHALL register a `missing_tests_audit` audit in the periodic-audit fra
 - **AND** the prompt directs the agent to focus on uncovered
   error paths, edge cases, and branches without assertions
 
-#### Scenario: Audit creates new OpenSpec changes
+#### Scenario: Audit creates units in the chosen lane
 - **WHEN** the audit identifies N coverage gaps (where N is
   capped by `audits.missing_tests_audit.max_proposals_per_run`,
   default `2`)
-- **THEN** the audit creates N change directories at
-  `openspec/changes/<change_name>/` where each contains a
-  proposal.md, tasks.md, and (when the gap implies a capability
-  invariant) a `specs/<capability>/spec.md` delta
-- **AND** each created change is named with a `tests-` prefix
+- **THEN** the audit creates N units, each in the lane it chose:
+  a spec-lane unit at `openspec/changes/<slug>/` (a proposal.md,
+  tasks.md, and — when the gap implies a capability invariant — a
+  `specs/<capability>/spec.md` delta), OR an issue-lane unit at
+  `issues/<slug>/` (an `issue.md` and `tasks.md`, no `specs/`
+  directory)
+- **AND** each created unit is named with a `tests-` prefix
   (e.g. `tests-error-paths-in-queue-engine`) so operators can
-  recognize audit-produced changes at a glance
+  recognize audit-produced units at a glance
 
-#### Scenario: Audit commits created changes to agent branch
+#### Scenario: Audit commits created units to agent branch
 - **WHEN** the agent finishes creating files
-- **THEN** the audit framework's WritePolicy::OpenSpecOnly check
-  passes (every modified path is under `openspec/changes/`)
-- **AND** the audit runs `git add openspec/changes/ && git commit
-  -m "audit: missing-tests proposals (N change(s))"`
+- **THEN** the audit framework's `WritePolicy::PlanningLanes` check
+  passes (every modified path is under `openspec/changes/` OR
+  `issues/`)
+- **AND** the audit stages the produced planning lanes and commits
+  (`git commit -m "audit: missing-tests proposals (N unit(s))"`)
 - **AND** the audit returns
-  `AuditOutcome::SpecsWritten(change_names)` where
-  `change_names` is the list of newly-created change directory
-  names
+  `AuditOutcome::SpecsWritten(unit_names)` where `unit_names` is
+  the list of newly-created unit directory names across whichever
+  lanes were used
 
-#### Scenario: Same iteration's queue walk picks up created changes
+#### Scenario: Same iteration's queue walk picks up created units
 - **WHEN** the audit returns `SpecsWritten(names)` AND the
-  iteration proceeds to `list_pending`
-- **THEN** `list_pending` observes the new directories (they have
-  `proposal.md`, no `.in-progress`, no `.question.json`)
-- **AND** the iteration's `walk_queue` includes them in its
-  archive cap, ordered by their `proposal.md` mtime
-  (per the existing time-based ordering)
+  iteration proceeds to lane selection
+- **THEN** the lane walker for each produced unit observes its new
+  directory (the changes walker for `openspec/changes/<slug>/`, the
+  issues walker for `issues/<slug>/`)
+- **AND** the iteration works them under the established lane
+  precedence (issues over changes), ordered within a lane per the
+  existing rule
 
 #### Scenario: Cap on proposals per run
 - **WHEN** the prompt would produce more than
-  `max_proposals_per_run` changes
+  `max_proposals_per_run` units
 - **THEN** the prompt instructs the agent to pick the N highest-
   priority gaps (by severity / risk) and emit only those
-- **AND** the agent does NOT create more than N changes in this
+- **AND** the agent does NOT create more than N units in this
   run; remaining gaps will be re-surfaced on subsequent runs as
   the audit re-evaluates the codebase
 
-#### Scenario: Write outside openspec/changes triggers framework revert
-- **WHEN** the agent writes a file outside `openspec/changes/`
-  (e.g. a `src/foo.rs` modification or a `README.md` edit)
-- **THEN** the foundation's `WritePolicy::OpenSpecOnly` post-hoc
+#### Scenario: Write outside the planning lanes triggers framework revert
+- **WHEN** the agent writes a file outside BOTH `openspec/changes/`
+  AND `issues/` (e.g. a `src/foo.rs` modification or a `README.md`
+  edit)
+- **THEN** the foundation's `WritePolicy::PlanningLanes` post-hoc
   check fails AND the framework reverts via `git reset --hard
   HEAD + git clean -fd`
 - **AND** the audit is treated as failed (state NOT updated,
   chatops alert posted, audit re-runs next iteration)
-- **AND** no OpenSpec changes are committed from this run
+- **AND** no units are committed from this run
 
-#### Scenario: Empty findings produce no spec changes and no chatops post
-- **WHEN** the audit identifies zero meaningful coverage gaps
-- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])`
-- **AND** no commit is made, no chatops post is sent (per
-  framework behavior for spec-writing audits)
+#### Scenario: A behavior-preserving gap routes to the issues lane
+- **WHEN** `features.issues` is on AND a coverage gap is in code
+  that is already correctly specified AND closing it changes no
+  observable contract
+- **THEN** the audit writes an `issues/<slug>/` unit (`issue.md`
+  with acceptance stated against the existing specification, plus
+  `tasks.md`, no `specs/`)
+- **AND** it does NOT create an `openspec/changes/` unit for that
+  finding
+
+#### Scenario: A gap implying a new invariant routes to the spec lane
+- **WHEN** closing a gap requires asserting a new or changed
+  capability invariant (a contract change)
+- **THEN** the audit writes an `openspec/changes/<slug>/` unit with
+  the `specs/<capability>/` delta
+- **AND** it does NOT route that finding to the issues lane
+
+#### Scenario: Genuine no-findings is declared, not inferred from absence
+- **WHEN** the audit's session runs to completion AND the agent positively declares that it examined the code and identified zero meaningful coverage gaps
+- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])` carrying the agent's examined-summary
+- **AND** no commit is made, AND no chatops post is sent for this clean periodic run (per framework behavior for spec-writing audits)
+
+#### Scenario: A run with no terminal declaration is surfaced, never reported as no-findings
+- **WHEN** the audit's session ends without the agent positively declaring a survey conclusion (it errored, its exit status was not captured, or it produced output but persisted no valid unit directory)
+- **THEN** the audit returns `AuditOutcome::DidNotComplete { .. }`, NOT `SpecsWritten(vec![])`
+- **AND** the cadence state is NOT advanced AND a chatops alert is posted
 
 ### Requirement: Security & bug audit
-autocoder SHALL register a `security_bug_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with an OpenSpec-only sandbox and a security-and-bug-detection prompt; it creates new OpenSpec change directories under `openspec/changes/` describing proposed fixes, commits them, and returns the change names so the same iteration implements them. The audit is `requires_head_change = true` and `WritePolicy::OpenSpecOnly`.
+autocoder SHALL register a `security_bug_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a writable planning-lanes sandbox and a security-and-bug-detection prompt. Per the `Spec-writing bug/gap audits choose their output lane by canon judgment` requirement, it reads the relevant canonical specs and routes each finding to the spec lane (`openspec/changes/<slug>/` describing the proposed fix) OR, when `features.issues` is enabled and the fix carries no contract change, the issues lane (`issues/<slug>/`); it commits the produced units and returns the unit names so the same iteration implements them. The audit is `requires_head_change = true` and `WritePolicy::PlanningLanes`.
 
 The prompt's confidence-filtering and scope guidance below is design intent verified by the drift audit's semantic judgment; it SHALL NOT be pinned by a unit test asserting verbatim substrings of the prompt (per the project-documentation requirement `Tests assert behavior or derivation, never message wording`).
 
@@ -1772,18 +1696,18 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
   opinions, performance unless measurable, anything the project
   has explicitly accepted)
 
-#### Scenario: Created changes use fix- or secure- prefix
-- **WHEN** the audit creates a change for a proposed fix
-- **THEN** the change directory name uses `fix-` prefix for bug
+#### Scenario: Created units use fix- or secure- prefix
+- **WHEN** the audit creates a unit for a proposed fix
+- **THEN** the unit directory name uses `fix-` prefix for bug
   fixes (e.g. `fix-off-by-one-in-queue-walker`) AND `secure-`
   prefix for security hardening (e.g.
-  `secure-sanitize-user-paths`)
+  `secure-sanitize-user-paths`), in whichever lane it lands
 - **AND** the operator can recognize audit-produced security/bug
-  changes by their prefix at a glance
+  units by their prefix at a glance
 
-#### Scenario: Each proposed change includes a fix specification
-- **WHEN** the audit creates a change
-- **THEN** the change SHALL contain:
+#### Scenario: Each proposed unit includes its fix specification
+- **WHEN** the audit creates a unit
+- **THEN** a spec-lane change SHALL contain:
   - `proposal.md` naming the issue, citing the source location,
     and explaining the fix.
   - `tasks.md` listing the implementation steps.
@@ -1791,23 +1715,27 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
     operation X SHALL validate Y"), a `specs/<capability>/spec.md`
     delta MODIFYING the relevant requirement OR adding a new
     requirement.
-- **AND** validation via `openspec validate <name> --strict`
-  passes before the audit commits the change
+- **AND** an issue-lane unit SHALL contain `issue.md` (the issue,
+  the source location, AND acceptance criteria stated against the
+  EXISTING specification) and `tasks.md`, with NO `specs/`
+  directory
+- **AND** for a spec-lane change, validation via `openspec validate
+  <name> --strict` passes before the audit commits it
 
-#### Scenario: Validation failure rejects the change without committing
-- **WHEN** the agent produces a change that fails `openspec
-  validate --strict`
+#### Scenario: Validation failure rejects the spec-lane change without committing
+- **WHEN** the agent produces a spec-lane change that fails
+  `openspec validate --strict`
 - **THEN** the audit deletes the offending change directory AND
   records a WARN log entry naming the validation error
 - **AND** the audit does NOT chatops-alert per-change validation
   failures (the audit-run log is sufficient operator signal)
-- **AND** if every proposed change fails validation, the audit
+- **AND** if every proposed unit fails validation, the audit
   returns `AuditOutcome::SpecsWritten(vec![])` and no commit
   is made
 
 #### Scenario: Per-run proposal cap
 - **WHEN** the agent would produce more than
-  `max_proposals_per_run` (default `2`) changes
+  `max_proposals_per_run` (default `2`) units
 - **THEN** the prompt instructs the agent to pick the
   highest-severity issues and emit only those
 - **AND** the cap is enforced post-hoc: if the agent produces
@@ -1815,107 +1743,43 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
   after the post-run snapshot) and deletes the rest with a WARN
   log
 
-#### Scenario: Write outside openspec/changes triggers framework revert
-- **WHEN** the agent writes a file outside `openspec/changes/`
-  (attempts to fix the bug directly, edits a source file, etc.)
-- **THEN** the foundation's `WritePolicy::OpenSpecOnly` post-hoc
+#### Scenario: Write outside the planning lanes triggers framework revert
+- **WHEN** the agent writes a file outside BOTH `openspec/changes/`
+  AND `issues/` (attempts to fix the bug directly, edits a source
+  file, etc.)
+- **THEN** the foundation's `WritePolicy::PlanningLanes` post-hoc
   check fails AND the framework reverts via
   `git reset --hard HEAD + git clean -fd`
 - **AND** the audit is treated as failed; chatops alert posted;
   the audit re-runs next iteration
 
-#### Scenario: Empty findings produce no spec changes and no chatops post
-- **WHEN** the agent identifies zero confident security or bug
-  issues
-- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])`
-- **AND** no commit, no chatops post, the iteration proceeds
-  normally
+#### Scenario: A behavior-preserving fix routes to the issues lane
+- **WHEN** `features.issues` is on AND the finding is a defect in
+  code that is already correctly specified AND the fix changes no
+  observable contract
+- **THEN** the audit writes an `issues/<slug>/` unit (`issue.md`
+  with acceptance stated against the existing specification, plus
+  `tasks.md`, no `specs/`)
+- **AND** it does NOT create an `openspec/changes/` unit for that
+  finding
 
-### Requirement: Architecture consultative audit
-autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The agent SHALL return those findings by calling the `submit_findings` MCP tool — validated against the architecture finding schema, which caps the array at 5 entries, and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
+#### Scenario: A contract-changing fix routes to the spec lane
+- **WHEN** the fix requires new or changed observable behavior, OR
+  canon itself permits/mandates the defective behavior and must be
+  corrected
+- **THEN** the audit writes an `openspec/changes/<slug>/` unit with
+  the appropriate delta
+- **AND** it does NOT route that finding to the issues lane
 
-#### Scenario: Prompt forbids "rewrite at scale" suggestions
-- **WHEN** the prompt is loaded
-- **THEN** the prompt explicitly forbids the agent from suggesting:
-  - splitting the codebase into microservices, separate processes,
-    or separate binaries
-  - rewrites in a different programming language
-  - new infrastructure dependencies (message queues, databases,
-    caches, RPC frameworks) unless the project already uses one
-    of equivalent shape
-  - patterns implying team-of-50 scale (event sourcing for a
-    single-operator daemon, CQRS where a simple function would
-    do, etc.)
-- **AND** the prompt explicitly directs the agent to:
-  - frame observations as questions, not directives
-  - anchor each observation to a specific `file:line` range
-  - drop suggestions whose implementation adds more code than
-    it removes
+#### Scenario: Genuine no-findings is declared, not inferred from absence
+- **WHEN** the audit's session runs to completion AND the agent positively declares that it examined the code and identified zero confident security or bug issues
+- **THEN** the audit returns `AuditOutcome::SpecsWritten(vec![])` carrying the agent's examined-summary
+- **AND** no commit is made, no chatops post is sent, AND the iteration proceeds normally
 
-#### Scenario: Prompt is language-agnostic
-- **WHEN** the prompt is loaded
-- **THEN** the prompt makes NO assumptions about programming
-  language, framework, or runtime
-- **AND** the prompt operates from observable structure (file
-  organization, function boundaries, module interfaces) without
-  language-specific idioms
-- **AND** the prompt explicitly allows polyglot codebases
-  (front-end + back-end, multi-language tools, language
-  bridges) as a normal configuration to be observed, not
-  flagged
-
-#### Scenario: Returns 0-5 findings per run
-- **WHEN** the audit runs
-- **THEN** the agent calls the `submit_findings` MCP tool with a
-  payload of shape:
-  ```json
-  {
-    "findings": [
-      {
-        "subject": "Should X be its own module?",
-        "body": "<one paragraph of context>",
-        "anchor": "path/to/file.ext:120-180",
-        "severity": "low" | "medium"
-      }
-    ]
-  }
-  ```
-- **AND** the `findings` array contains AT MOST 5 entries — the
-  registered schema rejects a submission with more than 5,
-  surfacing it to the agent as a correctable tool error
-- **AND** if the audit produces 0 findings (no observations rise
-  above the prompt's quality bar), the agent calls
-  `submit_findings` with an empty array, the result is
-  `AuditOutcome::Reported(vec![])`, and per framework behavior no
-  chatops post is sent unless `notify_on_clean: true`
-
-#### Scenario: Findings render as questions in chatops
-- **WHEN** the audit produces N findings AND posts to chatops
-- **THEN** each bullet in the message is the finding's `subject`,
-  which by prompt construction is phrased as a question
-- **AND** the `anchor` is included so the operator can navigate
-  directly to the cited code
-- **AND** the full body text is preserved in the audit-run log
-  (chatops only shows the subject + anchor for compactness)
-
-#### Scenario: No valid submission fails the audit
-- **WHEN** the agent never calls `submit_findings`, OR every
-  `submit_findings` call is rejected by the schema (malformed
-  shape, or more than 5 findings) and the session ends with no
-  stored submission
-- **THEN** the audit returns `Err` with a diagnostic AND a
-  truncated stdout/stderr excerpt
-- **AND** the framework treats this as audit failure: state is
-  NOT updated, chatops alert posts under the existing
-  audit-failure category, the next iteration retries
-
-#### Scenario: Audit-run log captures the full agent output
-- **WHEN** the audit runs (success or failure)
-- **THEN** the audit-run log contains the prompt sent to the CLI,
-  the full raw stdout, the full raw stderr, and the final
-  outcome variant
-- **AND** operators reviewing a confusing chatops finding can
-  consult this log to see exactly what the agent produced
+#### Scenario: A run with no terminal declaration is surfaced, never reported as no-findings
+- **WHEN** the audit's session ends without the agent positively declaring a survey conclusion (it errored, its exit status was not captured, or it identified an issue it could not persist as a unit directory)
+- **THEN** the audit returns `AuditOutcome::DidNotComplete { .. }`, NOT `SpecsWritten(vec![])`
+- **AND** the cadence state is NOT advanced AND a chatops alert is posted so the inability to run is visible
 
 ### Requirement: github.recreate_fork_on_reinit config field
 The `github:` config block SHALL accept an optional `recreate_fork_on_reinit: bool` field that defaults to `false` when unset. When `true`, the workspace manager applies the destructive re-fork behavior described in `workspace-manager`'s "Optional fork recreation on workspace reinitialization" requirement.
@@ -2087,7 +1951,7 @@ Recovery is safe in this position because (a) the agent branch is rebuilt from b
   to the next sleep as with any iteration-level failure
 
 ### Requirement: Periodic audits enforce their per-audit subprocess timeout
-Every audit that spawns the wrapped agent CLI as a child process (`drift_audit`, `architecture_consultative_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL kill the child and return `Err(_)` once the elapsed wall-clock time exceeds `executor.timeout_secs`. The error message SHALL name both the audit type and the timeout condition so the operator can tell from a single log line which audit hung and why. The audit log file SHALL record the timeout outcome before the error returns so post-mortem inspection of `/tmp/autocoder/logs/<basename>/audits/<audit_type>-<ts>.log` is conclusive.
+Every audit that spawns the wrapped agent CLI as a child process — including `drift_audit`, `architecture_advisor`, `missing_tests_audit`, `security_bug_audit`, AND `documentation_audit` — SHALL kill the child and return `Err(_)` once the elapsed wall-clock time exceeds `executor.timeout_secs`. The error message SHALL name both the audit type and the timeout condition so the operator can tell from a single log line which audit hung and why. The audit log file SHALL record the timeout outcome before the error returns so post-mortem inspection of `/tmp/autocoder/logs/<basename>/audits/<audit_type>-<ts>.log` is conclusive.
 
 #### Scenario: drift_audit subprocess exceeds timeout
 - **WHEN** `DriftAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured `executor.command` is a script that sleeps longer than the timeout
@@ -2095,9 +1959,9 @@ Every audit that spawns the wrapped agent CLI as a child process (`drift_audit`,
 - **AND** the audit log file written via the audit's `AuditLogWriter` contains a `kind: Err` section together with the substring `reason: timeout`
 - **AND** the spawned child process does not survive past the call's return (no orphaned `sleep` left behind)
 
-#### Scenario: architecture_consultative_audit subprocess exceeds timeout
-- **WHEN** `ArchitectureConsultativeAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured command sleeps longer than the timeout
-- **THEN** the call returns `Err(_)` whose message contains `architecture_consultative` AND `timeout`
+#### Scenario: architecture_advisor subprocess exceeds timeout
+- **WHEN** `ArchitectureAdvisorAudit::run` is invoked with `executor_timeout_secs = 1` AND the configured command sleeps longer than the timeout
+- **THEN** the call returns `Err(_)` whose message contains `architecture_advisor` AND `timeout`
 - **AND** the audit log file contains a `kind: Err` / `reason: timeout` section
 
 #### Scenario: specs-writing audit (via missing_tests) subprocess exceeds timeout
@@ -2150,9 +2014,9 @@ Three small pure helpers in the polling loop (`extract_stdout_section`, `filter_
 - **AND** truncation respects UTF-8 char boundaries (no panic on multi-byte input even when byte-count and char-count diverge)
 
 ### Requirement: Registered periodic audits
-autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slug `dependency_update_triage` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
+autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slugs `dependency_update_triage`, `architecture_brightline`, AND `architecture_consultative` SHALL NOT be registered. `spec_sync_audit` — the deterministic, no-LLM spec-sync audit — is configurable under `audits.defaults` and `repositories[].audits` but is NOT an `AuditRegistry` entry: it runs via the spec-sync rebuild path rather than the LLM audit framework, so it is a recognized audit slug, not an unknown one. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; a slug that is neither a registered audit NOR the recognized `spec_sync_audit` present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the valid slugs.
 
-This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming an unregistered slug is a startup-time failure with a clear list of valid slugs.
+This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming a slug that is neither a registered audit nor the deterministic `spec_sync_audit` is a startup-time failure with a clear list of valid slugs.
 
 #### Scenario: Startup with default config registers the canonical set
 - **WHEN** autocoder starts with a config whose `audits:` block is
@@ -2169,17 +2033,26 @@ This enumeration is the canonical contract for which audits exist. Future change
 - **THEN** config validation succeeds AND the scheduler invokes
   that audit per its cadence on the appropriate iteration
 
-#### Scenario: Operator configures the removed dependency_update_triage slug
+#### Scenario: Operator configures a removed audit slug
 - **WHEN** an operator's `audits.defaults` (or
-  `repositories[].audits`, or `audits.settings`) contains the key
-  `dependency_update_triage` (a slug that was registered in
-  earlier versions of autocoder but has since been removed)
+  `repositories[].audits`, or `audits.settings`) contains a slug
+  that was registered in an earlier version of autocoder but has
+  since been removed (`dependency_update_triage`,
+  `architecture_brightline`, OR `architecture_consultative`)
 - **THEN** `validate_audit_type_names` fails at startup with an
-  error naming `dependency_update_triage` as unknown AND listing
-  the registered slugs so the operator knows what to use
+  error naming the unknown slug AND listing the registered slugs
+  so the operator knows what to use
 - **AND** the daemon does NOT start (consistent with the existing
   behavior for typos in audit slugs); the operator must remove the
   entries from their YAML to recover
+
+#### Scenario: The deterministic spec_sync_audit slug passes validation
+- **WHEN** a config (or the install wizard's conservative default)
+  sets `audits.defaults.spec_sync_audit` to a non-`disabled` cadence
+- **THEN** `validate_audit_type_names` succeeds — `spec_sync_audit`
+  is a recognized deterministic audit slug, not an unknown one
+- **AND** the daemon starts (the install wizard's conservative
+  default does not prevent startup)
 
 #### Scenario: Adding or removing an audit requires updating this requirement
 - **WHEN** an implementing agent ships a change that registers a
@@ -2623,7 +2496,7 @@ The threat model is unchanged from existing chatops behavior: write access to th
   worth adding
 
 ### Requirement: Install wizard configures periodic audits
-The `autocoder install` wizard SHALL prompt operators about periodic audits during first-time install, after the reviewer prompt and before the config-assembly step. The wizard offers a three-tier UX: (1) inline prompt for `spec_sync_audit` with default ON at daily cadence (cheap, defensive, no LLM cost); (2) a single yes/no gate for the LLM-driven audits (default no — operators who don't want a tour answer once and move on); (3) a fast-path "enable all five at recommended cadences" question for operators who answered yes to the gate, with per-audit walk-through as the fallback when the fast path is declined. The non-interactive mode SHALL mirror this with flags whose defaults match the conservative interactive defaults so existing IaC scripts that don't know about the new flags continue to work without behavior change.
+The `autocoder install` wizard SHALL prompt operators about periodic audits during first-time install, after the reviewer prompt and before the config-assembly step. The wizard offers a three-tier UX: (1) inline prompt for `spec_sync_audit` with default ON at daily cadence (cheap, defensive, no LLM cost); (2) a single yes/no gate for the LLM-driven audits (default no — operators who don't want a tour answer once and move on); (3) a fast-path "enable all at recommended cadences" question for operators who answered yes to the gate, with per-audit walk-through as the fallback when the fast path is declined. The non-interactive mode SHALL mirror this with flags whose defaults match the conservative interactive defaults so existing IaC scripts that don't know about the new flags continue to work without behavior change.
 
 #### Scenario: Default interactive path enables spec_sync_audit only
 - **WHEN** an operator runs `autocoder install` AND accepts
@@ -2644,19 +2517,18 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
   block entirely (matching the `Option<AuditsConfig>`
   schema's `None` representation)
 
-#### Scenario: Fast-path enables all six audits
+#### Scenario: Fast-path enables all five audits
 - **WHEN** the operator chose a non-disabled cadence for
   spec-sync AND answered `y` to the LLM-driven-audits gate
   AND accepted the fast-path default `Y` on the "enable all
-  five with recommended cadences" prompt
-- **THEN** config.yaml contains all six audits at their
+  at recommended cadences" prompt
+- **THEN** config.yaml contains all five audits at their
   recommended cadences:
   - `spec_sync_audit`: per the operator's spec-sync answer
-  - `architecture_brightline`: weekly
+  - `architecture_advisor`: weekly
   - `drift_audit`: weekly
   - `missing_tests_audit`: monthly
   - `security_bug_audit`: weekly
-  - `architecture_consultative`: monthly
 - **AND** total wizard interaction in this branch is three
   prompts (spec-sync cadence + LLM gate + fast-path
   acceptance)
@@ -2664,7 +2536,7 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
 #### Scenario: Individual cadence walk-through after declining fast-path
 - **WHEN** the operator answered `y` to the LLM-driven gate
   AND `n` to the fast-path prompt
-- **THEN** the wizard prompts for each of the five LLM-driven
+- **THEN** the wizard prompts for each of the four LLM-driven
   audits individually: slug + description + cadence choice
   (with the recommended cadence as the default)
 - **AND** each audit's chosen cadence appears in
@@ -2689,14 +2561,14 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
 - **WHEN** an operator runs
   `autocoder install --non-interactive --audits-llm-driven recommended`
   with all other required flags
-- **THEN** config.yaml contains all six audits at their
+- **THEN** config.yaml contains all five audits at their
   recommended cadences (same as the interactive fast-path)
 - **AND** no per-audit `--audit-<slug>` flag is required
 
 #### Scenario: Non-interactive per-audit override within recommended preset
 - **WHEN** the operator passes
   `--audits-llm-driven recommended --audit-security-bug-audit disabled`
-- **THEN** four of the five LLM-driven audits get their
+- **THEN** three of the four LLM-driven audits get their
   recommended cadences AND `security_bug_audit` is omitted
   from config.yaml (treated as disabled)
 - **AND** spec-sync follows its own `--audits-spec-sync`
@@ -2704,25 +2576,14 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
 
 #### Scenario: --audits-llm-driven none master switch overrides per-audit flags
 - **WHEN** the operator passes
-  `--audits-llm-driven none --audit-architecture-brightline weekly`
-- **THEN** architecture_brightline is NOT enabled (the
+  `--audits-llm-driven none --audit-architecture-advisor weekly`
+- **THEN** architecture_advisor is NOT enabled (the
   master switch wins)
 - **AND** the rendered config.yaml has no
-  architecture_brightline entry
+  architecture_advisor entry
 - **AND** the wizard emits a one-line stdout note explaining
   that the per-audit flag was overridden by the master
   switch (so IaC logs distinguish "operator opted-out
-  explicitly" from "operator forgot to set the flag")
-
-#### Scenario: Audit description rendering
-- **WHEN** the wizard prompts for any audit's cadence
-- **THEN** the prompt body includes the audit's
-  `description()` string (a one-line operator-facing
-  description, ≤ 80 chars, from the `Audit` trait)
-- **AND** the description is enough for an operator to
-  recognize the audit in subsequent chatops alerts or
-  config.yaml lines without needing to consult external
-  documentation
 
 ### Requirement: autocoder invokes openspec archive for the archive step
 autocoder SHALL perform per-change archive operations by invoking `openspec archive <change> -y` as a subprocess in the workspace directory, rather than doing its own filesystem move. The `-y` flag suppresses confirmation prompts so the subprocess runs cleanly in the non-interactive polling-loop context. On exit code 0, autocoder treats the change as successfully archived (the change directory has moved to `openspec/changes/archive/<UTC-date>-<slug>/` AND the canonical specs at `openspec/specs/<capability>/spec.md` have been merged with the change's `## ADDED`/`## MODIFIED`/`## REMOVED`/`## RENAMED` deltas). On any non-zero exit, autocoder treats the iteration as Failed for that change, with the openspec stderr as the failure reason; the change stays at the active path for the operator to investigate.
@@ -3120,7 +2981,7 @@ The rebuild SHALL locate the resulting archive directory after a successful `ope
 - **AND** the unrelated directory is not renamed or touched
 
 ### Requirement: LLM-driven audits validate their generated proposals before committing
-Every LLM-driven audit (currently `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL invoke `openspec validate <slug> --strict` against its just-written `openspec/changes/<slug>/` directory before returning success. The `architecture_brightline` audit, which does not generate spec proposals via LLM, is unaffected by this requirement. When validation passes, the audit returns its existing outcome variant. When validation fails AND the configured retry budget is not exhausted, the audit SHALL re-invoke its LLM with the validation error appended to the prompt and overwrite the change directory with the new response. When validation fails AND the retry budget IS exhausted, the audit SHALL discard the change directory AND post a chatops failure notification AND return a `ValidationExhausted` outcome.
+Every LLM-driven audit that writes a proposal (currently `missing_tests_audit` AND `security_bug_audit`) SHALL invoke `openspec validate <slug> --strict` against its just-written `openspec/changes/<slug>/` directory before returning success. The advisory audits — `architecture_advisor`, `drift_audit`, AND `documentation_audit` — generate findings rather than a spec proposal AND are unaffected by this requirement. When validation passes, the audit returns its existing outcome variant. When validation fails AND the configured retry budget is not exhausted, the audit SHALL re-invoke its LLM with the validation error appended to the prompt and overwrite the change directory with the new response. When validation fails AND the retry budget IS exhausted, the audit SHALL discard the change directory AND post a chatops failure notification AND return a `ValidationExhausted` outcome.
 
 #### Scenario: Valid proposal on first attempt
 - **WHEN** an LLM-driven audit writes a proposal and `openspec validate <slug> --strict` exits 0 on first invocation
@@ -3354,7 +3215,7 @@ Each open PR being tracked has a state file at `<workspace>/.autocoder/revisions
 - **AND** an interrupted write does NOT leave a partial canonical file on disk
 
 ### Requirement: Audit posts a chatops notification when it creates a queue-bound proposal
-Every LLM-driven audit (`architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL post a chatops notification immediately after `openspec validate <slug> --strict` passes for its just-written proposal AND before the audit function returns to the scheduler. The notification names the audit type, the change slug, and a one-line excerpt of the proposal's `## Why` section, so operators have clear provenance when the next polling iteration begins implementing the change. The notification fires regardless of the audit's `notify_on_clean` setting, since it signals "something was found" rather than "nothing was found." The pure-data `architecture_brightline` audit, which does not generate LLM proposals, is unaffected.
+Every LLM-driven audit that writes a proposal (`missing_tests_audit` AND `security_bug_audit`) SHALL post a chatops notification immediately after `openspec validate <slug> --strict` passes for its just-written proposal AND before the audit function returns to the scheduler. The notification names the audit type, the change slug, and a one-line excerpt of the proposal's `## Why` section, so operators have clear provenance when the next polling iteration begins implementing the change. The notification fires regardless of the audit's `notify_on_clean` setting, since it signals "something was found" rather than "nothing was found." The advisory audits — `architecture_advisor`, `drift_audit`, AND `documentation_audit` — generate findings rather than a proposal AND do not post the `🔍 created proposal` notification.
 
 #### Scenario: Validated proposal fires the notification on first attempt
 - **WHEN** an LLM-driven audit's proposal passes `openspec validate <slug> --strict` on the first attempt (`retries_used == 0`)
@@ -3375,8 +3236,8 @@ Every LLM-driven audit (`architecture_consultative`, `drift_audit`, `missing_tes
 - **THEN** the `🔍 created proposal` notification still fires
 - **AND** the existing `notify_on_clean=false` semantics still suppress only the empty-findings success message
 
-#### Scenario: architecture_brightline produces no proposal-created notification
-- **WHEN** the `architecture_brightline` audit runs to completion AND produces any number of findings
+#### Scenario: architecture_advisor produces no proposal-created notification
+- **WHEN** the `architecture_advisor` audit runs to completion AND produces any number of recommendations
 - **THEN** no `🔍 created proposal` notification fires from this audit
 - **AND** the audit's existing notification behaviour (if any) is unchanged
 
@@ -3401,8 +3262,8 @@ The chatops listener SHALL recognize `@<bot> send it` (case-insensitive on `send
 - **AND** the bot replies in the thread `✓ Triage scheduled for <audit_type> on <repo_url>. The next polling iteration will run it (~Nm).`
 
 #### Scenario: Send-it in untracked thread is politely refused
-- **WHEN** an operator posts `@<bot> send it` in a thread that has no corresponding `AuditThreadState`
-- **THEN** the bot replies `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in audit-notification threads.`
+- **WHEN** an operator posts `@<bot> send it` in a thread that matches no audit-thread, brownfield-survey, issue-candidate, OR spec-revision state
+- **THEN** the bot replies `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.`
 - **AND** no control-socket action is submitted
 
 #### Scenario: Send-it on stale audit thread is politely refused
@@ -3442,13 +3303,13 @@ The polling iteration SHALL drain its per-repo triage queue (alongside the exist
 - **AND** no PRs are created
 
 ### Requirement: Completed triage splits into one or two PRs by content path
-After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths AND keep ONLY paths inside `openspec/changes/<derived-slug>/`. Each path outside that subtree (code fixes, doc edits, ANY non-spec content) SHALL be reverted to its committed (HEAD) state BEFORE the spec-PR commit, by a strategy chosen by where the path lives: a tracked path PRESENT in HEAD (a modification, deletion, type-change, OR the source side of a rename) is restored — BOTH the index AND the worktree — via `git checkout HEAD -- <path>`, so a code edit the executor staged with `git add` cannot survive; a tracked path ABSENT from HEAD (a brand-new file the executor created AND staged — porcelain `A ` — OR a rename destination) is unstaged via `git reset HEAD -- <path>` AND removed from disk; an untracked addition is removed from disk via `std::fs::remove_file` / `remove_dir_all`. The not-in-HEAD case SHALL NOT be reverted with `git checkout HEAD` / `git restore --source=HEAD`, which abort with a "pathspec did not match any file(s) known to git" error for a path absent from HEAD on some git versions — exactly the common case where the executor `git add`ed a new code file. If any non-spec write cannot be reverted or removed, the daemon SHALL abort before the spec-PR commit rather than allow the write to leak into the spec PR. At most ONE PR is created per triage run — the spec PR. The fixes-PR path is removed entirely; code fixes flow through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR.
+After the triage executor returns `Completed`, the daemon SHALL inspect the working tree's changed paths AND keep ONLY paths inside the triage's output subtree for this run — `openspec/changes/<derived-slug>/` for a spec change OR `issues/<derived-slug>/` for a behavior-preserving issue. Each path outside the kept subtree (code fixes, doc edits, ANY other content) SHALL be reverted to its committed (HEAD) state BEFORE the PR commit, by a strategy chosen by where the path lives: a tracked path PRESENT in HEAD (a modification, deletion, type-change, OR the source side of a rename) is restored — BOTH the index AND the worktree — via `git checkout HEAD -- <path>`, so a code edit the executor staged with `git add` cannot survive; a tracked path ABSENT from HEAD (a brand-new file the executor created AND staged — porcelain `A ` — OR a rename destination) is unstaged via `git reset HEAD -- <path>` AND removed from disk; an untracked addition is removed from disk via `std::fs::remove_file` / `remove_dir_all`. The not-in-HEAD case SHALL NOT be reverted with `git checkout HEAD` / `git restore --source=HEAD`, which abort with a "pathspec did not match any file(s) known to git" error for a path absent from HEAD on some git versions — exactly the common case where the executor `git add`ed a new code file. If any out-of-scope write cannot be reverted or removed, the daemon SHALL abort before the PR commit rather than allow the write to leak into the PR. At most ONE PR is created per triage run — the spec PR OR the issue PR. Code fixes flow through the standard implementer pipeline on a subsequent polling iteration after the operator merges the PR.
 
-When the discard step drops non-empty paths (the agent wrote code despite the prompt's restriction), the daemon SHALL emit a WARN log naming the dropped paths AND post a chatops reply in the audit-thread naming the dropped paths AND directing the operator to capture the dropped fixes as `tasks.md` items in the spec if they were load-bearing.
+When the discard step drops non-empty out-of-scope paths (the agent wrote code despite the prompt's restriction), the daemon SHALL emit a WARN log naming the dropped paths AND post a chatops reply in the audit-thread naming the dropped paths AND directing the operator to capture the dropped fixes as `tasks.md` items if they were load-bearing.
 
-When the discard step leaves NO spec content in `openspec/changes/<derived-slug>/` (the agent wrote only code AND no spec), NO PR is created AND the daemon posts a chatops reply in the audit-thread naming `no spec content produced; retry with a clearer directive`. The audit-thread's `status` flips to `TriageFailed`.
+When the discard step leaves NO content in EITHER `openspec/changes/<derived-slug>/` OR `issues/<derived-slug>/` (the agent wrote only code, or nothing), NO PR is created AND the daemon posts a chatops reply in the audit-thread naming `no spec or issue content produced; retry with a clearer directive`. The audit-thread's `status` flips to `TriageFailed`.
 
-When the discard step leaves spec content, the daemon SHALL create the spec branch off the same base, commit the spec paths with subject `audit-triage spec proposal from <audit_type>`, push the branch, AND open the spec PR via the existing PR-creation helpers. PR-body text describes the spec content AND does NOT cross-link to any fixes PR (there is no fixes PR).
+When the discard step leaves content in the kept subtree, the daemon SHALL create the branch off the same base, commit the kept paths with a lane-appropriate subject (`audit-triage spec proposal from <audit_type>` for a spec change, `audit-triage issue from <audit_type>` for an issue), push the branch, AND open the PR via the existing PR-creation helpers. On merge of an issue PR, the issues-lane walker picks up `issues/<derived-slug>/` and implements it through the standard pipeline. PR-body text describes the content AND does NOT cross-link to any fixes PR (there is no fixes PR).
 
 #### Scenario: Mixed diff produces one spec PR; code paths are discarded with chatops warning
 - **GIVEN** the triage executor's Completed working tree contains BOTH new files in `openspec/changes/audit-fix-x/` AND modifications to `src/foo.rs`
@@ -3458,16 +3319,24 @@ When the discard step leaves spec content, the daemon SHALL create the spec bran
 - **AND** a WARN log fires naming the audit type, the derived slug, AND `src/foo.rs` as the dropped path
 - **AND** the daemon creates a spec branch + PR with ONLY `openspec/changes/audit-fix-x/` paths
 - **AND** the PR body does NOT mention a companion fixes PR
-- **AND** the daemon posts a chatops reply in the audit-thread naming `src/foo.rs` as dropped AND explaining `Per a43, code fixes go through the standard implementer pipeline. The spec PR has been opened; if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items.`
+- **AND** the daemon posts a chatops reply in the audit-thread naming `src/foo.rs` as dropped AND explaining that code fixes go through the standard implementer pipeline; the spec PR has been opened; if the dropped fixes were load-bearing, revise the spec to capture them as tasks.md items
 - **AND** the audit-thread's `status` flips to `Acted`
 
 #### Scenario: A staged brand-new code file is discarded without a pathspec error
 - **GIVEN** the triage executor's Completed working tree contains new files in `openspec/changes/audit-fix-x/` AND a brand-new file `src/new.rs` the executor created AND staged with `git add` (porcelain `A `, absent from HEAD)
 - **WHEN** the audit-triage completion handler runs
 - **THEN** `src/new.rs` is unstaged via `git reset HEAD -- src/new.rs` AND removed from disk, NOT reverted with `git checkout HEAD` / `git restore --source=HEAD` (which would abort with a pathspec error for a path absent from HEAD)
-- **AND** the discard step does NOT error AND the triage flow proceeds to open the spec PR
+- **AND** the discard step does NOT error AND the triage flow proceeds to open the PR
 - **AND** `src/new.rs` is named among the dropped paths in both the WARN log AND the chatops reply
-- **AND** the spec PR's diff contains ONLY `openspec/changes/audit-fix-x/` paths
+- **AND** the PR's diff contains ONLY `openspec/changes/audit-fix-x/` paths
+
+#### Scenario: A refactor triage produces one issue PR
+- **GIVEN** the triage acted on an architecture_advisor recommendation AND the executor's Completed working tree contains new files in `issues/<derived-slug>/` (`issue.md` AND `tasks.md`, no `specs/` directory) AND modifications to `src/foo.rs`
+- **WHEN** the audit-triage completion handler runs
+- **THEN** `src/foo.rs` is reverted by the same per-path strategy AND only `issues/<derived-slug>/` is kept
+- **AND** the daemon commits with subject `audit-triage issue from architecture_advisor` AND opens ONE issue PR
+- **AND** no `openspec/changes/` spec proposal is created
+- **AND** on merge the issues-lane walker picks up `issues/<derived-slug>/`
 
 #### Scenario: Spec-only triage produces one spec PR with no warning
 - **GIVEN** the triage executor's Completed working tree contains ONLY new files in `openspec/changes/audit-fix-x/`
@@ -3477,12 +3346,12 @@ When the discard step leaves spec content, the daemon SHALL create the spec bran
 - **AND** NO chatops warning is posted (the agent followed the restriction)
 - **AND** the audit-thread's `status` flips to `Acted`
 
-#### Scenario: Code-only triage produces NO PR; chatops reply explains no spec content
-- **GIVEN** the triage executor's Completed working tree contains ONLY modifications to `src/foo.rs` (no `openspec/changes/<derived-slug>/` content)
+#### Scenario: Code-only triage produces NO PR; chatops reply explains no content
+- **GIVEN** the triage executor's Completed working tree contains ONLY modifications to `src/foo.rs` (no `openspec/changes/<derived-slug>/` AND no `issues/<derived-slug>/` content)
 - **WHEN** the audit-triage completion handler runs
 - **THEN** the discard step restores `src/foo.rs` to the base-branch state
-- **AND** no spec branch is created AND no PR is opened
-- **AND** the daemon posts a chatops reply in the audit-thread naming `no spec content produced; retry with a clearer directive`
+- **AND** no branch is created AND no PR is opened
+- **AND** the daemon posts a chatops reply in the audit-thread naming `no spec or issue content produced; retry with a clearer directive`
 - **AND** the audit-thread's `status` flips to `TriageFailed`
 
 #### Scenario: Empty-diff triage posts a no-action reply
@@ -3493,10 +3362,10 @@ When the discard step leaves spec content, the daemon SHALL create the spec bran
 - **AND** the audit-thread's `status` flips to `Acted`
 
 #### Scenario: Slug collision is suffixed
-- **GIVEN** the derived slug `<audit-type>-<hash>` already exists as `openspec/changes/<slug>/`
-- **WHEN** the audit-triage completion handler builds the spec dir
+- **GIVEN** the derived slug `<audit-type>-<hash>` already exists as the kept subtree (`openspec/changes/<slug>/` OR `issues/<slug>/`)
+- **WHEN** the audit-triage completion handler builds the output dir
 - **THEN** the daemon increments a suffix (`-2`, `-3`, ...) until it finds a free path
-- **AND** the resulting spec directory uses the suffixed slug
+- **AND** the resulting directory uses the suffixed slug
 
 ### Requirement: Triage-created PRs participate in the existing PR-comment-revision-loop
 PRs spawned by audit-reply triage SHALL be structurally identical to polling-loop-spawned PRs from the revision-loop dispatcher's perspective. Operators replying `@<bot> revise <text>` on either the fixes PR OR the spec PR get revisions through the standard channel from `a01-pr-comment-revision-loop`; the dispatcher does not need to distinguish triage-PRs from regular PRs.
@@ -3581,13 +3450,13 @@ The chatops listener SHALL recognize `@<bot> audit <audit-substring> <repo-subst
 - **AND** the bot posts a threaded reply whose first line is `✓ Queued security_bug_audit for <repo_url>. Will run on the next polling iteration (~Nm).` (where `~Nm` is the per-repo poll interval rounded to minutes, OR `imminently` when the next iteration is <30 seconds away)
 
 #### Scenario: Ambiguous audit substring lists candidates
-- **WHEN** an operator posts `@<bot> audit arch myrepo` AND `arch` matches both `architecture_brightline` and `architecture_consultative`
-- **THEN** the bot replies `✗ audit substring \`arch\` matches multiple: architecture_brightline, architecture_consultative. Be more specific.`
+- **WHEN** an operator posts `@<bot> audit canon myrepo` AND `canon` matches both `canon_contradiction_audit` and `canon_consolidation_audit`
+- **THEN** the bot replies `✗ audit substring \`canon\` matches multiple: canon_consolidation_audit, canon_contradiction_audit. Be more specific.`
 - **AND** no audit is queued
 
 #### Scenario: Unknown audit substring lists all registered names
 - **WHEN** an operator posts `@<bot> audit gibberish myrepo`
-- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_brightline, architecture_consultative, drift_audit, missing_tests_audit, security_bug_audit.`
+- **THEN** the bot replies `✗ no audit matched \`gibberish\`; registered: architecture_advisor, drift_audit, missing_tests_audit, security_bug_audit, documentation_audit, canon_contradiction_audit, canon_consolidation_audit.`
 - **AND** no audit is queued
 
 ### Requirement: Queued audit runs bypass cadence on the next iteration
@@ -7106,23 +6975,6 @@ When `cache.workspaces_max_gb` is unset, the cache is unbounded (today's behavio
 - **THEN** the daemon re-creates the workspace via the existing workspace-init (clone) path
 - **AND** the repo's per-PR revision state AND audit state (resolved from the state directory, not the workspace) are intact
 
-### Requirement: Consultative audit prioritizes oversized, low-cohesion code
-The `architecture_consultative` audit's prompt SHALL direct the agent to treat code size as a priority signal. Among the observations it is allowed to raise (per the `Architecture consultative audit` requirement's 0-5 cap, question framing, AND finding schema — this requirement adds a prioritization directive only; it does NOT change the audit's output transport, severity range, or cap), the agent SHALL rank a file or function that is large relative to the rest of the codebase AND exhibits multiple responsibilities as a first-rank "should this split, and along what seams?" question. The prompt SHALL direct the agent to reason about cohesion rather than raw line count — a large file that is genuinely one cohesive responsibility is left unflagged, while a smaller file that mixes unrelated responsibilities may be raised — AND to flag families of near-identical functions (the same control-flow skeleton under different names) that an identical-signature comparison cannot detect.
-
-#### Scenario: An oversized, multi-responsibility file is raised as a split question
-- **WHEN** the consultative audit runs against a codebase containing a file that is large relative to its peers AND spans several unrelated responsibilities
-- **THEN** the prompt directs the agent to raise that file as a "should this split, and along what seams?" question, anchored to the file per the consultative audit's anchoring rule
-- **AND** the question is ranked ahead of lower-priority observations within the 0-5 cap
-
-#### Scenario: A large but cohesive file is not flagged for splitting
-- **WHEN** the consultative audit encounters a file that exceeds typical size but implements a single cohesive responsibility
-- **THEN** the prompt directs the agent NOT to raise a split question on size alone
-- **AND** size without a cohesion problem does not consume one of the 0-5 finding slots
-
-#### Scenario: Near-identical function families are flagged
-- **WHEN** the codebase contains several functions sharing one control-flow skeleton under different names, which an identical-signature comparison does not match
-- **THEN** the prompt directs the agent to raise the family as a consolidation observation anchored to the constituent sites
-
 ### Requirement: Reviewer-initiated revisions from one review dispatch as a single run
 All `<!-- reviewer-revision -->` requests produced by a single review SHALL be collected and dispatched as ONE revision run — one executor invocation carrying every concern from that review together — rather than one run per request. The aggregated run SHALL count as exactly ONE increment against the auto-revision cap (`executor.max_auto_revisions_per_pr`), AND SHALL post one operator-visible summary of the concerns it is addressing.
 
@@ -7271,6 +7123,10 @@ Within the existing per-repo serializer (the busy-marker — one unit of work pe
 ### Requirement: Hybrid issue ingestion with maintainer promotion
 The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write `issues/<slug>/` AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
 
+The candidate notification SHALL be posted in a way that a later promotion reply can be matched to it: the daemon SHALL capture the posted message's `thread_ts` AND `channel` AND persist them on the candidate's stored state. A candidate whose thread was not captured (a degraded post) is simply not matchable by a reply — graceful degradation, never an error. The notification SHALL instruct the maintainer to reply `@<bot> send it` (the mention form that the verb recognizes), retaining the statement that nothing is written OR queued until they do.
+
+Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate, write `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md` for a public-origin candidate), AND flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready `issues/<slug>/`). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
+
 #### Scenario: A triaged report posts a candidate and queues nothing
 - **WHEN** a reported issue is triaged
 - **THEN** a candidate `issues/<slug>/` is drafted and posted to chatops
@@ -7288,6 +7144,22 @@ The daemon SHALL ingest reported issues without giving public authors the abilit
 #### Scenario: Duplicates are deduped
 - **WHEN** a report duplicates an open or an archived issue
 - **THEN** it is deduped AND no candidate is queued
+
+#### Scenario: The candidate notification is matchable and instructs the mention form
+- **WHEN** a candidate is posted to chatops
+- **THEN** the posted message's `thread_ts` AND `channel` are persisted on the candidate's stored state
+- **AND** the notification instructs the maintainer to reply `@<bot> send it`
+
+#### Scenario: The promotion action writes, queues, and flips status
+- **WHEN** the promotion control-socket action runs for a posted candidate
+- **THEN** the daemon writes `issues/<slug>/` (including the quarantined `report-body.md` for a public-origin candidate)
+- **AND** the candidate's stored status becomes promoted
+- **AND** the written unit is ready for the issues-lane walker
+
+#### Scenario: The promotion action is idempotent
+- **WHEN** the promotion control-socket action runs for a candidate that is already promoted
+- **THEN** no further filesystem write is performed
+- **AND** the action reports that the candidate is already promoted
 
 ### Requirement: Triage routing classifies each report
 Triage SHALL classify each report AND route it accordingly: a **Bug** (code has drifted from a specification that is itself correct) becomes an issues-lane candidate; a **Behavior change** (the report wants new or changed behavior) is routed to the changes lane as a proposal, NOT an issue; a **Question, invalid report, or duplicate** is declined or deduped with no work queued.
@@ -7641,4 +7513,297 @@ The `autocoder install` wizard SHALL prompt operators about the issues lane duri
 #### Scenario: Non-interactive explicit disable
 - **WHEN** an operator passes `--issues-lane disabled`
 - **THEN** the rendered config.yaml contains no `features.issues` entry (same as the default)
+
+### Requirement: Audit runs fail closed to a non-passing did-not-complete outcome
+Every audit run SHALL initialize its outcome to an explicit non-passing "did not complete" state, conforming to the project-documentation `gatekeepers-fail-closed` standard. That initial state SHALL be overwritten ONLY by an evidenced terminal verdict: a session that demonstrably ran to completion AND either produced its expected artifact OR positively declared a survey conclusion. A run that cannot produce such evidence SHALL resolve to a surfaced did-not-complete outcome — never to a passing `NoFindings` / empty `SpecsWritten` result.
+
+The audit framework SHALL expose a `DidNotComplete { audit_type, cause, examined_summary }` outcome variant. `cause` distinguishes at least: a session error (timeout, non-zero exit, **OR an exit status that was not captured**); a session that ended without declaring any terminal verdict; and a session that declared findings it could not persist. The scheduler SHALL treat `DidNotComplete` like the existing audit-failure path — it SHALL NOT advance the audit's cadence state AND it SHALL surface the failure (chatops alert when a backend is configured) — and SHALL keep it distinct from `NoFindings`, `SpecsWritten`, and `WorkspaceUnavailable`.
+
+For a specs-writing audit, "no findings" SHALL be backed by the agent's positive declaration that it examined the code and reached that conclusion; the mere absence of new change directories SHALL NOT by itself be reported as "no findings." A specs-writing audit's terminal outcome — its written-proposals result OR its did-not-complete result — SHALL carry an `examined_summary` (the agent's account of what it looked at) so that even a clean run is accompanied by evidence the audit actually ran, and so the on-demand completion notification can report it.
+
+#### Scenario: Outcome is non-passing until an evidenced verdict overwrites it
+- **WHEN** an audit run begins
+- **THEN** its outcome is initialized to a non-passing did-not-complete state
+- **AND** only a session that ran to completion AND produced its expected artifact OR positively declared a survey conclusion may overwrite that state with a passing outcome
+
+#### Scenario: Uncaptured exit status is a failure, not a pass
+- **WHEN** an audit's wrapped session ends AND no exit status was captured (e.g. the process was signal-killed)
+- **THEN** the audit resolves to `DidNotComplete { cause: <session-errored>, .. }`
+- **AND** the scheduler does NOT advance the cadence state AND surfaces the failure
+- **AND** the outcome is NOT `NoFindings` or empty `SpecsWritten`
+
+#### Scenario: Findings that cannot be persisted are surfaced, not dropped
+- **WHEN** a specs-writing audit's agent declares it found one or more issues but no valid change directory was persisted for them
+- **THEN** the audit resolves to `DidNotComplete { cause: <found-but-could-not-persist>, .. }`
+- **AND** a chatops alert is posted AND the cadence state is NOT advanced
+- **AND** the run is NOT reported as "0 findings"
+
+#### Scenario: A specs-writing outcome carries an examined summary
+- **WHEN** a specs-writing audit reaches a terminal outcome (proposals written, no findings, or did-not-complete)
+- **THEN** the outcome carries an `examined_summary` describing what the audit looked at, available to the on-demand completion notification and its conclusion
+
+### Requirement: On-demand audit triggers carry their chat origin and receive a terminal completion notification
+When an audit is triggered on demand — via the chatops `audit` verb or the CLI `audit run` subcommand against a running daemon — the originating chat context (channel and thread identifiers, when present) SHALL be carried through the `queue_audit` control-socket action and onto the queued entry, so the daemon can reply to the operator who asked. After the queued audit reaches a terminal outcome, the scheduler SHALL post a terminal completion notification to that origin. A cadence-driven (not operator-triggered) run carries no origin and SHALL NOT emit this completion notification (its existing findings / failure notifications are unchanged).
+
+#### Scenario: queue_audit carries the originating chat context
+- **WHEN** an operator triggers `@<bot> audit <type> <repo>` from a chat thread
+- **THEN** the submitted `queue_audit` action includes the originating channel and thread identifiers
+- **AND** the queued entry retains that origin until the audit runs
+
+#### Scenario: A completed on-demand audit replies to the operator's thread
+- **WHEN** an operator-triggered audit reaches a terminal outcome
+- **THEN** the scheduler posts a completion notification to the originating thread reporting the terminal result (findings, no-findings with the examined summary, OR a did-not-complete failure with its cause)
+
+#### Scenario: A cadence-driven run emits no completion notification
+- **WHEN** an audit runs because its cadence came due (no operator trigger, no origin)
+- **THEN** no on-demand completion notification is posted
+- **AND** the audit's existing findings / failure notification behavior is unchanged
+
+### Requirement: On-demand audit-run queue survives pass-skip, early-return, and bound-zero
+A queued on-demand audit SHALL be removed from the `pending_audit_runs` queue ONLY after the audit has actually run. When the polling pass that would run it is skipped (busy marker), returns early before the audit phase (workspace-init failure), or is bounded out (`max_audits_per_iteration: 0`), the queued entry SHALL remain for a later iteration rather than being discarded.
+
+#### Scenario: A busy-skipped pass does not lose the queued audit
+- **WHEN** an audit is queued AND the next pass skips because a busy marker is held
+- **THEN** the queued entry is still present for the following iteration
+- **AND** the audit runs once a non-skipped pass reaches the audit phase
+
+#### Scenario: A workspace-init failure does not lose the queued audit
+- **WHEN** an audit is queued AND the next pass returns early because `ensure_initialized` failed
+- **THEN** the queued entry is still present for the following iteration
+
+#### Scenario: An audit bound of zero defers rather than discards
+- **WHEN** an audit is queued AND `max_audits_per_iteration` is `0`
+- **THEN** the audit phase runs no audits this iteration AND the queued entry is retained for a later iteration
+
+### Requirement: On-demand audit-run queue persists across daemon restart
+The per-repo on-demand audit-run queue (`pending_audit_runs`) SHALL be persisted to durable storage so that a daemon restart between an operator's enqueue acknowledgement and the audit's run does not lose the queued request. The queue SHALL be written on every mutation — both enqueue AND the post-run prune — using an atomic write (tempfile + rename), AND SHALL be loaded into memory when a repo's polling task is spawned. A persisted entry whose repo is no longer configured SHALL be reconciled away at load. Persistence SHALL be best-effort: a read or write failure is logged AND does NOT abort the run, with the in-memory queue remaining authoritative for the live process.
+
+#### Scenario: A restart between enqueue and run preserves the queued audit
+- **WHEN** an audit is queued AND the daemon restarts before the audit has run
+- **THEN** the queued audit is restored from durable storage when the repo's polling task is spawned
+- **AND** it runs on a subsequent iteration
+
+#### Scenario: A persisted entry is removed once its audit runs
+- **WHEN** a queued audit runs AND is pruned from the in-memory queue
+- **THEN** the durable copy is updated to no longer contain that entry
+- **AND** a later restart does NOT re-run the already-run audit
+
+#### Scenario: An orphaned persisted entry is reconciled at load
+- **WHEN** the daemon starts AND a persisted queue file names a repository that is no longer in the configured set
+- **THEN** the orphaned entry is dropped at load rather than resurrected as work
+
+#### Scenario: A corrupt queue file degrades gracefully
+- **WHEN** the persisted queue file cannot be read OR parsed at load
+- **THEN** the failure is logged AND the repo starts with an empty in-memory queue
+- **AND** the daemon does not panic or abort startup
+
+### Requirement: Spec-writing bug/gap audits choose their output lane by canon judgment
+The `security_bug_audit` AND `missing_tests_audit` audits SHALL choose the output lane for each finding by canon-grounded judgment, never defaulting to the spec lane. Before proposing a fix the audit SHALL read the canonical spec(s) for the capability the finding touches. A finding whose fix changes an observable contract (public API, serialized/wire format, CLI surface, a state machine, OR a new/changed invariant), OR whose correct fix requires changing a canonical requirement, SHALL be written to the spec lane (`openspec/changes/<slug>/`). A finding whose fix preserves the observed behavior of code that is already correctly specified SHALL be written to the issues lane (`issues/<slug>/`, containing `issue.md` AND `tasks.md`, with NO `specs/` directory). The audit SHALL reuse canonical vocabulary AND SHALL prefer a `MODIFIED` delta of an existing requirement over an `ADDED` requirement that introduces a parallel term for a concept canon already names.
+
+Lane choice SHALL be gated by the `features.issues` flag for the repository: when the flag is off, ONLY the spec lane is offered AND the audit behaves as it did before this capability existed. The audits SHALL run under a `WritePolicy` permitting writes under BOTH `openspec/changes/` AND `issues/`, reverting any write outside those two planning lanes. `canon_consolidation_audit` is excluded from lane choice — it exists to evolve canon AND is spec-lane by definition.
+
+#### Scenario: Lane is chosen by contract impact, never defaulted
+- **WHEN** a bug/gap audit produces a finding AND `features.issues` is on for the repository
+- **THEN** it selects the lane by whether the fix changes an observable contract — spec lane for a contract change, issues lane for a behavior-preserving fix
+- **AND** it does NOT route to the spec lane by default
+
+#### Scenario: Canon is read and its vocabulary reused
+- **WHEN** the audit frames a fix
+- **THEN** it has read the canonical spec(s) for the area of the finding
+- **AND** it reuses the canonical vocabulary rather than coining a new term for a concept canon already names
+- **AND** it prefers a `MODIFIED` delta of the existing requirement over an `ADDED` requirement introducing a parallel term
+
+#### Scenario: A contract-correcting fix uses a legible MODIFIED delta
+- **WHEN** the correct fix requires changing a canonical requirement (canon permits or mandates the defective behavior)
+- **THEN** the audit writes a spec-lane change carrying a `MODIFIED` delta of that requirement
+- **AND** it states the contract change plainly in the proposal's rationale rather than burying it inside an issue
+
+#### Scenario: With features.issues off only the spec lane is offered
+- **WHEN** `features.issues` is off for the repository
+- **THEN** the audit writes only `openspec/changes/` units AND the issue lane is not offered
+- **AND** its behavior is unchanged from before this capability existed
+
+#### Scenario: A write outside the two planning lanes is reverted
+- **WHEN** the agent writes any path outside BOTH `openspec/changes/` AND `issues/` (a source edit, a doc edit, a config change)
+- **THEN** the audit's `WritePolicy` post-run check fails AND the framework reverts via `git reset --hard HEAD && git clean -fd`
+- **AND** the run is treated as failed: cadence state is NOT advanced, a chatops alert is posted, AND the audit re-runs next iteration
+
+### Requirement: Spec-writing audits gate-check their output and self-heal before commit
+After a spec-writing audit (`security_bug_audit`, `missing_tests_audit`) writes a spec-lane change AND it passes `openspec validate --strict`, the audit SHALL run the `[in]` (change-internal) AND `[canon]` (change-vs-canonical) verifier-gate checks against that change BEFORE committing it, for each gate that is enabled. These authoring-time checks reuse the verifier framework's existing checks unchanged — the same prompts, the same `submit_contradictions` / `submit_canon_contradictions` MCP tools, AND the same opt-in flags (`executor.change_internal_contradiction_check`, `executor.change_canonical_contradiction_check`) that govern the implement-time gates. A verifier gate that is disabled runs at neither authoring nor implement time; an enabled one runs at BOTH — early (here, self-healing) AND at implement time (the unchanged pre-executor gate). These verifier gates are distinct from the issue-lane implementer kick-back (`Issue-flavored implementer prompt verifies against existing canon`), which is an always-on property of the issue implementer — NOT one of these gates AND NOT governed by their flags; disabling a gate does not affect it.
+
+A contradiction finding from `[in]` OR `[canon]` SHALL feed the audit's existing validation-retry loop: the authoring agent is re-invoked with the findings appended to its prompt AND rewrites the unit (delete-and-rewrite), bounded by the same `max_validation_retries` budget that governs `--strict` retries. The agent MAY resolve a finding by aligning the change to canon (reusing canonical vocabulary), by writing a `MODIFIED` delta of the contradicted canonical requirement, OR by converting the unit to an issue. A resolution SHALL NOT dissolve a `[canon]` finding by silently bending the contradicted requirement to fit: a canon-changing resolution SHALL be a legible `MODIFIED` delta whose contract change is stated plainly in the proposal's rationale.
+
+On exhausting the retry budget with the contradiction unresolved, the audit SHALL NOT commit the offending unit AND SHALL resolve that unit to `AuditOutcome::DidNotComplete` — the fail-closed framework's "found a finding it could not persist as a clean unit" disposition — surfaced via the existing audit-failure path. The interactive human handoff for such a residue is provided separately.
+
+#### Scenario: Enabled gates run against the written change before commit
+- **WHEN** a spec-writing audit produces a spec-lane change that passes `openspec validate --strict` AND the `[in]` and/or `[canon]` gate is enabled
+- **THEN** the audit runs each enabled gate's contradiction check against that change before committing it
+- **AND** the checks use the same prompts, MCP submission tools, and opt-in flags as the implement-time gates
+
+#### Scenario: A contradiction feeds the existing retry loop
+- **WHEN** the `[canon]` check returns one or more contradictions for the written change AND the retry budget is not exhausted
+- **THEN** the audit re-invokes the authoring agent with the findings appended to its prompt AND the agent rewrites the unit (delete-and-rewrite)
+- **AND** the rewritten unit is re-checked on the next attempt
+
+#### Scenario: Self-heal by aligning to canon
+- **WHEN** the agent resolves a `[canon]` contradiction by reusing the canonical vocabulary so the change no longer conflicts with the existing requirement
+- **THEN** the rewritten change passes the `[canon]` check AND is committed
+- **AND** no canonical requirement is modified by the change
+
+#### Scenario: Self-heal by converting to an issue
+- **WHEN** the agent judges that the finding's correct resolution is a behavior-preserving fix with no contract change AND `features.issues` is enabled
+- **THEN** it converts the unit to an `issues/<slug>/` unit (which then runs the issue contract-change check)
+- **AND** the original spec-lane change directory is not committed
+
+#### Scenario: A canon-changing resolution is legible, not laundered
+- **WHEN** the only correct resolution is to change a canonical contract
+- **THEN** the rewritten change carries a `MODIFIED` delta of the contradicted requirement AND states the contract change in the proposal's rationale
+- **AND** the audit does NOT make the finding vanish by quietly altering the requirement to match the original change
+
+#### Scenario: Exhausted budget fails closed without committing
+- **WHEN** the retry budget is exhausted AND a `[in]` or `[canon]` contradiction remains unresolved
+- **THEN** the audit does NOT commit the offending unit
+- **AND** it resolves that unit to `AuditOutcome::DidNotComplete` (the found-but-could-not-persist disposition) AND surfaces the failure via the audit-failure path
+
+#### Scenario: A disabled gate is not run at authoring time
+- **WHEN** the `[canon]` gate is disabled (`executor.change_canonical_contradiction_check` unset)
+- **THEN** the audit does NOT run a `[canon]` check at authoring time
+- **AND** the change is committed on `--strict` success as before (the `[canon]` verifier gate likewise does not run at implement time for this change, consistent with the gate being disabled)
+
+#### Scenario: A clean change commits unchanged
+- **WHEN** the written change passes `--strict` AND every enabled gate returns no contradictions
+- **THEN** the audit commits it exactly as it does today
+- **AND** the enabled implement-time gates still run as the backstop and find it clean
+
+### Requirement: Audit-authored issues are checked for hidden contract changes at authoring time
+When a spec-writing audit writes an issue-lane unit (`issues/<slug>/`), it SHALL run an authoring-time contract-change check before committing the unit, whenever the `[canon]` gate is enabled (`executor.change_canonical_contradiction_check`). The check is an `agentic_run` session in a read-only sandbox that reads the unit's `issue.md` AND the relevant canonical specs AND judges whether implementing the issue would require changing a canonical contract — the same canon-consistency judgment the `[canon]` gate applies to spec deltas, applied here to an issue that claims (by carrying no spec delta) to change no contract.
+
+If implementing the issue would require a contract change, the audit SHALL re-route the unit to the spec lane within the retry budget (after which the spec-lane gate checks apply); an unresolved case SHALL be rejected — the unit is NOT committed AND resolves to the fail-closed found-but-could-not-persist disposition. This authoring-time check is the early complement to the implement-time issue kick-back ("Issue-flavored implementer prompt verifies against existing canon"): both enforce that an issue carries no contract change, one before the unit is committed and one at run time as the backstop.
+
+#### Scenario: An honest issue passes the contract-change check
+- **WHEN** an audit-authored issue's fix preserves observed behavior of already-correctly-specified code AND the `[canon]` gate is enabled
+- **THEN** the contract-change check finds no required contract change AND the issue is committed
+- **AND** no spec delta is produced for it
+
+#### Scenario: An issue needing a contract change is re-routed to the spec lane
+- **WHEN** the contract-change check finds that implementing the issue would require changing a canonical contract AND the retry budget is not exhausted
+- **THEN** the audit re-routes the unit to the spec lane AND the spec-lane gate checks then apply to it
+- **AND** the issue-lane unit is not committed as an issue
+
+#### Scenario: An unresolved contract-change issue is rejected, not committed
+- **WHEN** the contract-change finding cannot be resolved within the retry budget
+- **THEN** the unit is NOT committed AND resolves to `AuditOutcome::DidNotComplete` (the found-but-could-not-persist disposition)
+- **AND** the failure is surfaced via the audit-failure path
+
+#### Scenario: Disabled canon gate skips the authoring-time issue check
+- **WHEN** the `[canon]` gate is disabled
+- **THEN** the audit does NOT run the authoring-time contract-change check
+- **AND** the issue is committed on its structural validity (an `issue.md` and `tasks.md`, no `specs/`), with the implement-time issue kick-back — a separate always-on mechanism, NOT the `[canon]` gate — remaining as the backstop
+
+### Requirement: Spec-revision contradiction alert is a tracked, discussable thread
+When autocoder posts a `SpecNeedsRevision` chatops alert for a CONTRADICTION marker — a `.needs-spec-revision.json` whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty (a `[in]` / `[canon]` semantic finding, NOT the executor's unimplementable-tasks flag NOR a gate-error hold) — autocoder SHALL capture the posted message's `channel` AND `thread_ts` in a `RevisionThreadState` keyed to the repository AND change slug, so a later reply can be matched to the change. The alert body SHALL advertise that the operator may reply in the thread to discuss the revision OR post `@<bot> send it` to have the change revised and a PR opened. A degraded post that returns no `thread_ts` SHALL still write the marker AND alert but SHALL NOT record a `RevisionThreadState` (the alert is simply not reply-matchable — graceful degradation, never an error). The `clear-revision` verb remains the unchanged manual escape.
+
+#### Scenario: A contradiction alert is tracked and advertises the thread
+- **WHEN** autocoder posts the `SpecNeedsRevision` alert for a marker with empty `unimplementable_tasks` AND empty `gate_error`
+- **THEN** it records a `RevisionThreadState` carrying the alert's `channel`, `thread_ts`, repository, AND change slug
+- **AND** the alert body states that a reply discusses the revision AND that `@<bot> send it` revises the change and opens a PR
+
+#### Scenario: An unimplementable-tasks alert is not tracked as a revision thread
+- **WHEN** the marker's `unimplementable_tasks` is non-empty (the executor's flag-and-halt case)
+- **THEN** no `RevisionThreadState` is recorded for it AND the alert does not advertise the revision thread
+- **AND** that marker keeps its existing operator-authored flow (the agent flags; the operator edits `tasks.md`)
+
+#### Scenario: A degraded post is not reply-matchable
+- **WHEN** the alert post returns no `thread_ts`
+- **THEN** the marker AND alert are still produced
+- **AND** no `RevisionThreadState` is recorded (the thread is simply not reply-matchable)
+
+### Requirement: Revision advisor discusses a flagged change read-only
+A non-`send it` `@<bot>` reply whose `thread_ts` matches a `RevisionThreadState` SHALL run a read-only agentic session — the revision advisor — reconstructed from the flagged change's spec deltas, the relevant canonical specs, the marker's contradiction narrative, AND the thread transcript so far. The advisor SHALL answer the operator's question — typically whether to align the change to canon's existing vocabulary OR to MODIFY the contradicted canonical requirement, and how — AND SHALL write nothing to the workspace. The session SHALL be stateless: each reply reconstructs the advisor from the on-disk artifacts AND the thread transcript; no agent session is persisted between replies.
+
+#### Scenario: The advisor answers from change, canon, and transcript, writing nothing
+- **WHEN** an operator posts a discussion reply in a revision thread
+- **THEN** a read-only session reads the change deltas, the relevant canon, the marker's contradiction, AND the thread so far, AND replies with its assessment
+- **AND** no file in the workspace is modified by the reply
+
+#### Scenario: Multiple rounds reconstruct from the growing transcript
+- **WHEN** the operator posts a second discussion reply in the same thread
+- **THEN** the advisor is reconstructed afresh, with the earlier exchange included via the thread transcript
+- **AND** no agent session was held between the two replies
+
+### Requirement: Send it in a revision thread runs the spec-revision executor
+`@<bot> send it` in a revision thread SHALL run the spec-revision executor: a write-scoped agentic session that edits the flagged change's spec deltas along the direction the thread converged on, then re-runs the `[in]` AND `[canon]` checks against the revised change before producing any output. On a clean re-gate the executor SHALL open a PR carrying the change's spec-delta revision AND report the PR link in the thread; on a re-gate that still finds a contradiction the executor SHALL open NO PR AND report the remaining contradiction in the thread (the operator may discuss further AND `send it` again). The executor SHALL NOT commit a spec revision to the base branch outside the PR — human review of the PR is the merge gate — AND SHALL NOT auto-edit a `tasks.md` to dodge the executor's unimplementable-tasks flag (that separate marker keeps its operator-authored invariant). The revision is to the change's spec deltas to achieve canon-consistency, performed under operator direction (the thread) AND human review (the PR).
+
+#### Scenario: Send-it revises, re-gates clean, and opens a PR
+- **WHEN** an operator `send it`s a revision thread AND the executor's revision passes the re-run `[in]` and `[canon]` checks
+- **THEN** the executor opens a PR carrying the change's spec-delta revision
+- **AND** it reports the PR link in the thread
+- **AND** it does not merge the PR or commit the revision to the base branch outside the PR
+
+#### Scenario: A revision that still contradicts opens no PR and reports back
+- **WHEN** the executor's revision still fails the re-run `[in]` or `[canon]` check
+- **THEN** no PR is opened
+- **AND** the remaining contradiction is reported in the thread so the operator can discuss further and `send it` again
+
+#### Scenario: The unimplementable-tasks invariant is preserved
+- **WHEN** the spec-revision executor runs
+- **THEN** it revises the change's spec deltas to resolve the contradiction
+- **AND** it does NOT auto-edit a `tasks.md` to make an unimplementable-tasks flag pass (that marker's operator-authored flow is untouched)
+
+### Requirement: Architecture advisory audit
+autocoder SHALL register an `architecture_advisor` audit in the periodic-audit framework, replacing `architecture_brightline` AND `architecture_consultative`. The audit is `requires_head_change = true` AND `WritePolicy::None`.
+
+The audit SHALL select a bounded set of candidate files using a cheap, language-agnostic signal — whole-file line count — taking ONLY the longest files whose line count exceeds a configurable pain threshold, up to a configurable candidate cap; NOT every file over the threshold. The line count is a SELECTOR ONLY: it determines which files the audit examines AND SHALL NOT be emitted as a finding. There is no function-length, duplicate-signature, or duplicate-body metric, AND no `.brightline-ignore` file.
+
+For each selected candidate the audit SHALL invoke the wrapped agent CLI with a read-only sandbox AND a prompt directing the agent to read the file (AND the surrounding context needed to judge cohesion AND placement) AND return a professional recommendation: whether the file warrants refactoring, the nature of the problem (oversized, a low-cohesion "junk drawer", a single oversized function, OR a monolith better wrapped than decomposed), AND a concrete recommended action grounded in the project's own language, architecture, AND patterns. The prompt SHALL forbid snark AND generic best-practice lecturing, AND SHALL require each recommendation to carry a `file` or `file:line-range` anchor.
+
+The audit SHALL return findings as `AuditOutcome::Reported(findings)`, ranked, capped at a small maximum (5). A run that examines its candidates AND finds none worth refactoring SHALL return `AuditOutcome::Reported(vec![])`; the audit-run log SHALL record the candidates examined AND the no-recommendation conclusion so the run carries evidence it looked.
+
+#### Scenario: The audit selects only the longest files over the pain threshold
+- **WHEN** the audit runs against a repository with many files of varying length
+- **THEN** it examines only the longest files whose line count exceeds the configured threshold, up to the configured candidate cap
+- **AND** a file's line count selects it for examination AND is never emitted as a finding
+
+#### Scenario: Each recommendation is actionable and anchored
+- **WHEN** the audit judges a selected file to warrant refactoring
+- **THEN** the finding states what is wrong, why it matters, AND the recommended action
+- **AND** it carries a `file` or `file:line-range` anchor
+- **AND** it is phrased as a recommendation, not a question, with no snark
+
+#### Scenario: A large but cohesive file is not flagged
+- **WHEN** a selected file exceeds the size threshold but implements a single cohesive responsibility
+- **THEN** the audit does NOT recommend splitting it on size alone
+- **AND** that file does not consume one of the capped recommendation slots
+
+#### Scenario: A clean run records what it examined and stays quiet
+- **WHEN** the audit examines its candidates AND none warrant refactoring
+- **THEN** it returns `AuditOutcome::Reported(vec![])`
+- **AND** the audit-run log records the candidates examined AND the no-recommendation conclusion
+- **AND** no chatops post is sent unless `notify_on_clean: true` is set
+
+### Requirement: Audit triage routes behavior-preserving work to the issues lane
+When an operator acts on an advisory audit finding via `send it`, the audit-reply triage SHALL choose its output lane by the nature of the work. A behavior-preserving correction or refactor — one that changes no observable contract — SHALL be drafted as an issue (`issues/<derived-slug>/` containing `issue.md` AND `tasks.md`, with NO `specs/` directory). A spec change (`openspec/changes/<derived-slug>/`) SHALL be produced ONLY when the work requires altering an observable contract (public API, serialized/wire format, CLI surface) OR surfaces a new capability decision that belongs in canon. For architecture-advisor refactor findings the default SHALL be an issue.
+
+#### Scenario: A refactor recommendation becomes an issue
+- **WHEN** triage acts on an `architecture_advisor` recommendation to decompose an oversized file AND no contract change is required
+- **THEN** it drafts `issues/<derived-slug>/` with `issue.md` AND `tasks.md` AND no `specs/` directory
+- **AND** it does NOT create an `openspec/changes/` spec proposal
+
+#### Scenario: A contract-changing cleanup becomes a spec change
+- **WHEN** the recommended cleanup cannot be done without changing a public API, serialized/wire format, OR CLI surface
+- **THEN** triage drafts an `openspec/changes/<derived-slug>/` spec proposal instead of an issue
+- **AND** the issues lane is not used for that finding
+
+### Requirement: Audit findings do not mint new canonical metric requirements
+No audit, AND no triage acting on an audit's findings, SHALL author a NEW canonical requirement that re-encodes an audit's selection or detection metric — a file-size threshold, a function-length threshold, a duplication count, OR a similar heuristic — as a binding constraint a future change is measured against. A project's size/structure budget has a SINGLE canonical home: the `Source files and functions stay within a size budget` requirement, which is explicitly advisory AND non-gating (a size finding never blocks a pull request or a change from archiving). Triage that acts on an architectural finding SHALL produce a behavior-preserving refactor (an issue), NOT a spec requirement restating the threshold. The metric remains a signal the audit uses to select candidates, never a contract.
+
+#### Scenario: An audit threshold is not restated as a new requirement
+- **WHEN** an audit surfaces files or functions exceeding a size threshold AND an operator acts on the finding
+- **THEN** no new spec requirement is authored that states files or functions SHALL stay within that threshold
+- **AND** the resulting work is a behavior-preserving refactor (an issue), not a spec encoding the metric
+
+#### Scenario: The size budget keeps a single advisory home
+- **WHEN** the project records a size or structure budget
+- **THEN** it lives in the single advisory `Source files and functions stay within a size budget` requirement
+- **AND** it is NOT duplicated into per-change specs NOR promoted to a pull-request-blocking gate
 

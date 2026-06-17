@@ -17,10 +17,10 @@
 //! - [`state`]: persistence of `last_run_at` + `last_run_sha` per audit.
 //! - [`scheduler`]: cadence + change-guard + write-policy enforcement.
 
-pub mod architecture_consultative;
-pub mod brightline;
+pub mod architecture_advisor;
 pub mod canon_consolidation;
 pub mod canon_contradiction;
+pub mod code_metrics;
 pub mod documentation_audit;
 pub mod drift;
 pub mod missing_tests;
@@ -75,6 +75,20 @@ pub enum WritePolicy {
     /// `openspec/changes/`. Violations revert the entire diff via
     /// `git reset --hard HEAD` + `git clean -fd` + chatops alert.
     OpenSpecOnly,
+    /// Planning-lanes audit (a01). Sandbox allows `Write`/`Edit`. The
+    /// audit may write under EITHER planning lane — `openspec/changes/`
+    /// (the spec lane) OR the issues lane (the path the issues walker
+    /// reads via [`crate::lanes::issues::ISSUES_SUBDIR`], today
+    /// `openspec/issues/`). The post-hoc check accepts any modified/new
+    /// path under either prefix AND reverts anything else (a source edit,
+    /// a doc edit, a config change) via `git reset --hard HEAD` +
+    /// `git clean -fd` + chatops alert — exactly the `OpenSpecOnly`
+    /// revert, only the set of allowed prefixes widens. The two bug/gap
+    /// audits (`security_bug_audit`, `missing_tests_audit`) run under this
+    /// policy so they can choose their output lane per finding;
+    /// `canon_consolidation_audit` stays `OpenSpecOnly` (spec-lane by
+    /// definition).
+    PlanningLanes,
     /// Full write access. Reserved for future audits with broader
     /// scope; not used by any audit landing in the foundation.
     Approved,
@@ -83,8 +97,9 @@ pub enum WritePolicy {
 impl WritePolicy {
     /// Whether an audit with this policy needs a read-write workspace so its
     /// wrapped agent can persist output. `OpenSpecOnly` audits create change
-    /// dirs under `openspec/changes/`; `Approved` may write anywhere; `None`
-    /// audits are strictly advisory and run read-only.
+    /// dirs under `openspec/changes/`; `PlanningLanes` audits create units
+    /// under `openspec/changes/` OR the issues lane; `Approved` may write
+    /// anywhere; `None` audits are strictly advisory and run read-only.
     ///
     /// This is the SINGLE source from which the audit CLI runners derive BOTH
     /// the OS-sandbox workspace mount AND the CLI-settings `deny_writes` flag,
@@ -96,7 +111,7 @@ impl WritePolicy {
     pub fn workspace_writable(self) -> bool {
         match self {
             WritePolicy::None => false,
-            WritePolicy::OpenSpecOnly | WritePolicy::Approved => true,
+            WritePolicy::OpenSpecOnly | WritePolicy::PlanningLanes | WritePolicy::Approved => true,
         }
     }
 }
@@ -129,6 +144,35 @@ pub struct Finding {
     pub anchor: Option<String>,
 }
 
+/// Why an audit failed to reach an evidenced terminal verdict. Carried by
+/// [`AuditOutcome::DidNotComplete`] and surfaced to operators so an inability
+/// to run is explicit and actionable, never a silent pass (the
+/// `gatekeepers-fail-closed` standard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFailureCause {
+    /// The wrapped session errored: it timed out, exited non-zero, OR its
+    /// exit status could not be captured (e.g. a signal kill).
+    SessionErrored,
+    /// The session ended without the agent declaring a terminal verdict, so
+    /// there is no evidence it ran to a conclusion.
+    NoTerminalVerdict,
+    /// The agent declared findings but none could be persisted as a valid
+    /// change directory.
+    FoundButCouldNotPersist,
+}
+
+impl AuditFailureCause {
+    /// Short operator-facing phrase for log lines and chatops alerts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionErrored => "session errored or exit status not captured",
+            Self::NoTerminalVerdict => "session produced no terminal verdict",
+            Self::FoundButCouldNotPersist => "findings could not be persisted",
+        }
+    }
+}
+
 /// Outcome of one audit's `run`. The scheduler dispatches on the variant:
 /// `NoFindings` → silent; `Reported` → chatops post unless empty + clean
 /// (controlled by `notify_on_clean`); `SpecsWritten` → info log only;
@@ -154,6 +198,10 @@ pub enum AuditOutcome {
     SpecsWritten {
         changes: Vec<String>,
         retries_used: u32,
+        /// The agent's account of what it examined, captured from the session
+        /// transcript. Surfaced by the on-demand completion notification so
+        /// even a clean (zero-proposal) run carries evidence the audit ran.
+        examined_summary: Option<String>,
     },
     /// The audit's LLM produced a proposal that failed
     /// `openspec validate --strict` after exhausting the configured
@@ -177,6 +225,17 @@ pub enum AuditOutcome {
         workspace_path: PathBuf,
         reason: String,
     },
+    /// The audit could not produce an evidenced terminal verdict, so it fails
+    /// closed rather than reporting a passing / no-findings result (the
+    /// `gatekeepers-fail-closed` standard). The scheduler treats this like the
+    /// audit-failure path: it does NOT advance the cadence state and surfaces
+    /// the failure. `examined_summary` carries whatever the agent reported
+    /// about what it looked at, when available.
+    DidNotComplete {
+        audit_type: String,
+        cause: AuditFailureCause,
+        examined_summary: Option<String>,
+    },
 }
 
 impl AuditOutcome {
@@ -197,6 +256,7 @@ impl AuditOutcome {
         Self::SpecsWritten {
             changes,
             retries_used: 0,
+            examined_summary: None,
         }
     }
 
@@ -207,6 +267,7 @@ impl AuditOutcome {
             Self::SpecsWritten { .. } => AuditOutcomeKind::SpecsWritten,
             Self::ValidationExhausted { .. } => AuditOutcomeKind::ValidationExhausted,
             Self::WorkspaceUnavailable { .. } => AuditOutcomeKind::WorkspaceUnavailable,
+            Self::DidNotComplete { .. } => AuditOutcomeKind::DidNotComplete,
         }
     }
 
@@ -224,6 +285,7 @@ impl AuditOutcome {
                 retries_attempted, ..
             } => *retries_attempted,
             Self::WorkspaceUnavailable { .. } => 0,
+            Self::DidNotComplete { .. } => 0,
         }
     }
 }
@@ -239,6 +301,7 @@ pub enum AuditOutcomeKind {
     SpecsWritten,
     ValidationExhausted,
     WorkspaceUnavailable,
+    DidNotComplete,
 }
 
 impl AuditOutcomeKind {
@@ -250,6 +313,7 @@ impl AuditOutcomeKind {
             Self::SpecsWritten => "SpecsWritten",
             Self::ValidationExhausted => "ValidationExhausted",
             Self::WorkspaceUnavailable => "WorkspaceUnavailable",
+            Self::DidNotComplete => "DidNotComplete",
         }
     }
 }
@@ -270,8 +334,8 @@ pub struct AuditContext<'a> {
     /// scheduler-dispatch time and clamped to
     /// [`crate::config::MAX_VALIDATION_RETRIES_CEILING`] at config-load.
     /// Audits that produce LLM-generated proposals consult this; audits
-    /// that produce advisory findings (`drift`, `architecture_consultative`,
-    /// `architecture_brightline`) ignore it.
+    /// that produce advisory findings (`drift`, `architecture_advisor`,
+    /// `documentation_audit`) ignore it.
     pub max_validation_retries: u32,
 }
 
@@ -799,6 +863,38 @@ pub async fn post_validation_exhausted_notification(
     }
 }
 
+/// Post the `🚫` did-not-complete notification: the audit could not reach an
+/// evidenced terminal verdict, so it fails closed rather than reporting a
+/// passing / no-findings result (the `gatekeepers-fail-closed` standard). The
+/// top-line names the repo, audit type, and cause; the examined-summary (when
+/// present) goes in the thread body so an operator sees what, if anything, the
+/// audit looked at before it failed.
+pub async fn post_did_not_complete_notification(
+    ctx: &ChatOpsContext,
+    repo_url: &str,
+    audit_type: &str,
+    cause: AuditFailureCause,
+    examined_summary: Option<&str>,
+) -> Result<()> {
+    let top_line = format!(
+        "🚫 {audit_type} did NOT complete for {repo_url} — {cause}. Treated as failed-to-run (NOT \"no findings\"); cadence unchanged, the audit re-runs next cadence.",
+        cause = cause.as_str(),
+    );
+    match examined_summary {
+        Some(s) if !s.trim().is_empty() => {
+            let body = format!(
+                "What the audit examined before failing:\n{}",
+                truncate_chars(s, VALIDATION_ERROR_NOTIFICATION_CAP)
+            );
+            ctx.chatops
+                .post_notification_with_thread(&ctx.channel, &top_line, &body)
+                .await
+                .map(|_| ())
+        }
+        _ => ctx.chatops.post_notification(&ctx.channel, &top_line).await,
+    }
+}
+
 /// Threading predicate for `ValidationExhausted` notifications: a
 /// validation error spanning more than one line OR more than 300
 /// characters routes through the threaded path. Single-line short
@@ -1129,7 +1225,7 @@ pub(crate) fn audit_resolved_model(
 /// rather than on stdout; the caller drains the stored submission via
 /// [`try_consume_submission`] after this returns.
 ///
-/// `role` is the audit type (`drift_audit`, `architecture_consultative`,
+/// `role` is the audit type (`drift_audit`, `architecture_advisor`,
 /// `documentation_audit`); it doubles as the submission routing `change`
 /// key so the recorder (MCP child) AND the consumer (this module) agree.
 /// The MCP config is deleted on every exit path so the read-only
@@ -1148,7 +1244,7 @@ pub(crate) async fn run_audit_cli_with_submit(
     // canon_consolidation via its RAG/`query_canonical_specs` path, which
     // still writes a `consolidate-` change dir), `false` for WritePolicy::None
     // advisory audits (drift, canon_contradiction, documentation,
-    // architecture_consultative) that only submit findings. Governs both the
+    // architecture_advisor) that only submit findings. Governs both the
     // CLI write-deny AND the OS mount.
     workspace_writable: bool,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
@@ -1313,9 +1409,9 @@ pub fn register_submission_schemas(store: &crate::submission_store::SubmissionSt
         Arc::new(|p: &serde_json::Value| drift::payload_to_findings(p).map(|_| ())),
     );
     store.register_schema(
-        architecture_consultative::ArchitectureConsultativeAudit::TYPE,
+        architecture_advisor::ArchitectureAdvisorAudit::TYPE,
         Arc::new(|p: &serde_json::Value| {
-            architecture_consultative::payload_to_findings(p).map(|_| ())
+            architecture_advisor::payload_to_findings(p).map(|_| ())
         }),
     );
     store.register_schema(
@@ -1515,10 +1611,9 @@ pub fn format_audit_notification_with_attribution(
 }
 
 /// Build the per-audit-type top-line string. Documented shapes:
-/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <P> function(s) over line threshold; <M> duplicate signature(s); <Q> duplicate body group(s)` —
-///   with an optional trailing `; <K> stale ignore entries to clean up`
-///   clause when the audit detected stale entries in `.brightline-ignore`.
+/// - `architecture_advisor`: `🏛 architecture_advisor on <repo>: <N> refactor recommendation(s)`
 /// - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
+/// - `documentation_audit`: `📚 documentation_audit on <repo>: <N> finding(s)`
 /// - other audits: generic `📋 <audit_type> on <repo>: <N> finding(s)`
 ///
 /// Empty findings with `notify_on_clean=true` → uniform
@@ -1533,22 +1628,11 @@ fn format_audit_top_line(
         return format!("✅ {audit_type} on {repo_url}: no findings");
     }
     match audit_type {
-        "architecture_brightline" => {
-            let counts = count_brightline_findings(findings);
-            let mut line = format!(
-                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {funcs} function(s) over line threshold; {dupes} duplicate signature(s); {bodies} duplicate body group(s)",
-                files = counts.files,
-                funcs = counts.functions,
-                dupes = counts.duplicate_signatures,
-                bodies = counts.duplicate_bodies,
-            );
-            if counts.stale > 0 {
-                line.push_str(&format!(
-                    "; {stale} stale ignore entries to clean up",
-                    stale = counts.stale
-                ));
-            }
-            line
+        "architecture_advisor" => {
+            format!(
+                "🏛 architecture_advisor on {repo_url}: {n} refactor recommendation(s)",
+                n = findings.len()
+            )
         }
         "drift_audit" => {
             format!(
@@ -1569,50 +1653,6 @@ fn format_audit_top_line(
             )
         }
     }
-}
-
-/// Per-metric brightline finding counts, derived from finding-subject
-/// prefixes. Used to render the chatops top-line's per-metric clauses.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct BrightlineCounts {
-    files: usize,
-    functions: usize,
-    duplicate_signatures: usize,
-    duplicate_bodies: usize,
-    stale: usize,
-}
-
-/// Partition brightline findings by subject shape, using the
-/// subject-prefix constants the audit stamps onto each finding kind.
-/// File-size subjects start with `"file "` AND contain
-/// `" lines (threshold:"`; function-size subjects start with
-/// `"function "` AND contain the same; duplicate-signature AND
-/// duplicate-body subjects start with their respective prefixes;
-/// stale-ignore-entry subjects start with
-/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any other
-/// finding shape falls into none of the buckets AND is not counted in any
-/// total (the per-finding body still appears in the thread).
-fn count_brightline_findings(findings: &[Finding]) -> BrightlineCounts {
-    let mut counts = BrightlineCounts::default();
-    for f in findings {
-        let s = f.subject.as_str();
-        if s.starts_with(brightline::STALE_IGNORE_SUBJECT_PREFIX) {
-            counts.stale += 1;
-        } else if s.starts_with(brightline::FUNCTION_SIZE_SUBJECT_PREFIX)
-            && s.contains(" lines (threshold:")
-        {
-            counts.functions += 1;
-        } else if s.starts_with(brightline::FILE_SIZE_SUBJECT_PREFIX)
-            && s.contains(" lines (threshold:")
-        {
-            counts.files += 1;
-        } else if s.starts_with(brightline::DUPLICATE_SIGNATURE_SUBJECT_PREFIX) {
-            counts.duplicate_signatures += 1;
-        } else if s.starts_with(brightline::DUPLICATE_BODY_SUBJECT_PREFIX) {
-            counts.duplicate_bodies += 1;
-        }
-    }
-    counts
 }
 
 /// Render the per-finding body the thread reply carries. Same shape as
@@ -2017,7 +2057,7 @@ mod tests {
         let workspace = dir.path().join(&basename);
         std::fs::create_dir_all(&workspace).unwrap();
         let paths = crate::paths::DaemonPaths::under_root(dir.path());
-        let writer = AuditLogWriter::open(&paths, &workspace, "architecture_brightline")
+        let writer = AuditLogWriter::open(&paths, &workspace, "architecture_advisor")
             .expect("log open succeeds");
         writer.write_section("prompt", "(none)").unwrap();
         writer.write_section("output", "no findings").unwrap();
@@ -2123,7 +2163,8 @@ mod tests {
         assert_eq!(
             AuditOutcome::SpecsWritten {
                 changes: vec![],
-                retries_used: 3
+                retries_used: 3,
+                examined_summary: None,
             }
             .retries_used(),
             3
@@ -2542,53 +2583,12 @@ mod tests {
     // format_audit_notification tests (chatops-audit-findings-in-threads)
     // ====================================================================
 
-    fn brightline_file_finding(rel: &str, n: u64) -> Finding {
+    fn advisor_finding(subject: &str, rel: &str) -> Finding {
         Finding {
             severity: Severity::Medium,
-            subject: format!("file {rel} is {n} lines (threshold: 800)"),
-            body: format!("path: {rel}\nlines: {n}\nthreshold: 800"),
-            anchor: Some(format!("{rel}:1")),
-        }
-    }
-
-    fn brightline_dup_finding(sig: &str) -> Finding {
-        Finding {
-            severity: Severity::Low,
-            subject: format!("duplicate signature `{sig}` across 2 files"),
-            body: "mod_a.rs:1\nmod_b.rs:1".to_string(),
-            anchor: Some("mod_a.rs:1".into()),
-        }
-    }
-
-    fn brightline_function_finding(name: &str, rel: &str, n: u64) -> Finding {
-        Finding {
-            severity: Severity::Low,
-            subject: format!("function {name} in {rel} is {n} lines (threshold: 200)"),
-            body: format!("path: {rel}\nfunction: {name}\nstart_line: 1\nlines: {n}\nthreshold: 200"),
-            anchor: Some(format!("{rel}:1")),
-        }
-    }
-
-    fn brightline_dup_body_finding(name_a: &str, name_b: &str) -> Finding {
-        Finding {
-            severity: Severity::Low,
-            subject: format!("duplicate body across 2 files ({name_a}, {name_b})"),
-            body: format!("mod_a.rs:1 {name_a}\nmod_b.rs:1 {name_b}"),
-            anchor: Some("mod_a.rs:1".into()),
-        }
-    }
-
-    fn brightline_stale_finding(file: &str, function: &str, reason: &str) -> Finding {
-        Finding {
-            severity: Severity::Low,
-            subject: format!(
-                "{prefix}{file} :: {function} — {reason}",
-                prefix = brightline::STALE_IGNORE_SUBJECT_PREFIX,
-            ),
-            body: format!(
-                "file: {file}\nfunction: {function}\nreason: {reason}"
-            ),
-            anchor: None,
+            subject: subject.to_string(),
+            body: format!("recommendation body for {rel}"),
+            anchor: Some(format!("{rel}:1-200")),
         }
     }
 
@@ -2606,153 +2606,50 @@ mod tests {
         "2026-05-26T15:30:45Z".parse().unwrap()
     }
 
+    /// The advisor top-line names the refactor-recommendation count with the
+    /// `🏛` emoji; the finding bodies appear in the threaded body.
     #[test]
-    fn format_audit_notification_brightline_counts_files_and_dupes_in_top_line() {
-        let mut findings = Vec::new();
-        for i in 0..7 {
-            findings.push(brightline_file_finding(&format!("src/file{i}.rs"), 1000 + i));
-        }
-        for i in 0..3 {
-            findings.push(brightline_dup_finding(&format!("fn helper{i}")));
-        }
+    fn format_audit_notification_advisor_counts_recommendations_in_top_line() {
+        let findings = vec![
+            advisor_finding("Split the polling loop's god-file", "src/polling_loop/mod.rs"),
+            advisor_finding("Extract the config validator", "src/config.rs"),
+            advisor_finding("Decompose the executor harness", "src/executor/mod.rs"),
+        ];
         let n = format_audit_notification(
-            "architecture_brightline",
+            "architecture_advisor",
             "git@github.com:o/r.git",
             &findings,
             false,
             ts(),
         );
         assert!(
-            n.top_line.contains("📐 architecture_brightline on git@github.com:o/r.git"),
+            n.top_line
+                .contains("🏛 architecture_advisor on git@github.com:o/r.git"),
             "top_line: {}",
             n.top_line
         );
         assert!(
-            n.top_line.contains("7 file(s) over line threshold"),
-            "top_line should report 7 files: {}",
+            n.top_line.contains("3 refactor recommendation(s)"),
+            "top_line should report 3 recommendations: {}",
             n.top_line
         );
-        assert!(
-            n.top_line.contains("3 duplicate signature(s)"),
-            "top_line should report 3 dupes: {}",
-            n.top_line
-        );
-        assert!(n.thread_body.contains("src/file0.rs"));
-        assert!(n.thread_body.contains("duplicate signature `fn helper0`"));
-        assert!(
-            n.should_thread,
-            "10 findings exceed the threshold, must thread"
-        );
+        assert!(n.thread_body.contains("Split the polling loop's god-file"));
     }
 
+    /// A single recommendation renders the singular-friendly count form.
     #[test]
-    fn format_audit_notification_brightline_stale_clause_appears_when_nonzero() {
-        let findings = vec![
-            brightline_file_finding("src/big.rs", 1200),
-            brightline_dup_finding("fn foo"),
-            brightline_stale_finding(
-                "examples/site-x/auth.ts",
-                "handleAuthCallback",
-                "site removed in refactor",
-            ),
-            brightline_stale_finding(
-                "examples/site-y/auth.ts",
-                "handleAuthCallback",
-                "site removed in refactor",
-            ),
-            brightline_stale_finding(
-                "examples/site-z/auth.ts",
-                "handleAuthCallback",
-                "site removed in refactor",
-            ),
-        ];
+    fn format_audit_notification_advisor_single_recommendation() {
+        let findings = vec![advisor_finding("Split src/big.rs", "src/big.rs")];
         let n = format_audit_notification(
-            "architecture_brightline",
+            "architecture_advisor",
             "git@github.com:o/r.git",
             &findings,
             false,
             ts(),
         );
         assert!(
-            n.top_line.contains("1 file(s) over line threshold"),
-            "top_line should report 1 file: {}",
-            n.top_line
-        );
-        assert!(
-            n.top_line.contains("1 duplicate signature(s)"),
-            "top_line should report 1 dupe: {}",
-            n.top_line
-        );
-        assert!(
-            n.top_line.contains("3 stale ignore entries to clean up"),
-            "top_line should include the stale clause: {}",
-            n.top_line
-        );
-        // Stale entries' subject + reason appear in the threaded body.
-        assert!(
-            n.thread_body.contains("examples/site-x/auth.ts"),
-            "thread_body should name the stale file: {}",
-            n.thread_body
-        );
-    }
-
-    #[test]
-    fn format_audit_notification_brightline_no_stale_clause_when_zero() {
-        let findings = vec![
-            brightline_file_finding("src/big.rs", 1200),
-            brightline_dup_finding("fn foo"),
-        ];
-        let n = format_audit_notification(
-            "architecture_brightline",
-            "git@github.com:o/r.git",
-            &findings,
-            false,
-            ts(),
-        );
-        assert!(
-            !n.top_line.contains("stale ignore"),
-            "no stale entries → no clause: {}",
-            n.top_line
-        );
-    }
-
-    /// 8.6 — the top-line renders all four metric counts (file, function,
-    /// duplicate signature, duplicate body) from a mixed finding set. We
-    /// assert the derived counts, not the exact sentence.
-    #[test]
-    fn format_audit_notification_brightline_renders_all_four_counts() {
-        let findings = vec![
-            brightline_file_finding("src/a.rs", 1200),
-            brightline_file_finding("src/b.rs", 1300),
-            brightline_function_finding("huge", "src/c.rs", 400),
-            brightline_dup_finding("fn helper(u32)"),
-            brightline_dup_body_finding("alert_disk", "alert_mem"),
-        ];
-        let n = format_audit_notification(
-            "architecture_brightline",
-            "git@github.com:o/r.git",
-            &findings,
-            false,
-            ts(),
-        );
-        assert!(
-            n.top_line.contains("2 file(s) over line threshold"),
-            "top_line should report 2 files: {}",
-            n.top_line
-        );
-        assert!(
-            n.top_line.contains("1 function(s) over line threshold"),
-            "top_line should report 1 function: {}",
-            n.top_line
-        );
-        assert!(
-            n.top_line.contains("1 duplicate signature(s)"),
-            "top_line should report 1 duplicate signature: {}",
-            n.top_line
-        );
-        assert!(
-            n.top_line.contains("1 duplicate body group(s)"),
-            "top_line should report 1 duplicate body group: {}",
+            n.top_line.contains("1 refactor recommendation(s)"),
+            "top_line should report 1 recommendation: {}",
             n.top_line
         );
     }
@@ -2844,7 +2741,7 @@ mod tests {
     #[test]
     fn format_audit_notification_empty_findings_with_notify_on_clean_uses_check_form() {
         let n = format_audit_notification(
-            "architecture_brightline",
+            "architecture_advisor",
             "git@github.com:o/r.git",
             &[],
             true,
@@ -2852,7 +2749,7 @@ mod tests {
         );
         assert_eq!(
             n.top_line,
-            "✅ architecture_brightline on git@github.com:o/r.git: no findings"
+            "✅ architecture_advisor on git@github.com:o/r.git: no findings"
         );
         assert!(n.thread_body.is_empty(), "no findings → empty body");
         assert!(!n.should_thread, "empty body → no thread");
@@ -2890,7 +2787,7 @@ mod tests {
             anchor: None,
         }];
         let n = format_audit_notification(
-            "architecture_brightline",
+            "architecture_advisor",
             "git@github.com:o/r.git",
             &findings,
             false,
@@ -2917,7 +2814,7 @@ mod tests {
         // The audit_id is derived from the repo + audit_type + timestamp.
         // sanitize_for_audit_id replaces ':', '@', '/' with '_'.
         assert!(
-            n.thread_body.contains("git_github.com_o_r.git:architecture_brightline:"),
+            n.thread_body.contains("git_github.com_o_r.git:architecture_advisor:"),
             "audit_id should sanitize repo url: {}",
             n.thread_body
         );
@@ -2944,14 +2841,14 @@ mod tests {
     fn format_audit_notification_unknown_audit_type_uses_generic_top_line() {
         let findings = vec![drift_finding("x")];
         let n = format_audit_notification(
-            "architecture_consultative",
+            "some_other_audit",
             "u",
             &findings,
             false,
             ts(),
         );
         assert!(
-            n.top_line.starts_with("📋 architecture_consultative on u"),
+            n.top_line.starts_with("📋 some_other_audit on u"),
             "unknown audit_type falls back to generic format: {}",
             n.top_line
         );
@@ -3251,11 +3148,8 @@ mod tests {
         .expect("test executor config");
         let (_paths_td, paths) = crate::testing::test_daemon_paths();
         let audits: Vec<Arc<dyn Audit>> = vec![
-            Arc::new(crate::audits::brightline::ArchitectureBrightlineAudit::new(
-                &audit_settings,
-            )),
             Arc::new(
-                crate::audits::architecture_consultative::ArchitectureConsultativeAudit::new(
+                crate::audits::architecture_advisor::ArchitectureAdvisorAudit::new(
                     &audit_settings,
                     &executor,
                 ),
@@ -3345,7 +3239,7 @@ mod a57_submission_round_trip_tests {
         let store = store_with_schemas();
         let payload = serde_json::json!({
             "findings": [{
-                "subject": "Should the parser move into its own module?",
+                "subject": "Split the parser into its own module",
                 "body": "context",
                 "anchor": "src/parser.rs:1-200",
                 "severity": "medium"
@@ -3354,16 +3248,16 @@ mod a57_submission_round_trip_tests {
         store
             .record(
                 "repo".into(),
-                "architecture_consultative".into(),
-                "architecture_consultative",
+                "architecture_advisor".into(),
+                "architecture_advisor",
                 payload,
             )
             .expect("valid architecture payload accepted");
         let consumed = store
-            .consume("repo", "architecture_consultative")
+            .consume("repo", "architecture_advisor")
             .expect("submission present");
         let findings =
-            architecture_consultative::payload_to_findings(&consumed).expect("deserializes");
+            architecture_advisor::payload_to_findings(&consumed).expect("deserializes");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Medium);
         assert_eq!(findings[0].anchor.as_deref(), Some("src/parser.rs:1-200"));
@@ -3412,14 +3306,14 @@ mod a57_submission_round_trip_tests {
         let err = store
             .record(
                 "repo".into(),
-                "architecture_consultative".into(),
-                "architecture_consultative",
+                "architecture_advisor".into(),
+                "architecture_advisor",
                 six,
             )
             .expect_err("six findings must be rejected");
         assert!(err.contains("caps at 5"), "rejection reason: {err}");
         // Nothing stored — a rejected submission does not become the result.
-        assert!(store.consume("repo", "architecture_consultative").is_none());
+        assert!(store.consume("repo", "architecture_advisor").is_none());
 
         // A subsequent valid submission in the same execution is accepted.
         let five = serde_json::json!({
@@ -3430,16 +3324,16 @@ mod a57_submission_round_trip_tests {
         store
             .record(
                 "repo".into(),
-                "architecture_consultative".into(),
-                "architecture_consultative",
+                "architecture_advisor".into(),
+                "architecture_advisor",
                 five,
             )
             .expect("five findings accepted after the rejection");
         let consumed = store
-            .consume("repo", "architecture_consultative")
+            .consume("repo", "architecture_advisor")
             .expect("the valid submission is stored");
         let findings =
-            architecture_consultative::payload_to_findings(&consumed).expect("deserializes");
+            architecture_advisor::payload_to_findings(&consumed).expect("deserializes");
         assert_eq!(findings.len(), 5);
     }
 

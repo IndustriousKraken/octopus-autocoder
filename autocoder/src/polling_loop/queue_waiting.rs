@@ -12,7 +12,7 @@ pub(crate) async fn run_due_audits_after_queue(
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
-    queued_audit_types: &std::collections::HashSet<String>,
+    queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
 ) {
     if let Err(e) = run_due_audits(
         paths,

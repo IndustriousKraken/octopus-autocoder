@@ -91,6 +91,154 @@ pub struct ChatOpsContext {
     pub pr_opened_enabled: bool,
 }
 
+/// The chat context an on-demand audit request originated from, so the daemon
+/// can post the terminal completion notification back to the operator's
+/// thread (a cadence-driven run carries `None` and emits no completion post).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChatOrigin {
+    pub channel: String,
+    /// The originating message's thread id, when the backend supports
+    /// threading. `None` → the completion notification posts channel-level.
+    pub thread_ts: Option<String>,
+}
+
+/// One entry in a repo's on-demand audit-run queue (`pending_audit_runs`).
+/// Carries the audit-type name AND the originating chat context so the
+/// scheduler can reply where the request came from. Kept in the queue until
+/// the audit has actually run, so a skipped, early-returning, or bounded-out
+/// pass never silently drops an acknowledged request. Serialize/Deserialize
+/// back the durable mirror written by [`save_pending_audit_runs`] /
+/// [`load_pending_audit_runs`], so the queue also survives a daemon restart
+/// (persist-on-demand-audit-queue).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueuedAudit {
+    pub audit_type: String,
+    #[serde(default)]
+    pub origin: Option<ChatOrigin>,
+}
+
+/// Derive the workspace basename used to key a repo's durable
+/// `pending_audit_runs` file. Mirrors `alert_state`'s convention: the
+/// workspace path's final component, or `"unknown"` if absent (which
+/// should never happen for a resolved workspace path). `pub(crate)` so the
+/// spawn/orphan-sweep sites in `cli/run.rs` derive the basename through this
+/// single helper rather than re-implementing it (load and save agree).
+pub(crate) fn pending_audit_runs_basename(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Atomically persist `queue` as the durable mirror of `workspace`'s
+/// on-demand audit-run queue, written via tempfile-then-rename in the
+/// same directory so a torn write can never be observed by a concurrent
+/// reader (mirrors `AlertState::save`). The file is the serialized
+/// `Vec<QueuedAudit>`; an empty queue persists as `[]` so the durable
+/// copy always reflects exactly what remains in memory.
+///
+/// Persistence is best-effort at the call site: callers log a write
+/// failure and keep the in-memory queue authoritative for the live
+/// process.
+pub fn save_pending_audit_runs(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    queue: &[QueuedAudit],
+) -> Result<()> {
+    let basename = pending_audit_runs_basename(workspace);
+    let path = paths.pending_audit_runs_path(&basename);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating parent dir {}", parent.display()))?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, queue)
+        .with_context(|| format!("serializing pending audit runs for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load the durable on-demand audit-run queue for `workspace_basename`.
+/// Best-effort: a missing file is an empty queue (not an error — the
+/// common case for a repo that has never had an audit queued); an
+/// unreadable OR unparseable file logs a WARN and degrades to an empty
+/// queue, so a corrupt file never panics or aborts the repo's startup.
+pub fn load_pending_audit_runs(
+    paths: &DaemonPaths,
+    workspace_basename: &str,
+) -> Vec<QueuedAudit> {
+    let path = paths.pending_audit_runs_path(workspace_basename);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!(
+                "pending-audit-runs file at {} is corrupt; starting with an empty queue: {e:#}",
+                path.display()
+            );
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "pending-audit-runs file at {} unreadable; starting with an empty queue: {e:#}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Startup orphan reconciliation for the durable on-demand audit-run
+/// queue: remove any `pending-audit-runs/<basename>.json` file whose
+/// workspace basename is no longer in `configured_basenames`, so a
+/// removed repo's stale queue file never resurrects work after a
+/// restart. Matches the other startup marker sweeps; best-effort —
+/// every IO failure is logged and never aborts startup. A missing
+/// directory (no audit has ever been queued) is a no-op.
+pub fn reconcile_pending_audit_runs(
+    paths: &DaemonPaths,
+    configured_basenames: &std::collections::HashSet<String>,
+) {
+    let dir = paths.pending_audit_runs_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                "pending-audit-runs reconcile: cannot read {}: {e:#}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider our `<basename>.json` files; ignore tempfiles
+        // and anything else that lands in the directory.
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if configured_basenames.contains(stem) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                "pending-audit-runs reconcile: dropped orphan queue file for unconfigured repo `{stem}` ({})",
+                path.display()
+            ),
+            Err(e) => tracing::warn!(
+                "pending-audit-runs reconcile: failed to remove orphan {}: {e:#}",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// Run the polling loop for a single repository. Each iteration is wrapped in
 /// `execute_one_pass`; failures inside a pass are logged and do not break the
 /// loop. Cancellation is checked between iterations and during the sleep.
@@ -124,7 +272,7 @@ pub async fn run(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
-    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<QueuedAudit>>>,
     pending_proposal_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>>,
     pending_changelog_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>>,
     pending_brownfield_requests: Arc<
@@ -147,6 +295,7 @@ pub async fn run(
     pending_brownfield_batch_requests: Arc<
         std::sync::Mutex<std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>>,
     >,
+    pending_revision_requests: crate::control_socket::RevisionRequestQueues,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -180,6 +329,7 @@ pub async fn run(
         pending_sync_upstream_requests,
         pending_brownfield_survey_requests,
         pending_brownfield_batch_requests,
+        pending_revision_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -240,7 +390,7 @@ pub async fn run_with_hooks(
     audit_settings: Arc<HashMap<String, AuditSettings>>,
     pending_rebuild: Arc<std::sync::atomic::AtomicBool>,
     pending_triages: Arc<std::sync::Mutex<Vec<String>>>,
-    pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_audit_runs: Arc<std::sync::Mutex<Vec<QueuedAudit>>>,
     pending_proposal_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>>,
     pending_changelog_requests: Arc<std::sync::Mutex<Vec<crate::control_socket::ChangelogRequest>>>,
     pending_brownfield_requests: Arc<
@@ -263,6 +413,7 @@ pub async fn run_with_hooks(
     pending_brownfield_batch_requests: Arc<
         std::sync::Mutex<std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>>,
     >,
+    pending_revision_requests: crate::control_socket::RevisionRequestQueues,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -323,13 +474,13 @@ pub async fn run_with_hooks(
 
         run_state_housekeeping(&paths);
 
-        // Drain the per-repo on-demand audit-run queue; the HashSet collapses
-        // any duplicates that survived the control-socket-level de-dup.
-        let queued_audit_types: std::collections::HashSet<String> = {
-            let mut g = pending_audit_runs.lock().unwrap();
-            std::mem::take(&mut *g).into_iter().collect()
-        };
-
+        // The on-demand audit-run queue is NOT drained here. Its handle is
+        // passed into the iteration work so the scheduler consumes only the
+        // audits it actually runs: a pass that skips (busy marker), returns
+        // early (workspace-init failure), or is bounded out
+        // (`max_audits_per_iteration: 0`) leaves queued entries intact for a
+        // later iteration rather than silently discarding an acknowledged
+        // request (durability).
         drain_chat_and_triage_queues(
             &paths,
             &workspace,
@@ -367,6 +518,7 @@ pub async fn run_with_hooks(
             &pending_sync_upstream_requests,
             &pending_brownfield_survey_requests,
             &pending_brownfield_batch_requests,
+            &pending_revision_requests,
         )
         .await;
 
@@ -385,7 +537,7 @@ pub async fn run_with_hooks(
                 reviewer_snap.as_deref(),
                 chatops_ctx.as_ref(),
                 want_rebuild,
-                &queued_audit_types,
+                &pending_audit_runs,
                 stuck_threshold_secs,
                 perma_stuck_threshold,
                 max_changes_per_pr,

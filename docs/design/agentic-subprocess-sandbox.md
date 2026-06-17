@@ -8,7 +8,7 @@ The a60/PR-#95 incident — `OpencodeStrategy` wrote a plaintext provider key in
 
 ## Scope — every agentic subprocess, by construction
 
-Every agentic role funnels through the **single** subprocess spawn in `agentic_run`: the executor, the agentic reviewer, every audit (drift, security-bug, architecture, missing-tests, docs, brightline-triage), the contradiction check, the changelog-stylist, triage, scout, brownfield. The sandbox is a property of that one seam — wrap the spawn (`<sandbox> … -- <cli> …`) and no role can opt out.
+Every agentic role funnels through the **single** subprocess spawn in `agentic_run`: the executor, the agentic reviewer, every audit (drift, security-bug, architecture-advisor, missing-tests, docs), the contradiction check, the changelog-stylist, triage, scout, brownfield. The sandbox is a property of that one seam — wrap the spawn (`<sandbox> … -- <cli> …`) and no role can opt out.
 
 Per-role variation is only:
 - **tool allowlist** — read-only roles (reviewer, audits) get Read/Glob/Grep and no Bash/Write; the executor gets the write set;
