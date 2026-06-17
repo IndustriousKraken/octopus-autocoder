@@ -208,6 +208,64 @@ pub struct BrownfieldBatchRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight spec-revision ADVISOR request (a03). The chatops
+/// dispatcher's non-`send it` `@<bot>` reply in a revision thread pushes
+/// here via the `revision_advise` control-socket action. The polling loop
+/// drains at most ONE per iteration AND runs a read-only agentic session
+/// reconstructed from the change deltas, the canon, the marker's
+/// contradiction, AND the thread transcript so far — replying in the thread
+/// without writing anything. `reply_text` is the operator's current message
+/// (the transcript is re-fetched from chat at drain time).
+#[derive(Debug, Clone)]
+pub struct RevisionAdviseRequest {
+    pub repo_url: String,
+    pub change_slug: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub reply_text: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One in-flight spec-revision EXECUTOR request (a03). The chatops
+/// dispatcher's `@<bot> send it` in a revision thread pushes here via the
+/// `revision_execute` control-socket action. The polling loop drains at most
+/// ONE per iteration AND runs a write-scoped session that edits the change's
+/// spec deltas, re-runs the `[in]` / `[canon]` gates, AND opens a PR on a
+/// clean re-gate.
+#[derive(Debug, Clone)]
+pub struct RevisionExecuteRequest {
+    pub repo_url: String,
+    pub change_slug: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The two revision-thread request queues (a03), bundled so they thread
+/// through the polling loop as a single unit AND sit on the
+/// [`RepoTaskHandle`] for the control-socket handlers to push onto. Drained
+/// one-per-iteration each (mirroring the brownfield-batch drain).
+#[derive(Clone)]
+pub struct RevisionRequestQueues {
+    pub advise: Arc<Mutex<std::collections::VecDeque<RevisionAdviseRequest>>>,
+    pub execute: Arc<Mutex<std::collections::VecDeque<RevisionExecuteRequest>>>,
+}
+
+impl RevisionRequestQueues {
+    pub fn new() -> Self {
+        Self {
+            advise: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            execute: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+}
+
+impl Default for RevisionRequestQueues {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -309,6 +367,13 @@ pub struct RepoTaskHandle {
     /// the batch handler.
     pub pending_brownfield_batch_requests:
         Arc<Mutex<std::collections::VecDeque<BrownfieldBatchRequest>>>,
+    /// Queues of chat-driven spec-revision thread requests (a03). The
+    /// chatops dispatcher's `revision_advise` action (a non-`send it` reply
+    /// in a revision thread) pushes onto `advise`; its `revision_execute`
+    /// action (`send it` in a revision thread) pushes onto `execute`. The
+    /// polling loop drains at most ONE of EACH per iteration AFTER the
+    /// brownfield-batch drain.
+    pub pending_revision_requests: RevisionRequestQueues,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -565,6 +630,8 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_sync_upstream_request" => handle_queue_sync_upstream_request(&parsed, state),
         "queue_brownfield_survey_request" => handle_queue_brownfield_survey_request(&parsed, state),
         "queue_brownfield_batch_request" => handle_queue_brownfield_batch_request(&parsed, state),
+        "revision_advise" => handle_revision_advise(&parsed, state),
+        "revision_execute" => handle_revision_execute(&parsed, state),
         "queue_clear_survey" => handle_queue_clear_survey(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
@@ -2221,6 +2288,138 @@ fn handle_queue_brownfield_batch_request(parsed: &Value, state: &ControlState) -
     })
 }
 
+/// Queue a spec-revision ADVISOR request (a03). A non-`send it` `@<bot>`
+/// reply in a tracked revision thread routes here; the polling loop drains
+/// it AND runs a read-only agentic session that discusses the revision in
+/// the thread. De-duplicated on `(change_slug, reply_text)` so a doubly-
+/// delivered mention event does not run the advisor twice for the same
+/// message.
+fn handle_revision_advise(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let reply_text = parsed
+        .get("reply_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_revision_requests.advise.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g
+            .iter()
+            .any(|r| r.change_slug == change && r.reply_text == reply_text)
+        {
+            g.push_back(RevisionAdviseRequest {
+                repo_url: url.clone(),
+                change_slug: change.clone(),
+                channel,
+                thread_ts,
+                reply_text,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "change": change,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Queue a spec-revision EXECUTOR request (a03). `@<bot> send it` in a
+/// tracked revision thread routes here; the polling loop drains it AND runs
+/// a write-scoped session that revises the change's spec deltas, re-runs the
+/// `[in]` / `[canon]` gates, AND opens a PR on a clean re-gate. De-duplicated
+/// on `change_slug` so a doubly-delivered `send it` enqueues only one run.
+fn handle_revision_execute(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_revision_requests.execute.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.change_slug == change) {
+            g.push_back(RevisionExecuteRequest {
+                repo_url: url.clone(),
+                change_slug: change.clone(),
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "change": change,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Handle the `queue_clear_survey` action (a29). Synchronously deletes
 /// every `BrownfieldSurveyState` file in the matched repo's workspace
 /// AND returns the count cleared. The chatops dispatcher posts the
@@ -2870,6 +3069,7 @@ mod tests {
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_revision_requests: RevisionRequestQueues::new(),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },
@@ -3007,6 +3207,76 @@ github:
                 "section `{section}` missing from unchanged: {unchanged:?}"
             );
         }
+        cancel.cancel();
+    }
+
+    /// a03: the `revision_advise` action queues a [`RevisionAdviseRequest`]
+    /// onto the matched repo's handle, carrying the operator's reply text for
+    /// the read-only advisor session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_advise_action_queues_request() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"revision_advise","url":"git@github.com:owner/repo.git","change":"a03-x","channel":"C1","thread_ts":"9.9","reply_text":"align to canon?"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let q = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard
+                .get("git@github.com:owner/repo.git")
+                .unwrap()
+                .pending_revision_requests
+                .advise
+                .clone()
+        };
+        let g = q.lock().unwrap();
+        assert_eq!(g.len(), 1, "advise queue should have one entry");
+        assert_eq!(g[0].change_slug, "a03-x");
+        assert_eq!(g[0].reply_text, "align to canon?");
+        assert_eq!(g[0].thread_ts, "9.9");
+        cancel.cancel();
+    }
+
+    /// a03: the `revision_execute` action queues a [`RevisionExecuteRequest`]
+    /// onto the matched repo's handle. De-duplicated on `change_slug` so a
+    /// doubly-delivered `send it` enqueues only one run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_execute_action_queues_request_deduped() {
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let req = r#"{"action":"revision_execute","url":"git@github.com:owner/repo.git","change":"a03-x","channel":"C1","thread_ts":"9.9"}"#;
+        let resp = send_request(&socket, req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        // A second identical request must not enqueue a duplicate.
+        let resp2 = send_request(&socket, req).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true), "resp: {resp2}");
+        let q = {
+            let guard = state.repo_tasks.lock().unwrap();
+            guard
+                .get("git@github.com:owner/repo.git")
+                .unwrap()
+                .pending_revision_requests
+                .execute
+                .clone()
+        };
+        let g = q.lock().unwrap();
+        assert_eq!(g.len(), 1, "execute queue should de-dupe on change_slug");
+        assert_eq!(g[0].change_slug, "a03-x");
+        cancel.cancel();
+    }
+
+    /// a03: a revision action for an unconfigured repo is refused (no live
+    /// polling task to queue onto).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_execute_unknown_repo_is_refused() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"revision_execute","url":"git@github.com:owner/nope.git","change":"a03-x","channel":"C1","thread_ts":"9.9"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
         cancel.cancel();
     }
 
@@ -4467,6 +4737,7 @@ github:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     pending_brownfield_batch_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_revision_requests: RevisionRequestQueues::new(),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
                 },

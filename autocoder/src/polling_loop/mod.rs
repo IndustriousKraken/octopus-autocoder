@@ -295,6 +295,7 @@ pub async fn run(
     pending_brownfield_batch_requests: Arc<
         std::sync::Mutex<std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>>,
     >,
+    pending_revision_requests: crate::control_socket::RevisionRequestQueues,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -328,6 +329,7 @@ pub async fn run(
         pending_sync_upstream_requests,
         pending_brownfield_survey_requests,
         pending_brownfield_batch_requests,
+        pending_revision_requests,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -411,6 +413,7 @@ pub async fn run_with_hooks(
     pending_brownfield_batch_requests: Arc<
         std::sync::Mutex<std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>>,
     >,
+    pending_revision_requests: crate::control_socket::RevisionRequestQueues,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -515,6 +518,7 @@ pub async fn run_with_hooks(
             &pending_sync_upstream_requests,
             &pending_brownfield_survey_requests,
             &pending_brownfield_batch_requests,
+            &pending_revision_requests,
         )
         .await;
 

@@ -15,21 +15,21 @@
 
 ## 3. Revision advisor (read-only)
 
-- [ ] 3.1 Add a `revision_advise` control-socket action that runs a read-only agentic session reconstructed from the change's spec deltas, the relevant canon, the marker's contradiction narrative, AND the thread transcript so far, and replies in the thread. It writes nothing. Stateless — no session is persisted; each reply rebuilds context.
-- [ ] 3.2 Pass the thread transcript into the advisor's prompt as the conversation history so multi-round discussion works without a held session.
+- [x] 3.1 Add a `revision_advise` control-socket action that runs a read-only agentic session reconstructed from the change's spec deltas, the relevant canon, the marker's contradiction narrative, AND the thread transcript so far, and replies in the thread. It writes nothing. Stateless — no session is persisted; each reply rebuilds context.
+- [x] 3.2 Pass the thread transcript into the advisor's prompt as the conversation history so multi-round discussion works without a held session.
 
 ## 4. Revision executor (write + re-gate + PR)
 
-- [ ] 4.1 Add a `revision_execute` control-socket action: a write-scoped agentic session that edits the flagged change's spec deltas along the discussed direction, scoped to that change's `openspec/changes/<slug>/` directory.
-- [ ] 4.2 Re-run the `[in]` and `[canon]` checks (a02's invocation) against the revised change. On clean, open a PR carrying the spec-delta revision via the existing PR-open helpers and report the PR link in the thread. On a remaining contradiction, open no PR and report the contradiction in the thread.
-- [ ] 4.3 Do NOT commit the revision to the base branch outside the PR, and do NOT auto-edit `tasks.md` to dodge the executor's unimplementable-tasks flag. Flip the `RevisionThreadState.status` to an acted state on a successful PR so a repeat `send it` is handled gracefully.
+- [x] 4.1 Add a `revision_execute` control-socket action: a write-scoped agentic session that edits the flagged change's spec deltas along the discussed direction, scoped to that change's `openspec/changes/<slug>/` directory.
+- [x] 4.2 Re-run the `[in]` and `[canon]` checks (a02's invocation) against the revised change. On clean, open a PR carrying the spec-delta revision via the existing PR-open helpers and report the PR link in the thread. On a remaining contradiction, open no PR and report the contradiction in the thread.
+- [x] 4.3 Do NOT commit the revision to the base branch outside the PR, and do NOT auto-edit `tasks.md` to dodge the executor's unimplementable-tasks flag. Flip the `RevisionThreadState.status` to an acted state on a successful PR so a repeat `send it` is handled gracefully.
 
 ## 5. Tests
 
 - [x] 5.1 A contradiction marker's alert records a `RevisionThreadState` (channel/thread_ts/repo/slug) and advertises the thread; an unimplementable-tasks marker records none and keeps its operator-authored flow (assert behavior/state, not message wording).
 - [x] 5.2 Dispatcher: a `send it` matching a `RevisionThreadState` runs `revision_execute`; a non-`send it` reply runs `revision_advise`; a reply matching no record returns the four-context refusal; audit/survey/issue-candidate matches still take precedence (regression).
-- [ ] 5.3 The advisor writes nothing to the workspace and is reconstructed per reply (no persisted session); a second reply includes the first exchange via the transcript.
-- [ ] 5.4 The executor revises the change's spec deltas, re-gates, and opens a PR on a clean re-gate; on a still-failing re-gate it opens no PR and reports back; it never merges or commits outside the PR; it does not edit `tasks.md` to clear an unimplementable-tasks flag.
+- [x] 5.3 The advisor writes nothing to the workspace and is reconstructed per reply (no persisted session); a second reply includes the first exchange via the transcript.
+- [x] 5.4 The executor revises the change's spec deltas, re-gates, and opens a PR on a clean re-gate; on a still-failing re-gate it opens no PR and reports back; it never merges or commits outside the PR; it does not edit `tasks.md` to clear an unimplementable-tasks flag.
 
 ## 6. Docs
 
