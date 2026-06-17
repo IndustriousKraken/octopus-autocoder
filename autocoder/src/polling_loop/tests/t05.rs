@@ -96,6 +96,7 @@ async fn cancellation_during_sleep_exits() {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            crate::control_socket::RevisionRequestQueues::new(),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,

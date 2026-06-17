@@ -1267,6 +1267,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let pending_brownfield_batch_requests_for_task =
             pending_brownfield_batch_requests.clone();
+        // a03: the spec-revision advisor + executor request queues, bundled.
+        let pending_revision_requests =
+            crate::control_socket::RevisionRequestQueues::new();
+        let pending_revision_requests_for_task = pending_revision_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -1307,6 +1311,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_sync_upstream_requests_for_task,
                 pending_brownfield_survey_requests_for_task,
                 pending_brownfield_batch_requests_for_task,
+                pending_revision_requests_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -1373,6 +1378,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_sync_upstream_requests,
                     pending_brownfield_survey_requests,
                     pending_brownfield_batch_requests,
+                    pending_revision_requests,
                     iteration_cancel,
                     iteration_drained,
                 },

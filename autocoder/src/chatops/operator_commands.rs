@@ -48,7 +48,7 @@ pub const WIPE_CONFIRM_TTL_SECS: u64 = 60;
 /// not tracking. Wording matches the `audit-reply-acts` spec scenario
 /// "Send-it in untracked thread is politely refused".
 pub const SEND_IT_REFUSE_UNTRACKED: &str =
-    "✗ This reply is in a thread autocoder is not tracking. The `send it` verb only acts in audit-notification threads.";
+    "✗ This reply is in a thread autocoder is not tracking. The `send it` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.";
 
 /// Polite-refusal reply for `send it` against an audit thread whose
 /// `posted_at` is older than the 7-day staleness cap.
@@ -432,6 +432,16 @@ enum ParseOutcome {
 
 fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
     parse_command_outcome_in_thread(message, bot_mention, None)
+}
+
+/// True when `message` is addressed to the bot (begins with the bot mention).
+/// a03: used by the advisor routing to distinguish a bot-addressed free-form
+/// reply (route to the read-only revision advisor) from ambient channel
+/// chatter the listener should ignore. An empty mention (some test paths)
+/// never matches.
+fn message_addresses_bot(message: &str, bot_mention: &str) -> bool {
+    let mention = bot_mention.trim();
+    !mention.is_empty() && message.trim().starts_with(mention)
 }
 
 /// Same as `parse_command_outcome` but also threads through the
@@ -1742,7 +1752,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `spec-it <N> [optional guidance]` — scout-thread-only: scope a scouted item into a propose-equivalent flow\n");
     out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout-run state file for the repo\n");
     out.push_str("  • `brownfield-survey <repo> [optional guidance]` — chat-driven workflow: survey the repo for proposed capability boundaries (use `send it` in the survey thread to batch-generate all specs)\n");
-    out.push_str("  • `send it` (in audit OR brownfield-survey thread) — act on the thread's findings: triage an audit, OR batch-generate specs from a survey (one item per iteration)\n");
+    out.push_str("  • `send it` (in an audit-notification, brownfield-survey, issue-candidate, OR spec-revision thread) — act on the thread's findings: triage an audit, batch-generate specs from a survey (one item per iteration), promote an issue candidate, OR revise a contradiction-flagged change AND open a PR\n");
     out.push_str("  • `clear-survey <repo>` — operator-recovery: wipe every brownfield-survey state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: fetch+rebase the workspace's base branch onto upstream (no push)\n");
@@ -2028,6 +2038,14 @@ pub struct OperatorCommandDispatcher {
     workspace_resolver: Option<
         Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
     >,
+    /// Directory under which spec-revision-thread state files live (a03). The
+    /// dispatcher resolves a `send it` (or any non-`send it` `@<bot>` reply)
+    /// against `<revision_thread_state_dir>/revision-threads/<thread_ts>.json`
+    /// for the fourth `send it` context AND the advisor routing. Defaults to
+    /// `crate::revision_thread::default_state_root()` (the daemon `state_dir`,
+    /// same root as the audit-thread state) — tests override via
+    /// `with_revision_thread_state_dir`.
+    revision_thread_state_dir: PathBuf,
 }
 
 impl OperatorCommandDispatcher {
@@ -2045,7 +2063,16 @@ impl OperatorCommandDispatcher {
             scout_enabled: true,
             brownfield_survey_enabled: true,
             workspace_resolver: None,
+            revision_thread_state_dir: crate::revision_thread::default_state_root(paths),
         }
+    }
+
+    /// Override the revision-thread state directory (a03). Tests use this the
+    /// same way `with_audit_thread_state_dir` is used.
+    #[allow(dead_code)]
+    pub fn with_revision_thread_state_dir(mut self, dir: PathBuf) -> Self {
+        self.revision_thread_state_dir = dir;
+        self
     }
 
     /// Override the daemon-wide brownfield-survey-feature enable flag (a29).
@@ -2321,7 +2348,21 @@ impl OperatorCommandDispatcher {
                 self.dispatch(cmd, channel_id, operator_user, repositories, submitter)
                     .await,
             )),
-            ParseOutcome::None => None,
+            ParseOutcome::None => {
+                // a03: a bot-addressed reply that did NOT parse to a known verb,
+                // posted inside a tracked spec-revision thread, routes to the
+                // read-only revision advisor (NOT the `?` reaction). `send it`
+                // parses to `SendItOnAudit` above, so it never reaches here —
+                // only free-form discussion does. A reply that matches no
+                // revision thread falls through to `None` (the `?` reaction).
+                if let Some(ts) = thread_ts.filter(|t| !t.is_empty())
+                    && message_addresses_bot(text, bot_mention)
+                    && let Some(reply) = self.try_revision_advise(ts, text, submitter).await
+                {
+                    return Some(reply);
+                }
+                None
+            }
             ParseOutcome::Invalid(reply) => Some(reply),
         }
     }
@@ -3514,6 +3555,112 @@ impl OperatorCommandDispatcher {
         ))
     }
 
+    /// a03: look up the operator-replied `thread_ts` against the stored
+    /// `RevisionThreadState` set (the dispatcher's FOURTH `send it` context).
+    /// On a match this fires the spec-revision executor (`revision_execute`)
+    /// for the change AND returns `Some(reply)`. A thread whose status is
+    /// already `Acted` (a prior `send it` opened a PR) returns the
+    /// already-acted reply WITHOUT re-running the executor. Returns `None`
+    /// when no revision thread matches — the caller falls through to the
+    /// canonical untracked-thread refusal.
+    ///
+    /// The state files are keyed by `thread_ts` (mirroring the audit-thread
+    /// store), so the lookup is a direct read — `thread_ts` resolves to at
+    /// most one record across the four contexts.
+    async fn try_send_it_on_revision(
+        &self,
+        thread_ts: &str,
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<String> {
+        use crate::revision_thread::{RevisionThreadStatus, read_state};
+        let state = match read_state(&self.revision_thread_state_dir, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "revision-thread state read failed; treating as untracked: {e:#}"
+                );
+                return None;
+            }
+        };
+        if state.status == RevisionThreadStatus::Acted {
+            return Some(format!(
+                "✓ send it: a PR has already been opened for the revision of `{change}`. Review/merge that PR, or reply here to discuss further.",
+                change = state.change_slug,
+            ));
+        }
+        let payload = serde_json::json!({
+            "action": "revision_execute",
+            "url": state.repo_url,
+            "change": state.change_slug,
+            "channel": state.channel,
+            "thread_ts": state.thread_ts,
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(format!("✗ send it: could not start the spec revision: {err}"));
+        }
+        Some(format!(
+            "✓ Revising `{change}` along the discussed direction. autocoder will re-run the [in] and [canon] gates AND reply in this thread with the PR link (or the remaining contradiction).",
+            change = state.change_slug,
+        ))
+    }
+
+    /// a03: a non-`send it` `@<bot>` reply whose `thread_ts` matches a stored
+    /// `RevisionThreadState` routes to the read-only revision advisor. Submits
+    /// the `revision_advise` control-socket action carrying the operator's
+    /// reply text; the polling iteration reconstructs a read-only agentic
+    /// session from the change deltas, the canon, the marker contradiction,
+    /// AND the thread transcript, then replies in the thread. Returns
+    /// `Some(reply)` when the thread matched (so the inbound listener does NOT
+    /// apply the `?` reaction); `None` when no revision thread matches (the
+    /// reply is genuinely unrecognized).
+    async fn try_revision_advise(
+        &self,
+        thread_ts: &str,
+        reply_text: &str,
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<Reply> {
+        use crate::revision_thread::read_state;
+        let state = match read_state(&self.revision_thread_state_dir, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "revision-thread state read failed; treating reply as untracked: {e:#}"
+                );
+                return None;
+            }
+        };
+        let payload = serde_json::json!({
+            "action": "revision_advise",
+            "url": state.repo_url,
+            "change": state.change_slug,
+            "channel": state.channel,
+            "thread_ts": state.thread_ts,
+            "reply_text": reply_text,
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(Reply::Sync(format!(
+                "✗ revision advisor: could not start a discussion session: {err}"
+            )));
+        }
+        Some(Reply::Sync(
+            "🤔 Reconstructing the revision context (change deltas, canon, this thread) — I'll reply here read-only; nothing is written.".to_string(),
+        ))
+    }
+
     /// Handle the `clear-scout` verb (a25). Submits a `queue_clear_scout`
     /// control-socket action; the response carries the count cleared.
     async fn dispatch_clear_scout(
@@ -3693,12 +3840,15 @@ impl OperatorCommandDispatcher {
         let mut state = match read_state(state_root, thread_ts) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                // No audit thread matched — try the survey-thread
-                // fallback before refusing.
+                // No audit thread matched — try the survey-thread then the
+                // revision-thread fallback before refusing.
                 if let Some(reply) = self
                     .try_send_it_on_survey(thread_ts, repositories, submitter)
                     .await
                 {
+                    return reply;
+                }
+                if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
                     return reply;
                 }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
@@ -3712,6 +3862,9 @@ impl OperatorCommandDispatcher {
                     .try_send_it_on_survey(thread_ts, repositories, submitter)
                     .await
                 {
+                    return reply;
+                }
+                if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
                     return reply;
                 }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
@@ -9153,10 +9306,18 @@ mod tests {
             text.contains("clear-survey"),
             "help must mention clear-survey: {text}"
         );
-        assert!(
-            text.contains("audit OR brownfield-survey thread"),
-            "send-it help must name BOTH valid contexts: {text}"
-        );
+        // a03: `send it`'s help now names all four valid thread contexts.
+        for ctx in [
+            "audit-notification",
+            "brownfield-survey",
+            "issue-candidate",
+            "spec-revision",
+        ] {
+            assert!(
+                text.contains(ctx),
+                "send-it help must name the {ctx} context: {text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9456,5 +9617,210 @@ mod tests {
         let text = unwrap_sync(reply);
         assert!(text.contains("not tracking"), "{text}");
         assert!(submitter.calls().is_empty());
+    }
+
+    // ---------- send it / advisor in a spec-revision thread (a03) ----------
+
+    fn write_revision_thread_state(
+        state_root: &std::path::Path,
+        thread_ts: &str,
+        status: crate::revision_thread::RevisionThreadStatus,
+    ) {
+        let state = crate::revision_thread::RevisionThreadState {
+            thread_ts: thread_ts.to_string(),
+            channel: "C_OPS".to_string(),
+            repo_url: "git@github.com:acme/myrepo.git".to_string(),
+            change_slug: "a03-spec-revision-thread".to_string(),
+            status,
+            posted_at: chrono::Utc::now(),
+        };
+        crate::revision_thread::write_state(state_root, &state).unwrap();
+    }
+
+    /// `send it` in a tracked revision thread fires `revision_execute`.
+    #[tokio::test]
+    async fn send_it_in_revision_thread_runs_revision_execute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_revision_thread_state(
+            tmp.path(),
+            "1748.rev",
+            crate::revision_thread::RevisionThreadStatus::Open,
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("revision_execute", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748.rev"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("send-it must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "must accept: {text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action: the revision executor");
+        assert_eq!(calls[0]["action"], "revision_execute");
+        assert_eq!(calls[0]["change"], "a03-spec-revision-thread");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["thread_ts"], "1748.rev");
+        // The advisor (the non-`send it` path) was NOT invoked.
+        assert!(!calls.iter().any(|c| c["action"] == "revision_advise"));
+    }
+
+    /// A non-`send it` `@<bot>` reply in a revision thread routes to the
+    /// read-only revision advisor (NOT the executor, NOT the `?` reaction).
+    #[tokio::test]
+    async fn discussion_reply_in_revision_thread_routes_to_advisor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_revision_thread_state(
+            tmp.path(),
+            "1748.rev2",
+            crate::revision_thread::RevisionThreadStatus::Open,
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("revision_advise", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} is canon wrong here, or should the change align?"),
+                "C_OPS",
+                Some("1748.rev2"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("a discussion reply in a revision thread must produce a reply, not `?`");
+        // Some(reply) means the listener does NOT apply the `?` reaction.
+        let _ = unwrap_sync(reply);
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action: the advisor");
+        assert_eq!(calls[0]["action"], "revision_advise");
+        assert_eq!(calls[0]["change"], "a03-spec-revision-thread");
+        assert_eq!(calls[0]["thread_ts"], "1748.rev2");
+        // The operator's reply text is carried into the advisor session.
+        assert!(
+            calls[0]["reply_text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("canon wrong"),
+            "advisor must receive the operator's reply text: {:?}",
+            calls[0]["reply_text"]
+        );
+        // The executor was NOT invoked by a discussion reply.
+        assert!(!calls.iter().any(|c| c["action"] == "revision_execute"));
+    }
+
+    /// A reply matching NO tracked thread returns the four-context refusal.
+    #[tokio::test]
+    async fn send_it_in_untracked_thread_names_four_contexts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748.nope"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("audit-notification"), "{text}");
+        assert!(text.contains("brownfield-survey"), "{text}");
+        assert!(text.contains("issue-candidate"), "{text}");
+        assert!(text.contains("spec-revision"), "{text}");
+        assert!(submitter.calls().is_empty());
+    }
+
+    /// Regression: an audit-thread match takes precedence over a revision
+    /// match for the same `thread_ts` (audit lookup runs first).
+    #[tokio::test]
+    async fn send_it_audit_match_takes_precedence_over_revision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Both an audit thread AND a revision thread recorded for the same ts.
+        write_audit_thread_state(
+            tmp.path(),
+            "1748.both",
+            crate::audits::threads::AuditThreadStatus::Open,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        write_revision_thread_state(
+            tmp.path(),
+            "1748.both",
+            crate::revision_thread::RevisionThreadStatus::Open,
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "trigger_audit_action",
+            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748.both"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let _ = unwrap_sync(reply);
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "trigger_audit_action", "audit wins");
+        assert!(!calls.iter().any(|c| c["action"] == "revision_execute"));
+    }
+
+    /// A repeat `send it` on an already-acted revision thread is handled
+    /// gracefully WITHOUT re-running the executor.
+    #[tokio::test]
+    async fn send_it_on_acted_revision_thread_is_graceful() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_revision_thread_state(
+            tmp.path(),
+            "1748.acted",
+            crate::revision_thread::RevisionThreadStatus::Acted,
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748.acted"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "{text}");
+        assert!(text.contains("already"), "{text}");
+        assert!(
+            submitter.calls().is_empty(),
+            "an acted thread must not re-run the executor"
+        );
     }
 }

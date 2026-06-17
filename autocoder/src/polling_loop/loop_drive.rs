@@ -376,6 +376,7 @@ pub(crate) async fn drain_sync_survey_batch_queues(
     pending_brownfield_batch_requests: &std::sync::Mutex<
         std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>,
     >,
+    pending_revision_requests: &crate::control_socket::RevisionRequestQueues,
 ) {
     // OSS-fork support (a26): drain at most ONE sync-upstream
     // request per iteration. The handler fetches the configured
@@ -476,6 +477,59 @@ pub(crate) async fn drain_sync_survey_batch_queues(
         tracing::error!(
             url = snapshot_ref.url.as_str(),
             "brownfield-batch item drain errored for {}: {error:#}",
+            snapshot_ref.url
+        );
+    }
+
+    // Drain at most ONE spec-revision ADVISOR request per iteration (a03).
+    // The handler reconstructs a read-only agentic session from the change
+    // deltas, the canon, the marker's contradiction, AND the thread
+    // transcript, then replies in the thread — writing nothing.
+    let revision_advise_request: Option<crate::control_socket::RevisionAdviseRequest> = {
+        let mut g = pending_revision_requests.advise.lock().unwrap();
+        g.pop_front()
+    };
+    if let Some(req) = revision_advise_request
+        && let Err(error) = crate::polling::revision_session::process_pending_revision_advise(
+            workspace,
+            snapshot_ref,
+            chatops_ctx,
+            &req,
+        )
+        .await
+    {
+        tracing::error!(
+            url = snapshot_ref.url.as_str(),
+            change = req.change_slug.as_str(),
+            "revision-advise processing errored for {}: {error:#}",
+            snapshot_ref.url
+        );
+    }
+
+    // Drain at most ONE spec-revision EXECUTOR request per iteration (a03).
+    // The handler runs a write-scoped session that revises the change's spec
+    // deltas, re-runs the `[in]` / `[canon]` gates, AND opens a PR on a clean
+    // re-gate (reporting the PR link in the thread); on a still-failing
+    // re-gate it opens no PR and reports the remaining contradiction.
+    let revision_execute_request: Option<crate::control_socket::RevisionExecuteRequest> = {
+        let mut g = pending_revision_requests.execute.lock().unwrap();
+        g.pop_front()
+    };
+    if let Some(req) = revision_execute_request
+        && let Err(error) = crate::polling::revision_session::process_pending_revision_execute(
+            paths,
+            workspace,
+            snapshot_ref,
+            github_snap,
+            chatops_ctx,
+            &req,
+        )
+        .await
+    {
+        tracing::error!(
+            url = snapshot_ref.url.as_str(),
+            change = req.change_slug.as_str(),
+            "revision-execute processing errored for {}: {error:#}",
             snapshot_ref.url
         );
     }

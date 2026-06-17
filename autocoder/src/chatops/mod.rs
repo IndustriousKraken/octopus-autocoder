@@ -61,6 +61,22 @@ pub struct HumanReply {
     pub ts: String,
 }
 
+/// One message in a thread transcript (a03). Unlike [`HumanReply`] — which
+/// returns only the EARLIEST non-bot reply — a transcript includes EVERY
+/// message in the thread, oldest-first, INCLUDING the bot's own posts (the
+/// alert body, prior advisor answers). The spec-revision advisor reconstructs
+/// the full discussion from this each reply, since no agent session is held
+/// between replies.
+#[derive(Debug, Clone)]
+pub struct ThreadMessage {
+    /// `true` when autocoder itself posted the message (the alert body, a
+    /// prior advisor answer); `false` for an operator reply.
+    pub from_bot: bool,
+    pub user_id: String,
+    pub text: String,
+    pub ts: String,
+}
+
 /// Backend abstraction the polling loop holds. Each implementation talks
 /// to a different chat provider (Slack, Discord, Teams, Mattermost, Matrix).
 #[async_trait]
@@ -133,6 +149,24 @@ pub trait ChatOpsBackend: Send + Sync {
             "backend `{}` does not support threaded replies",
             self.provider_name()
         ))
+    }
+
+    /// Fetch the full reply transcript of the thread at `(channel,
+    /// thread_ts)`, oldest-first, INCLUDING the bot's own messages. Used by
+    /// the spec-revision advisor (a03) to rebuild the discussion's
+    /// conversation history each reply (the advisor holds no session between
+    /// replies, so every round reconstructs context from the transcript).
+    ///
+    /// Default impl returns `Ok(vec![])` so non-threading backends compile
+    /// and degrade to a transcript-less (single-turn) advisor — the operator's
+    /// current reply is still answered; only the prior rounds are absent.
+    #[allow(dead_code)] // called only by the a03 revision advisor
+    async fn fetch_thread_transcript(
+        &self,
+        _channel: &str,
+        _thread_ts: &str,
+    ) -> Result<Vec<ThreadMessage>> {
+        Ok(Vec::new())
     }
 
     /// Post `text` as a top-level channel message AND return the
