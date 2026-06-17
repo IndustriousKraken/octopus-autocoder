@@ -24,7 +24,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use super::specs_writing::{ALLOWED_TOOLS, SpecsWritingAuditParams, run_specs_writing_audit};
+use super::specs_writing::{
+    ALLOWED_TOOLS, ScopedGateChecker, SpecsWritingAuditParams, run_specs_writing_audit,
+};
 use super::{Audit, AuditContext, AuditOutcome, WritePolicy};
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -175,6 +177,9 @@ impl Audit for MissingTestsAudit {
             .unwrap_or_else(|| "<embedded default>".to_string());
         // audit-model-selection: route to the configured model (if any).
         let model = super::audit_resolved_model(&self.settings);
+        // a02: the production gate checker reads the scoped `[in]`/`[canon]`
+        // verifier-gate contexts (enabled gates run at authoring time too).
+        let gate_checker = ScopedGateChecker;
         run_specs_writing_audit(
             SpecsWritingAuditParams {
                 audit_type: Self::TYPE,
@@ -192,6 +197,7 @@ impl Audit for MissingTestsAudit {
                 model: model.as_ref(),
                 planning_lanes: true,
                 issues_lane_enabled: self.issues_lane_enabled(),
+                gate_checker: &gate_checker,
             },
             ctx,
         )

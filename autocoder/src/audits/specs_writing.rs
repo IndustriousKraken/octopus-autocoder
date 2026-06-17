@@ -111,6 +111,221 @@ pub(crate) struct SpecsWritingAuditParams<'a> {
     /// permits issue-lane writes structurally (the `PlanningLanes`
     /// `WritePolicy`) — the flag governs the prompt, not the post-hoc check.
     pub issues_lane_enabled: bool,
+    /// a02: the authoring-time gate checker run against each just-written unit
+    /// AFTER it passes `openspec validate --strict` (spec lane) OR is produced
+    /// (issue lane). Production audits pass [`ScopedGateChecker`], which reads
+    /// the verifier-gate task-local contexts (`[in]`/`[canon]`) so an enabled
+    /// gate runs at authoring time (self-healing) AND at implement time (the
+    /// unchanged backstop); a gate that is disabled (no scoped context) runs at
+    /// neither. Tests inject a scripted checker to drive the retry / re-route /
+    /// fail-closed paths deterministically without spawning a CLI.
+    pub gate_checker: &'a dyn AuthoringGateChecker,
+}
+
+/// Result of running the enabled authoring-time gate checks against ONE
+/// just-written unit (a02). Collapses the per-gate `[in]`/`[canon]` /
+/// issue-contract-change outcomes into the disposition the write-loop acts on.
+#[derive(Debug)]
+pub(crate) enum GateCheckOutcome {
+    /// Every enabled gate ran AND returned no finding (or no gate is enabled).
+    /// The unit is clean by the gates AND proceeds to commit.
+    Clean,
+    /// An enabled gate found a contradiction (`[in]`/`[canon]`, spec lane) OR a
+    /// required contract change (issue lane). Carries a human narrative for the
+    /// retry addendum so the rewrite is directed.
+    Found(String),
+    /// An enabled gate could NOT run (transport / parse / no-submission). The
+    /// unit is held — NOT treated as clean (the gates' fail-closed posture).
+    CouldNotRun(String),
+}
+
+/// Runs the enabled authoring-time verifier-gate checks against a single
+/// just-written unit (a02; task 1.1). One method per lane: spec-lane changes
+/// run the `[in]` + `[canon]` contradiction checks; issue-lane units run the
+/// contract-change check. The production implementation ([`ScopedGateChecker`])
+/// reuses the verifier framework's existing checks, prompts, AND
+/// `submit_contradictions` / `submit_canon_contradictions` MCP tools unchanged.
+#[async_trait::async_trait]
+pub(crate) trait AuthoringGateChecker: Send + Sync {
+    /// Run the enabled `[in]` and `[canon]` checks against the spec-lane change
+    /// `slug` (under `openspec/changes/<slug>/`). Returns `Clean` when every
+    /// enabled gate is clean (or none is enabled).
+    async fn check_spec_change(&self, workspace: &Path, slug: &str) -> GateCheckOutcome;
+    /// Run the issue contract-change check against the issue-lane unit `slug`
+    /// (under the issues lane), when the `[canon]` gate is enabled. Returns
+    /// `Clean` when the `[canon]` gate is disabled (the check does not run) OR
+    /// the issue is honest.
+    async fn check_issue_unit(&self, workspace: &Path, slug: &str) -> GateCheckOutcome;
+}
+
+/// Production gate checker: resolves the `[in]`/`[canon]` verifier-gate
+/// contexts from the task-locals the polling task scoped (so an enabled gate
+/// runs at authoring time AND implement time, a disabled one at neither — the
+/// SAME opt-in flags govern both points), AND dispatches to the verifier
+/// framework's existing checks.
+pub(crate) struct ScopedGateChecker;
+
+/// The scoped `[in]` gate context, gated on the registry installing the
+/// change-internal contradiction check — mirrors `run_in_gate`'s enable test
+/// so the authoring-time check fires under exactly the same condition as the
+/// implement-time gate.
+fn scoped_in_gate_ctx()
+-> Option<std::sync::Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>> {
+    crate::preflight::change_contradiction::current().filter(|_| {
+        matches!(
+            crate::verifier_gate::GateRegistry::standard()
+                .resolve(crate::verifier_gate::VerifierGate::In),
+            Some(crate::verifier_gate::GateImpl::ContradictionCheck)
+        )
+    })
+}
+
+/// The scoped `[canon]` gate context, gated on the registry installing the
+/// change-vs-canonical check. Governs BOTH the spec-lane `[canon]` check AND
+/// the issue-lane contract-change check (per a02: the issue check runs whenever
+/// the `[canon]` gate is enabled).
+fn scoped_canon_gate_ctx()
+-> Option<std::sync::Arc<crate::preflight::canon_contradiction::CanonContradictionCheckCtx>> {
+    crate::preflight::canon_contradiction::current().filter(|_| {
+        matches!(
+            crate::verifier_gate::GateRegistry::standard()
+                .resolve(crate::verifier_gate::VerifierGate::Canon),
+            Some(crate::verifier_gate::GateImpl::CanonContradictionCheck)
+        )
+    })
+}
+
+#[async_trait::async_trait]
+impl AuthoringGateChecker for ScopedGateChecker {
+    async fn check_spec_change(&self, workspace: &Path, slug: &str) -> GateCheckOutcome {
+        use crate::preflight::canon_contradiction::CanonContradictionCheckOutcome;
+        use crate::preflight::change_contradiction::ContradictionCheckOutcome;
+        // [in] first (cheaper: change-internal), then [canon]. Short-circuit on
+        // the first non-clean result — a single finding already drives the
+        // retry, AND stopping early respects the per-run cost (design D7).
+        if let Some(cc) = scoped_in_gate_ctx() {
+            match crate::preflight::change_contradiction::run_agentic_contradiction_check(
+                cc.as_ref(),
+                workspace,
+                slug,
+            )
+            .await
+            {
+                ContradictionCheckOutcome::Clean => {}
+                ContradictionCheckOutcome::Found(f) => {
+                    return GateCheckOutcome::Found(render_in_findings(&f));
+                }
+                ContradictionCheckOutcome::Errored { cause } => {
+                    return GateCheckOutcome::CouldNotRun(format!("[verifier:in] {cause}"));
+                }
+            }
+        }
+        if let Some(canon) = scoped_canon_gate_ctx() {
+            match crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
+                canon.as_ref(),
+                workspace,
+                slug,
+            )
+            .await
+            {
+                CanonContradictionCheckOutcome::Clean => {}
+                CanonContradictionCheckOutcome::Found(f) => {
+                    return GateCheckOutcome::Found(render_canon_findings(&f));
+                }
+                CanonContradictionCheckOutcome::Errored { cause } => {
+                    return GateCheckOutcome::CouldNotRun(format!("[verifier:canon] {cause}"));
+                }
+            }
+        }
+        GateCheckOutcome::Clean
+    }
+
+    async fn check_issue_unit(&self, workspace: &Path, slug: &str) -> GateCheckOutcome {
+        use crate::preflight::canon_contradiction::CanonContradictionCheckOutcome;
+        // The issue contract-change check runs only when the [canon] gate is
+        // enabled (a02). Disabled → Clean (the issue commits on its structural
+        // validity; the implement-time issue kick-back is the backstop).
+        let Some(canon) = scoped_canon_gate_ctx() else {
+            return GateCheckOutcome::Clean;
+        };
+        match crate::preflight::canon_contradiction::run_agentic_issue_contract_change_check(
+            canon.as_ref(),
+            workspace,
+            slug,
+        )
+        .await
+        {
+            CanonContradictionCheckOutcome::Clean => GateCheckOutcome::Clean,
+            CanonContradictionCheckOutcome::Found(f) => {
+                GateCheckOutcome::Found(render_issue_contract_findings(&f))
+            }
+            CanonContradictionCheckOutcome::Errored { cause } => {
+                GateCheckOutcome::CouldNotRun(format!("[verifier:canon] {cause}"))
+            }
+        }
+    }
+}
+
+/// Render `[in]` (change-internal) findings into a retry-addendum narrative.
+fn render_in_findings(
+    findings: &[crate::preflight::change_contradiction::ContradictionFinding],
+) -> String {
+    let body = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "- `{}` vs `{}`: {}",
+                f.requirement_a, f.requirement_b, f.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "The change passed `openspec validate --strict` but the [verifier:in] gate found \
+         requirement(s) within it that cannot all hold at once:\n{body}"
+    )
+}
+
+/// Render `[canon]` (change-vs-canonical) findings into a retry-addendum
+/// narrative.
+fn render_canon_findings(
+    findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
+) -> String {
+    let body = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "- this change's `{}` conflicts with the canonical `{}` (capability `{}`): {}",
+                f.change_requirement, f.canonical_requirement, f.canonical_capability, f.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "The change passed `openspec validate --strict` but the [verifier:canon] gate found \
+         it contradicts an ALREADY-canonical requirement:\n{body}"
+    )
+}
+
+/// Render an issue contract-change finding into a retry-addendum narrative.
+fn render_issue_contract_findings(
+    findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
+) -> String {
+    let body = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "- implementing this issue would require changing the canonical `{}` \
+                 (capability `{}`): {}",
+                f.canonical_requirement, f.canonical_capability, f.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "This issue claims (by carrying no spec delta) to change no contract, but implementing \
+         it would require a canonical contract change:\n{body}"
+    )
 }
 
 /// Execute one spec-writing audit run. Returns the outcome the framework
@@ -195,24 +410,27 @@ pub(crate) async fn run_specs_writing_audit(
         params.prompt.to_string()
     };
 
-    // Per-attempt state: dirs created on the prior attempt that we
-    // need to clear before the next LLM call (we ran into validation
-    // failures and are retrying).
-    let mut prior_attempt_dirs: Vec<String> = Vec::new();
-    // The validation error from the most recent failed attempt, fed
-    // to the LLM as a prompt addendum on the next attempt.
+    // Per-attempt state: units created on the prior attempt that we need to
+    // clear before the next LLM call (we hit a validation / gate failure and
+    // are retrying). a02: a failure can land in EITHER planning lane (an
+    // issue-lane unit can fail the contract-change check too), so this carries
+    // the lane, not just the name.
+    let mut prior_attempt_units: Vec<ProducedUnit> = Vec::new();
+    // The fully-composed prompt addendum from the most recent failed attempt
+    // (a `--strict` error narrative, an authoring-time gate-finding narrative
+    // with the permitted resolutions, OR both), fed to the LLM on the next
+    // attempt.
     let mut last_addendum_body: Option<String> = None;
 
     for attempt in 0..total_attempts {
-        // Clean up dirs produced by the prior failed attempt so they do
-        // not pollute this attempt's diff. `prior_attempt_dirs` holds only
-        // spec-lane names (per the validation invariant below), so resolving
-        // them under `openspec/changes/` is exhaustive.
-        for name in &prior_attempt_dirs {
-            let path = ctx.workspace.join("openspec/changes").join(name);
+        // Clean up units produced by the prior failed attempt so they do not
+        // pollute this attempt's diff. a02: resolve each in its own lane (a
+        // failure — and the re-route it drives — can land in either lane).
+        for u in &prior_attempt_units {
+            let path = unit_path(ctx.workspace, u.lane, &u.name);
             let _ = std::fs::remove_dir_all(&path);
         }
-        prior_attempt_dirs.clear();
+        prior_attempt_units.clear();
 
         let before_changes: HashSet<String> = snapshot_change_dirs(ctx.workspace);
         // a01: only a planning-lanes audit observes the issues lane; for a
@@ -225,11 +443,10 @@ pub(crate) async fn run_specs_writing_audit(
 
         let effective_prompt = match &last_addendum_body {
             None => base_prompt.clone(),
-            Some(err) => format!(
-                "{}\n\n{}",
-                base_prompt,
-                build_validation_addendum(err)
-            ),
+            // a02: `last_addendum_body` already carries the fully-composed
+            // addendum (the `--strict` framing and/or the gate-finding framing
+            // with permitted resolutions), so it is appended verbatim.
+            Some(addendum) => format!("{base_prompt}\n\n{addendum}"),
         };
 
         let _ = ctx.log_writer.write_section(
@@ -409,57 +626,132 @@ pub(crate) async fn run_specs_writing_audit(
             }
         }
 
-        // a01: validate SPEC-lane units via `openspec validate --strict`.
-        // Issue-lane units carry NO spec delta (no `specs/` directory), so
-        // there is nothing for openspec to validate — they are accepted as
-        // produced (the issues walker validates their `issue.md`/`tasks.md`
-        // shape when it works them next iteration). INVARIANT: only the
-        // `Lane::Changes` arm can push to `failures`, so `failures` (and the
-        // `prior_attempt_dirs` derived from it for retry cleanup) names ONLY
-        // spec-lane units — every cleanup below resolves them under
-        // `openspec/changes/`, never the issues lane.
+        // a01/a02: validate each produced unit in its lane, then run the
+        // enabled authoring-time verifier gates against it.
+        //
+        // - SPEC lane: `openspec validate --strict` (a01), then — when enabled
+        //   — the `[in]` and `[canon]` gate checks (a02). A `--strict` failure,
+        //   a gate finding, OR a gate that could-not-run all hold the unit (it
+        //   is not committed).
+        // - ISSUE lane: carries no spec delta to `--strict`, but — when the
+        //   `[canon]` gate is enabled — runs the authoring-time contract-change
+        //   check (a02). A finding re-routes it to the spec lane via the retry.
+        //
+        // a02: a failure can now land in EITHER lane, so `failures` (and the
+        // `prior_attempt_units` derived from it for cleanup) carries each unit's
+        // lane — cleanup resolves it via [`unit_path`], not a fixed prefix.
         let mut validated: Vec<ProducedUnit> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
+        let mut failures: Vec<UnitFailure> = Vec::new();
         for u in &new_units {
-            match u.lane {
-                Lane::Issues => validated.push(u.clone()),
+            let gate_outcome = match u.lane {
                 Lane::Changes => {
                     match validate_change(params.openspec_command, ctx.workspace, &u.name).await {
-                        Ok(()) => validated.push(u.clone()),
-                        Err(e) => failures.push((u.name.clone(), format!("{e:#}"))),
+                        Err(e) => {
+                            failures.push(UnitFailure {
+                                unit: u.clone(),
+                                error: format!("{e:#}"),
+                                kind: FailureKind::Strict,
+                            });
+                            continue;
+                        }
+                        Ok(()) => {
+                            params
+                                .gate_checker
+                                .check_spec_change(ctx.workspace, &u.name)
+                                .await
+                        }
                     }
+                }
+                Lane::Issues => {
+                    params
+                        .gate_checker
+                        .check_issue_unit(ctx.workspace, &u.name)
+                        .await
+                }
+            };
+            match gate_outcome {
+                GateCheckOutcome::Clean => validated.push(u.clone()),
+                GateCheckOutcome::Found(narrative) => failures.push(UnitFailure {
+                    unit: u.clone(),
+                    error: narrative,
+                    kind: FailureKind::GateFinding,
+                }),
+                GateCheckOutcome::CouldNotRun(cause) => failures.push(UnitFailure {
+                    unit: u.clone(),
+                    error: cause,
+                    kind: FailureKind::GateCouldNotRun,
+                }),
+            }
+        }
+
+        // Log every per-unit failure so operators can audit exactly what the
+        // LLM produced and why. `--strict` rejections keep their historical
+        // section name + WARN; gate failures (findings / could-not-run) carry
+        // the fail-closed framing.
+        for f in &failures {
+            match f.kind {
+                FailureKind::Strict => {
+                    let _ = ctx.log_writer.write_section(
+                        &format!(
+                            "{audit_type}_validation_failure_{}_attempt_{attempt}",
+                            f.unit.name
+                        ),
+                        &format!(
+                            "change: {}\nattempt: {attempt}\nerror: {}",
+                            f.unit.name, f.error
+                        ),
+                    );
+                    tracing::warn!(
+                        url = %ctx.repo.url,
+                        audit_type = audit_type,
+                        change = %f.unit.name,
+                        attempt = attempt,
+                        "rejecting agent-produced change that failed `openspec validate --strict`: {}",
+                        f.error
+                    );
+                }
+                FailureKind::GateFinding | FailureKind::GateCouldNotRun => {
+                    let kind_str = if matches!(f.kind, FailureKind::GateCouldNotRun) {
+                        "gate_could_not_run"
+                    } else {
+                        "gate_finding"
+                    };
+                    let _ = ctx.log_writer.write_section(
+                        &format!(
+                            "{audit_type}_gate_failure_{}_attempt_{attempt}",
+                            f.unit.name
+                        ),
+                        &format!(
+                            "unit: {}\nattempt: {attempt}\nkind: {kind_str}\ndetail: {}",
+                            f.unit.label(),
+                            f.error
+                        ),
+                    );
+                    tracing::warn!(
+                        url = %ctx.repo.url,
+                        audit_type = audit_type,
+                        unit = %f.unit.label(),
+                        attempt = attempt,
+                        kind = kind_str,
+                        "holding agent-produced unit that failed an authoring-time verifier gate (fail-closed): {}",
+                        f.error
+                    );
                 }
             }
         }
 
-        // Log every per-change validation failure so operators can audit
-        // exactly what the LLM produced and why. (Spec lane only — issue
-        // units are not openspec-validated.)
-        for (name, err) in &failures {
-            let _ = ctx.log_writer.write_section(
-                &format!("{audit_type}_validation_failure_{name}_attempt_{attempt}"),
-                &format!("change: {name}\nattempt: {attempt}\nerror: {err}"),
-            );
-            tracing::warn!(
-                url = %ctx.repo.url,
-                audit_type = audit_type,
-                change = %name,
-                attempt = attempt,
-                "rejecting agent-produced change that failed `openspec validate --strict`: {err}"
-            );
-        }
-
         if !validated.is_empty() {
-            // Mixed run: keep valid units, drop invalid spec-lane dirs,
-            // commit, return.
-            for (name, _) in &failures {
-                let path = ctx.workspace.join("openspec/changes").join(name);
+            // Mixed run: keep valid units, drop the failed ones (in either
+            // lane — a02), commit, return. A clean unit produced in the same
+            // run still commits even when a sibling failed a gate.
+            for f in &failures {
+                let path = unit_path(ctx.workspace, f.unit.lane, &f.unit.name);
                 if let Err(rm_err) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(
                         url = %ctx.repo.url,
                         audit_type = audit_type,
                         path = %path.display(),
-                        "failed to remove invalid change dir: {rm_err}"
+                        "failed to remove rejected unit dir: {rm_err}"
                     );
                 }
             }
@@ -538,31 +830,55 @@ pub(crate) async fn run_specs_writing_audit(
             });
         }
 
-        // All produced dirs failed validation. Drop them and either
-        // retry (if budget remains) or return ValidationExhausted.
-        prior_attempt_dirs = failures.iter().map(|(n, _)| n.clone()).collect();
+        // All produced units failed (a `--strict` rejection, a gate finding, OR
+        // a gate that could not run). Drop them and either retry (budget
+        // remains) or fail closed.
+        prior_attempt_units = failures.iter().map(|f| f.unit.clone()).collect();
         let combined_err = failures
             .iter()
-            .map(|(n, e)| format!("{n}: {e}"))
+            .map(|f| format!("{}: {}", f.unit.label(), f.error))
             .collect::<Vec<_>>()
             .join("\n");
 
         if attempt + 1 < total_attempts {
-            // Retry. Stash the combined error as the addendum for the
-            // next LLM call. The dirs get deleted at the top of the
-            // next iteration.
-            last_addendum_body = Some(combined_err);
+            // Retry. Compose the addendum for the next LLM call — the `--strict`
+            // framing AND/OR the gate-finding framing with the permitted
+            // resolutions (a02 task 2.1). The dirs get deleted at the top of
+            // the next iteration.
+            last_addendum_body =
+                Some(build_retry_addendum(&failures, params.issues_lane_enabled));
             continue;
         }
 
-        // Exhausted budget. Clean up and notify. `prior_attempt_dirs` is
-        // spec-lane-only (validation invariant), so `openspec/changes/` covers
-        // every entry.
-        for name in &prior_attempt_dirs {
-            let path = ctx.workspace.join("openspec/changes").join(name);
+        // Exhausted budget. Clean up first (each unit in its own lane — a02).
+        for u in &prior_attempt_units {
+            let path = unit_path(ctx.workspace, u.lane, &u.name);
             let _ = std::fs::remove_dir_all(&path);
         }
-        prior_attempt_dirs.clear();
+        prior_attempt_units.clear();
+
+        // a02: a contradiction / required-contract-change / gate-could-not-run
+        // that survived to budget exhaustion fails CLOSED — the offending unit
+        // is NOT committed AND the audit resolves to `DidNotComplete` (the
+        // found-but-could-not-persist disposition). The scheduler surfaces it
+        // via the audit-failure path (the `🚫` did-not-complete notification),
+        // so — unlike the `ValidationExhausted` path below — this branch does
+        // NOT post chatops itself. A pure `--strict` exhaustion keeps the
+        // historical `ValidationExhausted` + `❌`-notification behavior.
+        if failures.iter().any(|f| f.kind != FailureKind::Strict) {
+            let _ = ctx.log_writer.write_section(
+                &format!("{audit_type}_outcome"),
+                &format!(
+                    "kind: DidNotComplete\ncause: found_but_could_not_persist\nretries_attempted: {attempt}\nfinal_error:\n{combined_err}"
+                ),
+            );
+            return Ok(AuditOutcome::DidNotComplete {
+                audit_type: audit_type.to_string(),
+                cause: AuditFailureCause::FoundButCouldNotPersist,
+                examined_summary: summarize_session_output(&outcome.stdout),
+            });
+        }
+
         let _ = ctx.log_writer.write_section(
             &format!("{audit_type}_outcome"),
             &format!(
@@ -693,6 +1009,100 @@ fn unit_path(workspace: &Path, lane: Lane, name: &str) -> std::path::PathBuf {
             .join(crate::lanes::issues::ISSUES_SUBDIR)
             .join(name),
     }
+}
+
+/// Why a produced unit failed the per-attempt checks (a02). Distinguishes a
+/// `--strict` rejection (keeps the historical `ValidationExhausted` exhaustion
+/// outcome) from an authoring-time verifier-gate failure (a contradiction /
+/// required contract change, OR a gate that could-not-run — both fail CLOSED to
+/// `DidNotComplete` on exhaustion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// `openspec validate --strict` rejected the spec-lane change.
+    Strict,
+    /// An enabled `[in]`/`[canon]` gate found a contradiction (spec lane) OR
+    /// the issue contract-change check found a required contract change.
+    GateFinding,
+    /// An enabled authoring-time gate could not run (transport / parse /
+    /// no-submission). Held — never treated as clean (fail-closed posture).
+    GateCouldNotRun,
+}
+
+/// One produced unit that failed an attempt's checks, with its lane (for
+/// cleanup), the error / finding narrative (for the retry addendum AND the
+/// run-log), AND the [`FailureKind`] (which governs the exhaustion outcome).
+struct UnitFailure {
+    unit: ProducedUnit,
+    error: String,
+    kind: FailureKind,
+}
+
+/// Compose the next attempt's prompt addendum from this attempt's failures
+/// (a02 task 2.1). `--strict` failures keep the historical
+/// [`build_validation_addendum`] framing (so the existing retry-prompt shape is
+/// unchanged); gate findings / could-not-runs get a resolutions-aware addendum
+/// that presents the findings AND the permitted resolutions so the rewrite is
+/// directed. When both kinds are present this attempt, both sections are
+/// included.
+fn build_retry_addendum(failures: &[UnitFailure], issues_lane_enabled: bool) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    let strict: Vec<&UnitFailure> = failures
+        .iter()
+        .filter(|f| f.kind == FailureKind::Strict)
+        .collect();
+    if !strict.is_empty() {
+        let combined = strict
+            .iter()
+            .map(|f| format!("{}: {}", f.unit.label(), f.error))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(build_validation_addendum(&combined));
+    }
+    let gated: Vec<&UnitFailure> = failures
+        .iter()
+        .filter(|f| f.kind != FailureKind::Strict)
+        .collect();
+    if !gated.is_empty() {
+        sections.push(build_gate_finding_addendum(&gated, issues_lane_enabled));
+    }
+    sections.join("\n\n")
+}
+
+/// Build the gate-finding retry addendum: the findings followed by the
+/// permitted resolutions (align to canon, legible `MODIFIED`, convert to an
+/// issue, OR re-route an issue to the spec lane). The convert-to-issue option
+/// is offered only when the issues lane is available for this run.
+fn build_gate_finding_addendum(gated: &[&UnitFailure], issues_lane_enabled: bool) -> String {
+    let findings = gated
+        .iter()
+        .map(|f| format!("• ({})\n{}", f.unit.label(), f.error))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut resolutions = String::from(
+        "Rewrite the offending unit(s) to resolve the finding(s). Permitted resolutions:\n\
+         - ALIGN TO CANON: reword the change to reuse the canonical vocabulary so it no longer \
+         conflicts with the existing requirement (no canonical requirement is modified).\n\
+         - LEGIBLE `MODIFIED` DELTA: when the only correct fix genuinely changes a canonical \
+         contract, write a `## MODIFIED Requirements` delta of the contradicted requirement AND \
+         state the contract change plainly in the proposal's `## Why` rationale. Do NOT make the \
+         finding vanish by quietly bending the requirement to match the original change.\n",
+    );
+    if issues_lane_enabled {
+        resolutions.push_str(
+            "- CONVERT TO AN ISSUE: when the correct fix is behavior-preserving (the code drifted \
+             from an already-correct spec), delete the spec-lane change and write the unit as an \
+             `openspec/issues/<slug>/` issue instead (`issue.md` + `tasks.md`, NO `specs/`).\n",
+        );
+    }
+    resolutions.push_str(
+        "- RE-ROUTE AN ISSUE TO THE SPEC LANE: an issue flagged as requiring a contract change \
+         must be rewritten as a spec-lane change under `openspec/changes/<slug>/` carrying the \
+         legible `MODIFIED`/`ADDED` delta — delete the issue-lane unit.\n",
+    );
+    format!(
+        "Your previous response produced unit(s) that failed an authoring-time verifier gate:\n\n\
+         {findings}\n\n{resolutions}\nReply with the full revised unit(s)."
+    )
 }
 
 /// a01: the per-run lane-availability addendum the daemon appends to a
@@ -964,6 +1374,514 @@ mod outcome_tests {
         assert!(format!("{err:#}").contains("not captured"));
         let log = std::fs::read_to_string(&log_path).expect("log readable");
         assert!(log.contains("reason: exit status not captured"));
+    }
+}
+
+/// a02: authoring-time gate-check + self-heal behavior, driven through
+/// `run_specs_writing_audit` with a SCRIPTED [`AuthoringGateChecker`] so the
+/// retry / re-route / fail-closed paths are exercised deterministically — no
+/// CLI gate session, no task-local scope. The fake `claude` script writes the
+/// units; the scripted checker decides each unit's gate verdict.
+#[cfg(test)]
+mod a02_gate_tests {
+    use super::*;
+    use crate::audits::{AuditContext, AuditLogWriter};
+    use crate::config::{RepositoryConfig, ResolvedSandbox};
+    use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command as StdCommand;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    /// One scripted gate verdict. `Copy` so a `VecDeque` is trivial to drain.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Clean,
+        Found,
+        CouldNotRun,
+    }
+
+    fn to_outcome(s: Step) -> GateCheckOutcome {
+        match s {
+            Step::Clean => GateCheckOutcome::Clean,
+            Step::Found => GateCheckOutcome::Found("seeded contradiction with canon".into()),
+            Step::CouldNotRun => {
+                GateCheckOutcome::CouldNotRun("[verifier:canon] session failed".into())
+            }
+        }
+    }
+
+    /// Scripted checker: drains a per-lane queue of verdicts (empty → `Clean`)
+    /// AND counts calls so tests can assert a gate did / did not run.
+    struct ScriptedGateChecker {
+        spec: Mutex<VecDeque<Step>>,
+        issue: Mutex<VecDeque<Step>>,
+        spec_calls: AtomicUsize,
+        issue_calls: AtomicUsize,
+    }
+
+    impl ScriptedGateChecker {
+        fn new(spec: Vec<Step>, issue: Vec<Step>) -> Self {
+            Self {
+                spec: Mutex::new(spec.into()),
+                issue: Mutex::new(issue.into()),
+                spec_calls: AtomicUsize::new(0),
+                issue_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthoringGateChecker for ScriptedGateChecker {
+        async fn check_spec_change(&self, _ws: &Path, _slug: &str) -> GateCheckOutcome {
+            self.spec_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.spec.lock().unwrap().pop_front().unwrap_or(Step::Clean);
+            to_outcome(step)
+        }
+        async fn check_issue_unit(&self, _ws: &Path, _slug: &str) -> GateCheckOutcome {
+            self.issue_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.issue.lock().unwrap().pop_front().unwrap_or(Step::Clean);
+            to_outcome(step)
+        }
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn init_workspace() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().to_path_buf();
+        let runs = |args: &[&str]| {
+            assert!(
+                StdCommand::new("git")
+                    .args(args)
+                    .current_dir(&ws)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        runs(&["init", "-q", "-b", "main"]);
+        runs(&["config", "user.email", "t@e.com"]);
+        runs(&["config", "user.name", "t"]);
+        std::fs::write(ws.join("README.md"), "hi\n").unwrap();
+        runs(&["add", "README.md"]);
+        runs(&["commit", "-q", "-m", "init"]);
+        (dir, ws)
+    }
+
+    fn fixture_repo() -> RepositoryConfig {
+        RepositoryConfig {
+            forge: None,
+            url: "git@github.com:test/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+            sandbox: None,
+        }
+    }
+
+    fn make_log_writer(workspace: &Path) -> AuditLogWriter {
+        let (td, paths) = crate::testing::test_daemon_paths();
+        std::mem::forget(td);
+        AuditLogWriter::open(&paths, workspace, "a02_test").expect("log writer opens")
+    }
+
+    fn ok_validator(ws: &Path) -> PathBuf {
+        write_script(ws, "ok.sh", "#!/bin/sh\nexit 0\n")
+    }
+
+    /// Drive `run_specs_writing_audit` with a fake `claude` script + scripted
+    /// gate checker. Returns the outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_audit(
+        ws: &Path,
+        script: &Path,
+        openspec_cmd: &Path,
+        max_validation_retries: u32,
+        checker: &dyn AuthoringGateChecker,
+        issues_lane_enabled: bool,
+        settings_dir: &Path,
+    ) -> AuditOutcome {
+        let sandbox = ResolvedSandbox::resolve(None);
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(ws),
+            max_validation_retries,
+        };
+        run_specs_writing_audit(
+            SpecsWritingAuditParams {
+                audit_type: "a02_test_audit",
+                prompt: "survey and write units",
+                max_proposals: 4,
+                executor_command: &script.to_string_lossy(),
+                executor_timeout_secs: 30,
+                sandbox: &sandbox,
+                settings_dir: Some(settings_dir),
+                openspec_command: &openspec_cmd.to_string_lossy(),
+                prompt_source: "<test>",
+                commit_subject: "a02 test proposals",
+                allowed_tools: ALLOWED_TOOLS,
+                include_autocoder_tools: false,
+                model: None,
+                planning_lanes: true,
+                issues_lane_enabled,
+                gate_checker: checker,
+            },
+            &mut ctx,
+        )
+        .await
+        .expect("run succeeds")
+    }
+
+    fn head(ws: &Path) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn cleanup_log(ws: &Path) {
+        // Drop the per-test audit-log tree (best-effort).
+        let lw = make_log_writer(ws);
+        if let Some(parent) = lw.path().parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// 5.1: a seeded `[canon]` contradiction drives a retry with the finding in
+    /// the addendum; the rewrite that aligns to canon passes the gate AND
+    /// commits. Asserted via the gate result (Found → Clean across attempts) +
+    /// the committed unit, NOT prompt wording.
+    #[tokio::test]
+    async fn seeded_contradiction_retries_then_commits_on_clean_rewrite() {
+        let (_t, ws) = init_workspace();
+        let dir = ws.join("openspec/changes/fix-thing").display().to_string();
+        // Writes the same spec-lane change on every attempt (the gate verdict,
+        // not the content, is what changes).
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!("#!/bin/sh\nmkdir -p '{dir}'\necho '# proposal' > '{dir}/proposal.md'\nexit 0\n"),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        // Attempt 0 → Found, attempt 1 → Clean.
+        let checker = ScriptedGateChecker::new(vec![Step::Found, Step::Clean], vec![]);
+        let outcome = run_audit(
+            &ws,
+            &script,
+            &validator,
+            1,
+            &checker,
+            true,
+            settings.path(),
+        )
+        .await;
+        match outcome {
+            AuditOutcome::SpecsWritten {
+                changes,
+                retries_used,
+                ..
+            } => {
+                assert_eq!(changes, vec!["fix-thing".to_string()]);
+                assert_eq!(retries_used, 1, "the contradiction consumed one retry");
+            }
+            other => panic!("expected SpecsWritten after self-heal, got {other:?}"),
+        }
+        assert_eq!(checker.spec_calls.load(Ordering::SeqCst), 2, "checked each attempt");
+        // The committed unit cleared the gate (final check was Clean).
+        let tracked = StdCommand::new("git")
+            .args(["ls-files", "openspec/changes/fix-thing"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(!tracked.stdout.is_empty(), "the self-healed change is committed");
+        cleanup_log(&ws);
+    }
+
+    /// 5.2 (part 1): budget exhaustion on an unresolved contradiction yields
+    /// `DidNotComplete` (found-but-could-not-persist) AND no commit.
+    #[tokio::test]
+    async fn unresolved_contradiction_at_budget_exhaustion_fails_closed_no_commit() {
+        let (_t, ws) = init_workspace();
+        let dir = ws.join("openspec/changes/fix-bad").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!("#!/bin/sh\nmkdir -p '{dir}'\necho '# p' > '{dir}/proposal.md'\nexit 0\n"),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        let head_before = head(&ws);
+        // Found on every attempt (max_retries 1 → 2 attempts → 2 Founds).
+        let checker = ScriptedGateChecker::new(vec![Step::Found, Step::Found], vec![]);
+        let outcome = run_audit(&ws, &script, &validator, 1, &checker, true, settings.path()).await;
+        assert!(
+            matches!(
+                outcome,
+                AuditOutcome::DidNotComplete {
+                    cause: AuditFailureCause::FoundButCouldNotPersist,
+                    ..
+                }
+            ),
+            "an unresolved contradiction must fail closed to DidNotComplete, got {outcome:?}"
+        );
+        assert_eq!(head_before, head(&ws), "no commit on the fail-closed path");
+        assert!(
+            !ws.join("openspec/changes/fix-bad").exists(),
+            "the offending unit is dropped, not left in the tree"
+        );
+        cleanup_log(&ws);
+    }
+
+    /// 5.2 (part 2): a clean sibling unit produced in the same run still
+    /// commits even when a sibling fails its gate (the mixed-run path drops the
+    /// failed unit AND commits the clean one).
+    #[tokio::test]
+    async fn clean_sibling_commits_when_other_unit_fails_gate() {
+        let (_t, ws) = init_workspace();
+        let good = ws.join("openspec/changes/fix-good").display().to_string();
+        let bad = ws.join("openspec/changes/fix-bad").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{good}' '{bad}'\necho '# g' > '{good}/proposal.md'\necho '# b' > '{bad}/proposal.md'\nexit 0\n"
+            ),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        // Units sort by name: fix-bad (Found), fix-good (Clean).
+        let checker = ScriptedGateChecker::new(vec![Step::Found, Step::Clean], vec![]);
+        let outcome = run_audit(&ws, &script, &validator, 0, &checker, true, settings.path()).await;
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-good".to_string()], "only the clean sibling commits");
+            }
+            other => panic!("expected SpecsWritten with the clean sibling, got {other:?}"),
+        }
+        assert!(ws.join("openspec/changes/fix-good").exists());
+        assert!(
+            !ws.join("openspec/changes/fix-bad").exists(),
+            "the gate-failing sibling is dropped"
+        );
+        cleanup_log(&ws);
+    }
+
+    /// 5.3: with the gate disabled (the production `ScopedGateChecker` and NO
+    /// scoped verifier-gate context), neither the spec-lane nor the issue
+    /// check runs at authoring time — the unit commits on its a01 structural
+    /// validity.
+    #[tokio::test]
+    async fn disabled_gate_commits_on_structural_rules() {
+        let (_t, ws) = init_workspace();
+        let dir = ws.join("openspec/changes/fix-structural").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!("#!/bin/sh\nmkdir -p '{dir}'\necho '# p' > '{dir}/proposal.md'\nexit 0\n"),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        // The production checker with no task-local scope → both checks Clean.
+        let checker = ScopedGateChecker;
+        let outcome = run_audit(&ws, &script, &validator, 0, &checker, true, settings.path()).await;
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-structural".to_string()]);
+            }
+            other => panic!("expected SpecsWritten (gate disabled), got {other:?}"),
+        }
+        cleanup_log(&ws);
+    }
+
+    /// 5.3 (unit): the production `ScopedGateChecker` returns `Clean` for both
+    /// lanes when no verifier-gate context is scoped — i.e. the authoring-time
+    /// checks do NOT run when the gates are disabled.
+    #[tokio::test]
+    async fn scoped_checker_is_clean_when_no_gate_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let checker = ScopedGateChecker;
+        assert!(matches!(
+            checker.check_spec_change(tmp.path(), "x").await,
+            GateCheckOutcome::Clean
+        ));
+        assert!(matches!(
+            checker.check_issue_unit(tmp.path(), "x").await,
+            GateCheckOutcome::Clean
+        ));
+    }
+
+    /// 5.4: an issue whose fix would require a contract change is re-routed to
+    /// the spec lane (the committed unit is `openspec/changes/<slug>/`, not
+    /// `openspec/issues/<slug>/`); an honest issue commits as an issue.
+    #[tokio::test]
+    async fn issue_requiring_contract_change_is_rerouted_to_spec_lane() {
+        let (_t, ws) = init_workspace();
+        let issue = ws.join("openspec/issues/fix-route").display().to_string();
+        let change = ws.join("openspec/changes/fix-route").display().to_string();
+        let toggle = ws.join(".attempt-toggle").display().to_string();
+        // Attempt 0: write an issue. Attempt 1: write a spec-lane change
+        // (the agent re-routed per the addendum).
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nif [ ! -f '{toggle}' ]; then\n  touch '{toggle}'\n  mkdir -p '{issue}'\n  printf '## Report\\nbug\\n' > '{issue}/issue.md'\n  printf '## 1\\n- [ ] 1.1 fix\\n' > '{issue}/tasks.md'\nelse\n  mkdir -p '{change}'\n  echo '# proposal' > '{change}/proposal.md'\nfi\nexit 0\n"
+            ),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        // Issue check Found (attempt 0); spec check Clean (attempt 1).
+        let checker = ScriptedGateChecker::new(vec![Step::Clean], vec![Step::Found]);
+        let outcome = run_audit(&ws, &script, &validator, 1, &checker, true, settings.path()).await;
+        match outcome {
+            AuditOutcome::SpecsWritten {
+                changes,
+                retries_used,
+                ..
+            } => {
+                assert_eq!(changes, vec!["fix-route".to_string()]);
+                assert_eq!(retries_used, 1, "the re-route consumed one retry");
+            }
+            other => panic!("expected SpecsWritten after re-route, got {other:?}"),
+        }
+        // The committed unit is a spec-lane CHANGE, not an issue.
+        let tracked = |path: &str| {
+            !StdCommand::new("git")
+                .args(["ls-files", path])
+                .current_dir(&ws)
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        };
+        assert!(tracked("openspec/changes/fix-route"), "the re-routed unit is a change");
+        assert!(
+            !tracked("openspec/issues/fix-route"),
+            "the issue-lane unit must not be committed"
+        );
+        assert!(
+            !ws.join("openspec/issues/fix-route").exists(),
+            "the original issue dir is cleaned up on re-route"
+        );
+        cleanup_log(&ws);
+    }
+
+    /// 5.4 (honest issue): an issue whose contract-change check is clean commits
+    /// as an issue (no re-route).
+    #[tokio::test]
+    async fn honest_issue_commits_as_issue() {
+        let (_t, ws) = init_workspace();
+        let issue = ws.join("openspec/issues/fix-honest").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{issue}'\nprintf '## Report\\nbug\\n' > '{issue}/issue.md'\nprintf '## 1\\n- [ ] 1.1 fix\\n' > '{issue}/tasks.md'\nexit 0\n"
+            ),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        let checker = ScriptedGateChecker::new(vec![], vec![Step::Clean]);
+        let outcome = run_audit(&ws, &script, &validator, 0, &checker, true, settings.path()).await;
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, .. } => {
+                assert_eq!(changes, vec!["fix-honest".to_string()]);
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+        assert!(ws.join("openspec/issues/fix-honest/issue.md").is_file());
+        assert!(
+            !ws.join("openspec/changes/fix-honest").exists(),
+            "an honest issue is NOT routed to the spec lane"
+        );
+        cleanup_log(&ws);
+    }
+
+    /// 5.5: a gate that fails to run (could-not-run) does NOT commit the unit
+    /// AND surfaces the failure (fail-closed) — `DidNotComplete`, distinct from
+    /// a clean empty `SpecsWritten`.
+    #[tokio::test]
+    async fn gate_could_not_run_fails_closed_no_commit() {
+        let (_t, ws) = init_workspace();
+        let dir = ws.join("openspec/changes/fix-held").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!("#!/bin/sh\nmkdir -p '{dir}'\necho '# p' > '{dir}/proposal.md'\nexit 0\n"),
+        );
+        let validator = ok_validator(&ws);
+        let settings = TempDir::new().unwrap();
+        let head_before = head(&ws);
+        let checker = ScriptedGateChecker::new(vec![Step::CouldNotRun], vec![]);
+        let outcome = run_audit(&ws, &script, &validator, 0, &checker, true, settings.path()).await;
+        assert!(
+            matches!(
+                outcome,
+                AuditOutcome::DidNotComplete {
+                    cause: AuditFailureCause::FoundButCouldNotPersist,
+                    ..
+                }
+            ),
+            "a gate that could-not-run must fail closed (not a clean SpecsWritten), got {outcome:?}"
+        );
+        assert_eq!(head_before, head(&ws), "no commit when the gate could not run");
+        assert!(!ws.join("openspec/changes/fix-held").exists());
+        cleanup_log(&ws);
+    }
+
+    /// A pure `--strict` exhaustion still resolves to `ValidationExhausted`
+    /// (NOT `DidNotComplete`) — the a02 fail-closed path is reserved for gate
+    /// failures, leaving the historical strict-validation behavior intact.
+    #[tokio::test]
+    async fn strict_only_exhaustion_stays_validation_exhausted() {
+        let (_t, ws) = init_workspace();
+        let dir = ws.join("openspec/changes/fix-invalid").display().to_string();
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!("#!/bin/sh\nmkdir -p '{dir}'\necho '# p' > '{dir}/proposal.md'\nexit 0\n"),
+        );
+        let bad_validator =
+            write_script(&ws, "bad.sh", "#!/bin/sh\necho 'missing SHALL' >&2\nexit 2\n");
+        let settings = TempDir::new().unwrap();
+        // The gate never gets to run (the unit fails --strict first), so the
+        // checker stays Clean/unused.
+        let checker = ScriptedGateChecker::new(vec![], vec![]);
+        let outcome =
+            run_audit(&ws, &script, &bad_validator, 0, &checker, true, settings.path()).await;
+        assert!(
+            matches!(outcome, AuditOutcome::ValidationExhausted { .. }),
+            "a pure --strict exhaustion stays ValidationExhausted, got {outcome:?}"
+        );
+        assert_eq!(
+            checker.spec_calls.load(Ordering::SeqCst),
+            0,
+            "the gate is never reached when --strict fails first"
+        );
+        cleanup_log(&ws);
     }
 }
 
