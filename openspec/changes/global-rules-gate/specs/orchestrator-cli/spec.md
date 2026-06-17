@@ -40,7 +40,7 @@ The verifier gates' fail-closed disposition SHALL be enforced **structurally** �
 
 For each change under gate evaluation, every gate slot (`[in]`, `[canon]`, `[rules]`, `[out]`) SHALL have a verdict in the ledger, INITIALIZED to `PENDING` (a non-passing state). A verdict SHALL become `PASS` ONLY by an explicit, completed clean result. The verdict set is: `PENDING` (default — a runner that never recorded a verdict; treated as held), `PASS` (ran, clean), `FAIL` (ran, findings), `FAILED_TO_RUN` (ran, could not produce a verdict), `DISABLED` (gate not configured; non-blocking).
 
-There SHALL be no skip/absent code path for a gate slot: every slot — whether its gate is enabled OR disabled — SHALL run a runner that affirmatively writes a verdict. A disabled gate's runner is a STUB that writes `DISABLED`. This eliminates the disabled-vs-failed ambiguity at the structural level — "disabled" is an explicit recorded verdict, never an absence that a reader must remember to treat as a pass.
+There SHALL be no skip/absent code path among the slots the ledger carries: the ledger holds one slot per REALIZED gate, AND every such slot — whether its gate is enabled OR disabled — SHALL run a runner that affirmatively writes a verdict. A disabled gate's runner is a STUB that writes `DISABLED`; stamping that verdict is NOT invoking the gate — no check runs speculatively, consistent with the framework's posture toward inactive gates. A gate that no change has realized is ABSENT per the `Verifier-gate framework` requirement: it has no ledger slot AND no runner until it is realized, at which point it gains both. This keeps "unrealized" (no installed gate, no slot) distinct from "disabled" (installed, configured off, slot records `DISABLED`), AND eliminates the disabled-vs-failed ambiguity at the structural level — "disabled" is an explicit recorded verdict, never an absence that a reader must remember to treat as a pass.
 
 The executor SHALL be invoked ONLY when every BLOCKING gate (`[in]`, `[canon]`, `[rules]`) is `PASS` or `DISABLED`. A blocking gate that is `PENDING`, `FAIL`, or `FAILED_TO_RUN` SHALL hold the change. Because the default is `PENDING`, any failure to affirmatively record `PASS` holds the change without the holding code having to anticipate the specific failure. (`[rules]` is a pre-executor blocking gate, like `[in]` and `[canon]`; `[out]` is advisory and non-blocking.)
 
@@ -52,9 +52,15 @@ The ledger SHALL be rendered into the PR body as a compliance record: per gate, 
 - **AND** no code path needs to anticipate the specific failure for the hold to occur
 
 #### Scenario: A disabled gate records DISABLED via a stub
-- **WHEN** a gate is not configured (disabled)
+- **WHEN** a gate is realized but not configured (disabled)
 - **THEN** its slot's stub runner records `DISABLED` (a non-blocking verdict), NOT an absence
 - **AND** the executor proceeds (a disabled gate does not hold the change)
+- **AND** the gate's own check is NOT invoked (stamping `DISABLED` is not running the gate)
+
+#### Scenario: An unrealized gate has no ledger slot
+- **WHEN** a gate named in the framework has not been realized by any change
+- **THEN** the ledger carries no slot for it AND invokes no runner — not even a stub — consistent with the `Verifier-gate framework` requirement treating it as absent
+- **AND** when a later change realizes the gate, it gains both a ledger slot AND a runner that affirmatively writes its verdict
 
 #### Scenario: The executor runs only when blocking gates are PASS or DISABLED
 - **WHEN** the gate ledger for a change is evaluated before the executor

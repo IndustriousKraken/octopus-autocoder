@@ -260,7 +260,14 @@ pub fn parse_triage_verdict(text: &str) -> Option<TriageVerdict> {
 fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
     let line = line.trim_start_matches('*').trim_start();
     let prefix = format!("{label}:");
-    if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+    // `line.get(..prefix.len())` yields `None` (rather than panicking) when
+    // `prefix.len()` is not a char boundary, e.g. a multi-byte UTF-8 char
+    // straddles that byte offset. A successful ASCII-prefix match guarantees
+    // byte `prefix.len()` is a char boundary, so the slice below is valid.
+    if line
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+    {
         Some(line[prefix.len()..].trim_start_matches('*').trim())
     } else {
         None
@@ -1116,6 +1123,39 @@ mod tests {
         // Behavior change + bold markers tolerated.
         let v = parse_triage_verdict("**CLASSIFICATION:** BEHAVIOR_CHANGE").unwrap();
         assert_eq!(v.classification, ReportClassification::BehaviorChange);
+    }
+
+    #[test]
+    fn strip_label_does_not_panic_on_multibyte_boundary() {
+        // In "日本語のバグ" each CJK char is 3 bytes, so char boundaries fall
+        // at byte offsets 0, 3, 6, 9, 12, 15, 18. `SLUG:` (5 bytes) and
+        // `SUMMARY:` (8 bytes) end mid-codepoint (offsets 5 and 8), so the old
+        // guard's `line[..prefix.len()]` slice panicked with "byte index N is
+        // not a char boundary"; the fixed `line.get(..prefix.len())` form
+        // returns `None` instead. `CLASSIFICATION:` (15 bytes) ends on a char
+        // boundary, so it returns `None` because the prefix simply doesn't
+        // match rather than via the panic path.
+        assert_eq!(strip_label("日本語のバグ", "SLUG"), None);
+        assert_eq!(strip_label("日本語のバグ", "SUMMARY"), None);
+        assert_eq!(strip_label("日本語のバグ", "CLASSIFICATION"), None);
+        // Emoji are 4 bytes; byte offset 5 (`SLUG:`) lands inside the second
+        // glyph, so this also straddles a codepoint boundary.
+        assert_eq!(strip_label("🐛🐛report", "SLUG"), None);
+        // Valid ASCII labels still match (semantics preserved).
+        assert_eq!(strip_label("SLUG: my-slug", "SLUG"), Some("my-slug"));
+    }
+
+    #[test]
+    fn parse_triage_verdict_handles_non_ascii_lines_without_panic() {
+        // A valid classification plus a line of CJK text whose prefix-length
+        // byte offsets land mid-codepoint. Parsing must succeed (the
+        // classification still resolves) rather than crash the lane.
+        let text = "CLASSIFICATION: BUG\n\
+            日本語のバグ報告です\n\
+            SUMMARY: 日本語 diagnosis\n\
+            🐛🐛🐛";
+        let v = parse_triage_verdict(text).unwrap();
+        assert_eq!(v.classification, ReportClassification::Bug);
     }
 
     #[test]
