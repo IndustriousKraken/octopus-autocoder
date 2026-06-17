@@ -633,6 +633,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "revision_advise" => handle_revision_advise(&parsed, state),
         "revision_execute" => handle_revision_execute(&parsed, state),
         "queue_clear_survey" => handle_queue_clear_survey(&parsed, state),
+        "promote_issue_candidate" => handle_promote_issue_candidate(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
@@ -2450,6 +2451,77 @@ fn handle_queue_clear_survey(parsed: &Value, state: &ControlState) -> Value {
     })
 }
 
+/// Handle the `promote_issue_candidate` action (a010). Synchronously
+/// promotes a posted issue-lane candidate the chatops `send it` dispatcher
+/// matched to a maintainer's in-thread reply: resolves the repo AND its
+/// workspace, loads the candidate, AND — when it is still `Posted` — writes
+/// `issues/<slug>/` (its `issue.md` + `tasks.md`, plus the quarantined
+/// `report-body.md` for a public-origin candidate) AND flips the candidate's
+/// status to `Promoted`. Writing the unit IS the queue (the issues-lane
+/// walker picks up any ready `issues/<slug>/`). Idempotent: an already-
+/// `Promoted` candidate writes nothing further AND reports `already_promoted`
+/// so the dispatcher can word its reply without re-writing. Mirrors
+/// [`handle_queue_clear_survey`]'s synchronous-filesystem-work shape.
+///
+/// `channel` AND `thread_ts` are required so the request identifies the
+/// originating thread (matching the survey/audit action contract); the
+/// promotion itself is a pure filesystem write that needs neither.
+fn handle_promote_issue_candidate(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let candidate_id = match require_str(parsed, "candidate_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    if let Err(e) = require_str(parsed, "channel") {
+        return json!({"ok": false, "error": e});
+    }
+    if let Err(e) = require_str(parsed, "thread_ts") {
+        return json!({"ok": false, "error": e});
+    }
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = crate::workspace::resolve_path(&state.paths, &repo);
+    let candidate =
+        match crate::lanes::ingestion::read_candidate(&state.paths.state, &candidate_id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("no issue candidate `{candidate_id}` recorded"),
+                });
+            }
+            Err(e) => {
+                return json!({"ok": false, "error": format!("reading issue candidate: {e:#}")});
+            }
+        };
+    match candidate.status {
+        crate::lanes::ingestion::CandidateStatus::Promoted => json!({
+            "ok": true,
+            "already_promoted": true,
+            "slug": candidate.slug,
+        }),
+        crate::lanes::ingestion::CandidateStatus::Posted => {
+            match crate::lanes::ingestion::promote_candidate(
+                &workspace,
+                &state.paths.state,
+                &candidate,
+            ) {
+                Ok(dir) => json!({
+                    "ok": true,
+                    "slug": candidate.slug,
+                    "path": dir.display().to_string(),
+                }),
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
+    }
+}
+
 /// Handle the `query_canonical_specs` action (a21). Looks up the
 /// workspace's `CanonicalRagStore` in the daemon's registry; on hit,
 /// runs the query and returns ranked chunks. Every error path is
@@ -3958,6 +4030,98 @@ github:
         });
         let resp = send_request(&socket, &req.to_string()).await;
         assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        cancel.cancel();
+    }
+
+    /// Seed a posted, public-origin issue candidate under the daemon state
+    /// root so the `promote_issue_candidate` handler can act on it.
+    fn seed_posted_candidate(
+        state_root: &Path,
+        url: &str,
+        number: u64,
+        slug: &str,
+    ) -> String {
+        let id = crate::lanes::ingestion::candidate_id(url, number);
+        let candidate = crate::lanes::ingestion::CandidateState {
+            id: id.clone(),
+            repo_url: url.to_string(),
+            source_issue: number,
+            slug: slug.to_string(),
+            origin: crate::lanes::ingestion::IssueOrigin::Public,
+            issue_md: "## Report\nmaintainer-approved diagnosis\n".to_string(),
+            tasks_md: "- [ ] 1.1 fix the code to conform to the spec\n".to_string(),
+            report_body: "raw public reporter body {{x}}".to_string(),
+            posted_at: chrono::Utc::now(),
+            status: crate::lanes::ingestion::CandidateStatus::Posted,
+            thread_ts: Some("1755.cand".to_string()),
+            channel: Some("C_OPS".to_string()),
+        };
+        crate::lanes::ingestion::write_candidate(state_root, &candidate).unwrap();
+        id
+    }
+
+    /// 5.3: the `promote_issue_candidate` handler writes `issues/<slug>/`
+    /// (public origin includes `report-body.md`), flips the candidate to
+    /// promoted, is idempotent on a second invocation, AND errors on a
+    /// missing candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promote_issue_candidate_writes_queues_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+
+        let url = "git@github.com:owner/myrepo.git";
+        let id = seed_posted_candidate(&state.paths.state, url, 7, "drop-newline");
+
+        let req = serde_json::json!({
+            "action": "promote_issue_candidate",
+            "url": url,
+            "candidate_id": id,
+            "channel": "C_OPS",
+            "thread_ts": "1755.cand",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["slug"], "drop-newline");
+
+        // The unit is written under issues/<slug>/ — its bot-authored files
+        // plus the quarantined report-body for a public-origin candidate.
+        let issue_dir = workspace.join("openspec/issues/drop-newline");
+        assert!(issue_dir.join("issue.md").exists(), "issue.md written");
+        assert!(issue_dir.join("tasks.md").exists(), "tasks.md written");
+        assert!(
+            issue_dir.join("report-body.md").exists(),
+            "public-origin report-body.md quarantined"
+        );
+
+        // The candidate is flipped to Promoted.
+        let after = crate::lanes::ingestion::read_candidate(&state.paths.state, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            crate::lanes::ingestion::CandidateStatus::Promoted
+        );
+
+        // Second invocation is idempotent: reports already_promoted, no
+        // re-write (and no already-exists error).
+        let resp2 = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true), "resp2: {resp2}");
+        assert_eq!(resp2["already_promoted"], serde_json::Value::Bool(true));
+        assert_eq!(resp2["slug"], "drop-newline");
+
+        // A missing candidate returns an error.
+        let missing = serde_json::json!({
+            "action": "promote_issue_candidate",
+            "url": url,
+            "candidate_id": "owner-myrepo-999",
+            "channel": "C_OPS",
+            "thread_ts": "1755.none",
+        });
+        let resp3 = send_request(&socket, &missing.to_string()).await;
+        assert_eq!(resp3["ok"], serde_json::Value::Bool(false), "resp3: {resp3}");
         cancel.cancel();
     }
 

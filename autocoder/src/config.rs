@@ -2557,7 +2557,7 @@ impl NotificationsConfig {
 /// and no scheduler work happens. `defaults` maps audit type names to
 /// their global cadence; `settings` carries per-audit knobs (prompt
 /// override path, notify-on-clean flag, free-form `extra` for per-audit
-/// thresholds like brightline's `file_lines_threshold`).
+/// thresholds like the advisor's `selector_threshold`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditsConfig {
@@ -2890,15 +2890,23 @@ pub fn validate_audit_type_names(
     cfg: &Config,
     known_audit_types: &[&str],
 ) -> Result<()> {
+    // The deterministic spec-sync audit is configurable under `audits.*` but
+    // is NOT an `AuditRegistry` entry — it runs via the spec-sync rebuild path
+    // rather than the LLM audit framework. Accept its slug here so the install
+    // wizard's conservative default (`audits.defaults.spec_sync_audit`) does
+    // not fail startup validation.
+    let is_known = |name: &str| {
+        known_audit_types.contains(&name) || name == SPEC_SYNC_AUDIT_SLUG
+    };
     let mut unknown: Vec<(String, String)> = Vec::new();
     if let Some(audits) = cfg.audits.as_ref() {
         for name in audits.defaults.keys() {
-            if !known_audit_types.contains(&name.as_str()) {
+            if !is_known(name.as_str()) {
                 unknown.push((format!("audits.defaults.{name}"), name.clone()));
             }
         }
         for name in audits.settings.keys() {
-            if !known_audit_types.contains(&name.as_str()) {
+            if !is_known(name.as_str()) {
                 unknown.push((format!("audits.settings.{name}"), name.clone()));
             }
         }
@@ -2906,7 +2914,7 @@ pub fn validate_audit_type_names(
     for (idx, repo) in cfg.repositories.iter().enumerate() {
         if let Some(overrides) = repo.audits.as_ref() {
             for name in overrides.keys() {
-                if !known_audit_types.contains(&name.as_str()) {
+                if !is_known(name.as_str()) {
                     unknown.push((
                         format!("repositories[{idx}].audits.{name}"),
                         name.clone(),
@@ -2919,9 +2927,9 @@ pub fn validate_audit_type_names(
         return Ok(());
     }
     let known_list = if known_audit_types.is_empty() {
-        "(none registered)".to_string()
+        SPEC_SYNC_AUDIT_SLUG.to_string()
     } else {
-        known_audit_types.join(", ")
+        format!("{}, {SPEC_SYNC_AUDIT_SLUG}", known_audit_types.join(", "))
     };
     let mut msg = format!(
         "unknown audit type name(s) in config; known types: {known_list}\n"
@@ -3619,15 +3627,25 @@ impl ValidationReport {
 /// either silently accept a typo (validator too lenient) or reject a
 /// valid slug (validator too strict).
 pub const KNOWN_AUDIT_TYPES: &[&str] = &[
-    "architecture_brightline",
+    "architecture_advisor",
     "drift_audit",
     "missing_tests_audit",
     "security_bug_audit",
-    "architecture_consultative",
     "documentation_audit",
     "canon_contradiction_audit",
     "canon_consolidation_audit",
+    // The deterministic spec-sync audit is configurable but is NOT an
+    // `AuditRegistry` entry — it runs via the spec-sync rebuild path. Listed
+    // here so the validator accepts its slug (see `SPEC_SYNC_AUDIT_SLUG`).
+    SPEC_SYNC_AUDIT_SLUG,
 ];
+
+/// The deterministic, no-LLM spec-sync audit slug. Configurable under
+/// `audits.defaults` / `repositories[].audits` (the install wizard's
+/// conservative default sets it) but NOT registered in the `AuditRegistry`:
+/// it runs via the spec-sync rebuild path, so it is a recognized audit slug,
+/// not an unknown one.
+pub const SPEC_SYNC_AUDIT_SLUG: &str = "spec_sync_audit";
 
 /// Run every config validation check and return a structured report.
 /// Side-effect-free apart from reading process env vars for the
@@ -7693,7 +7711,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config parses");
@@ -7714,7 +7732,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   max_validation_retries: 0
 "#;
         let (_dir, path) = write_config(yaml);
@@ -7739,7 +7757,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   max_validation_retries: 5
 "#;
         let (_dir, path) = write_config(yaml);
@@ -7764,7 +7782,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   max_validation_retries: 10
 "#;
         let (_dir, path) = write_config(yaml);
@@ -7794,7 +7812,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config parses");
@@ -7815,7 +7833,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   max_audits_per_iteration: 3
 "#;
         let (_dir, path) = write_config(yaml);
@@ -7841,7 +7859,7 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   max_audits_per_iteration: 0
 "#;
         let (_dir, path) = write_config(yaml);
@@ -7883,27 +7901,27 @@ executor:
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
   settings:
-    architecture_brightline:
+    architecture_advisor:
       notify_on_clean: true
       extra:
-        file_lines_threshold: 500
+        selector_threshold: 500
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config with audits block should parse");
         let audits = cfg.audits.expect("audits block present");
         assert_eq!(
-            audits.defaults.get("architecture_brightline").copied(),
+            audits.defaults.get("architecture_advisor").copied(),
             Some(Cadence::Weekly)
         );
         let settings = audits
             .settings
-            .get("architecture_brightline")
+            .get("architecture_advisor")
             .expect("settings present");
         assert!(settings.notify_on_clean);
         assert!(
-            settings.extra.get("file_lines_threshold").is_some(),
+            settings.extra.get("selector_threshold").is_some(),
             "extra threshold should be parsed"
         );
     }
@@ -7925,7 +7943,7 @@ audits:
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("YAML must parse — validation is separate");
-        let err = validate_audit_type_names(&cfg, &["architecture_brightline"])
+        let err = validate_audit_type_names(&cfg, &["architecture_advisor"])
             .expect_err("unknown audit name must be rejected by validate_audit_type_names");
         let msg = format!("{err:#}");
         assert!(
@@ -7933,7 +7951,7 @@ audits:
             "error must name the offending audit type; got: {msg}"
         );
         assert!(
-            msg.contains("architecture_brightline"),
+            msg.contains("architecture_advisor"),
             "error must list known types; got: {msg}"
         );
     }
@@ -7954,7 +7972,7 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("YAML must parse");
-        let err = validate_audit_type_names(&cfg, &["architecture_brightline"])
+        let err = validate_audit_type_names(&cfg, &["architecture_advisor"])
             .expect_err("unknown per-repo audit name must be rejected");
         let msg = format!("{err:#}");
         assert!(
@@ -7970,7 +7988,7 @@ github: {}
     #[test]
     fn per_repo_audit_overrides_global_default() {
         let mut defaults = HashMap::new();
-        defaults.insert("architecture_brightline".to_string(), Cadence::Weekly);
+        defaults.insert("architecture_advisor".to_string(), Cadence::Weekly);
         let audits_cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
@@ -7978,22 +7996,22 @@ github: {}
         };
         let mut overrides = HashMap::new();
         overrides.insert(
-            "architecture_brightline".to_string(),
+            "architecture_advisor".to_string(),
             Cadence::EveryNDays(3),
         );
         let repo = make_repo("git@github.com:o/r.git", Some(overrides));
-        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_advisor");
         assert_eq!(effective, Cadence::EveryNDays(3));
     }
 
     #[test]
     fn audit_absent_from_both_resolves_to_disabled() {
         let repo = make_repo("git@github.com:o/r.git", None);
-        let effective = resolved_cadence(&repo, None, "architecture_brightline");
+        let effective = resolved_cadence(&repo, None, "architecture_advisor");
         assert_eq!(effective, Cadence::Disabled);
 
         let audits_cfg = AuditsConfig::default();
-        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_advisor");
         assert_eq!(effective, Cadence::Disabled);
 
         let mut defaults = HashMap::new();
@@ -8003,7 +8021,7 @@ github: {}
             settings: HashMap::new(),
             ..AuditsConfig::default()
         };
-        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_advisor");
         assert_eq!(
             effective,
             Cadence::Disabled,
@@ -8014,14 +8032,14 @@ github: {}
     #[test]
     fn global_default_applies_when_no_per_repo_override() {
         let mut defaults = HashMap::new();
-        defaults.insert("architecture_brightline".to_string(), Cadence::Monthly);
+        defaults.insert("architecture_advisor".to_string(), Cadence::Monthly);
         let audits_cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
             ..AuditsConfig::default()
         };
         let repo = make_repo("git@github.com:o/r.git", None);
-        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_advisor");
         assert_eq!(effective, Cadence::Monthly);
     }
 
@@ -8034,17 +8052,17 @@ repositories:
     agent_branch: agent-q
     poll_interval_sec: 60
     audits:
-      architecture_brightline: daily
+      architecture_advisor: daily
 executor:
   kind: claude_cli
 github: {}
 audits:
   defaults:
-    architecture_brightline: weekly
+    architecture_advisor: weekly
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        validate_audit_type_names(&cfg, &["architecture_brightline"])
+        validate_audit_type_names(&cfg, &["architecture_advisor"])
             .expect("registered audit must pass validation");
     }
 
@@ -8054,12 +8072,13 @@ audits:
     #[test]
     fn validate_audit_type_names_accepts_canon_contradiction_audit() {
         let known = &[
-            "architecture_brightline",
-            "architecture_consultative",
+            "architecture_advisor",
             "drift_audit",
             "missing_tests_audit",
             "security_bug_audit",
+            "documentation_audit",
             "canon_contradiction_audit",
+            "canon_consolidation_audit",
         ];
 
         // Accepts the new slug.
@@ -8115,11 +8134,11 @@ audits:
         // The seven slugs the canonical "Registered periodic audits"
         // enumeration carries after a76 (a75's six + canon_consolidation).
         let known = &[
-            "architecture_brightline",
-            "architecture_consultative",
+            "architecture_advisor",
             "drift_audit",
             "missing_tests_audit",
             "security_bug_audit",
+            "documentation_audit",
             "canon_contradiction_audit",
             "canon_consolidation_audit",
         ];
@@ -8167,6 +8186,59 @@ audits:
             msg.contains("canon_consolidation_audit"),
             "lists the registered slugs including the new one: {msg}"
         );
+    }
+
+    /// The deterministic `spec_sync_audit` slug passes validation even though
+    /// it is NOT an `AuditRegistry` entry — the install wizard's conservative
+    /// default (`audits.defaults.spec_sync_audit: daily`) must not block
+    /// startup. The removed architecture slugs are still rejected. (Task 7.3.)
+    #[test]
+    fn validate_audit_type_names_accepts_spec_sync_and_rejects_removed_slugs() {
+        let registered = &[
+            "architecture_advisor",
+            "drift_audit",
+            "missing_tests_audit",
+            "security_bug_audit",
+            "documentation_audit",
+            "canon_contradiction_audit",
+            "canon_consolidation_audit",
+        ];
+
+        // spec_sync_audit is accepted though it is not in the registry list.
+        let ok_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    spec_sync_audit: daily
+"#;
+        let (_d1, p1) = write_config(ok_yaml);
+        let cfg_ok = Config::load_from(&p1).unwrap();
+        validate_audit_type_names(&cfg_ok, registered)
+            .expect("the deterministic spec_sync_audit slug must be accepted");
+
+        // Each removed slug is still rejected.
+        for removed in [
+            "architecture_brightline",
+            "architecture_consultative",
+            "dependency_update_triage",
+        ] {
+            let bad_yaml = format!(
+                "repositories:\n  - url: \"git@github.com:owner/repo.git\"\n    base_branch: main\n    agent_branch: agent-q\n    poll_interval_sec: 60\nexecutor:\n  kind: claude_cli\ngithub: {{}}\naudits:\n  defaults:\n    {removed}: weekly\n"
+            );
+            let (_d, p) = write_config(&bad_yaml);
+            let cfg_bad = Config::load_from(&p).unwrap();
+            let err = validate_audit_type_names(&cfg_bad, registered)
+                .expect_err("removed slug must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(removed), "must name the removed slug {removed}: {msg}");
+        }
     }
 
     #[test]

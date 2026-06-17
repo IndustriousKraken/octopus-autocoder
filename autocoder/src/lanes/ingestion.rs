@@ -489,6 +489,19 @@ pub struct CandidateState {
     pub report_body: String,
     pub posted_at: DateTime<Utc>,
     pub status: CandidateStatus,
+    /// The posted candidate-notification's thread id, captured so a later
+    /// `@<bot> send it` reply can be matched back to this candidate (the
+    /// audit/survey send-it pattern). `None` when the post degraded (a
+    /// backend with no threading, OR an older record written before this
+    /// was captured): the candidate is posted but not reply-matchable.
+    /// `#[serde(default)]` so pre-existing candidate files deserialize.
+    #[serde(default)]
+    pub thread_ts: Option<String>,
+    /// The channel the candidate notification was posted to, carried
+    /// alongside `thread_ts` so the promotion action can address the
+    /// originating thread. `None` when chatops was not wired at post time.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 /// Stable per-report candidate id: `<owner>-<repo>-<number>` sanitized, OR
@@ -527,9 +540,8 @@ pub fn write_candidate(state_root: &Path, state: &CandidateState) -> Result<()> 
 
 /// Read a candidate state file. `Ok(None)` when absent.
 ///
-/// Reachable from the chatops "send it" promotion handler (the audit
-/// send-it pattern) — wired by a follow-up; tests exercise it directly.
-#[allow(dead_code)]
+/// Reached from the chatops "send it" promotion control-socket handler
+/// (the audit send-it pattern).
 pub fn read_candidate(state_root: &Path, id: &str) -> Result<Option<CandidateState>> {
     let path = candidate_path(state_root, id);
     let raw = match std::fs::read_to_string(&path) {
@@ -548,12 +560,50 @@ fn candidate_exists(state_root: &Path, id: &str) -> bool {
     candidate_path(state_root, id).exists()
 }
 
+/// Find the candidate whose recorded `thread_ts` equals `thread_ts` by
+/// scanning [`candidates_dir`] (mirrors the brownfield-survey scan). Used
+/// by the `send it` dispatcher to match a maintainer's in-thread reply to
+/// the candidate it should promote; `Posted` is the promotable status, but
+/// the matched record is returned regardless of status so the caller can
+/// branch (an already-`Promoted` candidate is reported as such, not
+/// re-promoted). Returns `None` when no candidate carries that thread —
+/// the caller falls through to the next `send it` context. A candidate with
+/// no recorded thread (`thread_ts: None`) never matches.
+pub fn find_candidate_by_thread(state_root: &Path, thread_ts: &str) -> Option<CandidateState> {
+    let dir = candidates_dir(state_root);
+    let rd = std::fs::read_dir(&dir).ok()?;
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(entry.path()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Ok(state) = serde_json::from_str::<CandidateState>(&raw)
+            && state.thread_ts.as_deref() == Some(thread_ts)
+        {
+            return Some(state);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Posting + promotion.
 // ---------------------------------------------------------------------------
 
 /// Post a drafted candidate to chatops AND record its `Posted` state.
 /// Writes NOTHING to `issues/` AND queues NOTHING — promotion is the gate.
+///
+/// The notification is posted via the thread-returning path
+/// (`post_notification_with_thread`) so the posted message's `thread_ts`
+/// (AND its channel) can be captured on the written state; a later
+/// `@<bot> send it` reply in that thread is then matched back to this
+/// candidate by [`find_candidate_by_thread`]. When the post degrades to a
+/// non-threaded message (a backend without threading) OR fails outright,
+/// the candidate is still recorded — with `thread_ts: None` (not
+/// reply-matchable) AND a warn log.
 pub async fn post_candidate(
     state_root: &Path,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -561,6 +611,52 @@ pub async fn post_candidate(
     candidate: &IssueCandidate,
 ) -> Result<CandidateState> {
     let id = candidate_id(repo_url, candidate.source_issue);
+    let origin_label = if candidate.origin.is_public() {
+        "public"
+    } else {
+        "maintainer"
+    };
+    let top_line = format!(
+        "🧪 `{repo_url}`: issue-lane candidate `{slug}` drafted from reported issue #{number} \
+         (origin: {origin}).",
+        slug = candidate.slug,
+        number = candidate.source_issue,
+        origin = origin_label,
+    );
+    let thread_body = format!(
+        "Reply `@<bot> send it` in this thread to write `issues/{slug}/` AND queue it; \
+         nothing is written OR queued until you do.",
+        slug = candidate.slug,
+    );
+    // Capture the posted message's thread (and channel) so a later
+    // promotion reply matches. A degraded post (no thread) leaves the
+    // candidate posted but not reply-matchable — graceful, never an error.
+    let (thread_ts, channel) = match chatops_ctx {
+        Some(ctx) => match ctx
+            .chatops
+            .post_notification_with_thread(&ctx.channel, &top_line, &thread_body)
+            .await
+        {
+            Ok(Some(ts)) => (Some(ts), Some(ctx.channel.clone())),
+            Ok(None) => {
+                tracing::warn!(
+                    repo_url = %repo_url,
+                    candidate = %id,
+                    "issue candidate posted without a thread_ts (backend has no threading); not reply-matchable"
+                );
+                (None, Some(ctx.channel.clone()))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo_url = %repo_url,
+                    candidate = %id,
+                    "issue candidate notification failed; recording the candidate without a thread: {e:#}"
+                );
+                (None, Some(ctx.channel.clone()))
+            }
+        },
+        None => (None, None),
+    };
     let state = CandidateState {
         id: id.clone(),
         repo_url: repo_url.to_string(),
@@ -572,20 +668,10 @@ pub async fn post_candidate(
         report_body: candidate.report_body.clone(),
         posted_at: Utc::now(),
         status: CandidateStatus::Posted,
+        thread_ts,
+        channel,
     };
     write_candidate(state_root, &state)?;
-    shared::notify(
-        chatops_ctx,
-        &format!(
-            "🧪 `{repo_url}`: issue-lane candidate `{slug}` drafted from reported issue #{number} \
-             (origin: {origin}). Reply `send it` in this thread to write `issues/{slug}/` AND queue it; \
-             nothing is queued until you do.",
-            slug = candidate.slug,
-            number = candidate.source_issue,
-            origin = if candidate.origin.is_public() { "public" } else { "maintainer" },
-        ),
-    )
-    .await;
     Ok(state)
 }
 
@@ -595,9 +681,8 @@ pub async fn post_candidate(
 /// Writing the unit IS the queue — [`crate::lanes::walker`] picks it up.
 /// This is the "send it" half of the audit send-it pattern.
 ///
-/// Reachable from the chatops "send it" promotion handler — wired by a
-/// follow-up; tests exercise it directly.
-#[allow(dead_code)]
+/// Reached from the chatops "send it" promotion control-socket handler
+/// ([`crate::control_socket`]'s `promote_issue_candidate` action).
 pub fn promote_candidate(
     workspace: &Path,
     state_root: &Path,
@@ -1235,5 +1320,174 @@ mod tests {
         assert!(out.contains("body says {{canonical_specs_index}}"));
         // The specs index is substituted exactly once (the template slot).
         assert_eq!(out.matches("- alpha").count(), 1);
+    }
+
+    #[test]
+    fn candidate_state_without_thread_fields_deserializes() {
+        // 1.1: a pre-existing candidate file (no thread_ts/channel keys)
+        // still deserializes — `#[serde(default)]` fills the absent fields.
+        let json = r#"{
+            "id": "o-r-3",
+            "repo_url": "https://github.com/o/r",
+            "source_issue": 3,
+            "slug": "drop-newline",
+            "origin": "public",
+            "issue_md": "report markdown",
+            "tasks_md": "task markdown",
+            "report_body": "raw",
+            "posted_at": "2026-01-01T00:00:00Z",
+            "status": "posted"
+        }"#;
+        let state: CandidateState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.status, CandidateStatus::Posted);
+        assert!(state.thread_ts.is_none());
+        assert!(state.channel.is_none());
+    }
+
+    // ----- candidate thread capture + thread-match lookup (a010) -----
+
+    /// Chatops backend that records every threaded notification AND returns a
+    /// configurable `thread_ts` from `post_notification_with_thread`, so the
+    /// candidate-posting path can be exercised end to end (thread capture).
+    struct ThreadRecordingBackend {
+        thread_ts: Option<String>,
+        posts: Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::chatops::ChatOpsBackend for ThreadRecordingBackend {
+        fn provider_name(&self) -> &'static str {
+            "thread-recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _c: &str, _ch: &str, _q: &str) -> Result<String> {
+            unreachable!("candidate posting is notification-only")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _c: &str,
+            _h: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            unreachable!("candidate posting is notification-only")
+        }
+        async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn post_notification_with_thread(
+            &self,
+            channel: &str,
+            top_line: &str,
+            thread_body: &str,
+        ) -> Result<Option<String>> {
+            self.posts.lock().unwrap().push((
+                channel.to_string(),
+                top_line.to_string(),
+                thread_body.to_string(),
+            ));
+            Ok(self.thread_ts.clone())
+        }
+    }
+
+    fn thread_ctx(
+        backend: std::sync::Arc<ThreadRecordingBackend>,
+        channel: &str,
+    ) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: backend,
+            channel: channel.to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_candidate_persists_thread_and_instructs_mention_form() {
+        // 5.1: post_candidate captures the posted thread_ts AND channel on the
+        // candidate state (round-trip), AND the notification instructs the
+        // mention form `@<bot> send it`.
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = std::sync::Arc::new(ThreadRecordingBackend {
+            thread_ts: Some("1700000000.123456".to_string()),
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = thread_ctx(backend.clone(), "C_ISSUES");
+        let r = report(9, "Drop newline", "raw body {{x}}", Some("NONE"));
+        let v = bug_verdict("drop-newline");
+        let candidate = draft_candidate(&r, &v, IssueOrigin::Public);
+        let state = post_candidate(&paths.state, Some(&ctx), &repo_cfg().url, &candidate)
+            .await
+            .unwrap();
+        // Behavior: captured on the returned state AND persisted to disk.
+        assert_eq!(state.thread_ts.as_deref(), Some("1700000000.123456"));
+        assert_eq!(state.channel.as_deref(), Some("C_ISSUES"));
+        let id = candidate_id(&repo_cfg().url, 9);
+        let round = read_candidate(&paths.state, &id).unwrap().unwrap();
+        assert_eq!(round.thread_ts.as_deref(), Some("1700000000.123456"));
+        assert_eq!(round.channel.as_deref(), Some("C_ISSUES"));
+        // The notification instructs the mention form (assert the behavior, not
+        // the full string).
+        let posts = backend.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "exactly one threaded post");
+        let combined = format!("{}\n{}", posts[0].1, posts[0].2);
+        assert!(combined.contains("@<bot> send it"), "{combined}");
+    }
+
+    #[tokio::test]
+    async fn post_candidate_degraded_post_records_no_thread() {
+        // 1.2: when the backend returns no thread_ts (no threading), the
+        // candidate is still recorded — with thread_ts: None (not matchable).
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = std::sync::Arc::new(ThreadRecordingBackend {
+            thread_ts: None,
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = thread_ctx(backend.clone(), "C_ISSUES");
+        let r = report(10, "Drop newline", "raw body", Some("NONE"));
+        let v = bug_verdict("drop-newline");
+        let candidate = draft_candidate(&r, &v, IssueOrigin::Public);
+        let state = post_candidate(&paths.state, Some(&ctx), &repo_cfg().url, &candidate)
+            .await
+            .unwrap();
+        assert_eq!(state.status, CandidateStatus::Posted);
+        assert!(state.thread_ts.is_none(), "no thread captured on a degraded post");
+        // Not reply-matchable: the thread-match lookup finds nothing.
+        assert!(find_candidate_by_thread(&paths.state, "anything").is_none());
+    }
+
+    #[tokio::test]
+    async fn find_candidate_by_thread_matches_and_reports_promoted() {
+        // 5.2: the thread-match lookup returns the posted candidate for a
+        // matching thread_ts AND None for a non-matching one; an already-
+        // promoted candidate is reported as such, not re-promotable.
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = std::sync::Arc::new(ThreadRecordingBackend {
+            thread_ts: Some("1755.abc".to_string()),
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = thread_ctx(backend.clone(), "C_ISSUES");
+        let r = report(11, "Drop newline", "raw body {{x}}", Some("NONE"));
+        let v = bug_verdict("drop-newline");
+        let candidate = draft_candidate(&r, &v, IssueOrigin::Public);
+        post_candidate(&paths.state, Some(&ctx), &repo_cfg().url, &candidate)
+            .await
+            .unwrap();
+
+        // Matching thread_ts → the posted candidate.
+        let found = find_candidate_by_thread(&paths.state, "1755.abc").unwrap();
+        assert_eq!(found.status, CandidateStatus::Posted);
+        assert_eq!(found.slug, "drop-newline");
+        // Non-matching thread_ts → None.
+        assert!(find_candidate_by_thread(&paths.state, "1755.nope").is_none());
+
+        // Promote it; the lookup now reports it Promoted (caller does not
+        // re-promote — it words the already-promoted reply instead).
+        promote_candidate(ws, &paths.state, &found).unwrap();
+        let after = find_candidate_by_thread(&paths.state, "1755.abc").unwrap();
+        assert_eq!(after.status, CandidateStatus::Promoted);
     }
 }

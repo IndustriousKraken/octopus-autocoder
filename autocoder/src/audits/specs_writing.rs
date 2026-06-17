@@ -1233,7 +1233,7 @@ fn summarize_session_output(stdout: &str) -> Option<String> {
 /// Pure transformation: given an [`crate::agentic_run::AgenticRunOutcome`],
 /// return Some(error) if the outcome is terminal (timed out, non-zero exit,
 /// OR an uncaptured exit status). Returns None when the caller should continue
-/// processing. Mirrors the same-named helpers in the `architecture_consultative`
+/// processing. Mirrors the same-named helpers in the `architecture_advisor`
 /// and `drift` audit modules.
 fn outcome_to_terminal_err(
     outcome: &crate::agentic_run::AgenticRunOutcome,

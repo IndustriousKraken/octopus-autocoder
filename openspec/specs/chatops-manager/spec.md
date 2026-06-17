@@ -630,15 +630,15 @@ The audit scheduler SHALL route findings notifications through `post_notificatio
 ### Requirement: Audit top-line uses per-type emoji and audit-specific summary
 The top-line of each audit notification SHALL be formatted per audit type so operators can scan the channel and immediately recognize the audit producing each message:
 
-- `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)`
+- `architecture_advisor`: `🏛 architecture_advisor on <repo>: <N> refactor recommendation(s)`
 - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
-- The proposal-creating audits (`missing_tests_audit`, `security_bug_audit`, `architecture_consultative`) use the `🔍 created proposal` form from `a02-audit-proposal-created-notification` (unchanged by this requirement; their notifications are already concise and do not need threading).
+- The proposal-creating audits (`missing_tests_audit`, `security_bug_audit`) use the `🔍 created proposal` form from `a02-audit-proposal-created-notification` (unchanged by this requirement; their notifications are already concise and do not need threading).
 
 When an audit has zero findings AND `notify_on_clean=true`, the top-line is `✅ <audit_type> on <repo>: no findings` (uniform across audit types).
 
-#### Scenario: Brightline summary names both counts
-- **WHEN** an `architecture_brightline` notification fires with 7 files over threshold AND 3 duplicate signatures
-- **THEN** the top-line is `📐 architecture_brightline on <repo>: 7 file(s) over line threshold; 3 duplicate signature(s)`
+#### Scenario: Advisor summary names the recommendation count
+- **WHEN** an `architecture_advisor` notification fires with 3 refactor recommendations
+- **THEN** the top-line is `🏛 architecture_advisor on <repo>: 3 refactor recommendation(s)`
 
 #### Scenario: Drift summary names the divergence count
 - **WHEN** a `drift_audit` notification fires with 2 divergences detected
@@ -951,18 +951,6 @@ The Slack Socket Mode inbound listener SHALL recognize `@<bot> changelog <repo-s
 - **AND** exactly one `ChangelogAction` is submitted regardless of redelivery count
 - **AND** exactly one ack message is posted to the channel
 
-### Requirement: Brightline chatops top-line admits a stale-ignore-cleanup clause
-The brightline audit's chatops top-line (the `📐` notification) SHALL include a trailing `; <K> stale ignore entries to clean up` clause when the audit detected `K > 0` stale entries in the workspace's `.brightline-ignore` file. The threaded body SHALL list each stale entry's `file + function + reason` so the operator can identify what to remove. This clause is informational only — the audit does NOT modify `.brightline-ignore` (brightline declares `WritePolicy::None`).
-
-#### Scenario: Stale entries surface in the top-line and body
-- **WHEN** a brightline run finds 1 oversize file, 2 duplicate signatures (1 fully ignored, 1 not), AND 3 stale ignore entries
-- **THEN** the chatops top-line reads `📐 architecture_brightline on <repo>: 1 file(s) over line threshold; 1 duplicate signature(s); 3 stale ignore entries to clean up`
-- **AND** the threaded body lists each stale entry with `file + function + reason`
-
-#### Scenario: No stale entries produces no clause
-- **WHEN** a brightline run finds no stale ignore entries (every entry validates against the current workspace)
-- **THEN** the chatops top-line is the pre-spec format without the trailing stale-cleanup clause
-
 ### Requirement: `ignore-and-continue` and `clear-ignore` verbs manage the `.ignore-for-queue.json` marker
 The chatops dispatcher SHALL recognize `@<bot> ignore-and-continue <repo-substring> <change-slug>` AND `@<bot> clear-ignore <repo-substring> <change-slug>` (both case-insensitive on the verb). The verbs manage the `.ignore-for-queue.json` marker introduced by `a18`'s orchestrator-cli requirement.
 
@@ -1015,7 +1003,7 @@ The `@<bot> status` reply's "active markers" section (when present) SHALL annota
 - **AND** the trailing "(blocking queue)" hint MAY be appended for clarity (implementation choice — the spec doesn't mandate the hint, only the ignore-for-queue annotation)
 
 ### Requirement: Documentation-audit chatops notification uses 📚 emoji
-The chatops audit-notification surface SHALL emit `documentation_audit` findings with a `📚`-prefixed top-line, parallel to the existing per-audit emoji conventions (`📐` brightline, `🧭` drift, `📋` consultative, `🔍` proposal-created). The notification SHALL use the existing threaded-notification path (top-line in channel, findings body as a thread reply when length warrants).
+The chatops audit-notification surface SHALL emit `documentation_audit` findings with a `📚`-prefixed top-line, parallel to the existing per-audit emoji conventions (`🏛` advisor, `🧭` drift, `🔍` proposal-created). The notification SHALL use the existing threaded-notification path (top-line in channel, findings body as a thread reply when length warrants).
 
 #### Scenario: Top-line format
 - **WHEN** `documentation_audit` returns `Reported(findings)` with non-empty findings
@@ -1032,13 +1020,6 @@ The chatops audit-notification surface SHALL emit `documentation_audit` findings
 #### Scenario: Findings body uses the existing threaded path
 - **WHEN** `documentation_audit` produces findings whose total body exceeds 3 lines OR 300 characters
 - **THEN** the chatops post routes through the threaded-notification path (per the existing `Audit findings post via the threaded-notification path` requirement) — top-line in channel, body in thread reply
-- **AND** shorter findings inline into a single message per the existing length threshold
-
-#### Scenario: Operator can act on findings via `send it`
-- **WHEN** an operator replies `@<bot> send it` inside a `documentation_audit` thread that is fresh, tracked, AND open
-- **THEN** the existing `audit-reply-acts` mechanism handles the verb (per its existing requirement)
-- **AND** the triage produces a doc-fix PR
-- **AND** no special-casing of `documentation_audit` is needed in the `send it` handler — the audit's `Reported` outcome surface is identical to other reported-outcome audits
 
 ### Requirement: Inbound listener recognizes the `brownfield` verb AND submits a `BrownfieldAction`
 The inbound chatops listener SHALL recognize `@<bot> brownfield <repo-substring> <capability-name> [optional guidance]` as a known verb alongside the existing chat-driven workflow verbs (`propose`, `send it`, `audit`) AND the operator recovery verbs. The listener SHALL parse the verb's arguments per the following grammar:
@@ -1600,5 +1581,45 @@ A reply in a revision thread that is an `@<bot>` mention but is NOT the `send it
 #### Scenario: Send-it in an untracked thread names four contexts
 - **WHEN** an operator posts `@<bot> send it` in a thread matching no audit, survey, issue-candidate, OR revision record
 - **THEN** the bot posts the untracked-thread refusal naming the four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread)
+- **AND** no action is submitted
+
+### Requirement: Inbound listener routes `send it` to issue-candidate promotion when posted in an issue-candidate thread
+
+The `send it` verb SHALL recognize an issue-candidate thread as one of its thread contexts: when `@<bot> send it` is posted as a reply whose `thread_ts` matches a posted issue-candidate's recorded thread, the dispatcher SHALL promote that candidate INSTEAD OF the audit-triage, brownfield-batch, OR spec-revision actions. This requirement DEFINES the issue-candidate routing that the canonical `send it`-context requirements already reference: the `Inbound listener routes send it to BrownfieldBatchAction when posted in a brownfield-survey thread` requirement enumerates the full thread-context set (audit, brownfield-survey, issue-candidate, AND spec-revision) AND cites this requirement for the issue-candidate branch, but the branch itself was not previously defined OR wired.
+
+At parse time, after the audit-thread lookup AND the brownfield-survey lookup both miss, the dispatcher SHALL look up the reply's `thread_ts` against the issue-candidate set — the `thread_ts` values recorded on stored candidate states — BEFORE the spec-revision lookup (matching the context order the canonical brownfield-survey requirement states). A `thread_ts` resolves to at most one record across the four sets.
+
+On a match whose candidate `status` is the posted (not-yet-promoted) state, the dispatcher SHALL submit the promotion control-socket action carrying the candidate identity AND the originating `channel`/`thread_ts`, AND reply with the write-and-queue confirmation. On a match whose candidate is already promoted, the dispatcher SHALL reply that the candidate is already promoted AND submit nothing. When a thread reply matches NONE of the four sets, the dispatcher SHALL post the untracked-thread refusal, whose text names all four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread). A `send it` at top level (not a thread reply) is NOT a thread context — it parses as the unknown-verb fallback (the `?` reaction), per the canonical brownfield-survey requirement, NOT the untracked-thread refusal.
+
+#### Scenario: Send-it in an audit thread is unchanged
+
+- **WHEN** an operator posts `@<bot> send it` as a reply inside an audit thread
+- **THEN** the existing audit-triage action is submitted
+- **AND** the issue-candidate lookup is not consulted
+
+#### Scenario: Send-it promotes a posted issue candidate
+
+- **WHEN** an operator posts `@<bot> send it` as a reply whose `thread_ts`
+  matches a stored issue candidate whose status is the posted (not-yet-promoted)
+  state
+- **THEN** the dispatcher submits the promotion control-socket action carrying
+  the candidate identity AND the originating `channel`/`thread_ts`
+- **AND** on success the bot replies that it wrote `issues/<slug>/` AND queued
+  it for the issues lane
+
+#### Scenario: Send-it on an already-promoted candidate takes no new action
+
+- **WHEN** an operator posts `@<bot> send it` in an issue-candidate thread whose
+  candidate is already promoted
+- **THEN** the bot replies that the candidate is already promoted
+- **AND** no promotion action is submitted
+
+#### Scenario: Send-it in an untracked thread names all four contexts
+
+- **WHEN** an operator posts `@<bot> send it` as a reply in a thread that
+  matches no audit, survey, issue-candidate, OR spec-revision record
+- **THEN** the bot posts the untracked-thread refusal naming the four valid
+  contexts (audit thread, brownfield-survey thread, issue-candidate thread,
+  spec-revision thread)
 - **AND** no action is submitted
 

@@ -558,21 +558,6 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** the example includes a permanent case with the ` (permanent; skipped until daemon restart) — operator inspection required` suffix
 - **AND** a one-line note explains the operator action: transient → wait; permanent → SSH and investigate
 
-### Requirement: OPERATIONS.md describes the `.brightline-ignore` file and CHATOPS.md cross-links from `send it`
-`docs/OPERATIONS.md`'s `architecture_brightline` audit section SHALL include a `.brightline-ignore` subsection describing the file's purpose, location, YAML schema, match-suppression behavior, stale-entry handling, AND the `send it` integration. `docs/CHATOPS.md`'s `send it` section SHALL cross-link to the OPERATIONS.md subsection so operators discovering one find the other.
-
-#### Scenario: OPERATIONS.md describes the ignore file completely
-- **WHEN** an operator reads `docs/OPERATIONS.md`'s `architecture_brightline` section
-- **THEN** a `.brightline-ignore` subsection appears with the workspace-root path, the YAML schema, AND examples
-- **AND** the section describes the match-suppression rule (all sites match → suppress; partial → emit unmatched only)
-- **AND** the section describes the stale-entry handling (informational chatops clause; operator removes entries manually)
-- **AND** the section describes the `send it` integration (the LLM populates entries when classifying findings as intentional)
-
-#### Scenario: CHATOPS.md `send it` section cross-links to `.brightline-ignore`
-- **WHEN** an operator reads `docs/CHATOPS.md`'s `send it` section
-- **THEN** the section's brightline-handling paragraph cross-links to `OPERATIONS.md#brightline-ignore`
-- **AND** the cross-link explains that `send it` on brightline findings can produce `.brightline-ignore` updates instead of (or in addition to) code fixes
-
 ### Requirement: OPERATIONS.md, STATE-LAYOUT.md, and TROUBLESHOOTING.md document the alert-state move
 `docs/OPERATIONS.md`'s throttled-failure-alerts section SHALL name `<state_dir>/alert-state/<basename>.json` as the canonical path. `docs/STATE-LAYOUT.md` SHALL add `alert-state/` to the state-dir contents table AND remove `.alert-state.json` from any workspace-local-files table that lists it. `docs/TROUBLESHOOTING.md` SHALL gain a "git checkout fails with 'local changes to .alert-state.json'" entry describing the legacy-workspace case AND the migration's automatic handling on next daemon startup. `docs/OPERATIONS.md` SHALL also gain a "Migrations" section enumerating every migration marker the daemon checks at startup AND what each does.
 
@@ -1130,30 +1115,29 @@ A future change MAY add a per-repository tooling-config block that injects the e
 ### Requirement: Source files and functions stay within a size budget
 The project SHALL treat source-file AND function length as a maintainability budget, not merely a metric an audit happens to report. A source file SHOULD stay at or under a target of roughly **500 lines** AND a function at or under roughly **50 lines**. These are judgment targets, NOT hard caps: genuinely cohesive, single-responsibility code MAY exceed them when splitting would add indirection without reducing complexity — the test is cohesion, not the line count.
 
-Past the brightline thresholds (file `800`, function `200` — both operator-configurable), a file or function is treated as a **structural defect to be addressed**, with the concern escalating as it climbs further over: the architecture-brightline audit grades it `low` / `medium` / `high` at `1×` / `1.5×` / `2.5×` the threshold. Duplicated logic — near-identical function bodies, OR repeated signatures across files — is likewise a structural defect, because in an LLM-grown codebase the bloat is reachable (it passes a dead-code linter) and only a size/duplication signal catches it.
+The budget is surfaced **advisorily** by mechanisms that SAMPLE rather than exhaustively enumerate, so it never functions as a per-file or per-function gate. The `architecture_advisor` audit examines a bounded set of the longest files over a configurable pain threshold AND, by cohesion judgment, recommends refactoring the worst offenders — it samples the most over-budget FILES (not every file) and reasons about files rather than individual functions. Code review independently notes an over-budget file OR function when a pass enlarges it. Because the advisor samples the worst offenders rather than guaranteeing coverage, a file or function over the budget is a maintainability signal informing prioritization — NOT a defect the project is obligated to have surfaced on any given run, AND NOT, on its own, grounds to block a pull request or a change from archiving. Duplicated logic — near-identical function bodies, OR one intent reimplemented across files — is likewise a maintainability concern; because it spans the whole tree rather than one file, surfacing it is a corpus-level concern, not the per-file advisor's.
 
-These defects are surfaced **advisorily** — graded by the architecture-brightline audit, prioritized by the architecture-consultative audit (which reasons about cohesion, not raw lines), AND noted by code review when a pass enlarges an over-budget file or function. A size or duplication finding SHALL NOT, on its own, block a pull request or a change from archiving; it is a maintainability signal that informs prioritization, not a correctness gate.
+This requirement is the single canonical home of the size budget; the `architecture_advisor` audit AND the `Reviewer flags files and functions that breach the size brightline` requirement reference it rather than restating the thresholds.
 
-This requirement is the single source of the size budget that the `Architecture-brightline audit`, `Consultative audit prioritizes oversized, low-cohesion code`, AND `Reviewer flags files and functions that breach the size brightline` requirements enforce.
-
-#### Scenario: A file far past the threshold is a high-severity structural defect
-- **WHEN** a source file's length reaches or exceeds `2.5 ×` the file-line threshold
-- **THEN** the project treats it as a high-severity structural defect to be addressed
-- **AND** it is surfaced advisorily — `high` severity from the architecture-brightline audit, prioritized by the architecture-consultative audit, AND noted by code review when a pass enlarges it — without, on size alone, blocking a pull request or a change from archiving
+#### Scenario: A file far past the threshold is eligible for an advisory recommendation
+- **WHEN** a source file's length is well past the file-line threshold AND it is among the longest files the `architecture_advisor` samples
+- **THEN** the advisor MAY recommend refactoring it by cohesion judgment, AND code review notes it when a pass enlarges it
+- **AND** the size finding does not, on size alone, block a pull request or a change from archiving
 
 #### Scenario: A cohesive file may exceed the target by judgment
 - **WHEN** a file exceeds the ~500-line target but implements a single cohesive responsibility that splitting would only fragment into indirection
 - **THEN** exceeding the target is not, by itself, a structural defect
-- **AND** the architecture-consultative audit is directed to leave it unflagged (size without a cohesion problem)
+- **AND** the `architecture_advisor` audit leaves it unflagged (size without a cohesion problem)
 
 #### Scenario: Duplicated logic is a structural defect
-- **WHEN** two or more functions share a near-identical body, OR a signature is repeated across files
-- **THEN** the duplication is treated as a structural defect surfaced by the architecture-brightline audit (duplicate-body AND duplicate-signature metrics respectively)
+- **WHEN** two or more functions share a near-identical body, OR one intent is reimplemented across files
+- **THEN** the duplication is treated as a structural defect to be addressed
+- **AND** because it spans files, surfacing it is a corpus-level concern rather than the per-file advisor's
 
 ### Requirement: The orchestrator polling loop is decomposed by responsibility
 The polling-loop orchestration SHALL be organized as a directory module whose submodules each own a single responsibility — rather than a single flat file that mixes all of them. Distinct responsibilities such as alert/notification posting, queue walking, waiting-change handling, pre-flight checks, review-context assembly, pull-request construction, rebuild iteration, audit-triage handling, proposal handling, AND outcome handling SHALL each reside in their own submodule. No submodule SHALL exceed the file-size budget (per `Source files and functions stay within a size budget`), AND a function that exceeds the function-size budget SHALL be split along its internal phases rather than left as one oversized body. Unit tests SHALL reside in sibling test module(s), NOT in a `#[cfg(test)] mod tests` block inside the orchestration source.
 
-This requirement gives the project's largest historical bloat hotspot a durable structural contract: the architecture-brightline, drift, AND architecture-consultative audits verify it on every run, so the module cannot silently re-accrete into one file.
+This requirement gives the project's largest historical bloat hotspot a durable structural contract. The `architecture_advisor` surfaces a regression when the orchestration's files grow large enough to rank among the worst offenders it samples, AND code review flags a pass that re-accretes responsibilities into one file — advisory backstops that make silent re-accretion less likely, NOT a per-run coverage guarantee.
 
 #### Scenario: Orchestration responsibilities live in separate submodules
 - **WHEN** the polling-loop orchestration is evaluated

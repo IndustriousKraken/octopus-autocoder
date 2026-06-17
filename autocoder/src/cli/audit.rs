@@ -7,8 +7,7 @@
 
 use crate::audits::{
     AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry,
-    architecture_consultative::ArchitectureConsultativeAudit,
-    brightline::ArchitectureBrightlineAudit,
+    architecture_advisor::ArchitectureAdvisorAudit,
     canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
     drift::DriftAudit,
@@ -134,8 +133,9 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
     let audit_settings: HashMap<String, AuditSettings> = HashMap::new();
 
     let mut registry = AuditRegistry::new();
-    registry.register(std::sync::Arc::new(ArchitectureBrightlineAudit::new(
+    registry.register(std::sync::Arc::new(ArchitectureAdvisorAudit::new(
         &audit_settings,
+        &executor_cfg,
     )));
     registry.register(std::sync::Arc::new(DriftAudit::new(
         &audit_settings,
@@ -146,10 +146,6 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
         &executor_cfg,
     )));
     registry.register(std::sync::Arc::new(SecurityBugAudit::new(
-        &audit_settings,
-        &executor_cfg,
-    )));
-    registry.register(std::sync::Arc::new(ArchitectureConsultativeAudit::new(
         &audit_settings,
         &executor_cfg,
     )));
@@ -439,7 +435,7 @@ mod tests {
         );
         // Hints at the registered names.
         assert!(
-            msg.contains("architecture_brightline")
+            msg.contains("architecture_advisor")
                 || msg.contains("security_bug_audit"),
             "error must list registered audits: {msg}"
         );

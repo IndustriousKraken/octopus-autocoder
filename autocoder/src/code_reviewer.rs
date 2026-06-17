@@ -208,8 +208,10 @@ pub struct CodeReviewer {
     /// a67: file/function line thresholds for the advisory size flag. The
     /// reviewer appends a `## Size advisory` note when a pass pushes a
     /// changed file or function past these, OR grows one already over.
-    /// Default to the same values the `architecture-brightline` audit
-    /// applies (file `800`, function `200`).
+    /// These reference the size budget defined by the `Source files and
+    /// functions stay within a size budget` requirement — its single
+    /// canonical home — rather than restating numbers; the defaults track
+    /// that budget's targets.
     file_lines_threshold: u64,
     function_lines_threshold: u64,
     /// The reviewer's fully-resolved model (provider, model id, base URL,
@@ -241,15 +243,15 @@ impl CodeReviewer {
             kind: ReviewerKind::Oneshot,
             command: "claude".to_string(),
             provider: LlmProvider::Anthropic,
-            file_lines_threshold: crate::audits::brightline::DEFAULT_FILE_LINES_THRESHOLD,
-            function_lines_threshold: crate::audits::brightline::DEFAULT_FUNCTION_LINES_THRESHOLD,
+            file_lines_threshold: crate::audits::code_metrics::DEFAULT_FILE_LINES_THRESHOLD,
+            function_lines_threshold: crate::audits::code_metrics::DEFAULT_FUNCTION_LINES_THRESHOLD,
             resolved_model: None,
         }
     }
 
     /// Builder-style setter for the advisory size-flag thresholds (a67).
-    /// Defaults match the `architecture-brightline` audit (file `800`,
-    /// function `200`); `from_config` leaves the defaults in place since
+    /// Defaults track the size budget (`Source files and functions stay
+    /// within a size budget`); `from_config` leaves the defaults in place since
     /// `ReviewerConfig` carries no per-reviewer override. Exercised by the
     /// size-advisory tests.
     #[allow(dead_code)]
@@ -571,7 +573,7 @@ fn size_advisory_section(
         // Whole-file advisory.
         let file_net = stats.map(|s| s.net()).unwrap_or(0);
         if total > file_threshold && file_net > 0 {
-            match crate::audits::brightline::production_test_line_split(&file.contents, &ext) {
+            match crate::audits::code_metrics::production_test_line_split(&file.contents, &ext) {
                 Some((prod, test)) => items.push(format!(
                     "- `{}` is now {total} lines (production {prod} / test {test}); this pass added net lines.",
                     file.path
@@ -584,7 +586,7 @@ fn size_advisory_section(
         }
         // Function-level advisories.
         let hunks: &[DiffHunk] = stats.map(|s| s.hunks.as_slice()).unwrap_or(&[]);
-        for span in crate::audits::brightline::function_line_spans(&file.contents, &ext) {
+        for span in crate::audits::code_metrics::function_line_spans(&file.contents, &ext) {
             let n = span.line_count();
             if n <= function_threshold {
                 continue;

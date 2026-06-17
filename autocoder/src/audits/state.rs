@@ -262,7 +262,7 @@ mod tests {
         let mut s = AuditState::default();
         let now = Utc::now();
         s.record(
-            "architecture_brightline",
+            "architecture_advisor",
             AuditRunEntry {
                 last_run_at: now,
                 last_run_sha: Some("deadbeef".into()),
@@ -273,7 +273,7 @@ mod tests {
         let reloaded = AuditState::load_or_default(dir.path());
         let e = reloaded
             .runs
-            .get("architecture_brightline")
+            .get("architecture_advisor")
             .expect("entry roundtrips");
         assert_eq!(e.last_run_sha.as_deref(), Some("deadbeef"));
         assert_eq!(e.last_outcome, AuditOutcomeKind::NoFindings);
@@ -300,7 +300,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raw = r#"{
             "runs": {
-                "architecture_brightline": {
+                "architecture_advisor": {
                     "last_run_at": "2026-01-01T00:00:00Z",
                     "last_run_sha": "abc",
                     "last_outcome": "no_findings"
@@ -311,7 +311,7 @@ mod tests {
         let s = AuditState::load_or_default(dir.path());
         assert_eq!(s.runs.len(), 1);
         assert!(s.attempt_history.is_empty(), "missing field → empty map");
-        assert!(s.history("architecture_brightline").is_empty());
+        assert!(s.history("architecture_advisor").is_empty());
     }
 
     #[test]

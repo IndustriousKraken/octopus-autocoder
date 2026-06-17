@@ -1641,7 +1641,7 @@ mod tests {
         let top_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"channel":"C0FOO","text":"📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)"}"#
+                r#"{"channel":"C0FOO","text":"🏛 architecture_advisor on r: 1 refactor recommendation(s)"}"#
                     .to_string(),
             ))
             .with_status(200)
@@ -1655,7 +1655,7 @@ mod tests {
         let reply_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"channel":"C0FOO","text":"file foo.rs is 1234 lines","thread_ts":"9999.5555"}"#
+                r#"{"channel":"C0FOO","text":"split src/foo.rs into cohesive modules","thread_ts":"9999.5555"}"#
                     .to_string(),
             ))
             .with_status(200)
@@ -1667,8 +1667,8 @@ mod tests {
         let outcome = backend
             .post_notification_with_thread(
                 "C0FOO",
-                "📐 brightline on r: 1 file(s) over line threshold; 0 duplicate signature(s)",
-                "file foo.rs is 1234 lines",
+                "🏛 architecture_advisor on r: 1 refactor recommendation(s)",
+                "split src/foo.rs into cohesive modules",
             )
             .await
             .expect("happy path returns Ok");
@@ -2038,8 +2038,8 @@ mod tests {
             thread_ts: thread_ts.to_string(),
             channel: "C_OPS".to_string(),
             repo_url: "git@github.com:acme/myrepo.git".to_string(),
-            audit_type: "architecture_brightline".to_string(),
-            findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
+            audit_type: "architecture_advisor".to_string(),
+            findings_excerpt: "  • split src/foo.rs".to_string(),
             posted_at: chrono::Utc::now() - chrono::Duration::minutes(30),
             status: crate::audits::threads::AuditThreadStatus::Open,
             reason: None,

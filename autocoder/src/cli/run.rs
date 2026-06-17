@@ -4,8 +4,7 @@
 
 use crate::audits::{
     AuditRegistry,
-    architecture_consultative::ArchitectureConsultativeAudit,
-    brightline::ArchitectureBrightlineAudit,
+    architecture_advisor::ArchitectureAdvisorAudit,
     canon_consolidation::CanonConsolidationAudit,
     canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
@@ -714,9 +713,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     }
 
     // Build the audit registry once at startup. Operators wire the
-    // architecture-brightline audit by listing its slug under
+    // architecture-advisor audit by listing its slug under
     // `audits.defaults` (and optionally setting `extra` knobs under
-    // `audits.settings.architecture_brightline`); the cadence resolver
+    // `audits.settings.architecture_advisor`); the cadence resolver
     // returns `Disabled` for absent entries so the registry can stay
     // populated without forcing any audit to run.
     let audit_settings: HashMap<String, AuditSettings> = cfg
@@ -725,17 +724,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         .map(|a| a.settings.clone())
         .unwrap_or_default();
     let mut registry = AuditRegistry::new();
-    registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
+    registry.register(Arc::new(ArchitectureAdvisorAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
     registry.register(Arc::new(MissingTestsAudit::new(
         &audit_settings,
         &cfg.executor,
     )));
     registry.register(Arc::new(SecurityBugAudit::new(
-        &audit_settings,
-        &cfg.executor,
-    )));
-    registry.register(Arc::new(ArchitectureConsultativeAudit::new(
         &audit_settings,
         &cfg.executor,
     )));

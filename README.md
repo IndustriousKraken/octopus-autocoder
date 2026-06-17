@@ -32,7 +32,7 @@ Prefer to build from source instead? See [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Periodic audits during install
 
-The wizard asks about periodic audits before writing `config.yaml`. The five LLM-driven audits — `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit` — are gated behind a single `[y/N]` question so operators who want to defer can answer "n" and move on. Operators who accept the gate get a fast-path prompt that enables all five at recommended cadences, falling back to an individual cadence walk-through if they decline the fast path.
+The wizard asks about periodic audits before writing `config.yaml`. The LLM-driven audits — `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit` — are gated behind a single `[y/N]` question so operators who want to defer can answer "n" and move on. Operators who accept the gate get a fast-path prompt that enables them at recommended cadences, falling back to an individual cadence walk-through if they decline the fast path.
 
 For non-interactive installs, the same configuration is available via `--audits-spec-sync <disabled|daily|weekly|monthly>` (defaults to `daily`), `--audits-llm-driven <none|recommended|all-disabled>` (defaults to `none`), and per-audit `--audit-<slug> <cadence>` overrides. A `--non-interactive` invocation that passes none of the `--audits-*` flags inherits the conservative default (spec-sync daily; everything else disabled), so IaC scripts that pre-date this wizard step keep working without surprise behavior changes. See [docs/CONFIG.md#audits-optional](docs/CONFIG.md#audits-optional) for cadence syntax and the `extra` knobs each audit reads.
 
@@ -70,12 +70,11 @@ Once the daemon is running, this is the day-to-day surface.
 | `@<bot> status [<repo>]` | Live workspace snapshot — branches, last commits, latest PR, busy state, queue. Bare `status` returns the per-repo menu. |
 | Recovery verbs | `@<bot> clear-perma-stuck`, `clear-revision`, `wipe-workspace` (two-step confirm), `rebuild-specs`, `help`. See [docs/CHATOPS.md → Operator recovery commands](docs/CHATOPS.md#operator-recovery-commands). |
 
-**Periodic audits.** Five audits run on configurable cadences. All `disabled` by default; opt in globally via `audits.defaults.<slug>` or per-repo. The install wizard offers a single fast-path to enable the recommended cadences.
+**Periodic audits.** Seven audits run on configurable cadences. All `disabled` by default; opt in globally via `audits.defaults.<slug>` or per-repo. The install wizard offers a single fast-path to enable the recommended cadences.
 
 | Audit | What it does | LLM | Output |
 | --- | --- | --- | --- |
-| `architecture_brightline` | Pure-code metrics: oversize files, duplicate signatures across files. | No | Reported findings (chatops `📐`) |
-| `architecture_consultative` | Anchored architectural questions tied to specific `file:line` ranges. Read-only sandbox. | Yes | Reported findings (chatops `📋`) |
+| `architecture_advisor` | Selects the longest files over a configurable pain threshold (line count is a selector, never a finding) and returns ranked, anchored refactor recommendations. Read-only sandbox. Acting on a recommendation drafts an **issue** by default. | Yes | Reported findings (chatops `🏛`) |
 | `drift_audit` | Each canonical-spec requirement vs. observable code behavior, plus spec-vs-spec contradiction detection. Read-only sandbox. | Yes | Reported findings (chatops `🧭`) |
 | `missing_tests_audit` | Surveys for uncovered error paths; writes `openspec/changes/tests-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |
 | `security_bug_audit` | Surveys for security issues and bugs; writes `openspec/changes/fix-*` / `secure-*` proposals. | Yes | New OpenSpec changes (queued automatically; chatops `🔍`) |

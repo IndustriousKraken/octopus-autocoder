@@ -1,7 +1,7 @@
 use super::*;
 
-/// 7.4: code-only outcome → NO PR, "no spec content" reply, tree clean,
-/// status TriageFailed.
+/// 7.4: code-only outcome → NO PR, "no spec or issue content" reply, tree
+/// clean, status TriageFailed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a43_audit_code_only_opens_no_pr() {
     let (_dir, ws) = fixture_workspace_with_remote();
@@ -52,8 +52,8 @@ async fn a43_audit_code_only_opens_no_pr() {
     );
     let replies = chatops.replies.lock().unwrap().clone();
     assert!(
-        replies.iter().any(|r| r.contains("no spec content")),
-        "the no-spec-content reply must be posted, got {replies:?}"
+        replies.iter().any(|r| r.contains("no spec or issue content produced")),
+        "the no-content reply must be posted, got {replies:?}"
     );
 }
 
@@ -156,63 +156,6 @@ async fn a43_audit_empty_diff_posts_no_action_reply() {
             .iter()
             .any(|r| r.contains("Nothing actionable in these findings.")),
         "no-action reply must carry the executor's summary, got {replies:?}"
-    );
-}
-
-/// Brightline "Mark as intentional" carve-out: a brightline triage whose
-/// only write is `.brightline-ignore` ships it directly in one PR (NOT
-/// discarded as a non-spec write), since it has no implementer-pipeline
-/// equivalent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a43_brightline_intentional_ships_ignore_file_in_one_pr() {
-    let (_dir, ws) = fixture_workspace_with_remote();
-    let (_td, paths) = crate::testing::test_daemon_paths();
-    std::fs::write(
-        ws.join(".brightline-ignore"),
-        "ignore:\n  - file: a.ts\n    function: f\n    signature_match: \"f(\"\n    reason: intentional\n",
-    )
-    .unwrap();
-
-    let _hook = test_hooks::lock();
-    let mut server = mockito::Server::new_async().await;
-    let pr_mock = server
-        .mock("POST", "/repos/owner/fixture/pulls")
-        .with_status(201)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/11","number":11}"#)
-        .expect(1)
-        .create_async()
-        .await;
-    test_hooks::set_github_api_base(Some(server.url()));
-
-    let chatops = Arc::new(RecordingChatOps {
-        replies: std::sync::Mutex::new(Vec::new()),
-    });
-    let ctx = recording_ctx(&chatops);
-    let mut state = audit_state();
-    state.audit_type = "architecture_brightline".into();
-    let res = process_completed_triage(
-        &paths,
-        &ws,
-        &fixture_repo(&ws),
-        &triage_github_cfg(),
-        Some(&ctx),
-        &mut state,
-        None,
-    )
-    .await;
-    test_hooks::set_github_api_base(None);
-    res.expect("handler must succeed");
-
-    pr_mock.assert_async().await;
-    assert_eq!(
-        state.status,
-        crate::audits::threads::AuditThreadStatus::Acted
-    );
-    let files = crate::git::diff_files_changed(&ws, "main", "agent-q-triage-spec").unwrap();
-    assert!(
-        files.iter().any(|f| f == ".brightline-ignore"),
-        "the .brightline-ignore write must ship (not be discarded), got {files:?}"
     );
 }
 

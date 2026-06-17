@@ -2090,51 +2090,38 @@ mod tests {
         post_mock.assert_async().await;
     }
 
-    fn brightline_file_finding(n: usize) -> Finding {
+    fn advisor_finding(n: usize) -> Finding {
         Finding {
             severity: Severity::Medium,
-            subject: format!("file src/file{n}.rs is {lines} lines (threshold: 800)", lines = 1000 + n),
-            body: format!("path: src/file{n}.rs\nlines: {lines}\nthreshold: 800", lines = 1000 + n),
-            anchor: Some(format!("src/file{n}.rs:1")),
+            subject: format!("split src/file{n}.rs into cohesive modules"),
+            body: format!("src/file{n}.rs mixes unrelated responsibilities; decompose along its seams."),
+            anchor: Some(format!("src/file{n}.rs:1-200")),
         }
     }
 
     #[tokio::test]
-    async fn brightline_many_findings_post_via_thread() {
-        // 5 file findings + 2 dup findings → 7 body lines → above the
-        // threading threshold. The Slack backend issues TWO
-        // chat.postMessage calls under the hood: the top-line, then the
-        // threaded reply. The mockito server expects both.
+    async fn advisor_many_findings_post_via_thread() {
+        // 5 recommendations → above the threading threshold. The Slack
+        // backend issues TWO chat.postMessage calls under the hood: the
+        // top-line, then the threaded reply. The mockito server expects both.
         let (_t, ws) = init_workspace();
-        let mut findings = Vec::new();
-        for i in 0..5 {
-            findings.push(brightline_file_finding(i));
-        }
-        for i in 0..2 {
-            findings.push(Finding {
-                severity: Severity::Low,
-                subject: format!("duplicate signature `fn helper{i}` across 2 files"),
-                body: "mod_a.rs:1\nmod_b.rs:1".into(),
-                anchor: Some("mod_a.rs:1".into()),
-            });
-        }
+        let findings: Vec<Finding> = (0..5).map(advisor_finding).collect();
         let audit = Arc::new(
-            CountingAudit::new("architecture_brightline")
+            CountingAudit::new("architecture_advisor")
                 .with_outcome(AuditOutcome::reported(findings)),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
-        let cfg = audits_cfg_daily("architecture_brightline");
+        let cfg = audits_cfg_daily("architecture_advisor");
         let repo = fixture_repo();
 
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops(&mut server).await;
-        // Top-line POST: matches the brightline emoji + counts.
+        // Top-line POST: matches the advisor emoji + recommendation count.
         let top_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::Regex("📐 architecture_brightline".into()),
-                mockito::Matcher::Regex("5 file\\(s\\) over line threshold".into()),
-                mockito::Matcher::Regex("2 duplicate signature\\(s\\)".into()),
+                mockito::Matcher::Regex("🏛 architecture_advisor".into()),
+                mockito::Matcher::Regex("5 refactor recommendation\\(s\\)".into()),
             ]))
             .with_status(200)
             .with_body(r#"{"ok":true,"ts":"9999.0001"}"#)
@@ -2146,8 +2133,7 @@ mod tests {
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::Regex("9999.0001".into()),
-                mockito::Matcher::Regex("file src/file0.rs is".into()),
-                mockito::Matcher::Regex("duplicate signature `fn helper0`".into()),
+                mockito::Matcher::Regex("split src/file0.rs".into()),
             ]))
             .with_status(200)
             .with_body(r#"{"ok":true,"ts":"9999.0002"}"#)
@@ -2163,18 +2149,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn brightline_no_findings_notify_on_clean_posts_check_inline() {
+    async fn advisor_no_findings_notify_on_clean_posts_check_inline() {
         let (_t, ws) = init_workspace();
         let audit = Arc::new(
-            CountingAudit::new("architecture_brightline")
+            CountingAudit::new("architecture_advisor")
                 .with_outcome(AuditOutcome::reported(vec![])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
-        let cfg = audits_cfg_daily("architecture_brightline");
+        let cfg = audits_cfg_daily("architecture_advisor");
         let repo = fixture_repo();
         let mut settings = HashMap::new();
         settings.insert(
-            "architecture_brightline".to_string(),
+            "architecture_advisor".to_string(),
             AuditSettings {
                 prompt_path: None,
                 notify_on_clean: true,
@@ -2190,7 +2176,7 @@ mod tests {
         let post_mock = server
             .mock("POST", "/chat.postMessage")
             .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::Regex("✅ architecture_brightline".into()),
+                mockito::Matcher::Regex("✅ architecture_advisor".into()),
                 mockito::Matcher::Regex("no findings".into()),
             ]))
             .with_status(200)
@@ -2206,14 +2192,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn brightline_no_findings_without_notify_on_clean_posts_nothing() {
+    async fn advisor_no_findings_without_notify_on_clean_posts_nothing() {
         let (_t, ws) = init_workspace();
         let audit = Arc::new(
-            CountingAudit::new("architecture_brightline")
+            CountingAudit::new("architecture_advisor")
                 .with_outcome(AuditOutcome::reported(vec![])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
-        let cfg = audits_cfg_daily("architecture_brightline");
+        let cfg = audits_cfg_daily("architecture_advisor");
         let repo = fixture_repo();
 
         let mut server = mockito::Server::new_async().await;

@@ -1164,7 +1164,7 @@ mod tests {
         let basename = ws.file_name().unwrap().to_str().unwrap().to_string();
         let logs_dir = paths.audit_logs_dir(&basename);
         std::fs::create_dir_all(&logs_dir).unwrap();
-        let log_path = logs_dir.join(format!("architecture_consultative-{safe_ts}.log"));
+        let log_path = logs_dir.join(format!("architecture_advisor-{safe_ts}.log"));
         std::fs::write(&log_path, "").unwrap();
         let path = marker_path(&paths, &ws);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1179,7 +1179,7 @@ mod tests {
         };
         write_atomic(&path, &marker).unwrap();
         let summary = current(&paths, &ws, 600).expect("marker present");
-        assert_eq!(summary.audit_type.as_deref(), Some("architecture_consultative"));
+        assert_eq!(summary.audit_type.as_deref(), Some("architecture_advisor"));
         // Cleanup so this fixture doesn't bleed into other tests sharing
         // the same logs root.
         let _ = std::fs::remove_file(&log_path);
