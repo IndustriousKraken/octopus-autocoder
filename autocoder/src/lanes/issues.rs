@@ -1,15 +1,17 @@
 //! Issues-lane artifact loading, validation, AND lifecycle (a009 §2).
 //!
-//! An issue is a directory `openspec/issues/<slug>/` containing
+//! An issue is a directory `issues/<slug>/` containing
 //! `issue.md` (the report + diagnosis AND the acceptance criteria stated
 //! against the EXISTING specification) AND `tasks.md` (the fix steps),
 //! with NO `specs/` directory — that absence is the contract that an
 //! issue changes no spec. A unit that carries a `specs/` directory is
 //! malformed (an issue carries no delta).
 //!
-//! On completion the issue directory moves to `openspec/issues/archive/`
-//! (mirroring `openspec/changes/archive/`); NO canonical spec is
-//! modified — the issues lane leaves an audit trail only.
+//! The lane lives at the repository root (`issues/`), NOT under
+//! `openspec/`: issues are autocoder's own construct, not an OpenSpec
+//! artifact (the `openspec` CLI never reads them). On completion the issue
+//! directory moves to `issues/archive/` (mirroring `changes/archive/`); NO
+//! canonical spec is modified — the issues lane leaves an audit trail only.
 
 use crate::lanes::shared;
 use anyhow::{Context, Result};
@@ -17,9 +19,15 @@ use chrono::Utc;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Subdirectory under the workspace holding the issues lane, mirroring
-/// `openspec/changes` for the changes lane.
-pub const ISSUES_SUBDIR: &str = "openspec/issues";
+/// Subdirectory under the workspace holding the issues lane, at the
+/// repository root (mirroring `changes/` for the changes lane). Issues are
+/// autocoder's own construct, not an OpenSpec artifact, so the lane lives at
+/// the root rather than under `openspec/`.
+pub const ISSUES_SUBDIR: &str = "issues";
+/// Pre-relocation location of the issues lane. A repository that has not yet
+/// been migrated (`git mv openspec/issues issues`) is still served from here
+/// transitionally; see [`issues_dir`]. Removed in a later release.
+const LEGACY_ISSUES_SUBDIR: &str = "openspec/issues";
 const ARCHIVE_DIR: &str = "archive";
 const ISSUE_FILE: &str = "issue.md";
 const TASKS_FILE: &str = "tasks.md";
@@ -32,17 +40,48 @@ const SPECS_DIR: &str = "specs";
 /// (a009) units have no such file AND are not quarantined.
 pub const REPORT_BODY_FILE: &str = "report-body.md";
 
-/// `<workspace>/openspec/issues/`.
+/// `<workspace>/issues/` — the canonical issues-lane root.
+///
+/// Transitional migration: if the canonical `issues/` directory does not
+/// exist but a pre-relocation `openspec/issues/` directory does, this
+/// resolves to the legacy location (for BOTH read and write) so a repository
+/// that has not yet run `git mv openspec/issues issues` keeps working; a
+/// one-time WARN names the remedy. Once `issues/` exists the legacy path is
+/// ignored, and a fresh repository uses the canonical path. The legacy
+/// fallback is removed in a later release.
 pub fn issues_dir(workspace: &Path) -> PathBuf {
-    workspace.join(ISSUES_SUBDIR)
+    let canonical = workspace.join(ISSUES_SUBDIR);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = workspace.join(LEGACY_ISSUES_SUBDIR);
+    if legacy.is_dir() {
+        warn_legacy_issues_dir_once(&legacy);
+        return legacy;
+    }
+    canonical
 }
 
-/// `<workspace>/openspec/issues/<slug>/`.
+/// Emit a single process-wide WARN the first time the issues lane resolves
+/// to the pre-relocation `openspec/issues/` location, naming the migration.
+fn warn_legacy_issues_dir_once(legacy: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            legacy = %legacy.display(),
+            "issues lane resolved to the pre-relocation `openspec/issues/` location; \
+             run `git mv openspec/issues issues` to migrate (the legacy fallback is \
+             removed in a later release)"
+        );
+    });
+}
+
+/// `<workspace>/issues/<slug>/`.
 pub fn issue_dir(workspace: &Path, slug: &str) -> PathBuf {
     issues_dir(workspace).join(slug)
 }
 
-/// `<workspace>/openspec/issues/archive/`.
+/// `<workspace>/issues/archive/`.
 pub fn archive_root(workspace: &Path) -> PathBuf {
     issues_dir(workspace).join(ARCHIVE_DIR)
 }
@@ -157,7 +196,7 @@ pub fn load(workspace: &Path, slug: &str) -> std::result::Result<LoadedIssue, Is
 }
 
 /// List ready issue slugs: direct subdirectories of
-/// `<workspace>/openspec/issues/` that are not the `archive` directory,
+/// `<workspace>/issues/` that are not the `archive` directory,
 /// do not begin with `.`, do not carry an `.in-progress` lock, AND load
 /// as a well-formed issue. A malformed unit (one with a `specs/`
 /// directory) is excluded with a one-line WARN — it is rejected, not

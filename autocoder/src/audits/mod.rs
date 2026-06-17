@@ -79,7 +79,7 @@ pub enum WritePolicy {
     /// audit may write under EITHER planning lane — `openspec/changes/`
     /// (the spec lane) OR the issues lane (the path the issues walker
     /// reads via [`crate::lanes::issues::ISSUES_SUBDIR`], today
-    /// `openspec/issues/`). The post-hoc check accepts any modified/new
+    /// `issues/`). The post-hoc check accepts any modified/new
     /// path under either prefix AND reverts anything else (a source edit,
     /// a doc edit, a config change) via `git reset --hard HEAD` +
     /// `git clean -fd` + chatops alert — exactly the `OpenSpecOnly`

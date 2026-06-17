@@ -22,7 +22,7 @@ async fn self_heal_falls_through_when_openspec_validate_fails() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, _, includes_self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &repo,
@@ -93,7 +93,7 @@ async fn walk_queue_stops_at_max_changes() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _self_heal) = run_pass_through_commits(
+    let (processed, _, _self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -143,7 +143,7 @@ async fn walk_queue_cap_of_1_ships_one_per_pass() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -215,7 +215,7 @@ async fn walk_queue_halts_on_failed_change() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -321,7 +321,7 @@ async fn walk_queue_halts_on_escalated_change() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -374,7 +374,7 @@ async fn archived_change_leaves_clean_working_tree() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

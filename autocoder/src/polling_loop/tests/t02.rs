@@ -294,7 +294,7 @@ async fn askuser_on_pending_escalates_to_chatops() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -407,7 +407,7 @@ async fn waiting_change_resumes_and_archives_on_reply() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

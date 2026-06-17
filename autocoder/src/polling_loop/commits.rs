@@ -19,7 +19,7 @@ pub async fn run_pass_through_commits(
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
-) -> Result<(Vec<String>, bool)> {
+) -> Result<(Vec<String>, Vec<String>, bool)> {
     prepare_workspace_for_pass(paths, workspace, repo, github_cfg, chatops_ctx).await?;
 
     // Issues lane (a009): highest precedence (issues > changes > audits).
@@ -29,7 +29,7 @@ pub async fn run_pass_through_commits(
     // gates (a stuck/waiting change does not block issues — fault
     // isolation between lanes). Any commits it produces ride this pass's
     // push + PR via the commit-count gate downstream.
-    run_issues_lane(
+    let processed_issues = run_issues_lane(
         paths,
         workspace,
         repo,
@@ -109,7 +109,7 @@ pub async fn run_pass_through_commits(
             waiting = still_waiting.len(),
             "polling pass complete"
         );
-        return Ok((processed, includes_self_heal));
+        return Ok((processed, processed_issues, includes_self_heal));
     }
 
     // Same-repo block (a18): if any change carries an operator-action
@@ -131,7 +131,7 @@ pub async fn run_pass_through_commits(
     )
     .await?
     {
-        return Ok((processed, includes_self_heal));
+        return Ok((processed, processed_issues, includes_self_heal));
     }
 
     let remaining = max_changes_per_pr.saturating_sub(processed.len() as u32);
@@ -199,7 +199,7 @@ pub async fn run_pass_through_commits(
         waiting = waiting_after,
         "polling pass complete"
     );
-    Ok((processed, includes_self_heal))
+    Ok((processed, processed_issues, includes_self_heal))
 }
 
 /// Drive the issues lane (a009) for this pass, when enabled. Reads the
@@ -207,8 +207,11 @@ pub async fn run_pass_through_commits(
 /// this is a no-op. The issues walker owns its control flow + its own
 /// state file; any error is logged AND never aborts the surrounding pass
 /// (fault isolation — an issues-lane fault cannot break the changes
-/// lane). Returns nothing: the issues walker's commits are detected by
-/// the downstream commit-count gate, so they ship in this pass's PR.
+/// lane). Returns the slugs of the issue(s) WORKED (archived) this pass —
+/// their commits ride this pass's push + PR, AND the slugs let the reviewer
+/// step know an issue PR carries reviewable code (it would otherwise see an
+/// empty `processed` change-list and skip review). An empty vec means no
+/// issue was worked.
 async fn run_issues_lane(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -217,9 +220,9 @@ async fn run_issues_lane(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     max_units: u32,
-) {
+) -> Vec<String> {
     let Some(ctx) = crate::lanes::gate::current() else {
-        return;
+        return Vec::new();
     };
 
     // Hybrid PUBLIC ingestion (a010): when the scout issue-read opt-in is
@@ -257,11 +260,11 @@ async fn run_issues_lane(
                 url = %repo.url,
                 "issues lane: listing ready issues failed (skipping lane this pass): {e:#}"
             );
-            return;
+            return Vec::new();
         }
     };
     if issues_ready.is_empty() {
-        return;
+        return Vec::new();
     }
     // Precedence (a009 §4): issues > changes > audits. Confirm via the
     // shared selector that a ready issue is the highest-precedence unit —
@@ -277,7 +280,7 @@ async fn run_issues_lane(
                 "issues lane: selected highest-precedence ready unit"
             );
         }
-        _ => return,
+        _ => return Vec::new(),
     }
     match crate::lanes::walker::walk_issues(
         paths,
@@ -290,21 +293,24 @@ async fn run_issues_lane(
     )
     .await
     {
-        Ok(slugs) if !slugs.is_empty() => {
-            tracing::info!(
-                url = %repo.url,
-                archived = slugs.len(),
-                "issues lane: archived {} issue(s) this pass: {}",
-                slugs.len(),
-                slugs.join(", ")
-            );
+        Ok(slugs) => {
+            if !slugs.is_empty() {
+                tracing::info!(
+                    url = %repo.url,
+                    archived = slugs.len(),
+                    "issues lane: archived {} issue(s) this pass: {}",
+                    slugs.len(),
+                    slugs.join(", ")
+                );
+            }
+            slugs
         }
-        Ok(_) => {}
         Err(e) => {
             tracing::error!(
                 url = %repo.url,
                 "issues lane errored (iteration continues): {e:#}"
             );
+            Vec::new()
         }
     }
 }

@@ -461,6 +461,76 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
     .await;
 }
 
+/// Sibling of [`maybe_post_canon_contradiction_findings_alert`] for the
+/// global-rules-gate `[rules]` gate. Same throttle state, channel, and gating
+/// flag as the existing pre-flight alerts so a single stream of
+/// `AlertCategory::SpecNeedsRevision` notifications covers all pre-flight paths.
+/// Body framing names "global-rule violations" AND each finding names the
+/// violated rule by its stable id.
+pub(crate) async fn maybe_post_rule_violations_findings_alert(
+    paths: &DaemonPaths,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    findings: &[crate::preflight::global_rules::RuleViolationFinding],
+    revision_suggestion: &str,
+    attribution: Option<&str>,
+) {
+    let label = crate::verifier_gate::VerifierGate::Rules.label();
+    // a03: like the other findings alerts, the `[rules]` marker is a TRACKED
+    // revision thread — post threaded AND stamp a RevisionThreadState.
+    let findings = findings.to_vec();
+    let suggestion = revision_suggestion.to_string();
+    let attribution = attribution.map(|a| a.to_string());
+    post_tracked_revision_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        truncate_reason(revision_suggestion),
+        &format!("{label} global-rule-violations"),
+        |_workspace| {
+            crate::verifier_gate::VerifierGate::Rules.label_line(&format!(
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` violates a global rule (pre-flight)",
+                repo_url = repo.url,
+            ))
+        },
+        |workspace| {
+            let marker_path = workspace
+                .join("openspec/changes")
+                .join(change)
+                .join(".needs-spec-revision.json");
+            let mut findings_block = String::new();
+            for (i, f) in findings.iter().enumerate() {
+                findings_block.push_str(&format!(
+                    "  {n}. rule \"{rule}\" — {s}\n",
+                    n = i + 1,
+                    rule = f.rule_id,
+                    s = f.summary,
+                ));
+            }
+            let attribution_suffix = attribution
+                .map(|a| {
+                    format!(
+                        "\n\n{}",
+                        crate::attribution::attribution_line("Global-rules-check", &a)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "This change violates one or more global rules:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                findings_block = findings_block,
+                suggestion = suggestion,
+                advert = revision_thread_advert(),
+                change = change,
+                base = repo.base_branch,
+                marker = marker_path.display(),
+            )
+        },
+    )
+    .await;
+}
+
 /// Sibling of [`maybe_post_spec_revision_alert`] for the a17 pre-flight
 /// path. Body framing names "unarchivable spec deltas" rather than the
 /// agent-detected "unimplementable tasks", and lists each violation

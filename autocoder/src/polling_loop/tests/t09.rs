@@ -318,8 +318,8 @@ async fn canon_preflight_no_submission_holds_fail_closed() {
         .expect("the held marker must carry a structured gate_error (not a finding)");
     assert_eq!(ge.gate, "[verifier:canon]", "gate_error names the [canon] gate");
     assert!(
-        ge.cause.contains("no submit_canon_contradictions"),
-        "gate_error cause names the failure: {}",
+        ge.cause.contains("no submission"),
+        "gate_error cause names the failure (shared corpus-check core message): {}",
         ge.cause
     );
 }
@@ -435,7 +435,7 @@ async fn self_heal_archives_when_preconditions_met() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, _, includes_self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &repo,
@@ -519,7 +519,7 @@ async fn self_heal_falls_through_to_failed_when_tasks_incomplete() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, _, includes_self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &repo,

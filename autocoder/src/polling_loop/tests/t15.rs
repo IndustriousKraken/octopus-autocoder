@@ -405,7 +405,7 @@ async fn pending_changes_process_before_audits() {
         command_authorization: Default::default(),
     };
 
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -491,7 +491,7 @@ async fn audit_generated_changes_wait_one_iteration_for_implementer() {
         command_authorization: Default::default(),
     };
 
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

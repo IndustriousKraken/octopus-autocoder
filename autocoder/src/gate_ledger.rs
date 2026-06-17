@@ -89,6 +89,7 @@ pub struct GateEntry {
 pub struct GateLedger {
     pub r#in: GateEntry,
     pub canon: GateEntry,
+    pub rules: GateEntry,
     pub out: GateEntry,
 }
 
@@ -123,6 +124,20 @@ impl GateLedger {
         };
     }
 
+    /// Record the `[rules]` gate's verdict.
+    pub fn set_rules(
+        &mut self,
+        verdict: GateVerdict,
+        model: Option<String>,
+        summary: Option<String>,
+    ) {
+        self.rules = GateEntry {
+            verdict,
+            model,
+            summary,
+        };
+    }
+
     /// Record the `[out]` gate's verdict.
     pub fn set_out(&mut self, verdict: GateVerdict, model: Option<String>, summary: Option<String>) {
         self.out = GateEntry {
@@ -133,11 +148,14 @@ impl GateLedger {
     }
 
     /// The fail-closed proceed decision: true iff EVERY blocking gate (`[in]`,
-    /// `[canon]`) is `Pass` or `Disabled`. A blocking gate that is `Pending`,
-    /// `Fail`, or `FailedToRun` returns false — so the executor is held. The
-    /// advisory `[out]` gate never participates in the gating decision.
+    /// `[canon]`, `[rules]`) is `Pass` or `Disabled`. A blocking gate that is
+    /// `Pending`, `Fail`, or `FailedToRun` returns false — so the executor is
+    /// held. The advisory `[out]` gate never participates in the gating
+    /// decision.
     pub fn blocking_ok(&self) -> bool {
-        self.r#in.verdict.is_blocking_ok() && self.canon.verdict.is_blocking_ok()
+        self.r#in.verdict.is_blocking_ok()
+            && self.canon.verdict.is_blocking_ok()
+            && self.rules.verdict.is_blocking_ok()
     }
 
     /// Render the ledger into a `## Gate verdicts` PR-body section: per gate, its
@@ -150,6 +168,7 @@ impl GateLedger {
         for (gate, entry) in [
             (VerifierGate::In, &self.r#in),
             (VerifierGate::Canon, &self.canon),
+            (VerifierGate::Rules, &self.rules),
             (VerifierGate::Out, &self.out),
         ] {
             out.push_str(&render_entry_line(gate, entry));
@@ -236,6 +255,7 @@ mod tests {
         let l = GateLedger::new();
         assert_eq!(l.r#in.verdict, GateVerdict::Pending);
         assert_eq!(l.canon.verdict, GateVerdict::Pending);
+        assert_eq!(l.rules.verdict, GateVerdict::Pending);
         assert_eq!(l.out.verdict, GateVerdict::Pending);
         // Default-deny: a Pending blocking gate holds the change.
         assert!(!l.blocking_ok());
@@ -244,33 +264,35 @@ mod tests {
     #[test]
     fn blocking_ok_truth_table() {
         use GateVerdict::*;
-        // Exhaustive over the two blocking gates; `[out]` is advisory and must
-        // never affect the gating decision.
-        let cases: &[(GateVerdict, GateVerdict, bool)] = &[
-            (Pass, Pass, true),
-            (Pass, Disabled, true),
-            (Disabled, Pass, true),
-            (Disabled, Disabled, true),
-            (Pass, Pending, false),
-            (Pending, Pass, false),
-            (Pass, Fail, false),
-            (Fail, Pass, false),
-            (Pass, FailedToRun, false),
-            (FailedToRun, Pass, false),
-            (Pending, Pending, false),
-            (Fail, Fail, false),
+        // Exhaustive-ish over the three blocking gates; `[out]` is advisory and
+        // must never affect the gating decision.
+        let cases: &[(GateVerdict, GateVerdict, GateVerdict, bool)] = &[
+            (Pass, Pass, Pass, true),
+            (Pass, Disabled, Pass, true),
+            (Disabled, Pass, Disabled, true),
+            (Disabled, Disabled, Disabled, true),
+            // Any single blocking gate non-passing holds, incl. the new [rules].
+            (Pass, Pass, Pending, false),
+            (Pass, Pass, Fail, false),
+            (Pass, Pass, FailedToRun, false),
+            (Pass, Pending, Pass, false),
+            (Pending, Pass, Pass, false),
+            (Pass, Fail, Pass, false),
+            (Fail, Pass, Pass, false),
+            (Pending, Pending, Pending, false),
         ];
-        for &(in_v, canon_v, expect) in cases {
+        for &(in_v, canon_v, rules_v, expect) in cases {
             let mut l = GateLedger::new();
             l.set_in(in_v, None, None);
             l.set_canon(canon_v, None, None);
+            l.set_rules(rules_v, None, None);
             // The advisory [out] gate is set to a non-passing verdict to prove
             // it does NOT gate.
             l.set_out(Fail, None, Some("advisory only".into()));
             assert_eq!(
                 l.blocking_ok(),
                 expect,
-                "blocking_ok([in]={in_v:?}, [canon]={canon_v:?}) must be {expect}"
+                "blocking_ok([in]={in_v:?}, [canon]={canon_v:?}, [rules]={rules_v:?}) must be {expect}"
             );
         }
     }
@@ -280,9 +302,10 @@ mod tests {
         let mut l = GateLedger::new();
         l.set_in(GateVerdict::Disabled, None, None);
         l.set_canon(GateVerdict::Disabled, None, None);
+        l.set_rules(GateVerdict::Disabled, None, None);
         assert!(
             l.blocking_ok(),
-            "two disabled blocking gates must let the executor proceed"
+            "all-disabled blocking gates must let the executor proceed"
         );
     }
 
@@ -293,6 +316,7 @@ mod tests {
         let mut l = GateLedger::new();
         l.set_in(GateVerdict::Pass, Some("anthropic/claude-x".into()), None);
         l.set_canon(GateVerdict::Disabled, None, None);
+        l.set_rules(GateVerdict::Pass, Some("anthropic/claude-z".into()), None);
         l.set_out(
             GateVerdict::Fail,
             Some("anthropic/claude-y".into()),
@@ -303,6 +327,7 @@ mod tests {
         // Each gate identifier is present.
         assert!(section.contains("[verifier:in]"), "{section}");
         assert!(section.contains("[verifier:canon]"), "{section}");
+        assert!(section.contains("[verifier:rules]"), "{section}");
         assert!(section.contains("[verifier:out]"), "{section}");
         // Verdicts.
         assert!(section.contains("PASS"), "{section}");
@@ -320,10 +345,11 @@ mod tests {
         let mut l = GateLedger::new();
         l.set_in(GateVerdict::Pass, Some("m1".into()), None);
         l.set_canon(GateVerdict::Pass, Some("m2".into()), None);
+        l.set_rules(GateVerdict::Pass, Some("m4".into()), None);
         l.set_out(GateVerdict::Pass, Some("m3".into()), None);
         let section = l.render_pr_section();
         // A PASS is visible (not inferred from silence).
-        assert_eq!(section.matches("PASS").count(), 3, "{section}");
+        assert_eq!(section.matches("PASS").count(), 4, "{section}");
     }
 
     #[test]

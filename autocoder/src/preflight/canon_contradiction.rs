@@ -9,7 +9,7 @@
 //! the change's deltas against the EXISTING canonical specs.
 //!
 //! It is the natural sibling of the `[in]` gate: same lifecycle position
-//! (pre-executor), same opt-in + fail-open posture, same agentic transport
+//! (pre-executor), same opt-in + fail-CLOSED posture, same agentic transport
 //! (a56 [`crate::agentic_run`] + a `submit_*` tool). The check runs a
 //! CLI-wrapped agentic session in a read-only sandbox (`Read`, `Glob`, `Grep`
 //! — NO `Bash`/`Write`/`Edit`) with `ORCH_MCP_ROLE = canon_contradiction_check`
@@ -19,22 +19,27 @@
 //! MCP tool when a21's RAG is enabled — AND returns its findings by calling
 //! `submit_canon_contradictions`.
 //!
-//! The check is **fail-open by contract**: a session error (spawn, timeout, a
-//! resolved CLI strategy that is not registered yet), a schema-rejected
-//! submission the agent never corrects, OR a session that ends with no
-//! submission all log a WARN (carrying the `[verifier:canon]` label) and yield
-//! an empty `Vec` ("no contradictions found"). The daemon never gates
-//! iteration progress on the check.
+//! The check **fails CLOSED** (gatekeepers-fail-closed standard): a session
+//! error (spawn, timeout, a resolved CLI strategy that is not registered yet),
+//! a schema-rejected submission the agent never corrects, OR a session that
+//! ends with no submission all log a WARN (carrying the `[verifier:canon]`
+//! label) AND HOLD the change (an `Errored` outcome — the change was NOT
+//! evaluated), never waved through as "no contradictions found". An empty
+//! submission is a clean pass. The shared session/retry/fail-closed machinery
+//! lives in [`crate::preflight::corpus_check`]; this module instantiates it
+//! with the canonical-spec corpus (the `[rules]` gate instantiates the same
+//! core with the global rule corpus).
 
 use crate::agentic_run::ResolvedModel;
+use crate::preflight::corpus_check::{
+    CliCorpusCheckSessionRunner, CorpusCheckSession, CorpusCheckSessionRunner, run_corpus_check_with_runner,
+};
 use crate::verifier_gate::VerifierGate;
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use serde::Deserialize;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The MCP role AND submission routing key the canon-contradiction check
 /// uses. The per-execution MCP child advertises `submit_canon_contradictions`
@@ -42,34 +47,16 @@ use std::time::Duration;
 /// validator is registered under the same key (a56/a62).
 pub const CANON_CONTRADICTION_CHECK_ROLE: &str = "canon_contradiction_check";
 
-/// Read-only CLI tool permissions for the canon-contradiction-check sandbox.
-/// NO `Bash`, NO `Write`, NO `Edit` — the agent reads the change's spec-delta
-/// files AND the canonical specs on demand AND returns its findings through
-/// `submit_canon_contradictions`.
-pub const AGENTIC_CANON_CONTRADICTION_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
-
-/// Wall-clock cap for one canon-contradiction-check session. Mirrors the
-/// `[in]` gate's bound (a59): the wrapped CLI subprocess is the thing being
-/// bounded.
-const AGENTIC_CANON_CONTRADICTION_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// The full `--allowedTools` list the canon-contradiction-check sandbox
 /// grants: the read-only file tools PLUS the qualified
 /// `submit_canon_contradictions` MCP tool. Notably absent: `Bash`, `Write`,
 /// `Edit`. The common `query_canonical_specs` tool is added separately by the
 /// agentic-run layer (it is part of the daemon's MCP tool contract, available
-/// when a21's RAG is configured). Exposed so tests can assert the surface.
+/// when a21's RAG is configured). Delegates to the shared corpus-check core so
+/// the `[canon]` AND `[rules]` gates derive their surface the same way. Exposed
+/// so tests can assert the surface.
 pub fn agentic_canon_contradiction_allowed_tools() -> Vec<String> {
-    let mut tools: Vec<String> = AGENTIC_CANON_CONTRADICTION_ALLOWED_TOOLS
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    if let Some(t) =
-        crate::mcp_askuser_server::submission_tool_name_for_role(CANON_CONTRADICTION_CHECK_ROLE)
-    {
-        tools.push(crate::mcp_askuser_server::qualified_tool_name(t));
-    }
-    tools
+    crate::preflight::corpus_check::allowed_tools_for_role(CANON_CONTRADICTION_CHECK_ROLE)
 }
 
 /// Runtime context for the canon-contradiction-check pre-flight.
@@ -202,7 +189,6 @@ struct RawCanonContradictionSubmission {
 }
 
 const PROMPT_DELIMITER: &str = "\n\n---\n\n";
-const RESPONSE_EXCERPT_MAX: usize = 200;
 
 /// Validate AND map a consumed `submit_canon_contradictions` payload into
 /// [`CanonContradictionFinding`]s (a62). This is BOTH the daemon-side schema
@@ -253,121 +239,11 @@ pub fn register_canon_contradiction_submission_schema(
     );
 }
 
-/// Outcome of one canon-contradiction-check session: the consumed submission
-/// (or `None` when the agent recorded nothing valid) AND a truncated stdout
-/// excerpt for the no-submission fail-open WARN.
-struct CanonContradictionSessionOutcome {
-    submission: Option<serde_json::Value>,
-    stdout_excerpt: String,
-}
-
-impl crate::verifier_gate::SessionSubmission for CanonContradictionSessionOutcome {
-    fn has_submission(&self) -> bool {
-        self.submission.is_some()
-    }
-}
-
-/// Abstracts "run ONE canon-contradiction-check session AND drain its
-/// submission" so the orchestration
-/// ([`run_agentic_canon_contradiction_check_with_runner`]) is unit-testable
-/// without spawning a CLI. Production is [`CliCanonContradictionSessionRunner`];
-/// tests inject canned submissions.
-#[async_trait]
-trait CanonContradictionSessionRunner: Send + Sync {
-    async fn run_session(&self, prompt: &str) -> Result<CanonContradictionSessionOutcome>;
-}
-
-/// Production session runner: writes the per-execution MCP config
-/// (`ORCH_MCP_ROLE = canon_contradiction_check`), runs the wrapped CLI through
-/// [`crate::agentic_run::agentic_run`] in a read-only capture sandbox, AND
-/// drains the stored submission via the control socket. Mirrors the `[in]`
-/// gate's `CliContradictionSessionRunner`.
-struct CliCanonContradictionSessionRunner<'a> {
-    workspace: &'a Path,
-    strategy: &'a dyn crate::agentic_run::CliStrategy,
-    model: &'a ResolvedModel,
-    settings_dir: Option<&'a Path>,
-    timeout: Duration,
-}
-
-#[async_trait]
-impl CanonContradictionSessionRunner for CliCanonContradictionSessionRunner<'_> {
-    async fn run_session(&self, prompt: &str) -> Result<CanonContradictionSessionOutcome> {
-        // Write the per-execution MCP config advertising
-        // `submit_canon_contradictions`. `change == CANON_CONTRADICTION_CHECK_ROLE`
-        // keys the submission-store entry; this runner consumes the same key
-        // after exit.
-        crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(
-            self.workspace,
-            CANON_CONTRADICTION_CHECK_ROLE,
-            Some(CANON_CONTRADICTION_CHECK_ROLE),
-        )
-        .context("writing canon-contradiction-check MCP config")?;
-
-        // a70: a single-shot role — prune the session it creates on completion.
-        let result = crate::agentic_run::agentic_run_with_session(
-            crate::agentic_run::AgenticRunOpts {
-            workspace: self.workspace,
-            change: CANON_CONTRADICTION_CHECK_ROLE,
-            strategy: self.strategy,
-            prompt,
-            sandbox: crate::agentic_run::SandboxConfig {
-                allowed_tools: agentic_canon_contradiction_allowed_tools(),
-                disallowed_bash_patterns: Vec::new(),
-                disallowed_read_paths: Vec::new(),
-                deny_writes: true,
-            },
-            model: Some(self.model),
-            output_mode: crate::agentic_run::OutputMode::Capture,
-            timeout: self.timeout,
-            paths: None,
-            settings_dir: self.settings_dir,
-            // a21: `include_autocoder_tools` advertises the common
-            // `query_canonical_specs` tool (among others); it activates only
-            // when the daemon set the control-socket env (RAG configured), AND
-            // fails open to empty hits otherwise — so the gate runs correctly
-            // with OR without RAG.
-            include_autocoder_tools: true,
-            emit_stream_json_in_capture: false,
-            resume_session_id: None,
-            track_subprocess_marker: false,
-            etxtbsy_retry_spawn: true,
-            // a006: read-only contradiction-check role — read-only workspace;
-            // self-store from the resolved model's provider (task 2.5).
-            os_sandbox: crate::sandbox::current_run_sandbox(
-                crate::config::default_cli_for(self.model.provider),
-                false,
-            ),
-            },
-            true,
-            None,
-        )
-        .await;
-
-        // Always remove the config we wrote, regardless of run outcome.
-        crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
-
-        let outcome = result.context("spawning canon-contradiction-check subprocess")?;
-        if outcome.timed_out {
-            return Err(anyhow!(
-                "canon-contradiction-check session timed out after {}s",
-                self.timeout.as_secs()
-            ));
-        }
-        // Include stderr — opencode/agy write their real failure there, leaving
-        // stdout empty, so a stdout-only excerpt is blank when it matters most.
-        let stdout_excerpt = crate::agentic_run::failure_excerpt(&outcome, RESPONSE_EXCERPT_MAX);
-        let submission = crate::audits::try_consume_submission(
-            self.workspace,
-            CANON_CONTRADICTION_CHECK_ROLE,
-        )
-        .await;
-        Ok(CanonContradictionSessionOutcome {
-            submission,
-            stdout_excerpt,
-        })
-    }
-}
+/// The canon gate's production session runner is the shared
+/// [`CliCorpusCheckSessionRunner`] instantiated with the canon role + tools (a62
+/// machinery now lives in [`crate::preflight::corpus_check`]; the `[canon]` AND
+/// `[rules]` gates instantiate it rather than fork it). Built in
+/// [`run_agentic_canon_contradiction_check`].
 
 /// Test-only session runner that stands in for the CLI + control socket:
 /// returns a canned submission (`Some(payload)`) or `None` for the
@@ -380,10 +256,13 @@ struct CannedCanonContradictionRunner {
 }
 
 #[cfg(test)]
-#[async_trait]
-impl CanonContradictionSessionRunner for CannedCanonContradictionRunner {
-    async fn run_session(&self, _prompt: &str) -> Result<CanonContradictionSessionOutcome> {
-        Ok(CanonContradictionSessionOutcome {
+#[async_trait::async_trait]
+impl CorpusCheckSessionRunner for CannedCanonContradictionRunner {
+    async fn run_session(
+        &self,
+        _prompt: &str,
+    ) -> Result<crate::preflight::corpus_check::CorpusCheckSessionOutcome> {
+        Ok(crate::preflight::corpus_check::CorpusCheckSessionOutcome {
             submission: self.submission.clone(),
             stdout_excerpt: String::new(),
         })
@@ -394,16 +273,16 @@ impl CanonContradictionSessionRunner for CannedCanonContradictionRunner {
 /// (a62). Production entry point invoked from the polling loop's pre-flight.
 ///
 /// Resolves the CLI strategy from the model's provider (a56); a provider whose
-/// CLI has no registered strategy yet fails open here with a WARN AND no
-/// subprocess is spawned. Otherwise runs one agentic session in the read-only
-/// sandbox, drains the `submit_canon_contradictions` submission, AND maps it
-/// to findings.
+/// CLI has no registered strategy yet FAILS CLOSED here with a WARN AND no
+/// subprocess is spawned (the change is held). Otherwise runs one agentic
+/// session in the read-only sandbox, drains the `submit_canon_contradictions`
+/// submission, AND maps it to findings.
 ///
-/// Returns an empty `Vec` on EVERY fail-open path: strategy-not-registered,
-/// session error (spawn/timeout), a never-corrected schema rejection, OR a
-/// session that ends with no submission. WARN logs (carrying the
-/// `[verifier:canon]` label) name the specific failure so operators can
-/// investigate via journalctl.
+/// HOLDS the change (`Errored`) on EVERY fail-closed path: strategy-not-
+/// registered, session error (spawn/timeout), a never-corrected schema
+/// rejection, OR a session that ends with no submission. WARN logs (carrying
+/// the `[verifier:canon]` label) name the specific failure so operators can
+/// investigate via journalctl. An empty submission is a clean pass.
 /// Outcome of the `[canon]` gate. Fails CLOSED (gatekeepers-fail-closed
 /// standard): an inability to run is `Errored`, NEVER `Clean`. Mirrors
 /// [`crate::preflight::change_contradiction::ContradictionCheckOutcome`].
@@ -455,82 +334,63 @@ pub async fn run_agentic_canon_contradiction_check(
             return CanonContradictionCheckOutcome::Errored { cause };
         }
     };
-    let runner = CliCanonContradictionSessionRunner {
+    let runner = CliCorpusCheckSessionRunner {
         workspace: workspace_root,
+        role: CANON_CONTRADICTION_CHECK_ROLE,
+        allowed_tools: agentic_canon_contradiction_allowed_tools(),
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: AGENTIC_CANON_CONTRADICTION_TIMEOUT,
+        timeout: crate::preflight::corpus_check::CORPUS_CHECK_TIMEOUT,
+        subject_noun: "change-vs-canonical-check",
     };
     run_agentic_canon_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner)
         .await
 }
 
-/// Orchestration shared by production AND tests. Builds the prompt, runs one
-/// session via `runner`, AND applies the fail-open policy uniformly: a session
-/// error, a missing submission, OR a submission that fails re-mapping each WARN
-/// AND yield an empty `Vec`.
-async fn run_agentic_canon_contradiction_check_with_runner(
-    ctx: &CanonContradictionCheckCtx,
-    workspace_root: &Path,
+/// Map a corpus-check session result into a [`CanonContradictionCheckOutcome`]
+/// (the canon-specific finding shape). The shared [`run_corpus_check_with_runner`]
+/// core handles the session/retry/fail-closed disposition; this only re-maps the
+/// submitted payload: an empty mapped result is `Clean`, a non-empty one is
+/// `Found`, AND a re-map failure (the payload passed `record_submission` yet
+/// fails to map) is an internal invariant violation that holds (fail-closed).
+fn map_canon_session(
+    session: CorpusCheckSession,
     change_slug: &str,
-    runner: &dyn CanonContradictionSessionRunner,
 ) -> CanonContradictionCheckOutcome {
-    let prompt = build_canon_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
-    // a61: every diagnostic this gate emits carries the `[canon]` verifier-gate
-    // label. The gate FAILS CLOSED: any could-not-run path is `Errored` (the
-    // change is held), never `Clean`.
     let label = VerifierGate::Canon.label();
-    // Bounded retry of the agentic session on the flaky no-submission case
-    // (`executor.verifier_gate_retries`); a successful submission, a session
-    // error, a timeout, AND an unregistered-strategy / CLI-unavailable error
-    // are NOT retried. After the bound is exhausted the gate still fails
-    // closed (gatekeepers-fail-closed standard).
-    let session = crate::verifier_gate::run_session_with_retry(
-        VerifierGate::Canon,
-        change_slug,
-        ctx.retries,
-        || runner.run_session(&prompt),
-    )
-    .await;
     match session {
-        Err(e) => {
-            let cause = format!("session failed: {e:#}");
-            tracing::warn!(
-                change = %change_slug,
-                "{label} change-vs-canonical-check could not run ({cause}); holding the change (fail-closed)"
-            );
-            CanonContradictionCheckOutcome::Errored { cause }
-        }
-        Ok(outcome) => match outcome.submission {
-            None => {
-                let cause = format!(
-                    "session ended with no submit_canon_contradictions submission (excerpt: {})",
-                    outcome.stdout_excerpt
-                );
+        CorpusCheckSession::Errored { cause } => CanonContradictionCheckOutcome::Errored { cause },
+        CorpusCheckSession::Submitted(payload) => match payload_to_canon_contradictions(&payload) {
+            Ok(findings) if findings.is_empty() => CanonContradictionCheckOutcome::Clean,
+            Ok(findings) => CanonContradictionCheckOutcome::Found(findings),
+            Err(e) => {
+                let cause = format!("submission failed re-validation: {e}");
                 tracing::warn!(
                     change = %change_slug,
                     "{label} change-vs-canonical-check could not run ({cause}); holding the change (fail-closed)"
                 );
                 CanonContradictionCheckOutcome::Errored { cause }
             }
-            Some(payload) => match payload_to_canon_contradictions(&payload) {
-                Ok(findings) if findings.is_empty() => CanonContradictionCheckOutcome::Clean,
-                Ok(findings) => CanonContradictionCheckOutcome::Found(findings),
-                Err(e) => {
-                    // The payload passed `record_submission`'s validator, so a
-                    // re-map failure is an internal invariant violation — hold
-                    // (fail-closed), do NOT silently treat as clean.
-                    let cause = format!("submission failed re-validation: {e}");
-                    tracing::warn!(
-                        change = %change_slug,
-                        "{label} change-vs-canonical-check could not run ({cause}); holding the change (fail-closed)"
-                    );
-                    CanonContradictionCheckOutcome::Errored { cause }
-                }
-            },
         },
     }
+}
+
+/// Orchestration shared by production AND tests. Builds the prompt, runs one
+/// session via `runner` through the shared corpus-check core, AND maps the
+/// result into the canon finding shape (a session error, a missing submission,
+/// OR a submission that fails re-mapping all hold the change — fail-closed).
+async fn run_agentic_canon_contradiction_check_with_runner(
+    ctx: &CanonContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    runner: &dyn CorpusCheckSessionRunner,
+) -> CanonContradictionCheckOutcome {
+    let prompt = build_canon_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
+    let session =
+        run_corpus_check_with_runner(VerifierGate::Canon, change_slug, ctx.retries, &prompt, runner)
+            .await;
+    map_canon_session(session, change_slug)
 }
 
 /// Embedded prompt for the authoring-time issue contract-change check (a02).
@@ -594,70 +454,35 @@ pub async fn run_agentic_issue_contract_change_check(
             return CanonContradictionCheckOutcome::Errored { cause };
         }
     };
-    let runner = CliCanonContradictionSessionRunner {
+    let runner = CliCorpusCheckSessionRunner {
         workspace: workspace_root,
+        role: CANON_CONTRADICTION_CHECK_ROLE,
+        allowed_tools: agentic_canon_contradiction_allowed_tools(),
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: AGENTIC_CANON_CONTRADICTION_TIMEOUT,
+        timeout: crate::preflight::corpus_check::CORPUS_CHECK_TIMEOUT,
+        subject_noun: "issue contract-change check",
     };
     run_agentic_issue_contract_change_check_with_runner(ctx, workspace_root, issue_slug, &runner)
         .await
 }
 
 /// Orchestration shared by production AND tests for the issue contract-change
-/// check. Builds the issue-flavored prompt, runs one session via `runner`, AND
-/// applies the SAME fail-closed policy as the `[canon]` gate.
+/// check. Builds the issue-flavored prompt, runs one session via `runner`
+/// through the shared corpus-check core, AND maps the result with the SAME
+/// fail-closed policy as the `[canon]` gate.
 async fn run_agentic_issue_contract_change_check_with_runner(
     ctx: &CanonContradictionCheckCtx,
     workspace_root: &Path,
     issue_slug: &str,
-    runner: &dyn CanonContradictionSessionRunner,
+    runner: &dyn CorpusCheckSessionRunner,
 ) -> CanonContradictionCheckOutcome {
     let prompt = build_issue_contract_change_prompt(workspace_root, issue_slug);
-    let label = VerifierGate::Canon.label();
-    let session = crate::verifier_gate::run_session_with_retry(
-        VerifierGate::Canon,
-        issue_slug,
-        ctx.retries,
-        || runner.run_session(&prompt),
-    )
-    .await;
-    match session {
-        Err(e) => {
-            let cause = format!("session failed: {e:#}");
-            tracing::warn!(
-                issue = %issue_slug,
-                "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
-            );
-            CanonContradictionCheckOutcome::Errored { cause }
-        }
-        Ok(outcome) => match outcome.submission {
-            None => {
-                let cause = format!(
-                    "session ended with no submit_canon_contradictions submission (excerpt: {})",
-                    outcome.stdout_excerpt
-                );
-                tracing::warn!(
-                    issue = %issue_slug,
-                    "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
-                );
-                CanonContradictionCheckOutcome::Errored { cause }
-            }
-            Some(payload) => match payload_to_canon_contradictions(&payload) {
-                Ok(findings) if findings.is_empty() => CanonContradictionCheckOutcome::Clean,
-                Ok(findings) => CanonContradictionCheckOutcome::Found(findings),
-                Err(e) => {
-                    let cause = format!("submission failed re-validation: {e}");
-                    tracing::warn!(
-                        issue = %issue_slug,
-                        "{label} issue contract-change check could not run ({cause}); holding the unit (fail-closed)"
-                    );
-                    CanonContradictionCheckOutcome::Errored { cause }
-                }
-            },
-        },
-    }
+    let session =
+        run_corpus_check_with_runner(VerifierGate::Canon, issue_slug, ctx.retries, &prompt, runner)
+            .await;
+    map_canon_session(session, issue_slug)
 }
 
 /// Build the issue contract-change session prompt: the embedded issue-flavored
@@ -769,38 +594,11 @@ fn build_canon_contradiction_prompt(
 }
 
 /// Enumerate every `openspec/changes/<change>/specs/<cap>/spec.md` path
-/// (workspace-relative) for the change, sorted by capability. Returns an empty
-/// `Vec` when the change has no `specs/` subdir or no per-capability spec
-/// files. The agent reads them on demand via the read-only sandbox.
+/// (workspace-relative) for the change, sorted by capability. Delegates to the
+/// shared corpus-check helper so the `[canon]` AND `[rules]` gates list a
+/// change's deltas the same way.
 fn spec_delta_paths(workspace_root: &Path, change_slug: &str) -> Vec<String> {
-    let specs_dir = workspace_root
-        .join("openspec/changes")
-        .join(change_slug)
-        .join("specs");
-    let Ok(read) = std::fs::read_dir(&specs_dir) else {
-        return Vec::new();
-    };
-    let mut caps: Vec<(String, PathBuf)> = Vec::new();
-    for entry in read.flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            caps.push((name, path));
-        }
-    }
-    caps.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut out = Vec::new();
-    for (cap_name, cap_path) in caps {
-        if cap_path.join("spec.md").is_file() {
-            out.push(format!(
-                "openspec/changes/{change_slug}/specs/{cap_name}/spec.md"
-            ));
-        }
-    }
-    out
+    crate::preflight::corpus_check::change_spec_delta_paths(workspace_root, change_slug)
 }
 
 /// Enumerate every canonical `openspec/specs/<cap>/spec.md` path
@@ -839,14 +637,16 @@ fn canonical_spec_paths(workspace_root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::LlmProvider;
+    use crate::preflight::corpus_check::CorpusCheckSessionOutcome;
+    use async_trait::async_trait;
     use tempfile::TempDir;
 
     /// Test runner that simulates a session error (spawn/timeout/strategy).
     struct ErrorCanonContradictionRunner;
 
     #[async_trait]
-    impl CanonContradictionSessionRunner for ErrorCanonContradictionRunner {
-        async fn run_session(&self, _prompt: &str) -> Result<CanonContradictionSessionOutcome> {
+    impl CorpusCheckSessionRunner for ErrorCanonContradictionRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<CorpusCheckSessionOutcome> {
             Err(anyhow!("simulated session spawn error"))
         }
     }
@@ -872,11 +672,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl CanonContradictionSessionRunner for ScriptedCanonContradictionRunner {
-        async fn run_session(&self, _prompt: &str) -> Result<CanonContradictionSessionOutcome> {
+    impl CorpusCheckSessionRunner for ScriptedCanonContradictionRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<CorpusCheckSessionOutcome> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let idx = n.min(self.script.len().saturating_sub(1));
-            Ok(CanonContradictionSessionOutcome {
+            Ok(CorpusCheckSessionOutcome {
                 submission: self.script[idx].clone(),
                 stdout_excerpt: String::new(),
             })

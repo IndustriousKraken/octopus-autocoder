@@ -9,6 +9,7 @@ pub(crate) fn build_review_context(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
+    processed_issues: &[String],
     reviewer_kind: crate::config::ReviewerKind,
 ) -> Result<crate::code_reviewer::ReviewContext> {
     let diff = git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)?;
@@ -77,6 +78,34 @@ pub(crate) fn build_review_context(
             name: name.clone(),
             proposal,
             design,
+            tasks,
+        });
+    }
+
+    // Issue briefs (a009): a worked issue is archived under `issues/archive/`,
+    // not `changes/archive/`, and carries no proposal/design — its `issue.md`
+    // (the report + acceptance criteria) and `tasks.md` (the fix steps) are
+    // the reviewer's intent context. Load them as briefs so an issue PR is
+    // reviewed WITH the issue's intent, like a change PR with its proposal.
+    let issues_archive_root = crate::lanes::issues::archive_root(workspace);
+    for slug in processed_issues {
+        let dir = match locate_archive_dir(&issues_archive_root, slug)? {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    issue = %slug,
+                    "issue archive directory not found while building review context; \
+                     reviewing the diff without the issue brief"
+                );
+                continue;
+            }
+        };
+        let issue_md = std::fs::read_to_string(dir.join("issue.md")).unwrap_or_default();
+        let tasks = std::fs::read_to_string(dir.join("tasks.md")).unwrap_or_default();
+        archived_changes.push(crate::code_reviewer::ChangeBrief {
+            name: slug.clone(),
+            proposal: issue_md,
+            design: None,
             tasks,
         });
     }

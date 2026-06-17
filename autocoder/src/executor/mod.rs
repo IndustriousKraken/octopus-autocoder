@@ -276,7 +276,7 @@ pub struct ScoutContext {
 /// `outcome_*` tool calls are consumed for this issue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueContext {
-    /// The issue's directory slug under `openspec/issues/`.
+    /// The issue's directory slug under `issues/`.
     pub slug: String,
     /// Fully rendered issue-flavored prompt: template + issue body.
     pub rendered_prompt: String,

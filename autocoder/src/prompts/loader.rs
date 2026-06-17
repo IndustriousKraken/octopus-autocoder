@@ -101,6 +101,15 @@ pub enum PromptId {
     /// Wired through the loader by a future change.
     #[allow(dead_code)]
     ChangeVsCanonicalCheck,
+    /// `prompts/global-rules-check.md` — the `[rules]` gate's
+    /// change-vs-global-rules pre-flight (global-rules-gate).
+    ///
+    /// Registered for registry-completeness only; the `[rules]`-gate call site
+    /// resolves its own prompt directly via
+    /// `crate::preflight::global_rules::load_prompt_template`. Wired through the
+    /// loader by a future change.
+    #[allow(dead_code)]
+    GlobalRulesCheck,
     /// `prompts/code-implements-spec-check.md` — the `[out]` gate's
     /// code-implements-spec verification (a63).
     ///
@@ -152,6 +161,8 @@ const PROMPT_CHANGE_CONTRADICTION_CHECK: &str =
     include_str!("../../../prompts/change-contradiction-check.md");
 const PROMPT_CHANGE_VS_CANONICAL_CHECK: &str =
     include_str!("../../../prompts/change-vs-canonical-check.md");
+const PROMPT_GLOBAL_RULES_CHECK: &str =
+    include_str!("../../../prompts/global-rules-check.md");
 const PROMPT_CODE_IMPLEMENTS_SPEC_CHECK: &str =
     include_str!("../../../prompts/code-implements-spec-check.md");
 const PROMPT_ISSUE_CONTRACT_CHANGE_CHECK: &str =
@@ -181,6 +192,7 @@ impl PromptId {
             Self::Scout => PROMPT_SCOUT,
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
             Self::ChangeVsCanonicalCheck => PROMPT_CHANGE_VS_CANONICAL_CHECK,
+            Self::GlobalRulesCheck => PROMPT_GLOBAL_RULES_CHECK,
             Self::CodeImplementsSpecCheck => PROMPT_CODE_IMPLEMENTS_SPEC_CHECK,
             Self::IssueContractChangeCheck => PROMPT_ISSUE_CONTRACT_CHANGE_CHECK,
         }
@@ -211,6 +223,7 @@ impl PromptId {
             Self::Scout => "scout.md",
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
             Self::ChangeVsCanonicalCheck => "change-vs-canonical-check.md",
+            Self::GlobalRulesCheck => "global-rules-check.md",
             Self::CodeImplementsSpecCheck => "code-implements-spec-check.md",
             Self::IssueContractChangeCheck => "issue-contract-change-check.md",
         }
@@ -239,6 +252,7 @@ impl PromptId {
             Self::Scout => "Scout",
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
             Self::ChangeVsCanonicalCheck => "ChangeVsCanonicalCheck",
+            Self::GlobalRulesCheck => "GlobalRulesCheck",
             Self::CodeImplementsSpecCheck => "CodeImplementsSpecCheck",
             Self::IssueContractChangeCheck => "IssueContractChangeCheck",
         }
@@ -268,6 +282,7 @@ impl PromptId {
             Self::Scout,
             Self::ChangeContradictionCheck,
             Self::ChangeVsCanonicalCheck,
+            Self::GlobalRulesCheck,
             Self::CodeImplementsSpecCheck,
             Self::IssueContractChangeCheck,
         ]

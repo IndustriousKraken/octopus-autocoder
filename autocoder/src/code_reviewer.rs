@@ -1059,12 +1059,27 @@ fn render_review_submission_markdown(summary: &str, concerns: &[RawReviewConcern
     out
 }
 
+/// Relative path (within the workspace) of the transient unified-diff
+/// artifact the agentic reviewer reads on demand. Keyed by session slug so
+/// per_change sessions don't collide; a bundled session uses `bundled`. The
+/// daemon writes it before the read-only session AND removes it afterward.
+fn review_diff_artifact_rel(slug: &str) -> String {
+    let key = if slug.is_empty() { "bundled" } else { slug };
+    format!(".autocoder-review-diff-{key}.patch")
+}
+
 /// Render the agentic reviewer's prompt from a [`ReviewContext`] (a58):
-/// the change briefs, the changed-file PATH list (NOT full contents), AND
-/// the unified diff. The agent reads whatever files it needs on demand via
-/// `Read`, so `reviewer.prompt_budget_chars` is NOT consulted here AND no
+/// the change briefs, the changed-file PATH list (NOT full contents), AND a
+/// reference to the unified-diff artifact at `diff_artifact_rel` (NOT the
+/// inlined diff). The agent reads whatever files AND diff it needs on demand
+/// via `Read`, so the prompt stays bounded regardless of diff size,
+/// `reviewer.prompt_budget_chars` is NOT consulted here, AND no
 /// `## Skipped (budget exhausted)` truncation occurs.
-pub fn render_agentic_review_prompt(ctx: &ReviewContext, preamble: &str) -> String {
+pub fn render_agentic_review_prompt(
+    ctx: &ReviewContext,
+    preamble: &str,
+    diff_artifact_rel: &str,
+) -> String {
     let mut out = String::new();
     if !preamble.trim().is_empty() {
         out.push_str(preamble.trim_end());
@@ -1111,12 +1126,13 @@ pub fn render_agentic_review_prompt(ctx: &ReviewContext, preamble: &str) -> Stri
     if ctx.diff.trim().is_empty() {
         out.push_str("(no diff produced this pass)\n\n");
     } else {
-        out.push_str("```diff\n");
-        out.push_str(&ctx.diff);
-        if !ctx.diff.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("```\n\n");
+        out.push_str(&format!(
+            "The unified diff for this pass is written to `{diff_artifact_rel}` — it is NOT \
+             inlined here, so this prompt stays bounded regardless of how large the diff is. \
+             `Read` that file to see exactly what changed; for any file you need in full, \
+             `Read` it directly from the changed-file list above. Prioritize the hunks most \
+             relevant to a code-quality review.\n\n"
+        ));
     }
 
     out.push_str(
@@ -1158,8 +1174,10 @@ pub enum AgenticReviewOutcome {
 trait ReviewSessionRunner: Send + Sync {
     /// Run one session against `prompt` AND return the consumed
     /// `submit_review` payload, or `None` when the agent recorded no valid
-    /// submission. `slug` labels the session (empty for bundled).
-    async fn run_session(&self, slug: &str, prompt: &str) -> Result<Option<Value>>;
+    /// submission. `slug` labels the session (empty for bundled). `diff` is
+    /// the session's unified diff, which the runner writes to the
+    /// read-only-readable artifact the prompt references (and removes after).
+    async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>>;
 }
 
 /// Production session runner: writes the per-execution MCP config
@@ -1185,7 +1203,22 @@ struct CliReviewSessionRunner<'a> {
 
 #[async_trait]
 impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
-    async fn run_session(&self, _slug: &str, prompt: &str) -> Result<Option<Value>> {
+    async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>> {
+        // Write the unified diff to the artifact the prompt references, so the
+        // read-only agent `Read`s it on demand instead of receiving it inlined
+        // (which would overflow the model's context on a large pass). The
+        // artifact lives at the workspace root (a dotfile the agent can Read)
+        // and is removed after the session below, regardless of outcome.
+        let diff_artifact = self
+            .workspace
+            .join(review_diff_artifact_rel(slug));
+        if let Err(e) = std::fs::write(&diff_artifact, diff) {
+            tracing::warn!(
+                path = %diff_artifact.display(),
+                "failed to write reviewer diff artifact; the agent will see an empty diff file: {e}"
+            );
+        }
+
         // Write the per-execution MCP config advertising `submit_review`.
         // `change == REVIEWER_ROLE` keys the submission-store entry; this
         // runner consumes the same key after exit.
@@ -1240,8 +1273,17 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         )
         .await;
 
-        // Always remove the config we wrote, regardless of run outcome.
+        // Always remove the config AND the diff artifact we wrote, regardless
+        // of run outcome — the run leaves no reviewer litter in the workspace.
         crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
+        if let Err(e) = std::fs::remove_file(&diff_artifact) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %diff_artifact.display(),
+                    "failed to remove reviewer diff artifact: {e}"
+                );
+            }
+        }
 
         let outcome = result.context("spawning agentic reviewer subprocess")?;
         if outcome.timed_out {
@@ -1444,9 +1486,11 @@ async fn run_agentic_review_with_runner(
 
     let mut reviews: Vec<(Option<String>, ReviewResult)> = Vec::with_capacity(sessions.len());
     for (slug, session_ctx, preamble) in &sessions {
-        let prompt = render_agentic_review_prompt(session_ctx, preamble);
+        let session_slug = slug.as_deref().unwrap_or("");
+        let artifact_rel = review_diff_artifact_rel(session_slug);
+        let prompt = render_agentic_review_prompt(session_ctx, preamble, &artifact_rel);
         let consumed = runner
-            .run_session(slug.as_deref().unwrap_or(""), &prompt)
+            .run_session(session_slug, &prompt, &session_ctx.diff)
             .await?;
         match consumed {
             None => {
@@ -3751,6 +3795,7 @@ this is not yaml: at all: ::: {{{ broken
         submissions: Mutex<VecDeque<Option<serde_json::Value>>>,
         slugs: Mutex<Vec<String>>,
         prompts: Mutex<Vec<String>>,
+        diffs: Mutex<Vec<String>>,
     }
     impl CannedRunner {
         fn new(subs: Vec<Option<serde_json::Value>>) -> Self {
@@ -3758,6 +3803,7 @@ this is not yaml: at all: ::: {{{ broken
                 submissions: Mutex::new(subs.into_iter().collect()),
                 slugs: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
+                diffs: Mutex::new(Vec::new()),
             }
         }
         fn session_count(&self) -> usize {
@@ -3766,9 +3812,10 @@ this is not yaml: at all: ::: {{{ broken
     }
     #[async_trait]
     impl ReviewSessionRunner for CannedRunner {
-        async fn run_session(&self, slug: &str, prompt: &str) -> Result<Option<Value>> {
+        async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>> {
             self.slugs.lock().unwrap().push(slug.to_string());
             self.prompts.lock().unwrap().push(prompt.to_string());
+            self.diffs.lock().unwrap().push(diff.to_string());
             let next = self.submissions.lock().unwrap().pop_front();
             Ok(next.unwrap_or(None))
         }
@@ -3963,11 +4010,14 @@ this is not yaml: at all: ::: {{{ broken
         assert!(raw.contains("Edit(*)"), "deny list must contain Edit(*): {raw}");
     }
 
-    /// The agentic prompt lists changed-file PATHS (not their contents),
-    /// includes the diff, AND produces no budget-exhaustion footer — the
-    /// agent reads files on demand, so `prompt_budget_chars` does not apply.
+    /// The agentic prompt lists changed-file PATHS (not their contents) AND
+    /// references the diff artifact (NOT the inlined diff body), AND produces
+    /// no budget-exhaustion footer — the agent reads files AND the diff on
+    /// demand, so the prompt stays bounded and `prompt_budget_chars` does not
+    /// apply.
     #[test]
-    fn agentic_prompt_lists_paths_not_contents() {
+    fn agentic_prompt_lists_paths_and_references_diff_artifact() {
+        let artifact_rel = review_diff_artifact_rel("");
         let ctx = ReviewContext {
             archived_changes: vec![brief("demo")],
             changed_files: vec![ChangedFile {
@@ -3976,18 +4026,48 @@ this is not yaml: at all: ::: {{{ broken
             }],
             diff: "DIFFBODY".into(),
         };
-        let prompt = render_agentic_review_prompt(&ctx, "");
+        let prompt = render_agentic_review_prompt(&ctx, "", &artifact_rel);
         assert!(prompt.contains("src/big.rs"), "path must be listed");
         assert!(
             !prompt.contains("SECRET_FILE_BODY"),
             "full file contents must NOT be inlined (read on demand)"
         );
-        assert!(prompt.contains("DIFFBODY"), "diff must be included");
+        assert!(
+            !prompt.contains("DIFFBODY"),
+            "the diff body must NOT be inlined — it is referenced as an artifact"
+        );
+        assert!(
+            prompt.contains(&artifact_rel),
+            "the prompt must reference the diff artifact path"
+        );
         assert!(
             !prompt.contains("Skipped (budget exhausted)"),
             "no budget-exhaustion footer in the agentic prompt"
         );
         assert!(prompt.contains("submit_review"), "must instruct submit_review");
+    }
+
+    /// The agentic prompt's size does not grow with the diff: a tiny diff and
+    /// a huge diff produce prompts of (nearly) the same length, because the
+    /// diff is referenced as an artifact rather than inlined.
+    #[test]
+    fn agentic_prompt_is_bounded_regardless_of_diff_size() {
+        let artifact_rel = review_diff_artifact_rel("");
+        let mk = |diff: String| ReviewContext {
+            archived_changes: vec![brief("demo")],
+            changed_files: vec![ChangedFile {
+                path: "src/big.rs".into(),
+                contents: String::new(),
+            }],
+            diff,
+        };
+        let small = render_agentic_review_prompt(&mk("a".into()), "", &artifact_rel);
+        let huge = render_agentic_review_prompt(&mk("x".repeat(500_000)), "", &artifact_rel);
+        assert_eq!(
+            small.len(),
+            huge.len(),
+            "prompt length must not depend on diff size (diff is referenced, not inlined)"
+        );
     }
 
     /// 4.3: a schema-valid `submit_review` payload round-trips
@@ -4328,9 +4408,12 @@ this is not yaml: at all: ::: {{{ broken
     }
 
     /// a015 (agentic path): the fallback bundled session is handed the
-    /// context's diff and changed files (asserting on the prompt the stub
-    /// runner received, not on any log/message wording). Proves the reviewer
-    /// builds its prompt over the real context rather than skipping the call.
+    /// context's diff and changed files (asserting on what the stub runner
+    /// received, not on any log/message wording). Proves the reviewer builds
+    /// its session over the real context rather than skipping the call. Since
+    /// the diff is no longer inlined into the prompt (it is written to the
+    /// artifact the runner receives via `diff`), assert the diff reaches the
+    /// session AND the changed-file path is listed in the prompt.
     #[tokio::test]
     async fn agentic_per_change_empty_split_fallback_passes_diff_and_files() {
         let (client, _) = stub_with_capture("");
@@ -4349,10 +4432,11 @@ this is not yaml: at all: ::: {{{ broken
             .await
             .unwrap();
         let prompts = runner.prompts.lock().unwrap();
+        let diffs = runner.diffs.lock().unwrap();
         assert_eq!(prompts.len(), 1, "exactly one bundled session prompt");
         assert!(
-            prompts[0].contains("DIFF_SENTINEL_a015"),
-            "the fallback review receives the context's diff"
+            diffs[0].contains("DIFF_SENTINEL_a015"),
+            "the fallback review's session receives the context's diff (via the artifact)"
         );
         assert!(
             prompts[0].contains("src/TOUCHED_SENTINEL_a015.rs"),

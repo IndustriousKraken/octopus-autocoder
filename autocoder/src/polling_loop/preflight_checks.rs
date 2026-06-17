@@ -374,6 +374,120 @@ pub(crate) fn build_canon_contradiction_revision_suggestion(
     out
 }
 
+/// Run the change-vs-global-rules pre-flight — the `[rules]` gate
+/// (global-rules-gate) — against `change`, returning the gate's [`GateVerdict`]
+/// (verifier-gates-fail-closed §5). Disposition is identical to the `[canon]`
+/// gate's; the gates differ only in the comparison corpus AND what each finding
+/// names (a violated rule id vs. a canonical requirement):
+///   - `Clean` → [`GateVerdict::Pass`] (logs the positive line, proceed);
+///   - `Found` → [`GateVerdict::Fail`] (writes the findings marker + alert
+///     naming each violated rule by id);
+///   - `Errored` → [`GateVerdict::FailedToRun`] (calls [`handle_gate_error`]).
+pub(crate) async fn handle_rules_violations_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    rules_ctx: &crate::preflight::global_rules::GlobalRulesCheckCtx,
+) -> Result<crate::gate_ledger::GateVerdict> {
+    use crate::gate_ledger::GateVerdict;
+    use crate::preflight::global_rules::GlobalRulesCheckOutcome;
+    let findings = match crate::preflight::global_rules::run_agentic_global_rules_check(
+        rules_ctx, workspace, change,
+    )
+    .await
+    {
+        GlobalRulesCheckOutcome::Clean => {
+            // Positive signal: a clean pass is logged, so an operator can verify
+            // the gate RAN and PASSED rather than inferring it from silence.
+            let label = crate::verifier_gate::VerifierGate::Rules.label();
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "{label} gate passed: no global-rule violations; proceeding to executor"
+            );
+            return Ok(GateVerdict::Pass);
+        }
+        GlobalRulesCheckOutcome::Errored { cause } => {
+            handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                crate::verifier_gate::VerifierGate::Rules,
+                &cause,
+                rules_ctx.attribution.as_deref(),
+            )
+            .await?;
+            return Ok(GateVerdict::FailedToRun);
+        }
+        GlobalRulesCheckOutcome::Found(findings) => findings,
+    };
+    let suggestion = build_rules_violation_revision_suggestion(&findings);
+    // global-rules-gate: this is the `[rules]` verifier gate; its diagnostics
+    // carry the label.
+    let label = crate::verifier_gate::VerifierGate::Rules.label();
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        findings = findings.len(),
+        "{label} global-rules pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        revision_suggestion: suggestion.clone(),
+        gate_error: None,
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "{label} failed to write spec-needs-revision marker (global-rules pre-flight): {e:#}"
+        );
+    }
+    maybe_post_rule_violations_findings_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        &findings,
+        &suggestion,
+        rules_ctx.attribution.as_deref(),
+    )
+    .await;
+    Ok(GateVerdict::Fail)
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into the marker
+/// file when the `[rules]` gate catches one or more violations. Numbers each
+/// violation 1..N, naming the violated rule by its stable id AND the one-line
+/// summary, AND closes with operator-action guidance.
+pub(crate) fn build_rules_violation_revision_suggestion(
+    findings: &[crate::preflight::global_rules::RuleViolationFinding],
+) -> String {
+    let n = findings.len();
+    let mut out = format!(
+        "Pre-flight global-rules check found {n} issue(s) where this change's\n\
+         requirements appear to violate a global rule:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!(
+            "{idx}. Violated rule: {rule}\n   {summary}\n\n",
+            idx = i + 1,
+            rule = f.rule_id,
+            summary = f.summary,
+        ));
+    }
+    out.push_str(
+        "Revise this change so its requirements honor the named global rule(s).\n\
+         Push the spec change AND clear this marker via @<bot> clear-revision <repo> <change>.\n",
+    );
+    out
+}
+
 /// Pre-flight archive-collision check. For each entry in `candidates`,
 /// call `queue::would_collide_on_archive`. Colliding entries are dropped
 /// from the returned list, a WARN-level structured log fires (so

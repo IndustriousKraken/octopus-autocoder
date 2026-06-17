@@ -421,6 +421,12 @@ pub(crate) async fn process_one_pending_change(
         return Ok(step);
     }
 
+    // `[rules]` gate (global-rules-gate): same no-skip runner + record.
+    run_rules_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.rules.verdict, &ledger) {
+        return Ok(step);
+    }
+
     // DEFENSIVE proceed-gate (the structural fail-closed guarantee): read the
     // ledger. If any blocking gate is NOT `Pass`/`Disabled` — including a
     // `Pending` left by a runner that returned without recording — HOLD. This
@@ -432,6 +438,7 @@ pub(crate) async fn process_one_pending_change(
             change = %change,
             in_verdict = ledger.r#in.verdict.as_str(),
             canon_verdict = ledger.canon.verdict.as_str(),
+            rules_verdict = ledger.rules.verdict.as_str(),
             "gate ledger is not blocking-ok; HOLDING the change (fail-closed by construction)"
         );
         // Persist the ledger so the PR-render path (if reached) sees the held
@@ -551,7 +558,7 @@ async fn run_in_gate(
             GateVerdict::FailedToRun
         }
     };
-    ledger.set_in(verdict, model, gate_verdict_summary(verdict));
+    ledger.set_in(verdict, model, gate_verdict_summary(gate, verdict));
     Ok(())
 }
 
@@ -606,16 +613,85 @@ async fn run_canon_gate(
             GateVerdict::FailedToRun
         }
     };
-    ledger.set_canon(verdict, model, gate_verdict_summary(verdict));
+    ledger.set_canon(verdict, model, gate_verdict_summary(gate, verdict));
+    Ok(())
+}
+
+/// Run the `[rules]` gate's runner AND record its verdict (no-skip dispatch,
+/// global-rules-gate). Mirrors [`run_canon_gate`]: enabled (the scoped context
+/// is `Some` AND the registry installs `GlobalRulesCheck`) → handler verdict;
+/// disabled → `Disabled` stub; dispatch `Err` → `FailedToRun` + hold marker.
+async fn run_rules_gate(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+    ledger: &mut crate::gate_ledger::GateLedger,
+) -> Result<()> {
+    use crate::gate_ledger::GateVerdict;
+    let gate = crate::verifier_gate::VerifierGate::Rules;
+    let enabled = crate::preflight::global_rules::current().filter(|_| {
+        matches!(
+            crate::verifier_gate::GateRegistry::standard().resolve(gate),
+            Some(crate::verifier_gate::GateImpl::GlobalRulesCheck)
+        )
+    });
+    let Some(rules_ctx) = enabled else {
+        ledger.set_rules(GateVerdict::Disabled, None, None);
+        return Ok(());
+    };
+    let model = Some(rules_ctx.model.model.clone());
+    let verdict = match handle_rules_violations_preflight(
+        paths, workspace, repo, chatops_ctx, change, &rules_ctx,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "{} global-rules pre-flight errored unexpectedly; recording FAILED TO RUN (fail-closed): {e:#}",
+                gate.label()
+            );
+            let _ = handle_gate_error(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                change,
+                gate,
+                &format!("gate dispatch errored: {e:#}"),
+                rules_ctx.attribution.as_deref(),
+            )
+            .await;
+            GateVerdict::FailedToRun
+        }
+    };
+    ledger.set_rules(verdict, model, gate_verdict_summary(gate, verdict));
     Ok(())
 }
 
 /// A one-line PR summary for a blocking-gate verdict. `Fail`/`FailedToRun`
 /// carry a terse cause for the PR row; `Pass`/`Disabled`/`Pending` carry none.
-fn gate_verdict_summary(verdict: crate::gate_ledger::GateVerdict) -> Option<String> {
+/// The `Fail` noun is gate-specific: the `[rules]` gate writes "rule
+/// violations" (global-rules-gate), the `[in]`/`[canon]` gates write
+/// "contradiction findings" — both land in `.needs-spec-revision.json`.
+fn gate_verdict_summary(
+    gate: crate::verifier_gate::VerifierGate,
+    verdict: crate::gate_ledger::GateVerdict,
+) -> Option<String> {
     use crate::gate_ledger::GateVerdict;
+    use crate::verifier_gate::VerifierGate;
     match verdict {
-        GateVerdict::Fail => Some("contradiction findings written to .needs-spec-revision.json".into()),
+        GateVerdict::Fail => {
+            let noun = match gate {
+                VerifierGate::Rules => "rule violations",
+                _ => "contradiction findings",
+            };
+            Some(format!("{noun} written to .needs-spec-revision.json"))
+        }
         GateVerdict::FailedToRun => {
             Some("gate could not run — change held (see .needs-spec-revision.json)".into())
         }

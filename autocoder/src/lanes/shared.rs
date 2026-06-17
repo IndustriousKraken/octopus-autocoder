@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 /// The `.in-progress` lock filename, shared by both lanes' unit
 /// directories. The changes lane writes it under
 /// `openspec/changes/<slug>/`; the issues lane under
-/// `openspec/issues/<slug>/`.
+/// `issues/<slug>/`.
 pub const LOCK_FILE: &str = ".in-progress";
 
 // ----- workspace handling -----

@@ -1757,10 +1757,15 @@ async fn execute_code_review(
     // contents reflect the CURRENT PR state. The change_list drives
     // archived-change brief lookup; unfound briefs are best-effort.
     let processed: Vec<String> = change_list.to_vec();
+    // The operator re-review path derives its unit list from the PR body's
+    // change-list; it does not separately resolve worked-issue slugs, so no
+    // issue briefs are loaded here (the diff + changed files still reach the
+    // reviewer). Auto-review on the originating pass loads the issue brief.
     let ctx = match crate::polling_loop::build_review_context(
         workspace,
         repo,
         &processed,
+        &[],
         reviewer.kind(),
     ) {
         Ok(c) => c,

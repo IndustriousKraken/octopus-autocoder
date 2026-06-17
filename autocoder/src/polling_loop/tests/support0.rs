@@ -298,7 +298,7 @@ pub(crate) async fn run_one_pass_no_push(
     };
     // Use a very high threshold so existing tests' single-fail
     // iterations don't accidentally mark perma-stuck.
-    let (processed, _self_heal) = run_pass_through_commits(
+    let (processed, _, _self_heal) = run_pass_through_commits(
         &paths,
         workspace,
         &repo,
@@ -475,7 +475,7 @@ pub(crate) async fn run_one_pass_with_threshold(
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         paths,
         workspace,
         &repo,
@@ -596,6 +596,32 @@ pub(crate) fn canon_test_ctx(
         prompt_template: "TEST_PROMPT".into(),
         attribution,
         retries: 0,
+        test_submission: Some(submission),
+    }
+}
+
+/// global-rules-gate: build a `[rules]`-gate context whose agentic session is
+/// short-circuited by an injected `submit_rule_violations` submission
+/// (`Some(payload)`), a no-submission session (`None`), bypassing the CLI
+/// subprocess AND the control socket entirely. `corpus_dir` points at a (real)
+/// directory the prompt builder reads — callers seed it with rule files.
+pub(crate) fn gr_test_ctx(
+    submission: Option<serde_json::Value>,
+    attribution: Option<String>,
+    corpus_dir: std::path::PathBuf,
+) -> crate::preflight::global_rules::GlobalRulesCheckCtx {
+    crate::preflight::global_rules::GlobalRulesCheckCtx {
+        command: "claude".into(),
+        model: crate::agentic_run::ResolvedModel {
+            provider: crate::config::LlmProvider::Anthropic,
+            model: "claude-test".into(),
+            api_base_url: "https://example.invalid".into(),
+            api_key: "sk-test".into(),
+        },
+        prompt_template: "TEST_PROMPT".into(),
+        attribution,
+        retries: 0,
+        corpus_dir,
         test_submission: Some(submission),
     }
 }

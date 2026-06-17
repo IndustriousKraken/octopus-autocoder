@@ -19,7 +19,7 @@ async fn multi_change_pass_clean_after_each() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

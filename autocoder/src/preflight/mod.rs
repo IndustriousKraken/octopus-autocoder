@@ -6,4 +6,6 @@
 
 pub mod canon_contradiction;
 pub mod change_contradiction;
+pub mod corpus_check;
+pub mod global_rules;
 pub mod spec_archivability;
