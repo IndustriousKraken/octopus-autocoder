@@ -1,21 +1,21 @@
 ## MODIFIED Requirements
 
 ### Requirement: Inbound listener routes `send it` to `BrownfieldBatchAction` when posted in a brownfield-survey thread
-The existing `send it` verb (per the canonical `audit-reply-acts` mechanism — unchanged for audit threads) SHALL gain a SECOND recognized context: when posted as a reply inside a brownfield-survey lifecycle thread, the listener SHALL submit a `BrownfieldBatchAction { survey_request_id, channel, thread_ts }` INSTEAD OF the canonical audit-triage action.
+The existing `send it` verb (per the canonical `audit-reply-acts` mechanism; the audit-thread handler itself is defined by `send it verb in an audit thread` and is NOT redefined here) SHALL gain a SECOND recognized context: when posted as a reply inside a brownfield-survey lifecycle thread, the listener SHALL submit a `BrownfieldBatchAction { survey_request_id, channel, thread_ts }` INSTEAD OF the canonical audit-triage action.
 
 At parse time, the listener SHALL look up the parent thread's `ts` against FOUR sets of per-workspace state:
 
-1. Audit-thread set — existing canonical mechanism, unchanged.
+1. Audit-thread set — the existing canonical audit-thread state (its routing is defined by `send it verb in an audit thread`, not redefined here).
 2. Brownfield-survey set — `BrownfieldSurveyState.thread_ts` values across the workspace's stored surveys.
 3. Issue-candidate set — the `thread_ts` values recorded on stored issue-candidate states (per `Inbound listener routes send it to issue-candidate promotion when posted in an issue-candidate thread`).
 4. Revision-thread set — the `thread_ts` values recorded on stored `RevisionThreadState` entries (per `Inbound listener routes send it to the spec-revision executor when posted in a revision thread`).
 
-If the parent thread matches an audit thread, the existing canonical handler fires. If it matches a brownfield-survey thread, the new `BrownfieldBatchAction` is submitted. If it matches an issue-candidate thread, the issue-candidate promotion fires. If it matches a revision thread, the spec-revision executor fires. If it matches NONE of the four, the listener posts the untracked-thread refusal, whose text names all four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread).
+The four-set lookup applies ONLY to a `send it` posted as a thread reply (a non-empty parent `thread_ts`). A `send it` at top level (not a thread reply) is NOT a thread context at all — it parses as the unknown-verb fallback (the `?` reaction), per `send it verb in an audit thread`. For a thread reply: if the parent thread matches an audit thread, the audit-thread handler fires (as defined by `send it verb in an audit thread`); if it matches a brownfield-survey thread, the new `BrownfieldBatchAction` is submitted; if it matches an issue-candidate thread, the issue-candidate promotion fires; if it matches a revision thread, the spec-revision executor fires. If a thread reply matches NONE of the four tracked sets, the listener posts the untracked-thread refusal, whose text names all four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread).
 
 #### Scenario: Send-it in an audit thread (regression check)
-- **WHEN** an operator posts `@<bot> send it` as a reply inside an audit thread (per the canonical mechanism)
-- **THEN** the existing canonical audit-triage action is submitted
-- **AND** behavior is unchanged from the pre-`a29` flow
+- **WHEN** an operator posts `@<bot> send it` as a reply inside a tracked audit thread
+- **THEN** the existing canonical audit-triage action is submitted, as defined by `send it verb in an audit thread` (this requirement does not redefine the audit-thread routing)
+- **AND** the brownfield-survey, issue-candidate, and revision routing do not apply
 
 #### Scenario: Send-it in a brownfield-survey thread
 - **WHEN** an operator posts `@<bot> send it` as a reply inside a brownfield-survey lifecycle thread
@@ -33,9 +33,11 @@ If the parent thread matches an audit thread, the existing canonical handler fir
 - **THEN** the spec-revision executor fires for that change (per the revision-executor requirement)
 - **AND** neither the audit-triage, brownfield-batch, nor issue-candidate handler is invoked
 
-#### Scenario: Send-it outside any known thread context
-- **WHEN** an operator posts `@<bot> send it` at top level OR in an unrecognized thread (not audit, not survey, not issue-candidate, not revision)
-- **THEN** the bot replies with the rejection message naming the four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread)
+#### Scenario: Send-it in an unrecognized thread is refused; at top level it is the `?` fallback
+- **WHEN** an operator posts `@<bot> send it` as a reply in a thread that matches none of the four tracked contexts (audit, survey, issue-candidate, revision)
+- **THEN** the bot replies with the untracked-thread rejection message naming the four valid contexts AND no action is submitted
+- **WHEN** an operator posts `@<bot> send it` at top level (not a thread reply)
+- **THEN** it parses as the unknown-verb fallback (the `?` reaction, per `send it verb in an audit thread`), NOT the untracked-thread refusal
 - **AND** no action is submitted
 
 ### Requirement: Inbound listener recognizes the `clear-survey` verb
