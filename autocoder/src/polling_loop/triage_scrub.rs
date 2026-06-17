@@ -2,7 +2,7 @@ use super::*;
 
 /// a43 / architecture-advisory-redesign: discard every working-tree change
 /// OUTSIDE the two planning lanes — the spec lane (`openspec/changes/`) AND
-/// the issues lane (`openspec/issues/`, the path the issues walker reads via
+/// the issues lane (`issues/`, the path the issues walker reads via
 /// [`crate::lanes::issues::ISSUES_SUBDIR`]) — reverting each out-of-scope
 /// path to its committed (HEAD) state so the triage PR's commit is genuinely
 /// lane-only. Returns the sorted, de-duplicated list of discarded paths so
@@ -38,7 +38,7 @@ use super::*;
 /// side effects.
 pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<String>> {
     const SPEC_PREFIX: &str = "openspec/changes/";
-    // The issues lane the issues walker reads (today `openspec/issues/`).
+    // The issues lane the issues walker reads (today `issues/`).
     let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
     let keep = |path: &str| path.starts_with(SPEC_PREFIX) || path.starts_with(&issues_prefix);
     tracing::debug!(

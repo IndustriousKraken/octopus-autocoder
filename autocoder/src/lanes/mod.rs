@@ -6,7 +6,7 @@
 //!
 //! - the **changes** lane (`openspec/changes/<slug>/`, carries a spec
 //!   delta; lives in `crate::queue` + `crate::polling_loop`), AND
-//! - the **issues** lane (`openspec/issues/<slug>/`, a correction that
+//! - the **issues** lane (`issues/<slug>/`, a correction that
 //!   carries NO delta; this module).
 //!
 //! The two lanes are driven by SEPARATE walkers, each with its own

@@ -5,7 +5,7 @@
 //! lane by canon judgment: a contract-changing fix → a spec-lane change
 //! under `openspec/changes/<slug>/`; a behavior-preserving fix to
 //! already-correctly-specified code → an issue-lane unit under
-//! `openspec/issues/<slug>/` (when `features.issues` is enabled). The
+//! `issues/<slug>/` (when `features.issues` is enabled). The
 //! shared [`super::specs_writing::run_specs_writing_audit`] helper
 //! handles the sandbox, snapshot diff, validation, over-cap pruning, and
 //! commit; this module's only responsibilities are reading settings,
@@ -1206,9 +1206,9 @@ mod tests {
     // a01 lane-choice requirement specifies.
 
     /// Fake `claude` that writes a well-formed issue-lane unit:
-    /// `openspec/issues/<slug>/issue.md` + `tasks.md`, NO `specs/`.
+    /// `issues/<slug>/issue.md` + `tasks.md`, NO `specs/`.
     fn write_issue_unit_script(ws: &Path, slug: &str) -> PathBuf {
-        let dir = ws.join("openspec/issues").join(slug).display().to_string();
+        let dir = ws.join("issues").join(slug).display().to_string();
         write_script(
             ws,
             "fake-claude.sh",
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     /// 4.2: with `features.issues` enabled, a behavior-preserving finding
-    /// yields an `openspec/issues/<slug>/` unit with NO `specs/` directory
+    /// yields an `issues/<slug>/` unit with NO `specs/` directory
     /// (AND no spec-lane unit).
     #[tokio::test]
     async fn issues_enabled_behavior_preserving_finding_yields_issue_unit() {
@@ -1260,7 +1260,7 @@ mod tests {
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
         }
-        let issue_dir = ws.join("openspec/issues/fix-unhandled-error");
+        let issue_dir = ws.join("issues/fix-unhandled-error");
         assert!(issue_dir.join("issue.md").is_file(), "issue.md present");
         assert!(issue_dir.join("tasks.md").is_file(), "tasks.md present");
         assert!(
@@ -1323,7 +1323,7 @@ mod tests {
         }
         assert!(ws.join("openspec/changes/fix-wire-format").exists());
         assert!(
-            !ws.join("openspec/issues/fix-wire-format").exists(),
+            !ws.join("issues/fix-wire-format").exists(),
             "a contract-changing finding produces NO issue-lane unit"
         );
         if let Some(parent) = log_path.parent() {
@@ -1362,7 +1362,7 @@ mod tests {
         }
         assert!(ws.join("openspec/changes/fix-only-changes").exists());
         assert!(
-            !ws.join("openspec/issues").exists(),
+            !ws.join("issues").exists(),
             "issues lane must be untouched when features.issues is disabled"
         );
         if let Some(parent) = log_path.parent() {
@@ -1380,7 +1380,7 @@ mod tests {
             .join("openspec/changes/fix-contract")
             .display()
             .to_string();
-        let issue = ws.join("openspec/issues/fix-defect").display().to_string();
+        let issue = ws.join("issues/fix-defect").display().to_string();
         let _script = write_script(
             &ws,
             "fake-claude.sh",
@@ -1431,7 +1431,7 @@ mod tests {
             "spec-lane unit must be committed"
         );
         assert!(
-            tracked("openspec/issues/fix-defect"),
+            tracked("issues/fix-defect"),
             "issue-lane unit must be committed"
         );
         let git_log = StdCommand::new("git")

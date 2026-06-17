@@ -359,7 +359,7 @@ async fn start_of_work_notification_posted_on_dequeue() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -414,7 +414,7 @@ async fn start_of_work_suppressed_when_disabled() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

@@ -4,7 +4,7 @@ You are auditing test coverage for this repository. Your output is
 zero or more new planning-lane units, each describing a meaningful
 coverage gap AND proposing tests to fill it. Each gap goes to ONE of two
 lanes — the spec lane (`openspec/changes/<slug>/`) or the issue lane
-(`openspec/issues/<slug>/`) — chosen by canon judgment per the
+(`issues/<slug>/`) — chosen by canon judgment per the
 "Choosing the output lane" section below. The daemon appends a block to
 the END of this prompt naming which lanes are available this run AND the
 exact paths; obey it.
@@ -68,7 +68,7 @@ NOT default to the spec lane — make the call:
 
 - **No — the code is already correctly specified AND the missing test
   just pins observed behavior canon already implies.** → **ISSUE lane.**
-  Write `openspec/issues/<slug>/` containing `issue.md` (the gap, the
+  Write `issues/<slug>/` containing `issue.md` (the gap, the
   source location, AND acceptance stated against the EXISTING
   specification) AND `tasks.md` (the test functions to add), with NO
   `specs/` directory.
@@ -98,7 +98,7 @@ invocation. Order by priority:
 
 ## Issue-lane unit format
 
-An issue-lane unit is `openspec/issues/<slug>/`. Required files:
+An issue-lane unit is `issues/<slug>/`. Required files:
 
 - `issue.md` — the coverage gap, the source location, AND acceptance
   criteria stated against the EXISTING specification (name the canonical
@@ -166,7 +166,7 @@ their location.
 ## Hard constraints
 
 - Do NOT modify any file outside the two planning lanes
-  (`openspec/changes/` AND `openspec/issues/`). The sandbox WritePolicy
+  (`openspec/changes/` AND `issues/`). The sandbox WritePolicy
   is `PlanningLanes`; a write anywhere else fails the run.
 - Do NOT propose deleting tests.
 - Do NOT propose modifying existing tests unless factually broken.

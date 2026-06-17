@@ -63,7 +63,7 @@ async fn archive_collision_excludes_change_and_alerts() {
         command_authorization: Default::default(),
     };
 
-    let (processed, _self_heal) = run_pass_through_commits(
+    let (processed, _, _self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -165,7 +165,7 @@ async fn archive_collision_does_not_block_other_changes() {
         }
     }
 
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),
@@ -238,7 +238,7 @@ async fn archive_collision_two_iterations_throttle_alert_and_zero_executor_invoc
     };
 
     for _ in 0..2 {
-        let (processed, _) = run_pass_through_commits(
+        let (processed, _, _) = run_pass_through_commits(
             &paths,
             &ws,
             &fixture_repo(&ws),

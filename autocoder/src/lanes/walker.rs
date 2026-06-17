@@ -307,7 +307,7 @@ fn complete_issue(workspace: &Path, repo: &RepositoryConfig, slug: &str) -> Issu
     }
     // Archive BEFORE the commit so the single commit captures both the
     // fix diff AND the archive rename. The archive is a pure move under
-    // `openspec/issues/` — it never touches `openspec/specs/`.
+    // `issues/` — it never touches `openspec/specs/`.
     if let Err(e) = issues::archive(workspace, slug) {
         return IssueStep::Failed {
             reason: format!("issue archive failed: {e:#}"),

@@ -4088,7 +4088,7 @@ github:
 
         // The unit is written under issues/<slug>/ — its bot-authored files
         // plus the quarantined report-body for a public-origin candidate.
-        let issue_dir = workspace.join("openspec/issues/drop-newline");
+        let issue_dir = workspace.join("issues/drop-newline");
         assert!(issue_dir.join("issue.md").exists(), "issue.md written");
         assert!(issue_dir.join("tasks.md").exists(), "tasks.md written");
         assert!(

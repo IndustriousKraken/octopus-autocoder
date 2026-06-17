@@ -177,7 +177,7 @@ async fn iteration_auto_recovers_partial_clone_without_failure() {
         &std::sync::Mutex::new(Vec::new()),
     )
     .await;
-    let (processed, _self_heal) = result.expect(
+    let (processed, _, _self_heal) = result.expect(
         "iteration must report normal success after internal auto-cleanup + re-clone; \
          the recovery is invisible to the outcome layer",
     );

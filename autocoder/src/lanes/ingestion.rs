@@ -310,10 +310,10 @@ pub fn slug_from_title(title: &str) -> String {
 }
 
 /// The existing issue-unit slugs in the workspace: `(open, archived)`.
-/// `open` is every direct subdirectory of `openspec/issues/` except
+/// `open` is every direct subdirectory of `issues/` except
 /// `archive` AND dotfiles (regardless of well-formedness, so a malformed
 /// or locked unit still blocks a duplicate slug). `archived` is every
-/// entry under `openspec/issues/archive/` with its leading `YYYY-MM-DD-`
+/// entry under `issues/archive/` with its leading `YYYY-MM-DD-`
 /// date stripped.
 pub fn existing_issue_slugs(workspace: &Path) -> (Vec<String>, Vec<String>) {
     let root = issues::issues_dir(workspace);

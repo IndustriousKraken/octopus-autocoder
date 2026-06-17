@@ -5,7 +5,7 @@
 //! implying a new/changed invariant → a spec-lane change under
 //! `openspec/changes/<slug>/`; a behavior-preserving gap in
 //! already-correctly-specified code → an issue-lane unit under
-//! `openspec/issues/<slug>/` (when `features.issues` is enabled).
+//! `issues/<slug>/` (when `features.issues` is enabled).
 //!
 //! The audit itself does NOT decide which gaps matter — that's the
 //! agent's job. The shared [`super::specs_writing::run_specs_writing_audit`]

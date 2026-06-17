@@ -85,7 +85,7 @@ pub async fn execute_one_pass(
     if open_pr_exists_for_agent_branch(paths, repo, github_cfg).await {
         return Ok(());
     }
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, processed_issues, includes_self_heal) = run_pass_through_commits(
         paths,
         workspace,
         repo,
@@ -109,6 +109,7 @@ pub async fn execute_one_pass(
         workspace,
         repo,
         &processed,
+        &processed_issues,
         reviewer,
         chatops_ctx,
         revision_cap,
@@ -376,6 +377,7 @@ async fn run_reviewer_step(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
+    processed_issues: &[String],
     reviewer: Option<&CodeReviewer>,
     chatops_ctx: Option<&ChatOpsContext>,
     revision_cap: u32,
@@ -415,14 +417,20 @@ async fn run_reviewer_step(
         false
     };
 
-    let (review_report, draft, reviewer_revision_concerns) = if processed.is_empty()
+    // Skip the reviewer only when the pass produced NO reviewable code —
+    // neither a processed change NOR a worked issue. An issue carries real
+    // code (it just lives in the issues lane, not `processed`), so an
+    // issue-only pass MUST be reviewed like any change PR; treating it as
+    // audit-only would ship code unreviewed. A genuinely audit-only pass
+    // (proposal-writing, validated separately) still skips here.
+    let no_reviewable_work = processed.is_empty() && processed_issues.is_empty();
+    let (review_report, draft, reviewer_revision_concerns) = if no_reviewable_work
         || skip_reviewer_for_spec_only_pr
     {
-        // Audit-only iteration: no implementer-touched files to evaluate.
+        // No implementer-touched code to evaluate (audit-only, or nothing).
         // The audit's own validation pass already gated each proposal, so
-        // the reviewer would either error against an empty `processed`
-        // list or produce a meaningless review of mechanical
-        // proposal-writing. Skip the reviewer entirely.
+        // the reviewer would either error against an empty work list or
+        // produce a meaningless review of mechanical proposal-writing.
         //
         // a34 §6 also skips here when `reviewer.skip_spec_only_prs` AND
         // the iteration's diff is entirely under `openspec/`.
@@ -439,7 +447,7 @@ async fn run_reviewer_step(
                     // review (no verdict written, NOT an implicit Approve) AND
                     // posts the reviewer-failure operator alert.
                     crate::config::ReviewerKind::Agentic => {
-                        let ctx = build_review_context(workspace, repo, processed, r.kind())?;
+                        let ctx = build_review_context(workspace, repo, processed, processed_issues, r.kind())?;
                         match crate::code_reviewer::run_agentic_review(r, &ctx, workspace).await {
                             Ok(crate::code_reviewer::AgenticReviewOutcome::Reviewed(result)) => {
                                 let report = result.into_review_report();
@@ -471,7 +479,7 @@ async fn run_reviewer_step(
                         let outcome = match r.mode() {
                             crate::config::ReviewerMode::Bundled => {
                                 let ctx =
-                                    build_review_context(workspace, repo, processed, r.kind())?;
+                                    build_review_context(workspace, repo, processed, processed_issues, r.kind())?;
                                 r.review(&ctx).await
                             }
                             crate::config::ReviewerMode::PerChange => {

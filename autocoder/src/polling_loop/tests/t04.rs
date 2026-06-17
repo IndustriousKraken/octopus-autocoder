@@ -77,7 +77,7 @@ async fn reviewer_verdict_drives_pr_shape() {
             recreate_fork_on_reinit: false,
             command_authorization: Default::default(),
         };
-        let (processed, _) = run_pass_through_commits(
+        let (processed, _, _) = run_pass_through_commits(
             &paths,
             &ws,
             &fixture_repo(&ws),
@@ -98,7 +98,7 @@ async fn reviewer_verdict_drives_pr_shape() {
         // Now exercise the reviewer step's compose path manually,
         // mirroring what execute_one_pass does between
         // `run_pass_through_commits` and `open_pull_request`.
-        let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed, reviewer.kind())
+        let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed, &[], reviewer.kind())
             .expect("build_review_context succeeds");
         let (report, draft) = match reviewer.review(&ctx).await {
             Ok(report) => {
@@ -204,7 +204,7 @@ fn build_review_context_skips_file_reads_for_agentic_transport() {
     let processed: Vec<String> = Vec::new();
 
     // Oneshot: the full file body is read into `ChangedFile.contents`.
-    let oneshot = build_review_context(&ws, &repo, &processed, ReviewerKind::Oneshot)
+    let oneshot = build_review_context(&ws, &repo, &processed, &[], ReviewerKind::Oneshot)
         .expect("oneshot context builds");
     let f = oneshot
         .changed_files
@@ -214,7 +214,7 @@ fn build_review_context_skips_file_reads_for_agentic_transport() {
     assert_eq!(f.contents, body, "oneshot reads the full file contents");
 
     // Agentic: the same path is listed, but no contents are read from disk.
-    let agentic = build_review_context(&ws, &repo, &processed, ReviewerKind::Agentic)
+    let agentic = build_review_context(&ws, &repo, &processed, &[], ReviewerKind::Agentic)
         .expect("agentic context builds");
     let f = agentic
         .changed_files

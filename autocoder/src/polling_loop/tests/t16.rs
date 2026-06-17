@@ -23,7 +23,7 @@ async fn pending_only_iteration_runs_no_audit_work() {
         command_authorization: Default::default(),
     };
 
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         &paths,
         &ws,
         &fixture_repo(&ws),

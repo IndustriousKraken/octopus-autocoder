@@ -4,7 +4,7 @@ You are auditing this repository for security issues AND likely bugs.
 Your output is zero or more new planning-lane units, each describing one
 confirmed issue AND proposing a fix. Each finding goes to ONE of two
 lanes — the spec lane (`openspec/changes/<slug>/`) or the issue lane
-(`openspec/issues/<slug>/`) — chosen by canon judgment per the
+(`issues/<slug>/`) — chosen by canon judgment per the
 "Choosing the output lane" section below. The daemon appends a block to
 the END of this prompt naming which lanes are available this run AND the
 exact paths; obey it.
@@ -102,7 +102,7 @@ make the call:
 - **No — the code is already correctly specified AND the fix preserves
   the observed behavior** (an unhandled error path, a leak, a race, a
   mishandled `None` that canon already forbids). → **ISSUE lane.** Write
-  `openspec/issues/<slug>/` containing `issue.md` (the issue, the source
+  `issues/<slug>/` containing `issue.md` (the issue, the source
   location, AND acceptance criteria stated against the EXISTING
   specification) AND `tasks.md`, with NO `specs/` directory. The absence
   of `specs/` is the contract that the fix changes no spec.
@@ -134,7 +134,7 @@ not smuggle a contract change through it to avoid writing a spec.
 
 ## Issue-lane unit format
 
-An issue-lane unit is `openspec/issues/<slug>/`. Required files:
+An issue-lane unit is `issues/<slug>/`. Required files:
 
 - `issue.md` — the issue, the source location (cite `path/to/file.rs:123`),
   AND acceptance criteria stated against the EXISTING specification (name
@@ -203,7 +203,7 @@ not its location.
 ## Hard constraints
 
 - Do NOT modify any file outside the two planning lanes
-  (`openspec/changes/` AND `openspec/issues/`). The sandbox WritePolicy
+  (`openspec/changes/` AND `issues/`). The sandbox WritePolicy
   is `PlanningLanes`; a write anywhere else (a source edit, a doc edit, a
   config change) is reverted AND the run fails.
 - Do NOT fix bugs directly — propose them as a spec-lane change OR an

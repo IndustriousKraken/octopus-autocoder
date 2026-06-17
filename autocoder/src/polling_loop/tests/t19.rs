@@ -71,7 +71,7 @@ async fn walk_yields_after_one_change_when_changelog_pending() {
     let executor = PerChangeArtifactExecutor;
     let repo = fixture_repo(&ws);
     let gh = github_cfg();
-    let (processed, _) = operator_requests::scope(
+    let (processed, _, _) = operator_requests::scope(
         Some(queues.clone()),
         run_pass_through_commits(
             &paths,
@@ -126,7 +126,7 @@ async fn walk_yields_after_one_change_when_proposal_pending() {
     let executor = PerChangeArtifactExecutor;
     let repo = fixture_repo(&ws);
     let gh = github_cfg();
-    let (processed, _) = operator_requests::scope(
+    let (processed, _, _) = operator_requests::scope(
         Some(queues.clone()),
         run_pass_through_commits(
             &paths,
@@ -178,7 +178,7 @@ async fn walk_yields_after_one_change_when_triage_pending() {
     let executor = PerChangeArtifactExecutor;
     let repo = fixture_repo(&ws);
     let gh = github_cfg();
-    let (processed, _) = operator_requests::scope(
+    let (processed, _, _) = operator_requests::scope(
         Some(queues.clone()),
         run_pass_through_commits(
             &paths,
@@ -232,7 +232,7 @@ async fn walk_processes_full_batch_when_no_operator_request_pending() {
     let executor = PerChangeArtifactExecutor;
     let repo = fixture_repo(&ws);
     let gh = github_cfg();
-    let (processed, _) = operator_requests::scope(
+    let (processed, _, _) = operator_requests::scope(
         Some(queues.clone()),
         run_pass_through_commits(
             &paths,
@@ -321,7 +321,7 @@ async fn walk_finishes_current_change_before_yielding() {
     };
     let repo = fixture_repo(&ws);
     let gh = github_cfg();
-    let (processed, _) = operator_requests::scope(
+    let (processed, _, _) = operator_requests::scope(
         Some(queues.clone()),
         run_pass_through_commits(
             &paths,

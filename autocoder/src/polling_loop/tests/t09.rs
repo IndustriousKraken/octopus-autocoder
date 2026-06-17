@@ -435,7 +435,7 @@ async fn self_heal_archives_when_preconditions_met() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, _, includes_self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &repo,
@@ -519,7 +519,7 @@ async fn self_heal_falls_through_to_failed_when_tasks_incomplete() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, includes_self_heal) = run_pass_through_commits(
+    let (processed, _, includes_self_heal) = run_pass_through_commits(
         &paths,
         &ws,
         &repo,

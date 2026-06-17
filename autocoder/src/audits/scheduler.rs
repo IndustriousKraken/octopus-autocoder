@@ -798,7 +798,7 @@ pub(crate) fn detect_write_policy_violation(
         }
         WritePolicy::PlanningLanes => {
             // a01: two-prefix allowlist — the spec lane (`openspec/changes/`)
-            // OR the issues lane (`openspec/issues/`, the path the issues
+            // OR the issues lane (`issues/`, the path the issues
             // walker reads via `ISSUES_SUBDIR`). Any other path (source,
             // docs, config) is a violation that reverts the whole diff.
             let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
@@ -1458,7 +1458,7 @@ mod tests {
     // ---- a01: PlanningLanes two-prefix allowlist enforcement ----
 
     /// a01 (task 4.1): a PlanningLanes run whose only writes are under the
-    /// issues lane (`openspec/issues/`) survives the post-hoc check (the
+    /// issues lane (`issues/`) survives the post-hoc check (the
     /// artifact remains) AND advances cadence state.
     #[tokio::test]
     async fn planning_lanes_allows_issues_lane_write() {
@@ -1466,7 +1466,7 @@ mod tests {
         let audit = Arc::new(
             CountingAudit::new("pl_issues")
                 .with_policy(WritePolicy::PlanningLanes)
-                .writes_file("openspec/issues/fix-thing/issue.md")
+                .writes_file("issues/fix-thing/issue.md")
                 .with_outcome(AuditOutcome::specs_written(vec!["fix-thing".into()])),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
@@ -1476,7 +1476,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ws.join("openspec/issues/fix-thing/issue.md").exists(),
+            ws.join("issues/fix-thing/issue.md").exists(),
             "issues-lane artifact must survive the PlanningLanes post-hoc check"
         );
         let state = AuditState::load_or_default(&ws);
@@ -1551,7 +1551,7 @@ mod tests {
         let audit = Arc::new(
             CountingAudit::new("co_issues")
                 .with_policy(WritePolicy::OpenSpecOnly)
-                .writes_file("openspec/issues/fix-thing/issue.md"),
+                .writes_file("issues/fix-thing/issue.md"),
         );
         let registry = AuditRegistry::with_audits(vec![audit.clone()]);
         let cfg = audits_cfg_daily("co_issues");
@@ -1560,7 +1560,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !ws.join("openspec/issues/fix-thing/issue.md").exists(),
+            !ws.join("issues/fix-thing/issue.md").exists(),
             "OpenSpecOnly must revert an issues-lane write (it is outside openspec/changes/)"
         );
         let state = AuditState::load_or_default(&ws);

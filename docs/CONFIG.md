@@ -672,7 +672,7 @@ features:
 
 ### `features.issues` {#featuresissues}
 
-Config for the issues lane (a009/a010) — both the curated entry (a maintainer commits `openspec/issues/<slug>/` directly) AND the public ingestion path (the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it`). See [OPERATIONS.md → Issues lane](OPERATIONS.md) for the workflow.
+Config for the issues lane (a009/a010) — both the curated entry (a maintainer commits `issues/<slug>/` directly) AND the public ingestion path (the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it`). See [OPERATIONS.md → Issues lane](OPERATIONS.md) for the workflow.
 
 Unlike the chatops-verb features above — which are inert until invoked, hence `enabled: true` by default — the issues lane is **OFF by default**. Enabling it changes daemon behavior autonomously: per-iteration unit selection becomes `issues > changes > audits`, AND (when `features.scout.include_issues` is also true — the default) each pass runs an LLM triage over open GitHub issue bodies (untrusted public input) and posts candidates to chatops. That is automatic token spend and untrusted-input processing, so it is opt-in.
 

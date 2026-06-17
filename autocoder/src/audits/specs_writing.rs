@@ -12,7 +12,7 @@
 //! `openspec/changes/<name>/` directories, while the two bug/gap audits
 //! (`missing_tests_audit`, `security_bug_audit`) run under `PlanningLanes`
 //! (a01) and route each finding to the spec lane (`openspec/changes/`) OR
-//! the issues lane (`openspec/issues/`) by canon judgment.
+//! the issues lane (`issues/`) by canon judgment.
 //!
 //! The audits differ only in their prompt, their per-run cap source, their
 //! human-readable commit subject, and whether they choose a lane —
@@ -950,7 +950,7 @@ pub(crate) fn snapshot_change_dirs(workspace: &Path) -> HashSet<String> {
 }
 
 /// Enumerate the immediate child directory names under the issues lane
-/// (`<workspace>/openspec/issues/`, the path the issues walker reads via
+/// (`<workspace>/issues/`, the path the issues walker reads via
 /// [`crate::lanes::issues::ISSUES_SUBDIR`]). Mirrors [`snapshot_change_dirs`]:
 /// returns an empty set when the directory is absent, AND filters the
 /// `archive/` subdirectory so archived issues never count as newly created.
@@ -1091,7 +1091,7 @@ fn build_gate_finding_addendum(gated: &[&UnitFailure], issues_lane_enabled: bool
         resolutions.push_str(
             "- CONVERT TO AN ISSUE: when the correct fix is behavior-preserving (the code drifted \
              from an already-correct spec), delete the spec-lane change and write the unit as an \
-             `openspec/issues/<slug>/` issue instead (`issue.md` + `tasks.md`, NO `specs/`).\n",
+             `issues/<slug>/` issue instead (`issue.md` + `tasks.md`, NO `specs/`).\n",
         );
     }
     resolutions.push_str(
@@ -1181,7 +1181,7 @@ fn git_add_openspec_changes(workspace: &Path) -> Result<()> {
 }
 
 /// a01: stage BOTH planning lanes for a planning-lanes audit's commit —
-/// `openspec/changes/` AND the issues lane (`openspec/issues/`). Each lane
+/// `openspec/changes/` AND the issues lane (`issues/`). Each lane
 /// dir is staged only when it exists on disk (`git add <missing>` errors
 /// with "pathspec did not match any files"); the caller only commits when
 /// at least one lane produced a validated unit, so this always stages at
@@ -1735,11 +1735,11 @@ mod a02_gate_tests {
 
     /// 5.4: an issue whose fix would require a contract change is re-routed to
     /// the spec lane (the committed unit is `openspec/changes/<slug>/`, not
-    /// `openspec/issues/<slug>/`); an honest issue commits as an issue.
+    /// `issues/<slug>/`); an honest issue commits as an issue.
     #[tokio::test]
     async fn issue_requiring_contract_change_is_rerouted_to_spec_lane() {
         let (_t, ws) = init_workspace();
-        let issue = ws.join("openspec/issues/fix-route").display().to_string();
+        let issue = ws.join("issues/fix-route").display().to_string();
         let change = ws.join("openspec/changes/fix-route").display().to_string();
         let toggle = ws.join(".attempt-toggle").display().to_string();
         // Attempt 0: write an issue. Attempt 1: write a spec-lane change
@@ -1779,11 +1779,11 @@ mod a02_gate_tests {
         };
         assert!(tracked("openspec/changes/fix-route"), "the re-routed unit is a change");
         assert!(
-            !tracked("openspec/issues/fix-route"),
+            !tracked("issues/fix-route"),
             "the issue-lane unit must not be committed"
         );
         assert!(
-            !ws.join("openspec/issues/fix-route").exists(),
+            !ws.join("issues/fix-route").exists(),
             "the original issue dir is cleaned up on re-route"
         );
         cleanup_log(&ws);
@@ -1794,7 +1794,7 @@ mod a02_gate_tests {
     #[tokio::test]
     async fn honest_issue_commits_as_issue() {
         let (_t, ws) = init_workspace();
-        let issue = ws.join("openspec/issues/fix-honest").display().to_string();
+        let issue = ws.join("issues/fix-honest").display().to_string();
         let script = write_script(
             &ws,
             "fake-claude.sh",
@@ -1812,7 +1812,7 @@ mod a02_gate_tests {
             }
             other => panic!("expected SpecsWritten, got {other:?}"),
         }
-        assert!(ws.join("openspec/issues/fix-honest/issue.md").is_file());
+        assert!(ws.join("issues/fix-honest/issue.md").is_file());
         assert!(
             !ws.join("openspec/changes/fix-honest").exists(),
             "an honest issue is NOT routed to the spec lane"

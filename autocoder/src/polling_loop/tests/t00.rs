@@ -499,7 +499,7 @@ async fn a43_audit_spec_only_opens_pr_without_warning() {
     );
 }
 
-/// The discard step keeps the issues lane (`openspec/issues/<slug>/`) AND
+/// The discard step keeps the issues lane (`issues/<slug>/`) AND
 /// drops out-of-lane code. (architecture-advisory-redesign task 7.4.)
 #[test]
 fn discard_non_spec_writes_keeps_issues_lane_drops_code() {

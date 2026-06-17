@@ -298,7 +298,7 @@ pub(crate) async fn run_one_pass_no_push(
     };
     // Use a very high threshold so existing tests' single-fail
     // iterations don't accidentally mark perma-stuck.
-    let (processed, _self_heal) = run_pass_through_commits(
+    let (processed, _, _self_heal) = run_pass_through_commits(
         &paths,
         workspace,
         &repo,
@@ -475,7 +475,7 @@ pub(crate) async fn run_one_pass_with_threshold(
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
-    let (processed, _) = run_pass_through_commits(
+    let (processed, _, _) = run_pass_through_commits(
         paths,
         workspace,
         &repo,
