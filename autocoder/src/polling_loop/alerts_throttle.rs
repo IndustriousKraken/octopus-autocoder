@@ -154,6 +154,115 @@ async fn post_throttled_change_alert(
     }
 }
 
+/// a03: the tracked-thread variant of [`post_throttled_change_alert`] for a
+/// CONTRADICTION marker (`[in]` / `[canon]` findings). Same 24h-per-change
+/// throttle + `failure_alerts_enabled` gate, but it posts via the
+/// thread-returning notification path (`post_notification_with_thread`),
+/// captures the returned `thread_ts`, AND stamps a
+/// [`crate::revision_thread::RevisionThreadState`] keyed to repo + change so a
+/// later reply can be matched to the change (the dispatcher's fourth `send it`
+/// context + the advisor routing).
+///
+/// A degraded post that returns `Ok(None)` (a backend with no native threading)
+/// still records the throttle entry — the alert landed — but writes NO
+/// `RevisionThreadState`: the alert is simply not reply-matchable (graceful
+/// degradation, never an error). On post failure the throttle entry is NOT
+/// written so a later iteration can retry.
+///
+/// Only the contradiction posters call this; the gate-error AND
+/// unarchivable-deltas markers keep the untracked [`post_throttled_change_alert`]
+/// path (a03 D1: those markers are NOT tracked as revision threads).
+#[allow(clippy::too_many_arguments)]
+async fn post_tracked_revision_alert(
+    paths: &DaemonPaths,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    excerpt: String,
+    label: &str,
+    top_line: impl FnOnce(&Path) -> String,
+    thread_body: impl FnOnce(&Path) -> String,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(paths, repo);
+    let mut state = AlertState::load_or_default(paths, &workspace);
+    let now = Utc::now();
+    if !ThrottleMap::SpecRevision.should_alert(&state, change, now) {
+        return;
+    }
+    let top = top_line(&workspace);
+    let body = thread_body(&workspace);
+    let posted = ctx
+        .chatops
+        .post_notification_with_thread(&ctx.channel, &top, &body)
+        .await;
+    let maybe_thread_ts = match posted {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "{label} chatops alert post failed: {e:#}"
+            );
+            return;
+        }
+    };
+    // The alert landed — record the throttle entry so we don't re-alert within
+    // the window, regardless of whether the backend gave us a trackable thread.
+    ThrottleMap::SpecRevision.insert(
+        &mut state,
+        change,
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: excerpt,
+        },
+    );
+    if let Err(e) = state.save(paths, &workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to persist {label} alert state: {e:#}"
+        );
+    }
+    // a03 task 1.1: only a thread-returning post yields a trackable thread.
+    let Some(thread_ts) = maybe_thread_ts else {
+        // Degraded post (no native threading): the alert is not reply-matchable.
+        tracing::debug!(
+            url = %repo.url,
+            change = %change,
+            "{label} contradiction alert posted without a thread_ts; not recording a RevisionThreadState"
+        );
+        return;
+    };
+    let revision_state = crate::revision_thread::RevisionThreadState {
+        thread_ts: thread_ts.clone(),
+        channel: ctx.channel.clone(),
+        repo_url: repo.url.clone(),
+        change_slug: change.to_string(),
+        status: crate::revision_thread::RevisionThreadStatus::Open,
+        posted_at: now,
+    };
+    let root = crate::revision_thread::default_state_root(paths);
+    if let Err(e) = crate::revision_thread::write_state(&root, &revision_state) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            thread_ts = %thread_ts,
+            "{label} failed to stamp revision-thread state (`send it` / advisor will not resolve this thread): {e:#}"
+        );
+    }
+}
+
+/// The trailing block appended to every CONTRADICTION alert's thread body (a03
+/// task 1.3): the alert IS a revision thread, so it advertises that the
+/// operator may reply to discuss OR `@<bot> send it` to revise + open a PR.
+fn revision_thread_advert() -> &'static str {
+    "This alert is an interactive revision thread:\n  • Reply in this thread to discuss the revision with autocoder (read-only — nothing is written).\n  • Post `@<bot> send it` in this thread to have autocoder revise the change's spec deltas, re-run the gates, AND open a PR for review."
+}
+
 /// Sibling of `maybe_post_unarchivable_deltas_alert` for the a19
 /// contradiction pre-flight path. Same throttle state, channel, and
 /// gating flag as the existing alert so a single stream of
@@ -170,14 +279,25 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
     attribution: Option<&str>,
 ) {
     let label = crate::verifier_gate::VerifierGate::In.label();
-    post_throttled_change_alert(
+    // a03: the contradiction marker (empty unimplementable_tasks, empty
+    // gate_error) is a TRACKED revision thread — post via the thread-returning
+    // path AND stamp a RevisionThreadState so a later reply can be matched.
+    let findings = findings.to_vec();
+    let suggestion = revision_suggestion.to_string();
+    let attribution = attribution.map(|a| a.to_string());
+    post_tracked_revision_alert(
         paths,
         chatops_ctx,
         repo,
         change,
-        ThrottleMap::SpecRevision,
         truncate_reason(revision_suggestion),
         &format!("{label} contradiction-findings"),
+        |_workspace| {
+            crate::verifier_gate::VerifierGate::In.label_line(&format!(
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)",
+                repo_url = repo.url,
+            ))
+        },
         |workspace| {
             let marker_path = workspace
                 .join("openspec/changes")
@@ -199,19 +319,19 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                 .map(|a| {
                     format!(
                         "\n\n{}",
-                        crate::attribution::attribution_line("Contradiction-check", a)
+                        crate::attribution::attribution_line("Contradiction-check", &a)
                     )
                 })
                 .unwrap_or_default();
-            crate::verifier_gate::VerifierGate::In.label_line(&format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has change-internal contradictions (pre-flight)\n\nRequirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
-                repo_url = repo.url,
-                change = change,
+            format!(
+                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                suggestion = revision_suggestion,
+                suggestion = suggestion,
+                advert = revision_thread_advert(),
+                change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
-            ))
+            )
         },
     )
     .await;
@@ -283,14 +403,24 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
     attribution: Option<&str>,
 ) {
     let label = crate::verifier_gate::VerifierGate::Canon.label();
-    post_throttled_change_alert(
+    // a03: like the `[in]` findings alert, the `[canon]` contradiction marker is
+    // a TRACKED revision thread — post threaded AND stamp a RevisionThreadState.
+    let findings = findings.to_vec();
+    let suggestion = revision_suggestion.to_string();
+    let attribution = attribution.map(|a| a.to_string());
+    post_tracked_revision_alert(
         paths,
         chatops_ctx,
         repo,
         change,
-        ThrottleMap::SpecRevision,
         truncate_reason(revision_suggestion),
         &format!("{label} canon-contradiction-findings"),
+        |_workspace| {
+            crate::verifier_gate::VerifierGate::Canon.label_line(&format!(
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` contradicts the existing canonical specs (pre-flight)",
+                repo_url = repo.url,
+            ))
+        },
         |workspace| {
             let marker_path = workspace
                 .join("openspec/changes")
@@ -313,19 +443,19 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                 .map(|a| {
                     format!(
                         "\n\n{}",
-                        crate::attribution::attribution_line("Canon-contradiction-check", a)
+                        crate::attribution::attribution_line("Canon-contradiction-check", &a)
                     )
                 })
                 .unwrap_or_default();
-            crate::verifier_gate::VerifierGate::Canon.label_line(&format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` contradicts the existing canonical specs (pre-flight)\n\nThis change's requirements conflict with canon:\n{findings_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement).\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
-                repo_url = repo.url,
-                change = change,
+            format!(
+                "This change's requirements conflict with canon:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                suggestion = revision_suggestion,
+                suggestion = suggestion,
+                advert = revision_thread_advert(),
+                change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
-            ))
+            )
         },
     )
     .await;

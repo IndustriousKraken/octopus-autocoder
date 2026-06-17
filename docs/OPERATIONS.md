@@ -398,6 +398,17 @@ The marker is registered in `.git/info/exclude` at workspace init so it does not
 
 The marker is operator-cleared, not auto-cleared. autocoder does not remove it on the next iteration even when the spec has been revised — same rationale as the perma-stuck marker: the operator's audit trail is clearer when "did the issue actually get fixed?" requires an explicit human action.
 
+### Interactive revision thread for contradiction markers (a03)
+
+A **contradiction** marker — one whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty (a `[in]` / `[canon]` semantic finding, NOT the executor's unimplementable-tasks flag NOR a gate-error hold) — is more than a static alert: its `SpecNeedsRevision` post is captured as a `RevisionThreadState` (keyed to repo + change) AND becomes an **interactive revision thread**. The hand-edit workflow above still works, but the operator now has a faster, human-directed path:
+
+- **Reply in the alert thread to discuss.** Any non-`send it` `@<bot>` reply runs a read-only **revision advisor** — a fresh agentic session reconstructed from the change's spec deltas, the relevant canon, the marker's contradiction narrative, AND the thread transcript so far. It talks through the judgment call (align the change to canon's existing term, or turn the delta into a coherent `MODIFIED` of the canonical requirement, and how) AND writes nothing. The session is stateless: each reply rebuilds from on-disk artifacts plus the thread, so multi-round discussion survives a daemon restart.
+- **`@<bot> send it` to revise AND open a PR.** This runs the **spec-revision executor** — a write-scoped agentic session that edits the change's spec deltas (scoped to `openspec/changes/<slug>/`) along the discussed direction, then re-runs the `[in]` and `[canon]` gates against the revised change. On a clean re-gate it opens a PR carrying the spec-delta revision AND reports the PR link in the thread; on a still-failing re-gate it opens **no** PR AND reports the remaining contradiction so the operator can discuss further AND `send it` again. The executor never commits to the base branch outside the PR (human PR review is the merge gate) AND never auto-edits `tasks.md`.
+
+This preserves the marching-orders invariant — the operator directs the approach (discussion), triggers the rewrite (`send it`), AND reviews the result (PR merge); the agent drafts but never autonomously ships a spec revision.
+
+**Out of scope (operator-authored flow unchanged).** The executor's **unimplementable-tasks** marker (non-empty `unimplementable_tasks`) and the **gate-error hold** marker (populated `gate_error`) are NOT tracked as revision threads: their alerts do not advertise the thread, and they keep the flag-and-stop / fix-the-gate flows above. `@<bot> clear-revision <repo> <change>` remains the manual escape for every marker kind. See [CHATOPS.md → Discussing AND revising a contradiction-flagged change](CHATOPS.md#discussing-and-revising-a-contradiction-flagged-change-send-it-in-a-spec-revision-thread).
+
 ## Queue-blocking policy
 
 autocoder treats the following per-change marker categories as queue-blocking — when any change in `openspec/changes/<slug>/` has one of these markers AND does NOT also have `.ignore-for-queue.json`, the polling loop halts the queue walk for the iteration:

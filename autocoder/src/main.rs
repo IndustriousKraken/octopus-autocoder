@@ -52,6 +52,7 @@ mod proposal_requests;
 mod queue;
 mod rag;
 mod recovery_classification;
+mod revision_thread;
 mod revisions;
 mod sandbox;
 mod spec_revision;
