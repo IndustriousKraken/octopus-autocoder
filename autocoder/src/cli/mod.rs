@@ -82,6 +82,7 @@ pub mod doctor;
 pub mod inspect;
 pub mod install;
 pub mod pkg_manager;
+pub mod reconfigure;
 pub mod reload;
 pub mod rewind;
 pub mod run;

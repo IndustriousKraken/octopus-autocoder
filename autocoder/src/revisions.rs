@@ -688,6 +688,23 @@ async fn process_one_pr(
         return Ok(());
     }
     let mut latest_seen: Option<DateTime<Utc>> = None;
+    // Loop-invariant context shared by the executor-outcome handling, bundled
+    // so `apply_revise_outcome` AND its failure helper don't each carry a dozen
+    // immutable references.
+    let ctx = ReviseCtx {
+        paths,
+        workspace,
+        repo,
+        pr,
+        forge: &forge,
+        token,
+        owner,
+        repo_name,
+        bot_username,
+        reviewer,
+        push_remote,
+        chatops_ctx,
+    };
     for comment in comments {
         if cancel.is_cancelled() {
             // Persist whatever progress we made and return.
@@ -1157,375 +1174,23 @@ async fn process_one_pr(
         )
         .await;
         let revise_duration = revise_started_at.elapsed();
-        match outcome {
-            Ok(ExecutorOutcome::Completed { final_answer }) => {
-                let commit_subject = build_commit_subject(&change_name, &revision_text);
-                // a52: a `Completed` outcome may carry code changes OR be a
-                // deliberate no-change declination (the agent verified the
-                // request's claim against the cited code and concluded it was
-                // wrong, so it made no edit). Branch on the working-tree
-                // state: a dirty tree is an applied change to commit + push;
-                // a clean tree is a reported declination that must NOT be
-                // treated as a commit/push failure.
-                let tree_dirty = match crate::git::status_porcelain(workspace) {
-                    Ok(porcelain) => !porcelain.is_empty(),
-                    Err(e) => {
-                        // Reading the tree state failed; assume dirty so the
-                        // commit path runs (preserving pre-a52 behavior). A
-                        // genuinely empty commit still surfaces via the
-                        // commit/push-failure branch below.
-                        tracing::warn!(
-                            url = %repo.url,
-                            pr_number = pr.number,
-                            "revision: could not read working-tree state; assuming dirty: {e:#}"
-                        );
-                        true
-                    }
-                };
-                // Short-circuit: `apply_revision_commit` is only invoked on a
-                // dirty tree (the clean branch never commits). A genuine
-                // commit/push failure routes to the failure comment + cap
-                // increment, exactly as before a52.
-                if tree_dirty
-                    && let Err(e) =
-                        apply_revision_commit(workspace, repo, push_remote, &commit_subject)
-                {
-                    tracing::warn!(
-                        url = %repo.url,
-                        pr_number = pr.number,
-                        "revision commit/push failed; reporting as failed: {e:#}"
-                    );
-                    let push_failure_reason = format!("push to {} failed: {e}", repo.agent_branch);
-                    crate::polling_loop::maybe_post_revise_failed_alert(
-                        paths,
-                        chatops_ctx,
-                        repo,
-                        pr.number,
-                        &pr.url,
-                        &push_failure_reason,
-                        &comment_id_str,
-                    )
-                    .await;
-                    let body = format!(
-                        "✗ Revision attempt failed: commit/push failed: {e}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
-                        bot_username
-                    );
-                    let _ =
-                        forge.post_comment(token, owner, repo_name, pr.number, &body)
-                            .await;
-                    if is_automatic {
-                        state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
-                    }
-                    advance_seen(&mut latest_seen, comment.created_at);
-                    write_state(paths, workspace, &state)?;
-                    continue;
-                }
-                // Both branches count the attempt against the cap AND fire the
-                // same chatops success notification — the revision was
-                // processed, whether or not it produced a diff.
-                if is_automatic {
-                    state.auto_revisions_applied =
-                        state.auto_revisions_applied.saturating_add(1);
-                } else {
-                    // a000: a human revise attempt counts toward the
-                    // per-PR human-revise cap, mirroring the automatic
-                    // counter's terminal-outcome increment.
-                    state.human_revise_count =
-                        state.human_revise_count.saturating_add(1);
-                }
-                crate::polling_loop::maybe_post_revise_succeeded_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    &change_list_summary,
-                    &repo.agent_branch,
-                    revise_duration,
-                    &comment_id_str,
-                )
-                .await;
-                // a52: the dirty branch posts `✅ Revision applied:`; the
-                // clean branch posts the distinct `✅ Revision evaluated, no
-                // change made:` line. Both carry the agent's `final_answer`.
-                let reply = if tree_dirty {
-                    compose_revision_success_comment(
-                        &commit_subject,
-                        is_automatic,
-                        state.auto_revisions_applied,
-                        state.revision_cap,
-                        final_answer.as_deref(),
-                    )
-                } else {
-                    compose_revision_no_change_comment(
-                        &commit_subject,
-                        is_automatic,
-                        state.auto_revisions_applied,
-                        state.revision_cap,
-                        final_answer.as_deref(),
-                    )
-                };
-                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &reply,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        url = %repo.url,
-                        pr_number = pr.number,
-                        "failed to post success PR comment: {e:#}"
-                    );
-                }
-                // a33 task 7.3: maybe-post the re-review suggestion. Only the
-                // dirty branch moved the agent-branch head, so the clean
-                // (no-change) branch skips it — there is nothing new to
-                // re-review.
-                if tree_dirty {
-                    maybe_post_rereview_suggestion(
-                        workspace,
-                        repo,
-                        reviewer,
-                        pr,
-                        &mut state,
-                        chatops_ctx,
-                    )
-                    .await;
-                }
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
-            Ok(ExecutorOutcome::AskUser { question, resume_handle }) => {
-                // AskUser → existing chatops escalation. No commit, no
-                // count increment, no PR reply. `last_seen_comment_at`
-                // is NOT advanced past this comment so the next iteration
-                // can resume against it.
-                let _handle = resume_handle;
-                if let Some(ctx) = chatops_ctx {
-                    let chat_text = format!(
-                        "❓ Revision on {} PR #{} needs clarification: {}",
-                        repo.url, pr.number, question,
-                    );
-                    if let Err(e) = ctx.chatops.post_notification(ctx.channel, &chat_text).await {
-                        tracing::warn!(
-                            url = %repo.url,
-                            pr_number = pr.number,
-                            "failed to post AskUser chatops notification: {e:#}"
-                        );
-                    }
-                }
-                // Persist progress on prior comments only — do NOT advance
-                // past the current (unresolved) comment.
-                if let Some(t) = latest_seen {
-                    state.last_seen_comment_at = t;
-                    write_state(paths, workspace, &state)?;
-                }
-                return Ok(());
-            }
-            Ok(ExecutorOutcome::Failed { reason }) => {
-                crate::polling_loop::maybe_post_revise_failed_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    &reason,
-                    &comment_id_str,
-                )
-                .await;
-                let body = format!(
-                    "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
-                    reason, bot_username
-                );
-                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        url = %repo.url,
-                        pr_number = pr.number,
-                        "failed to post failure PR comment: {e:#}"
-                    );
-                }
-                if is_automatic {
-                    state.auto_revisions_applied =
-                        state.auto_revisions_applied.saturating_add(1);
-                } else {
-                    // a000: a human revise attempt counts toward the
-                    // per-PR human-revise cap, mirroring the automatic
-                    // counter's terminal-outcome increment.
-                    state.human_revise_count =
-                        state.human_revise_count.saturating_add(1);
-                }
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
-            Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
-                // a74: the agent subprocess never STARTED — a required
-                // precondition was unmet (e.g. the a006 OS-sandbox-mechanism
-                // gate refused to spawn with no usable mechanism AND no
-                // unsandboxed opt-in). No revision work was attempted, so this
-                // does NOT charge a revision slot (neither the automatic
-                // `auto_revisions_applied` nor the human `human_revise_count`
-                // counter is incremented). We still post a failure reply that
-                // directs the operator to resolve the precondition AND post a
-                // new revision request, AND we advance the seen-marker so the
-                // daemon does NOT auto-retry — an unmet precondition will not
-                // heal between polls, so a deliberate operator re-trigger is
-                // the right recovery. No commit or push is made.
-                crate::polling_loop::maybe_post_revise_failed_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    &reason,
-                    &comment_id_str,
-                )
-                .await;
-                let body = format!(
-                    "✗ Revision could not start: {}. The agent subprocess never started, so no revision was attempted AND this does NOT count against the revision cap. Resolve the precondition (see the message above), then reply with another `@{} revise ...` to re-trigger — the daemon will NOT retry automatically.",
-                    reason, bot_username
-                );
-                if let Err(e) = forge.post_comment(token, owner, repo_name, pr.number, &body,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        url = %repo.url,
-                        pr_number = pr.number,
-                        "failed to post precondition-unmet PR comment: {e:#}"
-                    );
-                }
-                // No count increment — no revision was attempted. Consume the
-                // trigger (advance the seen-marker) so it does not re-fire on
-                // the next poll; manual re-trigger is required.
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
-            Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
-                // The revise-lifecycle "failed" notification surfaces the
-                // iteration framing for chat operators. The pending-side
-                // `maybe_post_spec_revision_alert` continues to fire from
-                // its own canonical site when a SpecNeedsRevision marker
-                // is observed during a pending-change run; this lifecycle
-                // notification is additive and per-revise-comment.
-                crate::polling_loop::maybe_post_revise_failed_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    "spec needs revision (see PR comment for details)",
-                    &comment_id_str,
-                )
-                .await;
-                let body = "✗ Revision attempt failed: executor reported the original change spec is unimplementable. The PR is unchanged."
-                    .to_string();
-                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
-                )
-                .await;
-                if is_automatic {
-                    state.auto_revisions_applied =
-                        state.auto_revisions_applied.saturating_add(1);
-                } else {
-                    // a000: a human revise attempt counts toward the
-                    // per-PR human-revise cap, mirroring the automatic
-                    // counter's terminal-outcome increment.
-                    state.human_revise_count =
-                        state.human_revise_count.saturating_add(1);
-                }
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
-            Ok(ExecutorOutcome::IterationRequested { .. }) => {
-                // Revisions are single-shot bug fixes against a merged PR;
-                // they don't have the iteration-pending state machine that
-                // pending changes do. Treat IterationRequested as a Failed-
-                // equivalent so the PR comment surfaces the unhandled case.
-                crate::polling_loop::maybe_post_revise_failed_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    "executor returned IterationRequested (iteration sequences are not supported on the revise path)",
-                    &comment_id_str,
-                )
-                .await;
-                let body = format!(
-                    "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
-                    bot_username
-                );
-                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
-                )
-                .await;
-                if is_automatic {
-                    state.auto_revisions_applied =
-                        state.auto_revisions_applied.saturating_add(1);
-                } else {
-                    // a000: a human revise attempt counts toward the
-                    // per-PR human-revise cap, mirroring the automatic
-                    // counter's terminal-outcome increment.
-                    state.human_revise_count =
-                        state.human_revise_count.saturating_add(1);
-                }
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
-            Ok(ExecutorOutcome::Aborted { reason }) => {
-                // a39: subprocess killed by the daemon's own SIGTERM
-                // cascade. Do NOT bump auto_revisions_applied, do NOT post
-                // a failure alert, AND do NOT advance latest_seen — so
-                // the next iteration after restart re-enters this same
-                // comment AND retries.
-                tracing::info!(
-                    url = %repo.url,
-                    pr_number = pr.number,
-                    "revision: executor aborted by daemon shutdown: {reason}"
-                );
-                // Persist progress on prior comments only.
-                if let Some(t) = latest_seen {
-                    state.last_seen_comment_at = t;
-                    write_state(paths, workspace, &state)?;
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    url = %repo.url,
-                    pr_number = pr.number,
-                    "revision executor invocation errored: {e:#}"
-                );
-                let executor_error_reason = format!("executor error: {e:#}");
-                crate::polling_loop::maybe_post_revise_failed_alert(
-                    paths,
-                    chatops_ctx,
-                    repo,
-                    pr.number,
-                    &pr.url,
-                    &executor_error_reason,
-                    &comment_id_str,
-                )
-                .await;
-                let body = format!(
-                    "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
-                    e, bot_username
-                );
-                let _ = forge.post_comment(token, owner, repo_name, pr.number, &body,
-                )
-                .await;
-                if is_automatic {
-                    state.auto_revisions_applied =
-                        state.auto_revisions_applied.saturating_add(1);
-                } else {
-                    // a000: a human revise attempt counts toward the
-                    // per-PR human-revise cap, mirroring the automatic
-                    // counter's terminal-outcome increment.
-                    state.human_revise_count =
-                        state.human_revise_count.saturating_add(1);
-                }
-                advance_seen(&mut latest_seen, comment.created_at);
-                write_state(paths, workspace, &state)?;
-            }
+        match apply_revise_outcome(
+            &ctx,
+            &comment,
+            &comment_id_str,
+            &change_name,
+            &revision_text,
+            &change_list_summary,
+            revise_duration,
+            is_automatic,
+            outcome,
+            &mut state,
+            &mut latest_seen,
+        )
+        .await?
+        {
+            RevisionFlow::Stop => return Ok(()),
+            RevisionFlow::Continue => {}
         }
     }
     if let Some(t) = latest_seen
@@ -1535,6 +1200,414 @@ async fn process_one_pr(
         write_state(paths, workspace, &state)?;
     }
     Ok(())
+}
+
+/// Loop control after handling one executor outcome: `Continue` to the next
+/// PR comment, or `Stop` to return from `process_one_pr` (the AskUser
+/// escalation AND the Aborted-shutdown paths return without advancing past the
+/// current comment so the next run re-enters it).
+enum RevisionFlow {
+    Continue,
+    Stop,
+}
+
+/// Loop-invariant context for one PR's revision processing — the immutable
+/// references the executor-outcome handling needs. Bundled so
+/// [`apply_revise_outcome`] AND [`post_revise_failure`] don't each carry a
+/// dozen parameters.
+struct ReviseCtx<'a> {
+    paths: &'a crate::paths::DaemonPaths,
+    workspace: &'a Path,
+    repo: &'a RepositoryConfig,
+    pr: &'a github::PrSummary,
+    forge: &'a GithubForge,
+    token: &'a str,
+    owner: &'a str,
+    repo_name: &'a str,
+    bot_username: &'a str,
+    reviewer: Option<&'a CodeReviewer>,
+    push_remote: &'a str,
+    chatops_ctx: Option<&'a ChatOpsCtx<'a>>,
+}
+
+/// Charge one revision attempt against the per-PR cap: the automatic counter
+/// for a trusted-automatic revise, the human counter otherwise (a000: a human
+/// revise attempt counts toward the human-revise cap, mirroring the automatic
+/// counter's terminal-outcome increment).
+fn charge_revision_slot(is_automatic: bool, state: &mut RevisionState) {
+    if is_automatic {
+        state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
+    } else {
+        state.human_revise_count = state.human_revise_count.saturating_add(1);
+    }
+}
+
+/// Shared terminal post-processing for the failure-shaped executor outcomes
+/// (`Failed`, `PreconditionUnmet`, `SpecNeedsRevision`, `IterationRequested`,
+/// AND the executor `Err`): post the revise-failed chatops alert, post the PR
+/// failure comment, optionally charge the revision slot, advance the
+/// seen-marker, AND persist state.
+///
+/// `alert_reason` is the chatops alert text; `pr_body` is the PR comment.
+/// `post_warn` is `Some(context)` to log a warn on a post-comment failure (the
+/// `Failed` / `PreconditionUnmet` arms) AND `None` to ignore it (the arms that
+/// used `let _ = …`). `charge` is `Some(is_automatic)` to charge a revision
+/// slot, OR `None` for the precondition-unmet path that attempts no revision.
+#[allow(clippy::too_many_arguments)]
+async fn post_revise_failure(
+    ctx: &ReviseCtx<'_>,
+    comment: &github::IssueComment,
+    comment_id_str: &str,
+    state: &mut RevisionState,
+    latest_seen: &mut Option<DateTime<Utc>>,
+    alert_reason: &str,
+    pr_body: &str,
+    post_warn: Option<&str>,
+    charge: Option<bool>,
+) -> Result<()> {
+    crate::polling_loop::maybe_post_revise_failed_alert(
+        ctx.paths,
+        ctx.chatops_ctx,
+        ctx.repo,
+        ctx.pr.number,
+        &ctx.pr.url,
+        alert_reason,
+        comment_id_str,
+    )
+    .await;
+    let posted = ctx
+        .forge
+        .post_comment(ctx.token, ctx.owner, ctx.repo_name, ctx.pr.number, pr_body)
+        .await;
+    if let (Err(e), Some(warn_ctx)) = (&posted, post_warn) {
+        tracing::warn!(
+            url = %ctx.repo.url,
+            pr_number = ctx.pr.number,
+            "{warn_ctx}: {e:#}"
+        );
+    }
+    if let Some(is_automatic) = charge {
+        charge_revision_slot(is_automatic, state);
+    }
+    advance_seen(latest_seen, comment.created_at);
+    write_state(ctx.paths, ctx.workspace, state)?;
+    Ok(())
+}
+
+/// Handle one executor outcome for a revise comment, returning whether the PR
+/// loop should continue to the next comment or stop. Extracted from
+/// `process_one_pr`'s body so the orchestration is no longer one giant
+/// function; the per-arm replies, counters, AND marker handling are byte-for-
+/// byte identical to the prior inline `match`.
+#[allow(clippy::too_many_arguments)]
+async fn apply_revise_outcome(
+    ctx: &ReviseCtx<'_>,
+    comment: &github::IssueComment,
+    comment_id_str: &str,
+    change_name: &str,
+    revision_text: &str,
+    change_list_summary: &str,
+    revise_duration: std::time::Duration,
+    is_automatic: bool,
+    outcome: Result<ExecutorOutcome>,
+    state: &mut RevisionState,
+    latest_seen: &mut Option<DateTime<Utc>>,
+) -> Result<RevisionFlow> {
+    match outcome {
+        Ok(ExecutorOutcome::Completed { final_answer }) => {
+            let commit_subject = build_commit_subject(change_name, revision_text);
+            // a52: a `Completed` outcome may carry code changes OR be a
+            // deliberate no-change declination (the agent verified the
+            // request's claim against the cited code and concluded it was
+            // wrong, so it made no edit). Branch on the working-tree
+            // state: a dirty tree is an applied change to commit + push;
+            // a clean tree is a reported declination that must NOT be
+            // treated as a commit/push failure.
+            let tree_dirty = match crate::git::status_porcelain(ctx.workspace) {
+                Ok(porcelain) => !porcelain.is_empty(),
+                Err(e) => {
+                    // Reading the tree state failed; assume dirty so the
+                    // commit path runs (preserving pre-a52 behavior). A
+                    // genuinely empty commit still surfaces via the
+                    // commit/push-failure branch below.
+                    tracing::warn!(
+                        url = %ctx.repo.url,
+                        pr_number = ctx.pr.number,
+                        "revision: could not read working-tree state; assuming dirty: {e:#}"
+                    );
+                    true
+                }
+            };
+            // Short-circuit: `apply_revision_commit` is only invoked on a
+            // dirty tree (the clean branch never commits). A genuine
+            // commit/push failure routes to the failure comment + cap
+            // increment, exactly as before a52.
+            if tree_dirty
+                && let Err(e) =
+                    apply_revision_commit(ctx.workspace, ctx.repo, ctx.push_remote, &commit_subject)
+            {
+                tracing::warn!(
+                    url = %ctx.repo.url,
+                    pr_number = ctx.pr.number,
+                    "revision commit/push failed; reporting as failed: {e:#}"
+                );
+                let push_failure_reason = format!("push to {} failed: {e}", ctx.repo.agent_branch);
+                crate::polling_loop::maybe_post_revise_failed_alert(
+                    ctx.paths,
+                    ctx.chatops_ctx,
+                    ctx.repo,
+                    ctx.pr.number,
+                    &ctx.pr.url,
+                    &push_failure_reason,
+                    comment_id_str,
+                )
+                .await;
+                let body = format!(
+                    "✗ Revision attempt failed: commit/push failed: {e}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
+                    ctx.bot_username
+                );
+                let _ = ctx
+                    .forge
+                    .post_comment(ctx.token, ctx.owner, ctx.repo_name, ctx.pr.number, &body)
+                    .await;
+                if is_automatic {
+                    state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
+                }
+                advance_seen(latest_seen, comment.created_at);
+                write_state(ctx.paths, ctx.workspace, state)?;
+                return Ok(RevisionFlow::Continue);
+            }
+            // Both branches count the attempt against the cap AND fire the
+            // same chatops success notification — the revision was
+            // processed, whether or not it produced a diff.
+            charge_revision_slot(is_automatic, state);
+            crate::polling_loop::maybe_post_revise_succeeded_alert(
+                ctx.paths,
+                ctx.chatops_ctx,
+                ctx.repo,
+                ctx.pr.number,
+                &ctx.pr.url,
+                change_list_summary,
+                &ctx.repo.agent_branch,
+                revise_duration,
+                comment_id_str,
+            )
+            .await;
+            // a52: the dirty branch posts `✅ Revision applied:`; the
+            // clean branch posts the distinct `✅ Revision evaluated, no
+            // change made:` line. Both carry the agent's `final_answer`.
+            let reply = if tree_dirty {
+                compose_revision_success_comment(
+                    &commit_subject,
+                    is_automatic,
+                    state.auto_revisions_applied,
+                    state.revision_cap,
+                    final_answer.as_deref(),
+                )
+            } else {
+                compose_revision_no_change_comment(
+                    &commit_subject,
+                    is_automatic,
+                    state.auto_revisions_applied,
+                    state.revision_cap,
+                    final_answer.as_deref(),
+                )
+            };
+            if let Err(e) = ctx
+                .forge
+                .post_comment(ctx.token, ctx.owner, ctx.repo_name, ctx.pr.number, &reply)
+                .await
+            {
+                tracing::warn!(
+                    url = %ctx.repo.url,
+                    pr_number = ctx.pr.number,
+                    "failed to post success PR comment: {e:#}"
+                );
+            }
+            // a33 task 7.3: maybe-post the re-review suggestion. Only the
+            // dirty branch moved the agent-branch head, so the clean
+            // (no-change) branch skips it — there is nothing new to
+            // re-review.
+            if tree_dirty {
+                maybe_post_rereview_suggestion(
+                    ctx.workspace,
+                    ctx.repo,
+                    ctx.reviewer,
+                    ctx.pr,
+                    state,
+                    ctx.chatops_ctx,
+                )
+                .await;
+            }
+            advance_seen(latest_seen, comment.created_at);
+            write_state(ctx.paths, ctx.workspace, state)?;
+            Ok(RevisionFlow::Continue)
+        }
+        Ok(ExecutorOutcome::AskUser { question, resume_handle }) => {
+            // AskUser → existing chatops escalation. No commit, no
+            // count increment, no PR reply. `last_seen_comment_at`
+            // is NOT advanced past this comment so the next iteration
+            // can resume against it.
+            let _handle = resume_handle;
+            if let Some(cc) = ctx.chatops_ctx {
+                let chat_text = format!(
+                    "❓ Revision on {} PR #{} needs clarification: {}",
+                    ctx.repo.url, ctx.pr.number, question,
+                );
+                if let Err(e) = cc.chatops.post_notification(cc.channel, &chat_text).await {
+                    tracing::warn!(
+                        url = %ctx.repo.url,
+                        pr_number = ctx.pr.number,
+                        "failed to post AskUser chatops notification: {e:#}"
+                    );
+                }
+            }
+            // Persist progress on prior comments only — do NOT advance
+            // past the current (unresolved) comment.
+            if let Some(t) = *latest_seen {
+                state.last_seen_comment_at = t;
+                write_state(ctx.paths, ctx.workspace, state)?;
+            }
+            Ok(RevisionFlow::Stop)
+        }
+        Ok(ExecutorOutcome::Failed { reason }) => {
+            let body = format!(
+                "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
+                reason, ctx.bot_username
+            );
+            post_revise_failure(
+                ctx,
+                comment,
+                comment_id_str,
+                state,
+                latest_seen,
+                &reason,
+                &body,
+                Some("failed to post failure PR comment"),
+                Some(is_automatic),
+            )
+            .await?;
+            Ok(RevisionFlow::Continue)
+        }
+        Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
+            // a74: the agent subprocess never STARTED — a required
+            // precondition was unmet (e.g. the a006 OS-sandbox-mechanism
+            // gate refused to spawn with no usable mechanism AND no
+            // unsandboxed opt-in). No revision work was attempted, so this
+            // does NOT charge a revision slot. We still post a failure reply
+            // that directs the operator to resolve the precondition AND post
+            // a new revision request, AND we advance the seen-marker so the
+            // daemon does NOT auto-retry — an unmet precondition will not
+            // heal between polls, so a deliberate operator re-trigger is the
+            // right recovery. No commit or push is made.
+            let body = format!(
+                "✗ Revision could not start: {}. The agent subprocess never started, so no revision was attempted AND this does NOT count against the revision cap. Resolve the precondition (see the message above), then reply with another `@{} revise ...` to re-trigger — the daemon will NOT retry automatically.",
+                reason, ctx.bot_username
+            );
+            post_revise_failure(
+                ctx,
+                comment,
+                comment_id_str,
+                state,
+                latest_seen,
+                &reason,
+                &body,
+                Some("failed to post precondition-unmet PR comment"),
+                None,
+            )
+            .await?;
+            Ok(RevisionFlow::Continue)
+        }
+        Ok(ExecutorOutcome::SpecNeedsRevision { .. }) => {
+            // The revise-lifecycle "failed" notification surfaces the
+            // iteration framing for chat operators. The pending-side
+            // `maybe_post_spec_revision_alert` continues to fire from
+            // its own canonical site when a SpecNeedsRevision marker
+            // is observed during a pending-change run; this lifecycle
+            // notification is additive and per-revise-comment.
+            let body = "✗ Revision attempt failed: executor reported the original change spec is unimplementable. The PR is unchanged."
+                .to_string();
+            post_revise_failure(
+                ctx,
+                comment,
+                comment_id_str,
+                state,
+                latest_seen,
+                "spec needs revision (see PR comment for details)",
+                &body,
+                None,
+                Some(is_automatic),
+            )
+            .await?;
+            Ok(RevisionFlow::Continue)
+        }
+        Ok(ExecutorOutcome::IterationRequested { .. }) => {
+            // Revisions are single-shot bug fixes against a merged PR;
+            // they don't have the iteration-pending state machine that
+            // pending changes do. Treat IterationRequested as a Failed-
+            // equivalent so the PR comment surfaces the unhandled case.
+            let body = format!(
+                "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
+                ctx.bot_username
+            );
+            post_revise_failure(
+                ctx,
+                comment,
+                comment_id_str,
+                state,
+                latest_seen,
+                "executor returned IterationRequested (iteration sequences are not supported on the revise path)",
+                &body,
+                None,
+                Some(is_automatic),
+            )
+            .await?;
+            Ok(RevisionFlow::Continue)
+        }
+        Ok(ExecutorOutcome::Aborted { reason }) => {
+            // a39: subprocess killed by the daemon's own SIGTERM
+            // cascade. Do NOT bump auto_revisions_applied, do NOT post
+            // a failure alert, AND do NOT advance latest_seen — so
+            // the next iteration after restart re-enters this same
+            // comment AND retries.
+            tracing::info!(
+                url = %ctx.repo.url,
+                pr_number = ctx.pr.number,
+                "revision: executor aborted by daemon shutdown: {reason}"
+            );
+            // Persist progress on prior comments only.
+            if let Some(t) = *latest_seen {
+                state.last_seen_comment_at = t;
+                write_state(ctx.paths, ctx.workspace, state)?;
+            }
+            Ok(RevisionFlow::Stop)
+        }
+        Err(e) => {
+            tracing::warn!(
+                url = %ctx.repo.url,
+                pr_number = ctx.pr.number,
+                "revision executor invocation errored: {e:#}"
+            );
+            let executor_error_reason = format!("executor error: {e:#}");
+            let body = format!(
+                "✗ Revision attempt failed: {}. The PR is unchanged. Reply with another `@{} revise ...` to retry, or close the PR if the request cannot be satisfied.",
+                e, ctx.bot_username
+            );
+            post_revise_failure(
+                ctx,
+                comment,
+                comment_id_str,
+                state,
+                latest_seen,
+                &executor_error_reason,
+                &body,
+                None,
+                Some(is_automatic),
+            )
+            .await?;
+            Ok(RevisionFlow::Continue)
+        }
+    }
 }
 
 fn advance_seen(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
