@@ -29,9 +29,9 @@ is removed.
 ## MODIFIED Requirements
 
 ### Requirement: Registered periodic audits
-autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slugs `dependency_update_triage`, `architecture_brightline`, AND `architecture_consultative` SHALL NOT be registered. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; an unregistered slug present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the registered slugs.
+autocoder SHALL register exactly the following audits in its `AuditRegistry` at startup, identified by their `audit_type()` slug: `architecture_advisor`, `drift_audit`, `missing_tests_audit`, `security_bug_audit`, `documentation_audit`, `canon_contradiction_audit`, `canon_consolidation_audit`. The slugs `dependency_update_triage`, `architecture_brightline`, AND `architecture_consultative` SHALL NOT be registered. `spec_sync_audit` — the deterministic, no-LLM spec-sync audit — is configurable under `audits.defaults` and `repositories[].audits` but is NOT an `AuditRegistry` entry: it runs via the spec-sync rebuild path rather than the LLM audit framework, so it is a recognized audit slug, not an unknown one. Each registered audit's cadence is independently configurable under `audits.defaults` and per-repo `repositories[].audits` overrides; a slug that is neither a registered audit NOR the recognized `spec_sync_audit` present in either location SHALL fail config validation at startup with the existing "unknown audit type" error message that lists the valid slugs.
 
-This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming an unregistered slug is a startup-time failure with a clear list of valid slugs.
+This enumeration is the canonical contract for which audits exist. Future changes that add or remove an audit MUST update this requirement in the same commit so the spec and the registered set never drift. The `validate_audit_type_names` startup check enforces the spec/code consistency at runtime: an operator's YAML naming a slug that is neither a registered audit nor the deterministic `spec_sync_audit` is a startup-time failure with a clear list of valid slugs.
 
 #### Scenario: Startup with default config registers the canonical set
 - **WHEN** autocoder starts with a config whose `audits:` block is
@@ -60,6 +60,14 @@ This enumeration is the canonical contract for which audits exist. Future change
 - **AND** the daemon does NOT start (consistent with the existing
   behavior for typos in audit slugs); the operator must remove the
   entries from their YAML to recover
+
+#### Scenario: The deterministic spec_sync_audit slug passes validation
+- **WHEN** a config (or the install wizard's conservative default)
+  sets `audits.defaults.spec_sync_audit` to a non-`disabled` cadence
+- **THEN** `validate_audit_type_names` succeeds — `spec_sync_audit`
+  is a recognized deterministic audit slug, not an unknown one
+- **AND** the daemon starts (the install wizard's conservative
+  default does not prevent startup)
 
 #### Scenario: Adding or removing an audit requires updating this requirement
 - **WHEN** an implementing agent ships a change that registers a
@@ -277,7 +285,7 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
   switch (so IaC logs distinguish "operator opted-out
 
 ### Requirement: LLM-driven audits validate their generated proposals before committing
-Every LLM-driven audit that writes a proposal (currently `drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL invoke `openspec validate <slug> --strict` against its just-written `openspec/changes/<slug>/` directory before returning success. The advisory `architecture_advisor` audit, which generates no spec proposal, is unaffected by this requirement. When validation passes, the audit returns its existing outcome variant. When validation fails AND the configured retry budget is not exhausted, the audit SHALL re-invoke its LLM with the validation error appended to the prompt and overwrite the change directory with the new response. When validation fails AND the retry budget IS exhausted, the audit SHALL discard the change directory AND post a chatops failure notification AND return a `ValidationExhausted` outcome.
+Every LLM-driven audit that writes a proposal (currently `missing_tests_audit` AND `security_bug_audit`) SHALL invoke `openspec validate <slug> --strict` against its just-written `openspec/changes/<slug>/` directory before returning success. The advisory audits — `architecture_advisor`, `drift_audit`, AND `documentation_audit` — generate findings rather than a spec proposal AND are unaffected by this requirement. When validation passes, the audit returns its existing outcome variant. When validation fails AND the configured retry budget is not exhausted, the audit SHALL re-invoke its LLM with the validation error appended to the prompt and overwrite the change directory with the new response. When validation fails AND the retry budget IS exhausted, the audit SHALL discard the change directory AND post a chatops failure notification AND return a `ValidationExhausted` outcome.
 
 #### Scenario: Valid proposal on first attempt
 - **WHEN** an LLM-driven audit writes a proposal and `openspec validate <slug> --strict` exits 0 on first invocation
@@ -310,7 +318,7 @@ Every LLM-driven audit that writes a proposal (currently `drift_audit`, `missing
 - **AND** the LLM's response replaces the change directory entirely (delete-and-rewrite, not patch)
 
 ### Requirement: Audit posts a chatops notification when it creates a queue-bound proposal
-Every LLM-driven audit that writes a proposal (`drift_audit`, `missing_tests_audit`, `security_bug_audit`) SHALL post a chatops notification immediately after `openspec validate <slug> --strict` passes for its just-written proposal AND before the audit function returns to the scheduler. The notification names the audit type, the change slug, and a one-line excerpt of the proposal's `## Why` section, so operators have clear provenance when the next polling iteration begins implementing the change. The notification fires regardless of the audit's `notify_on_clean` setting, since it signals "something was found" rather than "nothing was found." The advisory `architecture_advisor` audit, which generates no LLM proposal, is unaffected.
+Every LLM-driven audit that writes a proposal (`missing_tests_audit` AND `security_bug_audit`) SHALL post a chatops notification immediately after `openspec validate <slug> --strict` passes for its just-written proposal AND before the audit function returns to the scheduler. The notification names the audit type, the change slug, and a one-line excerpt of the proposal's `## Why` section, so operators have clear provenance when the next polling iteration begins implementing the change. The notification fires regardless of the audit's `notify_on_clean` setting, since it signals "something was found" rather than "nothing was found." The advisory audits — `architecture_advisor`, `drift_audit`, AND `documentation_audit` — generate findings rather than a proposal AND do not post the `🔍 created proposal` notification.
 
 #### Scenario: Validated proposal fires the notification on first attempt
 - **WHEN** an LLM-driven audit's proposal passes `openspec validate <slug> --strict` on the first attempt (`retries_used == 0`)
