@@ -3915,13 +3915,12 @@ fn check_schema(config: &Config, report: &mut ValidationReport) {
             Some(corpus) => {
                 // A local-path corpus is validated to exist NOW (a git-repo
                 // corpus is resolved/cloned at daemon startup, where a clone
-                // failure is itself a fail-fast). The `is_git_url` heuristic
-                // matches the resolver's.
-                let looks_like_git = corpus.starts_with("http://")
-                    || corpus.starts_with("https://")
-                    || corpus.starts_with("git@")
-                    || corpus.starts_with("ssh://")
-                    || corpus.ends_with(".git");
+                // failure is itself a fail-fast). Classify the corpus with the
+                // SAME `is_git_url` heuristic the resolver uses, so validation
+                // and resolution can never disagree about whether a corpus is a
+                // URL or a path.
+                let looks_like_git =
+                    crate::preflight::global_rules::is_git_url(corpus);
                 if !looks_like_git && !std::path::Path::new(corpus).is_dir() {
                     report.push_error(
                         FindingCategory::Schema,

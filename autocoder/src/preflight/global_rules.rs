@@ -159,8 +159,10 @@ fn collect_rules(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Rule>) {
 }
 
 /// Detect whether a configured corpus location is a git repo URL (vs. a local
-/// path). A URL the daemon clones; a local path it reads in place.
-fn is_git_url(corpus: &str) -> bool {
+/// path). A URL the daemon clones; a local path it reads in place. Exposed so
+/// config startup-validation classifies a corpus the SAME way the resolver does
+/// (one heuristic, not two that can drift apart).
+pub fn is_git_url(corpus: &str) -> bool {
     corpus.starts_with("http://")
         || corpus.starts_with("https://")
         || corpus.starts_with("git@")

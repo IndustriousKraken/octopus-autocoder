@@ -291,6 +291,17 @@ async fn rules_violation_writes_marker_and_halts() {
     let ledger = crate::gate_ledger::read_ledger(&ws, "leaks-secret").expect("ledger persisted");
     assert_eq!(ledger.rules.verdict, crate::gate_ledger::GateVerdict::Fail);
     assert!(!ledger.blocking_ok(), "a Fail [rules] verdict holds the change");
+    // The PR-body ledger summary for a `[rules]` Fail names "rule violations",
+    // NOT the `[in]`/`[canon]` gates' "contradiction findings" noun.
+    let summary = ledger
+        .rules
+        .summary
+        .as_deref()
+        .expect("a [rules] Fail row carries a one-line summary");
+    assert!(
+        summary.contains("rule violations"),
+        "the [rules] Fail summary must read 'rule violations', not 'contradiction findings'; got: {summary}"
+    );
 }
 
 /// global-rules-gate task 6.3: enabled `[rules]` gate + a clean change (empty

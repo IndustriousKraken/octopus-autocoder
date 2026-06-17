@@ -558,7 +558,7 @@ async fn run_in_gate(
             GateVerdict::FailedToRun
         }
     };
-    ledger.set_in(verdict, model, gate_verdict_summary(verdict));
+    ledger.set_in(verdict, model, gate_verdict_summary(gate, verdict));
     Ok(())
 }
 
@@ -613,7 +613,7 @@ async fn run_canon_gate(
             GateVerdict::FailedToRun
         }
     };
-    ledger.set_canon(verdict, model, gate_verdict_summary(verdict));
+    ledger.set_canon(verdict, model, gate_verdict_summary(gate, verdict));
     Ok(())
 }
 
@@ -669,16 +669,29 @@ async fn run_rules_gate(
             GateVerdict::FailedToRun
         }
     };
-    ledger.set_rules(verdict, model, gate_verdict_summary(verdict));
+    ledger.set_rules(verdict, model, gate_verdict_summary(gate, verdict));
     Ok(())
 }
 
 /// A one-line PR summary for a blocking-gate verdict. `Fail`/`FailedToRun`
 /// carry a terse cause for the PR row; `Pass`/`Disabled`/`Pending` carry none.
-fn gate_verdict_summary(verdict: crate::gate_ledger::GateVerdict) -> Option<String> {
+/// The `Fail` noun is gate-specific: the `[rules]` gate writes "rule
+/// violations" (global-rules-gate), the `[in]`/`[canon]` gates write
+/// "contradiction findings" — both land in `.needs-spec-revision.json`.
+fn gate_verdict_summary(
+    gate: crate::verifier_gate::VerifierGate,
+    verdict: crate::gate_ledger::GateVerdict,
+) -> Option<String> {
     use crate::gate_ledger::GateVerdict;
+    use crate::verifier_gate::VerifierGate;
     match verdict {
-        GateVerdict::Fail => Some("contradiction findings written to .needs-spec-revision.json".into()),
+        GateVerdict::Fail => {
+            let noun = match gate {
+                VerifierGate::Rules => "rule violations",
+                _ => "contradiction findings",
+            };
+            Some(format!("{noun} written to .needs-spec-revision.json"))
+        }
         GateVerdict::FailedToRun => {
             Some("gate could not run — change held (see .needs-spec-revision.json)".into())
         }
