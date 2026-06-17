@@ -3587,12 +3587,36 @@ impl OperatorCommandDispatcher {
                 slug = candidate.slug,
             )),
             CandidateStatus::Posted => {
+                // `find_candidate_by_thread` matches only candidates with
+                // `thread_ts: Some`, AND `post_candidate` sets `channel: Some`
+                // whenever `thread_ts` is `Some`, so a matched Posted candidate
+                // normally carries both. A `None` on either is a degenerate
+                // record (hand-edited / partially-written state); surface it as
+                // a refusal with a warn rather than submitting an empty string
+                // — the handler's `require_str` checks presence, not
+                // non-emptiness, so an empty channel would otherwise pass
+                // through silently.
+                let (Some(channel), Some(thread_ts)) =
+                    (candidate.channel.clone(), candidate.thread_ts.clone())
+                else {
+                    tracing::warn!(
+                        candidate = %candidate.id,
+                        slug = %candidate.slug,
+                        channel_present = candidate.channel.is_some(),
+                        thread_ts_present = candidate.thread_ts.is_some(),
+                        "issue-candidate send it: matched candidate is missing its channel/thread_ts; refusing to promote with an empty identifier"
+                    );
+                    return Some(format!(
+                        "✗ send it: issue candidate `{slug}` is missing its originating channel/thread; cannot promote. Re-trigger ingestion to repost it.",
+                        slug = candidate.slug,
+                    ));
+                };
                 let payload = serde_json::json!({
                     "action": "promote_issue_candidate",
                     "url": candidate.repo_url,
                     "candidate_id": candidate.id,
-                    "channel": candidate.channel.clone().unwrap_or_default(),
-                    "thread_ts": candidate.thread_ts.clone().unwrap_or_default(),
+                    "channel": channel,
+                    "thread_ts": thread_ts,
                 });
                 let resp = submitter.submit(payload).await;
                 if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -10125,5 +10149,54 @@ mod tests {
         assert!(text.contains("not tracking"), "{text}");
         assert!(text.contains("issue-candidate"), "{text}");
         assert!(submitter.calls().is_empty());
+    }
+
+    /// A degenerate posted candidate — matched by `thread_ts` but with a
+    /// `None` channel (a hand-edited / partially-written record) — is refused
+    /// with the missing-channel/thread message AND submits nothing, rather
+    /// than silently promoting with an empty channel string. (Revision: the
+    /// dispatcher surfaces the anomaly instead of `unwrap_or_default()`.)
+    #[tokio::test]
+    async fn send_it_degenerate_candidate_missing_channel_refuses_and_submits_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = "git@github.com:acme/myrepo.git";
+        let id = crate::lanes::ingestion::candidate_id(url, 7);
+        let state = crate::lanes::ingestion::CandidateState {
+            id: id.clone(),
+            repo_url: url.to_string(),
+            source_issue: 7,
+            slug: "drop-newline".to_string(),
+            origin: crate::lanes::ingestion::IssueOrigin::Public,
+            issue_md: "## Report\nx\n".to_string(),
+            tasks_md: "- [ ] 1.1 fix it\n".to_string(),
+            report_body: "raw {{x}}".to_string(),
+            posted_at: chrono::Utc::now(),
+            status: crate::lanes::ingestion::CandidateStatus::Posted,
+            thread_ts: Some("1755.degenerate".to_string()),
+            channel: None,
+        };
+        crate::lanes::ingestion::write_candidate(tmp.path(), &state).unwrap();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1755.degenerate"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("a matched-but-degenerate candidate still produces a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "must refuse: {text}");
+        assert!(text.contains("missing its originating channel/thread"), "{text}");
+        assert!(
+            submitter.calls().is_empty(),
+            "a degenerate candidate must not submit an empty-channel promotion"
+        );
     }
 }
