@@ -3555,6 +3555,77 @@ impl OperatorCommandDispatcher {
         ))
     }
 
+    /// a010: look up the operator-replied `thread_ts` against the stored
+    /// issue-candidate set (the dispatcher's THIRD `send it` context). On a
+    /// match whose candidate is still `Posted`, submits the
+    /// `promote_issue_candidate` control-socket action carrying the candidate
+    /// identity AND the originating `channel`/`thread_ts`, AND returns the
+    /// write-and-queue confirmation. On a match whose candidate is already
+    /// `Promoted`, returns the already-promoted reply AND submits nothing
+    /// (idempotent). Returns `None` when no candidate matches — the caller
+    /// falls through to `try_send_it_on_revision` and ultimately the canonical
+    /// untracked-thread refusal.
+    ///
+    /// The candidate store is global under the daemon state root (the same
+    /// root the dispatcher holds as `audit_thread_state_dir`), keyed by
+    /// candidate id — so, like the revision lookup, the match is found by
+    /// scanning that single store, NOT by walking the per-repo workspaces.
+    /// `_repositories` is accepted for call-shape symmetry with the survey
+    /// lookup; the candidate carries its own `repo_url`, so it is unused here.
+    async fn try_send_it_on_issue_candidate(
+        &self,
+        thread_ts: &str,
+        _repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<String> {
+        use crate::lanes::ingestion::{CandidateStatus, find_candidate_by_thread};
+        let state_root = self.audit_thread_state_dir.as_path();
+        let candidate = find_candidate_by_thread(state_root, thread_ts)?;
+        match candidate.status {
+            CandidateStatus::Promoted => Some(format!(
+                "✗ send it: issue candidate `{slug}` is already promoted. No new action taken.",
+                slug = candidate.slug,
+            )),
+            CandidateStatus::Posted => {
+                let payload = serde_json::json!({
+                    "action": "promote_issue_candidate",
+                    "url": candidate.repo_url,
+                    "candidate_id": candidate.id,
+                    "channel": candidate.channel.clone().unwrap_or_default(),
+                    "thread_ts": candidate.thread_ts.clone().unwrap_or_default(),
+                });
+                let resp = submitter.submit(payload).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return Some(format!("✗ send it: could not promote candidate: {err}"));
+                }
+                // The handler is idempotent: a race that promoted the
+                // candidate between the match AND the submit reports
+                // `already_promoted`. Honour that wording when it does.
+                if resp
+                    .get("already_promoted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return Some(format!(
+                        "✗ send it: issue candidate `{slug}` is already promoted. No new action taken.",
+                        slug = candidate.slug,
+                    ));
+                }
+                let slug = resp
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&candidate.slug);
+                Some(format!(
+                    "✓ Promoted issue candidate `{slug}` — wrote issues/{slug}/ AND queued it for the issues lane."
+                ))
+            }
+        }
+    }
+
     /// a03: look up the operator-replied `thread_ts` against the stored
     /// `RevisionThreadState` set (the dispatcher's FOURTH `send it` context).
     /// On a match this fires the spec-revision executor (`revision_execute`)
@@ -3812,21 +3883,31 @@ impl OperatorCommandDispatcher {
         )
     }
 
-    /// Handle the `send it` verb. The verb has TWO valid contexts:
+    /// Handle the `send it` verb. The verb has FOUR valid thread contexts,
+    /// consulted in this order (a `thread_ts` resolves to at most one record
+    /// across the four sets):
     ///
     ///   1. Audit-notification thread — `read_state` against
     ///      `<state_root>/audit-threads/<thread_ts>.json`. The
     ///      canonical four-case decision tree (untracked / stale /
     ///      already-acted / fresh-and-open) applies.
-    ///   2. Brownfield-survey lifecycle thread (a29) — `read_state`
-    ///      against `<workspace>/.state/brownfield_surveys/*.json`,
-    ///      matching by `thread_ts`. On a fresh-and-open match the
-    ///      dispatcher submits `queue_brownfield_batch_request` AND
-    ///      replies with the queue confirmation.
+    ///   2. Brownfield-survey lifecycle thread (a29) —
+    ///      [`try_send_it_on_survey`], matching by `thread_ts`. On a
+    ///      fresh-and-open match the dispatcher submits
+    ///      `queue_brownfield_batch_request` AND replies with the queue
+    ///      confirmation.
+    ///   3. Issue-candidate thread (a010) —
+    ///      [`try_send_it_on_issue_candidate`], matching by `thread_ts`. On
+    ///      a posted candidate the dispatcher submits
+    ///      `promote_issue_candidate` AND replies with the write-and-queue
+    ///      confirmation; on an already-promoted candidate it replies that
+    ///      no new action was taken AND submits nothing.
+    ///   4. Spec-revision thread (a03) — [`try_send_it_on_revision`].
     ///
-    /// Audit lookup runs first; survey lookup is the fallback. If
-    /// NEITHER matches, the dispatcher posts the canonical untracked-
-    /// thread refusal.
+    /// Audit lookup runs first; the survey, issue-candidate, AND revision
+    /// lookups are the fallbacks in that order. If NONE matches, the
+    /// dispatcher posts the canonical untracked-thread refusal, whose text
+    /// names all four contexts.
     async fn dispatch_send_it_on_audit(
         &self,
         thread_ts: &str,
@@ -3840,10 +3921,18 @@ impl OperatorCommandDispatcher {
         let mut state = match read_state(state_root, thread_ts) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                // No audit thread matched — try the survey-thread then the
-                // revision-thread fallback before refusing.
+                // No audit thread matched — try the survey-thread, then the
+                // issue-candidate, then the revision-thread fallback before
+                // refusing (canon's context order: audit → survey →
+                // issue-candidate → spec-revision).
                 if let Some(reply) = self
                     .try_send_it_on_survey(thread_ts, repositories, submitter)
+                    .await
+                {
+                    return reply;
+                }
+                if let Some(reply) = self
+                    .try_send_it_on_issue_candidate(thread_ts, repositories, submitter)
                     .await
                 {
                     return reply;
@@ -3860,6 +3949,12 @@ impl OperatorCommandDispatcher {
                 );
                 if let Some(reply) = self
                     .try_send_it_on_survey(thread_ts, repositories, submitter)
+                    .await
+                {
+                    return reply;
+                }
+                if let Some(reply) = self
+                    .try_send_it_on_issue_candidate(thread_ts, repositories, submitter)
                     .await
                 {
                     return reply;
@@ -9841,5 +9936,194 @@ mod tests {
             submitter.calls().is_empty(),
             "an acted thread must not re-run the executor"
         );
+    }
+
+    // ---------- send it in an issue-candidate thread (a010) ----------
+
+    /// Write an issue-candidate state under the dispatcher's state root,
+    /// keyed for the fixture repo (`acme/myrepo`), so the `send it` dispatcher
+    /// can match a reply against its `thread_ts`.
+    fn write_issue_candidate(
+        state_root: &std::path::Path,
+        thread_ts: &str,
+        status: crate::lanes::ingestion::CandidateStatus,
+        slug: &str,
+    ) -> String {
+        let url = "git@github.com:acme/myrepo.git";
+        let id = crate::lanes::ingestion::candidate_id(url, 7);
+        let state = crate::lanes::ingestion::CandidateState {
+            id: id.clone(),
+            repo_url: url.to_string(),
+            source_issue: 7,
+            slug: slug.to_string(),
+            origin: crate::lanes::ingestion::IssueOrigin::Public,
+            issue_md: "## Report\nmaintainer-approved diagnosis\n".to_string(),
+            tasks_md: "- [ ] 1.1 fix it\n".to_string(),
+            report_body: "raw public body {{x}}".to_string(),
+            posted_at: chrono::Utc::now(),
+            status,
+            thread_ts: Some(thread_ts.to_string()),
+            channel: Some("C_OPS".to_string()),
+        };
+        crate::lanes::ingestion::write_candidate(state_root, &state).unwrap();
+        id
+    }
+
+    /// `send it` whose `thread_ts` matches a posted candidate submits
+    /// `promote_issue_candidate` carrying the candidate identity AND the
+    /// originating channel/thread, AND replies with the write-and-queue text.
+    #[tokio::test]
+    async fn send_it_promotes_posted_issue_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = write_issue_candidate(
+            tmp.path(),
+            "1755.cand",
+            crate::lanes::ingestion::CandidateStatus::Posted,
+            "drop-newline",
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "promote_issue_candidate",
+            serde_json::json!({"ok": true, "slug": "drop-newline"}),
+        );
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1755.cand"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("send-it must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "must accept: {text}");
+        assert!(text.contains("issues/drop-newline/"), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action: the promotion");
+        assert_eq!(calls[0]["action"], "promote_issue_candidate");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["candidate_id"], id);
+        assert_eq!(calls[0]["thread_ts"], "1755.cand");
+        assert_eq!(calls[0]["channel"], "C_OPS");
+        // The audit/revision branches were NOT invoked.
+        assert!(!calls.iter().any(|c| c["action"] == "trigger_audit_action"));
+        assert!(!calls.iter().any(|c| c["action"] == "revision_execute"));
+    }
+
+    /// `send it` on an already-promoted candidate replies that it is already
+    /// promoted AND submits nothing (idempotent).
+    #[tokio::test]
+    async fn send_it_on_already_promoted_candidate_submits_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_issue_candidate(
+            tmp.path(),
+            "1755.done",
+            crate::lanes::ingestion::CandidateStatus::Promoted,
+            "drop-newline",
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1755.done"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("already promoted"), "{text}");
+        assert!(
+            submitter.calls().is_empty(),
+            "an already-promoted candidate submits nothing"
+        );
+    }
+
+    /// Regression: with an issue candidate present, a `send it` in a tracked
+    /// spec-revision thread (a different `thread_ts`) still routes to
+    /// `revision_execute` — the issue-candidate branch does not intercept it.
+    #[tokio::test]
+    async fn send_it_issue_candidate_does_not_intercept_revision_thread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A candidate on one thread, a revision thread on another.
+        write_issue_candidate(
+            tmp.path(),
+            "1755.cand",
+            crate::lanes::ingestion::CandidateStatus::Posted,
+            "drop-newline",
+        );
+        write_revision_thread_state(
+            tmp.path(),
+            "1755.rev",
+            crate::revision_thread::RevisionThreadStatus::Open,
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("revision_execute", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1755.rev"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let _ = unwrap_sync(reply);
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action: the revision executor");
+        assert_eq!(calls[0]["action"], "revision_execute");
+        assert!(
+            !calls.iter().any(|c| c["action"] == "promote_issue_candidate"),
+            "the candidate branch must not steal a revision thread"
+        );
+    }
+
+    /// Regression: an untracked thread (no audit/survey/candidate/revision
+    /// match) still returns the four-context refusal even when a candidate
+    /// exists for a different thread.
+    #[tokio::test]
+    async fn send_it_untracked_thread_still_refuses_with_candidate_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_issue_candidate(
+            tmp.path(),
+            "1755.cand",
+            crate::lanes::ingestion::CandidateStatus::Posted,
+            "drop-newline",
+        );
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1755.unmatched"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("not tracking"), "{text}");
+        assert!(text.contains("issue-candidate"), "{text}");
+        assert!(submitter.calls().is_empty());
     }
 }
