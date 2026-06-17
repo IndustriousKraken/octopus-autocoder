@@ -1127,11 +1127,14 @@ mod tests {
 
     #[test]
     fn strip_label_does_not_panic_on_multibyte_boundary() {
-        // Each CJK char is 3 bytes, so byte offsets 5 (`SLUG:`), 6 (`TASKS:`),
-        // 8 (`SUMMARY:`), and 15 (`CLASSIFICATION:`) all fall mid-codepoint.
-        // The old guard sliced `line[..prefix.len()]` directly and panicked
-        // with "byte index N is not a char boundary"; the fixed form returns
-        // `None`.
+        // In "日本語のバグ" each CJK char is 3 bytes, so char boundaries fall
+        // at byte offsets 0, 3, 6, 9, 12, 15, 18. `SLUG:` (5 bytes) and
+        // `SUMMARY:` (8 bytes) end mid-codepoint (offsets 5 and 8), so the old
+        // guard's `line[..prefix.len()]` slice panicked with "byte index N is
+        // not a char boundary"; the fixed `line.get(..prefix.len())` form
+        // returns `None` instead. `CLASSIFICATION:` (15 bytes) ends on a char
+        // boundary, so it returns `None` because the prefix simply doesn't
+        // match rather than via the panic path.
         assert_eq!(strip_label("日本語のバグ", "SLUG"), None);
         assert_eq!(strip_label("日本語のバグ", "SUMMARY"), None);
         assert_eq!(strip_label("日本語のバグ", "CLASSIFICATION"), None);
