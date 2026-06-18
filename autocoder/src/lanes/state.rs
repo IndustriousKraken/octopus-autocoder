@@ -38,9 +38,8 @@ fn slug_file(paths: &DaemonPaths, workspace: &Path, slug: &str) -> PathBuf {
 }
 
 /// Read the current failure count for `slug` (0 when no entry exists).
-/// Forward-looking read API for an issues perma-stuck gate (the changes
-/// lane's analogue); the walker records + clears counters today.
-#[allow(dead_code)]
+/// Consulted by the issues walker's perma-stuck gate (the changes lane's
+/// analogue) to decide when an issue has failed enough consecutive passes.
 pub fn failure_count(paths: &DaemonPaths, workspace: &Path, slug: &str) -> u32 {
     let path = slug_file(paths, workspace, slug);
     match std::fs::read_to_string(&path) {
