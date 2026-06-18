@@ -42,10 +42,6 @@ The `autocoder install` wizard SHALL prompt operators about the issues lane duri
 - **THEN** the rendered config.yaml contains no `features.issues` entry
 - **AND** the issues lane is on (the default); an install that omits the flag gains the active lane
 
-#### Scenario: Non-interactive explicit enable
-- **WHEN** an operator runs `autocoder install --non-interactive --issues-lane enabled` with all other required flags
-- **THEN** the rendered config.yaml contains `features.issues.enabled: true`
-
 #### Scenario: Non-interactive explicit disable
 - **WHEN** an operator passes `--issues-lane disabled`
 - **THEN** the rendered config.yaml contains `features.issues.enabled: false`
