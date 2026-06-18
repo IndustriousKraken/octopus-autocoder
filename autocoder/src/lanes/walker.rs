@@ -57,6 +57,7 @@ pub(crate) async fn walk_issues(
     chatops_ctx: Option<&ChatOpsContext>,
     prompt_path: Option<&Path>,
     max_units: u32,
+    perma_stuck_threshold: u32,
 ) -> Result<Vec<String>> {
     let ready = issues::list_ready(workspace)?;
     let mut archived: Vec<String> = Vec::new();
@@ -69,9 +70,17 @@ pub(crate) async fn walk_issues(
             );
             break;
         }
-        let step =
-            process_one_issue(paths, workspace, repo, executor, chatops_ctx, prompt_path, &slug)
-                .await;
+        let step = process_one_issue(
+            paths,
+            workspace,
+            repo,
+            executor,
+            chatops_ctx,
+            prompt_path,
+            &slug,
+            perma_stuck_threshold,
+        )
+        .await;
         tracing::info!(
             url = %repo.url,
             issue = %slug,
@@ -114,6 +123,7 @@ pub(crate) async fn process_one_issue(
     chatops_ctx: Option<&ChatOpsContext>,
     prompt_path: Option<&Path>,
     slug: &str,
+    perma_stuck_threshold: u32,
 ) -> IssueStep {
     let loaded = match issues::load(workspace, slug) {
         Ok(l) => l,
@@ -149,11 +159,102 @@ pub(crate) async fn process_one_issue(
         )
         .await;
 
-    let step = map_issue_outcome(paths, workspace, repo, chatops_ctx, slug, outcome).await;
+    let step = map_issue_outcome(
+        paths,
+        workspace,
+        repo,
+        chatops_ctx,
+        slug,
+        outcome,
+        perma_stuck_threshold,
+    )
+    .await;
     // Unlock on every path (archive already moved the dir, so the lock is
     // gone, but unlock is idempotent).
     let _ = issues::unlock(workspace, slug);
     step
+}
+
+/// Park a non-progressing issue: write the `.perma-stuck.json` marker,
+/// clear the failure counter (so removing the marker grants a fresh attempt
+/// budget), post an operator-visible chatops alert, AND log. Best-effort on
+/// a marker-write failure: the operator is still alerted (mirroring the
+/// changes lane's `handle_failure_counter`).
+async fn park_issue(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    slug: &str,
+    attempts: u32,
+    reason: &str,
+    alert: bool,
+) {
+    match issues::write_perma_stuck(workspace, slug, attempts, reason) {
+        Ok(()) => {
+            // The marker is now the park gate; reset the counter so a later
+            // operator unpark (marker removal) gets a fresh attempt budget.
+            let _ = state::clear(paths, workspace, slug);
+        }
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                issue = %slug,
+                "failed to write issue park marker: {e:#}"
+            );
+        }
+    }
+    tracing::error!(
+        url = %repo.url,
+        issue = %slug,
+        attempts,
+        "issue parked after {attempts} attempt(s); daemon will not retry until \
+         issues/{slug}/.perma-stuck.json is removed: {reason}"
+    );
+    // Kick-back already posted its own `↩️` notice, so it parks quietly
+    // (`alert = false`); the threshold AND escalate paths announce the park.
+    if alert {
+        shared::notify(
+            chatops_ctx,
+            &format!(
+                "🛑 `{}`: issue `{slug}` parked after {attempts} attempt(s) — {reason}. \
+                 It will not be retried until `issues/{slug}/.perma-stuck.json` is removed.",
+                repo.url
+            ),
+        )
+        .await;
+    }
+}
+
+/// Record a retryable issue failure AND park the issue once it reaches the
+/// threshold of consecutive failures. Returns the resulting `Failed` step.
+async fn fail_and_maybe_park(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    slug: &str,
+    perma_stuck_threshold: u32,
+    reason: String,
+) -> IssueStep {
+    // Persist the failure, then read the consecutive-failure count to decide
+    // whether this issue has stopped making progress.
+    let _ = state::record_failure(paths, workspace, slug, &reason);
+    let count = state::failure_count(paths, workspace, slug);
+    if count >= perma_stuck_threshold {
+        park_issue(
+            paths,
+            workspace,
+            repo,
+            chatops_ctx,
+            slug,
+            count,
+            &reason,
+            true,
+        )
+        .await;
+    }
+    IssueStep::Failed { reason }
 }
 
 /// Render the issue-flavored implementer prompt: load the template
@@ -209,6 +310,7 @@ async fn map_issue_outcome(
     chatops_ctx: Option<&ChatOpsContext>,
     slug: &str,
     outcome: Result<ExecutorOutcome>,
+    perma_stuck_threshold: u32,
 ) -> IssueStep {
     match outcome {
         Ok(ExecutorOutcome::Completed { .. }) => complete_issue(workspace, repo, slug),
@@ -238,6 +340,14 @@ async fn map_issue_outcome(
                 ),
             )
             .await;
+            // Retrying cannot resolve a kick-back (it belongs in another
+            // lane), so park immediately — this also stops the `↩️` notice
+            // from re-posting every pass. Park quietly: the notice above
+            // already told the operator.
+            park_issue(
+                paths, workspace, repo, chatops_ctx, slug, 1, &reason, false,
+            )
+            .await;
             IssueStep::KickedBackToChanges { reason }
         }
         Ok(ExecutorOutcome::AskUser { question, .. }) => {
@@ -246,35 +356,71 @@ async fn map_issue_outcome(
                 issue = %slug,
                 "issue run asked a question (issues lane v1 does not escalate): {question}"
             );
+            // The issues lane does not escalate; re-running just asks again.
+            // Park immediately AND alert so the question is not lost.
+            let reason = format!("agent asked a question (issues lane does not escalate): {question}");
+            park_issue(
+                paths, workspace, repo, chatops_ctx, slug, 1, &reason, true,
+            )
+            .await;
             IssueStep::Escalated
         }
         Ok(ExecutorOutcome::IterationRequested { reason, .. }) => {
             // v1: issues do not carry multi-iteration state; treat an
             // iteration request as a failure to converge this pass.
-            let _ = state::record_failure(paths, workspace, slug, &reason);
-            IssueStep::Failed {
-                reason: format!("issue run requested another iteration (unsupported in v1): {reason}"),
-            }
+            fail_and_maybe_park(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                slug,
+                perma_stuck_threshold,
+                format!("issue run requested another iteration (unsupported in v1): {reason}"),
+            )
+            .await
         }
         Ok(ExecutorOutcome::Aborted { reason }) => {
             tracing::info!(url = %repo.url, issue = %slug, "issue aborted: {reason}");
             IssueStep::Aborted
         }
         Ok(ExecutorOutcome::Failed { reason }) => {
-            let _ = state::record_failure(paths, workspace, slug, &reason);
-            IssueStep::Failed { reason }
+            fail_and_maybe_park(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                slug,
+                perma_stuck_threshold,
+                reason,
+            )
+            .await
         }
         Ok(ExecutorOutcome::PreconditionUnmet { reason }) => {
             // a74: surfaced only on the revise path today; the issues lane is
             // out of scope. Treat it as a failure (defensive — never produced
             // here at runtime).
-            let _ = state::record_failure(paths, workspace, slug, &reason);
-            IssueStep::Failed { reason }
+            fail_and_maybe_park(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                slug,
+                perma_stuck_threshold,
+                reason,
+            )
+            .await
         }
         Err(e) => {
-            let reason = format!("executor errored: {e:#}");
-            let _ = state::record_failure(paths, workspace, slug, &reason);
-            IssueStep::Failed { reason }
+            fail_and_maybe_park(
+                paths,
+                workspace,
+                repo,
+                chatops_ctx,
+                slug,
+                perma_stuck_threshold,
+                format!("executor errored: {e:#}"),
+            )
+            .await
         }
     }
 }
@@ -420,7 +566,8 @@ mod tests {
             outcome: Mutex::new(Some(ExecutorOutcome::Completed { final_answer: None })),
             write_file: true,
         };
-        let step = process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "fix-foo").await;
+        let step =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "fix-foo", 2).await;
         assert_eq!(step, IssueStep::Archived);
         // Active dir gone; archived under issues/archive/.
         assert!(!issues::issue_dir(&ws, "fix-foo").exists());
@@ -461,7 +608,8 @@ mod tests {
             write_file: false,
         };
         let step =
-            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "needs-behavior").await;
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "needs-behavior", 2)
+                .await;
         // Reported back to the changes lane.
         assert!(
             matches!(step, IssueStep::KickedBackToChanges { .. }),
@@ -485,6 +633,12 @@ mod tests {
         );
         assert!(issues::issue_dir(&ws, "needs-behavior").exists(), "issue stays in place");
         assert!(!issues::archive_root(&ws).exists(), "nothing archived");
+        // A kick-back cannot be resolved by retrying, so the issue is parked
+        // immediately — this stops the `↩️` notice re-posting every pass.
+        assert!(
+            issues::is_perma_stuck(&ws, "needs-behavior"),
+            "kick-back parks the issue"
+        );
     }
 
     #[tokio::test]
@@ -496,8 +650,9 @@ mod tests {
             outcome: Mutex::new(Some(ExecutorOutcome::Completed { final_answer: None })),
             write_file: false,
         };
-        let got =
-            walk_issues(&paths, td.path(), &repo_cfg(), &exec, None, None, 3).await.unwrap();
+        let got = walk_issues(&paths, td.path(), &repo_cfg(), &exec, None, None, 3, 2)
+            .await
+            .unwrap();
         assert!(got.is_empty());
     }
 
@@ -578,5 +733,168 @@ mod tests {
         let prompt = render_issue_prompt(None, td.path(), &loaded);
         assert!(!prompt.contains(UNTRUSTED_BEGIN));
         assert!(prompt.contains("maintainer-curated issue"));
+    }
+
+    // ----- perma-stuck park gate -----
+
+    /// A backend that records every `post_notification` so a test can assert
+    /// an operator alert was emitted (behavior, not exact wording).
+    struct NotificationRecordingBackend {
+        posts: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::chatops::ChatOpsBackend for NotificationRecordingBackend {
+        fn provider_name(&self) -> &'static str {
+            "notification-recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _c: &str, _ch: &str, _q: &str) -> Result<String> {
+            unreachable!("park alerts are notification-only")
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _c: &str,
+            _h: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            unreachable!("park alerts are notification-only")
+        }
+        async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn notify_ctx(backend: Arc<NotificationRecordingBackend>, channel: &str) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: backend,
+            channel: channel.to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    /// An executor that returns `Failed` on every issue run — unlike
+    /// `CapturingIssueExecutor`, which takes its outcome once and panics on a
+    /// second call. Used to drive an issue across the failure threshold.
+    struct AlwaysFailIssueExecutor;
+
+    #[async_trait]
+    impl Executor for AlwaysFailIssueExecutor {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+        async fn run_issue(&self, _w: &Path, _c: &IssueContext) -> Result<ExecutorOutcome> {
+            Ok(ExecutorOutcome::Failed {
+                reason: "boom".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_parks_at_threshold_and_alerts() {
+        let (_td, ws) = workspace_with_issue("flaky");
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = Arc::new(NotificationRecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = notify_ctx(backend.clone(), "C1");
+        let exec = AlwaysFailIssueExecutor;
+        // Threshold 2: the first failure must NOT park.
+        let s1 =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, Some(&ctx), None, "flaky", 2).await;
+        assert!(matches!(s1, IssueStep::Failed { .. }));
+        assert!(
+            !issues::is_perma_stuck(&ws, "flaky"),
+            "not parked before the threshold"
+        );
+        // The second failure reaches the threshold → parked + alerted.
+        let s2 =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, Some(&ctx), None, "flaky", 2).await;
+        assert!(matches!(s2, IssueStep::Failed { .. }));
+        assert!(
+            issues::is_perma_stuck(&ws, "flaky"),
+            "parked at the threshold"
+        );
+        // The park is announced to the operator, naming the issue.
+        let posts = backend.posts.lock().unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|(_, t)| t.contains("flaky") && t.contains("parked")),
+            "a park alert naming the issue was posted: {posts:?}"
+        );
+        // A parked issue is excluded from selection.
+        assert!(!issues::list_ready(&ws).unwrap().contains(&"flaky".to_string()));
+    }
+
+    #[tokio::test]
+    async fn escalation_parks_on_a_single_attempt() {
+        let (_td, ws) = workspace_with_issue("asky");
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let backend = Arc::new(NotificationRecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = notify_ctx(backend.clone(), "C1");
+        let exec = CapturingIssueExecutor {
+            seen_prompt: Arc::new(Mutex::new(None)),
+            outcome: Mutex::new(Some(ExecutorOutcome::AskUser {
+                question: "which config key?".into(),
+                resume_handle: ResumeHandle(serde_json::Value::Null),
+            })),
+            write_file: false,
+        };
+        // Threshold 5, but escalation cannot be resolved by retrying, so it
+        // parks on the FIRST attempt regardless of the threshold.
+        let step =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, Some(&ctx), None, "asky", 5).await;
+        assert_eq!(step, IssueStep::Escalated);
+        assert!(
+            issues::is_perma_stuck(&ws, "asky"),
+            "escalation parks immediately"
+        );
+        let posts = backend.posts.lock().unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|(_, t)| t.contains("asky") && t.contains("parked")),
+            "escalation park is alerted: {posts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_does_not_count_or_park() {
+        let (_td, ws) = workspace_with_issue("shutdowny");
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let exec = CapturingIssueExecutor {
+            seen_prompt: Arc::new(Mutex::new(None)),
+            outcome: Mutex::new(Some(ExecutorOutcome::Aborted {
+                reason: "SIGTERM cascade".into(),
+            })),
+            write_file: false,
+        };
+        // Even at the most aggressive threshold (1), a shutdown abort neither
+        // counts nor parks — operator-initiated shutdown is not a failure.
+        let step =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "shutdowny", 1).await;
+        assert_eq!(step, IssueStep::Aborted);
+        assert!(
+            !issues::is_perma_stuck(&ws, "shutdowny"),
+            "an abort does not park the issue"
+        );
+        assert_eq!(
+            state::failure_count(&paths, &ws, "shutdowny"),
+            0,
+            "an abort does not increment the failure counter"
+        );
     }
 }

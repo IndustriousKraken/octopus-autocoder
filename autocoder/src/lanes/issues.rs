@@ -32,6 +32,11 @@ const ARCHIVE_DIR: &str = "archive";
 const ISSUE_FILE: &str = "issue.md";
 const TASKS_FILE: &str = "tasks.md";
 const SPECS_DIR: &str = "specs";
+/// Park marker for a non-progressing issue, mirroring the changes lane's
+/// per-change marker. Reuses the `.perma-stuck.json` name already registered
+/// in `.git/info/exclude` (workspace init), so it is gitignored at any depth
+/// AND survives the per-iteration branch reset AND `git clean`.
+const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
 
 /// Optional file carrying the RAW, UNTRUSTED body of a public-origin
 /// reported issue (a010). Its presence marks the unit as public-origin:
@@ -146,6 +151,60 @@ pub fn is_malformed(workspace: &Path, slug: &str) -> bool {
     issue_dir(workspace, slug).join(SPECS_DIR).is_dir()
 }
 
+/// Serialized park-marker content. Mirrors the changes lane's
+/// `PermaStuckMarker`: an operator-readable record of why the issue is
+/// parked AND how to unpark it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IssuePermaStuckMarker {
+    pub slug: String,
+    pub consecutive_failures: u32,
+    pub last_reason: String,
+    pub marked_stuck_at: chrono::DateTime<Utc>,
+    pub operator_action: String,
+}
+
+/// `issues/<slug>/.perma-stuck.json`.
+fn perma_stuck_marker_path(workspace: &Path, slug: &str) -> PathBuf {
+    issue_dir(workspace, slug).join(PERMA_STUCK_FILE)
+}
+
+/// True when `issues/<slug>/` carries a `.perma-stuck.json` park marker —
+/// the presence-only flag [`list_ready`] consults to exclude a parked issue.
+pub fn is_perma_stuck(workspace: &Path, slug: &str) -> bool {
+    perma_stuck_marker_path(workspace, slug).exists()
+}
+
+/// Atomically write the park marker for `slug`. The issue directory must
+/// already exist (the caller is parking a unit it just worked).
+pub fn write_perma_stuck(
+    workspace: &Path,
+    slug: &str,
+    consecutive_failures: u32,
+    last_reason: &str,
+) -> Result<()> {
+    let path = perma_stuck_marker_path(workspace, slug);
+    let parent = path
+        .parent()
+        .with_context(|| format!("park-marker path has no parent: {}", path.display()))?;
+    if !parent.is_dir() {
+        anyhow::bail!("issue directory does not exist: {}", parent.display());
+    }
+    let marker = IssuePermaStuckMarker {
+        slug: slug.to_string(),
+        consecutive_failures,
+        last_reason: last_reason.to_string(),
+        marked_stuck_at: Utc::now(),
+        operator_action: "Delete this file to retry the issue.".to_string(),
+    };
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, &marker)
+        .with_context(|| format!("serializing park marker for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow::anyhow!("atomically persisting {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Load AND validate the `issues/<slug>/` unit. Validation order makes
 /// the malformed-`specs/` case authoritative: a unit with a `specs/`
 /// directory is rejected as malformed even if it also has `issue.md` +
@@ -222,6 +281,12 @@ pub fn list_ready(workspace: &Path) -> Result<Vec<String>> {
             continue;
         }
         if entry.path().join(shared::LOCK_FILE).exists() {
+            continue;
+        }
+        // A parked (perma-stuck) issue is excluded from selection until the
+        // operator removes its marker, mirroring the changes lane's
+        // `.perma-stuck.json` skip.
+        if is_perma_stuck(workspace, &name) {
             continue;
         }
         match load(workspace, &name) {
@@ -370,6 +435,30 @@ mod tests {
     fn list_ready_empty_when_dir_absent() {
         let td = TempDir::new().unwrap();
         assert!(list_ready(td.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_ready_excludes_parked_issue_until_marker_removed() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        make_issue(ws, "parked");
+        assert!(
+            list_ready(ws).unwrap().contains(&"parked".to_string()),
+            "selectable before parking"
+        );
+        // Park it.
+        write_perma_stuck(ws, "parked", 2, "agent gave up").unwrap();
+        assert!(is_perma_stuck(ws, "parked"));
+        assert!(
+            !list_ready(ws).unwrap().contains(&"parked".to_string()),
+            "a parked issue is excluded from selection"
+        );
+        // The operator unparks by removing the marker.
+        std::fs::remove_file(issue_dir(ws, "parked").join(PERMA_STUCK_FILE)).unwrap();
+        assert!(
+            list_ready(ws).unwrap().contains(&"parked".to_string()),
+            "removing the marker re-selects the issue"
+        );
     }
 
     #[test]

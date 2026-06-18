@@ -37,6 +37,7 @@ pub async fn run_pass_through_commits(
         executor,
         chatops_ctx,
         max_changes_per_pr,
+        perma_stuck_threshold,
     )
     .await;
 
@@ -220,6 +221,7 @@ async fn run_issues_lane(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     max_units: u32,
+    perma_stuck_threshold: u32,
 ) -> Vec<String> {
     let Some(ctx) = crate::lanes::gate::current() else {
         return Vec::new();
@@ -290,6 +292,7 @@ async fn run_issues_lane(
         chatops_ctx,
         ctx.prompt_path.as_deref(),
         max_units,
+        perma_stuck_threshold,
     )
     .await
     {
