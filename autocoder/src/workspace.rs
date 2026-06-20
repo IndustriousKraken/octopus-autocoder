@@ -203,6 +203,24 @@ pub fn ensure_initialized(
             "could not register .ignore-for-queue.json in .git/info/exclude: {e:#}"
         );
     }
+    // Per-run, server-specific CLI config artifacts the wrapped agent CLIs
+    // auto-discover from the workspace root (claude's `.mcp.json`, opencode's
+    // `opencode.json` + `.opencode/`, agy's `mcp_config.json`). `a16` excluded
+    // these before `git add -A` so they never commit; register them HERE too
+    // so they are excluded before ANY working-tree inspection — including the
+    // post-run clean-workspace check of an advisory (`WritePolicy::None`) audit,
+    // which runs a CLI but never stages or commits and would otherwise read the
+    // generated config as a disallowed write. Re-applied on every init so a
+    // re-cloned workspace (which resets the local exclude) is covered before its
+    // first pass. Best-effort: a failure must not abort init.
+    if let Err(e) =
+        crate::git::ensure_local_excludes(workspace, crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES)
+    {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register per-run CLI artifact excludes in .git/info/exclude: {e:#}"
+        );
+    }
     // One-time migration of any legacy iteration-pending markers (a27a1
     // originally placed them at <workspace>/openspec/changes/<change>/.iteration-pending.json,
     // where `git clean -fd` periodically wiped them). The marker now
@@ -658,6 +676,51 @@ mod tests {
         ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
         assert!(workspace.join(".git").is_dir());
         assert!(workspace.join("README.md").is_file());
+    }
+
+    #[test]
+    fn ensure_initialized_excludes_per_run_cli_artifacts_before_any_commit() {
+        let (_temp_paths, _paths_test) = test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
+
+        // Every per-run CLI artifact is registered in `.git/info/exclude` at
+        // init — no commit / `git add -A` required (advisory audits never stage).
+        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        for pat in crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES {
+            assert!(
+                exclude.lines().any(|l| l.trim() == *pat),
+                "`{pat}` must be registered at init; exclude file:\n{exclude}"
+            );
+        }
+
+        // Consequence: an untracked `opencode.json` (what the opencode CLI drops
+        // on launch) is invisible to the dirty check an advisory audit runs, so
+        // it cannot be misread as a write-policy violation.
+        std::fs::write(workspace.join("opencode.json"), "{generated}").unwrap();
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !status.contains("opencode.json"),
+            "an untracked opencode.json must be excluded from git status: {status:?}"
+        );
+
+        // Idempotent across re-init (the fetch path) — no duplicate entries.
+        ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
+        let exclude2 = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude2.matches("opencode.json").count(),
+            1,
+            "no duplicate opencode.json entry after re-init:\n{exclude2}"
+        );
     }
 
     #[test]

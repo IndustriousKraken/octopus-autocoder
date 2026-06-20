@@ -429,12 +429,19 @@ const OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 /// The per-run CLI artifact files/dirs the strategies write into the workspace
 /// ROOT — auto-discovered configs that (unlike the claude settings file) cannot
 /// live under `.git/`: claude's `.mcp.json`, opencode's `opencode.json` + its
-/// `.opencode/` project scratch, agy's `mcp_config.json`. [`crate::git::add_all`]
-/// adds these to the workspace's `.git/info/exclude` before every `git add -A`
-/// so a per-run, server-specific config never gets committed into a PR (a16:
-/// daemon bookkeeping stays out of the managed tree). `.git/info/exclude` only
-/// affects UNTRACKED files, so a repo that legitimately tracks one of these is
-/// unaffected — only autocoder's generated copy is skipped.
+/// `.opencode/` project scratch, agy's `mcp_config.json`. These are registered
+/// in the workspace's `.git/info/exclude` at workspace initialization
+/// ([`crate::workspace::ensure_initialized`]) AND, defensively, before every
+/// `git add -A` ([`crate::git::add_all`]). Init-time registration matters
+/// because an advisory (`WritePolicy::None`) audit runs a CLI but never stages
+/// or commits, so an exclude registered only before `git add -A` would not cover
+/// its post-run clean-workspace check; registering at init places the excludes
+/// before ANY working-tree inspection, for every lane AND every audit, and
+/// re-applies on each init so a re-cloned workspace is covered. A per-run,
+/// server-specific config thus never gets committed into a PR NOR misread as a
+/// disallowed write (a16: daemon bookkeeping stays out of the managed tree).
+/// `.git/info/exclude` only affects UNTRACKED files, so a repo that legitimately
+/// tracks one of these is unaffected — only autocoder's generated copy is skipped.
 pub const WORKSPACE_CLI_ARTIFACT_EXCLUDES: &[&str] = &[
     ".mcp.json",
     OPENCODE_CONFIG_FILENAME,
