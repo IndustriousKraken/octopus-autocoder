@@ -194,6 +194,60 @@ fn pr_section_renders_each_gate_model_verdict_and_reviewer() {
     assert!(section.contains("xai/grok"), "{section}");
 }
 
+/// reviewer-failure-visible-in-pr: a discarded/errored agentic review renders a
+/// VISIBLE `## Code Review: FAILED TO RUN` report (the PR-body section), naming
+/// the cause — NOT a silent omission AND NOT an approval.
+#[test]
+fn reviewer_failed_to_run_report_is_visible_and_not_an_approval() {
+    use crate::code_reviewer::ReviewVerdict;
+    use crate::polling_loop::pass::reviewer_failed_to_run_report;
+
+    let report = reviewer_failed_to_run_report(
+        "agentic reviewer session recorded no valid submit_review submission",
+    );
+    // Visible failed-to-run section in the PR body.
+    assert!(
+        report.markdown.contains("## Code Review: FAILED TO RUN"),
+        "markdown: {}",
+        report.markdown
+    );
+    // Names the cause.
+    assert!(
+        report.markdown.contains("no valid submit_review"),
+        "markdown: {}",
+        report.markdown
+    );
+    // A could-not-run state — NOT an approval/pass AND not a Block (advisory).
+    assert_eq!(report.verdict, ReviewVerdict::FailedToRun);
+    assert_ne!(report.verdict, ReviewVerdict::Pass);
+}
+
+/// reviewer-failure-visible-in-pr: the gate-verdict ledger records the reviewer
+/// as FAILED TO RUN on a discarded/errored review — NOT passed/approved AND NOT
+/// absent (so "could not run" is distinguishable from "ran and approved").
+#[test]
+fn ledger_records_reviewer_failed_to_run() {
+    use crate::code_reviewer::ReviewVerdict;
+    use crate::gate_ledger::{GateLedger, GateVerdict};
+    use crate::polling_loop::pass::reviewer_failed_to_run_report;
+
+    let mut ledger = GateLedger::new();
+    ledger.set_out(GateVerdict::Pass, Some("anthropic/claude-out".into()), None);
+    let report = reviewer_failed_to_run_report("agentic reviewer failed: spawn error");
+    assert_eq!(report.verdict, ReviewVerdict::FailedToRun);
+
+    let section = render_gate_verdicts_with_reviewer(&ledger, Some(&report));
+    // The reviewer line is present AND says FAILED TO RUN — not absent, not PASS.
+    assert!(
+        section.contains("reviewer FAILED TO RUN"),
+        "ledger must record the reviewer as failed-to-run: {section}"
+    );
+    assert!(
+        !section.contains("reviewer PASS"),
+        "a failed-to-run reviewer must NOT read as PASS: {section}"
+    );
+}
+
 /// §6.2: `seed_ledger_from_processed` reads the pre-executor verdicts persisted
 /// per change during the queue walk, so the PR-level ledger carries the EXACT
 /// `[in]`/`[canon]` verdicts (not a re-derivation). A processed change with no

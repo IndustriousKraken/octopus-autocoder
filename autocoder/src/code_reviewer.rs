@@ -35,6 +35,13 @@ pub enum ReviewVerdict {
     Pass,
     Concerns,
     Block,
+    /// The reviewer could not produce a verdict — the agentic session was
+    /// discarded (no valid `submit_review`) or errored. Per the
+    /// gatekeepers-fail-closed standard this is a distinct, VISIBLE,
+    /// non-passing state (rendered as a `## Code Review: FAILED TO RUN`
+    /// section AND a `FAILED TO RUN` ledger line) — NOT an approval, NOT a
+    /// silent omission.
+    FailedToRun,
 }
 
 #[derive(Debug, Clone)]
@@ -835,6 +842,12 @@ impl From<ReviewVerdict> for Verdict {
         match v {
             ReviewVerdict::Block => Verdict::Block,
             ReviewVerdict::Pass | ReviewVerdict::Concerns => Verdict::Approve,
+            // A failed-to-run review is NOT an approval. This conversion feeds
+            // the operator re-review `Verdict {Approve, Block}` contract, which
+            // a failed-to-run state should never reach in practice (a re-review
+            // produces a real verdict); map it conservatively to Block rather
+            // than waving it through as Approve.
+            ReviewVerdict::FailedToRun => Verdict::Block,
         }
     }
 }
@@ -2276,6 +2289,7 @@ fn verdict_label(v: ReviewVerdict) -> &'static str {
         ReviewVerdict::Pass => "Pass",
         ReviewVerdict::Concerns => "Concerns",
         ReviewVerdict::Block => "Block",
+        ReviewVerdict::FailedToRun => "Failed to run",
     }
 }
 
@@ -2285,6 +2299,9 @@ fn worst_verdict(a: ReviewVerdict, b: ReviewVerdict) -> ReviewVerdict {
             ReviewVerdict::Pass => 0,
             ReviewVerdict::Concerns => 1,
             ReviewVerdict::Block => 2,
+            // A failed-to-run review is non-passing; rank it above Block so
+            // aggregating it with any other verdict never resolves to a pass.
+            ReviewVerdict::FailedToRun => 3,
         }
     }
     if rank(a) >= rank(b) { a } else { b }

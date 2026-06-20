@@ -6910,6 +6910,10 @@ Per the verifier framework, the `[canon]` gate SHALL FAIL CLOSED (gatekeepers-fa
 ### Requirement: Code-implements-spec verification (the [out] gate, advisory)
 autocoder SHALL provide an opt-in post-executor check — the `[out]` gate of the verifier framework — that judges whether the executor's implementation satisfies the change's spec delta, requirement by requirement AND scenario by scenario. This is the verifier step the code-reviewer requirement defers to ("Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step"). The gate runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) AFTER the executor implements the change, in a read-only sandbox that reads the spec delta, the diff, AND source on demand, AND returns its verdict via the `submit_verdict` MCP tool.
 
+The gate resolves the change's spec-delta files from WHEREVER they currently live, because by the time the `[out]` gate runs the change has typically ALREADY been archived in the same pass: a completed change's `openspec/changes/<slug>/` is moved to `openspec/changes/archive/<dated>-<slug>/` (and its delta folded into canon) BEFORE the post-executor gate runs. The gate SHALL therefore look for the delta at the active path `openspec/changes/<slug>/specs/` AND, when that is absent, at the archived path `openspec/changes/archive/*-<slug>/specs/`, so it verifies the just-archived delta rather than finding nothing. The diff (which still carries the delta files as part of the archive move) remains an input.
+
+When NO spec-delta is found for a processed change in EITHER location, the gate SHALL NOT run the agent against an empty contract AND SHALL NOT synthesize a passing verdict. Per the gatekeepers-fail-closed standard AND the gatekeepers-contain-no-judgment standard, an absent contract is a could-not-verify condition, NOT a pass: the gate SHALL render an explicit `## Spec Verification: FAILED TO RUN` section naming the cause (no spec-delta contract found) rather than reporting the change as implemented. The code SHALL NOT derive a verdict from the inputs — a missing delta yields the failed-to-run state, never a code-synthesized "nothing to verify, so it passes."
+
 Judging whether the implementation satisfies a requirement SHALL include judging that the required behavior is REALLY implemented, not merely sketched. Per the project's no-stubs standard, where the spec delta calls for working code, a requirement (or scenario) is NOT satisfied — it is a gap — when the code that landed only stubs OR defers the behavior: a placeholder or hardcoded/faked return value, a `todo!()` / `unimplemented!()` / `panic!("not implemented")`, an unconditional early-return that skips the required path, a branch or error path left unwired, a config flag read but never acted on, OR an explicit deferral of the behavior to a later change. A wholly-stubbed requirement SHALL be reported as a `missing` gap; a half-wired one (the behavior exists for some inputs but a required path is stubbed) SHALL be reported as a `partial` gap, each with the stub itself as the evidence. A plausible-looking diff that does not actually do the work the spec requires is NOT a pass, AND the gate SHALL flag it whether or not the spec delta separately says "do not stub."
 
 The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the gatekeepers-fail-closed standard, the gate fails CLOSED to a VISIBLE state rather than silence: a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause — making clear the change was NOT verified (NOT a pass) — rather than omitting the section. It still never blocks PR creation. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
@@ -6955,6 +6959,17 @@ The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` de
 - **WHEN** the spec delta calls for working code for a behavior AND the landed implementation only stubs OR defers it (a placeholder/hardcoded return, `todo!()`/`unimplemented!()`, an unconditional early-return that skips the required path, an unwired branch, OR an explicit deferral to a later change)
 - **THEN** the gate reports that requirement (or scenario) as a gap with the stub as concrete evidence — `missing` when wholly stubbed, `partial` when a required path is stubbed
 - **AND** it does NOT report the change as fully implemented
+
+#### Scenario: The same-pass-archived delta is resolved and verified
+- **WHEN** the gate runs for a processed change that was archived earlier in the same pass (its `openspec/changes/<slug>/` is gone, now at `openspec/changes/archive/<dated>-<slug>/`)
+- **THEN** the gate resolves the spec-delta files from the archived path AND verifies the implementation against them
+- **AND** it does NOT treat the change as having no delta
+
+#### Scenario: A missing delta fails to run, never a synthesized pass
+- **WHEN** no spec-delta file is found for a processed change in EITHER the active OR the archived location
+- **THEN** the gate does NOT run the agent against an empty contract AND does NOT report the change as implemented
+- **AND** it renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause (no spec-delta contract found)
+- **AND** PR creation still proceeds — the gate never blocks
 
 ### Requirement: Workspace cache LRU eviction under a size cap
 The daemon SHALL support an optional cap on the total size of the per-repo workspace cache (`<cache>/workspaces/`), configured via `cache.workspaces_max_gb` (`Option<u64>`; unset = unbounded, the default). When the cap is set, the daemon SHALL keep the workspace cache under it by evicting least-recently-used IDLE workspaces. Whole-workspace eviction is language-agnostic: it removes entire least-recently-used clones (`<cache>/workspaces/<key>`) rather than reasoning about which subdirectories are build artifacts. An evicted repo re-clones via the existing workspace-init path on its next iteration; eviction is lossless because per-PR revision state AND audit state live in the state directory, NOT the workspace.
@@ -8142,4 +8157,32 @@ To keep the alert bounded when a single run dirties many files (e.g. a build or 
 - **THEN** the reason lists paths up to the cap AND appends a summary of how many more were omitted
 - **AND** the total count is still conveyed
 - **AND** the audit-run log still records the full, uncapped working-tree status
+
+### Requirement: A discarded or errored reviewer renders a visible FAILED TO RUN section in the PR
+The code reviewer is a control-plane gatekeeper, so per the gatekeepers-fail-closed standard its inability to run SHALL be a visible, non-passing state — never silence. When the agentic reviewer produces no usable verdict — it DISCARDS the review (a session that records no schema-valid `submit_review` submission) OR it errors (spawn/transport failure) — the PR body SHALL carry an explicit `## Code Review: FAILED TO RUN` section naming the cause, parallel to the `[out]` gate's `## Spec Verification: FAILED TO RUN`. The daemon SHALL NOT omit the reviewer section in this case, AND SHALL NOT represent the failure as an approval.
+
+This is the reviewer-side counterpart of the same fix the `[out]` gate already has: the prior behavior — returning no review report, which rendered NO `## Code Review` section at all — left a failed/discarded review invisible in the PR (only a chatops alert was posted), so an operator reading the PR could not distinguish "reviewed and approved" from "the reviewer never ran." The one-shot reviewer path already surfaces its failure as a visible report; this brings the agentic path (the default) into line.
+
+The reviewer remains ADVISORY: a FAILED TO RUN reviewer state SHALL NOT block PR creation AND SHALL NOT be a `Block`/`Approve` verdict — it is a distinct could-not-run state. The existing operator-visible chatops alert SHALL continue. The PR's gate-verdict ledger SHALL record the reviewer as failed-to-run (NOT passed/approved AND not absent), so the reviewer's could-not-run state is legible there too.
+
+#### Scenario: A discarded agentic review renders FAILED TO RUN, not silence
+- **WHEN** the agentic reviewer session records no schema-valid `submit_review` submission (the review is discarded)
+- **THEN** the PR body carries an explicit `## Code Review: FAILED TO RUN` section naming the cause
+- **AND** the reviewer section is NOT omitted AND the failure is NOT rendered as an approval
+- **AND** the existing reviewer-failure chatops alert is still posted
+- **AND** PR creation still proceeds — the reviewer never blocks
+
+#### Scenario: An errored agentic review renders FAILED TO RUN
+- **WHEN** the agentic reviewer errors (spawn/transport failure) before producing a verdict
+- **THEN** the PR body carries the `## Code Review: FAILED TO RUN` section naming the cause
+- **AND** it is not represented as an approval AND PR creation proceeds
+
+#### Scenario: The gate ledger records the reviewer as failed-to-run
+- **WHEN** the reviewer is discarded OR errors
+- **THEN** the PR's gate-verdict ledger records the reviewer verdict as failed-to-run
+- **AND** it is NOT recorded as passed/approved NOR left absent (so "could not run" is distinguishable from "ran and approved")
+
+#### Scenario: A successful review is unchanged
+- **WHEN** the agentic reviewer returns a valid verdict (Approve OR Block)
+- **THEN** the PR body renders the normal `## Code Review` section AND the ledger records that verdict, exactly as before
 
