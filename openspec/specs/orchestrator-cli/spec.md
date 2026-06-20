@@ -6910,6 +6910,8 @@ Per the verifier framework, the `[canon]` gate SHALL FAIL CLOSED (gatekeepers-fa
 ### Requirement: Code-implements-spec verification (the [out] gate, advisory)
 autocoder SHALL provide an opt-in post-executor check — the `[out]` gate of the verifier framework — that judges whether the executor's implementation satisfies the change's spec delta, requirement by requirement AND scenario by scenario. This is the verifier step the code-reviewer requirement defers to ("Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step"). The gate runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) AFTER the executor implements the change, in a read-only sandbox that reads the spec delta, the diff, AND source on demand, AND returns its verdict via the `submit_verdict` MCP tool.
 
+Judging whether the implementation satisfies a requirement SHALL include judging that the required behavior is REALLY implemented, not merely sketched. Per the project's no-stubs standard, where the spec delta calls for working code, a requirement (or scenario) is NOT satisfied — it is a gap — when the code that landed only stubs OR defers the behavior: a placeholder or hardcoded/faked return value, a `todo!()` / `unimplemented!()` / `panic!("not implemented")`, an unconditional early-return that skips the required path, a branch or error path left unwired, a config flag read but never acted on, OR an explicit deferral of the behavior to a later change. A wholly-stubbed requirement SHALL be reported as a `missing` gap; a half-wired one (the behavior exists for some inputs but a required path is stubbed) SHALL be reported as a `partial` gap, each with the stub itself as the evidence. A plausible-looking diff that does not actually do the work the spec requires is NOT a pass, AND the gate SHALL flag it whether or not the spec delta separately says "do not stub."
+
 The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the gatekeepers-fail-closed standard, the gate fails CLOSED to a VISIBLE state rather than silence: a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause — making clear the change was NOT verified (NOT a pass) — rather than omitting the section. It still never blocks PR creation. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
 
 The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.code_implements_spec_check_llm`, which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
@@ -6948,6 +6950,11 @@ The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` de
 - **AND** `executor.code_implements_spec_check_llm` is unset
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
 - **AND** the operator sees the error on stderr AND in journalctl
+
+#### Scenario: A stubbed or deferred required behavior is reported as a gap
+- **WHEN** the spec delta calls for working code for a behavior AND the landed implementation only stubs OR defers it (a placeholder/hardcoded return, `todo!()`/`unimplemented!()`, an unconditional early-return that skips the required path, an unwired branch, OR an explicit deferral to a later change)
+- **THEN** the gate reports that requirement (or scenario) as a gap with the stub as concrete evidence — `missing` when wholly stubbed, `partial` when a required path is stubbed
+- **AND** it does NOT report the change as fully implemented
 
 ### Requirement: Workspace cache LRU eviction under a size cap
 The daemon SHALL support an optional cap on the total size of the per-repo workspace cache (`<cache>/workspaces/`), configured via `cache.workspaces_max_gb` (`Option<u64>`; unset = unbounded, the default). When the cap is set, the daemon SHALL keep the workspace cache under it by evicting least-recently-used IDLE workspaces. Whole-workspace eviction is language-agnostic: it removes entire least-recently-used clones (`<cache>/workspaces/<key>`) rather than reasoning about which subdirectories are build artifacts. An evicted repo re-clones via the existing workspace-init path on its next iteration; eviction is lossless because per-PR revision state AND audit state live in the state directory, NOT the workspace.
@@ -7868,4 +7875,44 @@ Because it is a verifier gate, the `[rules]` gate runs server-side pre-executor 
 #### Scenario: Enabled without model or corpus fails fast at startup
 - **WHEN** `executor.global_rules_check: enabled` AND either `executor.global_rules_check_llm` OR `executor.global_rules.corpus` is unset/unresolvable
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
+
+### Requirement: Issues lane parks a non-progressing issue
+The issues lane SHALL NOT re-attempt the same issue indefinitely. The issues walker SHALL track a per-issue consecutive-failure counter (its own lane state, per the independent-lane-walkers requirement) AND, once an issue stops making progress, SHALL PARK it: write a `.perma-stuck.json` marker into `issues/<slug>/`, exclude the issue from selection while the marker is present, AND post an operator-visible chatops alert. The threshold SHALL be the existing `executor.perma_stuck_after_failures` value (no new configuration). The operator unparks an issue by removing the marker, exactly as for a parked change.
+
+Progress is defined by outcome:
+- A RETRYABLE failure (executor error, a `Completed` outcome that left the workspace unmodified, an unsupported iteration request, OR a precondition-unmet outcome) SHALL increment the counter; the issue is parked when the counter reaches `executor.perma_stuck_after_failures`.
+- An outcome that retrying cannot resolve — the agent escalating a question (the issues lane does not escalate) OR the agent kicking the fix back to the changes lane (it requires a behavior change) — SHALL park the issue IMMEDIATELY (a single attempt, not the full threshold). Immediate parking on kick-back also stops the kick-back notice from re-posting on every pass.
+- A daemon-shutdown abort SHALL NOT count toward the threshold (operator-initiated shutdown is not an issue failure).
+
+Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the attempt count, AND the last reason, so the lane is never silently re-attempting an issue NOR silently abandoning one. Completion (the fix landed AND the issue archived) SHALL clear both the counter AND the marker, so a later issue reusing the slug starts clean. The marker file SHALL reuse the `.perma-stuck.json` name already excluded via `.git/info/exclude`, so it is gitignored at any depth AND survives the per-iteration branch reset AND `git clean`.
+
+#### Scenario: A repeatedly failing issue is parked after the threshold
+- **WHEN** an issue's fix fails on `executor.perma_stuck_after_failures` consecutive passes
+- **THEN** a `.perma-stuck.json` marker is written into `issues/<slug>/`
+- **AND** an operator-visible chatops alert names the issue, the attempt count, AND the last reason
+
+#### Scenario: A parked issue is skipped until the operator removes the marker
+- **WHEN** an `issues/<slug>/` carries a `.perma-stuck.json` marker
+- **THEN** the issue is excluded from selection (it is not worked)
+- **AND** removing the marker makes the issue selectable again
+
+#### Scenario: An escalated issue is parked immediately
+- **WHEN** the agent escalates a question while working an issue
+- **THEN** the issue is parked on that single attempt (not after the full threshold)
+- **AND** the operator is alerted
+
+#### Scenario: A kicked-back issue is parked immediately and not re-reported
+- **WHEN** the agent reports that an issue requires a behavior change (a kick-back to the changes lane)
+- **THEN** the issue is parked on that single attempt
+- **AND** the kick-back notice is not re-posted on subsequent passes
+
+#### Scenario: A daemon-shutdown abort does not count toward the threshold
+- **WHEN** an issue's session is aborted by the daemon's shutdown cascade
+- **THEN** the issue's consecutive-failure counter is not incremented
+- **AND** the issue is not parked for the abort
+
+#### Scenario: Completion clears the counter and the marker
+- **WHEN** an issue's fix completes AND the issue is archived
+- **THEN** the per-issue failure counter is cleared
+- **AND** no `.perma-stuck.json` marker remains for that slug
 

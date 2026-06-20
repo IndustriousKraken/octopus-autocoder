@@ -50,7 +50,8 @@ pub const AGENTIC_CODE_IMPLEMENTS_SPEC_ALLOWED_TOOLS: &[&str] = &["Read", "Glob"
 
 /// Wall-clock cap for one code-implements-spec session. Mirrors the
 /// pre-executor gates' bound: the wrapped CLI subprocess is the thing being
-/// bounded.
+/// bounded. TODO: hard coding this to 15mins is very sus. What if it can't 
+/// finish checking a huge refactor in 15mins?
 const AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The full `--allowedTools` list the code-implements-spec sandbox grants: the
