@@ -200,6 +200,7 @@ fn default_standalone_executor_cfg() -> ExecutorConfig {
         implementer_cli: None,
         command: "claude".to_string(),
         timeout_secs: 600,
+        agentic_session_timeout_secs: crate::config::default_agentic_session_timeout(),
         sandbox: None,
         agent_env: None,
         implementer_prompt_path: None,

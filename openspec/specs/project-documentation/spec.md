@@ -1170,6 +1170,11 @@ This invariant SHALL hold by inspection — so the periodic `drift_audit` AND th
 - **The action on error follows the gatekeeper's role, but none is silent-pass.** A BLOCKING gatekeeper SHALL NOT let the gated work proceed as if it passed: it holds the work in an explicit failed-to-run state an operator clears (distinct from a "found a problem" verdict). An ADVISORY gatekeeper SHALL render an explicit "failed to run" result rather than omit its output OR report success.
 - **Transient-failure tolerance is bounded retry, NOT fail-open.** Where a gatekeeper retries transient failures to avoid wedging on a blip, it SHALL — after exhausting the retry bound — enter the errored state, never pass.
 
+The clauses above forbid turning an inability to run into a pass. A gatekeeper whose verdict is a matter of judgment SHALL delegate that judgment to an agent AND SHALL NOT manufacture the verdict in code — a manufactured verdict is fail-open even when nothing errored:
+
+- **The verdict is the agent's, surfaced verbatim — the code synthesizes none.** For a gatekeeper that delegates judgment to an agent, the code's responsibilities are exactly: initialize to the non-passing state, assemble the inputs (prompt + materials), invoke the agent, AND surface the agent's returned verdict. No code path SHALL derive, infer, OR short-circuit the verdict by inspecting the inputs — a code-authored conclusion such as "the materials to evaluate are absent, so this passes" is a manufactured pass, NOT a judgment, even though no error occurred. When a genuine agent evaluation is not possible, the outcome is the failed-to-run state (per the clauses above), NEVER a synthesized pass.
+- **The agent is never presented an option set that forecloses failure.** The verdict mechanism (the MCP submission tool's schema, AND the prompt that frames it) SHALL let the agent express a FAILING verdict with its own words ALONE. Structured detail (gap lists, concern arrays) MAY accompany a verdict but SHALL NEVER be a precondition for returning a failing verdict. A prompt OR schema constructed so that pass is the only expressible answer is fail-open by construction.
+
 A developer-facing standards doc SHALL record this invariant so contributors apply it to new gatekeepers.
 
 #### Scenario: A gatekeeper that cannot run does not pass
@@ -1191,6 +1196,16 @@ A developer-facing standards doc SHALL record this invariant so contributors app
 - **WHEN** a gatekeeper initializes a verdict OR aggregates a verdict over zero evaluated items
 - **THEN** the initial / default / zero-item result is a non-passing state (blocked / errored / unknown)
 - **AND** no code path yields approve / pass from a default OR from zero evaluated items
+
+#### Scenario: The code does not synthesize a verdict from the inputs
+- **WHEN** an agent-backed gatekeeper could reach a verdict by inspecting its inputs in code (for example, the materials to evaluate are missing or empty)
+- **THEN** the code does NOT emit a pass / approve from that inspection
+- **AND** the verdict comes only from the agent's evaluation, OR — when no genuine evaluation is possible — the outcome is the failed-to-run state, never a synthesized pass
+
+#### Scenario: The agent can always return a failing verdict
+- **WHEN** an agent-backed gatekeeper invokes its agent
+- **THEN** the verdict mechanism accepts a failing verdict accompanied by the agent's prose ALONE, with no structured detail required
+- **AND** no prompt OR schema constraint makes pass the only expressible verdict
 
 ### Requirement: Global rules are authored as minimal prose, not contract language
 The global rule corpus SHALL be a collection of project-agnostic rules that the `[rules]` gate checks changes against. Each rule SHALL be authored as minimal prose, deliberately NOT in OpenSpec's contract language: there are NO `SHALL`/`MODIFY`/`ADD`/`REMOVE`/`RENAME` deltas, NO scenarios, NO task lists, AND NO archive/compose step. A rule is interpreted by judgment, not algorithm; contract keywords add authoring friction without adding checkability, since the gate's model judges the prose directly.

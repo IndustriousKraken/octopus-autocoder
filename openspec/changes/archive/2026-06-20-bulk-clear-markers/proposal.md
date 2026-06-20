@@ -16,9 +16,12 @@ recovery moments these commands exist for.
   marker-clear verbs:
   - `clear-<kind> <repo> *` — clear every marker of that kind in one repo.
   - `clear-<kind> *` — clear every marker of that kind across all repos.
-- The literal `*` is recognized as a wildcard sentinel for these two verbs
-  before the change-slug / repo-substring regex runs, so it is exempt from those
-  patterns; every non-`*` argument is still sanitized as before.
+- The chatops-manager "Argument sanitization at parser entry" requirement is
+  MODIFIED to carve out `*` as a wildcard sentinel for these two verbs only,
+  recognized before the change-slug / repo-substring regex (the canonical rule
+  otherwise rejects a non-matching argument and forbids it reaching the control
+  socket — so the carve-out must live in that requirement, not be asserted around
+  it). Every non-`*` argument is still sanitized as before.
 - Bulk clearing is fail-loud: the reply enumerates what was cleared per repo and
   per change, and reports "nothing to clear" explicitly rather than replying
   empty; a per-repo failure is reported alongside the successes without aborting
@@ -26,10 +29,11 @@ recovery moments these commands exist for.
 
 ## Impact
 
-- Affected specs: `orchestrator-cli` (ADD the wildcard requirement). The existing
-  "Chatops operator commands" and the chatops-manager "Argument sanitization at
-  parser entry" requirements are unchanged — this adds the `*` sentinel for the
-  marker-clear verbs and explicitly leaves non-`*` argument sanitization intact.
+- Affected specs: `orchestrator-cli` (ADD the wildcard-behavior requirement) AND
+  `chatops-manager` (MODIFY "Argument sanitization at parser entry" to carve out
+  the `*` sentinel for the marker-clear verbs; all existing scenarios preserved,
+  one added). The orchestrator-cli "Chatops operator commands" requirement is
+  unchanged. Non-`*` argument sanitization is left intact.
 - Affected code: the operator-command parser (recognize `*` for these verbs) and
   the control-socket handlers for `ClearPermaStuckMarker` / `ClearRevisionMarker`
   (resolve `*` to all changes in a repo / all repos, enumerate, report).

@@ -17,7 +17,7 @@ The orchestrator SHALL provide a recovery operation that rolls a managed reposit
 
 The operation SHALL accept a rollback depth as EITHER a commit count (roll back the last N commits) OR a target commit SHA (roll back to that commit), resolved against the repository's base branch.
 
-The operation SHALL be expressed as a PULL REQUEST, NOT a direct push to the base branch: it prepares the rolled-back state on the agent branch AND opens a PR for the operator to review and merge, riding the normal flow. (An installation configured to push directly to the real repository is operating in that posture by its own choice; git history remains the backstop.)
+The operation SHALL ride the normal push + PR flow rather than force-pushing the base branch directly: it prepares the rolled-back state on the agent branch AND goes through the SAME push + PR-creation path as any change, honoring the per-repo `auto_submit_pr` setting — a pull request the operator reviews AND merges when `auto_submit_pr` is enabled (the default), OR a pushed agent branch with no PR (the `BranchPushedNoPr` outcome) when an installation has set it false. The operation SHALL NOT special-case a force-push to the base branch; it produces reviewable commits through the established flow, AND git history remains the backstop.
 
 Within the rolled-back range, the operation SHALL:
 
@@ -28,9 +28,9 @@ Within the rolled-back range, the operation SHALL:
 
 The operation SHALL be fail-loud AND reviewable: the PR body SHALL enumerate the commits rolled back, the changes/issues unarchived, AND state plainly that the code was discarded while the specs/issues were returned to the pipeline. Because it discards code, the operation SHALL require explicit confirmation before it acts (a confirmation prompt for the CLI, OR a two-step confirm for the chatops verb), mirroring the other destructive operator commands. A dry run (default for the CLI, OR an explicit preview) SHALL report exactly what WOULD be rolled back AND unarchived without changing anything.
 
-#### Scenario: Rollback by count opens a PR that discards code and unarchives specs
+#### Scenario: Rollback by count discards code and unarchives specs via the normal flow
 - **WHEN** an operator rolls a repository back by N commits AND those commits archived one or more changes/issues
-- **THEN** a PR is opened (not a direct base push) whose tree has the code restored to the rollback target
+- **THEN** it rides the normal push + PR flow (opening a PR when `auto_submit_pr` is enabled, the default; otherwise a pushed branch with no PR), NOT a force-push to base, with the agent branch's tree holding the code restored to the rollback target
 - **AND** each change archived in the range is moved back to `openspec/changes/<slug>/` with its canon fold undone (active, to be re-gated and re-implemented)
 - **AND** each issue archived in the range is moved back to the active `issues/` lane
 - **AND** the PR body enumerates the rolled-back commits AND the unarchived changes/issues
@@ -50,7 +50,7 @@ The operation SHALL be fail-loud AND reviewable: the PR body SHALL enumerate the
 - **THEN** it reports the commits it WOULD roll back AND the changes/issues it WOULD unarchive
 - **AND** it does NOT modify any branch, workspace, archive, or canon until the operator confirms
 
-#### Scenario: Code-only range opens a plain rollback PR
+#### Scenario: Code-only range is a plain rollback through the normal flow
 - **WHEN** the rolled-back range archived NO changes AND NO issues (code-only commits)
-- **THEN** the PR restores the code to the target with no unarchive step
-- **AND** the PR body says the rollback was code-only
+- **THEN** the rolled-back state restores the code to the target with no unarchive step AND rides the normal push + PR flow (a PR when `auto_submit_pr` is enabled)
+- **AND** the PR body (or push notification) says the rollback was code-only

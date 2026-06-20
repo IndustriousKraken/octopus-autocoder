@@ -114,6 +114,7 @@ pub(crate) fn build_review_context(
         archived_changes,
         changed_files,
         diff,
+        target: None,
     })
 }
 
@@ -217,6 +218,7 @@ pub(crate) fn build_per_change_contexts(
             archived_changes: vec![brief.clone()],
             changed_files,
             diff,
+            target: None,
         };
         let preamble = build_cross_change_preamble(&brief.name, &briefs);
         contexts.push(PerChangeContext {

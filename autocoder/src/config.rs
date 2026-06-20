@@ -1131,6 +1131,21 @@ pub struct ExecutorConfig {
     pub implementer_cli: Option<CliKind>,
     #[serde(default = "default_executor_timeout")]
     pub timeout_secs: u64,
+    /// Single wall-clock timeout (seconds) for EVERY auxiliary agentic session
+    /// — the verifier gates (`[in]`/`[canon]`/`[rules]`/`[out]`), the code
+    /// reviewer, AND the spec-revision sessions (the `send it` executor AND the
+    /// revision advisor). Defaults to `3600` (one hour) when unset, AND
+    /// overridable. This is the ONE source of the auxiliary-session timeout: no
+    /// auxiliary role embeds its own timeout literal, so raising this one value
+    /// raises the cap for all of them at once.
+    ///
+    /// The implementer is OUT of scope: it keeps its own `timeout_secs` (and the
+    /// derived spec-implicit threshold). The default exists because these
+    /// sessions do real, size-varying work — reading a large diff, judging a
+    /// wide spec delta, rewriting substantial code — AND a short fixed cap
+    /// guillotines a legitimately long task.
+    #[serde(default = "default_agentic_session_timeout")]
+    pub agentic_session_timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
     /// a014: capture of the operator's activated login-shell environment +
@@ -1660,6 +1675,14 @@ impl ExecutorConfig {
         self.startup_jitter_max_secs.unwrap_or(30)
     }
 
+    /// Resolved wall-clock timeout for every auxiliary agentic session (the
+    /// verifier gates, the reviewer, AND the revision sessions). This is the
+    /// SINGLE source every call site routes through; the value is
+    /// `agentic_session_timeout_secs` (default `3600`) wrapped as a `Duration`.
+    pub fn agentic_session_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.agentic_session_timeout_secs)
+    }
+
     /// Effective inter-iteration jitter percentage. Unset → `10`. Clamped
     /// to `100` so a negative offset cannot exceed the base interval (the
     /// arithmetic would otherwise saturate at zero and waste resolution).
@@ -1998,6 +2021,14 @@ pub(crate) fn default_executor_command() -> String {
 
 fn default_executor_timeout() -> u64 {
     1800
+}
+
+/// Default for [`ExecutorConfig::agentic_session_timeout_secs`]: 3600 seconds
+/// (one hour). This is the SOLE place the auxiliary-session timeout default
+/// literal appears; [`ExecutorConfig::agentic_session_timeout`] resolves it for
+/// every gate, the reviewer, AND the revision sessions.
+pub fn default_agentic_session_timeout() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4571,6 +4602,7 @@ github:
             // `ExecutorConfig` + `ExecutorSandboxConfig`.
             "command",
             "timeout_secs",
+            "agentic_session_timeout_secs",
             "sandbox",
             "implementer_prompt_path",
             "changelog_stylist_prompt_path",
@@ -4725,6 +4757,59 @@ github:
         // Reviewer and ChatOps blocks are commented out by default.
         assert!(cfg.reviewer.is_none(), "reviewer must be off by default");
         assert!(cfg.chatops.is_none(), "chatops must be off by default");
+    }
+
+    // ---- unified-agentic-session-timeout ----
+
+    /// Task 4.1: an executor config with `agentic_session_timeout_secs` UNSET
+    /// resolves the one-hour default (3600s) through the single resolver every
+    /// auxiliary role routes through.
+    #[test]
+    fn agentic_session_timeout_unset_resolves_one_hour_default() {
+        // Minimal executor with the field omitted → serde default applies.
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n")
+            .expect("minimal executor parses with the field omitted");
+        assert_eq!(
+            exec.agentic_session_timeout_secs,
+            default_agentic_session_timeout(),
+            "unset field must take the serde default"
+        );
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(3600),
+            "the unset default resolves to one hour"
+        );
+    }
+
+    /// Task 4.2 (resolver half): a CONFIGURED value flows through the single
+    /// resolver `ExecutorConfig::agentic_session_timeout()` that every gate,
+    /// the reviewer, AND the revision sessions consume. Changing the one field
+    /// changes the resolved value for all of them.
+    #[test]
+    fn agentic_session_timeout_configured_value_governs_the_resolver() {
+        let exec: ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 7200\n")
+                .expect("executor with the field set parses");
+        assert_eq!(exec.agentic_session_timeout_secs, 7200);
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(7200),
+            "the configured value is what the single resolver returns"
+        );
+    }
+
+    /// Task 4.1/4.3: the default literal lives in exactly ONE function. The
+    /// resolver wraps THAT function's value, never a second literal — so the
+    /// auxiliary roles cannot drift from the documented default.
+    #[test]
+    fn agentic_session_timeout_default_has_one_source() {
+        assert_eq!(default_agentic_session_timeout(), 3600);
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n").unwrap();
+        // The resolver derives from the default fn, not an independent literal.
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(default_agentic_session_timeout())
+        );
     }
 
     #[test]

@@ -48,12 +48,6 @@ pub const CODE_IMPLEMENTS_SPEC_ROLE: &str = "code_implements_spec";
 /// AND source on demand AND returns its verdict through `submit_verdict`.
 pub const AGENTIC_CODE_IMPLEMENTS_SPEC_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
-/// Wall-clock cap for one code-implements-spec session. Mirrors the
-/// pre-executor gates' bound: the wrapped CLI subprocess is the thing being
-/// bounded. TODO: hard coding this to 15mins is very sus. What if it can't 
-/// finish checking a huge refactor in 15mins?
-const AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// The full `--allowedTools` list the code-implements-spec sandbox grants: the
 /// read-only file tools PLUS the qualified `submit_verdict` MCP tool. Notably
 /// absent: `Bash`, `Write`, `Edit`. Exposed so tests can assert the surface.
@@ -298,6 +292,12 @@ pub struct CodeImplementsSpecCheckCtx {
     /// no-submission case retries — the advisory gate still renders FAILED
     /// TO RUN after the bound is exhausted (gatekeepers-fail-closed standard).
     pub retries: u32,
+    /// Wall-clock cap for one agentic session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the pre-executor
+    /// gates, the reviewer, AND the revision sessions). Set once at daemon
+    /// startup; a timed-out session renders FAILED TO RUN (advisory, never
+    /// blocks) per the fail-closed standard.
+    pub timeout: Duration,
     /// Test-only injected `submit_verdict` submission, bypassing the CLI
     /// subprocess AND the control socket. `Some(Some(p))` stands in for a
     /// recorded payload; `Some(None)` simulates "agent never submitted";
@@ -581,7 +581,7 @@ pub async fn run_code_implements_spec_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT,
+        timeout: ctx.timeout,
     };
     run_code_implements_spec_check_with_runner(
         ctx,
@@ -867,8 +867,30 @@ mod tests {
             // Default to no retry so the canned-runner tests below run the
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
+            timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             test_submission: None,
         }
+    }
+
+    /// unified-agentic-session-timeout task 4.2 ([out] gate): the gate ctx
+    /// carries the value resolved from `executor.agentic_session_timeout_secs`,
+    /// which its CLI verdict session runner feeds to the wrapped CLI.
+    #[test]
+    fn out_gate_ctx_carries_resolved_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 4500\n")
+                .expect("executor parses");
+        let ctx = CodeImplementsSpecCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "T".into(),
+            attribution: Some("anthropic/claude-test".into()),
+            retries: 0,
+            timeout: exec.agentic_session_timeout(),
+            test_submission: None,
+        };
+        assert_eq!(ctx.timeout, exec.agentic_session_timeout());
+        assert_eq!(ctx.timeout, Duration::from_secs(4500));
     }
 
     fn write(p: &Path, body: &str) {

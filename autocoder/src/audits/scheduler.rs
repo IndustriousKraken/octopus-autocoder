@@ -754,6 +754,33 @@ async fn drive_one_audit(
     Ok(true)
 }
 
+/// Maximum number of offending paths a write-policy violation reason names
+/// before it switches to a `(+K more)` summary. Keeps a large violation (an
+/// audit that dirtied hundreds of files) legible in the chatops alert AND the
+/// per-invocation log section while still conveying the full magnitude via the
+/// always-appended total count.
+const OFFENDING_PATHS_CAP: usize = 10;
+
+/// Render a list of offending paths into the violation-reason fragment shared by
+/// every naming arm of [`detect_write_policy_violation`]. Names up to
+/// [`OFFENDING_PATHS_CAP`] paths; when the list is longer, appends a
+/// `(+K more)` summary where `K` is the count beyond the cap; ALWAYS appends the
+/// total count so a truncated list still conveys the full magnitude. The empty
+/// slice (not reached on a real violation path) renders `none [0 total]`.
+fn render_offending_paths(paths: &[String]) -> String {
+    let total = paths.len();
+    if total == 0 {
+        return "none [0 total]".to_string();
+    }
+    let named = paths.len().min(OFFENDING_PATHS_CAP);
+    let mut s = paths[..named].join(", ");
+    if total > OFFENDING_PATHS_CAP {
+        s.push_str(&format!(" (+{} more)", total - OFFENDING_PATHS_CAP));
+    }
+    s.push_str(&format!(" [{total} total]"));
+    s
+}
+
 /// `pub(crate)` so the `pub(crate)` [`detect_write_policy_violation`] does not
 /// expose a more-private return type (a69 also reuses the detector from the
 /// agentic-run tests to assert the read-only write backstop applies to `agy`).
@@ -773,12 +800,18 @@ pub(crate) fn detect_write_policy_violation(
         return None;
     }
     match policy {
-        WritePolicy::None => Some(PolicyViolation {
-            reason: format!(
-                "workspace dirty after audit (expected clean): {} entry(ies)",
-                entries.len()
-            ),
-        }),
+        WritePolicy::None => {
+            // Every entry is offending — the workspace was required to stay
+            // clean. Name the offending paths (capped) instead of only a count
+            // so the operator sees WHICH paths the audit dirtied.
+            let bad_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+            Some(PolicyViolation {
+                reason: format!(
+                    "workspace dirty after audit (expected clean): {}",
+                    render_offending_paths(&bad_paths)
+                ),
+            })
+        }
         WritePolicy::OpenSpecOnly => {
             let bad_paths: Vec<String> = entries
                 .iter()
@@ -791,7 +824,7 @@ pub(crate) fn detect_write_policy_violation(
                 Some(PolicyViolation {
                     reason: format!(
                         "diff includes path(s) outside openspec/changes/: {}",
-                        bad_paths.join(", ")
+                        render_offending_paths(&bad_paths)
                     ),
                 })
             }
@@ -815,7 +848,7 @@ pub(crate) fn detect_write_policy_violation(
                 Some(PolicyViolation {
                     reason: format!(
                         "diff includes path(s) outside the planning lanes (openspec/changes/, {issues_prefix}): {}",
-                        bad_paths.join(", ")
+                        render_offending_paths(&bad_paths)
                     ),
                 })
             }
@@ -2336,8 +2369,107 @@ mod tests {
 
     #[test]
     fn detect_violation_none_with_dirty_workspace_fails() {
-        let v = detect_write_policy_violation(WritePolicy::None, &[se('?', '?', "new-file.txt")]);
+        // task 2.3: a small WritePolicy::None violation NAMES each offending
+        // path AND states the total count, not just a bare count.
+        let entries = [
+            se('?', '?', "new-file.txt"),
+            se(' ', 'M', "src/touched.rs"),
+        ];
+        let v = detect_write_policy_violation(WritePolicy::None, &entries);
         assert!(v.is_some());
+        let reason = v.unwrap().reason;
+        assert!(reason.contains("new-file.txt"), "reason: {reason}");
+        assert!(reason.contains("src/touched.rs"), "reason: {reason}");
+        // Total count is present and reflects every offending entry.
+        assert!(reason.contains("[2 total]"), "reason: {reason}");
+        // Small list (<= cap) carries no truncation summary.
+        assert!(!reason.contains("more)"), "reason: {reason}");
+    }
+
+    #[test]
+    fn render_offending_paths_at_or_below_cap_names_all_without_summary() {
+        // task 2.1: a list at the cap names every path, no `(+ more)` summary,
+        // and states the total count.
+        let paths: Vec<String> = (0..OFFENDING_PATHS_CAP)
+            .map(|i| format!("p{i}.rs"))
+            .collect();
+        let rendered = render_offending_paths(&paths);
+        for p in &paths {
+            assert!(rendered.contains(p.as_str()), "missing {p} in {rendered}");
+        }
+        assert!(!rendered.contains("more)"), "unexpected summary: {rendered}");
+        assert!(
+            rendered.contains(&format!("[{OFFENDING_PATHS_CAP} total]")),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_offending_paths_above_cap_caps_named_with_summary_and_total() {
+        // task 2.2: a list above the cap names exactly the cap's worth, appends
+        // `(+K more)` with the correct K, and states the correct total.
+        let total = OFFENDING_PATHS_CAP + 5;
+        let paths: Vec<String> = (0..total).map(|i| format!("p{i}.rs")).collect();
+        let rendered = render_offending_paths(&paths);
+        // Exactly the cap's worth named: the cap-th path (index CAP-1) is named,
+        // the next one (index CAP) is not.
+        assert!(
+            rendered.contains(&format!("p{}.rs", OFFENDING_PATHS_CAP - 1)),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("p{OFFENDING_PATHS_CAP}.rs")),
+            "rendered should not name beyond the cap: {rendered}"
+        );
+        assert!(rendered.contains("(+5 more)"), "rendered: {rendered}");
+        assert!(rendered.contains(&format!("[{total} total]")), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn detect_violation_none_above_cap_caps_with_summary_and_total() {
+        // task 2.4: a WritePolicy::None violation touching MORE than the cap
+        // caps the named list, appends `(+K more)`, and states the full total.
+        let total = OFFENDING_PATHS_CAP + 3;
+        let entries: Vec<git::StatusEntry> = (0..total)
+            .map(|i| se('?', '?', Box::leak(format!("dirt-{i}.txt").into_boxed_str())))
+            .collect();
+        let v = detect_write_policy_violation(WritePolicy::None, &entries);
+        assert!(v.is_some());
+        let reason = v.unwrap().reason;
+        assert!(reason.contains("(+3 more)"), "reason: {reason}");
+        assert!(reason.contains(&format!("[{total} total]")), "reason: {reason}");
+        // First path named, a beyond-cap path not named.
+        assert!(reason.contains("dirt-0.txt"), "reason: {reason}");
+        assert!(
+            !reason.contains(&format!("dirt-{OFFENDING_PATHS_CAP}.txt")),
+            "reason should not name beyond the cap: {reason}"
+        );
+    }
+
+    #[test]
+    fn detect_violation_openspec_only_above_cap_caps_via_shared_helper() {
+        // task 2.5: the OpenSpecOnly arm routes its out-of-prefix list through
+        // the SAME shared cap helper — more out-of-prefix paths than the cap
+        // produce a capped, `(+K more)`-summarized, total-bearing reason.
+        let bad_total = OFFENDING_PATHS_CAP + 2;
+        let mut entries: Vec<git::StatusEntry> = vec![
+            // An allowed path that must NOT count toward the offending total.
+            se('?', '?', "openspec/changes/x/proposal.md"),
+        ];
+        entries.extend((0..bad_total).map(|i| {
+            se(' ', 'M', Box::leak(format!("src/bad-{i}.rs").into_boxed_str()))
+        }));
+        let v = detect_write_policy_violation(WritePolicy::OpenSpecOnly, &entries);
+        assert!(v.is_some());
+        let reason = v.unwrap().reason;
+        assert!(reason.contains("(+2 more)"), "reason: {reason}");
+        // Total counts only the offending (out-of-prefix) paths.
+        assert!(reason.contains(&format!("[{bad_total} total]")), "reason: {reason}");
+        assert!(reason.contains("src/bad-0.rs"), "reason: {reason}");
+        assert!(
+            !reason.contains("openspec/changes/x/proposal.md"),
+            "allowed path must not appear in offending list: {reason}"
+        );
     }
 
     #[test]

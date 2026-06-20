@@ -334,6 +334,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -392,6 +393,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -457,6 +459,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                     prompt_template,
                     attribution: Some(attribution),
                     retries: cfg.executor.verifier_gate_retries,
+                    timeout: cfg.executor.agentic_session_timeout(),
                     corpus_dir,
                     #[cfg(test)]
                     test_submission: None,
@@ -516,6 +519,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -551,7 +555,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
-                .context("initializing code reviewer from config")?;
+                .context("initializing code reviewer from config")?
+                // Reviewer shares the ONE auxiliary-session timeout
+                // (`executor.agentic_session_timeout_secs`) with the verifier
+                // gates AND the revision sessions; the reviewer block does not
+                // carry the executor field, so it is threaded here.
+                .with_agentic_session_timeout(cfg.executor.agentic_session_timeout());
             // a64: when the effective kind is `agentic` but the resolved
             // reviewer CLI is unavailable on this host, degrade to the
             // `oneshot` HTTP path for the boot (one loud WARN logged inside).

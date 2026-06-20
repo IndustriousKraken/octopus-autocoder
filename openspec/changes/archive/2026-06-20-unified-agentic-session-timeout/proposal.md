@@ -2,10 +2,12 @@
 
 ## Why
 
-Five auxiliary agentic roles each carry their own hardcoded 900-second (15-minute)
-timeout: the reviewer, the `[in]`/`[canon]`/`[rules]` gates, the `[out]` gate, and
-the spec-revision executor + advisor. The number is decided by no one, tunable by
-no one, and duplicated five times. Worse, a fixed 15-minute cap guillotines any
+The auxiliary agentic roles — the reviewer, the four verifier gates
+(`[in]`/`[canon]`/`[rules]`/`[out]`), and the spec-revision executor + advisor —
+run under hardcoded 900-second (15-minute) timeouts, spread across five constants
+(the `[canon]` and `[rules]` gates share one, `CORPUS_CHECK_TIMEOUT`). The number
+is decided by no one and tunable by no one. Worse, a fixed 15-minute cap
+guillotines any
 session whose work is genuinely large — reading a 50,000-line refactor's diff,
 rewriting thousands of lines of spec — failing it not because anything is wrong
 but because the wall clock ran out. The implementer already resolves its timeout
@@ -31,9 +33,14 @@ pattern.
 - Affected specs: `orchestrator-cli` (ADD the single-timeout requirement). Canon
   specifies no timeout values today, so there is no existing requirement to MODIFY.
 - Affected code: add `executor.agentic_session_timeout_secs` (default 3600) to the
-  executor config; route `code_reviewer.rs`, `change_contradiction.rs`,
-  `corpus_check.rs`, `code_implements_spec.rs`, and `polling/revision_session.rs`
-  to read it instead of their local constants; update CONFIG.md.
+  executor config; route every call site off the five constants and onto the
+  resolved value — `code_reviewer.rs` (`AGENTIC_REVIEW_TIMEOUT`),
+  `preflight/change_contradiction.rs` (`AGENTIC_CONTRADICTION_TIMEOUT`),
+  `code_implements_spec.rs` (`AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT`),
+  `polling/revision_session.rs` (`REVISION_SESSION_TIMEOUT`), AND all THREE
+  consumers of `CORPUS_CHECK_TIMEOUT`: `preflight/corpus_check.rs`,
+  `preflight/canon_contradiction.rs` (the `[canon]` gate), AND
+  `preflight/global_rules.rs` (the `[rules]` gate). Update CONFIG.md.
 - The implementer is unchanged (keeps `executor.timeout_secs`). This is the
   configurable-base form; a progress/inactivity-based timeout that scales with
   work automatically is a possible later refinement, not part of this change.

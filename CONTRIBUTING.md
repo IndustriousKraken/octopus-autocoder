@@ -101,3 +101,47 @@ avoid wedging on a one-off, it retries a **bounded** number of times
 (`executor.verifier_gate_retries`, default `2`) and then enters the errored
 state. Retrying forever, or falling through to pass once the bound is
 exhausted, both violate the invariant.
+
+### Second axis: the gatekeeper contains no judgment
+
+Everything above closes one fail-open axis — *an inability to run collapsing
+into a pass*. There is a second, independent axis: the code that **manufactures
+the verdict** itself. A gatekeeper can satisfy every clause above — no error, no
+default, no zero-item aggregation — and still pass work that nothing evaluated,
+because the code decided the outcome instead of an agent. A pass nothing judged
+is fail-open by construction even though nothing errored.
+
+For a gatekeeper whose verdict is a matter of judgment (the reviewer, a
+verifier, an audit that gates `send it`), that judgment belongs to an agent, not
+to the code. The code's responsibilities are **exactly four**:
+
+1. **Initialize to the non-passing state** (the first axis).
+2. **Assemble the inputs** — the prompt and the materials to evaluate.
+3. **Invoke the agent.**
+4. **Surface the agent's returned verdict verbatim.**
+
+The code synthesizes **no** verdict. Two traps follow:
+
+- **The code never derives the verdict by inspecting the inputs.** A
+  code-authored conclusion — most often *"the materials to evaluate are absent
+  or empty, so this passes"* — is a **manufactured pass**, not a judgment, even
+  though no error occurred. When the inputs make a genuine agent evaluation
+  impossible, the outcome is the **failed-to-run** state (first axis), never a
+  synthesized pass. Example non-conformance to avoid: an `[out]` gate that finds
+  no spec delta and emits a pass instead of failing to run (and locating the
+  delta at its archived path).
+- **The agent is never handed an option set that forecloses failure.** The
+  verdict mechanism — the MCP submission tool's schema *and* the prompt that
+  frames it — must let the agent express a **failing** verdict with its own
+  **prose alone**. Structured detail (gap lists, concern arrays) may accompany a
+  verdict but is **never a precondition** for returning a failing one. A prompt
+  or schema built so that pass is the only expressible answer is fail-open by
+  construction. Example non-conformance to avoid: a verdict mechanism that
+  requires structured detail before a failing verdict can be submitted.
+
+The reviewer is again the reference shape: it assembles the diff and prompt,
+invokes the agent, and surfaces what the agent returns — a session with no valid
+submission is `Discarded { reason }`, never a code-chosen `Approve`. Apply both
+axes whenever you add or change a gate; the canonical requirement
+(`project-documentation` → *Control-plane gatekeepers fail closed, never to a
+passing verdict*) carries both, so `drift_audit` and the `[canon]` gate read it.

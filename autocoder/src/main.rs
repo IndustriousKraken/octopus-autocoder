@@ -53,6 +53,7 @@ mod queue;
 mod rag;
 mod recovery_classification;
 mod revision_thread;
+mod rollback;
 mod revisions;
 mod sandbox;
 mod spec_revision;
@@ -60,6 +61,7 @@ mod spec_root;
 mod spec_storage_routing;
 mod state;
 mod submission_store;
+mod survival;
 #[cfg(test)]
 mod testing;
 mod tool_probe;

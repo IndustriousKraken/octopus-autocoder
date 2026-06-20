@@ -19,6 +19,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
             implementer_cli: None,
             command: String::new(),
             timeout_secs: 60,
+            agentic_session_timeout_secs: crate::config::default_agentic_session_timeout(),
             sandbox: None,
             agent_env: None,
             implementer_prompt_path: None,
@@ -76,15 +77,20 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
 }
 
 pub mod audit;
+pub mod blame;
 pub mod changelog;
 pub mod check_config;
 pub mod doctor;
 pub mod inspect;
 pub mod install;
+pub mod log;
 pub mod pkg_manager;
 pub mod reload;
+pub mod review;
 pub mod rewind;
+pub mod rollback;
 pub mod run;
+pub mod survives;
 pub mod sync_specs;
 pub mod sync_specs_deps;
 
@@ -297,6 +303,108 @@ pub enum Command {
         command: InspectSubcommand,
     },
 
+    /// On-demand code review of a PR, commit, file-set, or described area
+    /// (on-demand-code-review). Connects to the running daemon's control
+    /// socket and submits the `review_target` action, which runs the agentic
+    /// reviewer against the resolved surface AND reports the verdict. The
+    /// review is advisory + read-only: it opens no revision and changes no
+    /// code or marker. Requires a running daemon (the reviewer and workspace
+    /// live in the daemon).
+    Review {
+        /// Repository URL or short-name substring (matched the same way the
+        /// chatops `review` verb matches).
+        repo: String,
+
+        /// The review target: `pr <N>`, `commit <sha>`, `files <path> [<path>
+        /// ...]`, OR a free-text description (the reviewer locates the files
+        /// itself). Captured as the trailing positional arguments.
+        #[arg(required = true, trailing_var_arg = true)]
+        target: Vec<String>,
+    },
+
+    /// List a managed repository's recent base-branch commits (short SHA,
+    /// subject, date; newest first). Read-only: modifies nothing. Used to
+    /// choose a rollback depth. Requires a running daemon (the repository
+    /// workspace lives in the daemon).
+    Log {
+        /// Repository URL or short-name substring (matched the same way the
+        /// chatops `log` verb matches).
+        repo: String,
+
+        /// How many commits to list (default 20).
+        #[arg(long)]
+        count: Option<usize>,
+    },
+
+    /// Survival analysis (review-survival-provenance): report which of a
+    /// past PR's OR commit's changes still survive verbatim in the current
+    /// base-branch tree, naming the surviving files AND line regions so an
+    /// operator can review only still-live code. Read-only: modifies
+    /// nothing. The report states its boundary plainly — it detects
+    /// VERBATIM survival (it under-reports surviving-but-edited lines AND
+    /// never over-reports). Requires a running daemon (the repository
+    /// workspace lives in the daemon).
+    Survives {
+        /// Repository URL or short-name substring.
+        repo: String,
+
+        /// Survival target: `pr <N>` OR `commit <sha>`. Captured as the
+        /// trailing positional arguments.
+        #[arg(required = true, trailing_var_arg = true)]
+        target: Vec<String>,
+
+        /// Apply `git blame -M -C` move/copy detection (heuristic; does NOT
+        /// change the verbatim-vs-semantic boundary).
+        #[arg(long, default_value_t = false)]
+        detect_moves: bool,
+    },
+
+    /// Provenance lookup (review-survival-provenance): trace current
+    /// line(s) of a file to the commit that last introduced them (short
+    /// SHA, subject, date), naming the PR when the commit subject names one
+    /// (no fabricated PR). Read-only. Requires a running daemon.
+    Blame {
+        /// Repository URL or short-name substring.
+        repo: String,
+
+        /// File path (workspace-relative).
+        path: String,
+
+        /// A single line `N` or an inclusive range `M-N`.
+        line: String,
+
+        /// Apply `git blame -M -C` move/copy detection.
+        #[arg(long, default_value_t = false)]
+        detect_moves: bool,
+    },
+
+    /// Code-rollback recovery: roll a repository's CODE back by a commit
+    /// count OR to a target SHA WHILE unarchiving the OpenSpec changes AND
+    /// issues archived in the rolled-back range (returning them to the
+    /// active lanes to be re-gated AND re-implemented). The untrusted code
+    /// is discarded; the sound spec/issue work re-enters the pipeline. Rides
+    /// the normal push + PR flow (honoring `auto_submit_pr`) — it does NOT
+    /// force-push the base branch. DRY-RUN IS THE DEFAULT: without
+    /// `--confirm`, it reports exactly what WOULD happen, changing nothing.
+    /// Requires a running daemon.
+    Rollback {
+        /// Repository URL or short-name substring.
+        repo: String,
+
+        /// Roll back the last N commits on the base branch.
+        #[arg(long, conflicts_with = "to")]
+        count: Option<usize>,
+
+        /// Roll back to this commit SHA (full or short).
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Actually perform the rollback (after a confirmation prompt).
+        /// Without this flag the command is a dry-run preview only.
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+    },
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -351,6 +459,33 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
         },
         Command::Inspect { command } => inspect::dispatch(command).await,
+        Command::Review { repo, target } => review::execute(repo, target).await,
+        Command::Log { repo, count } => log::execute(repo, count).await,
+        Command::Survives {
+            repo,
+            target,
+            detect_moves,
+        } => survives::execute(repo, target, detect_moves).await,
+        Command::Blame {
+            repo,
+            path,
+            line,
+            detect_moves,
+        } => blame::execute(repo, path, line, detect_moves).await,
+        Command::Rollback {
+            repo,
+            count,
+            to,
+            confirm,
+        } => {
+            rollback::execute(rollback::RollbackArgs {
+                repo,
+                count,
+                to,
+                confirm,
+            })
+            .await
+        }
         Command::Rewind {
             changes,
             config: config_path,

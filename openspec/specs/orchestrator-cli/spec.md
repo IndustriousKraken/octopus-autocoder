@@ -7916,3 +7916,230 @@ Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the
 - **THEN** the per-issue failure counter is cleared
 - **AND** no `.perma-stuck.json` marker remains for that slug
 
+### Requirement: Survival analysis — what of a past PR or commit is still live
+The orchestrator SHALL provide an analysis that reports which of a past pull request's OR commit's changes still survive verbatim in the current base-branch tree, so an operator can review long-past work that is still live AND spec a fix for surviving problems. It SHALL be available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> survives <repo-substring> <pr <N> | commit <sha>>`), resolving the repository by the same selector rule the other operator commands use. It SHALL be read-only.
+
+The analysis SHALL resolve the target to a commit (or commit-set: a single commit, OR a PR's commits / squash-merge commit) AND, for each file that target modified, determine which of the lines it ADDED still attribute to that target at the current `HEAD`:
+
+- As a cheap per-file pre-filter, a file the target touched that NO later commit has touched (`git log <target>..HEAD -- <file>` is empty) SHALL be reported as fully surviving — every hunk the target made there is still present, without line-level blame.
+- For a file later modified, the analysis SHALL use `git blame` at `HEAD` to keep the target's added lines that STILL attribute to the target; lines later overwritten attribute to a newer commit AND are reported as not surviving.
+
+The report SHALL summarize, per file, how much of the target survives (e.g. fully / partially with the surviving line regions / not at all) AND an overall count, newest-relevant first, naming the target.
+
+The analysis SHALL state its boundary plainly in its output: it detects VERBATIM survival, not semantic survival. Because `git blame` attributes a line to the LAST commit that touched it, a line the target introduced that was later reformatted, renamed, or moved attributes to the newer commit AND is reported as not surviving even if its substance persists. The analysis therefore UNDER-reports survival (it may miss surviving-but-edited lines) AND never over-reports (a line reported as surviving is the target's exact text). Move/copy detection (`git blame -M -C`) MAY be applied to recover relocated lines; it is heuristic AND does not change the verbatim-vs-semantic boundary.
+
+The surviving regions SHALL be consumable as the focus of an on-demand review (the operator can review only what is still live) — the analysis names the surviving files AND line regions in a form the review command can target.
+
+#### Scenario: A file untouched since the target survives fully via the cheap pre-filter
+- **WHEN** the target modified a file AND `git log <target>..HEAD -- <file>` is empty
+- **THEN** the file is reported as fully surviving without running line-level blame
+
+#### Scenario: A later-modified file is resolved line-by-line via blame
+- **WHEN** the target modified a file that a later commit also touched
+- **THEN** the analysis reports the target's added lines that still attribute to the target at `HEAD` as surviving, AND those overwritten by a newer commit as not surviving
+
+#### Scenario: The report states the verbatim-survival boundary
+- **WHEN** the analysis produces its report
+- **THEN** the report states that it detects verbatim survival (under-reports survival, never over-reports) — a line reported as surviving is the target's exact text
+- **AND** the per-file/overall survival counts are shown, naming the target
+
+#### Scenario: Survival output can focus an on-demand review
+- **WHEN** an operator follows a survival report with an on-demand review
+- **THEN** the surviving files AND line regions are available as the review target so only still-live code is reviewed
+
+### Requirement: Provenance lookup — where a line was introduced
+The orchestrator SHALL provide the inverse of survival analysis: given a file AND a line (or line range) in the current tree, report the commit that last introduced it AND the pull request that commit belongs to, so a problem found in current code can be traced to its origin AND the operator can decide between rolling back (recent) AND spec/issue-ing a fix (older). It SHALL be available as a CLI subcommand AND a chatops verb (`@<bot> blame <repo-substring> <path> <line>[-<line>]`), resolve the repository by the standard selector rule, AND be read-only.
+
+The lookup SHALL run `git blame` for the named line(s) at `HEAD`, report each line's introducing commit (short SHA, subject, date), AND — when the commit can be associated with a pull request (e.g. a merge commit, OR a commit whose PR is discoverable via the forge) — name that PR. When no PR association is found, the commit alone is reported.
+
+#### Scenario: A current line is traced to its introducing commit
+- **WHEN** an operator requests provenance for a file AND line range
+- **THEN** the response names, per line, the commit that last introduced it (short SHA, subject, date)
+
+#### Scenario: The introducing commit's PR is named when discoverable
+- **WHEN** the introducing commit can be associated with a pull request
+- **THEN** the response names that PR alongside the commit
+- **AND** when no PR association is found, the commit alone is reported (no fabricated PR)
+
+### Requirement: List recent commits for a managed repository
+The orchestrator SHALL provide a way to list a managed repository's recent commits from one place, so an operator choosing a rollback depth can see the history without leaving the management surface. It SHALL be available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> log <repo-substring> [<count>]`), resolving the repository by the same selector rule the other operator commands use. The listing SHALL show, per commit, at least the short SHA, the subject, AND the commit date, newest first, bounded by a count (default a small page, e.g. 20). This is a read-only command: it SHALL NOT modify any branch, workspace, or marker.
+
+#### Scenario: Listing shows recent commits newest-first
+- **WHEN** an operator requests the commit log for a resolved repository with a count N
+- **THEN** the response lists up to N of the base branch's most recent commits, newest first, each with its short SHA, subject, AND date
+- **AND** no branch, workspace, or marker is modified
+
+#### Scenario: Selector resolution matches the other operator commands
+- **WHEN** the repo-substring resolves to zero OR multiple repositories
+- **THEN** the response reports the ambiguity / no-match the same way the other operator commands do (listing candidates), rather than acting on a guess
+
+### Requirement: Code-rollback recovery rolls back code while unarchiving its specs and issues
+The orchestrator SHALL provide a recovery operation that rolls a managed repository's CODE back by a chosen depth WHILE preserving the OpenSpec changes AND issues that were archived in the rolled-back range — moving them back to the active lanes rather than discarding them. The motivating case: code that merged WITHOUT being gate-checked is not to be trusted, but the spec/issue work that drove it is sound AND should re-enter the pipeline to be re-implemented under the controls. A plain `git reset`/`revert` cannot express this, because the orchestrator commits the implementation, the archive move, AND the canonical-spec fold together — so reverting the commits would discard the spec work entirely, back to before it existed.
+
+The operation SHALL accept a rollback depth as EITHER a commit count (roll back the last N commits) OR a target commit SHA (roll back to that commit), resolved against the repository's base branch.
+
+The operation SHALL ride the normal push + PR flow rather than force-pushing the base branch directly: it prepares the rolled-back state on the agent branch AND goes through the SAME push + PR-creation path as any change, honoring the per-repo `auto_submit_pr` setting — a pull request the operator reviews AND merges when `auto_submit_pr` is enabled (the default), OR a pushed agent branch with no PR (the `BranchPushedNoPr` outcome) when an installation has set it false. The operation SHALL NOT special-case a force-push to the base branch; it produces reviewable commits through the established flow, AND git history remains the backstop.
+
+Within the rolled-back range, the operation SHALL:
+
+- Restore the CODE (every path outside `openspec/` AND outside the issues lane) to its state at the rollback target — the untrusted implementation is discarded.
+- For each OpenSpec change archived in the range, UNARCHIVE it: the change returns to `openspec/changes/<slug>/` (active), its canonical-spec fold is undone, so it is pending again AND will be re-gated AND re-implemented. It is NOT reverted to non-existence.
+- For each issue archived in the range, UNARCHIVE it: the issue unit returns from `issues/archive/` to the active `issues/` lane.
+- Leave changes/issues archived OUTSIDE the range untouched (still archived, canon intact).
+
+The operation SHALL be fail-loud AND reviewable: the PR body SHALL enumerate the commits rolled back, the changes/issues unarchived, AND state plainly that the code was discarded while the specs/issues were returned to the pipeline. Because it discards code, the operation SHALL require explicit confirmation before it acts (a confirmation prompt for the CLI, OR a two-step confirm for the chatops verb), mirroring the other destructive operator commands. A dry run (default for the CLI, OR an explicit preview) SHALL report exactly what WOULD be rolled back AND unarchived without changing anything.
+
+#### Scenario: Rollback by count discards code and unarchives specs via the normal flow
+- **WHEN** an operator rolls a repository back by N commits AND those commits archived one or more changes/issues
+- **THEN** it rides the normal push + PR flow (opening a PR when `auto_submit_pr` is enabled, the default; otherwise a pushed branch with no PR), NOT a force-push to base, with the agent branch's tree holding the code restored to the rollback target
+- **AND** each change archived in the range is moved back to `openspec/changes/<slug>/` with its canon fold undone (active, to be re-gated and re-implemented)
+- **AND** each issue archived in the range is moved back to the active `issues/` lane
+- **AND** the PR body enumerates the rolled-back commits AND the unarchived changes/issues
+
+#### Scenario: Rollback to a SHA is equivalent to the count form
+- **WHEN** an operator rolls back to a specific commit SHA instead of a count
+- **THEN** the same restore-code / unarchive-specs-and-issues operation runs against that target
+- **AND** the result is a PR with identical structure to the count form
+
+#### Scenario: Specs and issues archived outside the range are untouched
+- **WHEN** the rollback range covers some archived changes/issues but not others
+- **THEN** only the changes/issues archived WITHIN the range are unarchived
+- **AND** changes/issues archived before the range stay archived AND their canon fold is intact
+
+#### Scenario: Confirmation is required and a dry run changes nothing
+- **WHEN** the operation is invoked without confirmation (OR in dry-run/preview mode)
+- **THEN** it reports the commits it WOULD roll back AND the changes/issues it WOULD unarchive
+- **AND** it does NOT modify any branch, workspace, archive, or canon until the operator confirms
+
+#### Scenario: Code-only range is a plain rollback through the normal flow
+- **WHEN** the rolled-back range archived NO changes AND NO issues (code-only commits)
+- **THEN** the rolled-back state restores the code to the target with no unarchive step AND rides the normal push + PR flow (a PR when `auto_submit_pr` is enabled)
+- **AND** the PR body (or push notification) says the rollback was code-only
+
+### Requirement: On-demand code review of a PR, commit, or target
+The orchestrator SHALL let an operator request a code review on demand — outside the normal per-pass flow — from one management surface, available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> review <repo-substring> <target>`), resolving the repository by the same selector rule the other operator commands use. The review SHALL run the existing agentic reviewer (its sandbox, `submit_review`, AND reads-on-demand behavior unchanged) AND report the resulting verdict + concerns back to the operator: as a reply in the originating chat channel, AND — when the target is a PR — optionally as a comment on that PR.
+
+The target SHALL be one of:
+
+- `pr <number>` — review the pull request's diff. The diff is resolved from the repository's local clone (the PR's base..head range); the review surface is that diff + its changed files.
+- `commit <sha>` — review a single commit's diff (`git show <sha>`).
+- `files <path> [<path> ...]` — review the current content of the named files (a TARGET review: no diff; the reviewer reads the files on demand).
+- a free-text description — review the area the description names; the reviewer locates the relevant files itself (via `Glob`/`Grep`) AND reviews them (a TARGET review).
+
+The on-demand review SHALL be advisory AND read-only: it SHALL NOT modify code, open a revision, NOR change any marker — it reports findings; the operator decides what to do with them (e.g. roll the implementation back, OR spec/issue a fix). A review whose session fails to produce a valid verdict SHALL surface that failure (per the gatekeepers-fail-closed standard) rather than reporting a clean pass.
+
+A target spanning many files (a broad area, OR the whole codebase) SHALL be SCOPED rather than forced into a single oversized prompt: the orchestrator SHALL chunk the target (e.g. per file or per module) into multiple reviewer sessions AND aggregate their findings into one report, so a large review degrades into bounded sessions rather than overflowing the model's context. When a target is bounded enough for one session, a single session is used.
+
+#### Scenario: Review a PR posts a verdict
+- **WHEN** an operator requests `@<bot> review <repo> pr <N>`
+- **THEN** the orchestrator resolves the PR's diff from the local clone AND runs the agentic reviewer over it
+- **AND** it reports the verdict + concerns to the operator (a chat reply, AND optionally a PR comment)
+- **AND** it opens no revision AND modifies no code or marker
+
+#### Scenario: Review a commit
+- **WHEN** an operator requests `@<bot> review <repo> commit <sha>`
+- **THEN** the reviewer reviews that commit's diff AND the verdict is reported back
+
+#### Scenario: Review a file-set with no diff
+- **WHEN** an operator requests `@<bot> review <repo> files src/a.rs src/b.rs`
+- **THEN** the reviewer runs a TARGET review over the current content of those files (no diff) AND reports the verdict
+
+#### Scenario: Review a described area, reviewer finds the files
+- **WHEN** an operator requests a review by free-text description of functionality
+- **THEN** the reviewer locates the relevant files itself (via `Glob`/`Grep`) AND reviews them
+- **AND** the verdict names the files it actually reviewed so the operator can see the scope it chose
+
+#### Scenario: A large target is chunked and aggregated, not one giant prompt
+- **WHEN** the target spans more files than fit one bounded session (a broad area or the whole codebase)
+- **THEN** the orchestrator runs multiple reviewer sessions over chunks (per file or per module) AND aggregates their findings into one report
+- **AND** no single session is handed an oversized prompt
+
+#### Scenario: On-demand review is advisory and read-only
+- **WHEN** any on-demand review completes with findings
+- **THEN** it reports them to the operator AND does NOT open a revision, modify code, or change any marker
+- **AND** a session that fails to produce a valid verdict surfaces the failure rather than reporting a clean pass
+
+### Requirement: Marker-clear operator commands accept wildcard targets
+The marker-clear operator commands `clear-perma-stuck` AND `clear-revision` SHALL accept a wildcard target so an operator can clear markers in bulk without naming each change OR each repository. In addition to the exact form (`clear-<kind> <repo-substring> <change-slug>`), the parser SHALL recognize:
+
+- `clear-<kind> <repo-substring> *` — clear EVERY marker of that kind in the one resolved repository.
+- `clear-<kind> *` — clear EVERY marker of that kind across ALL configured repositories.
+
+The literal `*` is a wildcard sentinel, NOT a change-slug NOR a repo-substring. Its ACCEPTANCE at the parser — recognized for these two verbs before the change-slug / repo-substring regex, exempt from those patterns — is defined by the chatops-manager "Argument sanitization at parser entry" requirement; THIS requirement defines what the sentinel DOES (the bulk clear below). A change-slug position is therefore either a sanitized slug OR `*`; a repo-substring position is either a sanitized substring OR `*`; every non-`*` argument is sanitized as the chatops-manager requirement specifies.
+
+The wildcard sweep is a DISTINCT operation from a single-target clear: when the target is `*`, the action enumerates the marker directories itself AND SHALL NOT pass `*` through the single-slug resolver defined by the "Partial change-slug resolution in marker-clearing control-socket actions" requirement. That resolver continues to govern ONLY non-`*` (single-target) clears, where it resolves an exact-or-prefix `change` value as before; `*` is intercepted ahead of it AND never reaches it. (This is why a single-slug resolver that has not been taught about `*` would otherwise return `NoMatch` for a literal `*` — the sweep path must branch before resolution.)
+
+Bulk clearing SHALL be fail-loud, never silent: the reply SHALL enumerate what was cleared — each repository AND each change/marker removed — AND SHALL report a repository (or the whole fleet) that had no matching markers as an explicit "nothing to clear" result rather than an empty reply. A per-repository failure (e.g. a workspace that cannot be read) SHALL NOT abort the sweep; it is reported alongside the successes. Wildcard clearing removes ONLY the named marker kind (`clear-perma-stuck` → `.perma-stuck.json`; `clear-revision` → `.needs-spec-revision.json`), matching the exact-form behavior, including `clear-perma-stuck`'s removal of an accompanying `.ignore-for-queue.json` when present.
+
+#### Scenario: Wildcard clears all markers of a kind in one repo
+- **WHEN** an operator posts `@<bot> clear-perma-stuck your-repo *` AND `your-repo` resolves to one repository
+- **THEN** every `.perma-stuck.json` marker in that repository is removed
+- **AND** the reply enumerates each change whose marker was cleared
+- **AND** if the repository had no such markers, the reply says so explicitly
+
+#### Scenario: Fleet-wide wildcard clears across all repositories
+- **WHEN** an operator posts `@<bot> clear-revision *`
+- **THEN** every `.needs-spec-revision.json` marker across ALL configured repositories is removed
+- **AND** the reply enumerates, per repository, the changes whose markers were cleared
+- **AND** a repository with no matching markers is reported as such, not omitted silently
+
+#### Scenario: A per-repository failure does not abort the fleet sweep
+- **WHEN** a fleet-wide wildcard clear runs AND one repository's markers cannot be read or removed
+- **THEN** the sweep continues across the remaining repositories
+- **AND** the reply reports the failed repository AND cause alongside the repositories that were cleared
+
+#### Scenario: The wildcard sweep bypasses the single-slug resolver
+- **WHEN** a marker-clear action receives the wildcard target `*`
+- **THEN** it branches to the sweep enumeration BEFORE invoking the single-slug resolver (`resolve_change_prefix`), so `*` is never resolved as an exact-or-prefix `change` value
+- **AND** the single-slug resolver is invoked ONLY for non-`*` targets, where its exact-or-prefix behavior is unchanged
+
+#### Scenario: The exact-target forms are unchanged
+- **WHEN** an operator posts `@<bot> clear-perma-stuck your-repo a06-foo` (no wildcard)
+- **THEN** the behavior is exactly as before — the single named marker is cleared, with the same success AND not-found replies
+
+### Requirement: One configurable timeout for gate, review, and revision sessions
+The wall-clock timeout for every auxiliary agentic session — the verifier gates (`[in]`, `[canon]`, `[rules]`, `[out]`), the code reviewer, AND the spec-revision sessions (the `send it` executor AND the revision advisor) — SHALL be resolved from a SINGLE configurable value, NOT from a per-role hardcoded constant. The value SHALL be `executor.agentic_session_timeout_secs`, defaulting to `3600` (one hour) when unset, AND overridable in config. There SHALL be exactly one source of this timeout; no auxiliary-session role embeds its own timeout literal.
+
+The implementer is OUT of scope: it retains its existing `executor.timeout_secs` (and the derived spec-implicit threshold). This requirement governs the auxiliary agentic sessions that previously each carried their own fixed constant.
+
+The default exists because these sessions do real work whose size varies — reading a large diff, judging a wide spec delta, rewriting substantial code — AND a short fixed cap guillotines a legitimately long task. An operator whose repositories run large refactors or spec rewrites raises the one value rather than hunting per-role constants.
+
+This timeout's exhaustion is a session failure, surfaced per the gatekeepers-fail-closed standard: a gate/reviewer/revision session that times out enters its failed-to-run state (it does NOT pass), naming the timeout AND the resolved value in its diagnostic.
+
+#### Scenario: Unset uses the one-hour default
+- **WHEN** `executor.agentic_session_timeout_secs` is unset
+- **THEN** every gate, reviewer, AND revision session uses a 3600-second timeout
+- **AND** no auxiliary-session role applies a different, role-private timeout value
+
+#### Scenario: The configured value governs every auxiliary session
+- **WHEN** `executor.agentic_session_timeout_secs` is set to a value
+- **THEN** the verifier gates, the reviewer, AND the revision sessions all use that value
+- **AND** changing it in one place changes the timeout for all of them
+
+#### Scenario: A timed-out session fails to run, never passes
+- **WHEN** an auxiliary agentic session exceeds the resolved timeout
+- **THEN** the session enters its failed-to-run state per the gatekeepers-fail-closed standard (a blocking gate holds; an advisory gate/reviewer renders an explicit failed-to-run result), never a pass
+- **AND** the diagnostic names the timeout AND the resolved value
+
+### Requirement: An audit write-policy violation names the offending paths
+When a periodic audit trips its write-policy post-check (the workspace carried an unexpected working-tree change after the audit ran), the operator-facing violation reason — the text rendered into the chatops alert AND the audit-run log's violation section — SHALL name the offending path(s), regardless of which `WritePolicy` was violated. A bare count ("N entry(ies)") is insufficient: the operator cannot tell whether the change was harmless tooling ephemera or a real escape without re-deriving it from the workspace.
+
+This generalizes the behavior the prefix-allowlist policies already have (`WritePolicy::OpenSpecOnly` and `WritePolicy::PlanningLanes` reasons already list the paths outside their allowed prefix) to the clean-workspace policy (`WritePolicy::None`), so all three violation reasons name what was written. For `WritePolicy::None` every dirty entry is offending (nothing is allowed); for the prefix-allowlist policies the offending set is the entries outside the allowed prefix(es), as today.
+
+To keep the alert bounded when a single run dirties many files (e.g. a build or cache directory), the reason SHALL list the offending paths up to a fixed cap AND, when more remain, append a remaining-count summary (e.g. "+K more") rather than emitting an unbounded list. The count SHALL still be present so the operator knows the total magnitude. The full, uncapped set remains available in the audit-run log's existing porcelain section.
+
+#### Scenario: A WritePolicy::None violation names the dirty path
+- **WHEN** an audit declaring `WritePolicy::None` leaves the workspace with an unexpected entry (e.g. `opencode.json`)
+- **THEN** the violation reason names that path
+- **AND** the reason still conveys the total number of offending entries
+
+#### Scenario: The prefix-allowlist policies still name their out-of-lane paths
+- **WHEN** an audit declaring `WritePolicy::OpenSpecOnly` or `WritePolicy::PlanningLanes` writes a path outside its allowed prefix(es)
+- **THEN** the violation reason names the out-of-lane path(s), as before
+
+#### Scenario: A large offending set is capped with a remaining-count summary
+- **WHEN** a violation's offending set exceeds the display cap
+- **THEN** the reason lists paths up to the cap AND appends a summary of how many more were omitted
+- **AND** the total count is still conveyed
+- **AND** the audit-run log still records the full, uncapped working-tree status
+

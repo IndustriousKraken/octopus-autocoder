@@ -22,9 +22,9 @@ changes; it never rolls back base-branch code, so it cannot do this.
   `@<bot> log <repo> [N]` chatops verb) — lists a repo's recent commits so the
   operator picks a rollback depth by looking, from the same management surface.
 - A new `orchestrator-cli` recovery operation that rolls a repo's code back by a
-  commit count OR to a target SHA, expressed as a PULL REQUEST (not a direct base
-  push — it rides the normal flow; an install that pushes directly to the real
-  repo is in that posture by its own choice, with git history as the backstop).
+  commit count OR to a target SHA, riding the normal push + PR flow (honoring the
+  per-repo `auto_submit_pr` setting — a PR by default, or a pushed branch with no
+  PR when an install set it false) rather than force-pushing the base branch.
   Within the rolled-back range it: restores the code to the target (discards the
   untrusted implementation); unarchives each OpenSpec change back to
   `openspec/changes/<slug>/` with its canon fold undone (pending, to be re-gated

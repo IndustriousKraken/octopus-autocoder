@@ -40,10 +40,6 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::time::Duration;
 
-/// Wall-clock cap for one advisor OR edit session. Mirrors the contradiction
-/// gates' bound (a59).
-const REVISION_SESSION_TIMEOUT: Duration = Duration::from_secs(900);
-
 // =====================================================================
 // Shared helpers
 // =====================================================================
@@ -196,6 +192,11 @@ trait AdvisorSessionRunner: Send + Sync {
 struct CliAdvisorRunner<'a> {
     command: String,
     model: &'a crate::agentic_run::ResolvedModel,
+    /// Wall-clock cap for the session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the verifier gates
+    /// AND the reviewer). Carried by the `[in]` gate ctx the revision sessions
+    /// reuse for their model + command.
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -225,7 +226,7 @@ impl AdvisorSessionRunner for CliAdvisorRunner<'_> {
                 },
                 model: Some(self.model),
                 output_mode: crate::agentic_run::OutputMode::Capture,
-                timeout: REVISION_SESSION_TIMEOUT,
+                timeout: self.timeout,
                 paths: None,
                 settings_dir: None,
                 include_autocoder_tools: false,
@@ -246,7 +247,7 @@ impl AdvisorSessionRunner for CliAdvisorRunner<'_> {
         if outcome.timed_out {
             return Err(anyhow!(
                 "revision-advisor session timed out after {}s",
-                REVISION_SESSION_TIMEOUT.as_secs()
+                self.timeout.as_secs()
             ));
         }
         Ok(outcome.stdout.trim().to_string())
@@ -300,6 +301,7 @@ pub async fn process_pending_revision_advise(
     let runner = CliAdvisorRunner {
         command: cc_ctx.command.clone(),
         model: &cc_ctx.model,
+        timeout: cc_ctx.timeout,
     };
     advise_with_runner(workspace, ctx, request, &transcript, &runner).await
 }
@@ -504,6 +506,11 @@ trait EditSessionRunner: Send + Sync {
 struct CliEditRunner<'a> {
     command: String,
     model: &'a crate::agentic_run::ResolvedModel,
+    /// Wall-clock cap for the session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the verifier gates
+    /// AND the reviewer). Carried by the `[in]` gate ctx the revision sessions
+    /// reuse for their model + command.
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -535,7 +542,7 @@ impl EditSessionRunner for CliEditRunner<'_> {
                 },
                 model: Some(self.model),
                 output_mode: crate::agentic_run::OutputMode::Capture,
-                timeout: REVISION_SESSION_TIMEOUT,
+                timeout: self.timeout,
                 paths: None,
                 settings_dir: None,
                 include_autocoder_tools: false,
@@ -556,7 +563,7 @@ impl EditSessionRunner for CliEditRunner<'_> {
         if outcome.timed_out {
             return Err(anyhow!(
                 "revision-executor session timed out after {}s",
-                REVISION_SESSION_TIMEOUT.as_secs()
+                self.timeout.as_secs()
             ));
         }
         Ok(())
@@ -725,6 +732,7 @@ pub async fn process_pending_revision_execute(
     let edit = CliEditRunner {
         command: in_ctx.command.clone(),
         model: &in_ctx.model,
+        timeout: in_ctx.timeout,
     };
     let regate = GatesReGateRunner {
         in_ctx: Some(in_ctx.clone()),
