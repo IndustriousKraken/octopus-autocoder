@@ -1068,6 +1068,48 @@ fn review_diff_artifact_rel(slug: &str) -> String {
     format!(".autocoder-review-diff-{key}.patch")
 }
 
+/// RAII guard for the agentic reviewer's transient unified-diff artifact. It
+/// writes the diff to a sandbox-readable dotfile at the workspace root on
+/// construction (so the read-only session can `Read` it on demand instead of
+/// receiving the diff inlined) AND removes it on `Drop`. Because `Drop` runs
+/// on EVERY exit path — normal return, an early `?`, a timeout, OR a panic —
+/// the run leaves no diff-artifact litter in the workspace whether the session
+/// succeeded, failed, OR timed out. This mirrors the MCP-config cleanup done
+/// around the same session, but as an RAII guard so no exit path can skip it.
+struct DiffArtifactGuard {
+    path: std::path::PathBuf,
+}
+
+impl DiffArtifactGuard {
+    /// Write `diff` to the slug-keyed artifact under `workspace` AND return a
+    /// guard that removes it on drop. A write failure is logged at WARN (the
+    /// agent then sees an empty/absent diff file) rather than aborting the
+    /// review — the artifact path is still tracked so the drop cleanup runs.
+    fn write(workspace: &Path, slug: &str, diff: &str) -> Self {
+        let path = workspace.join(review_diff_artifact_rel(slug));
+        if let Err(e) = std::fs::write(&path, diff) {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to write reviewer diff artifact; the agent will see an empty diff file: {e}"
+            );
+        }
+        Self { path }
+    }
+}
+
+impl Drop for DiffArtifactGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    "failed to remove reviewer diff artifact: {e}"
+                );
+            }
+        }
+    }
+}
+
 /// Render the agentic reviewer's prompt from a [`ReviewContext`] (a58):
 /// the change briefs, the changed-file PATH list (NOT full contents), AND a
 /// reference to the unified-diff artifact at `diff_artifact_rel` (NOT the
@@ -1207,17 +1249,11 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         // Write the unified diff to the artifact the prompt references, so the
         // read-only agent `Read`s it on demand instead of receiving it inlined
         // (which would overflow the model's context on a large pass). The
-        // artifact lives at the workspace root (a dotfile the agent can Read)
-        // and is removed after the session below, regardless of outcome.
-        let diff_artifact = self
-            .workspace
-            .join(review_diff_artifact_rel(slug));
-        if let Err(e) = std::fs::write(&diff_artifact, diff) {
-            tracing::warn!(
-                path = %diff_artifact.display(),
-                "failed to write reviewer diff artifact; the agent will see an empty diff file: {e}"
-            );
-        }
+        // artifact lives at the workspace root (a dotfile the agent can Read);
+        // the RAII guard removes it on drop — after this session returns,
+        // errors, OR times out — so the run leaves no diff-artifact litter,
+        // even on the early `?` paths below.
+        let _diff_artifact = DiffArtifactGuard::write(self.workspace, slug, diff);
 
         // Write the per-execution MCP config advertising `submit_review`.
         // `change == REVIEWER_ROLE` keys the submission-store entry; this
@@ -1273,17 +1309,11 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         )
         .await;
 
-        // Always remove the config AND the diff artifact we wrote, regardless
-        // of run outcome — the run leaves no reviewer litter in the workspace.
+        // Always remove the per-execution MCP config, regardless of run
+        // outcome — the run leaves no reviewer litter in the workspace. The
+        // diff artifact is removed by `_diff_artifact`'s drop at scope exit
+        // (which also covers the early `?` returns below).
         crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
-        if let Err(e) = std::fs::remove_file(&diff_artifact) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %diff_artifact.display(),
-                    "failed to remove reviewer diff artifact: {e}"
-                );
-            }
-        }
 
         let outcome = result.context("spawning agentic reviewer subprocess")?;
         if outcome.timed_out {
@@ -4068,6 +4098,65 @@ this is not yaml: at all: ::: {{{ broken
             huge.len(),
             "prompt length must not depend on diff size (diff is referenced, not inlined)"
         );
+    }
+
+    /// 3.3: the diff artifact is created BEFORE the session (so the read-only
+    /// agent can `Read` it) AND removed AFTER it (so the run leaves no litter).
+    /// The artifact path the guard writes is exactly the one the prompt
+    /// references via `review_diff_artifact_rel`, with the diff body as content.
+    #[test]
+    fn diff_artifact_guard_writes_before_and_removes_after_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slug = "demo-change";
+        let path = dir.path().join(review_diff_artifact_rel(slug));
+        assert!(!path.exists(), "no artifact before the session");
+        {
+            // Construction == "before the session": the artifact exists AND
+            // holds the diff body the prompt points the agent at.
+            let _guard = DiffArtifactGuard::write(dir.path(), slug, "DIFFBODY");
+            assert!(path.exists(), "artifact created before the session");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "DIFFBODY",
+                "the artifact holds the unified diff the agent reads on demand"
+            );
+        } // guard drops here == "after the session"
+        assert!(!path.exists(), "artifact removed after the session");
+    }
+
+    /// 3.3 (error/timeout paths): the guard's drop removes the artifact even
+    /// when the enclosing scope returns early via `?` — the same early-return
+    /// shape `run_session` takes on a subprocess error OR a session timeout —
+    /// so no artifact survives a failed or timed-out run.
+    #[test]
+    fn diff_artifact_guard_removes_on_error_or_timeout_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(review_diff_artifact_rel(""));
+        // A closure that constructs the guard then bails — mirroring the
+        // `result.context(...)?` / `outcome.timed_out → Err` early returns.
+        let run = || -> Result<()> {
+            let _guard = DiffArtifactGuard::write(dir.path(), "", "X");
+            assert!(path.exists(), "artifact present while the session runs");
+            Err(anyhow!("simulated subprocess failure / timeout"))
+        };
+        assert!(run().is_err(), "the session errored (or timed out)");
+        assert!(
+            !path.exists(),
+            "the artifact is removed even when the session errors or times out"
+        );
+    }
+
+    /// 2.3: a per_change session and a bundled session resolve DISTINCT,
+    /// change-scoped artifact paths, so concurrent per-change sessions cannot
+    /// collide on or clobber each other's diff artifact.
+    #[test]
+    fn per_change_and_bundled_diff_artifacts_are_distinct() {
+        let a = review_diff_artifact_rel("change-a");
+        let b = review_diff_artifact_rel("change-b");
+        let bundled = review_diff_artifact_rel("");
+        assert_ne!(a, b, "each per-change session has its own artifact path");
+        assert_ne!(a, bundled, "a per-change artifact differs from the bundled one");
+        assert!(a.contains("change-a"), "the path is scoped to the change slug");
     }
 
     /// 4.3: a schema-valid `submit_review` payload round-trips
