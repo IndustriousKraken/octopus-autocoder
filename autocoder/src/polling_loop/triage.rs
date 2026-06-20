@@ -319,6 +319,13 @@ pub(crate) async fn process_completed_triage(
     let branch = format!("{agent_branch}-triage-spec");
     git::recreate_branch(workspace, &branch)
         .with_context(|| format!("audit-triage: recreate `{branch}`"))?;
+    // guard-canon-and-archive (Catch layer): before staging, revert any canon
+    // edit OR archive entry the triage session produced (its planning-lane
+    // writes are preserved). The existing `discard_non_spec_writes` keeps all of
+    // `openspec/changes/` AND `issues/`, so it would let an archive entry under
+    // `.../archive/` ride into the PR — this closes that. Fail-closed.
+    crate::canon_guard::enforce(workspace, "audit triage")
+        .with_context(|| "audit-triage: canon/archive guard".to_string())?;
     git::add_all(workspace).with_context(|| "audit-triage: staging planning-lane paths".to_string())?;
     let subject = if lane_is_spec {
         format!("audit-triage spec proposal from {}", state.audit_type)

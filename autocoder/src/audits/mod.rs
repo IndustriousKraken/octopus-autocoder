@@ -545,6 +545,17 @@ pub fn write_sandbox_settings(
         deny.push("Write(*)".to_string());
         deny.push("Edit(*)".to_string());
     }
+    // guard-canon-and-archive (Prevent layer): deny writes under
+    // `openspec/specs/` AND execution of `openspec archive` for EVERY session.
+    // The executor allows `Write`/`Edit` (deny_writes == false), so without
+    // these it could fold canon or archive a change mid-run — both are
+    // autocoder-only. Redundant no-ops for read-only roles (which already deny
+    // `Write(*)`/`Edit(*)`); the `openspec archive` deny is added here
+    // unconditionally so it holds even if an operator overrides the default
+    // `disallowed_bash_patterns`. See [`crate::canon_guard`].
+    for entry in crate::canon_guard::SANDBOX_DENY_ENTRIES {
+        deny.push((*entry).to_string());
+    }
     for pat in &sandbox.disallowed_bash_patterns {
         deny.push(format!("Bash({pat})"));
     }

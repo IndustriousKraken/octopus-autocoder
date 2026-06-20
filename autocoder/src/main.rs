@@ -9,6 +9,7 @@ mod alerts;
 mod attribution;
 mod audits;
 mod busy_marker;
+mod canon_guard;
 mod changelog_requests;
 mod changelog_triage;
 mod chatops;

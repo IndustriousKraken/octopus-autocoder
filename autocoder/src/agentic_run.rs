@@ -1277,6 +1277,19 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
     )
     .context("generating sandbox settings file")?;
 
+    // guard-canon-and-archive (Teach layer): a writing session
+    // (`deny_writes == false` — the implementer, the spec-revision executor, a
+    // spec-writing audit, audit triage, OR a proposer) is pointed at the
+    // repository's `OCTOPUS.md` for the workflow conventions AND the
+    // canon/archive constraints when that file is present; an absent file is a
+    // graceful no-op. Read-only sessions (the reviewer, the gates, advisory
+    // audits) are unaffected — their prompts are not augmented.
+    let prompt_for_run: String = if opts.sandbox.deny_writes {
+        opts.prompt.to_string()
+    } else {
+        crate::canon_guard::with_octopus_directive(opts.workspace, opts.prompt)
+    };
+
     let streaming = matches!(opts.output_mode, OutputMode::Streaming);
     let emit_stream_json = streaming || opts.emit_stream_json_in_capture;
 
@@ -1404,7 +1417,7 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
     };
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(opts.prompt.as_bytes()).await;
+        let _ = stdin.write_all(prompt_for_run.as_bytes()).await;
     }
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -1420,7 +1433,7 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
                 paths,
                 opts.workspace,
                 opts.change,
-                opts.prompt,
+                &prompt_for_run,
                 opts.timeout,
             )
             .await

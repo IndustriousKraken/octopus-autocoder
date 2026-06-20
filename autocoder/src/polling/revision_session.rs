@@ -891,6 +891,19 @@ async fn run_revision_execute(
         }
     }
 
+    // guard-canon-and-archive (Catch layer): revert any canon edit OR archive
+    // entry the revision executor produced before staging. The staging below is
+    // already scoped to the change dir (so canon could not ride into the PR
+    // regardless), but this reverts the working-tree pollution AND surfaces the
+    // violation — the fail-closed backstop. A guard error here is logged, not
+    // fatal: the change-dir-scoped staging already prevents a leak.
+    if let Err(e) = crate::canon_guard::enforce(workspace, "spec-revision executor") {
+        tracing::warn!(
+            change = %change_slug,
+            "spec-revision: canon/archive guard error (continuing — staging is change-dir-scoped): {e:#}"
+        );
+    }
+
     // Clean re-gate → stage the change directory's revised deltas, then
     // unstage the daemon's `.needs-spec-revision.json` marker so it never
     // rides into the PR (it is untracked bookkeeping, not a spec delta).

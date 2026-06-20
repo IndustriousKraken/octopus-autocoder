@@ -313,6 +313,12 @@ pub(crate) async fn process_completed_proposal(
     let spec_branch = format!("{agent_branch}-chat-spec");
     git::recreate_branch(workspace, &spec_branch)
         .with_context(|| format!("chat-triage: recreate `{spec_branch}`"))?;
+    // guard-canon-and-archive (Catch layer): before staging, revert any canon
+    // edit OR archive entry the proposer produced (its own change-dir deltas
+    // are preserved) so the spec PR carries deltas only — canon and the archive
+    // are autocoder-only. Fail-closed.
+    crate::canon_guard::enforce(workspace, "proposer")
+        .with_context(|| "chat-triage: canon/archive guard".to_string())?;
     git::add_all(workspace).with_context(|| "chat-triage: staging spec paths".to_string())?;
     let subject = format!("chat-triage spec proposal (request {})", state.request_id);
     git::commit(workspace, &subject)

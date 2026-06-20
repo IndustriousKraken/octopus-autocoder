@@ -219,6 +219,14 @@ fn handle_completed_outcome(
             reason: "agent attempted lazy archive (rename only, no implementation)".into(),
         });
     } else {
+        // guard-canon-and-archive (Catch layer): the session's diff is in the
+        // working tree now, BEFORE autocoder's own archive step below. Revert
+        // any canon edit OR archive entry the SESSION produced (preserving its
+        // implementation + change-dir writes) so it cannot bypass the
+        // post-executor gate or double-apply on merge. Fail-closed: a revert
+        // error aborts rather than committing a canon/archive write.
+        crate::canon_guard::enforce(workspace, "changes-lane implementer")
+            .context("canon/archive guard for the changes-lane implementer")?;
         // Build the commit subject BEFORE the archive rename: it
         // reads `openspec/changes/<change>/proposal.md`, which the
         // archive step moves to `openspec/changes/archive/...`.

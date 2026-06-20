@@ -780,17 +780,26 @@ pub(crate) fn detect_write_policy_violation(
             ),
         }),
         WritePolicy::OpenSpecOnly => {
+            // guard-canon-and-archive: a path under `openspec/changes/` is
+            // allowed EXCEPT the autocoder-only archive subtree
+            // (`openspec/changes/archive/`) — archiving a change is the daemon's
+            // job, so a spec-writing audit that creates an archive entry is a
+            // violation even though it sits inside the allowed prefix.
             let bad_paths: Vec<String> = entries
                 .iter()
                 .map(|e| e.path.clone())
-                .filter(|p| !p.starts_with("openspec/changes/"))
+                .filter(|p| {
+                    !p.starts_with("openspec/changes/")
+                        || crate::canon_guard::classify(p)
+                            == Some(crate::canon_guard::GuardKind::Archive)
+                })
                 .collect();
             if bad_paths.is_empty() {
                 None
             } else {
                 Some(PolicyViolation {
                     reason: format!(
-                        "diff includes path(s) outside openspec/changes/: {}",
+                        "diff includes path(s) outside openspec/changes/ (or under the autocoder-only archive): {}",
                         bad_paths.join(", ")
                     ),
                 })
@@ -802,11 +811,18 @@ pub(crate) fn detect_write_policy_violation(
             // walker reads via `ISSUES_SUBDIR`). Any other path (source,
             // docs, config) is a violation that reverts the whole diff.
             let issues_prefix = format!("{}/", crate::lanes::issues::ISSUES_SUBDIR);
+            // guard-canon-and-archive: as for `OpenSpecOnly`, a path under
+            // either lane is allowed EXCEPT the autocoder-only archive subtrees
+            // (`openspec/changes/archive/`, `<issues>/archive/`) — archiving is
+            // the daemon's job, so an archive entry is a violation even inside
+            // an otherwise-allowed lane.
             let bad_paths: Vec<String> = entries
                 .iter()
                 .map(|e| e.path.clone())
                 .filter(|p| {
-                    !p.starts_with("openspec/changes/") && !p.starts_with(&issues_prefix)
+                    (!p.starts_with("openspec/changes/") && !p.starts_with(&issues_prefix))
+                        || crate::canon_guard::classify(p)
+                            == Some(crate::canon_guard::GuardKind::Archive)
                 })
                 .collect();
             if bad_paths.is_empty() {
@@ -814,7 +830,7 @@ pub(crate) fn detect_write_policy_violation(
             } else {
                 Some(PolicyViolation {
                     reason: format!(
-                        "diff includes path(s) outside the planning lanes (openspec/changes/, {issues_prefix}): {}",
+                        "diff includes path(s) outside the planning lanes (openspec/changes/, {issues_prefix}) or under the autocoder-only archive: {}",
                         bad_paths.join(", ")
                     ),
                 })
@@ -2358,6 +2374,38 @@ mod tests {
         let v = detect_write_policy_violation(WritePolicy::OpenSpecOnly, &entries);
         assert!(v.is_some());
         assert!(v.unwrap().reason.contains("src/lib.rs"));
+    }
+
+    // guard-canon-and-archive: an archive entry under `openspec/changes/archive/`
+    // is a violation even though it sits inside the otherwise-allowed
+    // `openspec/changes/` prefix — archiving a change is autocoder-only.
+    #[test]
+    fn detect_violation_openspec_only_rejects_archive_entry() {
+        let entries = [
+            se('?', '?', "openspec/changes/new/proposal.md"),
+            se('?', '?', "openspec/changes/archive/2026-06-20-new/proposal.md"),
+        ];
+        let v = detect_write_policy_violation(WritePolicy::OpenSpecOnly, &entries);
+        assert!(v.is_some());
+        assert!(v.unwrap().reason.contains("archive"));
+    }
+
+    // guard-canon-and-archive: same for the two-lane `PlanningLanes` policy —
+    // an archive entry under either lane's `.../archive/` is a violation.
+    #[test]
+    fn detect_violation_planning_lanes_rejects_archive_entry() {
+        let entries = [
+            se('?', '?', "issues/new-issue/issue.md"),
+            se('?', '?', "openspec/changes/archive/2026-06-20-new/proposal.md"),
+        ];
+        let v = detect_write_policy_violation(WritePolicy::PlanningLanes, &entries);
+        assert!(v.is_some());
+        // A non-archive write under either lane stays allowed.
+        let ok = [
+            se('?', '?', "issues/new-issue/issue.md"),
+            se('?', '?', "openspec/changes/new/proposal.md"),
+        ];
+        assert!(detect_write_policy_violation(WritePolicy::PlanningLanes, &ok).is_none());
     }
 
     #[test]
