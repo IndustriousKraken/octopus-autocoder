@@ -16,7 +16,7 @@ walker and the `issues > changes > audits` unit-selection precedence. It does NO
 turn on autonomous triage of public GitHub issues — that is separately gated by
 `features.scout.include_issues` and remains opt-in. So default-on does not
 introduce any autonomous public-facing behavior; it makes the daemon work
-committed and audit-written `issues/<slug>/` units.
+committed and audit-written issue units.
 
 ## What Changes
 
