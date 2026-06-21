@@ -97,6 +97,20 @@ pub trait Forge: Send + Sync {
         draft: bool,
     ) -> Result<CreatedPr>;
 
+    /// Update an existing PR/MR's title AND body. Used by the confirmed-rollback
+    /// PR step to RETITLE a reused agent-branch PR to the rollback (the
+    /// force-push already updated its head), instead of raw-creating — which
+    /// fails when a PR already exists for the head. Returns the PR's HTML URL.
+    async fn update_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+        token: &str,
+    ) -> Result<String>;
+
     /// List open PRs whose head and base match the given qualifiers. Used by
     /// the polling loop to skip an iteration when a PR is already pending.
     async fn list_open_prs(
@@ -240,6 +254,19 @@ impl Forge for GithubForge {
             draft,
         )
         .await
+    }
+
+    async fn update_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+        token: &str,
+    ) -> Result<String> {
+        github::update_pull_request_at(&self.api_base, owner, repo, pr_number, title, body, token)
+            .await
     }
 
     async fn list_open_prs(

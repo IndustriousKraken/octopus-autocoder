@@ -449,6 +449,19 @@ pub const WORKSPACE_CLI_ARTIFACT_EXCLUDES: &[&str] = &[
     ANTIGRAVITY_MCP_CONFIG_FILENAME,
 ];
 
+/// Build-output paths registered in the workspace-local `.git/info/exclude` at
+/// workspace init (alongside [`WORKSPACE_CLI_ARTIFACT_EXCLUDES`]). Because
+/// `.git/info/exclude` is LOCAL to the clone and is NOT part of any restored
+/// tree, it survives a rollback that DELETES the repo's `.gitignore` (restoring
+/// to a target that predates it), so `git add -A` never stages stale build
+/// output even when the rolled-back tree carries no `.gitignore`. This is a
+/// fleet-wide commit-hygiene guarantee, not rollback-only: it also keeps
+/// normal-pass and OCTOPUS.md-provisioning commits from staging build output in
+/// any repo whose tracked `.gitignore` does not cover it. `.git/info/exclude`
+/// only affects UNTRACKED files, so a repo that legitimately tracks `target/`
+/// is unaffected.
+pub const WORKSPACE_BUILD_OUTPUT_EXCLUDES: &[&str] = &["target/"];
+
 /// Env var carrying a SUPPLIED provider key for the `opencode` strategy. The
 /// workspace `opencode.json` references it as `{env:...}` (so the raw secret is
 /// never written into that committed file); the strategy sets the variable to

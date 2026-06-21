@@ -520,32 +520,15 @@ pub fn try_acquire_with(
                 // that PID. Fall back to the marker's `pgid` only when
                 // no sidecar exists (older daemon, or the subprocess
                 // never started).
-                let sidecar_pid = read_subprocess_marker(paths, workspace);
-                let target_pgid = sidecar_pid.unwrap_or(existing.pgid);
-                let wait_pid: u32 = match sidecar_pid {
-                    Some(p) if p > 0 => p as u32,
-                    _ => existing.pid,
-                };
                 tracing::warn!(
                     path = %path.display(),
                     pid = existing.pid,
                     marker_pgid = existing.pgid,
-                    sidecar_pgid = ?sidecar_pid,
-                    target_pgid,
                     age_secs,
                     stage = %existing.stage.as_str(),
                     "busy_marker: stuck (PID alive past threshold); killing process group and clearing"
                 );
-                ops.killpg_terminate(target_pgid);
-                // SIGKILL fallback after a short grace window. Wait on
-                // the actual subprocess PID (sidecar) when present so
-                // we observe the orphaned tree's exit, not autocoder's.
-                ops.wait_for_exit(wait_pid, Duration::from_secs(5));
-                if ops.pid_alive(wait_pid) {
-                    ops.killpg_kill(target_pgid);
-                }
-                let _ = std::fs::remove_file(&path);
-                remove_subprocess_marker(paths, workspace);
+                force_reclaim(paths, workspace, &existing, ops);
                 if attempt == 0 {
                     continue;
                 }
@@ -563,6 +546,54 @@ pub fn try_acquire_with(
         }
     }
     unreachable!("loop exits via return in all branches");
+}
+
+/// Forcibly reclaim a held busy marker: kill the holder's process group and
+/// clear the marker file + its subprocess sidecar. This is the SINGLE
+/// kill-and-clear mechanism shared by BOTH the age-based stuck-recovery branch
+/// of [`try_acquire_with`] AND the confirmed-rollback forceful escalation
+/// (`control_socket::preempt_and_force_acquire_busy_marker`). After this
+/// returns, the marker file is gone, so a follow-on `try_acquire_with` (or the
+/// stuck branch's loop-back) creates a fresh marker and yields `Acquired`.
+///
+/// Kill-target precedence mirrors the stuck branch: prefer the subprocess
+/// sidecar PID (the spawned executor, which lives in its own process group)
+/// over the marker's recorded `pgid` (autocoder's own group at acquire time).
+/// SIGTERM → bounded 5s wait → SIGKILL-if-still-alive → remove both files.
+///
+/// `marker` is the held marker's parsed contents (for the `pgid`/`pid`
+/// fallback). The kill goes through the injected [`ProcessOps`] seam so tests
+/// drive it without signalling a real process.
+pub fn force_reclaim(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    marker: &BusyMarker,
+    ops: &dyn ProcessOps,
+) {
+    let sidecar_pid = read_subprocess_marker(paths, workspace);
+    let target_pgid = sidecar_pid.unwrap_or(marker.pgid);
+    let wait_pid: u32 = match sidecar_pid {
+        Some(p) if p > 0 => p as u32,
+        _ => marker.pid,
+    };
+    tracing::warn!(
+        pid = marker.pid,
+        marker_pgid = marker.pgid,
+        sidecar_pgid = ?sidecar_pid,
+        target_pgid,
+        "busy_marker: force_reclaim — SIGTERM process group, wait, SIGKILL if alive, clear marker"
+    );
+    ops.killpg_terminate(target_pgid);
+    // SIGKILL fallback after a short grace window. Wait on the actual
+    // subprocess PID (sidecar) when present so we observe the orphaned tree's
+    // exit, not autocoder's.
+    ops.wait_for_exit(wait_pid, Duration::from_secs(5));
+    if ops.pid_alive(wait_pid) {
+        ops.killpg_kill(target_pgid);
+    }
+    let path = marker_path(paths, workspace);
+    let _ = std::fs::remove_file(&path);
+    remove_subprocess_marker(paths, workspace);
 }
 
 fn read_marker(path: &Path) -> Result<BusyMarker> {

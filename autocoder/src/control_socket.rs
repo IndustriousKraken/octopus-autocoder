@@ -1889,6 +1889,49 @@ pub async fn preempt_and_acquire_busy_marker(
     .await
 }
 
+/// FORCEFUL variant of [`preempt_and_acquire_busy_marker`] for the CONFIRMED,
+/// operator-acknowledged destructive rollback. After the SAME polite preempt
+/// (iteration cancel + `PreemptSignaller` SIGTERM + bounded marker-release
+/// wait), this ESCALATES on a still-held (`SkipFreshInProgress`) OR
+/// PID-reuse-suspected (`SkipAmbiguous`) marker instead of returning `Busy`: it
+/// drives the busy-marker forced reclaim (`busy_marker::force_reclaim` —
+/// SIGKILL the process group, clear the marker file + subprocess sidecar) and
+/// re-acquires. The reclaim fires regardless of marker age — the operator's
+/// confirmation, not `stuck_threshold_secs`, is the authority.
+///
+/// Terminal outcomes are ONLY `Acquired` (possibly via the escalation) OR
+/// `Internal` (a real filesystem error). It NEVER returns `Busy`. The polite
+/// preempt the non-destructive ops use is unchanged.
+pub async fn preempt_and_force_acquire_busy_marker(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    preempt_and_acquire_busy_marker_inner(
+        state,
+        repo,
+        workspace,
+        &RealSignaller,
+        &busy_marker::RealProcessOps,
+        true,
+    )
+    .await
+}
+
+/// Test-injectable forceful variant. Mirrors
+/// [`preempt_and_acquire_busy_marker_with`] but escalates to a forced reclaim
+/// on a stuck/ambiguous marker (the confirmed-rollback behavior).
+#[cfg(test)]
+pub async fn preempt_and_force_acquire_busy_marker_with(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    signaller: &dyn PreemptSignaller,
+    ops: &(dyn busy_marker::ProcessOps + Send + Sync),
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    preempt_and_acquire_busy_marker_inner(state, repo, workspace, signaller, ops, true).await
+}
+
 /// Test-injectable variant of [`preempt_and_acquire_busy_marker`]. The
 /// `signaller` seam lets unit tests record the SIGTERM target without
 /// killing a real process group; the `ops` seam lets them drive the
@@ -1900,6 +1943,24 @@ pub async fn preempt_and_acquire_busy_marker_with(
     workspace: &Path,
     signaller: &dyn PreemptSignaller,
     ops: &(dyn busy_marker::ProcessOps + Send + Sync),
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    preempt_and_acquire_busy_marker_inner(state, repo, workspace, signaller, ops, false).await
+}
+
+/// Shared body for the polite ([`preempt_and_acquire_busy_marker_with`]) AND
+/// forceful ([`preempt_and_force_acquire_busy_marker_with`]) preempt-and-acquire
+/// paths. `forceful == false` is the polite preempt the non-destructive ops use
+/// (maps a still-held / ambiguous marker to `Busy`). `forceful == true` is the
+/// confirmed-rollback escalation: on a still-held / ambiguous marker it drives
+/// `busy_marker::force_reclaim` (SIGKILL + clear) and re-acquires, so it NEVER
+/// returns `Busy`.
+async fn preempt_and_acquire_busy_marker_inner(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    signaller: &dyn PreemptSignaller,
+    ops: &(dyn busy_marker::ProcessOps + Send + Sync),
+    forceful: bool,
 ) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
     let cfg = state.last_config.load_full();
     let stale_threshold_secs = cfg.executor.busy_marker_stale_threshold_secs();
@@ -1989,11 +2050,32 @@ pub async fn preempt_and_acquire_busy_marker_with(
             guard,
             preempted_change,
         }),
+        Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) if forceful => {
+            // CONFIRMED destructive override: the operator authorized killing
+            // an unrecognized holder. Forcibly reclaim past the ambiguity.
+            tracing::warn!(
+                url = %repo.url,
+                pid = m.pid,
+                "rollback: forceful escalation — reclaiming ambiguous (PID-reuse-suspected) marker"
+            );
+            escalate_force_reclaim(state, repo, workspace, ops, &m, preempted_change)
+        }
         Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => Err(PreemptAcquireError::Busy(format!(
             "repository `{}` is busy with an unrecognized holder (PID {} alive, PID-reuse suspected); \
              refusing to preempt — investigate before retrying",
             repo.url, m.pid
         ))),
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) if forceful => {
+            // CONFIRMED destructive override: the marker did not release within
+            // the bounded wait. Forcibly reclaim regardless of age.
+            tracing::warn!(
+                url = %repo.url,
+                pid = details.marker.pid,
+                age_secs = details.age_secs,
+                "rollback: forceful escalation — reclaiming still-held marker (did not release in time)"
+            );
+            escalate_force_reclaim(state, repo, workspace, ops, &details.marker, preempted_change)
+        }
         Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) => {
             Err(PreemptAcquireError::Busy(format!(
                 "repository `{}` is still busy after the preempt wait \
@@ -2003,6 +2085,55 @@ pub async fn preempt_and_acquire_busy_marker_with(
         }
         Err(e) => Err(PreemptAcquireError::Internal(format!(
             "acquiring busy marker for `{}`: {e:#}",
+            repo.url
+        ))),
+    }
+}
+
+/// The forced-reclaim escalation shared by both escalating arms of
+/// [`preempt_and_acquire_busy_marker_inner`]. Drives `busy_marker::force_reclaim`
+/// (SIGKILL the holder's process group + clear the marker file and subprocess
+/// sidecar — the SAME kill-and-clear mechanism the age-based stuck branch uses)
+/// against the held `marker`, then re-acquires. A cleared marker yields
+/// `Acquired`; a residual still-held marker (should not happen after a clear)
+/// OR a filesystem error maps to `Internal` — NEVER `Busy`.
+fn escalate_force_reclaim(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    ops: &(dyn busy_marker::ProcessOps + Send + Sync),
+    marker: &busy_marker::BusyMarker,
+    preempted_change: Option<String>,
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    busy_marker::force_reclaim(&state.paths, workspace, marker, ops);
+    let stale_threshold_secs = state
+        .last_config
+        .load_full()
+        .executor
+        .busy_marker_stale_threshold_secs();
+    match busy_marker::try_acquire_with(
+        &state.paths,
+        workspace,
+        &repo.url,
+        stale_threshold_secs,
+        ops,
+    ) {
+        Ok(busy_marker::AcquireOutcome::Acquired(guard)) => Ok(PreemptAcquireOutcome {
+            guard,
+            preempted_change,
+        }),
+        Ok(other) => Err(PreemptAcquireError::Internal(format!(
+            "rollback forceful reclaim cleared the marker for `{}` but re-acquire still saw it held \
+             ({}); this should not happen after a force_reclaim",
+            repo.url,
+            match other {
+                busy_marker::AcquireOutcome::Acquired(_) => "acquired",
+                busy_marker::AcquireOutcome::SkipFreshInProgress(_) => "skip-fresh-in-progress",
+                busy_marker::AcquireOutcome::SkipAmbiguous(_) => "skip-ambiguous",
+            }
+        ))),
+        Err(e) => Err(PreemptAcquireError::Internal(format!(
+            "re-acquiring busy marker for `{}` after forceful reclaim: {e:#}",
             repo.url
         ))),
     }
@@ -3531,10 +3662,16 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
     // → PR). The `_busy_guard` binding keeps the marker held until the
     // handler returns; its `Drop` releases on EVERY path (success OR error),
     // so no new pass can start mid-op.
+    // CONFIRMED rollback is the operator's emergency override: it uses the
+    // FORCEFUL reclaim (escalate past a stuck/ambiguous marker instead of
+    // failing `Busy`), so it always ends up holding the marker. It therefore
+    // never returns a "still busy" error — only an Internal filesystem error.
     let (_busy_guard, preempted_change) =
-        match preempt_and_acquire_busy_marker(state, &repo, &workspace).await {
+        match preempt_and_force_acquire_busy_marker(state, &repo, &workspace).await {
             Ok(outcome) => (outcome.guard, outcome.preempted_change),
             Err(PreemptAcquireError::Busy(msg)) => {
+                // Unreachable for the forceful path (it escalates rather than
+                // returning Busy); surfaced defensively rather than panicking.
                 return json!({"ok": false, "error": msg});
             }
             Err(PreemptAcquireError::Internal(msg)) => {
@@ -3577,19 +3714,11 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
         Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
     };
     let preview = crate::rollback::format_preview(&workspace, &plan);
-    let collisions = crate::rollback::detect_collisions(&workspace, &plan);
 
-    // A collision is fail-loud (never silently overwrite active work).
-    if !collisions.is_empty() {
-        return json!({
-            "ok": false,
-            "error": format!(
-                "rollback aborted: {} in-range unit(s) collide with existing active directories. \
-                 Resolve them, then retry. Preview:\n{preview}",
-                collisions.len()
-            ),
-        });
-    }
+    // A CONFIRMED rollback does NOT abort on collisions: it RECONCILES to the
+    // target state (active-exactly-once, redundant archive entry removed) in
+    // `prepare_rolled_back_tree` below. The dry-run path above still reports
+    // `has_collisions` informationally; the confirmed path resolves them.
 
     // Prepare the rolled-back state on a FRESH agent branch at the base tip,
     // so the rollback rides the normal push + PR flow rather than
@@ -3662,7 +3791,11 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
         });
     }
 
-    match crate::polling_loop::open_triage_pull_request(
+    // Reuse an existing agent-branch PR (the force-push already updated its
+    // head) instead of raw-creating, which 422s when a PR already exists; the
+    // existing PR's title + body are updated to the rollback. Create only when
+    // none exists.
+    match crate::polling_loop::open_or_update_rollback_pull_request(
         &state.paths,
         &repo,
         &github_cfg,
@@ -7365,12 +7498,16 @@ github:
     struct PreemptMockOps {
         alive: Vec<u32>,
         comms: std::collections::HashMap<u32, String>,
+        killpg_terminate_called: StdMutex<Vec<i32>>,
+        killpg_kill_called: StdMutex<Vec<i32>>,
     }
     impl PreemptMockOps {
         fn new() -> Self {
             Self {
                 alive: Vec::new(),
                 comms: std::collections::HashMap::new(),
+                killpg_terminate_called: StdMutex::new(Vec::new()),
+                killpg_kill_called: StdMutex::new(Vec::new()),
             }
         }
         fn with_alive(mut self, pid: u32) -> Self {
@@ -7389,8 +7526,12 @@ github:
         fn read_comm(&self, pid: u32) -> Option<String> {
             self.comms.get(&pid).cloned()
         }
-        fn killpg_terminate(&self, _pgid: i32) {}
-        fn killpg_kill(&self, _pgid: i32) {}
+        fn killpg_terminate(&self, pgid: i32) {
+            self.killpg_terminate_called.lock().unwrap().push(pgid);
+        }
+        fn killpg_kill(&self, pgid: i32) {
+            self.killpg_kill_called.lock().unwrap().push(pgid);
+        }
         fn wait_for_exit(&self, _pid: u32, _max: std::time::Duration) {}
     }
 
@@ -7611,6 +7752,118 @@ github:
         cancel.cancel();
     }
 
+    /// unconditional-rollback §3.1 — the FORCEFUL path escalates on a
+    /// still-held marker (the polite path would classify SkipFreshInProgress):
+    /// it fires the busy-marker forced reclaim (SIGKILL the process group +
+    /// clear the marker) and returns `Acquired`, NEVER `Busy`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forceful_escalates_on_still_held_marker_and_acquires() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = dir.path().join("ws-forceful-held");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Live pid, comm matches, age BELOW threshold → the polite acquire
+        // classifies SkipFreshInProgress (would be `Busy` for a non-destructive
+        // op). marker.pgid = 1234 (set by write_marker), no sidecar.
+        let live = std::process::id();
+        write_marker(&state.paths, &workspace, live, "claude", 10, "a07-foo");
+        let sig = RecordingSignaller::new();
+        let ops = PreemptMockOps::new().with_alive(live).with_comm(live, "claude");
+
+        // Zero drain timeout so the bounded marker-release wait returns at once
+        // (the marker stays held, driving the escalation).
+        let mut cfg2 = cfg.clone();
+        cfg2.executor.wipe_drain_timeout_secs = 0;
+        state.last_config.store(Arc::new(cfg2));
+
+        let outcome =
+            preempt_and_force_acquire_busy_marker_with(&state, &repo, &workspace, &sig, &ops)
+                .await
+                .expect("forceful path must escalate and ACQUIRE, never Busy");
+
+        // The forced reclaim SIGKILL'd the held holder's process group (1234).
+        assert_eq!(
+            ops.killpg_kill_called.lock().unwrap().clone(),
+            vec![1234],
+            "forceful escalation must SIGKILL the held marker's process group"
+        );
+        // The marker the test wrote was cleared and a FRESH one acquired by
+        // this live process.
+        assert!(
+            busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "the freshly-acquired guard's marker exists while in scope"
+        );
+        drop(outcome);
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "marker released on guard drop"
+        );
+        cancel.cancel();
+    }
+
+    /// unconditional-rollback §3.2 — the FORCEFUL path also reclaims a
+    /// PID-reuse-suspected (SkipAmbiguous) marker for the confirmed rollback,
+    /// while the POLITE path still returns `Busy` on the SAME marker (the
+    /// non-destructive ops' behavior is unchanged).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forceful_reclaims_ambiguous_marker_while_polite_returns_busy() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+
+        let live = std::process::id();
+
+        // --- POLITE path: ambiguous marker → Busy, file left in place. ---
+        let ws_polite = dir.path().join("ws-ambiguous-polite");
+        std::fs::create_dir_all(&ws_polite).unwrap();
+        write_marker(&state.paths, &ws_polite, live, "definitely-not-real", 10_000, "a09-bar");
+        let sig_p = RecordingSignaller::new();
+        let ops_p = PreemptMockOps::new().with_alive(live).with_comm(live, "claude");
+        let mut cfg2 = cfg.clone();
+        cfg2.executor.wipe_drain_timeout_secs = 0;
+        state.last_config.store(Arc::new(cfg2));
+        match preempt_and_acquire_busy_marker_with(&state, &repo, &ws_polite, &sig_p, &ops_p).await {
+            Err(PreemptAcquireError::Busy(_)) => {}
+            Err(PreemptAcquireError::Internal(m)) => {
+                panic!("polite path must return Busy on an ambiguous marker, got Internal: {m}")
+            }
+            Ok(_) => panic!("polite path must return Busy on an ambiguous marker, got Acquired"),
+        }
+        assert!(
+            busy_marker::marker_path(&state.paths, &ws_polite).exists(),
+            "polite path leaves the ambiguous marker for investigation"
+        );
+        let _ = std::fs::remove_file(busy_marker::marker_path(&state.paths, &ws_polite));
+
+        // --- FORCEFUL path: ambiguous marker → reclaimed + Acquired. ---
+        let ws_force = dir.path().join("ws-ambiguous-force");
+        std::fs::create_dir_all(&ws_force).unwrap();
+        write_marker(&state.paths, &ws_force, live, "definitely-not-real", 10_000, "a09-bar");
+        let sig_f = RecordingSignaller::new();
+        let ops_f = PreemptMockOps::new().with_alive(live).with_comm(live, "claude");
+        let outcome =
+            preempt_and_force_acquire_busy_marker_with(&state, &repo, &ws_force, &sig_f, &ops_f)
+                .await
+                .expect("forceful path must reclaim an ambiguous marker and ACQUIRE");
+        assert_eq!(
+            ops_f.killpg_kill_called.lock().unwrap().clone(),
+            vec![1234],
+            "forceful escalation past ambiguity must SIGKILL the held marker's process group"
+        );
+        assert!(busy_marker::marker_path(&state.paths, &ws_force).exists());
+        drop(outcome);
+        assert!(!busy_marker::marker_path(&state.paths, &ws_force).exists());
+        cancel.cancel();
+    }
+
     /// 4.5 — rollback handler: a dry_run invocation acquires NO marker
     /// (the marker is absent both during and after). The live path's
     /// acquire-before-mutation is covered by the helper unit tests above
@@ -7817,6 +8070,263 @@ github:
             !busy_marker::marker_path(&state.paths, &workspace).exists(),
             "dry-run must not acquire the busy marker"
         );
+        cancel.cancel();
+    }
+
+    /// unconditional-rollback §7.1 — THE end-to-end gate. Drives a REAL
+    /// confirmed rollback through `handle_rollback_recovery` against the
+    /// ADVERSARIAL state all at once and asserts it SUCCEEDS and produces a
+    /// correct, clean PR:
+    ///   - a busy marker held by a LIVE in-flight pass (a real spawned child) →
+    ///     forcibly reclaimed (the real RealProcessOps SIGKILLs its group);
+    ///   - an in-range unit colliding with an active dir → reconciled;
+    ///   - a pre-existing agent-branch PR (mockito) → reused + retitled (no 422);
+    ///   - a built `target/` with NO `.gitignore` at the target → excluded.
+    /// End state asserted: marker released, in-range units active-exactly-once
+    /// with canon fold undone, a SINGLE agent-branch PR carrying the rolled-back
+    /// source with a rollback title/body, and NO `target/` committed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_confirmed_end_to_end_forceful_reconcile_reuse_pr_no_target() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        fn run(path: &Path, args: &[&str]) {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed in {}", path.display());
+        }
+
+        let _hook_lock = crate::polling_loop::test_hooks::lock();
+
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        run(dir.path(), &["init", "-q", "-b", "main", "workspace"]);
+        run(&workspace, &["config", "user.email", "t@e.com"]);
+        run(&workspace, &["config", "user.name", "t"]);
+
+        // --- commit 1 (the rollback TARGET): base code + canon, NO .gitignore. ---
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "// base\n").unwrap();
+        std::fs::create_dir_all(workspace.join("openspec/specs/widget")).unwrap();
+        std::fs::write(workspace.join("openspec/specs/widget/spec.md"), "CANON widget v1\n").unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "base"]);
+
+        // --- commit 2: ship change feature-a (code + canon fold + dated archive). ---
+        std::fs::write(workspace.join("src/a.rs"), "// feature-a impl\n").unwrap();
+        std::fs::write(
+            workspace.join("openspec/specs/widget/spec.md"),
+            "CANON widget v1\nMODIFIED a\n",
+        )
+        .unwrap();
+        let arch_a = workspace.join("openspec/changes/archive/2026-05-01-feature-a");
+        std::fs::create_dir_all(&arch_a).unwrap();
+        std::fs::write(arch_a.join("proposal.md"), "## Why\nfeature-a\n").unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "feature-a: ship change"]);
+
+        // --- commit 3: ship issue fix-thing (code + dated issues archive). ---
+        std::fs::write(workspace.join("src/c.rs"), "// fix fix-thing\n").unwrap();
+        let arch_i = workspace.join("issues/archive/2026-05-02-fix-thing");
+        std::fs::create_dir_all(&arch_i).unwrap();
+        std::fs::write(arch_i.join("issue.md"), "## Report\nfix-thing\n").unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "fix-thing: ship issue fix"]);
+
+        // --- commit 4: plant the COLLISION — an active openspec/changes/feature-a/
+        //     dir of the same slug ALONGSIDE the dated archive entry (the stale
+        //     duplicate the production case hits). ---
+        std::fs::create_dir_all(workspace.join("openspec/changes/feature-a")).unwrap();
+        std::fs::write(
+            workspace.join("openspec/changes/feature-a/proposal.md"),
+            "stale active feature-a\n",
+        )
+        .unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "plant stale active feature-a"]);
+
+        // Bare origin the workspace fetches/pushes against.
+        let origin = dir.path().join("origin.git");
+        run(dir.path(), &["clone", "-q", "--bare", "workspace", "origin.git"]);
+        run(&workspace, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run(&workspace, &["fetch", "-q", "origin"]);
+
+        // --- adversarial untracked state: a built `target/` (no `.gitignore`
+        //     anywhere in the tree). A naive `git add -A` would stage it once
+        //     the target's `.gitignore` is gone; the workspace-local exclude
+        //     must keep it out. ---
+        std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        std::fs::write(workspace.join("target/debug/autocoder"), "ELF-bytes").unwrap();
+
+        // Config: real github-form URL (so parse_repo_url works) but local_path
+        // pins the workspace (so ensure_initialized only fetches). Zero drain
+        // timeout so the bounded marker-release wait returns at once, driving
+        // the forceful escalation.
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let mut cfg = Config::load_from(&cfg_path).unwrap();
+        cfg.repositories[0].local_path = Some(workspace.clone());
+        cfg.executor.wipe_drain_timeout_secs = 0;
+        // Small stale threshold so the live-pid marker is classified stuck.
+        cfg.executor.busy_marker_stale_threshold_secs = Some(1);
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+
+        // --- the held busy marker: a REAL live child (`sleep`) in its OWN
+        //     process group, recorded in both the marker AND the sidecar so the
+        //     forceful reclaim's RealProcessOps SIGKILLs a real, safe-to-kill
+        //     process group (not the test runner's). ---
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep child");
+        let child_pid = child.id();
+        // Write the marker by hand with the child as holder, comm "sleep",
+        // aged past the (1s) threshold so it classifies as stuck.
+        {
+            let path = busy_marker::marker_path(&state.paths, &workspace);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let marker = busy_marker::BusyMarker {
+                repo_url: repo.url.clone(),
+                pid: child_pid,
+                pgid: child_pid as i32,
+                comm: "sleep".into(),
+                started_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+                stage: busy_marker::Stage::Executor,
+                change: "feature-a".into(),
+            };
+            std::fs::write(&path, serde_json::to_string_pretty(&marker).unwrap()).unwrap();
+        }
+        busy_marker::write_subprocess_marker(&state.paths, &workspace, child_pid).unwrap();
+
+        // --- mockito: a pre-existing agent-branch PR (#42) is found, then
+        //     reused via PATCH (no raw create / 422). ---
+        let mut server = mockito::Server::new_async().await;
+        let list_mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{"number":42,"html_url":"https://github.com/owner/repo/pull/42"}]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let patch_mock = server
+            .mock("PATCH", "/repos/owner/repo/pulls/42")
+            .with_status(200)
+            .with_body(
+                r#"{"number":42,"html_url":"https://github.com/owner/repo/pull/42"}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        // A create POST must NEVER fire (that path would 422).
+        let create_mock = server
+            .mock("POST", "/repos/owner/repo/pulls")
+            .with_status(422)
+            .with_body(r#"{"message":"a pull request already exists"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        crate::polling_loop::test_hooks::set_github_api_base(Some(server.url()));
+
+        // --- DRIVE THE REAL CONFIRMED ROLLBACK: roll back to the base tip
+        //     (the last 3 commits). ---
+        let req = json!({
+            "action": "rollback_recovery",
+            "url": repo.url,
+            "count": 3,
+            "dry_run": false,
+        });
+        let resp = handle_rollback_recovery(&req, &state).await;
+
+        // Clean up the override + the child regardless of outcome.
+        crate::polling_loop::test_hooks::set_github_api_base(None);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // ---- assertions: it SUCCEEDED and produced a clean, correct PR ----
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "rollback must succeed: {resp}");
+        assert_eq!(resp["outcome"], serde_json::json!("pr_opened"), "resp: {resp}");
+        assert_eq!(
+            resp["pr_url"], serde_json::json!("https://github.com/owner/repo/pull/42"),
+            "the SINGLE reused PR's URL is returned: {resp}"
+        );
+
+        // The pre-existing PR was REUSED (listed + PATCHed), never raw-created.
+        list_mock.assert_async().await;
+        patch_mock.assert_async().await;
+        create_mock.assert_async().await;
+
+        // Marker RELEASED (the busy guard dropped at handler return).
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "busy marker must be released after the rollback"
+        );
+
+        // Inspect the committed agent-branch tree (what the PR carries).
+        let tracked: Vec<String> = {
+            let out = Command::new("git")
+                .args(["ls-tree", "-r", "--name-only", "agent-q"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        };
+
+        // RECONCILE: feature-a active EXACTLY once, redundant dated archive gone.
+        assert!(
+            tracked.iter().any(|f| f == "openspec/changes/feature-a/proposal.md"),
+            "feature-a active after reconcile: {tracked:?}"
+        );
+        assert!(
+            !tracked
+                .iter()
+                .any(|f| f.starts_with("openspec/changes/archive/2026-05-01-feature-a")),
+            "redundant dated archive entry removed: {tracked:?}"
+        );
+        // fix-thing issue unarchived to the active lane.
+        assert!(
+            tracked.iter().any(|f| f == "issues/fix-thing/issue.md"),
+            "fix-thing issue active after rollback: {tracked:?}"
+        );
+        assert!(
+            !tracked
+                .iter()
+                .any(|f| f.starts_with("issues/archive/2026-05-02-fix-thing")),
+            "fix-thing archive entry moved out: {tracked:?}"
+        );
+
+        // CANON FOLD UNDONE: the in-range change's canon edit is reverted.
+        let canon = {
+            let out = Command::new("git")
+                .args(["show", "agent-q:openspec/specs/widget/spec.md"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert_eq!(canon, "CANON widget v1\n", "canon fold for feature-a must be undone");
+
+        // CODE DISCARDED: the in-range implementation files are gone.
+        assert!(!tracked.iter().any(|f| f == "src/a.rs"), "feature-a code discarded: {tracked:?}");
+        assert!(!tracked.iter().any(|f| f == "src/c.rs"), "issue code discarded: {tracked:?}");
+        assert!(tracked.iter().any(|f| f == "src/lib.rs"), "base code preserved: {tracked:?}");
+
+        // NO build output committed even though the tree has no `.gitignore`.
+        assert!(
+            !tracked.iter().any(|f| f.starts_with("target/")),
+            "target/ build output must NOT be committed: {tracked:?}"
+        );
+
         cancel.cancel();
     }
 

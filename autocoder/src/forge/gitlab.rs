@@ -210,6 +210,40 @@ impl Forge for GitlabForge {
         })
     }
 
+    async fn update_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+        token: &str,
+    ) -> Result<String> {
+        let id = project_id(owner, repo);
+        let url = format!("{}/projects/{id}/merge_requests/{pr_number}", self.api_base);
+        let payload = serde_json::json!({ "title": title, "description": body });
+        let resp = reqwest::Client::new()
+            .put(&url)
+            .header("PRIVATE-TOKEN", token)
+            .header("User-Agent", "openspec-autocoder")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("gitlab MR PUT failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet = body_snippet(resp).await;
+            return Err(anyhow!(
+                "gitlab MR PUT {owner}/{repo}!{pr_number} returned {status}: {snippet}"
+            ));
+        }
+        let mr: MrResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("gitlab MR PUT response decode failed: {e}"))?;
+        Ok(mr.web_url)
+    }
+
     async fn list_open_prs(
         &self,
         owner: &str,
