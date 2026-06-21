@@ -506,3 +506,71 @@ pub(crate) async fn open_triage_pull_request(
     .await?;
     Ok(pr.html_url)
 }
+
+/// Open the confirmed-rollback PR, REUSING an existing agent-branch PR when one
+/// is present instead of raw-creating (which 422s "a pull request already
+/// exists"). The rollback's force-push of the agent branch already updated any
+/// existing PR's head to the rolled-back state; this detects that PR — via the
+/// SAME `list_open_prs` head/base query the polling loop's open-PR check uses —
+/// and updates its title AND body to describe the rollback. A new PR is created
+/// ONLY when none exists.
+///
+/// Returns the PR's HTML URL on either path.
+pub(crate) async fn open_or_update_rollback_pull_request(
+    _paths: &DaemonPaths,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    head_branch: &str,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<String> {
+    use crate::forge::Forge;
+    let (owner, name) = github::parse_repo_url(&repo.url)
+        .with_context(|| "rollback PR: parsing repo URL".to_string())?;
+    let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
+    let head = format!("{head_owner}:{head_branch}");
+
+    let forge = rollback_forge();
+
+    // Detect an existing open PR for the agent branch (same head/base query as
+    // the polling loop's open-PR check). On a transport/parse error this is a
+    // best-effort detection: fall through to create (the create either succeeds
+    // or surfaces the real 422 to the operator).
+    let existing = forge
+        .list_open_prs(&owner, &name, &head, base_branch, &token)
+        .await
+        .ok()
+        .and_then(|prs| prs.into_iter().next());
+
+    if let Some(pr) = existing {
+        tracing::info!(
+            url = %repo.url,
+            pr_number = pr.number,
+            "rollback: reusing existing agent-branch PR (force-push updated its head); retitling to the rollback"
+        );
+        return forge
+            .update_pr(&owner, &name, pr.number, title, body, &token)
+            .await
+            .with_context(|| format!("updating existing rollback PR #{}", pr.number));
+    }
+
+    let created = forge
+        .open_pr(&owner, &name, &head, base_branch, title, body, &token, None, false)
+        .await?;
+    Ok(created.html_url)
+}
+
+/// Build the `Forge` provider for the rollback PR step, threading the
+/// (test-injected) API base under `cfg(test)` so mockito-driven tests exercise
+/// the same path as production.
+fn rollback_forge() -> crate::forge::GithubForge {
+    #[cfg(test)]
+    {
+        if let Some(api_base) = test_hooks::github_api_base() {
+            return crate::forge::GithubForge::with_api_base(api_base);
+        }
+    }
+    crate::forge::GithubForge::new()
+}

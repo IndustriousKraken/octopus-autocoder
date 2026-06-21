@@ -661,6 +661,49 @@ pub(crate) async fn create_issue_comment_at(
     Ok(())
 }
 
+/// Update an existing PR's title AND body via `PATCH
+/// /repos/{owner}/{repo}/pulls/{number}`. Used by the confirmed-rollback PR
+/// step to RETITLE a reused agent-branch PR to the rollback (the force-push
+/// already updated its head), instead of calling raw create — which 422s "a
+/// pull request already exists". Returns the PR's `html_url`.
+pub(crate) async fn update_pull_request_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    title: &str,
+    body: &str,
+    token: &str,
+) -> Result<String> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls/{pr_number}");
+    let payload = serde_json::json!({ "title": title, "body": body });
+    let resp = reqwest::Client::new()
+        .patch(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow!("github pr PATCH failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let snippet: String = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github pr PATCH {owner}/{repo}#{pr_number} returned {status}: {snippet}"
+        ));
+    }
+    let parsed: PullResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github pr PATCH response decode failed: {e}"))?;
+    Ok(parsed.html_url)
+}
+
 /// GitHub's hard cap on PR-body length. Bodies submitted above this size
 /// are rejected by the REST API. Used by `compose_body` to truncate the
 /// LAST per-change reviewer section under per-change mode (matching the

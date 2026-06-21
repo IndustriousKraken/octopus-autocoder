@@ -310,29 +310,17 @@ pub fn detect_collisions(workspace: &Path, plan: &RollbackPlan) -> Vec<Collision
 ///
 /// Caller contract: the workspace is on a freshly-recreated `agent_branch`
 /// at the base-branch tip (the daemon does `git::recreate_branch` before
-/// calling this), AND the plan was resolved against the same tip. A detected
-/// collision (see [`detect_collisions`]) is an error — the caller must
-/// surface it rather than overwrite active work.
+/// calling this), AND the plan was resolved against the same tip. This is the
+/// CONFIRMED rollback path: an in-range collision (an active dir of the same
+/// slug already present, see [`detect_collisions`]) is RECONCILED to the target
+/// state rather than aborted — each in-range unit ends up active exactly once
+/// with its canon fold undone, and any redundant dated archive entry is removed.
 ///
 /// Returns the commit message used (so the daemon can log / thread it).
 pub fn prepare_rolled_back_tree(
     workspace: &Path,
     plan: &RollbackPlan,
 ) -> Result<String> {
-    let collisions = detect_collisions(workspace, plan);
-    if !collisions.is_empty() {
-        let detail = collisions
-            .iter()
-            .map(|c| format!("{} `{}` (active dir {} exists)", c.lane, c.slug, c.active_path))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(anyhow!(
-            "rollback aborted: {} in-range unit(s) would collide with existing active \
-             directories: {detail}",
-            collisions.len()
-        ));
-    }
-
     // 1. Restore lane-external code to the target. `git checkout <target> --
     //    . ':!openspec' ':!issues'` restores every tracked path that exists
     //    at the target outside the two lanes; it does NOT delete paths added
@@ -347,17 +335,21 @@ pub fn prepare_rolled_back_tree(
     //    an in-range change is removed (it does not exist at the target).
     restore_canon_to_target(workspace, &plan.target_sha)?;
 
-    // 3. Unarchive each in-range change (dated archive dir → active), with
-    //    its canon fold already undone by step 2 — it is pending again.
+    // 3. Reconcile each in-range change to the target: active exactly once
+    //    (dated archive dir → active when not already active), canon fold
+    //    already undone by step 2 — pending again. A pre-existing active dir
+    //    is NOT an error: the redundant dated archive entry is removed.
     for unit in &plan.changes {
-        queue::unarchive(workspace, &unit.slug)
-            .with_context(|| format!("unarchiving change `{}`", unit.slug))?;
+        reconcile_change_unit(workspace, &unit.slug)
+            .with_context(|| format!("reconciling change `{}`", unit.slug))?;
     }
 
-    // 4. Unarchive each in-range issue (issues/archive/<dated> → issues/<slug>).
+    // 4. Reconcile each in-range issue (issues/archive/<dated> → issues/<slug>),
+    //    same active-exactly-once rule, preserving the single-file vs directory
+    //    form.
     for unit in &plan.issues {
-        unarchive_issue(workspace, unit)
-            .with_context(|| format!("unarchiving issue `{}`", unit.slug))?;
+        reconcile_issue_unit(workspace, unit)
+            .with_context(|| format!("reconciling issue `{}`", unit.slug))?;
     }
 
     // 5. Stage + commit the prepared tree on the agent branch.
@@ -406,12 +398,52 @@ fn restore_canon_to_target(workspace: &Path, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Move an archived issue back to its active location, in EITHER form: a
-/// directory `issues/archive/<dated>/` → `issues/<slug>/`, OR a single file
-/// `issues/archive/<dated>-<slug>.md` → `issues/<slug>.md`. Mirrors
-/// [`queue::unarchive`] for the issues lane: a collision (active unit
-/// already exists, in either form) is an error, not an overwrite.
-fn unarchive_issue(workspace: &Path, unit: &ArchivedUnit) -> Result<()> {
+/// Reconcile an in-range CHANGE to the target state: it must end up active
+/// exactly once at `openspec/changes/<slug>/` with no redundant dated archive
+/// entry. This is the CONFIRMED-rollback reconcile (no abort on a pre-existing
+/// active dir):
+///
+/// - active dir absent → unarchive (move the dated archive entry → active), as
+///   the non-colliding path does (reuses [`queue::unarchive`]).
+/// - active dir present AND a dated archive entry also present → keep the active
+///   dir as the single active unit, remove the redundant dated archive entry.
+///   (Code and canon are already restored to the target, so the active dir is
+///   the target-state unit.)
+/// - active dir present AND no dated archive entry → already in target form;
+///   no move, no error (idempotent).
+fn reconcile_change_unit(workspace: &Path, slug: &str) -> Result<()> {
+    let active = workspace.join("openspec/changes").join(slug);
+    if !active.exists() {
+        // No collision — unarchive exactly as the non-colliding path.
+        return queue::unarchive(workspace, slug)
+            .with_context(|| format!("unarchiving change `{slug}`"));
+    }
+    // Active dir already present: reconcile to a single active copy by removing
+    // any redundant dated archive entry of the same slug.
+    remove_dated_archive_entries(
+        &workspace.join("openspec/changes/archive"),
+        slug,
+    )?;
+    Ok(())
+}
+
+/// Reconcile an in-range ISSUE to the target state, mirroring
+/// [`reconcile_change_unit`] for the issues lane and preserving the single-file
+/// vs directory form (via `unit.is_file`):
+///
+/// - active unit absent (neither `issues/<slug>.md` nor `issues/<slug>/`) →
+///   unarchive the dated archive entry to its form.
+/// - active unit present → keep it, remove the redundant dated archive entry.
+fn reconcile_issue_unit(workspace: &Path, unit: &ArchivedUnit) -> Result<()> {
+    // A pre-existing active unit in EITHER form means it is already active in
+    // target form; resolve to a single copy by removing the redundant dated
+    // archive entry (file OR directory).
+    if issues::resolve_form(workspace, &unit.slug).is_some() {
+        remove_dated_archive_entries(&workspace.join("issues/archive"), &unit.slug)?;
+        return Ok(());
+    }
+
+    // Not active yet: unarchive the dated archive entry to its active form.
     let src = workspace.join(&unit.archive_path);
     let dst = if unit.is_file {
         if !src.is_file() {
@@ -427,19 +459,46 @@ fn unarchive_issue(workspace: &Path, unit: &ArchivedUnit) -> Result<()> {
         }
         issues::issue_dir(workspace, &unit.slug)
     };
-    // A pre-existing active unit in EITHER form is a collision.
-    if issues::resolve_form(workspace, &unit.slug).is_some() {
-        return Err(anyhow!(
-            "unarchive destination already exists: an issues/{} unit is present",
-            unit.slug
-        ));
-    }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::rename(&src, &dst)
         .with_context(|| format!("renaming {} to {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+/// Remove every dated archive entry (`<YYYY-MM-DD>-<slug>` directory OR
+/// `<YYYY-MM-DD>-<slug>.md` file) matching `slug` under `archive_root`. Used by
+/// the reconcile to drop a redundant archived copy that sits alongside an
+/// already-active unit, so the unit ends up active EXACTLY once. A missing
+/// archive root is a no-op (nothing to remove).
+fn remove_dated_archive_entries(archive_root: &Path, slug: &str) -> Result<()> {
+    if !archive_root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(archive_root)
+        .with_context(|| format!("reading {}", archive_root.display()))?
+    {
+        let entry = entry?;
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let undated = strip_date_prefix(&name);
+        let matches = undated == slug || undated == format!("{slug}.md");
+        if !matches {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing redundant archive dir {}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing redundant archive file {}", path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -858,15 +917,19 @@ mod tests {
         );
     }
 
-    // ----- 5.2: in-range collision is reported, not overwritten -----
+    // ----- 5.2 / unconditional-rollback §2.x: a confirmed-path collision is
+    //        RECONCILED to the target (active-exactly-once), not aborted, while
+    //        the dry-run preview STILL reports it informationally. -----
 
     #[test]
-    fn collision_with_active_dir_is_reported_not_overwritten() {
+    fn collision_with_active_dir_is_reconciled_not_aborted() {
         let (_dir, ws) = fixture();
         ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
         let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
 
-        // Plant an active dir of the same slug — the unarchive would collide.
+        // Plant an active dir of the same slug ALONGSIDE the dated archive
+        // entry: the production "stale archived copy next to an active dir"
+        // collision shape.
         std::fs::create_dir_all(ws.join("openspec/changes/feature-a")).unwrap();
         std::fs::write(
             ws.join("openspec/changes/feature-a/proposal.md"),
@@ -876,23 +939,110 @@ mod tests {
         run(&ws, &["add", "-A"]);
         run(&ws, &["commit", "-q", "-m", "active feature-a"]);
 
+        // The dry-run informational report STILL flags the collision.
         let collisions = detect_collisions(&ws, &plan);
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].slug, "feature-a");
         assert_eq!(collisions[0].lane, "change");
-
         let preview = format_preview(&ws, &plan);
         assert!(preview.contains("COLLISIONS"), "preview flags collision: {preview}");
 
-        // prepare must refuse rather than overwrite the active dir.
+        // The CONFIRMED path reconciles rather than aborting.
         run(&ws, &["checkout", "-q", "-B", "agent-q"]);
-        let err = prepare_rolled_back_tree(&ws, &plan).expect_err("collision must abort");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("collide"), "error names the collision: {msg}");
-        // The active dir is intact.
+        prepare_rolled_back_tree(&ws, &plan).expect("confirmed path must reconcile, not abort");
+
+        // feature-a is active EXACTLY once.
+        assert!(
+            ws.join("openspec/changes/feature-a/proposal.md").is_file(),
+            "feature-a active after reconcile"
+        );
+        // The redundant dated archive entry is GONE.
+        assert!(
+            !ws.join("openspec/changes/archive/2026-05-01-feature-a").exists(),
+            "redundant dated archive entry removed"
+        );
+        // The tree is clean / committed.
+        let st = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            st.stdout.is_empty(),
+            "tree must be clean after reconcile: {}",
+            String::from_utf8_lossy(&st.stdout)
+        );
+    }
+
+    #[test]
+    fn collision_in_issue_lane_is_reconciled_both_forms() {
+        // Directory-form issue collision.
+        let (_dir, ws) = fixture();
+        ship_issue(&ws, "fix-dir", "src/d.rs");
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
+        // Plant an active directory issue of the same slug alongside the
+        // dated archive dir.
+        std::fs::create_dir_all(ws.join("issues/fix-dir")).unwrap();
+        std::fs::write(ws.join("issues/fix-dir/issue.md"), "active issue\n").unwrap();
+        run(&ws, &["add", "-A"]);
+        run(&ws, &["commit", "-q", "-m", "active fix-dir"]);
+
+        run(&ws, &["checkout", "-q", "-B", "agent-q"]);
+        prepare_rolled_back_tree(&ws, &plan).expect("issue dir collision must reconcile");
+        assert!(ws.join("issues/fix-dir/issue.md").is_file(), "active dir kept");
+        assert!(
+            !ws.join("issues/archive/2026-05-02-fix-dir").exists(),
+            "redundant issue archive dir removed"
+        );
+
+        // Single-file issue collision.
+        let (_dir2, ws2) = fixture();
+        ship_single_file_issue(&ws2, "fix-typo", "src/typo.rs");
+        let plan2 = resolve_plan(&ws2, "main", "main", &RollbackDepth::Count(1)).unwrap();
+        // Plant an active single-file issue of the same slug alongside the
+        // dated archive .md.
+        std::fs::create_dir_all(ws2.join("issues")).unwrap();
+        std::fs::write(ws2.join("issues/fix-typo.md"), "active typo issue\n").unwrap();
+        run(&ws2, &["add", "-A"]);
+        run(&ws2, &["commit", "-q", "-m", "active fix-typo"]);
+
+        run(&ws2, &["checkout", "-q", "-B", "agent-q"]);
+        prepare_rolled_back_tree(&ws2, &plan2).expect("issue file collision must reconcile");
+        assert!(ws2.join("issues/fix-typo.md").is_file(), "active file kept");
+        assert!(
+            !ws2.join("issues/archive/2026-05-02-fix-typo.md").exists(),
+            "redundant issue archive .md removed"
+        );
+    }
+
+    #[test]
+    fn already_active_no_archive_entry_is_idempotent_noop() {
+        // Idempotent edge: an in-range unit already active in target form with
+        // NO dated archive entry is a no-op (no move, no error). Simulate by
+        // shipping a change, then manually moving its archive entry to active
+        // AND deleting the archive dir before prepare runs.
+        let (_dir, ws) = fixture();
+        ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
+
+        run(&ws, &["checkout", "-q", "-B", "agent-q"]);
+        // Make feature-a already active with NO archive entry remaining.
+        std::fs::create_dir_all(ws.join("openspec/changes/feature-a")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/feature-a/proposal.md"),
+            "already active\n",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(ws.join("openspec/changes/archive/2026-05-01-feature-a")).unwrap();
+        run(&ws, &["add", "-A"]);
+        run(&ws, &["commit", "-q", "-m", "feature-a already active, no archive"]);
+
+        // Reconcile is a no-op: active dir survives, no error.
+        prepare_rolled_back_tree(&ws, &plan).expect("idempotent: already-active is a no-op");
         assert_eq!(
             std::fs::read_to_string(ws.join("openspec/changes/feature-a/proposal.md")).unwrap(),
-            "active work\n"
+            "already active\n",
+            "already-active unit untouched"
         );
     }
 

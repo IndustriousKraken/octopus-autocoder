@@ -229,12 +229,23 @@ pub fn ensure_initialized(
     // generated config as a disallowed write. Re-applied on every init so a
     // re-cloned workspace (which resets the local exclude) is covered before its
     // first pass. Best-effort: a failure must not abort init.
-    if let Err(e) =
-        crate::git::ensure_local_excludes(workspace, crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES)
-    {
+    // Build-output paths (`target/`) are registered HERE too so they stay out
+    // of `git add -A` even after a rollback DELETES the repo's `.gitignore`
+    // (`.git/info/exclude` is local to the clone, not part of the restored
+    // tree). Fleet-wide commit-hygiene, not rollback-only.
+    let init_excludes: Vec<&str> = crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES
+        .iter()
+        .copied()
+        .chain(
+            crate::agentic_run::WORKSPACE_BUILD_OUTPUT_EXCLUDES
+                .iter()
+                .copied(),
+        )
+        .collect();
+    if let Err(e) = crate::git::ensure_local_excludes(workspace, &init_excludes) {
         tracing::warn!(
             workspace = %workspace.display(),
-            "could not register per-run CLI artifact excludes in .git/info/exclude: {e:#}"
+            "could not register per-run CLI artifact + build-output excludes in .git/info/exclude: {e:#}"
         );
     }
     // One-time migration of any legacy iteration-pending markers (a27a1

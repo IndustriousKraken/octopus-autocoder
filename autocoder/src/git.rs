@@ -282,10 +282,16 @@ pub fn add_all(workspace: &Path) -> Result<()> {
     // UNTRACKED files, so a repo that legitimately tracks one of these is
     // unaffected — only autocoder's generated copy is skipped. Best-effort: an
     // exclude-write failure must not block staging.
-    let _ = ensure_local_excludes(
-        workspace,
-        crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES,
-    );
+    let add_all_excludes: Vec<&str> = crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES
+        .iter()
+        .copied()
+        .chain(
+            crate::agentic_run::WORKSPACE_BUILD_OUTPUT_EXCLUDES
+                .iter()
+                .copied(),
+        )
+        .collect();
+    let _ = ensure_local_excludes(workspace, &add_all_excludes);
     run_git(workspace, "add -A", &["add", "-A"])?;
     Ok(())
 }
@@ -2115,6 +2121,36 @@ mod tests {
         assert!(
             !tracked.iter().any(|f| f.starts_with(".opencode/")),
             ".opencode/ scratch must not be committed: {tracked:?}"
+        );
+    }
+
+    #[test]
+    fn add_all_excludes_target_build_output_even_with_no_gitignore() {
+        // The rollback-to-greenfield case: a built `target/` is present AND the
+        // tree's `.gitignore` is ABSENT (the rollback deleted it, restoring to a
+        // target that predates it). `git add -A` must NOT stage `target/` —
+        // the workspace-local `.git/info/exclude` (independent of any tracked
+        // `.gitignore`) keeps it out.
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("real_change.txt"), "spec").unwrap();
+        // No `.gitignore` in the tree.
+        assert!(!path.join(".gitignore").exists());
+        // A built `target/` with a typical artifact.
+        std::fs::create_dir_all(path.join("target/debug")).unwrap();
+        std::fs::write(path.join("target/debug/autocoder"), "ELF").unwrap();
+        std::fs::write(path.join("target/.rustc_info.json"), "{}").unwrap();
+
+        add_all(&path).unwrap();
+        commit(&path, "impl").unwrap();
+
+        let tracked = tracked_files(&path);
+        assert!(
+            tracked.iter().any(|f| f == "real_change.txt"),
+            "the change file is committed: {tracked:?}"
+        );
+        assert!(
+            !tracked.iter().any(|f| f.starts_with("target/")),
+            "target/ build output must not be committed even with no .gitignore: {tracked:?}"
         );
     }
 

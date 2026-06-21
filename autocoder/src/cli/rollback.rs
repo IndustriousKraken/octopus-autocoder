@@ -95,15 +95,21 @@ pub async fn execute_with_io<R: BufRead, W: Write>(
         return Ok(());
     }
 
+    // A confirmed rollback RECONCILES in-range collisions to the target state
+    // (active-exactly-once) rather than aborting; the preview above reports any
+    // detected duplicate informationally so the operator sees the repo state
+    // before confirming. Surface that note, then proceed to the confirmation.
     let has_collisions = preview_resp
         .get("has_collisions")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if has_collisions {
-        return Err(anyhow!(
-            "rollback aborted: in-range unit(s) collide with existing active directories \
-             (see the preview above). Resolve them, then retry."
-        ));
+        writeln!(
+            writer,
+            "\nNote: in-range unit(s) already have an active directory (see the preview above). \
+             A confirmed rollback reconciles these to the rollback target rather than aborting."
+        )?;
+        writer.flush()?;
     }
 
     // Step 2: confirmation prompt (mirrors `rewind`).
@@ -341,18 +347,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn confirm_with_collisions_aborts_before_prompt() {
+    async fn confirm_with_collisions_reconciles_and_proceeds() {
+        // A confirmed rollback RECONCILES in-range collisions to the target
+        // rather than aborting: with --confirm and `y`, the dry-run's
+        // `has_collisions: true` no longer blocks — it proceeds to act and
+        // surfaces the reconcile note.
         let (_dir, socket) = fake_server(
             r#"{"ok":true,"dry_run":true,"preview":"WOULD roll back 1 commit","has_collisions":true}"#,
             r#"{"ok":true,"dry_run":false,"outcome":"pr_opened","pr_url":"http://x/pr/1"}"#,
         )
         .await;
-        // Even with --confirm and a `y` on stdin, a collision aborts.
         let mut input = std::io::Cursor::new(b"y\n".to_vec());
         let mut out = Vec::<u8>::new();
-        let res =
-            execute_with_io(&socket, args("r", Some(1), true), &mut input, &mut out).await;
-        let err = res.expect_err("collision must abort");
-        assert!(format!("{err:#}").contains("collide"), "{err:#}");
+        execute_with_io(&socket, args("r", Some(1), true), &mut input, &mut out)
+            .await
+            .expect("confirmed rollback reconciles collisions and proceeds");
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("reconciles"), "reconcile note shown: {printed}");
+        assert!(printed.contains("Rollback PR opened: http://x/pr/1"), "{printed}");
     }
 }
