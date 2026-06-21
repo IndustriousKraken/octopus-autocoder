@@ -673,22 +673,36 @@ pub(crate) mod test_hooks {
     }
 
     /// Snapshot the currently-installed override URL (or `None`).
+    ///
+    /// Poison-tolerant: these locks guard only a serialization token AND a
+    /// per-test override string that every test sets fresh, so there is no
+    /// invariant to protect across a panic. Recovering the guard on poison
+    /// (instead of `unwrap()`-panicking) keeps ONE failing test from
+    /// cascading `PoisonError` into every other test that shares the lock,
+    /// which would otherwise smear a single failure across the whole suite.
     pub fn github_api_base() -> Option<String> {
-        cell().lock().unwrap().clone()
+        cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Install a PR-creation API-base override for the duration of a
     /// test. The test holds the returned guard until it has finished
     /// reading mockito's recorded calls; on drop the override is cleared.
     pub fn set_github_api_base(value: Option<String>) {
-        *cell().lock().unwrap() = value;
+        *cell().lock().unwrap_or_else(|e| e.into_inner()) = value;
     }
 
     /// Process-wide mutex held by any test that installs the PR-creation
     /// override. Serializes tests that share the static so two concurrent
     /// tests do not clobber each other's override URL.
+    ///
+    /// Poison-tolerant for the same reason as [`github_api_base`]: the mutex
+    /// guards a unit value, so a panic by a prior holder leaves nothing
+    /// broken. Recovering the guard preserves serialization while preventing
+    /// a poison cascade.
     pub fn lock<'a>() -> MutexGuard<'a, ()> {
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
