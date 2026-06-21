@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step.
 
 {{cross_change_preamble}}

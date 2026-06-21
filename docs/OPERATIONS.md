@@ -168,7 +168,13 @@ Public ingestion reads issues through autocoder's configured GitHub token — th
 
 A promoted issue that fails repeatedly follows the same perma-stuck handling as a change (`.perma-stuck.json` under `issues/<slug>/`); delete the marker to retry. A completed issue is archived to `issues/archive/` — the lane never touches canonical specs in `openspec/specs/`.
 
-**Migration (one-time).** Earlier builds stored the issues lane under `openspec/issues/`; the lane now lives at the repository root (`issues/`). For each repository that already holds an `openspec/issues/` tree (active and/or archived units), run `git mv openspec/issues issues` once and commit — this moves active and archived units together, preserving history. Until you do, the daemon transitionally reads and writes the legacy `openspec/issues/` location and logs a one-time WARN naming the remedy; the legacy fallback is removed in a later release.
+## In-repo agent guide (OCTOPUS.md) {#octopus-guide}
+
+The daemon provisions a committed `OCTOPUS.md` at the repository root — the in-repo reference for any agent or human working in the repo who is not one of autocoder's own gated agents. It states the issues format, the OpenSpec change format, the canon/archive ownership rules, and the gate model. An `AGENTS.md` reference (the conventional agent-guide spot) points at it; the daemon refreshes a single marked region in `AGENTS.md` and leaves any other content the repository carries untouched (creating `AGENTS.md` only when absent). The default prompts also direct the agent to read `OCTOPUS.md` when present.
+
+Provisioning rides the daemon's normal push + pull-request flow: the daemon writes the two files on the recreated agent branch (after the per-iteration base sync), commits them, and opens a pull request — honoring `auto_submit_pr` exactly as it does for change work (a pull request when `auto_submit_pr` is `true`, the default; a pushed branch with no pull request when `false`). The files reach the base branch only when that pull request merges; the daemon never commits to the base branch outside a pull request. Provisioning is idempotent: when the guide is already current on the base branch the daemon writes nothing, commits nothing, and opens no pull request — no empty PR, no churn.
+
+Provisioning is per-repository via `features.octopus_guide`, **enabled by default**. Set `features.octopus_guide.enabled: false` to opt a repository out — for a repository where metafiles are unwelcome, or a third-party repository where adding them is not your decision. `features.*` is not part of the `autocoder reload` hot-reload set, so a change takes a daemon restart.
 
 ## Revising an open PR via comment
 

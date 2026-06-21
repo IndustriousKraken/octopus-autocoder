@@ -153,6 +153,55 @@ pub fn archive_dir_with_postcondition(
     Ok(dest)
 }
 
+/// Move `active_file` into `archive_root/<dated_name>` AND verify the
+/// post-condition: the source file is gone AND the dated archive entry
+/// exists as a FILE. Creates `archive_root` if absent. Errors when the
+/// dated destination already exists (a same-day re-archive collision) OR
+/// the post-condition does not hold after the rename.
+///
+/// This is the file-unit sibling of [`archive_dir_with_postcondition`]:
+/// the issues lane's single-file form (`issues/<slug>.md`) archives to
+/// `issues/archive/<UTC-date>-<slug>.md` (a file), where the directory
+/// primitive's `is_dir()` assertions would reject both the source AND the
+/// destination. A pure move that touches NO canonical spec.
+pub fn archive_file_with_postcondition(
+    active_file: &Path,
+    archive_root: &Path,
+    dated_name: &str,
+) -> Result<PathBuf> {
+    if !active_file.is_file() {
+        return Err(anyhow!(
+            "cannot archive: source file {} not found",
+            active_file.display()
+        ));
+    }
+    std::fs::create_dir_all(archive_root)
+        .with_context(|| format!("creating archive root {}", archive_root.display()))?;
+    let dest = archive_root.join(dated_name);
+    if dest.exists() {
+        return Err(anyhow!(
+            "archive destination already exists: {}",
+            dest.display()
+        ));
+    }
+    std::fs::rename(active_file, &dest)
+        .with_context(|| format!("renaming {} to {}", active_file.display(), dest.display()))?;
+    // Post-condition: source moved AND dated entry produced.
+    if active_file.exists() {
+        return Err(anyhow!(
+            "archive reported success but the source file at {} still exists",
+            active_file.display()
+        ));
+    }
+    if !dest.is_file() {
+        return Err(anyhow!(
+            "archive reported success but the dated entry at {} does not exist as a file",
+            dest.display()
+        ));
+    }
+    Ok(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +259,49 @@ mod tests {
             .expect_err("collision must error");
         assert!(format!("{err:#}").contains("already exists"));
         // Source untouched on the error path.
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn archive_file_moves_file_and_checks_postcondition() {
+        let td = TempDir::new().unwrap();
+        let active = td.path().join("my-unit.md");
+        std::fs::write(&active, "body").unwrap();
+        let archive_root = td.path().join("archive");
+
+        let dest =
+            archive_file_with_postcondition(&active, &archive_root, "2026-06-05-my-unit.md")
+                .unwrap();
+
+        assert!(!active.exists(), "source must be gone");
+        assert!(dest.is_file(), "dated entry must exist as a file");
+        assert_eq!(dest, archive_root.join("2026-06-05-my-unit.md"));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "body");
+    }
+
+    #[test]
+    fn archive_file_errors_on_missing_source() {
+        let td = TempDir::new().unwrap();
+        let err = archive_file_with_postcondition(
+            &td.path().join("nope.md"),
+            &td.path().join("a"),
+            "x-nope.md",
+        )
+        .expect_err("missing source must error");
+        assert!(format!("{err:#}").contains("not found"));
+    }
+
+    #[test]
+    fn archive_file_errors_on_collision() {
+        let td = TempDir::new().unwrap();
+        let active = td.path().join("u.md");
+        std::fs::write(&active, "x").unwrap();
+        let archive_root = td.path().join("archive");
+        std::fs::create_dir_all(&archive_root).unwrap();
+        std::fs::write(archive_root.join("2026-06-05-u.md"), "old").unwrap();
+        let err = archive_file_with_postcondition(&active, &archive_root, "2026-06-05-u.md")
+            .expect_err("collision must error");
+        assert!(format!("{err:#}").contains("already exists"));
         assert!(active.exists());
     }
 }

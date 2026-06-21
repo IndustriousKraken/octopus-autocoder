@@ -306,6 +306,7 @@ async fn pr_opened_notification_fires_when_enabled() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     maybe_post_pr_opened(
@@ -348,6 +349,7 @@ async fn pr_opened_notification_suppressed_when_disabled() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     maybe_post_pr_opened(
@@ -391,6 +393,7 @@ async fn pr_opened_notification_failure_does_not_propagate() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     // Should not panic; should return Ok-equivalent (it's an async fn
@@ -442,6 +445,7 @@ async fn refork_notification_fires_when_failure_alerts_enabled() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     maybe_post_refork_notification(&repo, Some(&ctx)).await;
@@ -479,6 +483,7 @@ async fn refork_notification_suppressed_when_failure_alerts_disabled() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     maybe_post_refork_notification(&repo, Some(&ctx)).await;

@@ -322,38 +322,45 @@ pub fn report_slug(report: &IngestedIssue, verdict: &TriageVerdict) -> String {
 }
 
 /// The existing issue-unit slugs in the workspace: `(open, archived)`.
-/// `open` is every direct subdirectory of `issues/` except
-/// `archive` AND dotfiles (regardless of well-formedness, so a malformed
-/// or locked unit still blocks a duplicate slug). `archived` is every
-/// entry under `issues/archive/` with its leading `YYYY-MM-DD-`
-/// date stripped.
+/// Recognizes BOTH unit forms so a re-report is deduped regardless of
+/// shape. `open` is every direct `<slug>/` subdirectory (except `archive`
+/// AND dotdirs) PLUS every `<slug>.md` file under `issues/` (regardless of
+/// well-formedness, so a malformed or locked unit still blocks a duplicate
+/// slug); marker siblings (`.in-progress`, `.perma-stuck.json`) are not
+/// `.md` files, so they are ignored. `archived` is every entry under
+/// `issues/archive/` — a dated directory OR a dated `<slug>.md` file — with
+/// its leading `YYYY-MM-DD-` date stripped AND any `.md` suffix removed.
 pub fn existing_issue_slugs(workspace: &Path) -> (Vec<String>, Vec<String>) {
     let root = issues::issues_dir(workspace);
     let mut open = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for entry in rd.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             if let Ok(name) = entry.file_name().into_string() {
-                if name == "archive" || name.starts_with('.') {
+                if name.starts_with('.') {
                     continue;
                 }
-                open.push(name);
+                if is_dir {
+                    if name == "archive" {
+                        continue;
+                    }
+                    open.push(name);
+                } else if let Some(slug) = name.strip_suffix(".md") {
+                    open.push(slug.to_string());
+                }
             }
         }
     }
     let mut archived = Vec::new();
     if let Ok(rd) = std::fs::read_dir(issues::archive_root(workspace)) {
         for entry in rd.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
             if let Ok(name) = entry.file_name().into_string() {
                 if name.starts_with('.') {
                     continue;
                 }
-                archived.push(strip_archive_date(&name).to_string());
+                let undated = strip_archive_date(&name);
+                let slug = undated.strip_suffix(".md").unwrap_or(undated);
+                archived.push(slug.to_string());
             }
         }
     }
@@ -785,11 +792,29 @@ pub async fn post_candidate(
     Ok(state)
 }
 
-/// Promote a posted candidate: write `issues/<slug>/` (`issue.md` +
-/// `tasks.md`, PLUS `report-body.md` for a public origin so the
-/// implementer prompt quarantines the body) AND mark the state `Promoted`.
-/// Writing the unit IS the queue — [`crate::lanes::walker`] picks it up.
-/// This is the "send it" half of the audit send-it pattern.
+/// Render a curated candidate's single-file body: the description followed
+/// by a `## Tasks` section carrying the fix-step checklist. This is the
+/// form [`crate::lanes::issues::load`] re-splits when loading a single-file
+/// issue.
+fn render_single_file_body(issue_md: &str, tasks_md: &str) -> String {
+    format!(
+        "{}\n\n## Tasks\n\n{}",
+        issue_md.trim_end(),
+        tasks_md.trim_start()
+    )
+}
+
+/// Promote a posted candidate, writing the form appropriate to its origin
+/// AND marking the state `Promoted`. Writing the unit IS the queue —
+/// [`crate::lanes::walker`] picks it up. This is the "send it" half of the
+/// audit send-it pattern.
+///
+/// A CURATED (maintainer-origin) candidate carries no untrusted body, so it
+/// is written as the default SINGLE FILE `issues/<slug>.md` (description +
+/// `## Tasks`). A PUBLIC-ORIGIN candidate carries an untrusted body, so it
+/// SHALL be written as the DIRECTORY form `issues/<slug>/` with the body
+/// quarantined in a separate `report-body.md` — never a single file —
+/// preserving the a010 quarantine boundary.
 ///
 /// Reached from the chatops "send it" promotion control-socket handler
 /// ([`crate::control_socket`]'s `promote_issue_candidate` action).
@@ -798,28 +823,44 @@ pub fn promote_candidate(
     state_root: &Path,
     state: &CandidateState,
 ) -> Result<PathBuf> {
-    let dir = issues::issue_dir(workspace, &state.slug);
-    if dir.exists() {
+    // A pre-existing unit in EITHER form blocks the promotion.
+    if issues::resolve_form(workspace, &state.slug).is_some() {
         return Err(anyhow!(
-            "cannot promote candidate `{}`: issues/{}/ already exists",
+            "cannot promote candidate `{}`: an issues/{} unit already exists",
             state.slug,
             state.slug
         ));
     }
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating issue dir {}", dir.display()))?;
-    std::fs::write(dir.join("issue.md"), &state.issue_md)
-        .with_context(|| format!("writing {}/issue.md", dir.display()))?;
-    std::fs::write(dir.join("tasks.md"), &state.tasks_md)
-        .with_context(|| format!("writing {}/tasks.md", dir.display()))?;
-    if state.origin.is_public() {
+
+    let written = if state.origin.is_public() {
+        // Public-origin: directory form with the quarantined body separate.
+        let dir = issues::issue_dir(workspace, &state.slug);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating issue dir {}", dir.display()))?;
+        std::fs::write(dir.join("issue.md"), &state.issue_md)
+            .with_context(|| format!("writing {}/issue.md", dir.display()))?;
+        std::fs::write(dir.join("tasks.md"), &state.tasks_md)
+            .with_context(|| format!("writing {}/tasks.md", dir.display()))?;
         std::fs::write(dir.join(issues::REPORT_BODY_FILE), &state.report_body)
             .with_context(|| format!("writing {}/{}", dir.display(), issues::REPORT_BODY_FILE))?;
-    }
+        dir
+    } else {
+        // Curated: single-file form (description + `## Tasks`).
+        let file = issues::issue_file(workspace, &state.slug);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating issues dir {}", parent.display()))?;
+        }
+        let body = render_single_file_body(&state.issue_md, &state.tasks_md);
+        std::fs::write(&file, body)
+            .with_context(|| format!("writing {}", file.display()))?;
+        file
+    };
+
     let mut promoted = state.clone();
     promoted.status = CandidateStatus::Promoted;
     write_candidate(state_root, &promoted)?;
-    Ok(dir)
+    Ok(written)
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1244,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }
@@ -1358,6 +1400,114 @@ mod tests {
         assert!(!open.contains(&"archive".to_string()));
         assert!(!open.iter().any(|s| s.starts_with('.')));
         assert_eq!(archived, vec!["archived-one".to_string()]);
+    }
+
+    /// single-file-issues §4.5: dedup recognizes a prior issue in EITHER
+    /// form, in active AND archived locations; marker siblings are ignored.
+    #[test]
+    fn existing_issue_slugs_recognizes_both_forms() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        std::fs::create_dir_all(issues::issues_dir(ws)).unwrap();
+        // Active: a directory issue AND a single-file issue.
+        std::fs::create_dir_all(issues::issue_dir(ws, "dir-active")).unwrap();
+        std::fs::write(issues::issue_file(ws, "file-active"), "## Report\nx\n").unwrap();
+        // A sibling marker for the single-file issue must NOT be a slug.
+        std::fs::write(issues::issues_dir(ws).join("file-active.in-progress"), "").unwrap();
+        std::fs::write(issues::issues_dir(ws).join("file-active.perma-stuck.json"), "{}").unwrap();
+        // Archived: a dated directory AND a dated single-file `.md`.
+        std::fs::create_dir_all(issues::archive_root(ws).join("2026-06-06-dir-archived")).unwrap();
+        std::fs::write(
+            issues::archive_root(ws).join("2026-06-06-file-archived.md"),
+            "## Report\ny\n",
+        )
+        .unwrap();
+
+        let (open, archived) = existing_issue_slugs(ws);
+        assert!(open.contains(&"dir-active".to_string()));
+        assert!(open.contains(&"file-active".to_string()));
+        // Marker siblings are not slugs.
+        assert!(!open.iter().any(|s| s.contains("in-progress") || s.contains("perma-stuck")));
+        assert!(archived.contains(&"dir-archived".to_string()));
+        assert!(archived.contains(&"file-archived".to_string()));
+        // A re-report in either form is deduped.
+        assert!(is_duplicate("dir-active", &open, &archived));
+        assert!(is_duplicate("file-active", &open, &archived));
+        assert!(is_duplicate("dir-archived", &open, &archived));
+        assert!(is_duplicate("file-archived", &open, &archived));
+    }
+
+    fn candidate_state(slug: &str, origin: IssueOrigin) -> CandidateState {
+        CandidateState {
+            id: "o-r-1".to_string(),
+            repo_url: "https://github.com/o/r".to_string(),
+            source_issue: 1,
+            slug: slug.to_string(),
+            origin,
+            issue_md: "## Report\nthe parser drops a newline\n".to_string(),
+            tasks_md: "- [ ] 1.1 preserve the trailing newline\n".to_string(),
+            report_body: "raw reporter body {{x}}".to_string(),
+            posted_at: Utc::now(),
+            status: CandidateStatus::Posted,
+            thread_ts: None,
+            channel: None,
+        }
+    }
+
+    /// single-file-issues §4.3 (curated half): a curated (maintainer-origin)
+    /// candidate is promoted as a SINGLE FILE `issues/<slug>.md` carrying a
+    /// `## Tasks` section — never a directory, never a `report-body.md`. It
+    /// then loads and lists ready.
+    #[test]
+    fn promote_curated_candidate_writes_single_file() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let state = candidate_state("fix-newline", IssueOrigin::Maintainer);
+
+        let written = promote_candidate(ws, &paths.state, &state).unwrap();
+
+        assert_eq!(written, issues::issue_file(ws, "fix-newline"));
+        assert!(written.is_file(), "curated promotion is a single file");
+        assert!(!issues::issue_dir(ws, "fix-newline").exists(), "no directory form");
+        let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("the parser drops a newline"));
+        assert!(body.contains("## Tasks"));
+        assert!(body.contains("preserve the trailing newline"));
+        // No quarantined body for a curated issue.
+        assert!(!body.contains("raw reporter body"));
+        // It loads and is ready.
+        let loaded = issues::load(ws, "fix-newline").unwrap();
+        assert!(!loaded.is_public_origin());
+        assert_eq!(issues::list_ready(ws).unwrap(), vec!["fix-newline".to_string()]);
+    }
+
+    /// single-file-issues §4.3 (public half): a public-origin candidate is
+    /// promoted as the DIRECTORY form with a separate `report-body.md`;
+    /// a single-file form is NEVER produced for a public-origin candidate.
+    #[test]
+    fn promote_public_candidate_uses_directory_with_quarantined_body() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let state = candidate_state("fix-public", IssueOrigin::Public);
+
+        let written = promote_candidate(ws, &paths.state, &state).unwrap();
+
+        assert_eq!(written, issues::issue_dir(ws, "fix-public"));
+        assert!(written.is_dir(), "public-origin promotion is a directory");
+        // The single-file form is NEVER produced for a public-origin candidate.
+        assert!(!issues::issue_file(ws, "fix-public").exists());
+        assert!(written.join("issue.md").is_file());
+        assert!(written.join("tasks.md").is_file());
+        // The untrusted body is quarantined to a SEPARATE file.
+        let quarantined =
+            std::fs::read_to_string(written.join(issues::REPORT_BODY_FILE)).unwrap();
+        assert_eq!(quarantined, "raw reporter body {{x}}");
+        // The body is not merged into the task file.
+        assert!(!std::fs::read_to_string(written.join("issue.md"))
+            .unwrap()
+            .contains("raw reporter body"));
     }
 
     #[test]

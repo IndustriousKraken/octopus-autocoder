@@ -40,12 +40,17 @@ pub enum RollbackDepth {
 
 /// One archived unit (change OR issue) that the resolver found inside the
 /// rolled-back range AND will unarchive. `slug` is the canonical slug (the
-/// dated archive prefix stripped); `archive_path` is the workspace-relative
-/// path of the dated archive directory the unit currently lives in.
+/// dated archive prefix stripped, AND for a single-file issue the `.md`
+/// suffix stripped); `archive_path` is the workspace-relative path of the
+/// dated archive entry the unit currently lives in (a directory, OR an
+/// `<date>-<slug>.md` file for a single-file issue). `is_file` is true when
+/// the archive entry is a single-file issue (so unarchive moves it back to
+/// `issues/<slug>.md` rather than `issues/<slug>/`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedUnit {
     pub slug: String,
     pub archive_path: String,
+    pub is_file: bool,
 }
 
 /// A fully-resolved rollback plan: the target the code is restored to, the
@@ -166,10 +171,14 @@ pub fn resolve_plan(
 }
 
 /// Enumerate the archived units (changes OR issues) introduced under
-/// `archive_root` within `target..from`. Each ADD under
-/// `<archive_root>/<YYYY-MM-DD>-<slug>/...` collapses to one [`ArchivedUnit`]
-/// keyed by its dated directory; the slug is the directory name with the
-/// `YYYY-MM-DD-` date prefix stripped. Sorted by slug, deduplicated.
+/// `archive_root` within `target..from`. Each ADD collapses to one
+/// [`ArchivedUnit`] keyed by its dated entry:
+///   - A directory entry `<archive_root>/<YYYY-MM-DD>-<slug>/...` — the
+///     archive entry is a directory.
+///   - A single-file issue entry `<archive_root>/<YYYY-MM-DD>-<slug>.md`
+///     (no trailing path segment) — the archive entry is a file; the slug
+///     drops BOTH the date prefix AND the `.md` suffix.
+/// Sorted by slug, deduplicated.
 fn resolve_units(
     workspace: &Path,
     target: &str,
@@ -181,21 +190,34 @@ fn resolve_units(
         std::collections::BTreeMap::new();
     let prefix = format!("{archive_root}/");
     for path in added {
-        // Path: <archive_root>/<dated-dir>/<rest...>. Take the first
-        // segment after the archive root as the dated directory.
+        // Path: <archive_root>/<dated-entry>[/<rest...>]. Take the first
+        // segment after the archive root as the dated entry.
         let rest = match path.strip_prefix(&prefix) {
             Some(r) => r,
             None => continue,
         };
-        let dated_dir = match rest.split('/').next() {
+        let mut segments = rest.split('/');
+        let dated_entry = match segments.next() {
             Some(d) if !d.is_empty() => d,
             _ => continue,
         };
-        let slug = strip_date_prefix(dated_dir);
-        let archive_path = format!("{prefix}{dated_dir}");
+        let has_more = segments.next().is_some();
+        // A single-file issue archives as `<date>-<slug>.md` with NO
+        // trailing segment; a directory unit always has a trailing segment
+        // (its contents). A `.md` dated entry that is itself the whole path
+        // is the file form.
+        let (slug, archive_path, is_file) = if !has_more && dated_entry.ends_with(".md") {
+            let undated = strip_date_prefix(dated_entry);
+            let slug = undated.strip_suffix(".md").unwrap_or(&undated).to_string();
+            (slug, format!("{prefix}{dated_entry}"), true)
+        } else {
+            let slug = strip_date_prefix(dated_entry);
+            (slug, format!("{prefix}{dated_entry}"), false)
+        };
         seen.entry(slug.clone()).or_insert(ArchivedUnit {
             slug,
             archive_path,
+            is_file,
         });
     }
     Ok(seen.into_values().collect())
@@ -250,12 +272,19 @@ pub fn detect_collisions(workspace: &Path, plan: &RollbackPlan) -> Vec<Collision
         }
     }
     for unit in &plan.issues {
-        let active = issues::issue_dir(workspace, &unit.slug);
-        if active.exists() {
+        // A single-file archived issue unarchives to `issues/<slug>.md`; a
+        // directory issue to `issues/<slug>/`. A unit in EITHER active form
+        // collides.
+        if issues::resolve_form(workspace, &unit.slug).is_some() {
+            let active_path = if unit.is_file {
+                format!("issues/{}.md", unit.slug)
+            } else {
+                format!("issues/{}", unit.slug)
+            };
             out.push(Collision {
                 lane: "issue",
                 slug: unit.slug.clone(),
-                active_path: format!("issues/{}", unit.slug),
+                active_path,
             });
         }
     }
@@ -367,22 +396,32 @@ fn restore_canon_to_target(workspace: &Path, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Move `issues/archive/<dated>/` back to active `issues/<slug>/`. Mirrors
-/// [`queue::unarchive`] for the issues lane: collision (active dir exists)
-/// is an error, not an overwrite.
+/// Move an archived issue back to its active location, in EITHER form: a
+/// directory `issues/archive/<dated>/` → `issues/<slug>/`, OR a single file
+/// `issues/archive/<dated>-<slug>.md` → `issues/<slug>.md`. Mirrors
+/// [`queue::unarchive`] for the issues lane: a collision (active unit
+/// already exists, in either form) is an error, not an overwrite.
 fn unarchive_issue(workspace: &Path, unit: &ArchivedUnit) -> Result<()> {
     let src = workspace.join(&unit.archive_path);
-    if !src.is_dir() {
+    let dst = if unit.is_file {
+        if !src.is_file() {
+            return Err(anyhow!("archived issue file not found: {}", src.display()));
+        }
+        issues::issue_file(workspace, &unit.slug)
+    } else {
+        if !src.is_dir() {
+            return Err(anyhow!(
+                "archived issue directory not found: {}",
+                src.display()
+            ));
+        }
+        issues::issue_dir(workspace, &unit.slug)
+    };
+    // A pre-existing active unit in EITHER form is a collision.
+    if issues::resolve_form(workspace, &unit.slug).is_some() {
         return Err(anyhow!(
-            "archived issue directory not found: {}",
-            src.display()
-        ));
-    }
-    let dst = issues::issue_dir(workspace, &unit.slug);
-    if dst.exists() {
-        return Err(anyhow!(
-            "unarchive destination already exists: {}",
-            dst.display()
+            "unarchive destination already exists: an issues/{} unit is present",
+            unit.slug
         ));
     }
     if let Some(parent) = dst.parent() {
@@ -578,6 +617,21 @@ mod tests {
         run(ws, &["commit", "-q", "-m", &format!("{slug}: ship issue fix")]);
     }
 
+    /// Ship a single-file issue fix: write code AND drop a dated
+    /// `issues/archive/<date>-<slug>.md` FILE (the single-file form).
+    fn ship_single_file_issue(ws: &Path, slug: &str, code_file: &str) {
+        std::fs::write(ws.join(code_file), format!("// fix {slug}\n")).unwrap();
+        let archive_dir = ws.join("issues/archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join(format!("2026-05-02-{slug}.md")),
+            format!("## Report\n{slug}\n\n## Tasks\n\n- [x] fix\n"),
+        )
+        .unwrap();
+        run(ws, &["add", "-A"]);
+        run(ws, &["commit", "-q", "-m", &format!("{slug}: ship single-file issue fix")]);
+    }
+
     // ----- 6.1: resolver maps range → exactly the in-range units -----
 
     #[test]
@@ -713,6 +767,54 @@ mod tests {
             String::from_utf8_lossy(&st.stdout)
         );
         let _ = target;
+    }
+
+    // ----- single-file-issues §4.6: single-file archived issue unarchive ---
+
+    #[test]
+    fn single_file_archived_issue_unarchives_back_to_md_file() {
+        let (_dir, ws) = fixture();
+        ship_single_file_issue(&ws, "fix-typo", "src/typo.rs");
+
+        // The resolver maps the dated `.md` archive entry to a file unit.
+        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        assert_eq!(plan.issues.len(), 1);
+        let unit = &plan.issues[0];
+        assert_eq!(unit.slug, "fix-typo");
+        assert!(unit.is_file, "single-file archive entry resolves as a file");
+        assert_eq!(unit.archive_path, "issues/archive/2026-05-02-fix-typo.md");
+
+        // Prepare unarchives it back to `issues/fix-typo.md` (a FILE).
+        run(&ws, &["checkout", "-q", "-B", "agent-q"]);
+        prepare_rolled_back_tree(&ws, &plan).unwrap();
+
+        let active = ws.join("issues/fix-typo.md");
+        assert!(active.is_file(), "single-file issue unarchived to a .md file");
+        assert!(
+            !ws.join("issues/fix-typo").exists(),
+            "no directory form produced"
+        );
+        assert!(
+            !ws.join("issues/archive/2026-05-02-fix-typo.md").exists(),
+            "archive entry moved out"
+        );
+        assert!(std::fs::read_to_string(&active).unwrap().contains("## Tasks"));
+        // The issue-fix code is discarded (rolled back).
+        assert!(!ws.join("src/typo.rs").exists());
+    }
+
+    #[test]
+    fn directory_archived_issue_still_unarchives_to_directory() {
+        // Regression: the directory form still unarchives to `issues/<slug>/`.
+        let (_dir, ws) = fixture();
+        ship_issue(&ws, "fix-dir", "src/d.rs");
+        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        assert_eq!(plan.issues.len(), 1);
+        assert!(!plan.issues[0].is_file, "directory archive entry is not a file");
+        run(&ws, &["checkout", "-q", "-B", "agent-q"]);
+        prepare_rolled_back_tree(&ws, &plan).unwrap();
+        assert!(ws.join("issues/fix-dir/issue.md").is_file());
+        assert!(!ws.join("issues/fix-dir.md").exists());
     }
 
     // ----- 5.1: code-only range → plain rollback, no unarchive -----

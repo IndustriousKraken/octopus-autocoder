@@ -373,7 +373,7 @@ fn should_stop_after_commit_check(
 /// Run the reviewer step (skip-decision, agentic/oneshot review, revision
 /// partitioning) and return the review report, draft flag, and taken
 /// reviewer-revision concerns. Extracted from `execute_one_pass` (a68 split).
-async fn run_reviewer_step(
+pub(crate) async fn run_reviewer_step(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],

@@ -693,6 +693,24 @@ features:
 
 **Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; enabling the issues lane requires a daemon restart. Public ingestion additionally needs `gh` authenticated on the host; on a failed read a WARN logs and the pass proceeds.
 
+### `features.octopus_guide` {#featuresoctopusguide}
+
+Config for the in-repo agent guide. When enabled (the default), the daemon provisions a committed `OCTOPUS.md` plus an `AGENTS.md` reference into the repository through its normal push + pull-request flow, idempotently, honoring `auto_submit_pr`. See [OPERATIONS.md → In-repo agent guide](OPERATIONS.md#octopus-guide) for the workflow.
+
+```yaml
+features:
+  octopus_guide:
+    enabled: true                 # default TRUE; set false to opt this repo out
+```
+
+| Field     | Type   | Default | Description                                                                                                                                                                                                 |
+|-----------|--------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled` | `bool` | `true`  | Master switch for guide provisioning. When `false` the daemon writes neither `OCTOPUS.md` nor `AGENTS.md` and opens no bootstrap pull request for them — for a repo where metafiles are unwelcome.          |
+
+**Default behaviour.** Omitting the `features.octopus_guide` block (or the entire `features:` parent block) is equivalent to `enabled: true` — the guide is provisioned for every managed repository.
+
+**Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; toggling guide provisioning requires a daemon restart.
+
 
 ## `canonical_rag:` (optional)
 

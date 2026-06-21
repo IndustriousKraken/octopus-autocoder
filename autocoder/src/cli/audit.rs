@@ -13,9 +13,7 @@ use crate::audits::{
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
-use crate::config::{
-    AuditSettings, ExecutorConfig, ExecutorKind, RepositoryConfig,
-};
+use crate::config::{AuditSettings, RepositoryConfig};
 use crate::control_socket;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -121,7 +119,18 @@ async fn submit_queue_audit(
 /// Daemon-absent path: build a minimal audit registry, look up the
 /// named audit, construct a fake `RepositoryConfig` whose `local_path`
 /// is the operator-supplied workspace, and call the audit's `run`
-/// directly. Findings (if any) are printed to stdout.
+/// directly.
+///
+/// Submission-based advisory audits (architecture_advisor, drift,
+/// documentation, canon_contradiction) capture their verdict via an MCP
+/// `submit_findings` tool relayed over the control socket. The env var that
+/// names that socket is set only at daemon startup, so daemon-absent these
+/// audits would drain `None` from `try_consume_submission` and error "no
+/// submit_findings submission". We therefore stand up the in-process
+/// submission listener via `control_socket::spawn_submission_listener` for
+/// the duration of the run; the guard's `Drop` tears the socket down on
+/// exit. The audit's own outcome (findings, "no findings", or
+/// did-not-complete) is printed to stdout afterwards.
 async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, audit_name: &str) -> Result<()> {
     if !workspace.is_dir() {
         return Err(anyhow!(
@@ -129,7 +138,7 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
             workspace.display()
         ));
     }
-    let executor_cfg = default_standalone_executor_cfg();
+    let executor_cfg = crate::config::placeholder_executor_config();
     let audit_settings: HashMap<String, AuditSettings> = HashMap::new();
 
     let mut registry = AuditRegistry::new();
@@ -184,6 +193,13 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
         max_validation_retries: 1,
     };
 
+    // Stand up the in-process submission transport BEFORE running the audit
+    // so a submission-based audit's `submit_findings` verdict is captured
+    // (otherwise daemon-absent it drains `None` and errors). The guard is
+    // held for the whole run and dropped here on return, which cancels the
+    // listener and removes the socket file.
+    let _listener = control_socket::spawn_submission_listener(paths)?;
+
     println!(
         "▶ Running {audit} standalone against {ws}",
         audit = audit_arc.audit_type(),
@@ -192,52 +208,6 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
     let outcome = audit_arc.run(&mut ctx).await?;
     print_standalone_outcome(audit_arc.audit_type(), &outcome);
     Ok(())
-}
-
-fn default_standalone_executor_cfg() -> ExecutorConfig {
-    ExecutorConfig {
-        kind: ExecutorKind::ClaudeCli,
-        implementer_cli: None,
-        command: "claude".to_string(),
-        timeout_secs: 600,
-        agentic_session_timeout_secs: crate::config::default_agentic_session_timeout(),
-        sandbox: None,
-        agent_env: None,
-        implementer_prompt_path: None,
-        changelog_stylist_prompt_path: None,
-        perma_stuck_after_failures: None,
-        max_changes_per_pr: None,
-        startup_jitter_max_secs: None,
-        inter_iteration_jitter_pct: None,
-        max_auto_revisions_per_pr: 5,
-        max_revise_triggers_per_pr: 10,
-        wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
-        output_format: crate::config::default_output_format(),
-        log_retention_days: crate::config::default_log_retention_days(),
-        busy_marker_stale_threshold_secs: None,
-        change_internal_contradiction_check:
-            crate::config::ContradictionCheckMode::Disabled,
-        change_internal_contradiction_check_prompt_path: None,
-        change_internal_contradiction_check_llm: None,
-        change_canonical_contradiction_check:
-            crate::config::ContradictionCheckMode::Disabled,
-        change_canonical_contradiction_check_prompt_path: None,
-        change_canonical_contradiction_check_llm: None,
-        global_rules_check: crate::config::ContradictionCheckMode::Disabled,
-        global_rules_check_prompt_path: None,
-        global_rules_check_llm: None,
-        global_rules: crate::config::GlobalRulesConfig::default(),
-        code_implements_spec_check:
-            crate::config::ContradictionCheckMode::Disabled,
-        code_implements_spec_check_prompt_path: None,
-        code_implements_spec_check_llm: None,
-        verifier_gate_retries: crate::config::default_verifier_gate_retries(),
-        implementer: None,
-        changelog_stylist: None,
-        implementer_revision: None,
-        audit_triage: None,
-        chat_request_triage: None,
-    }
 }
 
 fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
@@ -253,6 +223,7 @@ fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     }
 }
@@ -444,5 +415,58 @@ mod tests {
                 || msg.contains("security_bug_audit"),
             "error must list registered audits: {msg}"
         );
+    }
+
+    /// The standalone audit path stands up the in-process submission
+    /// listener (via `spawn_submission_listener`) so a submission-based
+    /// audit's `submit_findings` verdict is CAPTURED rather than draining
+    /// `None` and erroring "no submit_findings submission". This test drives
+    /// the same listener the standalone path uses and confirms a relayed
+    /// submission round-trips through `try_consume_submission` (the audit's
+    /// own drain path) — proving the daemon-absent capture works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_listener_captures_submission() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        // Exactly the bootstrap `run_standalone` performs before invoking the
+        // audit.
+        let guard = control_socket::spawn_submission_listener(&paths)
+            .expect("standalone listener stands up");
+
+        // Simulate the audit's MCP child relaying its `submit_findings`.
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "myrepo",
+            "change": "audit-run",
+            "role": "architecture_advisor",
+            "payload": {"findings": []},
+        });
+        let stream = UnixStream::connect(guard.socket_path()).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut payload = rec.to_string();
+        payload.push('\n');
+        write_half.write_all(payload.as_bytes()).await.unwrap();
+        write_half.shutdown().await.unwrap();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "record: {resp}");
+
+        // The audit's own drain path captures it (no "no submission" error).
+        let drained = crate::audits::try_consume_submission(
+            std::path::Path::new("/x/myrepo"),
+            "audit-run",
+        )
+        .await;
+        assert!(
+            drained.is_some(),
+            "standalone audit must capture its submission via the listener"
+        );
+
+        drop(guard);
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+        }
     }
 }

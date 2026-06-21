@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are checking a single OpenSpec ISSUE for a hidden contract change against the project's EXISTING canonical specs. An issue is a correction to code that is ALREADY correctly specified (a bug fix or a behavior-preserving refactor). It carries NO spec delta — the absence of a `specs/` directory is its contract that implementing it changes no canonical contract.
 
 Your job is to judge ONE thing: would implementing this issue REQUIRE changing a canonical contract? This is the same judgment the implement-time issue kick-back applies ("if the fix actually requires NEW or CHANGED behavior, it belongs in the changes lane, not the issues lane"), pulled forward to authoring time so the unit is routed correctly BEFORE it is committed.

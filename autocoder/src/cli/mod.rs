@@ -93,6 +93,7 @@ pub mod run;
 pub mod survives;
 pub mod sync_specs;
 pub mod sync_specs_deps;
+pub mod verify;
 
 #[derive(Parser, Debug)]
 #[command(name = "autocoder")]
@@ -426,6 +427,37 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+
+    /// Run the pre-executor verifier-gate checks (`[in]` / `[canon]` /
+    /// `[rules]`) locally on a working-tree change BEFORE pushing, so you
+    /// learn whether the change would pass the server gates without a
+    /// remote round-trip. Runs in the cwd repo against
+    /// `openspec/changes/<change-slug>/`. By default runs the gates ENABLED
+    /// in config; `--all` runs every spec-checking gate, `--gate in,canon`
+    /// runs a named subset. Exits 0 only when every gate that ran is clean;
+    /// non-zero on any finding, any gate that could not run, OR when no gate
+    /// evaluated the change.
+    Verify {
+        /// The change slug under `openspec/changes/<slug>/`.
+        #[arg(required = true)]
+        change_slug: String,
+
+        /// Run every realized spec-checking gate (in, canon, rules)
+        /// regardless of its enabled state in config.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Run a named subset of gates, comma-separated (e.g. `in,canon`).
+        /// An unknown gate name is an error, not a silent skip.
+        #[arg(long)]
+        gate: Option<String>,
+
+        /// Path to the YAML configuration file. When omitted, the same
+        /// discovery as `run` is used (so the check-only install's minimal
+        /// config is found automatically).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> Result<()> {
@@ -502,6 +534,20 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     repo,
                 },
             )
+            .await
+        }
+        Command::Verify {
+            change_slug,
+            all,
+            gate,
+            config,
+        } => {
+            verify::execute(verify::VerifyArgs {
+                change_slug,
+                all,
+                gate,
+                config,
+            })
             .await
         }
     }

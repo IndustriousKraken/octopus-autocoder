@@ -310,6 +310,7 @@ async fn iteration_error_continues() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     let github = GithubConfig {
@@ -399,6 +400,249 @@ async fn iteration_error_continues() {
     assert!(
         count >= 2,
         "expected ≥2 executor invocations across iterations, got {count}"
+    );
+}
+
+/// Counting LLM client: records how many times `complete` was invoked so
+/// reviewer-invocation tests can assert the reviewer actually ran (vs.
+/// asserting the step returned `None`/skipped). Returns a canned `Pass`
+/// verdict on every call.
+struct CountingReviewerClient {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::llm::LlmClient for CountingReviewerClient {
+    async fn complete(&self, _: &str) -> Result<String> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("VERDICT: Pass\n\n## Security\n- None observed.\n".to_string())
+    }
+}
+
+/// Branch off `main` to `agent-q` and commit a non-spec-only code change so
+/// the reviewer step has a real diff to review (and the `skip_spec_only_prs`
+/// heuristic — off by default in `CodeReviewer::new` — would not trip even
+/// if enabled). Returns the workspace.
+fn agent_branch_with_code_diff(ws: &Path) {
+    fn git(ws: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+    git(ws, &["checkout", "-q", "-b", "agent-q"]);
+    std::fs::write(ws.join("fix.rs"), "fn fixed() {}\n").unwrap();
+    git(ws, &["add", "-A"]);
+    git(ws, &["commit", "-q", "-m", "issue-fix: implement"]);
+}
+
+/// 4.1: an issue-only pass (no processed change, `processed_issues` =
+/// `["slug"]`) INVOKES the reviewer exactly once. Drives the real
+/// `run_reviewer_step` skip-guard with a counting reviewer and asserts the
+/// reviewer's LLM client was hit once — proving the reviewer RAN, not that
+/// the step returned `None`/skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_only_pass_invokes_reviewer_once() {
+    use crate::code_reviewer::CodeReviewer;
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    agent_branch_with_code_diff(&ws);
+    // The worked issue's archive entry (the reviewer's brief source).
+    let _ = write_fake_archived_issue(&ws, "fix-the-widget");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reviewer = CodeReviewer::new(
+        Box::new(CountingReviewerClient {
+            calls: calls.clone(),
+        }),
+        "REVIEW:\n{{diff}}\n".to_string(),
+    );
+
+    let mut guard = match crate::busy_marker::try_acquire(
+        &paths,
+        &ws,
+        "git@github.com:owner/fixture.git",
+        u32::MAX as u64,
+    )
+    .expect("acquire busy marker")
+    {
+        crate::busy_marker::AcquireOutcome::Acquired(g) => g,
+        _ => panic!("expected Acquired busy marker"),
+    };
+
+    let (report, _draft, _concerns) = run_reviewer_step(
+        &ws,
+        &fixture_repo(&ws),
+        &[],                          // no processed change
+        &["fix-the-widget".into()],   // one worked issue
+        Some(&reviewer),
+        None,
+        0,
+        &mut guard,
+    )
+    .await
+    .expect("reviewer step succeeds");
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "issue-only pass must invoke the reviewer exactly once"
+    );
+    assert!(
+        report.is_some(),
+        "an issue-only pass must produce a review report, not a skip"
+    );
+}
+
+/// 4.2: `build_review_context(ws, repo, &[], &["slug"], kind)` loads the
+/// worked issue's brief from `issues/archive/` — its `issue.md` body becomes
+/// the brief's `proposal` and its `tasks.md` body becomes the brief's
+/// `tasks`. Asserts on the returned data structure, not on any prompt prose.
+#[test]
+fn issue_pass_review_context_carries_issue_brief() {
+    use crate::config::ReviewerKind;
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    agent_branch_with_code_diff(&ws);
+    let (issue_md, tasks_md) = write_fake_archived_issue(&ws, "fix-the-widget");
+
+    let ctx = build_review_context(
+        &ws,
+        &fixture_repo(&ws),
+        &[],
+        &["fix-the-widget".into()],
+        ReviewerKind::Oneshot,
+    )
+    .expect("build_review_context succeeds");
+
+    let brief = ctx
+        .archived_changes
+        .iter()
+        .find(|b| b.name == "fix-the-widget")
+        .expect("issue brief present in review context");
+    assert_eq!(
+        brief.proposal, issue_md,
+        "issue brief's proposal must be the issue.md body sourced from issues/archive"
+    );
+    assert_eq!(
+        brief.tasks, tasks_md,
+        "issue brief's tasks must be the tasks.md body sourced from issues/archive"
+    );
+    assert!(
+        brief.design.is_none(),
+        "issues carry no design.md, so the brief's design is None"
+    );
+}
+
+/// 4.3: a pass that processed NEITHER a change NOR an issue still skips the
+/// reviewer (regression guard for audit-only / empty passes). Asserts the
+/// reviewer's LLM client was never invoked AND no report was produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_change_no_issue_pass_skips_reviewer() {
+    use crate::code_reviewer::CodeReviewer;
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    agent_branch_with_code_diff(&ws);
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reviewer = CodeReviewer::new(
+        Box::new(CountingReviewerClient {
+            calls: calls.clone(),
+        }),
+        "REVIEW:\n{{diff}}\n".to_string(),
+    );
+
+    let mut guard = match crate::busy_marker::try_acquire(
+        &paths,
+        &ws,
+        "git@github.com:owner/fixture.git",
+        u32::MAX as u64,
+    )
+    .expect("acquire busy marker")
+    {
+        crate::busy_marker::AcquireOutcome::Acquired(g) => g,
+        _ => panic!("expected Acquired busy marker"),
+    };
+
+    let (report, _draft, _concerns) = run_reviewer_step(
+        &ws,
+        &fixture_repo(&ws),
+        &[], // no processed change
+        &[], // no worked issue
+        Some(&reviewer),
+        None,
+        0,
+        &mut guard,
+    )
+    .await
+    .expect("reviewer step succeeds");
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a pass with no change and no issue must skip the reviewer"
+    );
+    assert!(
+        report.is_none(),
+        "a skipped reviewer produces no report"
+    );
+}
+
+/// 4.4: a mixed change+issue pass loads BOTH briefs into the review context:
+/// the change brief from `changes/archive/` and the issue brief from
+/// `issues/archive/`. Asserts both appear in `ReviewContext.archived_changes`.
+#[test]
+fn mixed_change_and_issue_pass_carries_both_briefs() {
+    use crate::config::ReviewerKind;
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    agent_branch_with_code_diff(&ws);
+
+    // Archived CHANGE under changes/archive/ (the change brief source).
+    let change_dir = ws.join("openspec/changes/archive/2026-01-02-improve-thing");
+    std::fs::create_dir_all(&change_dir).unwrap();
+    let change_proposal = "## Why\nimprove the thing for clarity\n";
+    let change_tasks = "- [ ] do the improvement\n";
+    std::fs::write(change_dir.join("proposal.md"), change_proposal).unwrap();
+    std::fs::write(change_dir.join("tasks.md"), change_tasks).unwrap();
+
+    // Archived ISSUE under issues/archive/ (the issue brief source).
+    let (issue_md, issue_tasks) = write_fake_archived_issue(&ws, "fix-the-widget");
+
+    let ctx = build_review_context(
+        &ws,
+        &fixture_repo(&ws),
+        &["improve-thing".into()],
+        &["fix-the-widget".into()],
+        ReviewerKind::Oneshot,
+    )
+    .expect("build_review_context succeeds");
+
+    let change_brief = ctx
+        .archived_changes
+        .iter()
+        .find(|b| b.name == "improve-thing")
+        .expect("change brief present");
+    assert_eq!(change_brief.proposal, change_proposal);
+    assert_eq!(change_brief.tasks, change_tasks);
+
+    let issue_brief = ctx
+        .archived_changes
+        .iter()
+        .find(|b| b.name == "fix-the-widget")
+        .expect("issue brief present");
+    assert_eq!(issue_brief.proposal, issue_md);
+    assert_eq!(issue_brief.tasks, issue_tasks);
+
+    assert_eq!(
+        ctx.archived_changes.len(),
+        2,
+        "mixed pass carries exactly the change brief and the issue brief"
     );
 }
 

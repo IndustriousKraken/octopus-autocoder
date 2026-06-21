@@ -52,6 +52,7 @@ async fn audit_scheduler_not_invoked_when_ensure_initialized_fails() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     let github_cfg = GithubConfig {
@@ -150,6 +151,7 @@ async fn iteration_auto_recovers_partial_clone_without_failure() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     let github_cfg = GithubConfig {

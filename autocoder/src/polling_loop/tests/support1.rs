@@ -59,6 +59,7 @@ pub(crate) fn fixture_repo_for_rebuild_test() -> RepositoryConfig {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     }
 }

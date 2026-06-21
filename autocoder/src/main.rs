@@ -40,6 +40,7 @@ mod llm;
 mod log_retention;
 mod mcp_askuser_server;
 mod migration;
+mod octopus_guide;
 mod openspec_archive;
 mod outcome_store;
 mod paths;

@@ -7098,25 +7098,42 @@ GitLab SHALL be selected ONLY via an explicit `forge: { kind: gitlab }` — ther
 - **AND** GitLab is NOT selected by host inference
 
 ### Requirement: Issues lane for corrections
-The daemon SHALL provide a second work lane, `issues/`, for corrections — fixes to code that is already correctly specified (bug fixes, behavior-preserving refactors) that carry NO spec delta. An issue SHALL be a directory `issues/<slug>/` containing `issue.md` (the report and diagnosis AND the acceptance criteria stated against the EXISTING specification) AND `tasks.md` (the fix steps), with NO `specs/` directory — that absence is the contract that an issue changes no spec. The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing `issues/<slug>/` directly (repository write is the allowlist; no public surface). On completion the issue directory SHALL move to `issues/archive/`, mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
+The daemon SHALL provide a second work lane, `issues/`, for corrections — fixes to code that is already correctly specified (bug fixes, behavior-preserving refactors) that carry NO spec delta. An issue SHALL take ONE of two on-disk forms:
+
+- **Single file (the default):** `issues/<slug>.md` — a description of the problem and desired end state, OPTIONALLY followed by a `## Tasks` checklist of the fix steps. This is the form for the common case: a small, curated correction.
+- **Directory (when more is needed):** `issues/<slug>/` containing `issue.md` (the report/diagnosis AND acceptance criteria stated against the EXISTING specification) AND `tasks.md` (the fix steps). The directory form is REQUIRED when the unit must carry a separate artifact — in particular a quarantined public report body (see below) — and MAY be used for any issue with attachments.
+
+NEITHER form SHALL contain a `specs/` directory — that absence is the contract that an issue changes no spec; a unit carrying a `specs/` directory is malformed. A public-origin issue (one carrying an untrusted public report body) SHALL use the directory form so the quarantined `report-body.md` stays a separate file from the maintainer-approved task, preserving the quarantine boundary; collapsing an untrusted body into the single-file form is NOT permitted.
+
+The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
 
 #### Scenario: An enabled lane works a committed issue
-- **WHEN** `features.issues` is on AND an `issues/<slug>/` with `issue.md` and `tasks.md` is present
+- **WHEN** `features.issues` is on AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
 - **THEN** the issue is selected and worked
 - **AND** no spec delta is required for it
 
+#### Scenario: A single-file issue is a valid unit
+- **WHEN** `features.issues` is on AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
+- **THEN** it loads as a well-formed issue AND is worked like a directory-form issue
+- **AND** its `## Tasks` checklist (when present) is the fix-step list the implementer follows
+
 #### Scenario: An issue carrying a specs directory is rejected
-- **WHEN** an `issues/<slug>/` contains a `specs/` directory
+- **WHEN** a directory-form `issues/<slug>/` contains a `specs/` directory
 - **THEN** it is rejected as malformed, because an issue carries no spec delta
+
+#### Scenario: A public-origin issue uses the directory form to keep the body quarantined
+- **WHEN** a public-origin issue is written (it carries an untrusted public report body)
+- **THEN** it uses the directory form `issues/<slug>/` with the body in a separate `report-body.md`, NOT the single-file form
+- **AND** the untrusted body is never merged into the same file as the maintainer-approved task
 
 #### Scenario: Completion archives without touching canon
 - **WHEN** an issue's fix completes
-- **THEN** `issues/<slug>/` moves to `issues/archive/`
+- **THEN** a single-file issue moves `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, AND a directory-form issue moves `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/`
 - **AND** no canonical spec file is modified
 
 #### Scenario: The lane is disabled by default
 - **WHEN** `features.issues` is unset
-- **THEN** the issues lane is inactive AND `issues/<slug>/` directories are not worked
+- **THEN** the issues lane is inactive AND neither `issues/<slug>.md` files nor `issues/<slug>/` directories are worked
 
 ### Requirement: Independent lane walkers over shared utilities
 The changes lane AND the issues lane SHALL be driven by separate walkers, each with its own control flow AND its own state file; lane-specific behavior SHALL live in each walker, NOT in shared branching keyed on a lane flag. Shared leaf functionality — the busy-marker, PR opening, archiving, chatops notification, queue-state I/O, AND workspace handling — SHALL be composed from stateless shared utilities that both walkers call. A fault in one walker SHALL NOT corrupt the other lane's control flow or state: each walker reads AND writes only its own lane's state.
@@ -7149,11 +7166,11 @@ Within the existing per-repo serializer (the busy-marker — one unit of work pe
 - **THEN** they are selected in alphabetical order
 
 ### Requirement: Hybrid issue ingestion with maintainer promotion
-The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write `issues/<slug>/` AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
+The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write the issue unit AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
 
 The candidate notification SHALL be posted in a way that a later promotion reply can be matched to it: the daemon SHALL capture the posted message's `thread_ts` AND `channel` AND persist them on the candidate's stored state. A candidate whose thread was not captured (a degraded post) is simply not matchable by a reply — graceful degradation, never an error. The notification SHALL instruct the maintainer to reply `@<bot> send it` (the mention form that the verb recognizes), retaining the statement that nothing is written OR queued until they do.
 
-Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate, write `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md` for a public-origin candidate), AND flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready `issues/<slug>/`). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
+Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate AND write the issue unit in the form appropriate to its origin: a CURATED candidate (carrying no untrusted body) as the default single file `issues/<slug>.md` (a description plus an optional `## Tasks` checklist); a PUBLIC-ORIGIN candidate as the directory form `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md`) so the untrusted body stays a separate file from the maintainer-approved task. The action SHALL flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready issue unit). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
 
 #### Scenario: A triaged report posts a candidate and queues nothing
 - **WHEN** a reported issue is triaged
@@ -7162,8 +7179,13 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 
 #### Scenario: Promotion writes and queues
 - **WHEN** a maintainer "send it"s a posted candidate
-- **THEN** the daemon writes `issues/<slug>/`
+- **THEN** the daemon writes the issue unit in the form appropriate to its origin (a single file `issues/<slug>.md` for a curated candidate, OR `issues/<slug>/` for a public-origin candidate)
 - **AND** queues it for the issues lane
+
+#### Scenario: A curated candidate is promoted as a single file
+- **WHEN** the promotion action runs for a curated candidate (carrying no untrusted body)
+- **THEN** the daemon writes the single file `issues/<slug>.md` (description plus an optional `## Tasks` checklist), NOT a directory
+- **AND** the written unit is ready for the issues-lane walker
 
 #### Scenario: An unpromoted candidate does no work
 - **WHEN** a candidate is posted but no maintainer promotes it
@@ -7180,7 +7202,7 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 
 #### Scenario: The promotion action writes, queues, and flips status
 - **WHEN** the promotion control-socket action runs for a posted candidate
-- **THEN** the daemon writes `issues/<slug>/` (including the quarantined `report-body.md` for a public-origin candidate)
+- **THEN** the daemon writes the issue unit in the form appropriate to origin (a single file `issues/<slug>.md` for a curated candidate, OR `issues/<slug>/` including the quarantined `report-body.md` for a public-origin candidate)
 - **AND** the candidate's stored status becomes promoted
 - **AND** the written unit is ready for the issues-lane walker
 
@@ -7892,24 +7914,29 @@ Because it is a verifier gate, the `[rules]` gate runs server-side pre-executor 
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
 
 ### Requirement: Issues lane parks a non-progressing issue
-The issues lane SHALL NOT re-attempt the same issue indefinitely. The issues walker SHALL track a per-issue consecutive-failure counter (its own lane state, per the independent-lane-walkers requirement) AND, once an issue stops making progress, SHALL PARK it: write a `.perma-stuck.json` marker into `issues/<slug>/`, exclude the issue from selection while the marker is present, AND post an operator-visible chatops alert. The threshold SHALL be the existing `executor.perma_stuck_after_failures` value (no new configuration). The operator unparks an issue by removing the marker, exactly as for a parked change.
+The issues lane SHALL NOT re-attempt the same issue indefinitely. The issues walker SHALL track a per-issue consecutive-failure counter (its own lane state, per the independent-lane-walkers requirement) AND, once an issue stops making progress, SHALL PARK it: write a `.perma-stuck.json` marker for the issue — INSIDE `issues/<slug>/` for a directory-form issue, OR as the sibling `issues/<slug>.perma-stuck.json` for a single-file issue — exclude the issue from selection while the marker is present, AND post an operator-visible chatops alert. The threshold SHALL be the existing `executor.perma_stuck_after_failures` value (no new configuration). The operator unparks an issue by removing the marker, exactly as for a parked change.
 
 Progress is defined by outcome:
 - A RETRYABLE failure (executor error, a `Completed` outcome that left the workspace unmodified, an unsupported iteration request, OR a precondition-unmet outcome) SHALL increment the counter; the issue is parked when the counter reaches `executor.perma_stuck_after_failures`.
 - An outcome that retrying cannot resolve — the agent escalating a question (the issues lane does not escalate) OR the agent kicking the fix back to the changes lane (it requires a behavior change) — SHALL park the issue IMMEDIATELY (a single attempt, not the full threshold). Immediate parking on kick-back also stops the kick-back notice from re-posting on every pass.
 - A daemon-shutdown abort SHALL NOT count toward the threshold (operator-initiated shutdown is not an issue failure).
 
-Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the attempt count, AND the last reason, so the lane is never silently re-attempting an issue NOR silently abandoning one. Completion (the fix landed AND the issue archived) SHALL clear both the counter AND the marker, so a later issue reusing the slug starts clean. The marker file SHALL reuse the `.perma-stuck.json` name already excluded via `.git/info/exclude`, so it is gitignored at any depth AND survives the per-iteration branch reset AND `git clean`.
+Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the attempt count, AND the last reason, so the lane is never silently re-attempting an issue NOR silently abandoning one. Completion (the fix landed AND the issue archived) SHALL clear both the counter AND the marker, so a later issue reusing the slug starts clean. The park marker SHALL be gitignored regardless of issue form: the `.git/info/exclude` set SHALL match BOTH the in-directory `.perma-stuck.json` AND the single-file sibling `issues/<slug>.perma-stuck.json` (a suffix pattern such as `*.perma-stuck.json`, because a bare-basename exclude matches only the in-directory form), so the marker is gitignored at any depth AND survives the per-iteration branch reset AND `git clean` in either form.
 
 #### Scenario: A repeatedly failing issue is parked after the threshold
 - **WHEN** an issue's fix fails on `executor.perma_stuck_after_failures` consecutive passes
-- **THEN** a `.perma-stuck.json` marker is written into `issues/<slug>/`
+- **THEN** a `.perma-stuck.json` marker is written for the issue (inside `issues/<slug>/` for a directory issue, OR as the sibling `issues/<slug>.perma-stuck.json` for a single-file issue)
 - **AND** an operator-visible chatops alert names the issue, the attempt count, AND the last reason
 
 #### Scenario: A parked issue is skipped until the operator removes the marker
-- **WHEN** an `issues/<slug>/` carries a `.perma-stuck.json` marker
+- **WHEN** an issue carries a `.perma-stuck.json` marker (inside `issues/<slug>/`, OR as the sibling `issues/<slug>.perma-stuck.json`)
 - **THEN** the issue is excluded from selection (it is not worked)
 - **AND** removing the marker makes the issue selectable again
+
+#### Scenario: A single-file issue's sibling park marker is gitignored
+- **WHEN** a single-file issue `issues/<slug>.md` is parked with a sibling `issues/<slug>.perma-stuck.json` marker
+- **THEN** the marker is gitignored — the exclude set matches the sibling form, not only the in-directory `.perma-stuck.json`
+- **AND** it does not appear as an untracked change in the pre-pass dirty check, AND it survives `git clean` AND the per-iteration branch reset
 
 #### Scenario: An escalated issue is parked immediately
 - **WHEN** the agent escalates a question while working an issue
@@ -7929,7 +7956,7 @@ Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the
 #### Scenario: Completion clears the counter and the marker
 - **WHEN** an issue's fix completes AND the issue is archived
 - **THEN** the per-issue failure counter is cleared
-- **AND** no `.perma-stuck.json` marker remains for that slug
+- **AND** no `.perma-stuck.json` marker remains for that slug (in either form)
 
 ### Requirement: Survival analysis — what of a past PR or commit is still live
 The orchestrator SHALL provide an analysis that reports which of a past pull request's OR commit's changes still survive verbatim in the current base-branch tree, so an operator can review long-past work that is still live AND spec a fix for surviving problems. It SHALL be available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> survives <repo-substring> <pr <N> | commit <sha>>`), resolving the repository by the same selector rule the other operator commands use. It SHALL be read-only.
@@ -8185,4 +8212,139 @@ The reviewer remains ADVISORY: a FAILED TO RUN reviewer state SHALL NOT block PR
 #### Scenario: A successful review is unchanged
 - **WHEN** the agentic reviewer returns a valid verdict (Approve OR Block)
 - **THEN** the PR body renders the normal `## Code Review` section AND the ledger records that verdict, exactly as before
+
+### Requirement: Shared in-process submission listener for daemon-absent gate and audit runs
+
+autocoder SHALL provide a shared `control_socket::spawn_submission_listener(paths)` helper that stands up the submission transport in-process for a single invocation, so an agentic gate or audit that captures its verdict via an MCP `submit_*` tool can run without a daemon. The helper SHALL, in order: construct a `crate::submission_store::SubmissionStore`; register the gate submission schemas (`register_contradiction_submission_schema`, `register_canon_contradiction_submission_schema`, `register_rule_violations_submission_schema`) AND the audit submission schemas (`register_submission_schemas`); bind the control socket (`control_socket::bind_at`); set the control-socket env var (`mcp_askuser_server::ENV_CONTROL_SOCKET`) to the bound path; spawn `control_socket::serve` on a `ControlState`; AND return a guard whose drop cancels the listener's `CancellationToken` (stopping `serve`, which removes the socket file).
+
+The submission SCHEMA SET — the gate AND audit submission schemas — SHALL be registered from a SINGLE shared function (`register_gate_and_audit_submission_schemas`) used by ALL THREE submission-capturing entry points (the daemon at startup, the `verify` subcommand, AND the standalone audit path), so the set cannot drift between them: a gate or audit whose schema is registered in one path but not another would silently fail to capture its verdict. The `spawn_submission_listener` helper performs the full bind → env-var → `serve` bootstrap on a submission-only `ControlState` AND SHALL be the shared bootstrap for the two DAEMON-ABSENT callers (`verify` AND the standalone audit path). The daemon retains its own bootstrap because it serves a FULL `ControlState` (github, reviewer, chatops, reload handlers) that the submission-only helper does not build; it shares the schema-set registration, not the listener. Without a listener (or, for the daemon, its running control socket), an agentic gate or submission-based audit drains `None` from `try_consume_submission` and fails closed; with it, verdicts are captured exactly as under the daemon.
+
+#### Scenario: Listener is a precondition — gates fail closed without it
+- **WHEN** an agentic gate's verdict is drained while the control-socket env var is unset (no `spawn_submission_listener` active)
+- **THEN** the drain returns no submission AND the gate result is `Errored` (fail-closed)
+- **AND** no gate reports clean for a run whose verdict was never captured
+
+#### Scenario: Listener stands up the transport for an in-process run
+- **WHEN** `spawn_submission_listener(paths)` is held for the duration of a gate or audit run
+- **THEN** the control-socket env var points at a live bound socket AND the gate/audit submission schemas are registered on the store
+- **AND** the run captures its `submit_*` verdict via `try_consume_submission` as it would under a daemon
+
+#### Scenario: Listener tears down its transient socket on drop
+- **WHEN** the listener guard is dropped at the end of an invocation
+- **THEN** its `CancellationToken` fires, `serve` stops, AND the socket file is removed
+- **AND** no daemon control socket is left behind by the invocation
+
+### Requirement: `verify` subcommand runs the pre-executor gate checks locally on a working-tree change
+
+autocoder SHALL provide a `verify <change-slug>` subcommand that runs the pre-executor verifier-gate checks — `[in]` (change-internal), `[canon]` (change-vs-canonical), `[rules]` (global-rules), AND any other realized spec-checking gate that is enabled — against a change in the LOCAL working tree, so an operator can learn whether a change would pass the server gates BEFORE pushing it. It is a new invocation surface for the existing checks, NOT a redefinition of the verifier-gate framework: it invokes the same check entry points (`preflight::change_contradiction::run_agentic_contradiction_check`, `preflight::canon_contradiction::run_agentic_canon_contradiction_check`, `preflight::global_rules::run_agentic_global_rules_check`; shared core in `preflight::corpus_check`), the same prompts, the same per-gate model configuration (`executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, `executor.global_rules_check_llm`), AND the same submission schemas the server uses, so its verdict matches what the server will enforce.
+
+`verify` SHALL stand up the submission transport in-process via `control_socket::spawn_submission_listener(paths)` as a hard precondition for the duration of the run; without it the gates fail closed and `verify` cannot pass. `verify` SHALL resolve its agentic-session timeout from `ExecutorConfig::agentic_session_timeout()` (reading `executor.agentic_session_timeout_secs`, default `3600` when omitted) — NOT a verify-local literal.
+
+The subcommand SHALL run in the repository's working directory, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It SHALL NOT run the executor, SHALL NOT write `.needs-spec-revision.json`, AND SHALL NOT make spec or source edits. It MAY create transient run artifacts (`.mcp.json`, the control socket) AND SHALL clean them up on exit. It reports findings to stdout, grouped by gate AND labeled with the gate identifier, each carrying the finding narrative the server marker's `revision_suggestion` would carry.
+
+By default `verify` SHALL run the gates ENABLED in config (so its verdict matches server enforcement); a selector MAY override (`--all` for every realized spec-checking gate, `--gate <list>` for a named subset). Exit code SHALL be CI-usable, conforming to the `gatekeepers-fail-closed` standard: `0` ONLY when every gate that ran returned no findings; non-zero when any gate finds a contradiction; AND non-zero when an enabled gate CANNOT run (model unconfigured, transport error, unregistered strategy, no submission captured) — `verify` SHALL report "gate could not run" AND fail, never reporting clean for a gate that did not actually evaluate. When the resolved gate set is EMPTY (no spec-checking gate enabled AND no selector forcing one), `verify` SHALL NOT exit `0` silently: it SHALL report that no gate evaluated the change AND exit non-zero, conforming to the `gatekeepers-contain-no-judgment` standard (code never manufactures a clean pass when nothing was evaluated).
+
+`verify` is a subcommand of the autocoder binary (so it ships the identical check logic the server runs). A check-only install SHALL be supported: it fetches a PREBUILT binary, places it on the interactive `PATH`, AND drops a minimal config carrying only what `verify` needs (the `executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, AND `executor.global_rules_check_llm` model blocks with their `enabled` flags, plus corpus locations) — so it runs on a low-powered spec-authoring machine without building from source OR running the daemon.
+
+#### Scenario: A clean change passes verify
+- **WHEN** an operator runs `verify <slug>` in a repo against a change whose deltas contradict neither themselves nor canon AND the relevant gates are enabled and configured
+- **THEN** each run gate reports clean AND the command exits `0`
+- **AND** no marker is written, no executor runs, AND no spec or source files are edited; transient run artifacts are cleaned up
+
+#### Scenario: A contradicting change is reported with a non-zero exit
+- **WHEN** `verify <slug>` runs against a change whose deltas contradict canon (or each other)
+- **THEN** the command prints the finding(s), each labeled with the gate that produced it (`[in]` / `[canon]` / `[rules]`)
+- **AND** it exits non-zero
+- **AND** the finding narrative matches what the server's `.needs-spec-revision.json` would carry
+
+#### Scenario: verify's verdict matches the server gate
+- **WHEN** `verify` runs the same enabled gate against the same change the server would
+- **THEN** it uses the same check entry point, prompts, model config, and submission schema as the server
+- **AND** a change `verify` reports clean is not subsequently kicked back by that same server gate (absent canon drift since the local run)
+
+#### Scenario: A gate that cannot run fails closed, not clean
+- **WHEN** an enabled gate cannot run during `verify` (its model is unconfigured, the agentic session errors, its strategy is unregistered, or no submission is captured)
+- **THEN** `verify` reports that the gate could not run AND exits non-zero
+- **AND** it does NOT report the change as clean
+
+#### Scenario: Without the submission listener every gate fails closed
+- **WHEN** `verify` runs but the in-process submission listener was not stood up (the control-socket env var is unset)
+- **THEN** every gate drains no submission AND is reported as unable to run (fail-closed) with a non-zero exit
+- **AND** no gate reports clean — confirming the listener is a hard precondition
+
+#### Scenario: An empty enabled-gate set is loud, not a silent pass
+- **WHEN** `verify <slug>` runs with a config in which NO spec-checking gate is enabled AND no selector forces one
+- **THEN** `verify` reports that no gate evaluated the change AND exits non-zero
+- **AND** it does NOT exit `0` — code never manufactures a clean pass for a change nothing checked
+
+#### Scenario: verify honors the unified agentic-session timeout
+- **WHEN** `verify` runs with `executor.agentic_session_timeout_secs` configured (or omitted)
+- **THEN** the gate sessions use the value resolved from `ExecutorConfig::agentic_session_timeout()` (the configured value, or `3600` when omitted)
+- **AND** `verify` does NOT use a verify-local timeout literal
+
+#### Scenario: Default runs enabled gates; selector overrides
+- **WHEN** `verify <slug>` is run with no gate selector
+- **THEN** it runs exactly the spec-checking gates enabled in config
+- **WHEN** `verify <slug> --all` or `verify <slug> --gate in,canon` is run
+- **THEN** it runs the selected gates regardless of their enabled state (reporting any that cannot run as fail-closed)
+- **AND** an unknown gate name in `--gate` is an error, not a silent skip
+
+#### Scenario: Check-only install runs without a daemon or a source build
+- **WHEN** an operator runs the check-only install on a spec-authoring machine
+- **THEN** a prebuilt `verify`-capable binary is placed on the interactive `PATH` AND a minimal config with the `executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, and `executor.global_rules_check_llm` model blocks is written
+- **AND** `verify` runs against a local repo with no daemon running and without compiling from source
+
+### Requirement: Standalone `audit run` captures submission-based audit verdicts without a daemon
+
+The standalone audit path (`audit run`) SHALL stand up the in-process submission transport via `control_socket::spawn_submission_listener(paths)` before invoking an audit, so submission-based advisory audits (architecture_advisor, drift, documentation, canon_contradiction) capture their `submit_findings` verdict through `try_consume_submission` instead of draining `None` and failing closed. Without the listener these audits are non-functional daemon-absent (they error with "no submit_findings submission"); with it, a standalone `audit run` returns findings exactly as the daemon would.
+
+#### Scenario: A daemon-absent standalone advisory audit returns findings
+- **WHEN** an operator runs `audit run <submission-based-advisory-audit>` with no daemon running
+- **THEN** the standalone path stands up the submission listener for the run AND the audit's `submit_findings` verdict is captured
+- **AND** the audit returns its findings rather than erroring "no submit_findings submission"
+
+#### Scenario: Standalone audit listener is torn down after the run
+- **WHEN** a standalone `audit run` completes
+- **THEN** the submission listener guard is dropped AND its control socket is removed
+- **AND** no daemon control socket is left behind by the standalone run
+
+### Requirement: The daemon provisions OCTOPUS.md via a dedicated pull request, per-repo configurable
+The daemon SHALL provision `OCTOPUS.md` AND the `AGENTS.md` reference to it into a managed repository through the established push + pull-request flow — the SAME path any change rides — NOT during server provisioning (`autocoder install`, which writes host config, a systemd unit, AND a system user, and never touches a managed repository's working tree), AND NOT via a commit on the base branch outside a pull request.
+
+**Where the write happens.** The daemon SHALL write `OCTOPUS.md` AND refresh the `AGENTS.md` reference ON THE AGENT BRANCH — after the per-iteration base sync checks out `base_branch` AND recreates the agent branch (the daemon's per-pass workspace preparation performs the base checkout, `git pull --ff-only`, AND `git::recreate_branch` for the agent branch, AFTER `ensure_initialized` has cloned/fetched the workspace; pass work happens on the recreated agent branch thereafter). Writing on the agent branch, after base sync, is the only placement that survives the per-pass dirty-recovery step: a file written UNTRACKED before base sync is wiped by `attempt_dirty_workspace_recovery` (`git reset --hard origin/<base>` + `git clean -fd`), AND a commit landed on `base_branch` diverges from `origin/<base>` so the next `git pull --ff-only` fails, the same dirty-recovery reset discards it, AND it violates the canon prohibition on base-branch commits outside a pull request.
+
+**How it reaches the base branch.** The daemon SHALL stage the two files (`git::add_all`) AND commit them on the agent branch (`git::commit`), then ride the established push + PR-creation path (`git::push_force_with_lease` of the agent branch, then the PR-open step). The provisioning commit reaches the base branch only when the resulting pull request is merged — never by a direct base-branch commit. This bootstrap pull request MAY ride a pass that also carries change work, OR be opened on its own when no other unit is pending; either way the two files travel as ordinary committed content on the agent branch.
+
+**Honoring the per-repo PR toggle.** The daemon SHALL honor the repository's `auto_submit_pr` setting on this provisioning, exactly as it does for change work: when `auto_submit_pr` is `true` (the default) it opens a pull request carrying the two files; when `auto_submit_pr` is `false` it pushes the agent branch carrying the two files AND surfaces the branch (the `BranchPushedNoPr` outcome) without opening a pull request, leaving the operator to open it after local review.
+
+**Guide-provisioning toggle — global default, per-repo override.** Whether the daemon provisions the guide SHALL be a per-repository decision. A global default (`features.octopus_guide.enabled`, defaulting to ENABLED) sets the fleet-wide behavior, AND each repository MAY override it with its own setting; the EFFECTIVE value for a repository is its own override when set, else the global default. The default is ON because the in-repo agent guide benefits every managed repository the operator owns; the per-repo override exists so an operator can turn it OFF for a specific repository — one where they do not want metafiles, OR a third-party repository they contribute to where adding metafiles is not their decision — WITHOUT affecting the rest of the fleet. When the effective value is DISABLED for a repository, the daemon SHALL NEVER write `OCTOPUS.md` or `AGENTS.md` for it AND SHALL open no bootstrap pull request.
+
+**Idempotency — no needless pull request.** Provisioning SHALL be idempotent. When the guide is already present AND current on the base branch (the committed `OCTOPUS.md` matches the content the daemon would generate AND the managed `AGENTS.md` region is present and current), the daemon SHALL do nothing: it writes nothing, commits nothing, AND opens no pull request, so no empty PR AND no churn is produced. The daemon SHALL write the files AND open the bootstrap pull request ONLY when the guide is missing OR out of date on the base branch. When the daemon refreshes the `AGENTS.md` reference it SHALL leave any other `AGENTS.md` content the repository carries untouched; an `AGENTS.md` that does not yet exist is created carrying only the reference.
+
+The committed `OCTOPUS.md` SHALL state the in-repo workflow protocols per the `project-documentation` requirement `Managed repos carry a committed OCTOPUS.md agent guide` (the issues protocol, the OpenSpec change protocol, the canon/archive ownership rules, AND the gate model).
+
+#### Scenario: A bootstrap pull request is opened when the guide is missing and provisioning is enabled
+- **WHEN** the daemon processes a repository whose `features.octopus_guide` flag is enabled AND whose base branch has no `OCTOPUS.md` (or a stale one), with `auto_submit_pr` at its default `true`
+- **THEN** it writes `OCTOPUS.md` AND the managed `AGENTS.md` reference on the recreated agent branch (after base sync), commits both, pushes the agent branch, AND opens a pull request carrying the two files
+- **AND** the files reach the base branch only when that pull request is merged — the daemon makes no base-branch commit outside a pull request
+
+#### Scenario: BranchPushedNoPr when auto_submit_pr is false
+- **WHEN** the daemon would provision the guide for a repository whose `features.octopus_guide` flag is enabled but whose `auto_submit_pr` is `false`
+- **THEN** it writes AND commits the two files on the agent branch AND pushes that branch, but opens no pull request (the `BranchPushedNoPr` outcome), surfacing the branch so the operator can open the pull request after local review
+
+#### Scenario: No write and no pull request when provisioning is disabled
+- **WHEN** the daemon processes a repository whose effective guide-provisioning value (its per-repo override when set, else the global default) is disabled
+- **THEN** it writes neither `OCTOPUS.md` nor `AGENTS.md` AND opens no bootstrap pull request for them, leaving the repository's tree untouched by this feature
+
+#### Scenario: A per-repo override disables provisioning for one repository while the fleet default leaves others enabled
+- **WHEN** the global default is ENABLED but one repository carries its own guide-provisioning override set to disabled
+- **THEN** the daemon provisions the guide for the other repositories (whose effective value is the enabled global default) but writes nothing AND opens no bootstrap pull request for the overridden repository
+
+#### Scenario: No pull request when the guide is already current
+- **WHEN** the daemon processes a repository whose base branch already carries an `OCTOPUS.md` matching what the daemon would generate AND a current managed `AGENTS.md` reference
+- **THEN** it writes nothing, commits nothing, AND opens no bootstrap pull request — no empty PR, no churn
+
+#### Scenario: Provisioning does not write the managed-repo guide
+- **WHEN** `autocoder install` runs to provision a host
+- **THEN** it does NOT write `OCTOPUS.md` into any managed repository's working tree (the guide is provisioned through the daemon's push + pull-request flow, not by host provisioning)
 

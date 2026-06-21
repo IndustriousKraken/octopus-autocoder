@@ -480,6 +480,173 @@ pub fn socket_path(paths: &crate::paths::DaemonPaths) -> PathBuf {
     paths.control_socket_path()
 }
 
+/// Guard returned by [`spawn_submission_listener`]. Holds the
+/// `CancellationToken` for the in-process control-socket listener; on
+/// `Drop` it fires the token, which stops `serve` (the accept loop) and
+/// removes the bound socket file. Hold it for the lifetime of the gate or
+/// audit run that needs the submission transport; drop it to tear the
+/// transport down. The control-socket env var is set by
+/// `spawn_submission_listener` and is NOT cleared on drop (the process is
+/// exiting in every caller; clearing it would be a cross-thread env race).
+pub struct SubmissionListenerGuard {
+    cancel: CancellationToken,
+    /// The bound socket path, exposed so callers can confirm cleanup in
+    /// tests AND so the env var the gates read points at exactly this path.
+    socket: PathBuf,
+    /// Join handle for the spawned `serve` task; awaited on drop is not
+    /// possible (Drop is sync), so we only cancel — `serve` removes the
+    /// socket file as it unwinds.
+    _handle: JoinHandle<()>,
+}
+
+impl SubmissionListenerGuard {
+    /// The path of the bound control socket. Equals the value the
+    /// control-socket env var is set to for the duration of the guard.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+}
+
+impl Drop for SubmissionListenerGuard {
+    fn drop(&mut self) {
+        // Fire the token; `serve` observes it, breaks its accept loop, and
+        // removes the socket file. The spawned task is detached — we do not
+        // (and cannot, in a sync Drop) await it; cancellation is sufficient
+        // for the per-invocation lifecycle.
+        self.cancel.cancel();
+    }
+}
+
+/// Build a `ControlState` that carries ONLY what the submission-relay
+/// handlers (`record_submission` / `consume_submission`) need: the
+/// `submission_store` and `paths`. Every other field is a cheap, inert
+/// placeholder — the in-process listener handles ONLY submission traffic
+/// from a gate/audit's MCP child, so the github/reviewer/chatops/reload
+/// handlers are never reached. Used by [`spawn_submission_listener`].
+fn submission_only_state(
+    paths: Arc<crate::paths::DaemonPaths>,
+    submission_store: crate::submission_store::SubmissionStore,
+) -> ControlState {
+    // GithubConfig + CacheConfig are fully serde-defaulted / Default;
+    // Config requires repositories/executor/github, supplied here as the
+    // empty-repos placeholder. None of these are read on the submission
+    // path; they exist only to satisfy the struct.
+    let github: GithubConfig =
+        serde_json::from_value(serde_json::json!({})).expect("GithubConfig is fully serde-defaulted");
+    let placeholder_cfg = Config {
+        repositories: Vec::new(),
+        executor: crate::config::placeholder_executor_config(),
+        github: github.clone(),
+        reviewer: None,
+        chatops: None,
+        audits: None,
+        paths: crate::config::DaemonPathsConfig::default(),
+        cache: crate::config::CacheConfig::default(),
+        features: crate::config::FeaturesConfig::default(),
+        canonical_rag: None,
+        models: None,
+    };
+    // A no-op spawn closure: the reload handler is never invoked on the
+    // submission path, so this returning `StartupCheckFailed` is unreachable.
+    let spawn_repo: SpawnRepoFn =
+        Arc::new(|_repo: RepositoryConfig| SpawnOutcome::StartupCheckFailed);
+    ControlState {
+        github: Arc::new(ArcSwap::from_pointee(github)),
+        reviewer: Arc::new(ArcSwap::from_pointee(None)),
+        chatops: Arc::new(ArcSwap::from_pointee(None)),
+        cache: Arc::new(ArcSwap::from_pointee(crate::config::CacheConfig::default())),
+        last_config: Arc::new(ArcSwap::from_pointee(placeholder_cfg)),
+        config_path: PathBuf::new(),
+        repo_tasks: Arc::new(Mutex::new(HashMap::new())),
+        repo_tasks_changed: Arc::new(Notify::new()),
+        spawn_repo,
+        canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
+        outcome_store: crate::outcome_store::OutcomeStore::new(),
+        submission_store,
+        paths,
+    }
+}
+
+/// Register the gate AND advisory-audit `submit_*` payload schemas on
+/// `store`. This is the schema set every submission-based gate or audit
+/// validates against; it is the SINGLE source the daemon startup AND the
+/// in-process [`spawn_submission_listener`] both call (the daemon
+/// additionally registers the reviewer's and `[out]` gate's schemas, which
+/// `verify` / standalone-audit do not exercise).
+pub fn register_gate_and_audit_submission_schemas(
+    store: &crate::submission_store::SubmissionStore,
+) {
+    // The advisory audits' `submit_findings` schema.
+    crate::audits::register_submission_schemas(store);
+    // The `[in]` gate's `submit_contradictions` schema.
+    crate::preflight::change_contradiction::register_contradiction_submission_schema(store);
+    // The `[canon]` gate's `submit_canon_contradictions` schema.
+    crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(store);
+    // The `[rules]` gate's `submit_rule_violations` schema.
+    crate::preflight::global_rules::register_rule_violations_submission_schema(store);
+}
+
+/// Stand up the in-process submission transport for a single invocation,
+/// so an agentic gate or submission-based audit can capture its
+/// `submit_*` verdict over the control socket WITHOUT a running daemon.
+///
+/// This is the SINGLE source of the bootstrap sequence the daemon performs
+/// inline at startup. In order it: constructs a
+/// [`crate::submission_store::SubmissionStore`]; registers the gate
+/// submission schemas (`register_contradiction_submission_schema`,
+/// `register_canon_contradiction_submission_schema`,
+/// `register_rule_violations_submission_schema`) AND the audit submission
+/// schemas (`crate::audits::register_submission_schemas`); binds the
+/// control socket at [`socket_path`]; sets the control-socket env var
+/// ([`crate::mcp_askuser_server::ENV_CONTROL_SOCKET`]) to the bound path;
+/// spawns [`serve`] on a submission-only [`ControlState`]; AND returns a
+/// [`SubmissionListenerGuard`] whose `Drop` cancels the listener (stopping
+/// `serve`, which removes the socket file).
+///
+/// Three callers: the daemon entry point (`cli/run.rs`), the `verify`
+/// subcommand (`cli/verify.rs`), AND the standalone audit path
+/// (`cli/audit.rs::run_standalone`). Without the listener, an agentic gate
+/// or submission-based audit drains `None` from `try_consume_submission`
+/// and fails closed; with it, verdicts are captured exactly as under the
+/// daemon.
+pub fn spawn_submission_listener(
+    paths: &crate::paths::DaemonPaths,
+) -> Result<SubmissionListenerGuard> {
+    let submission_store = crate::submission_store::SubmissionStore::new();
+    // Register the gate AND advisory-audit submission schemas (single source).
+    register_gate_and_audit_submission_schemas(&submission_store);
+
+    let path = socket_path(paths);
+    let listener = bind_at(&path)?;
+    // SAFETY: the callers (verify / standalone audit / daemon startup) set
+    // this env var before spawning any agentic session that reads it; in
+    // the verify/audit CLI paths the process is single-threaded at this
+    // point. The guard intentionally does NOT clear it on drop (the
+    // process exits; a clear would race other threads).
+    unsafe {
+        std::env::set_var(
+            crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+            path.as_os_str(),
+        );
+    }
+
+    let cancel = CancellationToken::new();
+    let state = submission_only_state(Arc::new(paths.clone()), submission_store);
+    let serve_cancel = cancel.clone();
+    let serve_path = path.clone();
+    let handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = serve(listener, serve_path, state, serve_cancel).await {
+            tracing::error!("in-process submission listener exited: {e:#}");
+        }
+    });
+
+    Ok(SubmissionListenerGuard {
+        cancel,
+        socket: path,
+        _handle: handle,
+    })
+}
+
 /// Bind the listener at the canonical socket path and accept connections
 /// until `cancel` fires. Removes the socket file on shutdown.
 pub async fn listen(state: ControlState, cancel: CancellationToken) -> Result<()> {
@@ -5828,6 +5995,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         {
@@ -6091,6 +6259,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         let gh = GithubConfig {
@@ -6343,5 +6512,93 @@ github:
         .await;
         assert_eq!(resp["submission"], serde_json::Value::Null);
         cancel.cancel();
+    }
+
+    /// The listener is a HARD precondition: with the control-socket env var
+    /// unset (no `spawn_submission_listener` active), a submission drain
+    /// returns `None` — exactly what makes a gate / audit fail closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_listener_consume_returns_none_fail_closed() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by ENV_LOCK; we restore by clearing below.
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+        }
+        let drained = crate::audits::try_consume_submission(
+            Path::new("/tmp/myrepo"),
+            "some-change",
+        )
+        .await;
+        assert!(
+            drained.is_none(),
+            "with no listener the drain MUST be None (the gate/audit fails closed)"
+        );
+    }
+
+    /// `spawn_submission_listener` stands up the transport in-process: it
+    /// sets the env var to a live bound socket, registers the gate + audit
+    /// schemas, and a recorded submission round-trips via the same
+    /// `try_consume_submission` path the gates / audits use under a daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_listener_stands_up_transport_and_captures_submission() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let guard = spawn_submission_listener(&paths).expect("listener stands up");
+
+        // The env var points at the live socket.
+        let env_socket = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET)
+            .expect("env var set by the helper");
+        assert_eq!(
+            PathBuf::from(&env_socket),
+            guard.socket_path().to_path_buf(),
+            "env var must name the bound socket"
+        );
+        assert!(guard.socket_path().exists(), "socket file must be live");
+
+        // Simulate the MCP child relaying a `submit_findings` payload over the
+        // socket. `architecture_advisor`'s role/schema is registered by the
+        // helper via `register_submission_schemas`.
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "myrepo",
+            "change": "some-change",
+            "role": "architecture_advisor",
+            "payload": {"findings": []},
+        });
+        let resp = send_request(guard.socket_path(), &rec.to_string()).await;
+        assert_eq!(
+            resp["ok"],
+            serde_json::Value::Bool(true),
+            "record must succeed against the helper-registered schema: {resp}"
+        );
+
+        // The audit/gate drain path captures it (basename == "myrepo").
+        let drained = crate::audits::try_consume_submission(
+            Path::new("/some/where/myrepo"),
+            "some-change",
+        )
+        .await;
+        assert!(
+            drained.is_some(),
+            "with the listener up, the submission is captured"
+        );
+
+        // Drop tears the transport down and removes the socket file.
+        let socket = guard.socket_path().to_path_buf();
+        drop(guard);
+        // Cancellation → serve unwinds → removes the file. Poll briefly.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !socket.exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "the socket file must be removed on guard drop");
+        // Clean up the env var we set (serialized by ENV_LOCK).
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+        }
     }
 }

@@ -40,6 +40,7 @@ async fn cancellation_during_sleep_exits() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     let github = GithubConfig {
