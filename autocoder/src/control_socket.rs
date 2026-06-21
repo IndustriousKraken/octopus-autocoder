@@ -806,6 +806,8 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "survival_analysis" => handle_survival_analysis(&parsed, state),
         "provenance_lookup" => handle_provenance_lookup(&parsed, state),
         "rollback_recovery" => handle_rollback_recovery(&parsed, state).await,
+        "defer_unit" => handle_defer_unit(&parsed, state).await,
+        "undefer_unit" => handle_undefer_unit(&parsed, state).await,
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
@@ -1789,6 +1791,220 @@ async fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
             "ok": false,
             "error": format!("removing {display}: {e}"),
         }),
+    }
+}
+
+/// Outcome of [`preempt_and_acquire_busy_marker`] on success: the held
+/// busy-marker guard the caller keeps alive for the WHOLE workspace
+/// operation (its `Drop` releases the marker), plus the slug of the
+/// change the cancelled pass was working — `None` when no pass was in
+/// flight. The caller surfaces `preempted_change` to the operator (the
+/// chatops preempt acknowledgement) and otherwise just holds the guard.
+pub struct PreemptAcquireOutcome {
+    pub guard: busy_marker::BusyGuard,
+    pub preempted_change: Option<String>,
+}
+
+/// Failure modes of [`preempt_and_acquire_busy_marker`]. `Busy` means the
+/// marker could not be acquired — either it is ambiguous (PID alive,
+/// PID-reuse suspected) so we refuse to barge in, or it was still held
+/// after the bounded preempt wait. The caller surfaces this as a clear
+/// "repo busy with an unrecognized holder; investigate" error and does
+/// NOT mutate the workspace. `Internal` carries an unexpected error from
+/// the underlying `try_acquire` filesystem path.
+#[derive(Debug)]
+pub enum PreemptAcquireError {
+    Busy(String),
+    Internal(String),
+}
+
+/// Abstraction over the one OS effect this helper has that we do not
+/// want to fire for real in a unit test: sending `SIGTERM` to the
+/// in-flight executor's process group. Production uses [`RealSignaller`]
+/// (`libc::killpg`); tests inject a recording fake so no real process is
+/// signalled. The drain-coordination half (`iteration_cancel`) and the
+/// marker filesystem half run unmocked in both — only the kill is gated.
+pub trait PreemptSignaller: Send + Sync {
+    /// Send `SIGTERM` to the process group `pgid`. Best-effort: a failure
+    /// is logged but never aborts the preempt (the bounded marker-release
+    /// wait + clean-base preamble recover regardless).
+    fn sigterm_pgid(&self, pgid: i32);
+}
+
+/// Production signaller: `killpg(pgid, SIGTERM)`, mirroring the
+/// `--immediate` spec-rebuild coordination path
+/// (`cli/sync_specs.rs`).
+pub struct RealSignaller;
+
+impl PreemptSignaller for RealSignaller {
+    fn sigterm_pgid(&self, pgid: i32) {
+        let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGTERM) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                pgid,
+                "preempt: SIGTERM to executor process group failed: {err}"
+            );
+        }
+    }
+}
+
+/// Preempt an in-flight pass on `repo` and acquire the per-repo busy
+/// marker, holding it for the whole subsequent workspace-mutating
+/// operation. This is the shared primitive every workspace-mutating
+/// control-socket handler uses to conform to the invariant: a workspace
+/// op MUST NOT run concurrently with a pass on the same repo, AND MUST
+/// preempt the in-flight pass rather than wait for it.
+///
+/// Composed from the two existing halves (no new signal invented):
+///   1. Drain coordination via the per-repo `RepoTaskHandle`'s
+///      `iteration_cancel` token (as `handle_wipe_workspace` uses). This
+///      makes the pass body observe cancellation at its next await — but
+///      it does NOT terminate a long-running executor child.
+///   2. SIGTERM to the executor child via the busy-marker subprocess
+///      sidecar (as `coordinate_with_daemon`'s `--immediate` path and
+///      the busy-marker stuck-recovery do). This is the half that
+///      actually stops the child writing the workspace AND stops it
+///      spending tokens; a SIGTERM'd executor classifies as ABORTED and
+///      opens NO PR.
+///
+/// After signalling, it waits — bounded by `executor.wipe_drain_timeout_secs`
+/// (the SAME single drain/preempt timeout the wipe uses; no new knob) —
+/// for the marker file to release, then `busy_marker::try_acquire`s it.
+/// On `SkipAmbiguous` (PID-reuse suspected) it surfaces a clear `Busy`
+/// error rather than barging in. When no pass is in flight (no handle +
+/// no sidecar), it skips the preempt and acquires directly.
+pub async fn preempt_and_acquire_busy_marker(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    preempt_and_acquire_busy_marker_with(
+        state,
+        repo,
+        workspace,
+        &RealSignaller,
+        &busy_marker::RealProcessOps,
+    )
+    .await
+}
+
+/// Test-injectable variant of [`preempt_and_acquire_busy_marker`]. The
+/// `signaller` seam lets unit tests record the SIGTERM target without
+/// killing a real process group; the `ops` seam lets them drive the
+/// busy-marker PID-liveness / comm classification (e.g. to produce the
+/// `SkipAmbiguous` outcome deterministically on any platform).
+pub async fn preempt_and_acquire_busy_marker_with(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    signaller: &dyn PreemptSignaller,
+    ops: &(dyn busy_marker::ProcessOps + Send + Sync),
+) -> std::result::Result<PreemptAcquireOutcome, PreemptAcquireError> {
+    let cfg = state.last_config.load_full();
+    let stale_threshold_secs = cfg.executor.busy_marker_stale_threshold_secs();
+
+    // (1) Read the marker's currently-worked change BEFORE preempting, so
+    // the caller can name the cancelled change in the chatops
+    // acknowledgement. An empty/absent change → None.
+    let preempted_change =
+        busy_marker::current_with(&state.paths, workspace, stale_threshold_secs, ops).and_then(
+            |summary| {
+                let change = summary.change.trim().to_string();
+                if change.is_empty() { None } else { Some(change) }
+            },
+        );
+
+    // (2) Preempt the in-flight pass. Look up the per-repo handle's
+    // iteration_cancel token under the briefest lock (mirror
+    // handle_wipe_workspace). Fire it so the pass body drains at its next
+    // await; then SIGTERM the executor child via the sidecar so the
+    // running child actually stops writing the workspace AND opening a PR.
+    let iter_token: Option<CancellationToken> = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&repo.url)
+            .and_then(|h| h.iteration_cancel.lock().unwrap().clone())
+    };
+    let sidecar_pid = busy_marker::read_subprocess_marker(&state.paths, workspace);
+
+    let pass_in_flight = iter_token.is_some() || sidecar_pid.is_some();
+    if pass_in_flight {
+        if let Some(token) = &iter_token {
+            token.cancel();
+        }
+        match sidecar_pid {
+            Some(pid) if pid > 0 => {
+                tracing::info!(
+                    url = %repo.url,
+                    pgid = pid,
+                    "preempt: busy marker present; SIGTERM to executor process group"
+                );
+                signaller.sigterm_pgid(pid);
+            }
+            Some(_) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    "preempt: subprocess sidecar pid is non-positive; cannot SIGTERM"
+                );
+            }
+            None => {
+                // iteration_cancel fired but no executor child has spawned
+                // yet (pass between acquire and executor launch). The cancel
+                // drains the pass at its next await; nothing to SIGTERM.
+                tracing::info!(
+                    url = %repo.url,
+                    "preempt: iteration cancelled; no executor sidecar present (no child to SIGTERM yet)"
+                );
+            }
+        }
+
+        // (3) Wait, bounded, for the busy marker to release. Reuse the
+        // single wipe/preempt drain timeout — NO new config field.
+        let drain_timeout_secs = cfg.executor.wipe_drain_timeout_secs_clamped();
+        let marker = busy_marker::marker_path(&state.paths, workspace);
+        if drain_timeout_secs > 0 {
+            let start = std::time::Instant::now();
+            let max = std::time::Duration::from_secs(drain_timeout_secs);
+            while start.elapsed() < max {
+                if !marker.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    // (4) Acquire the marker. A SIGTERM'd child's marker (PID now dead)
+    // is recovered immediately by try_acquire's dead-pid branch, so the
+    // common post-preempt case yields Acquired.
+    match busy_marker::try_acquire_with(
+        &state.paths,
+        workspace,
+        &repo.url,
+        stale_threshold_secs,
+        ops,
+    ) {
+        Ok(busy_marker::AcquireOutcome::Acquired(guard)) => Ok(PreemptAcquireOutcome {
+            guard,
+            preempted_change,
+        }),
+        Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => Err(PreemptAcquireError::Busy(format!(
+            "repository `{}` is busy with an unrecognized holder (PID {} alive, PID-reuse suspected); \
+             refusing to preempt — investigate before retrying",
+            repo.url, m.pid
+        ))),
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) => {
+            Err(PreemptAcquireError::Busy(format!(
+                "repository `{}` is still busy after the preempt wait \
+                 (marker age {}s, PID {}); the prior pass did not release in time",
+                repo.url, details.age_secs, details.marker.pid
+            )))
+        }
+        Err(e) => Err(PreemptAcquireError::Internal(format!(
+            "acquiring busy marker for `{}`: {e:#}",
+            repo.url
+        ))),
     }
 }
 
@@ -3245,8 +3461,6 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
     let github_cfg = state.github.load_full();
     let workspace = workspace::resolve_path(&state.paths, &repo);
 
-    // Initialize the workspace (clone if needed; sync the base branch) so the
-    // plan is resolved against the live base-branch tip.
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
             Ok(u) => Some(u),
@@ -3255,6 +3469,81 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
         None => None,
     };
     let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
+
+    // DRY-RUN PATH: genuinely READ-ONLY — it inspects history to report what
+    // WOULD happen and mutates NOTHING, so it neither preempts an in-flight
+    // pass NOR acquires the busy marker, AND it cannot clobber a concurrent
+    // agentic session that has the same workspace bind-mounted writable.
+    //
+    // Read-only resolution: ensure the repo exists (clone if absent; on an
+    // existing workspace `ensure_initialized` only does `git fetch origin`,
+    // which updates the remote-tracking refs WITHOUT touching the working
+    // tree or the checked-out branch) and then resolve the plan against
+    // `origin/<base>` — the remote-tracking ref the fetch refreshed. No
+    // `git checkout`, no `git reset --hard`, no other working-tree mutation.
+    // The collision check reads active dirs only, so it stays.
+    if dry_run {
+        if let Err(e) =
+            workspace::ensure_initialized(&state.paths, &workspace, &repo.url, fork_arg)
+        {
+            return json!({"ok": false, "error": format!("workspace init failed: {e:#}")});
+        }
+        // The base branch always lives on `origin` (the live path resets to
+        // `origin/<base>` regardless of any fork remote, which is only the
+        // push target). Refresh just that tracking ref read-only.
+        if let Err(e) = git::fetch_remote_branch(&workspace, "origin", &repo.base_branch) {
+            tracing::warn!(
+                url = %repo.url,
+                "rollback dry-run: `git fetch origin {}` failed (resolving against the local \
+                 tracking ref as-is): {e:#}",
+                repo.base_branch
+            );
+        }
+        let resolve_ref = format!("origin/{}", repo.base_branch);
+        let plan = match crate::rollback::resolve_plan(
+            &workspace,
+            &repo.base_branch,
+            &resolve_ref,
+            &depth,
+        ) {
+            Ok(p) => p,
+            Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+        };
+        let preview = crate::rollback::format_preview(&workspace, &plan);
+        let collisions = crate::rollback::detect_collisions(&workspace, &plan);
+        return json!({
+            "ok": true,
+            "dry_run": true,
+            "url": repo.url,
+            "preview": preview,
+            "code_only": plan.is_code_only(),
+            "commit_count": plan.commit_count(),
+            "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "has_collisions": !collisions.is_empty(),
+        });
+    }
+
+    // LIVE PATH: this mutates the workspace tree AND branch, so it conforms
+    // to the workspace-mutating control-socket invariant — preempt any
+    // in-flight pass, acquire the per-repo busy marker, and hold it across
+    // the WHOLE operation (clean-base preamble → recreate → prepare → push
+    // → PR). The `_busy_guard` binding keeps the marker held until the
+    // handler returns; its `Drop` releases on EVERY path (success OR error),
+    // so no new pass can start mid-op.
+    let (_busy_guard, preempted_change) =
+        match preempt_and_acquire_busy_marker(state, &repo, &workspace).await {
+            Ok(outcome) => (outcome.guard, outcome.preempted_change),
+            Err(PreemptAcquireError::Busy(msg)) => {
+                return json!({"ok": false, "error": msg});
+            }
+            Err(PreemptAcquireError::Internal(msg)) => {
+                return json!({"ok": false, "error": format!("rollback preempt failed: {msg}")});
+            }
+        };
+
+    // Initialize the workspace (clone if needed; sync the base branch) so the
+    // plan is resolved against the live base-branch tip.
     if let Err(e) =
         workspace::ensure_initialized(&state.paths, &workspace, &repo.url, fork_arg)
     {
@@ -3275,26 +3564,20 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
         );
     }
 
-    let plan = match crate::rollback::resolve_plan(&workspace, &repo.base_branch, &depth) {
+    // The live path resolves against the checked-out, freshly-reset clean
+    // base branch (its working tree is the base tip), so the resolve ref IS
+    // the base branch name.
+    let plan = match crate::rollback::resolve_plan(
+        &workspace,
+        &repo.base_branch,
+        &repo.base_branch,
+        &depth,
+    ) {
         Ok(p) => p,
         Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
     };
     let preview = crate::rollback::format_preview(&workspace, &plan);
     let collisions = crate::rollback::detect_collisions(&workspace, &plan);
-
-    if dry_run {
-        return json!({
-            "ok": true,
-            "dry_run": true,
-            "url": repo.url,
-            "preview": preview,
-            "code_only": plan.is_code_only(),
-            "commit_count": plan.commit_count(),
-            "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
-            "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
-            "has_collisions": !collisions.is_empty(),
-        });
-    }
 
     // A collision is fail-loud (never silently overwrite active work).
     if !collisions.is_empty() {
@@ -3375,6 +3658,7 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
             "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
             "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
             "preview": preview,
+            "preempted_change": preempted_change,
         });
     }
 
@@ -3399,8 +3683,455 @@ async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value
             "commit_count": plan.commit_count(),
             "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
             "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "preempted_change": preempted_change,
         }),
         Err(e) => json!({"ok": false, "error": format!("opening rollback PR: {e:#}")}),
+    }
+}
+
+// =====================================================================
+// Defer / undefer (a02): set a work unit aside out of both lanes and
+// resume it, riding the agent-branch + push + PR flow.
+// =====================================================================
+
+/// The on-disk kind + concrete path of a unit a `defer`/`undefer` acts
+/// on. A change is always a directory; an issue is EITHER a single `.md`
+/// file OR a directory — `DeferKind` records which so the move preserves
+/// the form exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferKind {
+    /// `openspec/changes/<slug>/` ↔ `deferred-changes/<slug>/`.
+    Change,
+    /// `issues/<slug>.md` ↔ `deferred-issues/<slug>.md`.
+    IssueFile,
+    /// `issues/<slug>/` ↔ `deferred-issues/<slug>/`.
+    IssueDir,
+}
+
+/// Relative paths a change/issue unit occupies in its lane and in the
+/// deferred area, derived from the slug + kind.
+struct DeferPaths {
+    /// Path inside a lane (`openspec/changes/<slug>` or `issues/<slug>(.md)`).
+    lane: PathBuf,
+    /// Path inside the deferred area (`deferred-changes/<slug>` or
+    /// `deferred-issues/<slug>(.md)`).
+    deferred: PathBuf,
+}
+
+impl DeferKind {
+    /// Compute the absolute lane + deferred paths for `slug` under
+    /// `workspace`.
+    fn paths(&self, workspace: &Path, slug: &str) -> DeferPaths {
+        match self {
+            DeferKind::Change => DeferPaths {
+                lane: workspace.join("openspec/changes").join(slug),
+                deferred: workspace.join("deferred-changes").join(slug),
+            },
+            DeferKind::IssueFile => DeferPaths {
+                lane: workspace.join("issues").join(format!("{slug}.md")),
+                deferred: workspace.join("deferred-issues").join(format!("{slug}.md")),
+            },
+            DeferKind::IssueDir => DeferPaths {
+                lane: workspace.join("issues").join(slug),
+                deferred: workspace.join("deferred-issues").join(slug),
+            },
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            DeferKind::Change => "change",
+            DeferKind::IssueFile | DeferKind::IssueDir => "issue",
+        }
+    }
+}
+
+/// Result of locating a unit for a defer/undefer operation.
+enum DeferLocate {
+    /// The unit's lane location holds it; a move is required.
+    NeedsMove(DeferKind),
+    /// The unit is already at its destination (deferred location for
+    /// defer, lane location for undefer) AND absent from the source —
+    /// idempotent no-op.
+    AlreadyDone(DeferKind),
+    /// No unit by that slug exists at the relevant source OR destination.
+    NotFound,
+    /// The slug names more than one candidate (e.g. both a change AND an
+    /// issue) — ambiguous; the message names the candidates.
+    Ambiguous(String),
+}
+
+/// For each of the three forms, classify a slug's presence at a `source`
+/// (lane for defer; deferred for undefer) vs. `dest`. Returns the kinds
+/// present at source and the kinds present at dest, so the caller can map
+/// to a [`DeferLocate`].
+///
+/// `at_source` / `at_dest` are predicates that, given a [`DeferKind`],
+/// report whether that form exists at the source / destination location
+/// respectively.
+fn classify_defer(
+    at_source: impl Fn(&DeferKind) -> bool,
+    at_dest: impl Fn(&DeferKind) -> bool,
+    candidate_paths: impl Fn(&DeferKind) -> (PathBuf, PathBuf),
+) -> DeferLocate {
+    let forms = [DeferKind::Change, DeferKind::IssueFile, DeferKind::IssueDir];
+    let present_source: Vec<DeferKind> =
+        forms.iter().filter(|k| at_source(k)).cloned().collect();
+
+    if present_source.len() > 1 {
+        // Ambiguous: a change AND an issue (or both issue forms) share the
+        // slug at the source. Name both candidate source paths.
+        let names: Vec<String> = present_source
+            .iter()
+            .map(|k| {
+                let (src, _dst) = candidate_paths(k);
+                format!("{} ({})", src.display(), k.label())
+            })
+            .collect();
+        return DeferLocate::Ambiguous(names.join(" AND "));
+    }
+
+    if let Some(kind) = present_source.into_iter().next() {
+        return DeferLocate::NeedsMove(kind);
+    }
+
+    // Nothing at the source — check the destination for an idempotent
+    // already-done. (Both issue forms checked; a change is unambiguous.)
+    let present_dest: Vec<DeferKind> = forms.iter().filter(|k| at_dest(k)).cloned().collect();
+    if present_dest.len() > 1 {
+        let names: Vec<String> = present_dest
+            .iter()
+            .map(|k| {
+                let (_src, dst) = candidate_paths(k);
+                format!("{} ({})", dst.display(), k.label())
+            })
+            .collect();
+        return DeferLocate::Ambiguous(names.join(" AND "));
+    }
+    if let Some(kind) = present_dest.into_iter().next() {
+        return DeferLocate::AlreadyDone(kind);
+    }
+    DeferLocate::NotFound
+}
+
+/// Locate a unit named `slug` for a DEFER: it must live in a lane
+/// (`openspec/changes/<slug>/` or `issues/<slug>(.md|/)`). The deferred
+/// area is the destination (checked only for the idempotent
+/// already-deferred no-op).
+fn locate_for_defer(workspace: &Path, slug: &str) -> DeferLocate {
+    classify_defer(
+        |k| k.paths(workspace, slug).lane.exists(),
+        |k| k.paths(workspace, slug).deferred.exists(),
+        |k| {
+            let p = k.paths(workspace, slug);
+            (p.lane, p.deferred)
+        },
+    )
+}
+
+/// Locate a unit named `slug` for an UNDEFER: it must live in the
+/// deferred area; the lane is the destination (checked only for the
+/// idempotent already-active no-op).
+fn locate_for_undefer(workspace: &Path, slug: &str) -> DeferLocate {
+    classify_defer(
+        |k| k.paths(workspace, slug).deferred.exists(),
+        |k| k.paths(workspace, slug).lane.exists(),
+        |k| {
+            let p = k.paths(workspace, slug);
+            // For undefer, the "source" is the deferred location and the
+            // "dest" is the lane; report them in that order.
+            (p.deferred, p.lane)
+        },
+    )
+}
+
+/// Filesystem-rename a unit from `from` to `to`, creating the
+/// destination's parent directory if absent. Uses `std::fs::rename` — NOT
+/// `git mv` — so the WHOLE unit (including any gitignored markers like
+/// `.perma-stuck.json`, which `git mv` would orphan because it only moves
+/// tracked files) travels intact. Works for both a directory unit and a
+/// single-file issue.
+fn fs_move_unit(from: &Path, to: &Path) -> std::result::Result<(), String> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating destination parent {}: {e}", parent.display()))?;
+    }
+    std::fs::rename(from, to).map_err(|e| {
+        format!(
+            "moving {} → {}: {e}",
+            from.display(),
+            to.display()
+        )
+    })
+}
+
+async fn handle_defer_unit(parsed: &Value, state: &ControlState) -> Value {
+    handle_defer_or_undefer(parsed, state, /* defer = */ true).await
+}
+
+async fn handle_undefer_unit(parsed: &Value, state: &ControlState) -> Value {
+    handle_defer_or_undefer(parsed, state, /* defer = */ false).await
+}
+
+/// Shared body for `defer_unit` / `undefer_unit`. `defer == true` moves a
+/// unit out of its lane into the deferred area; `false` is the exact
+/// inverse. Both are workspace-mutating control-socket ops, so they
+/// preempt any in-flight pass AND hold the per-repo busy marker for the
+/// whole move (per a01's invariant), then perform the move on a freshly
+/// recreated agent branch and ride the push + PR flow honoring
+/// `auto_submit_pr`. Never commits to the base branch directly.
+async fn handle_defer_or_undefer(parsed: &Value, state: &ControlState, defer: bool) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let slug = match require_str(parsed, "slug") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let github_cfg = state.github.load_full();
+    let workspace = workspace::resolve_path(&state.paths, &repo);
+
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
+            Ok(u) => Some(u),
+            Err(e) => return json!({"ok": false, "error": format!("deriving fork url: {e:#}")}),
+        },
+        None => None,
+    };
+    let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
+
+    let verb = if defer { "defer" } else { "undefer" };
+
+    // READ-ONLY no-op detection FIRST, BEFORE any preempt or lock. An
+    // already-deferred `defer` (or already-active `undefer`) is a no-op:
+    // detecting it without preempting means a typo'd re-request does NOT
+    // cancel an in-flight pass nor acquire the busy marker for nothing
+    // (the "detect-before-preempt" invariant). We only `ensure_initialized`
+    // (clone-if-absent) — NO checkout/reset/preempt/lock — and inspect the
+    // current tree. An already-done request returns its no-op success here
+    // with no preempt. Every other outcome (NeedsMove / NotFound /
+    // Ambiguous) falls through to the live preempt + reset + re-detect path
+    // below, which classifies against the freshly-reset clean base tree.
+    if let Err(e) =
+        workspace::ensure_initialized(&state.paths, &workspace, &repo.url, fork_arg)
+    {
+        return json!({"ok": false, "error": format!("workspace init failed: {e:#}")});
+    }
+    let preflight = if defer {
+        locate_for_defer(&workspace, &slug)
+    } else {
+        locate_for_undefer(&workspace, &slug)
+    };
+    if let DeferLocate::AlreadyDone(_) = preflight {
+        // Idempotent no-op success: no commit, no PR, AND — per the
+        // detect-before-preempt invariant — NO preempt of any in-flight
+        // pass and NO busy-marker acquire.
+        let outcome = if defer { "already_deferred" } else { "already_active" };
+        return json!({
+            "ok": true,
+            "outcome": outcome,
+            "slug": slug,
+            "url": repo.url,
+            "preempted_change": serde_json::Value::Null,
+        });
+    }
+
+    // Workspace-mutating op: preempt any in-flight pass + acquire the
+    // per-repo busy marker BEFORE inspecting/mutating the tree, and hold
+    // the guard for the whole op (RAII-released on every return path). On
+    // `Busy`, surface a clear error and do NOT touch the workspace.
+    let (_busy_guard, preempted_change) =
+        match preempt_and_acquire_busy_marker(state, &repo, &workspace).await {
+            Ok(outcome) => (outcome.guard, outcome.preempted_change),
+            Err(PreemptAcquireError::Busy(msg)) => {
+                return json!({"ok": false, "error": msg});
+            }
+            Err(PreemptAcquireError::Internal(msg)) => {
+                return json!({"ok": false, "error": format!("{verb} preempt failed: {msg}")});
+            }
+        };
+
+    // Re-initialize against the now-held marker (clone if needed; sync the
+    // base branch) so the move lands on a clean base tip.
+    if let Err(e) =
+        workspace::ensure_initialized(&state.paths, &workspace, &repo.url, fork_arg)
+    {
+        return json!({"ok": false, "error": format!("workspace init failed: {e:#}")});
+    }
+    if let Err(e) = git::checkout(&workspace, &repo.base_branch) {
+        return json!({"ok": false, "error": format!("checkout base branch failed: {e:#}")});
+    }
+    if let Err(e) = git::reset_hard_to_remote(&workspace, &repo.base_branch) {
+        // Non-fatal in a fresh clone that already matches; log + proceed.
+        tracing::warn!(
+            url = %repo.url,
+            "{verb}: reset --hard to origin/{} failed (proceeding with local base): {e:#}",
+            repo.base_branch
+        );
+    }
+
+    // Locate the unit against the now-clean base tree. (The slug is
+    // resolved AFTER the reset so detection reflects the committed base
+    // state, not a stale or dirty working tree.)
+    let located = if defer {
+        locate_for_defer(&workspace, &slug)
+    } else {
+        locate_for_undefer(&workspace, &slug)
+    };
+    let kind = match located {
+        DeferLocate::NeedsMove(k) => k,
+        DeferLocate::AlreadyDone(_) => {
+            // Idempotent no-op success: no commit, no PR.
+            let outcome = if defer { "already_deferred" } else { "already_active" };
+            return json!({
+                "ok": true,
+                "outcome": outcome,
+                "slug": slug,
+                "url": repo.url,
+                "preempted_change": preempted_change,
+            });
+        }
+        DeferLocate::NotFound => {
+            let msg = if defer {
+                format!("no change or issue `{slug}` on {}", repo.url)
+            } else {
+                format!("no deferred change or issue `{slug}` on {}", repo.url)
+            };
+            return json!({"ok": false, "error": msg});
+        }
+        DeferLocate::Ambiguous(candidates) => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "ambiguous slug `{slug}` on {}: it names more than one unit ({candidates}); \
+                     resolve the collision before {verb}ring",
+                    repo.url
+                ),
+            });
+        }
+    };
+
+    let paths = kind.paths(&workspace, &slug);
+    // Defer moves lane → deferred; undefer moves deferred → lane.
+    let (from, to) = if defer {
+        (paths.lane.clone(), paths.deferred.clone())
+    } else {
+        (paths.deferred.clone(), paths.lane.clone())
+    };
+
+    // Perform the move on a FRESH agent branch at the base tip, so the
+    // operation rides the normal push + PR flow rather than committing to
+    // the base branch directly.
+    if let Err(e) = git::recreate_branch(&workspace, &repo.agent_branch) {
+        return json!({"ok": false, "error": format!("recreating agent branch failed: {e:#}")});
+    }
+    if let Err(e) = fs_move_unit(&from, &to) {
+        return json!({"ok": false, "error": e});
+    }
+    if let Err(e) = git::add_all(&workspace) {
+        return json!({"ok": false, "error": format!("staging the move failed: {e:#}")});
+    }
+    let commit_msg = if defer {
+        format!("chore: defer {slug}")
+    } else {
+        format!("chore: resume {slug}")
+    };
+    if let Err(e) = git::commit(&workspace, &commit_msg) {
+        return json!({"ok": false, "error": format!("committing the move failed: {e:#}")});
+    }
+
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    if let Err(e) = git::push_force_with_lease(&workspace, &repo.agent_branch, push_remote) {
+        return json!({"ok": false, "error": format!("pushing {verb} branch failed: {e:#}")});
+    }
+
+    let from_rel = from.strip_prefix(&workspace).unwrap_or(&from);
+    let to_rel = to.strip_prefix(&workspace).unwrap_or(&to);
+    let action_word = if defer { "Deferred" } else { "Resumed" };
+    let title = if defer {
+        format!("defer: set aside {} `{slug}`", kind.label())
+    } else {
+        format!("resume: reactivate {} `{slug}`", kind.label())
+    };
+    let pr_body = format!(
+        "{action_word} {} `{slug}`.\n\nMoved `{}` → `{}`.\n\n\
+         This rides the agent-branch + PR flow (no base-branch commit). \
+         The unit is preserved byte-for-byte, including any markers; \
+         {} is the exact inverse.",
+        kind.label(),
+        from_rel.display(),
+        to_rel.display(),
+        if defer { "`undefer`" } else { "`defer`" },
+    );
+    let outcome_word = if defer { "deferred" } else { "resumed" };
+
+    // Honor `auto_submit_pr`: open a PR by default, OR surface the pushed
+    // branch with no PR (`BranchPushedNoPr`) when an install set it false.
+    if !repo.auto_submit_pr {
+        let (owner, repo_name) = match crate::github::parse_repo_url(&repo.url) {
+            Ok(p) => p,
+            Err(e) => return json!({"ok": false, "error": format!("parsing repo url: {e:#}")}),
+        };
+        let branch_url = crate::polling_loop::compose_branch_url(
+            repo.forge.as_ref(),
+            &repo.url,
+            &owner,
+            &repo_name,
+            &repo.agent_branch,
+        );
+        let pr_base = repo
+            .upstream
+            .as_ref()
+            .map(|u| u.branch.as_str())
+            .unwrap_or(&repo.base_branch);
+        let suggested =
+            crate::polling_loop::push_only_command(repo.forge.as_ref(), pr_base, &repo.agent_branch);
+        return json!({
+            "ok": true,
+            "outcome": outcome_word,
+            "mechanism": "branch_pushed_no_pr",
+            "slug": slug,
+            "kind": kind.label(),
+            "url": repo.url,
+            "branch": repo.agent_branch,
+            "branch_url": branch_url,
+            "suggested_command": suggested,
+            "preempted_change": preempted_change,
+        });
+    }
+
+    match crate::polling_loop::open_triage_pull_request(
+        &state.paths,
+        &repo,
+        &github_cfg,
+        &repo.agent_branch,
+        &repo.base_branch,
+        &title,
+        &pr_body,
+    )
+    .await
+    {
+        Ok(pr_url) => json!({
+            "ok": true,
+            "outcome": outcome_word,
+            "mechanism": "pr_opened",
+            "slug": slug,
+            "kind": kind.label(),
+            "url": repo.url,
+            "branch": repo.agent_branch,
+            "pr_url": pr_url,
+            "preempted_change": preempted_change,
+        }),
+        Err(e) => json!({"ok": false, "error": format!("opening {verb} PR: {e:#}")}),
     }
 }
 
@@ -6600,5 +7331,1054 @@ github:
         unsafe {
             std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
         }
+    }
+
+    // ================================================================
+    // a01: workspace-mutating ops preempt and serialize against the pass
+    // ================================================================
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Recording fake signaller: captures the pgid(s) it was asked to
+    /// SIGTERM so a test asserts the preempt fired the kill without
+    /// signalling a real process group.
+    struct RecordingSignaller {
+        sent: StdMutex<Vec<i32>>,
+    }
+    impl RecordingSignaller {
+        fn new() -> Self {
+            Self {
+                sent: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+    impl PreemptSignaller for RecordingSignaller {
+        fn sigterm_pgid(&self, pgid: i32) {
+            self.sent.lock().unwrap().push(pgid);
+        }
+    }
+
+    /// Local ProcessOps mock for the preempt tests: lets a test drive
+    /// PID-liveness + comm so the busy-marker classification (acquire /
+    /// fresh / ambiguous) is deterministic on any platform (macOS skips
+    /// the real `/proc/<pid>/comm` read).
+    struct PreemptMockOps {
+        alive: Vec<u32>,
+        comms: std::collections::HashMap<u32, String>,
+    }
+    impl PreemptMockOps {
+        fn new() -> Self {
+            Self {
+                alive: Vec::new(),
+                comms: std::collections::HashMap::new(),
+            }
+        }
+        fn with_alive(mut self, pid: u32) -> Self {
+            self.alive.push(pid);
+            self
+        }
+        fn with_comm(mut self, pid: u32, comm: &str) -> Self {
+            self.comms.insert(pid, comm.to_string());
+            self
+        }
+    }
+    impl busy_marker::ProcessOps for PreemptMockOps {
+        fn pid_alive(&self, pid: u32) -> bool {
+            self.alive.contains(&pid)
+        }
+        fn read_comm(&self, pid: u32) -> Option<String> {
+            self.comms.get(&pid).cloned()
+        }
+        fn killpg_terminate(&self, _pgid: i32) {}
+        fn killpg_kill(&self, _pgid: i32) {}
+        fn wait_for_exit(&self, _pid: u32, _max: std::time::Duration) {}
+    }
+
+    /// Write a busy-marker JSON directly for `workspace` under the test
+    /// daemon paths, with control over `pid`, `comm`, age, and the
+    /// recorded `change`. Mirrors `busy_marker::pre_populate_marker` but
+    /// is local to this module (that one is private to busy_marker).
+    fn write_marker(
+        paths: &crate::paths::DaemonPaths,
+        workspace: &Path,
+        pid: u32,
+        comm: &str,
+        age_secs: i64,
+        change: &str,
+    ) {
+        let path = busy_marker::marker_path(paths, workspace);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let started = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        let marker = busy_marker::BusyMarker {
+            repo_url: "git@github.com:owner/repo.git".into(),
+            pid,
+            pgid: 1234,
+            comm: comm.into(),
+            started_at: started,
+            stage: busy_marker::Stage::Executor,
+            change: change.into(),
+        };
+        let body = serde_json::to_string_pretty(&marker).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+
+    /// Install an `iteration_cancel` token on the seeded handle for `url`
+    /// so a test can observe the preempt firing the per-iteration cancel.
+    fn install_iteration_cancel(state: &ControlState, url: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        let guard = state.repo_tasks.lock().unwrap();
+        let handle = guard.get(url).expect("seeded handle present");
+        *handle.iteration_cancel.lock().unwrap() = Some(token.clone());
+        token
+    }
+
+    fn repo_from(cfg: &Config) -> RepositoryConfig {
+        cfg.repositories[0].clone()
+    }
+
+    /// 4.1 — marker held (recorded change), sidecar present: the helper
+    /// fires the iteration cancel + sidecar SIGTERM, then acquires, and
+    /// returns the cancelled change slug. We use a DEAD pid so
+    /// `try_acquire`'s immediate dead-pid recovery yields `Acquired`
+    /// (modelling the post-SIGTERM "child exited" case) without the test
+    /// having to race a real marker release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_fires_cancel_and_sigterm_then_acquires_naming_change() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = dir.path().join("ws-preempt");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Marker with a dead pid + recorded change, plus a sidecar pid.
+        write_marker(&state.paths, &workspace, 999_999, "claude", 5, "a07-foo");
+        busy_marker::write_subprocess_marker(&state.paths, &workspace, 4242).unwrap();
+        let token = install_iteration_cancel(&state, &repo.url);
+        let sig = RecordingSignaller::new();
+        // pid 999_999 is NOT marked alive → dead-pid recovery yields Acquired,
+        // modelling the post-SIGTERM "child exited" case.
+        let ops = PreemptMockOps::new();
+
+        let outcome = preempt_and_acquire_busy_marker_with(&state, &repo, &workspace, &sig, &ops)
+            .await
+            .expect("preempt+acquire should succeed against a dead-pid marker");
+
+        assert!(token.is_cancelled(), "iteration cancel must have fired");
+        assert_eq!(
+            sig.sent.lock().unwrap().clone(),
+            vec![4242],
+            "SIGTERM must target the sidecar pid"
+        );
+        assert_eq!(
+            outcome.preempted_change.as_deref(),
+            Some("a07-foo"),
+            "preempted_change names the cancelled change"
+        );
+        assert!(
+            busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "the held guard's marker file exists while in scope"
+        );
+        drop(outcome);
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "marker released on guard drop"
+        );
+        cancel.cancel();
+    }
+
+    /// 4.2 — no marker present: acquire directly, no sidecar read, no
+    /// SIGTERM, preempted_change is None.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_with_no_marker_acquires_directly() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = dir.path().join("ws-clean");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sig = RecordingSignaller::new();
+        let ops = PreemptMockOps::new();
+
+        let outcome = preempt_and_acquire_busy_marker_with(&state, &repo, &workspace, &sig, &ops)
+            .await
+            .expect("clean acquire");
+        assert!(
+            sig.sent.lock().unwrap().is_empty(),
+            "no SIGTERM with no pass in flight"
+        );
+        assert_eq!(outcome.preempted_change, None);
+        assert!(busy_marker::marker_path(&state.paths, &workspace).exists());
+        cancel.cancel();
+    }
+
+    /// 4.3 — held-for-whole-op: while the returned guard is in scope a
+    /// concurrent `try_acquire` for the same workspace yields
+    /// SkipFreshInProgress; after the guard drops it yields Acquired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_holds_marker_for_whole_op() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = dir.path().join("ws-hold");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sig = RecordingSignaller::new();
+        let ops = PreemptMockOps::new();
+
+        let outcome = preempt_and_acquire_busy_marker_with(&state, &repo, &workspace, &sig, &ops)
+            .await
+            .expect("clean acquire");
+        // Concurrent acquire while held → fresh-in-progress (held by THIS
+        // live process, so pid_alive=true and age below threshold).
+        match busy_marker::try_acquire(&state.paths, &workspace, &repo.url, 600).unwrap() {
+            busy_marker::AcquireOutcome::SkipFreshInProgress(_) => {}
+            other => panic!(
+                "expected SkipFreshInProgress while held, got {}",
+                match other {
+                    busy_marker::AcquireOutcome::Acquired(_) => "Acquired",
+                    busy_marker::AcquireOutcome::SkipAmbiguous(_) => "Ambiguous",
+                    busy_marker::AcquireOutcome::SkipFreshInProgress(_) => "Fresh",
+                }
+            ),
+        }
+        drop(outcome);
+        match busy_marker::try_acquire(&state.paths, &workspace, &repo.url, 600).unwrap() {
+            busy_marker::AcquireOutcome::Acquired(_) => {}
+            _ => panic!("expected Acquired after guard drop"),
+        }
+        cancel.cancel();
+    }
+
+    /// 4.4 — ambiguous marker (PID alive, comm differs): the helper
+    /// returns `Busy` and leaves the marker file in place. We use the
+    /// current process's live PID with a deliberately wrong recorded comm
+    /// and a past-threshold age so `try_acquire` classifies it ambiguous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_on_ambiguous_marker_returns_busy_and_leaves_file() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = dir.path().join("ws-ambiguous");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Live pid (this process), recorded comm "definitely-not-real-comm"
+        // that cannot match /proc/<pid>/comm, age past the 600s threshold →
+        // ambiguous. No sidecar so the bounded wait returns immediately
+        // (drain timeout default applies but the marker stays).
+        let live = std::process::id();
+        write_marker(
+            &state.paths,
+            &workspace,
+            live,
+            "definitely-not-real-comm",
+            10_000,
+            "a09-bar",
+        );
+        let sig = RecordingSignaller::new();
+        // Mock: the recorded pid is alive, but its live comm ("claude")
+        // differs from the recorded comm ("definitely-not-real-comm") →
+        // try_acquire classifies SkipAmbiguous deterministically.
+        let ops = PreemptMockOps::new().with_alive(live).with_comm(live, "claude");
+
+        // Use a 0-second drain timeout via config override so the bounded
+        // wait does not stall the test for the default. We do this by
+        // swapping last_config with wipe_drain_timeout_secs = 0.
+        let mut cfg2 = cfg.clone();
+        cfg2.executor.wipe_drain_timeout_secs = 0;
+        state.last_config.store(Arc::new(cfg2));
+
+        match preempt_and_acquire_busy_marker_with(&state, &repo, &workspace, &sig, &ops).await {
+            Err(PreemptAcquireError::Busy(_)) => {}
+            Err(PreemptAcquireError::Internal(m)) => panic!("expected Busy, got Internal: {m}"),
+            Ok(_) => panic!("ambiguous marker must surface a Busy error, not Acquired"),
+        }
+        assert!(
+            busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "ambiguous marker MUST be left in place for investigation"
+        );
+        // Cleanup so a live-pid marker does not leak across tests.
+        let _ = std::fs::remove_file(busy_marker::marker_path(&state.paths, &workspace));
+        cancel.cancel();
+    }
+
+    /// 4.5 — rollback handler: a dry_run invocation acquires NO marker
+    /// (the marker is absent both during and after). The live path's
+    /// acquire-before-mutation is covered by the helper unit tests above
+    /// (4.1-4.4) plus the held-for-whole-op assertion; here we lock in the
+    /// dry-run scenario's "no lock, no preempt" contract, which is the one
+    /// directly observable without a real git remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_dry_run_acquires_no_marker() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let cfg = Config::load_from(&cfg_path).unwrap();
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+        let workspace = workspace::resolve_path(&state.paths, &repo);
+
+        let req = json!({
+            "action": "rollback_recovery",
+            "url": repo.url,
+            "count": 1,
+            "dry_run": true,
+        });
+        // The dry run fails at workspace init (no real remote to clone),
+        // which is fine: the assertion is that NO busy marker was ever
+        // acquired by the dry-run path, before OR after the failure.
+        let _ = handle_rollback_recovery(&req, &state).await;
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "dry-run path must NOT acquire the busy marker"
+        );
+        cancel.cancel();
+    }
+
+    /// 4.7 — dry-run is genuinely READ-ONLY: a `dry_run`
+    /// `handle_rollback_recovery` resolves the plan against `origin/<base>`
+    /// WITHOUT a checkout or reset, so it performs no working-tree mutation.
+    /// We seed the workspace with a sentinel uncommitted change AND assert it
+    /// survives the dry-run byte-for-byte, the HEAD does not move, the porcelain
+    /// status is unchanged, AND the dry-run still returns the correct plan
+    /// (the in-range change/issue slugs + a preview naming them). Asserts
+    /// working-tree state, not message wording. With the OLD mutating preamble
+    /// (`git checkout` + `git reset --hard origin/<base>`) the sentinel would be
+    /// blown away — this test is the read-only regression guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_dry_run_is_read_only_and_returns_plan() {
+        use std::process::Command;
+
+        fn run(path: &Path, args: &[&str]) {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed in {}", path.display());
+        }
+        fn porcelain(path: &Path) -> Vec<u8> {
+            Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(path)
+                .output()
+                .unwrap()
+                .stdout
+        }
+
+        let dir = TempDir::new().unwrap();
+        // Build a managed workspace with autocoder's commit shape: a base
+        // commit, then one "ship change" commit (code + dated archive +
+        // canon fold) and one "ship issue" commit. The rollback range is
+        // the last two commits.
+        let workspace = dir.path().join("workspace");
+        run(dir.path(), &["init", "-q", "-b", "main", "workspace"]);
+        run(&workspace, &["config", "user.email", "t@e.com"]);
+        run(&workspace, &["config", "user.name", "t"]);
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "// base\n").unwrap();
+        std::fs::create_dir_all(workspace.join("openspec/specs/widget")).unwrap();
+        std::fs::write(
+            workspace.join("openspec/specs/widget/spec.md"),
+            "CANON widget v1\n",
+        )
+        .unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "base"]);
+
+        // ship change `feature-a`
+        std::fs::write(workspace.join("src/a.rs"), "// feature-a\n").unwrap();
+        std::fs::write(
+            workspace.join("openspec/specs/widget/spec.md"),
+            "CANON widget v1\nMODIFIED a\n",
+        )
+        .unwrap();
+        let arch_a = workspace.join("openspec/changes/archive/2026-05-01-feature-a");
+        std::fs::create_dir_all(&arch_a).unwrap();
+        std::fs::write(arch_a.join("proposal.md"), "## Why\nfeature-a\n").unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "feature-a: ship change"]);
+
+        // ship issue `fix-thing`
+        std::fs::write(workspace.join("src/c.rs"), "// fix fix-thing\n").unwrap();
+        let arch_i = workspace.join("issues/archive/2026-05-02-fix-thing");
+        std::fs::create_dir_all(&arch_i).unwrap();
+        std::fs::write(arch_i.join("issue.md"), "## Report\nfix-thing\n").unwrap();
+        run(&workspace, &["add", "-A"]);
+        run(&workspace, &["commit", "-q", "-m", "fix-thing: ship issue fix"]);
+
+        // Create a bare `origin` the workspace fetches from (so `origin/main`
+        // resolves) and point the workspace's `origin` remote at it.
+        let origin = dir.path().join("origin.git");
+        run(dir.path(), &["clone", "-q", "--bare", "workspace", "origin.git"]);
+        run(&workspace, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run(&workspace, &["fetch", "-q", "origin"]);
+
+        // Seed a SENTINEL uncommitted working-tree change — the thing a
+        // concurrent agentic session might have in flight. The dry-run must
+        // leave it untouched.
+        let sentinel = workspace.join("src/SENTINEL.txt");
+        std::fs::write(&sentinel, "in-flight agent work — do not clobber\n").unwrap();
+
+        let head_before = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let porcelain_before = porcelain(&workspace);
+        let canon_before =
+            std::fs::read_to_string(workspace.join("openspec/specs/widget/spec.md")).unwrap();
+
+        // Configure a repo whose workspace IS the prepared dir (via
+        // `local_path`) and whose URL is the bare origin, so
+        // `ensure_initialized` sees an existing `.git` and only fetches.
+        let cfg_path = write_yaml(dir.path(), BASE_YAML);
+        let mut cfg = Config::load_from(&cfg_path).unwrap();
+        cfg.repositories[0].url = format!("file://{}", origin.display());
+        cfg.repositories[0].local_path = Some(workspace.clone());
+        let cancel = CancellationToken::new();
+        let state = seeded_state(cfg_path, &cfg, cancel.clone());
+        let repo = repo_from(&cfg);
+
+        let req = json!({
+            "action": "rollback_recovery",
+            "url": repo.url,
+            "count": 2,
+            "dry_run": true,
+        });
+        let resp = handle_rollback_recovery(&req, &state).await;
+
+        // The dry-run returns a correct plan resolved against origin/main.
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["dry_run"], serde_json::Value::Bool(true));
+        assert_eq!(resp["commit_count"], serde_json::json!(2), "resp: {resp}");
+        let changes: Vec<String> = resp["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(changes, vec!["feature-a"], "resp: {resp}");
+        let issues: Vec<String> = resp["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(issues, vec!["fix-thing"], "resp: {resp}");
+        let preview = resp["preview"].as_str().unwrap();
+        assert!(preview.contains("feature-a"), "preview names the change: {preview}");
+        assert!(preview.contains("fix-thing"), "preview names the issue: {preview}");
+
+        // READ-ONLY: the sentinel survives byte-for-byte, HEAD did not move,
+        // porcelain status is unchanged, and canon is untouched (no reset).
+        assert!(
+            sentinel.is_file(),
+            "sentinel uncommitted file must survive a read-only dry-run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "in-flight agent work — do not clobber\n",
+            "sentinel content must be unchanged by the dry-run"
+        );
+        let head_after = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(head_after, head_before, "dry-run must not move HEAD");
+        assert_eq!(
+            porcelain(&workspace),
+            porcelain_before,
+            "dry-run must not change the working-tree status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("openspec/specs/widget/spec.md")).unwrap(),
+            canon_before,
+            "dry-run must not reset canon (no `git reset --hard`)"
+        );
+        // And, per 4.5, no busy marker was acquired.
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "dry-run must not acquire the busy marker"
+        );
+        cancel.cancel();
+    }
+
+    // ================================================================
+    // a02: defer / undefer
+    // ================================================================
+
+    use std::process::Command as TestCmd;
+
+    fn git_run(path: &Path, args: &[&str]) {
+        let st = TestCmd::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed in {}", path.display());
+    }
+
+    /// Build a managed workspace with a bare `origin` it can push to, plus
+    /// an `agent-q` branch. Returns (TempDir, workspace path, origin path).
+    /// Seeds a change `c01-foo` (dir), a single-file issue `i01-bar.md`,
+    /// and a directory issue `i02-baz/`. Markers included to prove fs-move
+    /// carries gitignored files.
+    fn seed_defer_workspace() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        git_run(dir.path(), &["init", "-q", "-b", "main", "workspace"]);
+        git_run(&workspace, &["config", "user.email", "t@e.com"]);
+        git_run(&workspace, &["config", "user.name", "t"]);
+
+        // change c01-foo with a gitignored perma-stuck marker
+        let chg = workspace.join("openspec/changes/c01-foo");
+        std::fs::create_dir_all(&chg).unwrap();
+        std::fs::write(chg.join("proposal.md"), "## Why\nfoo\n").unwrap();
+        std::fs::write(chg.join(".perma-stuck.json"), "{}\n").unwrap();
+
+        // single-file issue
+        let issues = workspace.join("issues");
+        std::fs::create_dir_all(&issues).unwrap();
+        std::fs::write(issues.join("i01-bar.md"), "## Report\nbar\n").unwrap();
+
+        // directory issue with a marker inside
+        let idir = issues.join("i02-baz");
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(idir.join("issue.md"), "## Report\nbaz\n").unwrap();
+        std::fs::write(idir.join(".perma-stuck.json"), "{}\n").unwrap();
+
+        // gitignore the markers so a tracked-only `git mv` would orphan them
+        std::fs::write(workspace.join(".gitignore"), "**/.perma-stuck.json\n").unwrap();
+
+        git_run(&workspace, &["add", "-A"]);
+        git_run(&workspace, &["commit", "-q", "-m", "seed"]);
+        git_run(&workspace, &["branch", "agent-q"]);
+
+        let origin = dir.path().join("origin.git");
+        git_run(dir.path(), &["clone", "-q", "--bare", "workspace", "origin.git"]);
+        git_run(&workspace, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git_run(&workspace, &["fetch", "-q", "origin"]);
+        (dir, workspace, origin)
+    }
+
+    /// 7.2 detection (defer): only-change → Change; only single-file issue
+    /// → IssueFile; only dir issue → IssueDir; absent → NotFound; both →
+    /// Ambiguous.
+    #[test]
+    fn detection_defer_classifies_each_form_and_edges() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+
+        std::fs::create_dir_all(ws.join("openspec/changes/only-change")).unwrap();
+        assert!(matches!(
+            locate_for_defer(ws, "only-change"),
+            DeferLocate::NeedsMove(DeferKind::Change)
+        ));
+
+        std::fs::create_dir_all(ws.join("issues")).unwrap();
+        std::fs::write(ws.join("issues/only-file.md"), "x").unwrap();
+        assert!(matches!(
+            locate_for_defer(ws, "only-file"),
+            DeferLocate::NeedsMove(DeferKind::IssueFile)
+        ));
+
+        std::fs::create_dir_all(ws.join("issues/only-dir")).unwrap();
+        assert!(matches!(
+            locate_for_defer(ws, "only-dir"),
+            DeferLocate::NeedsMove(DeferKind::IssueDir)
+        ));
+
+        assert!(matches!(locate_for_defer(ws, "nonesuch"), DeferLocate::NotFound));
+
+        // both a change AND an issue with the same slug → ambiguous
+        std::fs::create_dir_all(ws.join("openspec/changes/dup")).unwrap();
+        std::fs::write(ws.join("issues/dup.md"), "x").unwrap();
+        assert!(matches!(locate_for_defer(ws, "dup"), DeferLocate::Ambiguous(_)));
+    }
+
+    /// 7.3 detection (undefer): present only under deferred-changes / deferred-issues forms.
+    #[test]
+    fn detection_undefer_classifies_each_form_and_edges() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+
+        std::fs::create_dir_all(ws.join("deferred-changes/dc")).unwrap();
+        assert!(matches!(
+            locate_for_undefer(ws, "dc"),
+            DeferLocate::NeedsMove(DeferKind::Change)
+        ));
+
+        std::fs::create_dir_all(ws.join("deferred-issues")).unwrap();
+        std::fs::write(ws.join("deferred-issues/df.md"), "x").unwrap();
+        assert!(matches!(
+            locate_for_undefer(ws, "df"),
+            DeferLocate::NeedsMove(DeferKind::IssueFile)
+        ));
+
+        std::fs::create_dir_all(ws.join("deferred-issues/dd")).unwrap();
+        assert!(matches!(
+            locate_for_undefer(ws, "dd"),
+            DeferLocate::NeedsMove(DeferKind::IssueDir)
+        ));
+
+        assert!(matches!(locate_for_undefer(ws, "nope"), DeferLocate::NotFound));
+    }
+
+    /// 7.6 idempotency at the detection layer: a defer whose lane location
+    /// is absent but deferred is present → AlreadyDone; symmetric for undefer.
+    #[test]
+    fn detection_idempotency_already_done() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Already deferred: deferred-changes present, lane absent.
+        std::fs::create_dir_all(ws.join("deferred-changes/c01")).unwrap();
+        assert!(matches!(
+            locate_for_defer(ws, "c01"),
+            DeferLocate::AlreadyDone(DeferKind::Change)
+        ));
+        // Already active: lane present, deferred absent.
+        std::fs::create_dir_all(ws.join("issues/i01")).unwrap();
+        assert!(matches!(
+            locate_for_undefer(ws, "i01"),
+            DeferLocate::AlreadyDone(DeferKind::IssueDir)
+        ));
+    }
+
+    /// 7.4 (unit-level) fs_move_unit carries gitignored markers (a dir
+    /// unit) and preserves single-file form, creating the parent dir.
+    #[test]
+    fn fs_move_unit_carries_markers_and_creates_parent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let from = ws.join("issues/i02-baz");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("issue.md"), "baz").unwrap();
+        std::fs::write(from.join(".perma-stuck.json"), "{}").unwrap();
+        let to = ws.join("deferred-issues/i02-baz");
+        fs_move_unit(&from, &to).unwrap();
+        assert!(!from.exists(), "source removed");
+        assert!(to.join("issue.md").is_file());
+        assert!(to.join(".perma-stuck.json").is_file(), "gitignored marker travelled");
+
+        // single-file form preserved
+        let f_from = ws.join("issues/i01-bar.md");
+        std::fs::write(&f_from, "bar").unwrap();
+        let f_to = ws.join("deferred-issues/i01-bar.md");
+        fs_move_unit(&f_from, &f_to).unwrap();
+        assert!(f_to.is_file() && !f_to.is_dir());
+        assert!(!f_from.exists());
+    }
+
+    /// 7.5 lanes ignore deferred: a unit under deferred-changes/ is not in
+    /// `list_pending`; a unit under deferred-issues/ is not in `list_ready`.
+    #[test]
+    fn lanes_ignore_deferred_units() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+
+        // deferred change → not pending
+        let dchg = ws.join("deferred-changes/c01-foo");
+        std::fs::create_dir_all(&dchg).unwrap();
+        std::fs::write(dchg.join("proposal.md"), "## Why\n").unwrap();
+        let pending = queue::list_pending(&paths, ws).unwrap();
+        assert!(
+            !pending.iter().any(|s| s == "c01-foo"),
+            "deferred change must not be pending: {pending:?}"
+        );
+
+        // deferred issues (both forms) → not ready
+        std::fs::create_dir_all(ws.join("deferred-issues")).unwrap();
+        std::fs::write(ws.join("deferred-issues/i01-bar.md"), "## Report\nbar\n").unwrap();
+        let didir = ws.join("deferred-issues/i02-baz");
+        std::fs::create_dir_all(&didir).unwrap();
+        std::fs::write(didir.join("issue.md"), "## Report\nbaz\n").unwrap();
+        let ready = crate::lanes::issues::list_ready(ws).unwrap();
+        assert!(
+            !ready.iter().any(|s| s == "i01-bar" || s == "i02-baz"),
+            "deferred issues must not be ready: {ready:?}"
+        );
+    }
+
+    /// Build a seeded ControlState + repo whose workspace is the prepared
+    /// git dir, with `auto_submit_pr` controllable.
+    fn defer_state(
+        td: &TempDir,
+        workspace: &Path,
+        origin: &Path,
+        auto_submit_pr: bool,
+        cancel: CancellationToken,
+    ) -> (ControlState, RepositoryConfig) {
+        let cfg_path = write_yaml(td.path(), BASE_YAML);
+        let mut cfg = Config::load_from(&cfg_path).unwrap();
+        // Keep the URL in `git@github.com:owner/repo.git` form so
+        // `parse_repo_url` (used by the no-pr branch_url helper) succeeds.
+        // Pushes go to the workspace's `origin` remote (pointed at the bare
+        // file repo by `seed_defer_workspace`), NOT the URL, so the move
+        // still lands without a real GitHub.
+        let _ = origin;
+        cfg.repositories[0].local_path = Some(workspace.to_path_buf());
+        cfg.repositories[0].auto_submit_pr = auto_submit_pr;
+        cfg.repositories[0].agent_branch = "agent-q".to_string();
+        cfg.repositories[0].base_branch = "main".to_string();
+        let state = seeded_state(cfg_path, &cfg, cancel);
+        let repo = repo_from(&cfg);
+        (state, repo)
+    }
+
+    /// 7.4 + 7.7: deferring a change moves it out of the lane to
+    /// `deferred-changes/`, contents (incl. gitignored markers) preserved,
+    /// on `agent_branch` (not base), and with `auto_submit_pr=false` yields
+    /// the `branch_pushed_no_pr` mechanism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_change_moves_to_deferred_no_pr() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"], "deferred", "resp: {resp}");
+        assert_eq!(resp["mechanism"], "branch_pushed_no_pr", "resp: {resp}");
+        assert_eq!(resp["branch"], "agent-q", "move lands on the agent branch: {resp}");
+
+        // The move happened on the agent branch's working tree.
+        assert!(
+            !workspace.join("openspec/changes/c01-foo").exists(),
+            "lane location removed"
+        );
+        let deferred = workspace.join("deferred-changes/c01-foo");
+        assert!(deferred.join("proposal.md").is_file(), "moved to deferred-changes");
+        assert!(
+            deferred.join(".perma-stuck.json").is_file(),
+            "gitignored marker travelled with the unit"
+        );
+
+        // Current branch is the agent branch, NOT base.
+        let cur = TestCmd::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&cur.stdout).trim(),
+            "agent-q",
+            "the move commit is on the agent branch"
+        );
+        cancel.cancel();
+    }
+
+    /// 7.4: undefer is the exact inverse — it returns a deferred unit to
+    /// its lane location. The handler resolves against a clean base tip, so
+    /// the deferred state is seeded onto base first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undefer_returns_unit_to_lane() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        // Seed base with the change already deferred (lane absent).
+        std::fs::create_dir_all(workspace.join("deferred-changes")).unwrap();
+        std::fs::rename(
+            workspace.join("openspec/changes/c01-foo"),
+            workspace.join("deferred-changes/c01-foo"),
+        )
+        .unwrap();
+        git_run(&workspace, &["add", "-A"]);
+        git_run(&workspace, &["commit", "-q", "-m", "pre-deferred c01-foo"]);
+        git_run(&workspace, &["push", "-q", "origin", "main"]);
+
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let req = json!({"action": "undefer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_undefer_unit(&req, &state).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"], "resumed", "resp: {resp}");
+        assert_eq!(resp["mechanism"], "branch_pushed_no_pr", "resp: {resp}");
+        assert!(
+            workspace.join("openspec/changes/c01-foo/proposal.md").is_file(),
+            "undefer returns the unit to its lane"
+        );
+        assert!(
+            !workspace.join("deferred-changes/c01-foo").exists(),
+            "deferred location emptied by undefer"
+        );
+        cancel.cancel();
+    }
+
+    /// 7.4: deferring a single-file issue preserves its single-file form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_single_file_issue_preserves_form() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "i01-bar"});
+        let resp = handle_defer_unit(&req, &state).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["kind"], "issue", "resp: {resp}");
+        let moved = workspace.join("deferred-issues/i01-bar.md");
+        assert!(moved.is_file() && !moved.is_dir(), "single-file form preserved");
+        assert!(!workspace.join("issues/i01-bar.md").exists());
+        cancel.cancel();
+    }
+
+    /// 7.6: deferring an already-deferred slug is a no-op success — no
+    /// commit, no PR. The handler resolves the slug against a clean base
+    /// tip (reset to `origin/<base>`), so the already-deferred state must
+    /// live on base: we commit the unit into `deferred-changes/` (lane
+    /// location absent) on base, then assert a defer reports
+    /// `already_deferred` with no `mechanism`/move and leaves the tree as-is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_already_deferred_is_noop_success() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        // Move the change into deferred-changes/ on base and push to origin
+        // so the post-reset base tree reflects the already-deferred state.
+        std::fs::create_dir_all(workspace.join("deferred-changes")).unwrap();
+        std::fs::rename(
+            workspace.join("openspec/changes/c01-foo"),
+            workspace.join("deferred-changes/c01-foo"),
+        )
+        .unwrap();
+        git_run(&workspace, &["add", "-A"]);
+        git_run(&workspace, &["commit", "-q", "-m", "pre-deferred c01-foo"]);
+        git_run(&workspace, &["push", "-q", "origin", "main"]);
+
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"], "already_deferred", "resp: {resp}");
+        // No move was performed: no mechanism field, deferred dir still there.
+        assert!(resp.get("mechanism").is_none(), "no-op performs no move: {resp}");
+        cancel.cancel();
+    }
+
+    /// 7.7: with `auto_submit_pr` true (default), the PR-open path is taken
+    /// rather than the branch_pushed_no_pr early return. There is no real
+    /// GitHub remote, so the handler reaches `open_triage_pull_request` and
+    /// fails THERE — proving the PR path (not the no-pr path) was selected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_with_auto_submit_pr_takes_pr_path() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, true, cancel.clone());
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+        // The move + push succeed; the PR open fails (no GitHub). The error
+        // names the PR step — NOT a branch_pushed_no_pr success — proving
+        // the auto_submit_pr=true branch was taken.
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("opening defer PR"),
+            "auto_submit_pr=true must reach the PR-open path: {err}"
+        );
+        assert_ne!(
+            resp["mechanism"], "branch_pushed_no_pr",
+            "must NOT take the no-pr early return"
+        );
+        cancel.cancel();
+    }
+
+    /// 7.2/error: a not-found slug returns a clear error and performs no move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_not_found_is_error() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "nonesuch"});
+        let resp = handle_defer_unit(&req, &state).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap().contains("no change or issue"),
+            "resp: {resp}"
+        );
+        cancel.cancel();
+    }
+
+    /// 7.8 preempt + serialize: deferring while a pass is in flight (busy
+    /// marker held by a live process with a recorded change) returns Busy
+    /// and does NOT move the unit. Mirrors the rollback handler's
+    /// preempt-and-serialize behaviour: a workspace-mutating op cannot
+    /// barge in on an ambiguous in-flight holder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_preempts_and_serializes_against_pass() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        // Install an iteration_cancel token so the preempt has a pass to
+        // cancel, and HOLD a real busy marker (acquired by THIS live
+        // process) so the concurrent acquire classifies SkipFreshInProgress
+        // (a live in-flight holder it must not barge in on) → Busy. Holding
+        // a real guard is deterministic across platforms (no reliance on
+        // /proc/<pid>/comm classification).
+        let token = install_iteration_cancel(&state, &repo.url);
+        let _held = match busy_marker::try_acquire(&state.paths, &workspace, &repo.url, 600).unwrap() {
+            busy_marker::AcquireOutcome::Acquired(g) => g,
+            other => panic!(
+                "fixture must acquire the marker first, got {}",
+                match other {
+                    busy_marker::AcquireOutcome::SkipAmbiguous(_) => "Ambiguous",
+                    busy_marker::AcquireOutcome::SkipFreshInProgress(_) => "Fresh",
+                    busy_marker::AcquireOutcome::Acquired(_) => "Acquired",
+                }
+            ),
+        };
+        // Zero the drain timeout so the bounded wait returns immediately.
+        let mut cfg2 = (*state.last_config.load_full()).clone();
+        cfg2.executor.wipe_drain_timeout_secs = 0;
+        state.last_config.store(Arc::new(cfg2));
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+
+        // The preempt fired the iteration cancel (it observed the pass).
+        assert!(token.is_cancelled(), "in-flight pass must be cancelled by the preempt");
+        // The busy holder is ambiguous → Busy error, NO workspace mutation.
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap().to_lowercase().contains("busy"),
+            "ambiguous in-flight holder must surface a busy error: {resp}"
+        );
+        // The unit was NOT moved (the op never got past the marker acquire).
+        assert!(
+            workspace.join("openspec/changes/c01-foo").exists(),
+            "no move occurs while a pass holds the workspace"
+        );
+        assert!(
+            !workspace.join("deferred-changes/c01-foo").exists(),
+            "deferred location must be empty after a refused (busy) defer"
+        );
+        drop(_held); // release the held marker (RAII) at end of test
+        cancel.cancel();
+    }
+
+    /// 7.8 (positive): deferring while a pass is in flight whose marker is
+    /// recoverable (dead pid) preempts the pass, acquires the marker, and
+    /// completes the move — the marker is held across the whole op. Asserts
+    /// the move succeeded AND the iteration cancel fired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_preempts_recoverable_pass_then_moves() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        let token = install_iteration_cancel(&state, &repo.url);
+        // Dead-pid marker → recoverable; after preempt the acquire yields
+        // Acquired and the move proceeds.
+        write_marker(&state.paths, &workspace, 999_999, "claude", 5, "c01-foo");
+        busy_marker::write_subprocess_marker(&state.paths, &workspace, 4242).unwrap();
+        let mut cfg2 = (*state.last_config.load_full()).clone();
+        cfg2.executor.wipe_drain_timeout_secs = 0;
+        state.last_config.store(Arc::new(cfg2));
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+
+        assert!(token.is_cancelled(), "the recoverable in-flight pass is cancelled");
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"], "deferred", "resp: {resp}");
+        assert!(
+            workspace.join("deferred-changes/c01-foo/proposal.md").is_file(),
+            "the move completes after preempting the recoverable pass"
+        );
+        // The op's busy guard was released on return (marker gone).
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "busy marker released after the op completes"
+        );
+        cancel.cancel();
+    }
+
+    /// 9.2 detect-before-preempt: an already-deferred `defer` issued while
+    /// a pass is in flight is a READ-ONLY no-op — it does NOT fire the
+    /// iteration-cancel token and does NOT acquire the busy marker (so a
+    /// typo'd re-defer cannot disrupt active work). We seed the
+    /// already-deferred state in the working tree (the no-op path inspects
+    /// the live tree without a reset), install an iteration-cancel token,
+    /// and HOLD a live busy marker; the handler must leave both untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_already_deferred_does_not_preempt_in_flight_pass() {
+        let (td, workspace, origin) = seed_defer_workspace();
+        // Move the change into deferred-changes/ in the WORKING TREE so the
+        // read-only pre-flight detection classifies it as already-deferred.
+        std::fs::create_dir_all(workspace.join("deferred-changes")).unwrap();
+        std::fs::rename(
+            workspace.join("openspec/changes/c01-foo"),
+            workspace.join("deferred-changes/c01-foo"),
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let (state, repo) = defer_state(&td, &workspace, &origin, false, cancel.clone());
+
+        // A pass is in flight: an iteration-cancel token is installed AND a
+        // live busy marker is held (acquired by THIS process). If the
+        // handler preempted it would fire the token; if it acquired it would
+        // need this marker released.
+        let token = install_iteration_cancel(&state, &repo.url);
+        let held = match busy_marker::try_acquire(&state.paths, &workspace, &repo.url, 600).unwrap() {
+            busy_marker::AcquireOutcome::Acquired(g) => g,
+            other => panic!(
+                "fixture must acquire the marker first, got {}",
+                match other {
+                    busy_marker::AcquireOutcome::SkipAmbiguous(_) => "Ambiguous",
+                    busy_marker::AcquireOutcome::SkipFreshInProgress(_) => "Fresh",
+                    busy_marker::AcquireOutcome::Acquired(_) => "Acquired",
+                }
+            ),
+        };
+
+        let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
+        let resp = handle_defer_unit(&req, &state).await;
+
+        // It is a no-op success, NOT a busy error or a move.
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"], "already_deferred", "resp: {resp}");
+        assert!(resp.get("mechanism").is_none(), "no-op performs no move: {resp}");
+        // No preempt occurred: preempted_change is null AND the in-flight
+        // pass's cancel token was NEVER fired.
+        assert!(resp["preempted_change"].is_null(), "no preempt for a no-op: {resp}");
+        assert!(
+            !token.is_cancelled(),
+            "an already-deferred no-op must NOT cancel the in-flight pass"
+        );
+        // The handler acquired no marker of its own: the marker still
+        // belongs to the held guard (which we drop here). It exists because
+        // WE hold it, not because the handler took it.
+        assert!(
+            busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "the held (fixture) marker is untouched by the no-op handler"
+        );
+        drop(held);
+        // With the fixture guard dropped the marker is gone — proof the
+        // handler never acquired a second/replacement marker of its own.
+        assert!(
+            !busy_marker::marker_path(&state.paths, &workspace).exists(),
+            "no handler-acquired marker remains after the fixture guard drops"
+        );
+        cancel.cancel();
     }
 }

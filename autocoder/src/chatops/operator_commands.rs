@@ -265,6 +265,25 @@ pub enum OperatorCommand {
         repo_substring: String,
         change: String,
     },
+    /// `@<bot> defer <repo-substring> <slug>` — set a work unit aside out
+    /// of both lanes without deleting or revising it. The verb auto-detects
+    /// whether `<slug>` is a change (`openspec/changes/<slug>/`) or an issue
+    /// (`issues/<slug>.md` | `issues/<slug>/`) by where it lives, then moves
+    /// it to `deferred-changes/<slug>/` or `deferred-issues/<slug>(.md|/)`
+    /// via the agent-branch + PR flow. Single-ack (no confirmation dance),
+    /// because defer discards no code and is reversible by `undefer`.
+    Defer {
+        repo_substring: String,
+        slug: String,
+    },
+    /// `@<bot> undefer <repo-substring> <slug>` — the inverse of `defer`:
+    /// resume a set-aside unit by moving it from its deferred location back
+    /// to its original lane location, preserving the on-disk form. Also
+    /// single-ack.
+    Undefer {
+        repo_substring: String,
+        slug: String,
+    },
     /// `@<bot> ignore-and-continue <repo-substring> <change-slug>` — stamps
     /// `.ignore-for-queue.json` alongside an existing blocking marker
     /// (`.perma-stuck.json` OR `.needs-spec-revision.json`). The marker
@@ -659,6 +678,39 @@ fn parse_command_outcome_in_thread(
         },
         "clear-perma-stuck" => parse_marker_clear(&rest, ClearKind::PermaStuck),
         "clear-revision" => parse_marker_clear(&rest, ClearKind::Revision),
+        "defer" => {
+            // `@<bot> defer <repo-substring> <slug>` — two-arg shape,
+            // mirroring the `ignore-and-continue` arm. The slug is validated
+            // with the same change-slug regex the other marker verbs use.
+            if rest.len() != 2 {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::Defer {
+                repo_substring: rest[0].to_string(),
+                slug: rest[1].to_string(),
+            })
+        }
+        "undefer" => {
+            if rest.len() != 2 {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            ParseOutcome::Ok(OperatorCommand::Undefer {
+                repo_substring: rest[0].to_string(),
+                slug: rest[1].to_string(),
+            })
+        }
         "ignore-and-continue" => {
             if rest.len() != 2 {
                 return ParseOutcome::None;
@@ -2291,6 +2343,8 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `status` (no repo) — list every watched repository with queue summary, busy state, and last-iteration time. Use `status <repo>` for the per-repo detail.\n");
     out.push_str("  • `clear-perma-stuck <repo> <change>` — clear `.perma-stuck.json` for a change. `clear-perma-stuck <repo> *` clears every such marker in one repo; `clear-perma-stuck *` clears them across all configured repos\n");
     out.push_str("  • `clear-revision <repo> <change>` — clear `.needs-spec-revision.json` for a change. `clear-revision <repo> *` clears every such marker in one repo; `clear-revision *` clears them across all configured repos\n");
+    out.push_str("  • `defer <repo> <slug>` — set a change OR issue aside out of both lanes (auto-detected), moving it to `deferred-changes/`/`deferred-issues/` via PR; single-ack, reversible by `undefer`\n");
+    out.push_str("  • `undefer <repo> <slug>` — resume a deferred change OR issue, moving it back to its lane via PR; single-ack\n");
     out.push_str("  • `ignore-and-continue <repo> <change>` — skip a broken change AND let siblings proceed (stamps `.ignore-for-queue.json`)\n");
     out.push_str("  • `clear-ignore <repo> <change>` — remove `.ignore-for-queue.json`; queue resumes blocking on the original marker\n");
     out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `confirm` (60s TTL)\n");
@@ -3133,6 +3187,42 @@ impl OperatorCommandDispatcher {
                     format!("✗ {err}")
                 }
             }
+            OperatorCommand::Defer { repo_substring, slug } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "defer_unit",
+                        "url": repo.url,
+                        "slug": slug,
+                    }))
+                    .await;
+                let reply = render_defer_reply(&resp, &slug, &repo.url);
+                prepend_defer_preempt_ack(&resp, "defer", &slug, reply)
+            }
+            OperatorCommand::Undefer { repo_substring, slug } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "undefer_unit",
+                        "url": repo.url,
+                        "slug": slug,
+                    }))
+                    .await;
+                let reply = render_defer_reply(&resp, &slug, &repo.url);
+                prepend_defer_preempt_ack(&resp, "undefer", &slug, reply)
+            }
             OperatorCommand::IgnoreAndContinue {
                 repo_substring,
                 change,
@@ -3529,7 +3619,23 @@ impl OperatorCommandDispatcher {
                         .unwrap_or("(no error message)");
                     return format!("✗ rollback failed: {err}");
                 }
-                format_rollback_outcome(&resp)
+                // Preempt acknowledgement: when the operation cancelled an
+                // in-flight pass, the control-socket response carries the
+                // cancelled change's slug. Surface it alongside the result so
+                // the cancelled change is not a silent surprise. When no pass
+                // was in flight the field is null/absent and no acknowledgement
+                // is emitted. Best-effort: this is part of the reply string, so
+                // it degrades with the reply itself when no backend is present.
+                let outcome = format_rollback_outcome(&resp);
+                match resp.get("preempted_change").and_then(|v| v.as_str()) {
+                    Some(slug) if !slug.trim().is_empty() => {
+                        format!(
+                            "↩️ Preempting in-flight work on `{}` to roll back.\n{outcome}",
+                            slack_escape(slug)
+                        )
+                    }
+                    _ => outcome,
+                }
             }
             OperatorCommand::Help => format_help_reply(),
             // The `propose` verb is routed via `handle_message_with_context`
@@ -5148,6 +5254,75 @@ fn short_repo_label(url: &str) -> String {
     after_colon.to_string()
 }
 
+/// Render a `defer_unit` / `undefer_unit` control-socket response into a
+/// single operator reply: `✓` on a performed move OR a no-op success
+/// (already-deferred / already-active), `✗` on a clear error (not-found,
+/// ambiguous). Single-ack — no pending-confirmation store. The reply text
+/// is derived from the response's `outcome`; the slug AND short repo label
+/// always appear so chatops scrollback names what was acted on.
+fn render_defer_reply(resp: &serde_json::Value, slug: &str, repo_url: &str) -> String {
+    if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no error message)");
+        return format!("✗ {err}");
+    }
+    let label = short_repo_label(repo_url);
+    let outcome = resp.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+    match outcome {
+        "already_deferred" => format!("✓ '{slug}' is already deferred on {label}"),
+        "already_active" => format!("✓ '{slug}' is already active on {label}"),
+        "deferred" => {
+            if let Some(pr) = resp.get("pr_url").and_then(|v| v.as_str()) {
+                format!("✓ deferred '{slug}' on {label} (PR: {pr})")
+            } else if let Some(branch) = resp.get("branch_url").and_then(|v| v.as_str()) {
+                format!("✓ deferred '{slug}' on {label} (pushed branch, no PR: {branch})")
+            } else {
+                format!("✓ deferred '{slug}' on {label}")
+            }
+        }
+        "resumed" => {
+            if let Some(pr) = resp.get("pr_url").and_then(|v| v.as_str()) {
+                format!("✓ resumed '{slug}' on {label} (PR: {pr})")
+            } else if let Some(branch) = resp.get("branch_url").and_then(|v| v.as_str()) {
+                format!("✓ resumed '{slug}' on {label} (pushed branch, no PR: {branch})")
+            } else {
+                format!("✓ resumed '{slug}' on {label}")
+            }
+        }
+        _ => format!("✓ '{slug}' on {label}"),
+    }
+}
+
+/// Preempt acknowledgement for `defer`/`undefer`: when the operation
+/// cancelled an in-flight pass, the control-socket response carries the
+/// cancelled change's slug in `preempted_change`. Surface it alongside
+/// the result reply (per the **Preempting in-flight work is acknowledged
+/// to the operator** requirement) so the cancelled change is not a silent
+/// surprise, naming the operation (`op`) AND the unit being deferred. When
+/// no pass was in flight the field is null/absent and only the result
+/// reply is returned. This mirrors the `rollback-confirm` arm's
+/// best-effort ack: the ack is prepended to the same reply string, so it
+/// degrades with the reply itself when no backend is present.
+fn prepend_defer_preempt_ack(
+    resp: &serde_json::Value,
+    op: &str,
+    slug: &str,
+    reply: String,
+) -> String {
+    match resp.get("preempted_change").and_then(|v| v.as_str()) {
+        Some(cancelled) if !cancelled.trim().is_empty() => {
+            format!(
+                "↩️ Preempting in-flight work on `{}` to {op} `{}`.\n{reply}",
+                slack_escape(cancelled),
+                slack_escape(slug),
+            )
+        }
+        _ => reply,
+    }
+}
+
 // ====================================================================
 // Reply-formatting helpers (private)
 // ====================================================================
@@ -5390,6 +5565,39 @@ mod tests {
     fn parse_ignore_and_continue_missing_args_returns_none() {
         assert!(parse_command(&format!("{BOT} ignore-and-continue myrepo"), BOT).is_none());
         assert!(parse_command(&format!("{BOT} ignore-and-continue"), BOT).is_none());
+    }
+
+    // ---------- a02: defer / undefer ----------
+
+    #[test]
+    fn parse_defer_happy_path() {
+        let cmd = parse_command(&format!("{BOT} defer myrepo a06-foo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Defer {
+                repo_substring: "myrepo".into(),
+                slug: "a06-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_undefer_happy_path() {
+        let cmd = parse_command(&format!("{BOT} undefer myrepo a06-foo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Undefer {
+                repo_substring: "myrepo".into(),
+                slug: "a06-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_defer_missing_args_returns_none() {
+        assert!(parse_command(&format!("{BOT} defer myrepo"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} defer"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} undefer myrepo"), BOT).is_none());
     }
 
     // -------------------------------------------------------------
@@ -7130,6 +7338,8 @@ mod tests {
             "clear-revision",
             "ignore-and-continue",
             "clear-ignore",
+            "defer",
+            "undefer",
             "wipe-workspace",
             "rebuild-specs",
             "help",
@@ -7289,6 +7499,173 @@ mod tests {
         // Single-pending one-liner form (≤5 entries triggers compact
         // queue line).
         assert!(text.contains("queue: 1 pending (a08-deploy)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_defer_submits_action_and_acks() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "defer_unit",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "deferred",
+                "slug": "a06-foo",
+                "url": "git@github.com:acme/myrepo.git",
+                "pr_url": "https://github.com/acme/myrepo/pull/7",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} defer myrepo a06-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        // Single-ack, no confirmation prompt.
+        assert!(text.starts_with("✓"), "{text}");
+        assert!(text.contains("a06-foo"), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action submitted");
+        assert_eq!(calls[0]["action"], "defer_unit");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["slug"], "a06-foo");
+    }
+
+    #[tokio::test]
+    async fn dispatch_undefer_already_active_is_ack_not_error() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "undefer_unit",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "already_active",
+                "slug": "a06-foo",
+                "url": "git@github.com:acme/myrepo.git",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} undefer myrepo a06-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✓"), "already-active is a no-op success: {text}");
+        let calls = submitter.calls();
+        assert_eq!(calls[0]["action"], "undefer_unit");
+    }
+
+    #[tokio::test]
+    async fn dispatch_defer_not_found_is_error() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "defer_unit",
+            serde_json::json!({"ok": false, "error": "no change or issue `x`"}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} defer myrepo a06-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "{text}");
+    }
+
+    /// 9.1 — the dispatcher surfaces a preempt acknowledgement IFF the
+    /// `defer` response carries a non-null `preempted_change`, naming the
+    /// operation AND the cancelled change, alongside the normal result.
+    #[tokio::test]
+    async fn dispatch_defer_acknowledges_preempt_when_change_present() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "defer_unit",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "deferred",
+                "slug": "a06-foo",
+                "url": "git@github.com:acme/myrepo.git",
+                "pr_url": "https://github.com/acme/myrepo/pull/7",
+                "preempted_change": "a07-bar",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} defer myrepo a06-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(
+            text.contains("a07-bar"),
+            "preempt ack must name the cancelled change: {text}"
+        );
+        assert!(
+            text.contains("Preempting in-flight work"),
+            "preempt ack must be present when a pass was cancelled: {text}"
+        );
+        assert!(
+            text.contains("a06-foo"),
+            "the normal result reply must still be present: {text}"
+        );
+    }
+
+    /// 9.1 (negative) — a null `preempted_change` yields no preempt
+    /// acknowledgement, only the normal result reply.
+    #[tokio::test]
+    async fn dispatch_undefer_no_preempt_ack_when_no_change() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "undefer_unit",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "resumed",
+                "slug": "a06-foo",
+                "url": "git@github.com:acme/myrepo.git",
+                "pr_url": "https://github.com/acme/myrepo/pull/8",
+                "preempted_change": serde_json::Value::Null,
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} undefer myrepo a06-foo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(
+            !text.contains("Preempting in-flight work"),
+            "no preempt ack when no pass was in flight: {text}"
+        );
+        assert!(
+            text.starts_with("✓"),
+            "the normal result reply must still be present: {text}"
+        );
     }
 
     #[tokio::test]
@@ -11695,6 +12072,83 @@ mod tests {
         assert_eq!(calls.len(), 2, "exactly one dry-run + one act");
         assert_eq!(calls[1]["dry_run"], serde_json::json!(false));
         assert_eq!(calls[1]["count"], serde_json::json!(2));
+    }
+
+    /// 4.6 — the dispatcher surfaces a preempt acknowledgement IFF the
+    /// confirmed rollback response carries a non-null `preempted_change`.
+    #[tokio::test]
+    async fn dispatch_rollback_confirm_acknowledges_preempt_when_change_present() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 1 commit",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/11",
+                "preempted_change": "a07-foo",
+            }),
+        );
+        // Step 1: preview (records the pending confirmation).
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} rollback myrepo 1"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        // Step 2: confirm → must include the preempt acknowledgement
+        // naming the cancelled change AND the normal outcome.
+        let act_text = unwrap_sync(
+            dispatcher
+                .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            act_text.contains("a07-foo"),
+            "preempt acknowledgement must name the cancelled change: {act_text}"
+        );
+        assert!(
+            act_text.contains("Rollback PR opened: http://x/pr/11"),
+            "the normal outcome must still be present: {act_text}"
+        );
+    }
+
+    /// 4.6 (negative) — no `preempted_change` field → no acknowledgement,
+    /// only the normal result.
+    #[tokio::test]
+    async fn dispatch_rollback_confirm_no_ack_when_no_preempt() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 1 commit",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/12",
+                "preempted_change": serde_json::Value::Null,
+            }),
+        );
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} rollback myrepo 1"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let act_text = unwrap_sync(
+            dispatcher
+                .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !act_text.contains("Preempting in-flight work"),
+            "no preempt acknowledgement when no change was preempted: {act_text}"
+        );
+        assert!(
+            act_text.contains("Rollback PR opened: http://x/pr/12"),
+            "normal outcome present: {act_text}"
+        );
     }
 
     #[tokio::test]

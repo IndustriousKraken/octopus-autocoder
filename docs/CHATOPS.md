@@ -448,6 +448,8 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `ignore-and-continue` | `@<bot> ignore-and-continue <repo-substring> <change-slug>` | Stamps `openspec/changes/<change>/.ignore-for-queue.json` alongside an existing `.perma-stuck.json` OR `.needs-spec-revision.json`. The change stays excluded from `list_pending`; siblings resume processing on the next iteration. Refuses when the named change has no underlying blocking marker. Commits + pushes the marker on the daemon's agent branch. See [OPERATIONS.md → Queue-blocking policy](OPERATIONS.md#queue-blocking-policy) for the model. |
 | `clear-ignore` | `@<bot> clear-ignore <repo-substring> <change-slug>` | Removes `openspec/changes/<change>/.ignore-for-queue.json`. The queue resumes blocking on the underlying marker. Refuses when no ignore-marker exists. |
+| `defer` | `@<bot> defer <repo-substring> <slug>` | Sets a work unit aside out of both lanes without deleting or revising it. Auto-detects whether `<slug>` is a change or an issue (see below) and moves it to the deferred area via the agent-branch + PR flow. Single acknowledgement — no two-step confirmation. Reversible by `undefer`. |
+| `undefer` | `@<bot> undefer <repo-substring> <slug>` | The inverse of `defer`: resumes a set-aside unit by moving it from the deferred area back to its original lane location, preserving the on-disk form, via the same agent-branch + PR flow. Single acknowledgement. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `<cache_dir>/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](OPERATIONS.md#rebuilding-canonical-specs-from-archive-history). |
 | `clear-scout` | `@<bot> clear-scout <repo-substring>` | Wipes every `ScoutRunState` file under `<workspace>/.state/scout_runs/`. Idempotent — running it twice (or against a repo with no runs) replies with `✓ Cleared 0 scout run(s) for <repo>.`. See [scout](#scout) above for the lifecycle. |
@@ -562,6 +564,30 @@ Refusals: missing/ambiguous repo (per the standard matcher); `✗ sync-upstream:
 
 See also `docs/OPERATIONS.md` "OSS contribution workflow" for the end-to-end loop.
 
+### Deferring and resuming a unit: `defer` / `undefer`
+
+A change that has gone perma-stuck — repeatedly kicked back, blocking its lane — has no resting state by default: the choices are to keep failing or to roll the code back. `defer` adds a third option. It sets a work unit aside, out of both lanes, without deleting or revising it; `undefer` resumes it when you are ready. Because defer discards no code and is fully reversible, it acts on a single acknowledgement — there is no two-step confirmation (the deliberate contrast with `rollback` and `wipe-workspace`, which destroy state and therefore confirm).
+
+**Auto-detection of change vs issue.** You name only a slug; the verb infers the unit's kind from where it lives:
+
+- A change lives at `openspec/changes/<slug>/` (the changes lane's enumeration root).
+- An issue lives at `issues/<slug>.md` (single-file form) OR `issues/<slug>/` (directory form).
+
+If exactly one of those exists, that unit is acted on. If neither exists, the reply is a clear not-found error. If the same slug names both a change AND an issue, the reply reports the ambiguity and names both candidate locations rather than guessing — resolve the collision first.
+
+**Deferred locations.** `defer` MOVES the unit (it is not a marker, not a copy) to a committed location at the repository root that neither lane enumerates:
+
+- A change: `openspec/changes/<slug>/` → `deferred-changes/<slug>/`.
+- An issue: `issues/<slug>.md` → `deferred-issues/<slug>.md`, OR `issues/<slug>/` → `deferred-issues/<slug>/` — the single-file-versus-directory form is preserved exactly.
+
+The move is a filesystem rename, so the whole unit travels intact, including any gitignored markers it carries (e.g. `.perma-stuck.json`). The markers are not cleared: the unit is preserved as-is so a later `undefer` resumes exactly where it left off. `undefer` is the exact inverse move, returning the unit to its original lane location and form.
+
+**Rides the PR flow.** Like `rollback`, the move is performed on the agent branch (recreated at the base tip) and rides the established push + PR-creation flow — a pull request when `auto_submit_pr` is enabled (the default), or a pushed agent branch with no PR when an installation has set it false. It never commits to the base branch directly. The PR body states what was deferred (or resumed) and from/to which location.
+
+**Preempt + serialize.** `defer` and `undefer` mutate the workspace, so — like `rollback` — they preempt any in-flight pass for the repository and hold the per-repo busy marker for the duration of the move, so the move never races a concurrent agentic session. If the busy marker is held by an unrecognized process (PID alive, PID-reuse suspected), the operation refuses rather than barging in.
+
+**Idempotency.** Deferring a slug that is already in the deferred area (and absent from its lane) is a no-op success reporting it is already deferred — no second move, no second PR. Undeferring a slug already back in its lane is the symmetric no-op success. (Because the operation resolves against a clean base tip, the already-deferred / already-active state is recognized once the prior move's PR has merged to the base branch.)
+
 ### Two-step confirmation for `wipe-workspace`
 
 `wipe-workspace` is destructive, so the first reply is a warning rather than the action. The warning includes a context preview drawn from the same live data the per-repo `status` command surfaces, so you can make an informed go/no-go call before committing to the wipe:
@@ -592,6 +618,14 @@ On `confirm`, the daemon signals the in-flight iteration's per-iteration cancel 
 - `✓ Wiped <path> (drain timeout — iteration may have been stuck)` — the iteration did not exit within the timeout; the wipe ran anyway. Yellow flag: see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for follow-up.
 - `✓ Wiped <path> (no iteration in flight)` — the daemon was between iterations at confirm time. No drain was needed.
 - `✓ Wiped <path> (already absent)` — the workspace directory was already missing. Idempotent no-op.
+
+### Confirmed `rollback` preempts an in-flight pass
+
+A confirmed code-rollback recovery (`@<bot> rollback <repo> <N | sha SHA>`, then `rollback-confirm`) mutates the repository's workspace tree and branch. To avoid two writers on one workspace — the unsandboxed daemon git and a concurrently-running agentic session that has the same workspace bind-mounted writable — the rollback preempts the repository's in-flight pass before it touches the workspace.
+
+The preempt cancels the change that pass was working: the executor subprocess is terminated, so it stops spending tokens and opens no pull request. The cancelled change re-enters the pipeline through the rollback's own unarchive step (it is not lost). The rollback then holds the per-repo busy marker for the whole operation, so no new pass can start mid-rollback; the marker is released when the rollback completes, on success or failure.
+
+When a pass is cancelled, the confirmation reply names the cancelled change, e.g. `↩️ Preempting in-flight work on \`a07-foo\` to roll back.` followed by the normal rollback result. When no pass is in flight, no preempt line is emitted. If the repository's busy marker is held by an unrecognized process (PID alive, PID-reuse suspected), the rollback refuses rather than barging in and reports that the repository is busy with an unrecognized holder requiring investigation. The dry-run preview mutates nothing and therefore neither preempts nor locks.
 
 ### Reply shape
 
