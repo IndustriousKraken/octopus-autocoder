@@ -646,6 +646,8 @@ autocoder SHALL emit INFO-level log lines marking the start and end of each poll
 ### Requirement: Per-repo busy marker prevents concurrent work
 autocoder SHALL acquire a per-repo busy marker file at the start of each polling iteration and hold it through every stage of the pass (executor invocation, commit, review, push, PR creation). The marker lives at `<runtime_dir>/busy/<workspace-basename>.json` (resolved per the daemon's path resolver) and is created atomically via POSIX `O_EXCL`. Its presence prevents any other autocoder pass — same daemon or different — from concurrently working on the same repo. Crashes that bypass normal release (SIGKILL, segfault, host power loss, daemon restart mid-iteration) leave the marker behind for the next pass to detect and recover from. Stuck-state recovery SHALL prefer the subprocess-sidecar PGID (set by the executor after spawning Claude) over the marker's own `pgid` field when sending kill signals.
 
+The busy marker SHALL also be the serialization point for out-of-band workspace mutation: a control-socket operation that mutates the workspace tree OR branch SHALL acquire AND hold the same per-repo busy marker for its whole duration (see "Workspace-mutating control-socket operations preempt and serialize against the pass"), so a pass AND an out-of-band workspace op can never write the same workspace concurrently. A read-only OR non-workspace control-socket operation SHALL NOT acquire the marker.
+
 The stale-threshold SHALL be a dedicated `executor.busy_marker_stale_threshold_secs` config field (default `600` seconds, max `7200` with WARN-and-clamp), NOT a derived value from `executor.timeout_secs`. Raising the executor timeout for legitimately long work SHALL NOT proportionally delay stale-marker recovery on unrelated iterations.
 
 Dead-pid recovery (the `Stuck threshold exceeded, PID dead` scenario below) SHALL fire IMMEDIATELY when the marker's recorded `pid` no longer exists in `/proc`, without waiting for the stale-threshold to elapse. A pid that no longer exists cannot be doing legitimate work; the marker is unambiguously stale the moment that's true.
@@ -657,7 +659,7 @@ At daemon startup, after resolving both `executor.timeout_secs` AND `executor.bu
 #### Scenario: Acquire on a clean repo
 - **WHEN** a polling iteration begins AND no marker file exists at the resolved `<runtime_dir>/busy/<workspace-basename>.json`
 - **THEN** the daemon creates the marker via `OpenOptions::new().write(true).create_new(true).open(path)` (atomic against concurrent daemons)
-- **AND** the marker contains a JSON document with fields `repo_url`, `pid` (this process's PID), `pgid` (this process's process group ID), `comm` (the value of `/proc/<pid>/comm` at acquire time, on Linux; empty string on other platforms), `started_at` (RFC 3339 UTC timestamp), AND `stage` (initially `"executor"`)
+- **AND** the marker contains a JSON document with fields `repo_url`, `pid` (this process's PID), `pgid` (this process's process group ID), `comm` (the value of `/proc/<pid>/comm` at acquire time, on Linux; empty string on other platforms), `started_at` (RFC 3339 UTC timestamp), `stage` (initially `"executor"`), AND `change` (the slug of the change currently being worked, updated as work progresses; empty at initial acquire) — the field the preempt path reads to name the change it cancels
 - **AND** the iteration proceeds normally
 
 #### Scenario: Atomic stage transitions
@@ -720,6 +722,11 @@ At daemon startup, after resolving both `executor.timeout_secs` AND `executor.bu
 - **WHEN** any iteration's busy-marker classification produces a "busy marker present; skipping" log line
 - **THEN** the line contains `age=<duration>`, `threshold=<duration>`, `pid_alive=<bool>`, AND `recovery_eligible=<bool>` fields
 - **AND** the operator can determine from a single log line whether the marker is stale, when recovery will fire, AND whether the pid is alive — without reading the marker file separately
+
+#### Scenario: Out-of-band workspace op holds the marker for its whole duration
+- **WHEN** a control-socket operation that mutates the workspace tree OR branch acquires the busy marker AND begins mutating
+- **THEN** the marker is held for the operation's whole duration (preempt-acquire through release), so a concurrent polling pass observes it as held AND skips
+- **AND** the marker is released on the operation's completion, success OR failure, so the next pass proceeds normally
 
 ### Requirement: Dirty workspace auto-recovers at startup
 autocoder SHALL attempt automatic recovery before falling back to the existing "skip for the process lifetime" behavior when a repository's workspace is dirty at startup (non-empty `git status --porcelain` output). Recovery consists of `git checkout <base_branch>`, `git reset --hard origin/<base_branch>`, and `git clean -fd`. After recovery, autocoder SHALL re-run the dirty check; if clean, the repository proceeds to normal polling.
@@ -8022,6 +8029,8 @@ The operation SHALL accept a rollback depth as EITHER a commit count (roll back 
 
 The operation SHALL ride the normal push + PR flow rather than force-pushing the base branch directly: it prepares the rolled-back state on the agent branch AND goes through the SAME push + PR-creation path as any change, honoring the per-repo `auto_submit_pr` setting — a pull request the operator reviews AND merges when `auto_submit_pr` is enabled (the default), OR a pushed agent branch with no PR (the `BranchPushedNoPr` outcome) when an installation has set it false. The operation SHALL NOT special-case a force-push to the base branch; it produces reviewable commits through the established flow, AND git history remains the backstop.
 
+Because it mutates the workspace tree AND branch, the operation SHALL conform to the workspace-mutating control-socket invariant (see "Workspace-mutating control-socket operations preempt and serialize against the pass"): before any workspace mutation it SHALL preempt an in-flight pass on the same repository (terminating the executor subprocess so it stops spending tokens AND opens no PR), acquire the per-repo busy marker, AND hold it across the whole rollback (clean-base preamble, agent-branch recreation, tree preparation, push, PR), releasing it on completion (success OR failure). This is what stops the daemon's unsandboxed rollback git from colliding with a concurrently-running agentic session that has the same workspace bind-mounted writable. The dry-run/preview path resolves the plan READ-ONLY — it fetches `origin/<base>` AND computes the rollback range against that ref, performing NO checkout, reset, or other working-tree mutation — AND therefore does NOT preempt OR lock (it changes nothing, so it cannot race a concurrent pass).
+
 Within the rolled-back range, the operation SHALL:
 
 - Restore the CODE (every path outside `openspec/` AND outside the issues lane) to its state at the rollback target — the untrusted implementation is discarded.
@@ -8051,12 +8060,20 @@ The operation SHALL be fail-loud AND reviewable: the PR body SHALL enumerate the
 #### Scenario: Confirmation is required and a dry run changes nothing
 - **WHEN** the operation is invoked without confirmation (OR in dry-run/preview mode)
 - **THEN** it reports the commits it WOULD roll back AND the changes/issues it WOULD unarchive
-- **AND** it does NOT modify any branch, workspace, archive, or canon until the operator confirms
+- **AND** it resolves the plan against `origin/<base>` READ-ONLY (a fetch plus a range computation) — it does NOT checkout, reset, or otherwise modify any branch, workspace, archive, or canon until the operator confirms
+- **AND** because it performs no mutation, the dry-run path does NOT preempt an in-flight pass AND does NOT acquire the busy marker — it cannot disrupt a concurrent pass
 
 #### Scenario: Code-only range is a plain rollback through the normal flow
 - **WHEN** the rolled-back range archived NO changes AND NO issues (code-only commits)
 - **THEN** the rolled-back state restores the code to the target with no unarchive step AND rides the normal push + PR flow (a PR when `auto_submit_pr` is enabled)
 - **AND** the PR body (or push notification) says the rollback was code-only
+
+#### Scenario: Confirmed rollback preempts an in-flight pass before mutating the workspace
+- **WHEN** an operator confirms a rollback on a repository whose polling pass is mid-flight on a change
+- **THEN** the rollback preempts the in-flight pass — terminating the executor subprocess so it stops spending tokens AND opens no PR — before any workspace mutation
+- **AND** the rollback acquires the per-repo busy marker AND holds it across the clean-base preamble, agent-branch recreation, tree preparation, push, AND PR
+- **AND** the unsandboxed rollback git does not run concurrently with the agentic session, so the git index is not corrupted (`git add` does not fail to write the index)
+- **AND** the marker is released when the rollback completes, success OR failure
 
 ### Requirement: On-demand code review of a PR, commit, or target
 The orchestrator SHALL let an operator request a code review on demand — outside the normal per-pass flow — from one management surface, available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> review <repo-substring> <target>`), resolving the repository by the same selector rule the other operator commands use. The review SHALL run the existing agentic reviewer (its sandbox, `submit_review`, AND reads-on-demand behavior unchanged) AND report the resulting verdict + concerns back to the operator: as a reply in the originating chat channel, AND — when the target is a PR — optionally as a comment on that PR.
@@ -8347,4 +8364,109 @@ The committed `OCTOPUS.md` SHALL state the in-repo workflow protocols per the `p
 #### Scenario: Provisioning does not write the managed-repo guide
 - **WHEN** `autocoder install` runs to provision a host
 - **THEN** it does NOT write `OCTOPUS.md` into any managed repository's working tree (the guide is provisioned through the daemon's push + pull-request flow, not by host provisioning)
+
+### Requirement: Workspace-mutating control-socket operations preempt and serialize against the pass
+A control-socket operation that mutates a repository's workspace tree OR branch (an "out-of-band workspace op") SHALL NOT run concurrently with that repository's polling pass, AND SHALL preempt an in-flight pass rather than wait for it. The operation SHALL hold the per-repo busy marker for its entire duration so no new pass can start while it runs.
+
+The ordering SHALL be: (1) preempt the in-flight pass — signal it to stop so it stops spending tokens AND never opens a pull request; (2) wait, bounded, for the per-repo busy marker to be released; (3) acquire the busy marker; (4) perform the operation; (5) release the marker (on success OR failure). When no pass is in flight, the operation SHALL skip the preempt step, acquire the marker, AND proceed.
+
+The preempt SHALL stop the in-flight executor subprocess (not merely ask the pass body to drain at its next await point): the operation SHALL terminate the running executor child via the busy-marker subprocess sidecar (read the sidecar PID, send `SIGTERM` to its process group), the same mechanism the `--immediate` spec-rebuild coordination uses. A preempted executor is classified ABORTED, not failed, AND produces no PR. The operation's own clean-base preamble (`checkout <base_branch>` + `reset --hard origin/<base_branch>` + recreate the agent branch) cleans up whatever the cancelled session left behind, so a dirty post-preempt workspace is acceptable AND requires no extra cleanup step.
+
+The preempt-and-acquire SHALL be best-effort-but-bounded: the wait for the marker to release SHALL be capped by `executor.wipe_drain_timeout_secs` (the SAME single configurable preempt/drain timeout the wipe-workspace drain uses — no new per-operation knob). If the busy marker is ambiguous (its holding PID is alive but PID-reuse is suspected, the busy marker's `SkipAmbiguous` classification), the operation SHALL surface a clear error to the operator rather than barging in — it SHALL NOT delete or overwrite an ambiguous marker. A marker whose holding PID is dead, OR a marker that releases within the bound, SHALL be acquired normally.
+
+A read-only OR non-workspace control-socket operation SHALL NOT preempt a pass AND SHALL NOT acquire the busy marker: `status` (a read-only marker peek), `list`, AND marker-clear of a gitignored state-file marker never touch the git tree AND never collide with the executor child's workspace writes, so they run without coordination.
+
+The currently-running operations that mutate the workspace tree/branch SHALL conform to this invariant; the code-rollback recovery operation conforms (see "Code-rollback recovery rolls back code while unarchiving its specs and issues"). Any future control-socket operation that mutates the workspace tree or branch inherits this invariant.
+
+#### Scenario: Rollback confirmed mid-pass preempts the in-flight pass before mutating the workspace
+- **WHEN** an operator confirms a workspace-mutating operation on a repository whose polling pass is mid-flight (busy marker held, holding PID alive)
+- **THEN** the operation signals the in-flight pass AND terminates the running executor subprocess via the subprocess sidecar's process group, so the executor stops spending tokens AND opens no PR
+- **AND** the operation then waits, bounded by `executor.wipe_drain_timeout_secs`, for the busy marker to be released, acquires it, AND only then begins mutating the workspace
+- **AND** the in-flight executor's death is classified ABORTED (not a failure) AND no pull request is opened for the cancelled work
+
+#### Scenario: No pass in flight skips the preempt and acquires directly
+- **WHEN** a workspace-mutating operation is invoked AND no busy marker is held for the repository
+- **THEN** the operation skips the preempt step, acquires the busy marker, AND performs the operation
+- **AND** no preempt acknowledgement is emitted
+
+#### Scenario: The marker is held for the whole operation so no new pass can start
+- **WHEN** a workspace-mutating operation is in progress (marker acquired, mid-mutation)
+- **THEN** any concurrent attempt by a polling pass to acquire the same repository's busy marker observes it as held (skip-fresh-in-progress) AND does not start
+- **AND** the marker is released only after the operation completes (success OR failure)
+
+#### Scenario: Ambiguous held marker surfaces an error instead of barging in
+- **WHEN** a workspace-mutating operation attempts to acquire the busy marker AND the marker is classified ambiguous (holding PID alive, PID-reuse suspected)
+- **THEN** the operation does NOT delete or overwrite the marker AND does NOT mutate the workspace
+- **AND** it returns a clear error the operator sees, naming that the repository is busy with an unrecognized holder requiring investigation
+
+#### Scenario: Read-only and marker-clear operations do not preempt or lock
+- **WHEN** a read-only operation (`status`, `list`) OR a marker-clear of a gitignored state-file marker is invoked on a repository whose pass is mid-flight
+- **THEN** the operation runs without preempting the pass AND without acquiring the busy marker
+- **AND** the in-flight pass continues uninterrupted
+
+### Requirement: Defer and resume a change or issue without deleting or revising it
+The orchestrator SHALL provide a defer operation that sets a work unit aside — out of both work lanes — without deleting OR revising it, AND an inverse undefer operation that resumes it. The motivating case: a change that has gone perma-stuck (repeatedly kicked back) can be set aside intact instead of being forced through the loop OR rolled back; the work is preserved AND reactivated when ready. A defer SHALL preserve the unit's tracked content byte-for-byte AND SHALL NOT clear any marker it carries — it is neither a delete nor a revise. (A unit's GITIGNORED runtime markers — the `.perma-stuck.json` park marker, the `.in-progress` lock — are not committed, so they do not travel through the PR-borne move; a resumed unit therefore re-enters its lane WITHOUT its prior parked/locked state. That is the intended fresh re-attempt — defer sets work aside, it does not freeze a perma-stuck state.)
+
+A unit SHALL be EITHER a change OR an issue, auto-detected by where it lives — the operator names only a slug:
+
+- A CHANGE lives at `openspec/changes/<slug>/` (the changes lane's enumeration root).
+- An ISSUE lives at `issues/<slug>.md` (single-file form) OR `issues/<slug>/` (directory form) — the two on-disk forms the issues lane accepts.
+
+The defer operation SHALL MOVE the unit out of its lane into a committed location at the repository root that NEITHER lane enumerates:
+
+- A change: `openspec/changes/<slug>/` → `deferred-changes/<slug>/`.
+- An issue: `issues/<slug>.md` → `deferred-issues/<slug>.md`, OR `issues/<slug>/` → `deferred-issues/<slug>/` — the single-file-versus-directory form SHALL be preserved exactly.
+
+The undefer operation SHALL be the exact inverse move, returning the unit to its original lane location in its original form.
+
+The operation SHALL ride the established agent-branch + push + PR flow rather than committing to the base branch directly: it performs the move on the agent branch (recreated at the base tip) AND goes through the SAME push + PR-creation path as any change, honoring the per-repo `auto_submit_pr` setting — a pull request when it is enabled (the default), OR a pushed agent branch with no PR (the `BranchPushedNoPr` outcome) when an installation has set it false. The operation SHALL NOT commit to the base branch directly: a base commit diverges from `origin/<base>`, breaks the per-pass `git pull --ff-only`, is wiped by the dirty-workspace recovery (`git reset --hard origin/<base>` + `git clean -fd`), AND violates the prohibition on base-branch commits outside a PR. The PR body SHALL state what was deferred (or resumed) AND from/to which location.
+
+Like `Code-rollback recovery`, defer AND undefer are workspace-mutating control-socket operations: they SHALL conform to the **Workspace-mutating control-socket operations preempt and serialize against the pass** requirement — preempting any in-flight pass for the repository AND holding the per-repo busy marker for the duration of the move — so the move never races a concurrent agentic session writing the same workspace (the corruption that the unsandboxed daemon git and the workspace-writable agentic child would otherwise cause).
+
+Because defer discards no code AND is fully reversible, it SHALL require only a normal acknowledgement — NOT the two-step confirmation the destructive `Code-rollback recovery` operation requires. This is an explicit contrast: rollback discards code, so it confirms; defer preserves everything, so it does not.
+
+The operation SHALL be idempotent at its edges: deferring a slug already in the deferred area (AND absent from its lane) is a no-op success reporting it is already deferred; undeferring a slug already back in its lane (AND absent from the deferred area) is a no-op success reporting it is already active. A slug present in NEITHER lane is a clear not-found error; a slug naming BOTH a change AND an issue is a clear ambiguous error that names both candidates AND performs no move.
+
+#### Scenario: deferring a change moves it out of the lane via the PR flow
+- **WHEN** an operator defers a slug that is a change at `openspec/changes/<slug>/`
+- **THEN** the change directory is moved to `deferred-changes/<slug>/` on the agent branch (recreated at the base tip), preserving its contents AND any markers
+- **AND** the operation rides the normal push + PR flow (a PR when `auto_submit_pr` is enabled, the default; otherwise a pushed branch with no PR — the `BranchPushedNoPr` outcome), NOT a direct base-branch commit
+- **AND** the PR body states the change was deferred AND names the source/destination location
+
+#### Scenario: deferring an issue preserves its on-disk form
+- **WHEN** an operator defers a slug that is an issue
+- **THEN** a single-file issue moves `issues/<slug>.md` → `deferred-issues/<slug>.md`, AND a directory-form issue moves `issues/<slug>/` → `deferred-issues/<slug>/`
+- **AND** the form (single-file versus directory) is preserved exactly, including any sibling or in-directory markers
+
+#### Scenario: undefer returns the unit to its original lane location
+- **WHEN** an operator undefers a slug currently in the deferred area
+- **THEN** the unit is moved back to its original lane location in its original form (`deferred-changes/<slug>/` → `openspec/changes/<slug>/`, OR `deferred-issues/<slug>(.md|/)` → `issues/<slug>(.md|/)`) via the same agent-branch + push + PR flow
+- **AND** the unit re-enters its lane's selection on the next polling iteration (assuming no other marker excludes it)
+
+#### Scenario: a deferred unit is invisible to both lanes
+- **WHEN** a change is at `deferred-changes/<slug>/` OR an issue is at `deferred-issues/<slug>(.md|/)`
+- **THEN** the changes lane's enumeration (which reads only `openspec/changes/`) does NOT return the deferred change
+- **AND** the issues lane's enumeration (which reads only `issues/`) does NOT return the deferred issue
+- **AND** neither lane works the deferred unit — it is set aside until undeferred, with no lane-enumeration change required
+
+#### Scenario: defer preempts an in-flight pass and serializes against it
+- **WHEN** an operator defers (OR undefers) a unit while a pass is in flight for that repository
+- **THEN** the operation preempts the in-flight pass AND acquires the per-repo busy marker before moving the unit, per the preempt-and-serialize invariant
+- **AND** the move never runs concurrently with the agentic session, so two writers cannot corrupt the same workspace
+
+#### Scenario: defer requires only a normal acknowledgement, unlike rollback
+- **WHEN** an operator invokes defer (OR undefer)
+- **THEN** the operation acts on a single acknowledgement — there is no two-step confirmation, contrasting with `Code-rollback recovery`, which requires explicit confirmation because it discards code
+- **AND** because defer preserves the unit byte-for-byte AND is reversible by undefer, no code OR spec work is at risk
+
+#### Scenario: deferring an already-deferred unit is a no-op success
+- **WHEN** an operator defers a slug that is already in the deferred area (absent from its lane)
+- **THEN** the operation reports the unit is already deferred AND performs no move, no commit, AND no PR — a no-op success, not an error
+- **AND** it detects the already-deferred state READ-ONLY, BEFORE any preempt or lock — it does NOT preempt an in-flight pass NOR acquire the busy marker for a no-op
+
+#### Scenario: a not-found or ambiguous slug is a clear error
+- **WHEN** an operator defers a slug present in NEITHER lane
+- **THEN** the operation returns a clear not-found error AND performs no move
+- **WHEN** an operator defers a slug that names BOTH a change AND an issue in the same repo
+- **THEN** the operation returns a clear ambiguous error naming both candidate locations AND performs no move
 

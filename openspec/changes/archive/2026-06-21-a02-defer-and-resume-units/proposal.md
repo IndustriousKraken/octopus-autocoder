@@ -41,3 +41,10 @@ the destructive rollback command requires.
   helper that rides the pass's push + PR path (mirroring `octopus_guide.rs` and the
   rollback-recovery handler). No change to `queue.rs` or `lanes/issues.rs`
   enumeration — they already ignore non-lane directories.
+- Depends on `a01-workspace-ops-preempt-and-serialize` (implement first): defer and
+  undefer are workspace-mutating control-socket ops, so they use its
+  `preempt_and_acquire_busy_marker` helper and conform to its **Workspace-mutating
+  control-socket operations preempt and serialize against the pass** invariant —
+  preempting any in-flight pass and holding the per-repo busy marker for the move,
+  exactly as the rollback handler does. Without this the defer handler would race a
+  concurrent agentic session and corrupt the workspace (the bug a01 fixes).

@@ -91,10 +91,19 @@ impl RollbackPlan {
     }
 }
 
-/// Resolve a [`RollbackDepth`] against `base_branch` into a [`RollbackPlan`]:
+/// Resolve a [`RollbackDepth`] against `resolve_ref` into a [`RollbackPlan`]:
 /// compute the rolled-back commit range (`target..from`) AND the set of
 /// changes/issues archived within it. Reads git only — NEVER modifies a
 /// branch, the workspace, the archive, or canon.
+///
+/// `resolve_ref` is the committish the range is computed against — the tip
+/// is `rev_parse(resolve_ref)` AND the count form's target is
+/// `<resolve_ref>~N`. The live path passes the checked-out clean base
+/// branch (e.g. `main`); the dry-run path passes the remote-tracking ref
+/// (e.g. `origin/main`) so it can compute the range WITHOUT a checkout or
+/// reset. `base_branch` is the human branch NAME recorded in the plan (for
+/// the preview / PR body) — it is display-only and need not equal
+/// `resolve_ref`.
 ///
 /// The range→archived-units resolver maps `git diff --diff-filter=A
 /// <target>..<from>` over the two archive lanes to slugs: an archive move
@@ -107,18 +116,19 @@ impl RollbackPlan {
 pub fn resolve_plan(
     workspace: &Path,
     base_branch: &str,
+    resolve_ref: &str,
     depth: &RollbackDepth,
 ) -> Result<RollbackPlan> {
-    let from_sha = git::rev_parse(workspace, base_branch)
-        .with_context(|| format!("resolving base branch `{base_branch}`"))?;
+    let from_sha = git::rev_parse(workspace, resolve_ref)
+        .with_context(|| format!("resolving rollback ref `{resolve_ref}`"))?;
 
     let target_sha = match depth {
         RollbackDepth::Count(n) => {
             if *n == 0 {
                 return Err(anyhow!("rollback count must be at least 1"));
             }
-            // `base_branch~N` is the commit N back from the tip.
-            let target_rev = format!("{base_branch}~{n}");
+            // `<resolve_ref>~N` is the commit N back from the tip.
+            let target_rev = format!("{resolve_ref}~{n}");
             git::rev_parse(workspace, &target_rev).with_context(|| {
                 format!(
                     "resolving rollback target `{target_rev}` (count {n} exceeds the branch's \
@@ -644,7 +654,7 @@ mod tests {
         ship_issue(&ws, "fix-thing", "src/c.rs");
 
         // Count form: roll back the last 3 commits.
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(3)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(3)).unwrap();
         assert_eq!(plan.target_sha, target);
         let change_slugs: Vec<&str> = plan.changes.iter().map(|u| u.slug.as_str()).collect();
         assert_eq!(change_slugs, vec!["feature-a", "feature-b"]);
@@ -667,7 +677,7 @@ mod tests {
 
         // Roll back only the last commit (feature-b). feature-a is now
         // BEFORE the range.
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
         assert_eq!(plan.target_sha, target_after_a);
         let change_slugs: Vec<&str> = plan.changes.iter().map(|u| u.slug.as_str()).collect();
         assert_eq!(change_slugs, vec!["feature-b"]);
@@ -683,8 +693,8 @@ mod tests {
         ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
         ship_issue(&ws, "fix-thing", "src/c.rs");
 
-        let by_count = resolve_plan(&ws, "main", &RollbackDepth::Count(2)).unwrap();
-        let by_sha = resolve_plan(&ws, "main", &RollbackDepth::Sha(target.clone())).unwrap();
+        let by_count = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(2)).unwrap();
+        let by_sha = resolve_plan(&ws, "main", "main", &RollbackDepth::Sha(target.clone())).unwrap();
         assert_eq!(by_count.target_sha, by_sha.target_sha);
         assert_eq!(by_count.changes, by_sha.changes);
         assert_eq!(by_count.issues, by_sha.issues);
@@ -703,7 +713,7 @@ mod tests {
         ship_change(&ws, "feature-b", "src/b.rs", "MODIFIED b");
         ship_issue(&ws, "fix-thing", "src/c.rs");
 
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(3)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(3)).unwrap();
         // Move onto a fresh agent branch at the base tip (daemon's job).
         run(&ws, &["checkout", "-q", "-B", "agent-q"]);
         prepare_rolled_back_tree(&ws, &plan).unwrap();
@@ -777,7 +787,7 @@ mod tests {
         ship_single_file_issue(&ws, "fix-typo", "src/typo.rs");
 
         // The resolver maps the dated `.md` archive entry to a file unit.
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
         assert_eq!(plan.issues.len(), 1);
         let unit = &plan.issues[0];
         assert_eq!(unit.slug, "fix-typo");
@@ -808,7 +818,7 @@ mod tests {
         // Regression: the directory form still unarchives to `issues/<slug>/`.
         let (_dir, ws) = fixture();
         ship_issue(&ws, "fix-dir", "src/d.rs");
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
         assert_eq!(plan.issues.len(), 1);
         assert!(!plan.issues[0].is_file, "directory archive entry is not a file");
         run(&ws, &["checkout", "-q", "-B", "agent-q"]);
@@ -831,7 +841,7 @@ mod tests {
         run(&ws, &["add", "-A"]);
         run(&ws, &["commit", "-q", "-m", "code only 2"]);
 
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(2)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(2)).unwrap();
         assert!(plan.is_code_only(), "no archived units in a code-only range");
         assert_eq!(plan.target_sha, target);
 
@@ -854,7 +864,7 @@ mod tests {
     fn collision_with_active_dir_is_reported_not_overwritten() {
         let (_dir, ws) = fixture();
         ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(1)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(1)).unwrap();
 
         // Plant an active dir of the same slug — the unarchive would collide.
         std::fs::create_dir_all(ws.join("openspec/changes/feature-a")).unwrap();
@@ -900,7 +910,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let plan = resolve_plan(&ws, "main", &RollbackDepth::Count(2)).unwrap();
+        let plan = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(2)).unwrap();
         let preview = format_preview(&ws, &plan);
         // The preview enumerates BOTH the commits AND the units.
         assert!(preview.contains("feature-a"), "names the change: {preview}");
@@ -927,7 +937,7 @@ mod tests {
     fn count_zero_errors() {
         let (_dir, ws) = fixture();
         ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
-        let err = resolve_plan(&ws, "main", &RollbackDepth::Count(0)).expect_err("zero errors");
+        let err = resolve_plan(&ws, "main", "main", &RollbackDepth::Count(0)).expect_err("zero errors");
         assert!(format!("{err:#}").contains("at least 1"));
     }
 
@@ -936,7 +946,7 @@ mod tests {
         let (_dir, ws) = fixture();
         ship_change(&ws, "feature-a", "src/a.rs", "MODIFIED a");
         let tip = head(&ws);
-        let err = resolve_plan(&ws, "main", &RollbackDepth::Sha(tip))
+        let err = resolve_plan(&ws, "main", "main", &RollbackDepth::Sha(tip))
             .expect_err("rolling back to the tip is a no-op error");
         assert!(format!("{err:#}").contains("nothing to roll back"));
     }

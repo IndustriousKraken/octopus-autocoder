@@ -5,7 +5,9 @@ The chatops listener SHALL recognize two operator verbs that set a work unit asi
 
 Both verbs SHALL be dispatched as actions through the existing Unix-domain control socket and replied to in the same channel where the command arrived. Because defer is reversible AND discards no code, both verbs SHALL reply with a SINGLE acknowledgement — there SHALL be no two-step confirmation AND no `defer-confirm` verb. This is the deliberate contrast with the destructive operator commands (`wipe-workspace`, `rollback`), which require a channel-keyed two-step confirm.
 
-The reply SHALL be one line: a `✓` acknowledgement on a performed move OR a no-op success (already-deferred for `defer`, already-active for `undefer`), naming the slug AND the repo; OR a `✗` clear error on a failure (no such unit, ambiguous slug). The verbs SHALL appear in the `@<bot> help` verb list with a one-line description each.
+The operation RESULT reply SHALL be one line: a `✓` acknowledgement on a performed move OR a no-op success (already-deferred for `defer`, already-active for `undefer`), naming the slug AND the repo; OR a `✗` clear error on a failure (no such unit, ambiguous slug). The verbs SHALL appear in the `@<bot> help` verb list with a one-line description each.
+
+SEPARATELY from that result reply: because `defer` AND `undefer` are workspace-mutating operator commands that preempt an in-flight pass, when a preempt actually occurs they SHALL emit the operator-facing preempt acknowledgement mandated by the **Preempting in-flight work is acknowledged to the operator** requirement — naming the operation AND the cancelled change — before or alongside the result reply. When no pass was in flight (no preempt occurred), no preempt acknowledgement is posted.
 
 #### Scenario: defer resolves the repo and acknowledges in one step
 - **WHEN** an operator posts `@<bot> defer your-repo a06-foo` AND `your-repo` resolves to exactly one configured repository AND `a06-foo` is a unit present in that repo's active lane
@@ -36,6 +38,13 @@ The reply SHALL be one line: a `✓` acknowledgement on a performed move OR a no
 #### Scenario: deferring an already-deferred unit is a no-op success
 - **WHEN** an operator defers a slug that is already set aside (absent from its lane, present in the deferred area)
 - **THEN** the bot reports the unit is already deferred — a `✓` no-op success, NOT an error AND NOT a second move
+- **AND** because it is a read-only no-op, it does NOT preempt an in-flight pass NOR acquire the busy marker (so a typo'd re-defer does not disrupt active work)
+
+#### Scenario: a preempt is acknowledged to the operator
+- **WHEN** a `defer` (OR `undefer`) preempts an in-flight pass on the repo to perform its move
+- **THEN** the bot emits the preempt acknowledgement naming the operation AND the cancelled change (per the **Preempting in-flight work is acknowledged to the operator** requirement), before or alongside the one-line result reply
+- **WHEN** no pass was in flight (no preempt occurred)
+- **THEN** only the result reply is posted, with no preempt acknowledgement
 
 #### Scenario: undefer of a unit not set aside is a clear error
 - **WHEN** an operator posts `@<bot> undefer your-repo a06-foo` AND no deferred unit by that slug exists
