@@ -8692,6 +8692,14 @@ github:
         let cancel = CancellationToken::new();
         let (state, repo) = defer_state(&td, &workspace, &origin, true, cancel.clone());
 
+        // Serialize on the github-api-base test hook: with `auto_submit_pr` true
+        // the defer handler reaches `open_triage_pull_request`, which reads the
+        // process-wide override. Without this guard a concurrent test that has
+        // installed the override (e.g. the confirmed-rollback e2e test, same
+        // `owner/repo` path) would receive this test's PR-create POST on its own
+        // mockito server, tripping that test's `expect(0)`. See `test_hooks::lock`.
+        let _hook = crate::polling_loop::test_hooks::lock();
+
         let req = json!({"action": "defer_unit", "url": repo.url, "slug": "c01-foo"});
         let resp = handle_defer_unit(&req, &state).await;
         // The move + push succeed; the PR open fails (no GitHub). The error
