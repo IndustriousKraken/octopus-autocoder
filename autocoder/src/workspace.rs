@@ -180,6 +180,22 @@ pub fn ensure_initialized(
             "could not register .perma-stuck.json in .git/info/exclude: {e:#}"
         );
     }
+    // A single-file issue's park/lock markers are SIBLING files
+    // (`issues/<slug>.perma-stuck.json`, `issues/<slug>.in-progress`), not
+    // in-directory `.perma-stuck.json` / `.in-progress`. A bare-basename
+    // exclude matches git's pattern rules only when the WHOLE basename
+    // equals it, so the sibling forms need SUFFIX patterns. These match
+    // BOTH the in-directory and sibling forms at any depth, so a sibling
+    // marker is gitignored — it does not trip the pre-pass dirty check AND
+    // survives `git clean -fd` + the per-iteration branch reset.
+    for suffix_pattern in ["*.perma-stuck.json", "*.in-progress"] {
+        if let Err(e) = ensure_git_info_excluded(workspace, suffix_pattern) {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                "could not register {suffix_pattern} in .git/info/exclude: {e:#}"
+            );
+        }
+    }
     // Per-change spec-revision markers live at
     // `openspec/changes/<change>/.needs-spec-revision.json`. They are
     // operator-managed (deletion is the "retry this change" signal) and
@@ -543,6 +559,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }
@@ -560,6 +577,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }
@@ -676,6 +694,71 @@ mod tests {
         ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
         assert!(workspace.join(".git").is_dir());
         assert!(workspace.join("README.md").is_file());
+    }
+
+    #[test]
+    fn ensure_initialized_excludes_single_file_issue_sibling_markers() {
+        // single-file-issues §4.4: a single-file issue's SIBLING markers
+        // (`issues/<slug>.perma-stuck.json`, `issues/<slug>.in-progress`)
+        // must be gitignored by the registered suffix patterns — a
+        // bare-basename exclude would not match them — so they neither trip
+        // the pre-pass dirty check NOR are wiped by `git clean`.
+        let (_temp_paths, _paths_test) = test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
+
+        // The suffix patterns are registered at init.
+        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        for pat in ["*.perma-stuck.json", "*.in-progress"] {
+            assert!(
+                exclude.lines().any(|l| l.trim() == pat),
+                "`{pat}` must be registered at init; exclude file:\n{exclude}"
+            );
+        }
+
+        // A single-file issue's sibling markers do not appear in the dirty
+        // check (they are gitignored).
+        let issues = workspace.join("issues");
+        std::fs::create_dir_all(&issues).unwrap();
+        std::fs::write(issues.join("fix-parser.md"), "## Report\nbug\n").unwrap();
+        std::fs::write(issues.join("fix-parser.perma-stuck.json"), "{}").unwrap();
+        std::fs::write(issues.join("fix-parser.in-progress"), "").unwrap();
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !status.contains("perma-stuck.json") && !status.contains("in-progress"),
+            "single-file sibling markers must be gitignored: {status:?}"
+        );
+
+        // The markers are gitignored specifically (not just collapsed under
+        // an untracked dir): `git status --ignored` lists them, and the body
+        // file is NOT ignored.
+        let ignored = Command::new("git")
+            .args(["status", "--porcelain", "--ignored", "issues/"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let ignored = String::from_utf8_lossy(&ignored.stdout);
+        assert!(
+            ignored.contains("!! issues/fix-parser.perma-stuck.json"),
+            "the sibling perma-stuck marker must be gitignored: {ignored:?}"
+        );
+        assert!(
+            ignored.contains("!! issues/fix-parser.in-progress"),
+            "the sibling in-progress marker must be gitignored: {ignored:?}"
+        );
+        assert!(
+            !ignored.contains("!! issues/fix-parser.md"),
+            "the issue body file must NOT be gitignored: {ignored:?}"
+        );
     }
 
     #[test]
@@ -1347,6 +1430,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }

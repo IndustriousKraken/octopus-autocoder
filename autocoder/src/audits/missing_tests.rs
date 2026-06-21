@@ -223,6 +223,7 @@ mod tests {
             implementer_cli: None,
             command: command.to_string(),
             timeout_secs: 30,
+            agentic_session_timeout_secs: crate::config::default_agentic_session_timeout(),
             sandbox: None,
             agent_env: None,
             implementer_prompt_path: None,
@@ -275,6 +276,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }

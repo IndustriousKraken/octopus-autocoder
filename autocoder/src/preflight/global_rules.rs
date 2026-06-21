@@ -36,6 +36,7 @@ use serde::Deserialize;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The MCP role AND submission routing key the global-rules check uses. The
 /// per-execution MCP child advertises `submit_rule_violations` ONLY when
@@ -254,6 +255,10 @@ pub struct GlobalRulesCheckCtx {
     /// Bounded retry of the agentic session on a no-submission outcome
     /// (`executor.verifier_gate_retries`).
     pub retries: u32,
+    /// Wall-clock cap for one agentic session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the other gates,
+    /// the reviewer, AND the revision sessions). Set once at daemon startup.
+    pub timeout: Duration,
     /// The resolved local directory holding the global rule corpus (a path, or a
     /// clone of the configured git repo). Read at prompt-build time.
     pub corpus_dir: PathBuf,
@@ -406,7 +411,7 @@ pub async fn run_agentic_global_rules_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: crate::preflight::corpus_check::CORPUS_CHECK_TIMEOUT,
+        timeout: ctx.timeout,
         subject_noun: "global-rules-check",
     };
     run_agentic_global_rules_check_with_runner(ctx, workspace_root, change_slug, &runner).await
@@ -559,9 +564,32 @@ mod tests {
             prompt_template: "TEST_PROMPT".into(),
             attribution: None,
             retries: 0,
+            timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             corpus_dir,
             test_submission: None,
         }
+    }
+
+    /// unified-agentic-session-timeout task 4.2 ([rules] gate): the gate ctx
+    /// carries the value resolved from `executor.agentic_session_timeout_secs`,
+    /// which its CLI corpus-check session runner feeds to the wrapped CLI.
+    #[test]
+    fn rules_gate_ctx_carries_resolved_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 4500\n")
+                .expect("executor parses");
+        let ctx = GlobalRulesCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "T".into(),
+            attribution: None,
+            retries: 0,
+            timeout: exec.agentic_session_timeout(),
+            corpus_dir: PathBuf::from("/tmp/does-not-matter"),
+            test_submission: None,
+        };
+        assert_eq!(ctx.timeout, exec.agentic_session_timeout());
+        assert_eq!(ctx.timeout, Duration::from_secs(4500));
     }
 
     // ---- payload_to_rule_violations ----

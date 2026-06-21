@@ -46,10 +46,6 @@ const RESPONSE_EXCERPT_MAX: usize = 200;
 /// `submit_*` MCP tool.
 pub const CORPUS_CHECK_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
-/// Wall-clock cap for one corpus-check session. Mirrors the `[in]` gate's bound
-/// (a59): the wrapped CLI subprocess is the thing being bounded.
-pub const CORPUS_CHECK_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// The read-only file tools PLUS the qualified `submit_*` MCP tool for `role`.
 /// Notably absent: `Bash`, `Write`, `Edit`. The common `query_canonical_specs`
 /// tool is added separately by the agentic-run layer. Exposed so gate modules

@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are auditing alignment between OpenSpec canonical specs and code in
 this repository, AND internal consistency BETWEEN canonical specs. Your
 job is to identify two kinds of divergence: (a) places where the

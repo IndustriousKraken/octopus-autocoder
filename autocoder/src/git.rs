@@ -663,6 +663,181 @@ pub fn log_subjects(workspace: &Path, range: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// One line of a recent-commit log listing (code-rollback-recovery's
+/// read-only `log` command). `short_sha` is the abbreviated hash, `subject`
+/// the commit subject line, AND `date` the committer date in short ISO
+/// form (`YYYY-MM-DD`). Newest-first ordering is the responsibility of
+/// [`recent_commits`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLogEntry {
+    pub short_sha: String,
+    pub subject: String,
+    pub date: String,
+}
+
+/// List the most recent `count` commits reachable from `rev` (typically the
+/// base branch), newest first. Each entry carries the short SHA, the
+/// subject, AND the committer date (`%cs`, short ISO `YYYY-MM-DD`). Pure
+/// read: this NEVER modifies a branch, the workspace, or any marker. Used
+/// by the code-rollback `log` command so an operator choosing a rollback
+/// depth can see the history.
+///
+/// The git format is `%h%x09%cs%x09%s` (short-sha, committer-date, subject).
+/// The first two fields are tab-free, so a subject containing a tab is
+/// preserved by splitting on the first two tabs only. `git log` already
+/// emits newest-first; the `-<count>` cap bounds the page.
+pub fn recent_commits(workspace: &Path, rev: &str, count: usize) -> Result<Vec<CommitLogEntry>> {
+    let count_arg = format!("-{count}");
+    let output = run_git(
+        workspace,
+        "log -n <count>",
+        &[
+            "log",
+            &count_arg,
+            "--no-color",
+            "--pretty=format:%h%x09%cs%x09%s",
+            rev,
+            "--",
+        ],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let short_sha = parts.next().unwrap_or("").to_string();
+        let date = parts.next().unwrap_or("").to_string();
+        let subject = parts.next().unwrap_or("").to_string();
+        if short_sha.is_empty() {
+            continue;
+        }
+        out.push(CommitLogEntry {
+            short_sha,
+            subject,
+            date,
+        });
+    }
+    Ok(out)
+}
+
+/// Return the workspace-relative paths ADDED (status `A`) within the commit
+/// range `from..to`, restricted to those under `pathspec`. Equivalent to
+/// `git diff --name-only --diff-filter=A <from>..<to> -- <pathspec>`. Used
+/// by the code-rollback range→archived-units resolver to find the
+/// `openspec/changes/archive/<dated-slug>/...` AND `issues/archive/<dated-slug>/...`
+/// entries that were INTRODUCED in the rolled-back range (an archive move is
+/// an add of the new dated path). Empty lines are filtered; each entry is a
+/// workspace-relative path.
+pub fn added_paths_in_range(
+    workspace: &Path,
+    from: &str,
+    to: &str,
+    pathspec: &str,
+) -> Result<Vec<String>> {
+    let range = format!("{from}..{to}");
+    let output = run_git(
+        workspace,
+        "diff --name-only --diff-filter=A",
+        &[
+            "diff",
+            "--name-only",
+            "--diff-filter=A",
+            &range,
+            "--",
+            pathspec,
+        ],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Restore the working-tree + index state of `pathspec` to its content at
+/// `target` WITHOUT moving HEAD. Equivalent to `git checkout <target> --
+/// <pathspec>` (which stages the restored paths) followed by removing any
+/// path that exists at HEAD-after-`target` but NOT at `target`. The
+/// trailing `git clean` is NOT used here — `git checkout <tree> -- <path>`
+/// does not delete files that were ADDED after `target`, so the caller is
+/// responsible for deletions when restoring a whole subtree. For the
+/// code-rollback use the caller restores the entire repo minus the spec /
+/// issue lanes, then explicitly removes lane-external paths added since the
+/// target via [`remove_paths_added_in_range`].
+pub fn restore_pathspec_to_target(
+    workspace: &Path,
+    target: &str,
+    pathspec: &str,
+) -> Result<()> {
+    run_git(
+        workspace,
+        "checkout <target> -- <pathspec>",
+        &["checkout", target, "--", pathspec],
+    )?;
+    Ok(())
+}
+
+/// Restore every tracked path EXCEPT those matched by the `exclude`
+/// pathspecs to its content at `target`, WITHOUT moving HEAD. Equivalent to
+/// `git checkout <target> -- . <exclude...>` where each exclude is a
+/// negative pathspec (`:!openspec`). The restored paths are staged. Like
+/// [`restore_pathspec_to_target`], this does NOT delete paths added after
+/// `target`; the caller removes those explicitly.
+pub fn restore_pathspec_to_target_excluding(
+    workspace: &Path,
+    target: &str,
+    exclude: &[&str],
+) -> Result<()> {
+    let mut args: Vec<&str> = vec!["checkout", target, "--", "."];
+    args.extend_from_slice(exclude);
+    run_git(workspace, "checkout <target> -- . <exclude>", &args)?;
+    Ok(())
+}
+
+/// True when `path` exists in the tree at `rev` (tracked at that commit).
+/// Implemented via `git cat-file -e <rev>:<path>` for a single path, falling
+/// back to `git ls-tree` for a directory. Used by the code-rollback prepare
+/// step to decide whether a canon subtree existed at the target before
+/// restoring it.
+pub fn path_exists_at(workspace: &Path, rev: &str, path: &str) -> Result<bool> {
+    let spec = format!("{rev}:{path}");
+    let out = Command::new("git")
+        .args(["cat-file", "-e", &spec])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git cat-file -e {spec}`"))?;
+    Ok(out.status.success())
+}
+
+/// `git rm -r --cached --ignore-unmatch -- <path>` followed by a filesystem
+/// removal of `path` under `workspace`. Used by the code-rollback prepare
+/// step to delete a lane-external file/dir that was ADDED after the rollback
+/// target (so the restored tree matches the target exactly, even for
+/// newly-introduced paths that `git checkout <target> -- <path>` leaves
+/// behind). `path` is workspace-relative. Missing paths are a no-op.
+pub fn remove_path(workspace: &Path, path: &str) -> Result<()> {
+    let abs = workspace.join(path);
+    // Drop it from the index (ignore-unmatch so an untracked/already-removed
+    // path is not an error) AND from disk.
+    run_git(
+        workspace,
+        "rm --cached",
+        &["rm", "-r", "--cached", "--ignore-unmatch", "--", path],
+    )?;
+    if abs.is_dir() {
+        std::fs::remove_dir_all(&abs)
+            .with_context(|| format!("removing directory {}", abs.display()))?;
+    } else if abs.exists() {
+        std::fs::remove_file(&abs)
+            .with_context(|| format!("removing file {}", abs.display()))?;
+    }
+    Ok(())
+}
+
 /// Return the three-dot diff between `base` and `head` — i.e. the changes
 /// present on `head` since it diverged from `base`. Equivalent to
 /// `git diff <base>...<head>`.
@@ -867,6 +1042,25 @@ pub fn files_for_commits(workspace: &Path, shas: &[String]) -> Result<Vec<String
     Ok(out)
 }
 
+/// Fetch a forge pull-request's head into a local ref so it can be diffed
+/// from the clone (a59 on-demand `pr <N>` review). GitHub/Gitea expose a
+/// PR's head commit at `refs/pull/<N>/head`; this fetches that ref from
+/// `remote` into the local ref `refs/autocoder/pr/<N>` and returns that
+/// local ref name for the caller to pass to [`diff_three_dot`] /
+/// [`diff_files_changed`]. The fetch is best-effort network I/O — a failure
+/// (no such PR, no network, a forge whose PR refs differ) propagates as an
+/// `Err` the caller surfaces to the operator.
+pub fn fetch_pull_request_head(workspace: &Path, remote: &str, number: u64) -> Result<String> {
+    let local_ref = format!("refs/autocoder/pr/{number}");
+    let refspec = format!("+refs/pull/{number}/head:{local_ref}");
+    run_git(
+        workspace,
+        "fetch <remote> <pr-refspec>",
+        &["fetch", remote, &refspec],
+    )?;
+    Ok(local_ref)
+}
+
 /// Return the name-only file list for the three-dot diff between `base`
 /// and `head`. Equivalent to `git diff --name-only <base>...<head>`.
 /// Empty lines are filtered. Each entry is a workspace-relative path.
@@ -884,6 +1078,308 @@ pub fn diff_files_changed(workspace: &Path, base: &str, head: &str) -> Result<Ve
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect())
+}
+
+/// One blamed line of a file at a ref: the 1-based `line_no` in the
+/// blamed revision, the full 40-char `sha` of the commit that LAST
+/// touched the line (`git blame` attribution — the LAST commit to touch
+/// it, which is the verbatim-survival semantic), the commit `subject`
+/// (`summary`), AND the author date in short ISO form (`YYYY-MM-DD`).
+/// Used by survival analysis (does this line still attribute to the
+/// target?) AND provenance lookup (which commit introduced this line?).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameLine {
+    pub line_no: usize,
+    pub sha: String,
+    pub subject: String,
+    pub date: String,
+}
+
+/// Run `git blame --line-porcelain` for a file at `rev`, returning one
+/// [`BlameLine`] per line in ascending `line_no` order. When `range` is
+/// `Some((start, end))`, restrict to that 1-based inclusive line range
+/// via `-L <start>,<end>`; when `None`, blame the whole file. When
+/// `detect_moves` is true, pass `-M -C` so a line relocated within or
+/// copied from another file is attributed to its original commit — a
+/// heuristic that recovers some relocated lines but does NOT change the
+/// verbatim-vs-semantic boundary (a reformatted line still attributes to
+/// the reformatting commit).
+///
+/// `--line-porcelain` repeats the full commit header before every line,
+/// so each line's record is self-contained: the header line is
+/// `<40-hex-sha> <orig-lineno> <final-lineno>[ <num-lines>]`, followed by
+/// `summary <subject>` AND `author-time <unix>` / `author-tz <tz>` among
+/// other fields, then a single content line prefixed with a TAB. The
+/// final-lineno from the header is the authoritative 1-based line number
+/// in the blamed revision.
+pub fn blame_lines(
+    workspace: &Path,
+    rev: &str,
+    path: &str,
+    range: Option<(usize, usize)>,
+    detect_moves: bool,
+) -> Result<Vec<BlameLine>> {
+    let mut args: Vec<String> = vec!["blame".into(), "--line-porcelain".into()];
+    if detect_moves {
+        args.push("-M".into());
+        args.push("-C".into());
+    }
+    if let Some((start, end)) = range {
+        args.push("-L".into());
+        args.push(format!("{start},{end}"));
+    }
+    args.push(rev.to_string());
+    args.push("--".into());
+    args.push(path.to_string());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_git(workspace, "blame --line-porcelain", &arg_refs)?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_blame_porcelain(&raw))
+}
+
+/// Pure parser for `git blame --line-porcelain` stdout. Exposed for
+/// unit-testing without a real git invocation. Each blamed line begins
+/// with a header `<sha> <orig> <final>[ <count>]`; subsequent header
+/// fields (`summary`, `author-time`, `author-tz`) populate the record
+/// until the TAB-prefixed content line closes it. Author time is rendered
+/// to a short ISO `YYYY-MM-DD` date in the author's own timezone offset.
+pub(crate) fn parse_blame_porcelain(raw: &str) -> Vec<BlameLine> {
+    let mut out: Vec<BlameLine> = Vec::new();
+    let mut cur_sha: Option<String> = None;
+    let mut cur_final: usize = 0;
+    let mut cur_subject = String::new();
+    let mut cur_time: Option<i64> = None;
+    let mut cur_tz: Option<String> = None;
+    for line in raw.lines() {
+        if line.starts_with('\t') {
+            // Content line closes the current record.
+            if let Some(sha) = cur_sha.take() {
+                let date = format_blame_date(cur_time, cur_tz.as_deref());
+                out.push(BlameLine {
+                    line_no: cur_final,
+                    sha,
+                    subject: std::mem::take(&mut cur_subject),
+                    date,
+                });
+            }
+            cur_time = None;
+            cur_tz = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("summary ") {
+            cur_subject = rest.to_string();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("author-time ") {
+            cur_time = rest.trim().parse::<i64>().ok();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("author-tz ") {
+            cur_tz = Some(rest.trim().to_string());
+            continue;
+        }
+        // A header line: `<sha> <orig> <final>[ <count>]`. The sha is 40
+        // lowercase hex chars; distinguish it from porcelain key/value
+        // lines (which all carry a textual key) by validating the shape.
+        let mut parts = line.split(' ');
+        let sha_tok = parts.next().unwrap_or("");
+        let is_sha = sha_tok.len() == 40 && sha_tok.chars().all(|c| c.is_ascii_hexdigit());
+        if is_sha {
+            // orig lineno, final lineno.
+            let _orig = parts.next();
+            let final_no = parts.next().and_then(|s| s.parse::<usize>().ok());
+            if let Some(fno) = final_no {
+                cur_sha = Some(sha_tok.to_string());
+                cur_final = fno;
+                // A repeated commit emits only the header + content (no
+                // summary/time block); carry no stale subject/date.
+                cur_subject = String::new();
+            }
+        }
+    }
+    out
+}
+
+/// Render a blame author time (unix seconds + `±HHMM` tz offset) to a
+/// short ISO `YYYY-MM-DD` date in the author's own offset. Falls back to
+/// an empty string when the time is missing or out of range, so a
+/// best-effort date never aborts the analysis.
+fn format_blame_date(time: Option<i64>, tz: Option<&str>) -> String {
+    let Some(secs) = time else { return String::new() };
+    let offset_secs = tz.and_then(parse_tz_offset_secs).unwrap_or(0);
+    let Some(utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) else {
+        return String::new();
+    };
+    match chrono::FixedOffset::east_opt(offset_secs) {
+        Some(off) => utc.with_timezone(&off).format("%Y-%m-%d").to_string(),
+        None => utc.format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// Parse a git `±HHMM` timezone token into an east-of-UTC offset in
+/// seconds. Returns `None` for a malformed token.
+fn parse_tz_offset_secs(tz: &str) -> Option<i32> {
+    let bytes = tz.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hh: i32 = tz.get(1..3)?.parse().ok()?;
+    let mm: i32 = tz.get(3..5)?.parse().ok()?;
+    Some(sign * (hh * 3600 + mm * 60))
+}
+
+/// Return the full 40-char SHAs reachable in the commit range `range`
+/// (e.g. `"main..refs/autocoder/pr/12"`), newest-first as `git rev-list`
+/// emits. Empty lines filtered. Used by survival analysis to expand a PR
+/// head ref into its commit-set. Read-only.
+pub fn rev_list_range(workspace: &Path, range: &str) -> Result<Vec<String>> {
+    let output = run_git(workspace, "rev-list", &["rev-list", range])?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Search the base branch for a commit whose subject names PR `number`
+/// via GitHub's squash/merge conventions — a squash-merge subject ends
+/// with `(#<number>)`, AND a merge commit's subject is
+/// `Merge pull request #<number> ...`. Returns the matching commit's full
+/// SHA when found (newest match first). This lets survival analysis pick
+/// up a PR whose individual commits were squashed away on merge: blame at
+/// HEAD attributes the surviving lines to the squash commit, not the PR's
+/// original commits. Read-only.
+pub fn base_commits_for_pr(workspace: &Path, base_branch: &str, number: u64) -> Result<Vec<String>> {
+    // `(#N)` squash convention OR `Merge pull request #N` merge convention.
+    let pattern = format!(r"(\(#{number}\)|Merge pull request #{number}([^0-9]|$))");
+    let output = run_git(
+        workspace,
+        "log --grep (pr)",
+        &[
+            "log",
+            "--pretty=format:%H",
+            "-E",
+            "--grep",
+            &pattern,
+            base_branch,
+        ],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Parse a PR number from a commit subject using GitHub's squash/merge
+/// conventions: a trailing `(#N)` (squash-merge) OR a leading
+/// `Merge pull request #N` (merge commit). Returns the FIRST match found,
+/// or `None` when the subject names no PR. Pure — exposed for provenance
+/// lookup, which associates a blamed commit with its PR WITHOUT a forge
+/// API call (so it never fabricates a PR). A subject with no marker yields
+/// `None` AND the commit is reported alone.
+pub(crate) fn pr_number_from_subject(subject: &str) -> Option<u64> {
+    // Merge-commit form: `Merge pull request #N from ...`.
+    if let Some(rest) = subject.strip_prefix("Merge pull request #") {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            return Some(n);
+        }
+    }
+    // Squash-merge form: subject ends with `(#N)`. Scan for the LAST
+    // `(#` occurrence so a subject mentioning an issue mid-text doesn't
+    // shadow the trailing PR marker.
+    if let Some(open) = subject.rfind("(#") {
+        let after = &subject[open + 2..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let rest = &after[digits.len()..];
+        if !digits.is_empty() && rest.starts_with(')') {
+            if let Ok(n) = digits.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// True when at least one commit in `target..HEAD` touched `path` — i.e.
+/// a LATER commit modified the file after the target. Equivalent to
+/// asking whether `git log <target>..HEAD -- <path>` is non-empty. This
+/// is the cheap per-file pre-filter for survival analysis: when this is
+/// false, NO commit after the target touched the file, so every line the
+/// target wrote there is still present verbatim AND no line-level blame
+/// is needed. `target` is any rev (a commit SHA or a merge SHA); `path`
+/// is workspace-relative. Read-only.
+pub fn file_touched_since(workspace: &Path, target: &str, path: &str) -> Result<bool> {
+    let range = format!("{target}..HEAD");
+    let output = run_git(
+        workspace,
+        "log <target>..HEAD -- <path>",
+        &[
+            "log",
+            "--no-color",
+            "--pretty=format:%H",
+            &range,
+            "--",
+            path,
+        ],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(raw.lines().any(|l| !l.trim().is_empty()))
+}
+
+/// Return the deduplicated workspace-relative paths MODIFIED by the given
+/// commit SHAs WITH the `A` (added) or `M` (modified) status — i.e. the
+/// files into which the target wrote lines. Equivalent to the union of
+/// `git show --name-status --diff-filter=AM --pretty=format:` across the
+/// SHAs, preserving first-seen order. Deleted / pure-rename records are
+/// excluded (no surviving content of the target to attribute). Used by
+/// survival analysis to enumerate the files to test.
+pub fn files_modified_by_commits(workspace: &Path, shas: &[String]) -> Result<Vec<String>> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for sha in shas {
+        let output = run_git(
+            workspace,
+            "show --name-status --diff-filter=AM",
+            &[
+                "show",
+                "--name-status",
+                "--diff-filter=AM",
+                "--pretty=format:",
+                "-M",
+                sha,
+            ],
+        )?;
+        let raw = String::from_utf8_lossy(&output.stdout);
+        for line in raw.lines() {
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            // `<STATUS>\t<path>` (status is A or M here).
+            let mut cols = l.splitn(2, '\t');
+            let _status = cols.next();
+            let Some(path) = cols.next() else { continue };
+            let path = path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            if seen.insert(path.to_string()) {
+                out.push(path.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1795,6 +2291,72 @@ mod tests {
         );
     }
 
+    /// `recent_commits` lists newest-first AND modifies nothing
+    /// (code-rollback-recovery's read-only `log`).
+    #[test]
+    fn recent_commits_lists_newest_first_and_changes_nothing() {
+        let (_dir, path) = fixture_repo();
+        // Add two more commits so we have a 3-commit history.
+        std::fs::write(path.join("a.txt"), "a\n").unwrap();
+        run_init(&path, &["add", "a.txt"]);
+        run_init(&path, &["commit", "-q", "-m", "second"]);
+        std::fs::write(path.join("b.txt"), "b\n").unwrap();
+        run_init(&path, &["add", "b.txt"]);
+        run_init(&path, &["commit", "-q", "-m", "third"]);
+
+        let head_before = rev_parse(&path, "HEAD").unwrap();
+        let status_before = status_porcelain(&path).unwrap();
+
+        let entries = recent_commits(&path, "main", 10).unwrap();
+        assert_eq!(entries.len(), 3, "all three commits: {entries:?}");
+        // Newest first.
+        assert_eq!(entries[0].subject, "third");
+        assert_eq!(entries[1].subject, "second");
+        assert_eq!(entries[2].subject, "initial");
+        // Each carries a short sha AND a YYYY-MM-DD date.
+        for e in &entries {
+            assert!(!e.short_sha.is_empty(), "short sha present: {e:?}");
+            assert_eq!(e.date.len(), 10, "short ISO date YYYY-MM-DD: {e:?}");
+        }
+        // The count bound caps the page.
+        let capped = recent_commits(&path, "main", 2).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].subject, "third");
+
+        // Read-only: HEAD AND the working tree are unchanged.
+        assert_eq!(rev_parse(&path, "HEAD").unwrap(), head_before);
+        assert_eq!(status_porcelain(&path).unwrap(), status_before);
+    }
+
+    /// `added_paths_in_range` reports paths ADDED in `from..to` under a
+    /// pathspec (the code-rollback range→archived-units resolver building
+    /// block).
+    #[test]
+    fn added_paths_in_range_reports_only_added_under_pathspec() {
+        let (_dir, path) = fixture_repo();
+        let base = rev_parse(&path, "HEAD").unwrap();
+        // Add an archive entry AND an unrelated code file in one commit.
+        std::fs::create_dir_all(path.join("openspec/changes/archive/2026-05-01-feat")).unwrap();
+        std::fs::write(
+            path.join("openspec/changes/archive/2026-05-01-feat/proposal.md"),
+            "x\n",
+        )
+        .unwrap();
+        std::fs::write(path.join("src.rs"), "code\n").unwrap();
+        run_init(&path, &["add", "-A"]);
+        run_init(&path, &["commit", "-q", "-m", "ship feat"]);
+
+        let added = added_paths_in_range(&path, &base, "HEAD", "openspec/changes/archive").unwrap();
+        assert_eq!(
+            added,
+            vec!["openspec/changes/archive/2026-05-01-feat/proposal.md".to_string()],
+            "only the archive add under the pathspec is reported"
+        );
+        // A pathspec that matches nothing returns empty.
+        let none = added_paths_in_range(&path, &base, "HEAD", "issues/archive").unwrap();
+        assert!(none.is_empty());
+    }
+
     /// The genuine-timeout path still kills the child and reports a
     /// timeout when the process never exits within the window.
     #[test]
@@ -1810,5 +2372,186 @@ mod tests {
             .expect_err("a child that never exits must time out");
         let msg = format!("{err:#}");
         assert!(msg.contains("timed out after 1s"), "got: {msg}");
+    }
+
+    // ----- survival/provenance primitives -----
+
+    #[test]
+    fn parse_blame_porcelain_extracts_sha_subject_date_per_line() {
+        // Two lines, each preceded by a full line-porcelain header block.
+        let raw = "\
+1111111111111111111111111111111111111111 1 1 1
+author Alice
+author-mail <a@example.com>
+author-time 1700000000
+author-tz +0000
+committer Alice
+summary first commit
+filename foo.rs
+\tfn first() {}
+2222222222222222222222222222222222222222 2 2 1
+author Bob
+author-mail <b@example.com>
+author-time 1700100000
+author-tz +0000
+committer Bob
+summary second commit
+filename foo.rs
+\tfn second() {}
+";
+        let lines = parse_blame_porcelain(raw);
+        assert_eq!(lines.len(), 2, "two blamed lines: {lines:?}");
+        assert_eq!(lines[0].line_no, 1);
+        assert_eq!(lines[0].sha, "1111111111111111111111111111111111111111");
+        assert_eq!(lines[0].subject, "first commit");
+        assert_eq!(lines[0].date, "2023-11-14");
+        assert_eq!(lines[1].line_no, 2);
+        assert_eq!(lines[1].sha, "2222222222222222222222222222222222222222");
+        assert_eq!(lines[1].subject, "second commit");
+    }
+
+    #[test]
+    fn parse_blame_porcelain_handles_repeated_commit_blocks() {
+        // git emits the full header only for the FIRST line of a run from a
+        // commit; subsequent lines of the same commit get only the header +
+        // content. The parser must still attribute them to that sha.
+        let raw = "\
+1111111111111111111111111111111111111111 1 1 2
+author Alice
+author-mail <a@example.com>
+author-time 1700000000
+author-tz +0000
+summary only commit
+filename foo.rs
+\tline one
+1111111111111111111111111111111111111111 2 2
+\tline two
+";
+        let lines = parse_blame_porcelain(raw);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].line_no, 2);
+        assert_eq!(
+            lines[1].sha, "1111111111111111111111111111111111111111",
+            "the repeated-commit line must attribute to the same sha"
+        );
+    }
+
+    #[test]
+    fn blame_lines_attributes_each_line_to_its_commit() {
+        let (_dir, path) = fixture_repo();
+        // Two commits, each adding a distinct line to a file.
+        std::fs::write(path.join("f.rs"), "alpha\n").unwrap();
+        run_init(&path, &["add", "f.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add alpha"]);
+        let first = rev_parse(&path, "HEAD").unwrap();
+        std::fs::write(path.join("f.rs"), "alpha\nbeta\n").unwrap();
+        run_init(&path, &["add", "f.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add beta"]);
+        let second = rev_parse(&path, "HEAD").unwrap();
+
+        let blamed = blame_lines(&path, "HEAD", "f.rs", None, false).unwrap();
+        assert_eq!(blamed.len(), 2, "{blamed:?}");
+        assert_eq!(blamed[0].sha, first, "line 1 (alpha) → first commit");
+        assert_eq!(blamed[0].subject, "add alpha");
+        assert_eq!(blamed[1].sha, second, "line 2 (beta) → second commit");
+        assert_eq!(blamed[1].subject, "add beta");
+        // Date is short ISO.
+        assert_eq!(blamed[0].date.len(), 10, "YYYY-MM-DD: {:?}", blamed[0].date);
+    }
+
+    #[test]
+    fn blame_lines_range_restricts_to_requested_lines() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("f.rs"), "one\ntwo\nthree\n").unwrap();
+        run_init(&path, &["add", "f.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "three lines"]);
+        let blamed = blame_lines(&path, "HEAD", "f.rs", Some((2, 3)), false).unwrap();
+        assert_eq!(blamed.len(), 2, "only lines 2-3: {blamed:?}");
+        assert_eq!(blamed[0].line_no, 2);
+        assert_eq!(blamed[1].line_no, 3);
+    }
+
+    #[test]
+    fn file_touched_since_false_when_no_later_commit_touched_it() {
+        let (_dir, path) = fixture_repo();
+        // target commit adds a file; nothing later touches it.
+        std::fs::write(path.join("stable.rs"), "x\n").unwrap();
+        run_init(&path, &["add", "stable.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add stable"]);
+        let target = rev_parse(&path, "HEAD").unwrap();
+        // A LATER commit touches a DIFFERENT file.
+        std::fs::write(path.join("other.rs"), "y\n").unwrap();
+        run_init(&path, &["add", "other.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add other"]);
+
+        assert!(
+            !file_touched_since(&path, &target, "stable.rs").unwrap(),
+            "stable.rs untouched since target → pre-filter says fully surviving"
+        );
+        assert!(
+            file_touched_since(&path, &target, "other.rs").unwrap(),
+            "other.rs was touched after the target"
+        );
+    }
+
+    #[test]
+    fn files_modified_by_commits_lists_added_and_modified_paths() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("a.rs"), "a\n").unwrap();
+        std::fs::write(path.join("b.rs"), "b\n").unwrap();
+        run_init(&path, &["add", "a.rs", "b.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add a and b"]);
+        let sha = rev_parse(&path, "HEAD").unwrap();
+        let files = files_modified_by_commits(&path, &[sha]).unwrap();
+        assert!(files.contains(&"a.rs".to_string()), "{files:?}");
+        assert!(files.contains(&"b.rs".to_string()), "{files:?}");
+    }
+
+    #[test]
+    fn pr_number_from_subject_recognizes_squash_and_merge_forms() {
+        assert_eq!(
+            pr_number_from_subject("fix the thing (#123)"),
+            Some(123),
+            "trailing (#N) squash form"
+        );
+        assert_eq!(
+            pr_number_from_subject("Merge pull request #45 from foo/bar"),
+            Some(45),
+            "merge-commit form"
+        );
+        assert_eq!(
+            pr_number_from_subject("plain commit with no pr"),
+            None,
+            "no marker → no PR (never fabricate)"
+        );
+        // A subject mentioning an issue mid-text but a PR at the end picks
+        // the trailing PR marker.
+        assert_eq!(
+            pr_number_from_subject("address (#1) report, closes it (#99)"),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn base_commits_for_pr_finds_squash_commit_by_subject() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("feat.rs"), "feature\n").unwrap();
+        run_init(&path, &["add", "feat.rs"]);
+        run_init(&path, &["commit", "-q", "-m", "add a feature (#7)"]);
+        let sha = rev_parse(&path, "HEAD").unwrap();
+        let found = base_commits_for_pr(&path, "main", 7).unwrap();
+        assert_eq!(found, vec![sha], "squash subject (#7) resolves to its commit");
+        // A PR number not present yields nothing (no fabrication).
+        let none = base_commits_for_pr(&path, "main", 9999).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn parse_tz_offset_secs_parses_signed_offsets() {
+        assert_eq!(parse_tz_offset_secs("+0000"), Some(0));
+        assert_eq!(parse_tz_offset_secs("+0530"), Some(5 * 3600 + 30 * 60));
+        assert_eq!(parse_tz_offset_secs("-0800"), Some(-(8 * 3600)));
+        assert_eq!(parse_tz_offset_secs("bad"), None);
+        assert_eq!(parse_tz_offset_secs("+12345"), None);
     }
 }

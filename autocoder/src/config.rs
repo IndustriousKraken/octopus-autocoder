@@ -656,6 +656,8 @@ pub struct FeaturesConfig {
     pub brownfield_survey: BrownfieldSurveyFeatureConfig,
     #[serde(default)]
     pub issues: IssuesFeatureConfig,
+    #[serde(default)]
+    pub octopus_guide: OctopusGuideFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -848,6 +850,33 @@ fn default_issues_enabled() -> bool {
     false
 }
 
+/// Config for the in-repo OCTOPUS.md agent-guide provisioning
+/// (`octopus-md-agent-guide`). When enabled (the default), the daemon
+/// provisions a committed `OCTOPUS.md` plus an `AGENTS.md` reference into a
+/// managed repository through the established push + pull-request flow,
+/// idempotently. Operators opt out per repository by setting
+/// `enabled: false` — for a repo where metafiles are unwelcome, or a
+/// third-party repo where adding them is not the operator's call. Modeled
+/// on [`IssuesFeatureConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OctopusGuideFeatureConfig {
+    #[serde(default = "default_octopus_guide_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for OctopusGuideFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_octopus_guide_enabled(),
+        }
+    }
+}
+
+fn default_octopus_guide_enabled() -> bool {
+    true
+}
+
 /// Modernized nested prompt-override block (a24). Used as the value
 /// type for every `<area>.<thing>` field that overrides an embedded
 /// prompt template. The single `prompt_path` field is workspace-
@@ -961,6 +990,16 @@ pub struct RepositoryConfig {
     /// (preserves existing auto-submit behavior).
     #[serde(default = "default_auto_submit_pr")]
     pub auto_submit_pr: bool,
+    /// Per-repository override of the in-repo agent-guide provisioning toggle
+    /// (`octopus-md-agent-guide`). `None` (the default) inherits the global
+    /// `features.octopus_guide.enabled` default; `Some(false)` disables the
+    /// guide for THIS repository only (e.g. a third-party repo where adding
+    /// metafiles is not the operator's call) while the fleet default leaves
+    /// others enabled; `Some(true)` forces it on for this repository even when
+    /// the global default is off. Resolved at the per-repo polling-task bind
+    /// site via `octopus_guide.unwrap_or(features.octopus_guide.enabled)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub octopus_guide: Option<bool>,
     /// a006: per-repository override of the credential-protection toggles
     /// (`os_hide`, `engine_deny`). Each set field overrides the global
     /// `executor.sandbox` value for this repository only; unset fields inherit
@@ -1131,6 +1170,21 @@ pub struct ExecutorConfig {
     pub implementer_cli: Option<CliKind>,
     #[serde(default = "default_executor_timeout")]
     pub timeout_secs: u64,
+    /// Single wall-clock timeout (seconds) for EVERY auxiliary agentic session
+    /// — the verifier gates (`[in]`/`[canon]`/`[rules]`/`[out]`), the code
+    /// reviewer, AND the spec-revision sessions (the `send it` executor AND the
+    /// revision advisor). Defaults to `3600` (one hour) when unset, AND
+    /// overridable. This is the ONE source of the auxiliary-session timeout: no
+    /// auxiliary role embeds its own timeout literal, so raising this one value
+    /// raises the cap for all of them at once.
+    ///
+    /// The implementer is OUT of scope: it keeps its own `timeout_secs` (and the
+    /// derived spec-implicit threshold). The default exists because these
+    /// sessions do real, size-varying work — reading a large diff, judging a
+    /// wide spec delta, rewriting substantial code — AND a short fixed cap
+    /// guillotines a legitimately long task.
+    #[serde(default = "default_agentic_session_timeout")]
+    pub agentic_session_timeout_secs: u64,
     #[serde(default)]
     pub sandbox: Option<ExecutorSandboxConfig>,
     /// a014: capture of the operator's activated login-shell environment +
@@ -1660,6 +1714,14 @@ impl ExecutorConfig {
         self.startup_jitter_max_secs.unwrap_or(30)
     }
 
+    /// Resolved wall-clock timeout for every auxiliary agentic session (the
+    /// verifier gates, the reviewer, AND the revision sessions). This is the
+    /// SINGLE source every call site routes through; the value is
+    /// `agentic_session_timeout_secs` (default `3600`) wrapped as a `Duration`.
+    pub fn agentic_session_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.agentic_session_timeout_secs)
+    }
+
     /// Effective inter-iteration jitter percentage. Unset → `10`. Clamped
     /// to `100` so a negative offset cannot exceed the base interval (the
     /// arithmetic would otherwise saturate at zero and waste resolution).
@@ -1998,6 +2060,64 @@ pub(crate) fn default_executor_command() -> String {
 
 fn default_executor_timeout() -> u64 {
     1800
+}
+
+/// Default for [`ExecutorConfig::agentic_session_timeout_secs`]: 3600 seconds
+/// (one hour). This is the SOLE place the auxiliary-session timeout default
+/// literal appears; [`ExecutorConfig::agentic_session_timeout`] resolves it for
+/// every gate, the reviewer, AND the revision sessions.
+pub fn default_agentic_session_timeout() -> u64 {
+    3600
+}
+
+/// A minimal, fully-populated [`ExecutorConfig`] for callers that need a
+/// placeholder executor block but do NOT run the executor — the standalone
+/// `audit run` path and the in-process submission listener's placeholder
+/// `ControlState`. Every gate/check mode is `Disabled` and every LLM block
+/// is `None`; the `agentic_session_timeout_secs` takes the unified default.
+/// This is the single definition of that placeholder (it was previously
+/// duplicated in `cli/audit.rs`).
+pub fn placeholder_executor_config() -> ExecutorConfig {
+    ExecutorConfig {
+        kind: ExecutorKind::ClaudeCli,
+        implementer_cli: None,
+        command: "claude".to_string(),
+        timeout_secs: 600,
+        agentic_session_timeout_secs: default_agentic_session_timeout(),
+        sandbox: None,
+        agent_env: None,
+        implementer_prompt_path: None,
+        changelog_stylist_prompt_path: None,
+        perma_stuck_after_failures: None,
+        max_changes_per_pr: None,
+        startup_jitter_max_secs: None,
+        inter_iteration_jitter_pct: None,
+        max_auto_revisions_per_pr: 5,
+        max_revise_triggers_per_pr: 10,
+        wipe_drain_timeout_secs: default_wipe_drain_timeout_secs(),
+        output_format: default_output_format(),
+        log_retention_days: default_log_retention_days(),
+        busy_marker_stale_threshold_secs: None,
+        change_internal_contradiction_check: ContradictionCheckMode::Disabled,
+        change_internal_contradiction_check_prompt_path: None,
+        change_internal_contradiction_check_llm: None,
+        change_canonical_contradiction_check: ContradictionCheckMode::Disabled,
+        change_canonical_contradiction_check_prompt_path: None,
+        change_canonical_contradiction_check_llm: None,
+        global_rules_check: ContradictionCheckMode::Disabled,
+        global_rules_check_prompt_path: None,
+        global_rules_check_llm: None,
+        global_rules: GlobalRulesConfig::default(),
+        code_implements_spec_check: ContradictionCheckMode::Disabled,
+        code_implements_spec_check_prompt_path: None,
+        code_implements_spec_check_llm: None,
+        verifier_gate_retries: default_verifier_gate_retries(),
+        implementer: None,
+        changelog_stylist: None,
+        implementer_revision: None,
+        audit_triage: None,
+        chat_request_triage: None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4571,6 +4691,7 @@ github:
             // `ExecutorConfig` + `ExecutorSandboxConfig`.
             "command",
             "timeout_secs",
+            "agentic_session_timeout_secs",
             "sandbox",
             "implementer_prompt_path",
             "changelog_stylist_prompt_path",
@@ -4725,6 +4846,59 @@ github:
         // Reviewer and ChatOps blocks are commented out by default.
         assert!(cfg.reviewer.is_none(), "reviewer must be off by default");
         assert!(cfg.chatops.is_none(), "chatops must be off by default");
+    }
+
+    // ---- unified-agentic-session-timeout ----
+
+    /// Task 4.1: an executor config with `agentic_session_timeout_secs` UNSET
+    /// resolves the one-hour default (3600s) through the single resolver every
+    /// auxiliary role routes through.
+    #[test]
+    fn agentic_session_timeout_unset_resolves_one_hour_default() {
+        // Minimal executor with the field omitted → serde default applies.
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n")
+            .expect("minimal executor parses with the field omitted");
+        assert_eq!(
+            exec.agentic_session_timeout_secs,
+            default_agentic_session_timeout(),
+            "unset field must take the serde default"
+        );
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(3600),
+            "the unset default resolves to one hour"
+        );
+    }
+
+    /// Task 4.2 (resolver half): a CONFIGURED value flows through the single
+    /// resolver `ExecutorConfig::agentic_session_timeout()` that every gate,
+    /// the reviewer, AND the revision sessions consume. Changing the one field
+    /// changes the resolved value for all of them.
+    #[test]
+    fn agentic_session_timeout_configured_value_governs_the_resolver() {
+        let exec: ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 7200\n")
+                .expect("executor with the field set parses");
+        assert_eq!(exec.agentic_session_timeout_secs, 7200);
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(7200),
+            "the configured value is what the single resolver returns"
+        );
+    }
+
+    /// Task 4.1/4.3: the default literal lives in exactly ONE function. The
+    /// resolver wraps THAT function's value, never a second literal — so the
+    /// auxiliary roles cannot drift from the documented default.
+    #[test]
+    fn agentic_session_timeout_default_has_one_source() {
+        assert_eq!(default_agentic_session_timeout(), 3600);
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n").unwrap();
+        // The resolver derives from the default fn, not an independent literal.
+        assert_eq!(
+            exec.agentic_session_timeout(),
+            std::time::Duration::from_secs(default_agentic_session_timeout())
+        );
     }
 
     #[test]
@@ -5767,6 +5941,7 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
@@ -5783,6 +5958,7 @@ chatops:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
@@ -7878,6 +8054,7 @@ github: {}
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }
@@ -9508,6 +9685,164 @@ features:
         assert_eq!(
             cfg.features.issues.prompt_path.as_deref(),
             Some(Path::new("./prompts/issue-custom.md"))
+        );
+    }
+
+    #[test]
+    fn features_octopus_guide_block_omitted_is_enabled_by_default() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features block parses");
+        // The guide provisions by default for every managed repo.
+        assert!(
+            cfg.features.octopus_guide.enabled,
+            "octopus_guide must default to ENABLED"
+        );
+        assert_eq!(
+            cfg.features.octopus_guide,
+            OctopusGuideFeatureConfig::default()
+        );
+    }
+
+    #[test]
+    fn features_octopus_guide_explicit_disabled_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  octopus_guide:
+    enabled: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit fields parse");
+        assert!(
+            !cfg.features.octopus_guide.enabled,
+            "explicit enabled: false must round-trip to false"
+        );
+    }
+
+    #[test]
+    fn repo_octopus_guide_override_absent_is_none() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent per-repo override parses");
+        // No per-repo override → None → inherit the global default.
+        assert_eq!(cfg.repositories[0].octopus_guide, None);
+    }
+
+    #[test]
+    fn repo_octopus_guide_override_explicit_false_round_trips() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    octopus_guide: false
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit per-repo override parses");
+        assert_eq!(cfg.repositories[0].octopus_guide, Some(false));
+    }
+
+    #[test]
+    fn repo_octopus_guide_override_resolves_per_repo_effective_value() {
+        // task 6.8: with the GLOBAL default ENABLED, a repo that sets
+        // `octopus_guide: false` resolves to DISABLED for itself, while a
+        // sibling repo with no override inherits the enabled global default.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/opted-out.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    octopus_guide: false
+  - url: "git@github.com:owner/inherits-default.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("two-repo override config parses");
+        // Global default is ENABLED (block omitted).
+        let global_default = cfg.features.octopus_guide.enabled;
+        assert!(global_default, "global default must be ENABLED for this test");
+        // The same resolution the per-repo polling-task bind site applies in
+        // run.rs: `repo.octopus_guide.unwrap_or(global_default)`.
+        let opted_out = cfg.repositories[0]
+            .octopus_guide
+            .unwrap_or(global_default);
+        let inherits = cfg.repositories[1]
+            .octopus_guide
+            .unwrap_or(global_default);
+        assert!(
+            !opted_out,
+            "per-repo octopus_guide: false must resolve the effective value to DISABLED"
+        );
+        assert!(
+            inherits,
+            "a sibling with no override must inherit the ENABLED global default"
+        );
+    }
+
+    #[test]
+    fn repo_octopus_guide_override_true_forces_on_when_global_disabled() {
+        // The override is symmetric: a repo can force the guide ON even when
+        // the fleet default is OFF.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/forced-on.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    octopus_guide: true
+executor:
+  kind: claude_cli
+github: {}
+features:
+  octopus_guide:
+    enabled: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("force-on override config parses");
+        let global_default = cfg.features.octopus_guide.enabled;
+        assert!(!global_default, "global default must be DISABLED for this test");
+        let effective = cfg.repositories[0]
+            .octopus_guide
+            .unwrap_or(global_default);
+        assert!(
+            effective,
+            "per-repo octopus_guide: true must force the effective value to ENABLED"
         );
     }
 

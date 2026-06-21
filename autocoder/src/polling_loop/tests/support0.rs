@@ -101,6 +101,22 @@ pub(crate) fn write_fake_issue(ws: &Path, slug: &str) {
     std::fs::write(dir.join("tasks.md"), "- [ ] split the file\n").unwrap();
 }
 
+/// Write a fake ARCHIVED issue under `issues/archive/<dated>-<slug>/`
+/// (mirrors what `lanes::issues::archive` produces after the issues lane
+/// works an issue: `issue.md` + `tasks.md`, dated-prefixed dir). Returns
+/// the `issue.md` body and `tasks.md` body so callers can assert the
+/// review context carried them verbatim. `locate_archive_dir` matches on
+/// the `-<slug>` suffix, so any date prefix works.
+pub(crate) fn write_fake_archived_issue(ws: &Path, slug: &str) -> (String, String) {
+    let dir = crate::lanes::issues::archive_root(ws).join(format!("2026-01-02-{slug}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let issue_md = format!("# Issue {slug}\nReport + acceptance criteria for {slug}.\n");
+    let tasks_md = format!("- [ ] fix step one for {slug}\n- [ ] fix step two for {slug}\n");
+    std::fs::write(dir.join("issue.md"), &issue_md).unwrap();
+    std::fs::write(dir.join("tasks.md"), &tasks_md).unwrap();
+    (issue_md, tasks_md)
+}
+
 /// Build a fixture remote repo with one commit on `main` AND a cloned
 /// workspace whose `origin` points to the remote. Returns the temp dir
 /// guard (drop = cleanup) plus the workspace path.
@@ -197,6 +213,7 @@ pub(crate) fn out_gate_ctx(
         prompt_template: "T".into(),
         attribution: Some("anthropic/claude-test".into()),
         retries: 0,
+        timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         test_submission: Some(submission),
     }
 }
@@ -275,6 +292,7 @@ pub(crate) fn fixture_repo(workspace: &Path) -> RepositoryConfig {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     }
 }
@@ -344,6 +362,7 @@ pub(crate) fn open_pr_test_repo() -> RepositoryConfig {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     }
 }
@@ -573,6 +592,7 @@ pub(crate) fn cc_test_ctx(
         prompt_template: "TEST_PROMPT".into(),
         attribution,
         retries: 0,
+        timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         test_submission: Some(submission),
     }
 }
@@ -596,6 +616,7 @@ pub(crate) fn canon_test_ctx(
         prompt_template: "TEST_PROMPT".into(),
         attribution,
         retries: 0,
+        timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         test_submission: Some(submission),
     }
 }
@@ -621,6 +642,7 @@ pub(crate) fn gr_test_ctx(
         prompt_template: "TEST_PROMPT".into(),
         attribution,
         retries: 0,
+        timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         corpus_dir,
         test_submission: Some(submission),
     }

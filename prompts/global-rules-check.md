@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are checking a single OpenSpec change against a corpus of project-agnostic GLOBAL RULES — portable engineering lessons the operator wants every project to honor (no futile tautological tests, prefer composition over inheritance, no committed secrets, and so on). A violation here is a requirement IN THIS CHANGE whose deltas, if implemented as specified, would BREAK one of those rules.
 
 This is NOT the change-vs-canonical check (which compares the change against THIS project's own specs). The global rules are cross-project policy, authored as minimal prose — each is a one-sentence assertion plus an optional rationale, identified by a stable id. There is no `SHALL`/`MODIFY`/`ADD` contract language to parse; you judge the prose directly.

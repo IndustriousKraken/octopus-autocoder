@@ -6910,6 +6910,12 @@ Per the verifier framework, the `[canon]` gate SHALL FAIL CLOSED (gatekeepers-fa
 ### Requirement: Code-implements-spec verification (the [out] gate, advisory)
 autocoder SHALL provide an opt-in post-executor check — the `[out]` gate of the verifier framework — that judges whether the executor's implementation satisfies the change's spec delta, requirement by requirement AND scenario by scenario. This is the verifier step the code-reviewer requirement defers to ("Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step"). The gate runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) AFTER the executor implements the change, in a read-only sandbox that reads the spec delta, the diff, AND source on demand, AND returns its verdict via the `submit_verdict` MCP tool.
 
+The gate resolves the change's spec-delta files from WHEREVER they currently live, because by the time the `[out]` gate runs the change has typically ALREADY been archived in the same pass: a completed change's `openspec/changes/<slug>/` is moved to `openspec/changes/archive/<dated>-<slug>/` (and its delta folded into canon) BEFORE the post-executor gate runs. The gate SHALL therefore look for the delta at the active path `openspec/changes/<slug>/specs/` AND, when that is absent, at the archived path `openspec/changes/archive/*-<slug>/specs/`, so it verifies the just-archived delta rather than finding nothing. The diff (which still carries the delta files as part of the archive move) remains an input.
+
+When NO spec-delta is found for a processed change in EITHER location, the gate SHALL NOT run the agent against an empty contract AND SHALL NOT synthesize a passing verdict. Per the gatekeepers-fail-closed standard AND the gatekeepers-contain-no-judgment standard, an absent contract is a could-not-verify condition, NOT a pass: the gate SHALL render an explicit `## Spec Verification: FAILED TO RUN` section naming the cause (no spec-delta contract found) rather than reporting the change as implemented. The code SHALL NOT derive a verdict from the inputs — a missing delta yields the failed-to-run state, never a code-synthesized "nothing to verify, so it passes."
+
+Judging whether the implementation satisfies a requirement SHALL include judging that the required behavior is REALLY implemented, not merely sketched. Per the project's no-stubs standard, where the spec delta calls for working code, a requirement (or scenario) is NOT satisfied — it is a gap — when the code that landed only stubs OR defers the behavior: a placeholder or hardcoded/faked return value, a `todo!()` / `unimplemented!()` / `panic!("not implemented")`, an unconditional early-return that skips the required path, a branch or error path left unwired, a config flag read but never acted on, OR an explicit deferral of the behavior to a later change. A wholly-stubbed requirement SHALL be reported as a `missing` gap; a half-wired one (the behavior exists for some inputs but a required path is stubbed) SHALL be reported as a `partial` gap, each with the stub itself as the evidence. A plausible-looking diff that does not actually do the work the spec requires is NOT a pass, AND the gate SHALL flag it whether or not the spec delta separately says "do not stub."
+
 The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the gatekeepers-fail-closed standard, the gate fails CLOSED to a VISIBLE state rather than silence: a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause — making clear the change was NOT verified (NOT a pass) — rather than omitting the section. It still never blocks PR creation. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
 
 The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.code_implements_spec_check_llm`, which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
@@ -6948,6 +6954,22 @@ The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` de
 - **AND** `executor.code_implements_spec_check_llm` is unset
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
 - **AND** the operator sees the error on stderr AND in journalctl
+
+#### Scenario: A stubbed or deferred required behavior is reported as a gap
+- **WHEN** the spec delta calls for working code for a behavior AND the landed implementation only stubs OR defers it (a placeholder/hardcoded return, `todo!()`/`unimplemented!()`, an unconditional early-return that skips the required path, an unwired branch, OR an explicit deferral to a later change)
+- **THEN** the gate reports that requirement (or scenario) as a gap with the stub as concrete evidence — `missing` when wholly stubbed, `partial` when a required path is stubbed
+- **AND** it does NOT report the change as fully implemented
+
+#### Scenario: The same-pass-archived delta is resolved and verified
+- **WHEN** the gate runs for a processed change that was archived earlier in the same pass (its `openspec/changes/<slug>/` is gone, now at `openspec/changes/archive/<dated>-<slug>/`)
+- **THEN** the gate resolves the spec-delta files from the archived path AND verifies the implementation against them
+- **AND** it does NOT treat the change as having no delta
+
+#### Scenario: A missing delta fails to run, never a synthesized pass
+- **WHEN** no spec-delta file is found for a processed change in EITHER the active OR the archived location
+- **THEN** the gate does NOT run the agent against an empty contract AND does NOT report the change as implemented
+- **AND** it renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause (no spec-delta contract found)
+- **AND** PR creation still proceeds — the gate never blocks
 
 ### Requirement: Workspace cache LRU eviction under a size cap
 The daemon SHALL support an optional cap on the total size of the per-repo workspace cache (`<cache>/workspaces/`), configured via `cache.workspaces_max_gb` (`Option<u64>`; unset = unbounded, the default). When the cap is set, the daemon SHALL keep the workspace cache under it by evicting least-recently-used IDLE workspaces. Whole-workspace eviction is language-agnostic: it removes entire least-recently-used clones (`<cache>/workspaces/<key>`) rather than reasoning about which subdirectories are build artifacts. An evicted repo re-clones via the existing workspace-init path on its next iteration; eviction is lossless because per-PR revision state AND audit state live in the state directory, NOT the workspace.
@@ -7076,25 +7098,42 @@ GitLab SHALL be selected ONLY via an explicit `forge: { kind: gitlab }` — ther
 - **AND** GitLab is NOT selected by host inference
 
 ### Requirement: Issues lane for corrections
-The daemon SHALL provide a second work lane, `issues/`, for corrections — fixes to code that is already correctly specified (bug fixes, behavior-preserving refactors) that carry NO spec delta. An issue SHALL be a directory `issues/<slug>/` containing `issue.md` (the report and diagnosis AND the acceptance criteria stated against the EXISTING specification) AND `tasks.md` (the fix steps), with NO `specs/` directory — that absence is the contract that an issue changes no spec. The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing `issues/<slug>/` directly (repository write is the allowlist; no public surface). On completion the issue directory SHALL move to `issues/archive/`, mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
+The daemon SHALL provide a second work lane, `issues/`, for corrections — fixes to code that is already correctly specified (bug fixes, behavior-preserving refactors) that carry NO spec delta. An issue SHALL take ONE of two on-disk forms:
+
+- **Single file (the default):** `issues/<slug>.md` — a description of the problem and desired end state, OPTIONALLY followed by a `## Tasks` checklist of the fix steps. This is the form for the common case: a small, curated correction.
+- **Directory (when more is needed):** `issues/<slug>/` containing `issue.md` (the report/diagnosis AND acceptance criteria stated against the EXISTING specification) AND `tasks.md` (the fix steps). The directory form is REQUIRED when the unit must carry a separate artifact — in particular a quarantined public report body (see below) — and MAY be used for any issue with attachments.
+
+NEITHER form SHALL contain a `specs/` directory — that absence is the contract that an issue changes no spec; a unit carrying a `specs/` directory is malformed. A public-origin issue (one carrying an untrusted public report body) SHALL use the directory form so the quarantined `report-body.md` stays a separate file from the maintainer-approved task, preserving the quarantine boundary; collapsing an untrusted body into the single-file form is NOT permitted.
+
+The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
 
 #### Scenario: An enabled lane works a committed issue
-- **WHEN** `features.issues` is on AND an `issues/<slug>/` with `issue.md` and `tasks.md` is present
+- **WHEN** `features.issues` is on AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
 - **THEN** the issue is selected and worked
 - **AND** no spec delta is required for it
 
+#### Scenario: A single-file issue is a valid unit
+- **WHEN** `features.issues` is on AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
+- **THEN** it loads as a well-formed issue AND is worked like a directory-form issue
+- **AND** its `## Tasks` checklist (when present) is the fix-step list the implementer follows
+
 #### Scenario: An issue carrying a specs directory is rejected
-- **WHEN** an `issues/<slug>/` contains a `specs/` directory
+- **WHEN** a directory-form `issues/<slug>/` contains a `specs/` directory
 - **THEN** it is rejected as malformed, because an issue carries no spec delta
+
+#### Scenario: A public-origin issue uses the directory form to keep the body quarantined
+- **WHEN** a public-origin issue is written (it carries an untrusted public report body)
+- **THEN** it uses the directory form `issues/<slug>/` with the body in a separate `report-body.md`, NOT the single-file form
+- **AND** the untrusted body is never merged into the same file as the maintainer-approved task
 
 #### Scenario: Completion archives without touching canon
 - **WHEN** an issue's fix completes
-- **THEN** `issues/<slug>/` moves to `issues/archive/`
+- **THEN** a single-file issue moves `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, AND a directory-form issue moves `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/`
 - **AND** no canonical spec file is modified
 
 #### Scenario: The lane is disabled by default
 - **WHEN** `features.issues` is unset
-- **THEN** the issues lane is inactive AND `issues/<slug>/` directories are not worked
+- **THEN** the issues lane is inactive AND neither `issues/<slug>.md` files nor `issues/<slug>/` directories are worked
 
 ### Requirement: Independent lane walkers over shared utilities
 The changes lane AND the issues lane SHALL be driven by separate walkers, each with its own control flow AND its own state file; lane-specific behavior SHALL live in each walker, NOT in shared branching keyed on a lane flag. Shared leaf functionality — the busy-marker, PR opening, archiving, chatops notification, queue-state I/O, AND workspace handling — SHALL be composed from stateless shared utilities that both walkers call. A fault in one walker SHALL NOT corrupt the other lane's control flow or state: each walker reads AND writes only its own lane's state.
@@ -7127,11 +7166,11 @@ Within the existing per-repo serializer (the busy-marker — one unit of work pe
 - **THEN** they are selected in alphabetical order
 
 ### Requirement: Hybrid issue ingestion with maintainer promotion
-The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write `issues/<slug>/` AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
+The daemon SHALL ingest reported issues without giving public authors the ability to trigger code work. It SHALL triage reported GitHub issues read-only (reusing scout's issue read), classify AND dedup each against open AND archived issues, draft a candidate `issues/<slug>/`, AND post the candidate to chatops WITHOUT queuing it. A maintainer SHALL promote a candidate with a "send it" (reusing the audit send-it pattern); ONLY on promotion does the daemon write the issue unit AND queue it. The public can REPORT but SHALL NOT TRIGGER code work — promotion is the authorization gate. The curated path (a009) is this path minus the auto-triage step.
 
 The candidate notification SHALL be posted in a way that a later promotion reply can be matched to it: the daemon SHALL capture the posted message's `thread_ts` AND `channel` AND persist them on the candidate's stored state. A candidate whose thread was not captured (a degraded post) is simply not matchable by a reply — graceful degradation, never an error. The notification SHALL instruct the maintainer to reply `@<bot> send it` (the mention form that the verb recognizes), retaining the statement that nothing is written OR queued until they do.
 
-Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate, write `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md` for a public-origin candidate), AND flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready `issues/<slug>/`). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
+Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate AND write the issue unit in the form appropriate to its origin: a CURATED candidate (carrying no untrusted body) as the default single file `issues/<slug>.md` (a description plus an optional `## Tasks` checklist); a PUBLIC-ORIGIN candidate as the directory form `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md`) so the untrusted body stays a separate file from the maintainer-approved task. The action SHALL flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready issue unit). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
 
 #### Scenario: A triaged report posts a candidate and queues nothing
 - **WHEN** a reported issue is triaged
@@ -7140,8 +7179,13 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 
 #### Scenario: Promotion writes and queues
 - **WHEN** a maintainer "send it"s a posted candidate
-- **THEN** the daemon writes `issues/<slug>/`
+- **THEN** the daemon writes the issue unit in the form appropriate to its origin (a single file `issues/<slug>.md` for a curated candidate, OR `issues/<slug>/` for a public-origin candidate)
 - **AND** queues it for the issues lane
+
+#### Scenario: A curated candidate is promoted as a single file
+- **WHEN** the promotion action runs for a curated candidate (carrying no untrusted body)
+- **THEN** the daemon writes the single file `issues/<slug>.md` (description plus an optional `## Tasks` checklist), NOT a directory
+- **AND** the written unit is ready for the issues-lane walker
 
 #### Scenario: An unpromoted candidate does no work
 - **WHEN** a candidate is posted but no maintainer promotes it
@@ -7158,7 +7202,7 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 
 #### Scenario: The promotion action writes, queues, and flips status
 - **WHEN** the promotion control-socket action runs for a posted candidate
-- **THEN** the daemon writes `issues/<slug>/` (including the quarantined `report-body.md` for a public-origin candidate)
+- **THEN** the daemon writes the issue unit in the form appropriate to origin (a single file `issues/<slug>.md` for a curated candidate, OR `issues/<slug>/` including the quarantined `report-body.md` for a public-origin candidate)
 - **AND** the candidate's stored status becomes promoted
 - **AND** the written unit is ready for the issues-lane walker
 
@@ -7868,4 +7912,439 @@ Because it is a verifier gate, the `[rules]` gate runs server-side pre-executor 
 #### Scenario: Enabled without model or corpus fails fast at startup
 - **WHEN** `executor.global_rules_check: enabled` AND either `executor.global_rules_check_llm` OR `executor.global_rules.corpus` is unset/unresolvable
 - **THEN** daemon startup fails with a named error AND does NOT begin polling
+
+### Requirement: Issues lane parks a non-progressing issue
+The issues lane SHALL NOT re-attempt the same issue indefinitely. The issues walker SHALL track a per-issue consecutive-failure counter (its own lane state, per the independent-lane-walkers requirement) AND, once an issue stops making progress, SHALL PARK it: write a `.perma-stuck.json` marker for the issue — INSIDE `issues/<slug>/` for a directory-form issue, OR as the sibling `issues/<slug>.perma-stuck.json` for a single-file issue — exclude the issue from selection while the marker is present, AND post an operator-visible chatops alert. The threshold SHALL be the existing `executor.perma_stuck_after_failures` value (no new configuration). The operator unparks an issue by removing the marker, exactly as for a parked change.
+
+Progress is defined by outcome:
+- A RETRYABLE failure (executor error, a `Completed` outcome that left the workspace unmodified, an unsupported iteration request, OR a precondition-unmet outcome) SHALL increment the counter; the issue is parked when the counter reaches `executor.perma_stuck_after_failures`.
+- An outcome that retrying cannot resolve — the agent escalating a question (the issues lane does not escalate) OR the agent kicking the fix back to the changes lane (it requires a behavior change) — SHALL park the issue IMMEDIATELY (a single attempt, not the full threshold). Immediate parking on kick-back also stops the kick-back notice from re-posting on every pass.
+- A daemon-shutdown abort SHALL NOT count toward the threshold (operator-initiated shutdown is not an issue failure).
+
+Parking SHALL be fail-loud, never silent: the chatops alert names the issue, the attempt count, AND the last reason, so the lane is never silently re-attempting an issue NOR silently abandoning one. Completion (the fix landed AND the issue archived) SHALL clear both the counter AND the marker, so a later issue reusing the slug starts clean. The park marker SHALL be gitignored regardless of issue form: the `.git/info/exclude` set SHALL match BOTH the in-directory `.perma-stuck.json` AND the single-file sibling `issues/<slug>.perma-stuck.json` (a suffix pattern such as `*.perma-stuck.json`, because a bare-basename exclude matches only the in-directory form), so the marker is gitignored at any depth AND survives the per-iteration branch reset AND `git clean` in either form.
+
+#### Scenario: A repeatedly failing issue is parked after the threshold
+- **WHEN** an issue's fix fails on `executor.perma_stuck_after_failures` consecutive passes
+- **THEN** a `.perma-stuck.json` marker is written for the issue (inside `issues/<slug>/` for a directory issue, OR as the sibling `issues/<slug>.perma-stuck.json` for a single-file issue)
+- **AND** an operator-visible chatops alert names the issue, the attempt count, AND the last reason
+
+#### Scenario: A parked issue is skipped until the operator removes the marker
+- **WHEN** an issue carries a `.perma-stuck.json` marker (inside `issues/<slug>/`, OR as the sibling `issues/<slug>.perma-stuck.json`)
+- **THEN** the issue is excluded from selection (it is not worked)
+- **AND** removing the marker makes the issue selectable again
+
+#### Scenario: A single-file issue's sibling park marker is gitignored
+- **WHEN** a single-file issue `issues/<slug>.md` is parked with a sibling `issues/<slug>.perma-stuck.json` marker
+- **THEN** the marker is gitignored — the exclude set matches the sibling form, not only the in-directory `.perma-stuck.json`
+- **AND** it does not appear as an untracked change in the pre-pass dirty check, AND it survives `git clean` AND the per-iteration branch reset
+
+#### Scenario: An escalated issue is parked immediately
+- **WHEN** the agent escalates a question while working an issue
+- **THEN** the issue is parked on that single attempt (not after the full threshold)
+- **AND** the operator is alerted
+
+#### Scenario: A kicked-back issue is parked immediately and not re-reported
+- **WHEN** the agent reports that an issue requires a behavior change (a kick-back to the changes lane)
+- **THEN** the issue is parked on that single attempt
+- **AND** the kick-back notice is not re-posted on subsequent passes
+
+#### Scenario: A daemon-shutdown abort does not count toward the threshold
+- **WHEN** an issue's session is aborted by the daemon's shutdown cascade
+- **THEN** the issue's consecutive-failure counter is not incremented
+- **AND** the issue is not parked for the abort
+
+#### Scenario: Completion clears the counter and the marker
+- **WHEN** an issue's fix completes AND the issue is archived
+- **THEN** the per-issue failure counter is cleared
+- **AND** no `.perma-stuck.json` marker remains for that slug (in either form)
+
+### Requirement: Survival analysis — what of a past PR or commit is still live
+The orchestrator SHALL provide an analysis that reports which of a past pull request's OR commit's changes still survive verbatim in the current base-branch tree, so an operator can review long-past work that is still live AND spec a fix for surviving problems. It SHALL be available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> survives <repo-substring> <pr <N> | commit <sha>>`), resolving the repository by the same selector rule the other operator commands use. It SHALL be read-only.
+
+The analysis SHALL resolve the target to a commit (or commit-set: a single commit, OR a PR's commits / squash-merge commit) AND, for each file that target modified, determine which of the lines it ADDED still attribute to that target at the current `HEAD`:
+
+- As a cheap per-file pre-filter, a file the target touched that NO later commit has touched (`git log <target>..HEAD -- <file>` is empty) SHALL be reported as fully surviving — every hunk the target made there is still present, without line-level blame.
+- For a file later modified, the analysis SHALL use `git blame` at `HEAD` to keep the target's added lines that STILL attribute to the target; lines later overwritten attribute to a newer commit AND are reported as not surviving.
+
+The report SHALL summarize, per file, how much of the target survives (e.g. fully / partially with the surviving line regions / not at all) AND an overall count, newest-relevant first, naming the target.
+
+The analysis SHALL state its boundary plainly in its output: it detects VERBATIM survival, not semantic survival. Because `git blame` attributes a line to the LAST commit that touched it, a line the target introduced that was later reformatted, renamed, or moved attributes to the newer commit AND is reported as not surviving even if its substance persists. The analysis therefore UNDER-reports survival (it may miss surviving-but-edited lines) AND never over-reports (a line reported as surviving is the target's exact text). Move/copy detection (`git blame -M -C`) MAY be applied to recover relocated lines; it is heuristic AND does not change the verbatim-vs-semantic boundary.
+
+The surviving regions SHALL be consumable as the focus of an on-demand review (the operator can review only what is still live) — the analysis names the surviving files AND line regions in a form the review command can target.
+
+#### Scenario: A file untouched since the target survives fully via the cheap pre-filter
+- **WHEN** the target modified a file AND `git log <target>..HEAD -- <file>` is empty
+- **THEN** the file is reported as fully surviving without running line-level blame
+
+#### Scenario: A later-modified file is resolved line-by-line via blame
+- **WHEN** the target modified a file that a later commit also touched
+- **THEN** the analysis reports the target's added lines that still attribute to the target at `HEAD` as surviving, AND those overwritten by a newer commit as not surviving
+
+#### Scenario: The report states the verbatim-survival boundary
+- **WHEN** the analysis produces its report
+- **THEN** the report states that it detects verbatim survival (under-reports survival, never over-reports) — a line reported as surviving is the target's exact text
+- **AND** the per-file/overall survival counts are shown, naming the target
+
+#### Scenario: Survival output can focus an on-demand review
+- **WHEN** an operator follows a survival report with an on-demand review
+- **THEN** the surviving files AND line regions are available as the review target so only still-live code is reviewed
+
+### Requirement: Provenance lookup — where a line was introduced
+The orchestrator SHALL provide the inverse of survival analysis: given a file AND a line (or line range) in the current tree, report the commit that last introduced it AND the pull request that commit belongs to, so a problem found in current code can be traced to its origin AND the operator can decide between rolling back (recent) AND spec/issue-ing a fix (older). It SHALL be available as a CLI subcommand AND a chatops verb (`@<bot> blame <repo-substring> <path> <line>[-<line>]`), resolve the repository by the standard selector rule, AND be read-only.
+
+The lookup SHALL run `git blame` for the named line(s) at `HEAD`, report each line's introducing commit (short SHA, subject, date), AND — when the commit can be associated with a pull request (e.g. a merge commit, OR a commit whose PR is discoverable via the forge) — name that PR. When no PR association is found, the commit alone is reported.
+
+#### Scenario: A current line is traced to its introducing commit
+- **WHEN** an operator requests provenance for a file AND line range
+- **THEN** the response names, per line, the commit that last introduced it (short SHA, subject, date)
+
+#### Scenario: The introducing commit's PR is named when discoverable
+- **WHEN** the introducing commit can be associated with a pull request
+- **THEN** the response names that PR alongside the commit
+- **AND** when no PR association is found, the commit alone is reported (no fabricated PR)
+
+### Requirement: List recent commits for a managed repository
+The orchestrator SHALL provide a way to list a managed repository's recent commits from one place, so an operator choosing a rollback depth can see the history without leaving the management surface. It SHALL be available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> log <repo-substring> [<count>]`), resolving the repository by the same selector rule the other operator commands use. The listing SHALL show, per commit, at least the short SHA, the subject, AND the commit date, newest first, bounded by a count (default a small page, e.g. 20). This is a read-only command: it SHALL NOT modify any branch, workspace, or marker.
+
+#### Scenario: Listing shows recent commits newest-first
+- **WHEN** an operator requests the commit log for a resolved repository with a count N
+- **THEN** the response lists up to N of the base branch's most recent commits, newest first, each with its short SHA, subject, AND date
+- **AND** no branch, workspace, or marker is modified
+
+#### Scenario: Selector resolution matches the other operator commands
+- **WHEN** the repo-substring resolves to zero OR multiple repositories
+- **THEN** the response reports the ambiguity / no-match the same way the other operator commands do (listing candidates), rather than acting on a guess
+
+### Requirement: Code-rollback recovery rolls back code while unarchiving its specs and issues
+The orchestrator SHALL provide a recovery operation that rolls a managed repository's CODE back by a chosen depth WHILE preserving the OpenSpec changes AND issues that were archived in the rolled-back range — moving them back to the active lanes rather than discarding them. The motivating case: code that merged WITHOUT being gate-checked is not to be trusted, but the spec/issue work that drove it is sound AND should re-enter the pipeline to be re-implemented under the controls. A plain `git reset`/`revert` cannot express this, because the orchestrator commits the implementation, the archive move, AND the canonical-spec fold together — so reverting the commits would discard the spec work entirely, back to before it existed.
+
+The operation SHALL accept a rollback depth as EITHER a commit count (roll back the last N commits) OR a target commit SHA (roll back to that commit), resolved against the repository's base branch.
+
+The operation SHALL ride the normal push + PR flow rather than force-pushing the base branch directly: it prepares the rolled-back state on the agent branch AND goes through the SAME push + PR-creation path as any change, honoring the per-repo `auto_submit_pr` setting — a pull request the operator reviews AND merges when `auto_submit_pr` is enabled (the default), OR a pushed agent branch with no PR (the `BranchPushedNoPr` outcome) when an installation has set it false. The operation SHALL NOT special-case a force-push to the base branch; it produces reviewable commits through the established flow, AND git history remains the backstop.
+
+Within the rolled-back range, the operation SHALL:
+
+- Restore the CODE (every path outside `openspec/` AND outside the issues lane) to its state at the rollback target — the untrusted implementation is discarded.
+- For each OpenSpec change archived in the range, UNARCHIVE it: the change returns to `openspec/changes/<slug>/` (active), its canonical-spec fold is undone, so it is pending again AND will be re-gated AND re-implemented. It is NOT reverted to non-existence.
+- For each issue archived in the range, UNARCHIVE it: the issue unit returns from `issues/archive/` to the active `issues/` lane.
+- Leave changes/issues archived OUTSIDE the range untouched (still archived, canon intact).
+
+The operation SHALL be fail-loud AND reviewable: the PR body SHALL enumerate the commits rolled back, the changes/issues unarchived, AND state plainly that the code was discarded while the specs/issues were returned to the pipeline. Because it discards code, the operation SHALL require explicit confirmation before it acts (a confirmation prompt for the CLI, OR a two-step confirm for the chatops verb), mirroring the other destructive operator commands. A dry run (default for the CLI, OR an explicit preview) SHALL report exactly what WOULD be rolled back AND unarchived without changing anything.
+
+#### Scenario: Rollback by count discards code and unarchives specs via the normal flow
+- **WHEN** an operator rolls a repository back by N commits AND those commits archived one or more changes/issues
+- **THEN** it rides the normal push + PR flow (opening a PR when `auto_submit_pr` is enabled, the default; otherwise a pushed branch with no PR), NOT a force-push to base, with the agent branch's tree holding the code restored to the rollback target
+- **AND** each change archived in the range is moved back to `openspec/changes/<slug>/` with its canon fold undone (active, to be re-gated and re-implemented)
+- **AND** each issue archived in the range is moved back to the active `issues/` lane
+- **AND** the PR body enumerates the rolled-back commits AND the unarchived changes/issues
+
+#### Scenario: Rollback to a SHA is equivalent to the count form
+- **WHEN** an operator rolls back to a specific commit SHA instead of a count
+- **THEN** the same restore-code / unarchive-specs-and-issues operation runs against that target
+- **AND** the result is a PR with identical structure to the count form
+
+#### Scenario: Specs and issues archived outside the range are untouched
+- **WHEN** the rollback range covers some archived changes/issues but not others
+- **THEN** only the changes/issues archived WITHIN the range are unarchived
+- **AND** changes/issues archived before the range stay archived AND their canon fold is intact
+
+#### Scenario: Confirmation is required and a dry run changes nothing
+- **WHEN** the operation is invoked without confirmation (OR in dry-run/preview mode)
+- **THEN** it reports the commits it WOULD roll back AND the changes/issues it WOULD unarchive
+- **AND** it does NOT modify any branch, workspace, archive, or canon until the operator confirms
+
+#### Scenario: Code-only range is a plain rollback through the normal flow
+- **WHEN** the rolled-back range archived NO changes AND NO issues (code-only commits)
+- **THEN** the rolled-back state restores the code to the target with no unarchive step AND rides the normal push + PR flow (a PR when `auto_submit_pr` is enabled)
+- **AND** the PR body (or push notification) says the rollback was code-only
+
+### Requirement: On-demand code review of a PR, commit, or target
+The orchestrator SHALL let an operator request a code review on demand — outside the normal per-pass flow — from one management surface, available BOTH as a CLI subcommand AND as a chatops verb (`@<bot> review <repo-substring> <target>`), resolving the repository by the same selector rule the other operator commands use. The review SHALL run the existing agentic reviewer (its sandbox, `submit_review`, AND reads-on-demand behavior unchanged) AND report the resulting verdict + concerns back to the operator: as a reply in the originating chat channel, AND — when the target is a PR — optionally as a comment on that PR.
+
+The target SHALL be one of:
+
+- `pr <number>` — review the pull request's diff. The diff is resolved from the repository's local clone (the PR's base..head range); the review surface is that diff + its changed files.
+- `commit <sha>` — review a single commit's diff (`git show <sha>`).
+- `files <path> [<path> ...]` — review the current content of the named files (a TARGET review: no diff; the reviewer reads the files on demand).
+- a free-text description — review the area the description names; the reviewer locates the relevant files itself (via `Glob`/`Grep`) AND reviews them (a TARGET review).
+
+The on-demand review SHALL be advisory AND read-only: it SHALL NOT modify code, open a revision, NOR change any marker — it reports findings; the operator decides what to do with them (e.g. roll the implementation back, OR spec/issue a fix). A review whose session fails to produce a valid verdict SHALL surface that failure (per the gatekeepers-fail-closed standard) rather than reporting a clean pass.
+
+A target spanning many files (a broad area, OR the whole codebase) SHALL be SCOPED rather than forced into a single oversized prompt: the orchestrator SHALL chunk the target (e.g. per file or per module) into multiple reviewer sessions AND aggregate their findings into one report, so a large review degrades into bounded sessions rather than overflowing the model's context. When a target is bounded enough for one session, a single session is used.
+
+#### Scenario: Review a PR posts a verdict
+- **WHEN** an operator requests `@<bot> review <repo> pr <N>`
+- **THEN** the orchestrator resolves the PR's diff from the local clone AND runs the agentic reviewer over it
+- **AND** it reports the verdict + concerns to the operator (a chat reply, AND optionally a PR comment)
+- **AND** it opens no revision AND modifies no code or marker
+
+#### Scenario: Review a commit
+- **WHEN** an operator requests `@<bot> review <repo> commit <sha>`
+- **THEN** the reviewer reviews that commit's diff AND the verdict is reported back
+
+#### Scenario: Review a file-set with no diff
+- **WHEN** an operator requests `@<bot> review <repo> files src/a.rs src/b.rs`
+- **THEN** the reviewer runs a TARGET review over the current content of those files (no diff) AND reports the verdict
+
+#### Scenario: Review a described area, reviewer finds the files
+- **WHEN** an operator requests a review by free-text description of functionality
+- **THEN** the reviewer locates the relevant files itself (via `Glob`/`Grep`) AND reviews them
+- **AND** the verdict names the files it actually reviewed so the operator can see the scope it chose
+
+#### Scenario: A large target is chunked and aggregated, not one giant prompt
+- **WHEN** the target spans more files than fit one bounded session (a broad area or the whole codebase)
+- **THEN** the orchestrator runs multiple reviewer sessions over chunks (per file or per module) AND aggregates their findings into one report
+- **AND** no single session is handed an oversized prompt
+
+#### Scenario: On-demand review is advisory and read-only
+- **WHEN** any on-demand review completes with findings
+- **THEN** it reports them to the operator AND does NOT open a revision, modify code, or change any marker
+- **AND** a session that fails to produce a valid verdict surfaces the failure rather than reporting a clean pass
+
+### Requirement: Marker-clear operator commands accept wildcard targets
+The marker-clear operator commands `clear-perma-stuck` AND `clear-revision` SHALL accept a wildcard target so an operator can clear markers in bulk without naming each change OR each repository. In addition to the exact form (`clear-<kind> <repo-substring> <change-slug>`), the parser SHALL recognize:
+
+- `clear-<kind> <repo-substring> *` — clear EVERY marker of that kind in the one resolved repository.
+- `clear-<kind> *` — clear EVERY marker of that kind across ALL configured repositories.
+
+The literal `*` is a wildcard sentinel, NOT a change-slug NOR a repo-substring. Its ACCEPTANCE at the parser — recognized for these two verbs before the change-slug / repo-substring regex, exempt from those patterns — is defined by the chatops-manager "Argument sanitization at parser entry" requirement; THIS requirement defines what the sentinel DOES (the bulk clear below). A change-slug position is therefore either a sanitized slug OR `*`; a repo-substring position is either a sanitized substring OR `*`; every non-`*` argument is sanitized as the chatops-manager requirement specifies.
+
+The wildcard sweep is a DISTINCT operation from a single-target clear: when the target is `*`, the action enumerates the marker directories itself AND SHALL NOT pass `*` through the single-slug resolver defined by the "Partial change-slug resolution in marker-clearing control-socket actions" requirement. That resolver continues to govern ONLY non-`*` (single-target) clears, where it resolves an exact-or-prefix `change` value as before; `*` is intercepted ahead of it AND never reaches it. (This is why a single-slug resolver that has not been taught about `*` would otherwise return `NoMatch` for a literal `*` — the sweep path must branch before resolution.)
+
+Bulk clearing SHALL be fail-loud, never silent: the reply SHALL enumerate what was cleared — each repository AND each change/marker removed — AND SHALL report a repository (or the whole fleet) that had no matching markers as an explicit "nothing to clear" result rather than an empty reply. A per-repository failure (e.g. a workspace that cannot be read) SHALL NOT abort the sweep; it is reported alongside the successes. Wildcard clearing removes ONLY the named marker kind (`clear-perma-stuck` → `.perma-stuck.json`; `clear-revision` → `.needs-spec-revision.json`), matching the exact-form behavior, including `clear-perma-stuck`'s removal of an accompanying `.ignore-for-queue.json` when present.
+
+#### Scenario: Wildcard clears all markers of a kind in one repo
+- **WHEN** an operator posts `@<bot> clear-perma-stuck your-repo *` AND `your-repo` resolves to one repository
+- **THEN** every `.perma-stuck.json` marker in that repository is removed
+- **AND** the reply enumerates each change whose marker was cleared
+- **AND** if the repository had no such markers, the reply says so explicitly
+
+#### Scenario: Fleet-wide wildcard clears across all repositories
+- **WHEN** an operator posts `@<bot> clear-revision *`
+- **THEN** every `.needs-spec-revision.json` marker across ALL configured repositories is removed
+- **AND** the reply enumerates, per repository, the changes whose markers were cleared
+- **AND** a repository with no matching markers is reported as such, not omitted silently
+
+#### Scenario: A per-repository failure does not abort the fleet sweep
+- **WHEN** a fleet-wide wildcard clear runs AND one repository's markers cannot be read or removed
+- **THEN** the sweep continues across the remaining repositories
+- **AND** the reply reports the failed repository AND cause alongside the repositories that were cleared
+
+#### Scenario: The wildcard sweep bypasses the single-slug resolver
+- **WHEN** a marker-clear action receives the wildcard target `*`
+- **THEN** it branches to the sweep enumeration BEFORE invoking the single-slug resolver (`resolve_change_prefix`), so `*` is never resolved as an exact-or-prefix `change` value
+- **AND** the single-slug resolver is invoked ONLY for non-`*` targets, where its exact-or-prefix behavior is unchanged
+
+#### Scenario: The exact-target forms are unchanged
+- **WHEN** an operator posts `@<bot> clear-perma-stuck your-repo a06-foo` (no wildcard)
+- **THEN** the behavior is exactly as before — the single named marker is cleared, with the same success AND not-found replies
+
+### Requirement: One configurable timeout for gate, review, and revision sessions
+The wall-clock timeout for every auxiliary agentic session — the verifier gates (`[in]`, `[canon]`, `[rules]`, `[out]`), the code reviewer, AND the spec-revision sessions (the `send it` executor AND the revision advisor) — SHALL be resolved from a SINGLE configurable value, NOT from a per-role hardcoded constant. The value SHALL be `executor.agentic_session_timeout_secs`, defaulting to `3600` (one hour) when unset, AND overridable in config. There SHALL be exactly one source of this timeout; no auxiliary-session role embeds its own timeout literal.
+
+The implementer is OUT of scope: it retains its existing `executor.timeout_secs` (and the derived spec-implicit threshold). This requirement governs the auxiliary agentic sessions that previously each carried their own fixed constant.
+
+The default exists because these sessions do real work whose size varies — reading a large diff, judging a wide spec delta, rewriting substantial code — AND a short fixed cap guillotines a legitimately long task. An operator whose repositories run large refactors or spec rewrites raises the one value rather than hunting per-role constants.
+
+This timeout's exhaustion is a session failure, surfaced per the gatekeepers-fail-closed standard: a gate/reviewer/revision session that times out enters its failed-to-run state (it does NOT pass), naming the timeout AND the resolved value in its diagnostic.
+
+#### Scenario: Unset uses the one-hour default
+- **WHEN** `executor.agentic_session_timeout_secs` is unset
+- **THEN** every gate, reviewer, AND revision session uses a 3600-second timeout
+- **AND** no auxiliary-session role applies a different, role-private timeout value
+
+#### Scenario: The configured value governs every auxiliary session
+- **WHEN** `executor.agentic_session_timeout_secs` is set to a value
+- **THEN** the verifier gates, the reviewer, AND the revision sessions all use that value
+- **AND** changing it in one place changes the timeout for all of them
+
+#### Scenario: A timed-out session fails to run, never passes
+- **WHEN** an auxiliary agentic session exceeds the resolved timeout
+- **THEN** the session enters its failed-to-run state per the gatekeepers-fail-closed standard (a blocking gate holds; an advisory gate/reviewer renders an explicit failed-to-run result), never a pass
+- **AND** the diagnostic names the timeout AND the resolved value
+
+### Requirement: An audit write-policy violation names the offending paths
+When a periodic audit trips its write-policy post-check (the workspace carried an unexpected working-tree change after the audit ran), the operator-facing violation reason — the text rendered into the chatops alert AND the audit-run log's violation section — SHALL name the offending path(s), regardless of which `WritePolicy` was violated. A bare count ("N entry(ies)") is insufficient: the operator cannot tell whether the change was harmless tooling ephemera or a real escape without re-deriving it from the workspace.
+
+This generalizes the behavior the prefix-allowlist policies already have (`WritePolicy::OpenSpecOnly` and `WritePolicy::PlanningLanes` reasons already list the paths outside their allowed prefix) to the clean-workspace policy (`WritePolicy::None`), so all three violation reasons name what was written. For `WritePolicy::None` every dirty entry is offending (nothing is allowed); for the prefix-allowlist policies the offending set is the entries outside the allowed prefix(es), as today.
+
+To keep the alert bounded when a single run dirties many files (e.g. a build or cache directory), the reason SHALL list the offending paths up to a fixed cap AND, when more remain, append a remaining-count summary (e.g. "+K more") rather than emitting an unbounded list. The count SHALL still be present so the operator knows the total magnitude. The full, uncapped set remains available in the audit-run log's existing porcelain section.
+
+#### Scenario: A WritePolicy::None violation names the dirty path
+- **WHEN** an audit declaring `WritePolicy::None` leaves the workspace with an unexpected entry (e.g. `opencode.json`)
+- **THEN** the violation reason names that path
+- **AND** the reason still conveys the total number of offending entries
+
+#### Scenario: The prefix-allowlist policies still name their out-of-lane paths
+- **WHEN** an audit declaring `WritePolicy::OpenSpecOnly` or `WritePolicy::PlanningLanes` writes a path outside its allowed prefix(es)
+- **THEN** the violation reason names the out-of-lane path(s), as before
+
+#### Scenario: A large offending set is capped with a remaining-count summary
+- **WHEN** a violation's offending set exceeds the display cap
+- **THEN** the reason lists paths up to the cap AND appends a summary of how many more were omitted
+- **AND** the total count is still conveyed
+- **AND** the audit-run log still records the full, uncapped working-tree status
+
+### Requirement: A discarded or errored reviewer renders a visible FAILED TO RUN section in the PR
+The code reviewer is a control-plane gatekeeper, so per the gatekeepers-fail-closed standard its inability to run SHALL be a visible, non-passing state — never silence. When the agentic reviewer produces no usable verdict — it DISCARDS the review (a session that records no schema-valid `submit_review` submission) OR it errors (spawn/transport failure) — the PR body SHALL carry an explicit `## Code Review: FAILED TO RUN` section naming the cause, parallel to the `[out]` gate's `## Spec Verification: FAILED TO RUN`. The daemon SHALL NOT omit the reviewer section in this case, AND SHALL NOT represent the failure as an approval.
+
+This is the reviewer-side counterpart of the same fix the `[out]` gate already has: the prior behavior — returning no review report, which rendered NO `## Code Review` section at all — left a failed/discarded review invisible in the PR (only a chatops alert was posted), so an operator reading the PR could not distinguish "reviewed and approved" from "the reviewer never ran." The one-shot reviewer path already surfaces its failure as a visible report; this brings the agentic path (the default) into line.
+
+The reviewer remains ADVISORY: a FAILED TO RUN reviewer state SHALL NOT block PR creation AND SHALL NOT be a `Block`/`Approve` verdict — it is a distinct could-not-run state. The existing operator-visible chatops alert SHALL continue. The PR's gate-verdict ledger SHALL record the reviewer as failed-to-run (NOT passed/approved AND not absent), so the reviewer's could-not-run state is legible there too.
+
+#### Scenario: A discarded agentic review renders FAILED TO RUN, not silence
+- **WHEN** the agentic reviewer session records no schema-valid `submit_review` submission (the review is discarded)
+- **THEN** the PR body carries an explicit `## Code Review: FAILED TO RUN` section naming the cause
+- **AND** the reviewer section is NOT omitted AND the failure is NOT rendered as an approval
+- **AND** the existing reviewer-failure chatops alert is still posted
+- **AND** PR creation still proceeds — the reviewer never blocks
+
+#### Scenario: An errored agentic review renders FAILED TO RUN
+- **WHEN** the agentic reviewer errors (spawn/transport failure) before producing a verdict
+- **THEN** the PR body carries the `## Code Review: FAILED TO RUN` section naming the cause
+- **AND** it is not represented as an approval AND PR creation proceeds
+
+#### Scenario: The gate ledger records the reviewer as failed-to-run
+- **WHEN** the reviewer is discarded OR errors
+- **THEN** the PR's gate-verdict ledger records the reviewer verdict as failed-to-run
+- **AND** it is NOT recorded as passed/approved NOR left absent (so "could not run" is distinguishable from "ran and approved")
+
+#### Scenario: A successful review is unchanged
+- **WHEN** the agentic reviewer returns a valid verdict (Approve OR Block)
+- **THEN** the PR body renders the normal `## Code Review` section AND the ledger records that verdict, exactly as before
+
+### Requirement: Shared in-process submission listener for daemon-absent gate and audit runs
+
+autocoder SHALL provide a shared `control_socket::spawn_submission_listener(paths)` helper that stands up the submission transport in-process for a single invocation, so an agentic gate or audit that captures its verdict via an MCP `submit_*` tool can run without a daemon. The helper SHALL, in order: construct a `crate::submission_store::SubmissionStore`; register the gate submission schemas (`register_contradiction_submission_schema`, `register_canon_contradiction_submission_schema`, `register_rule_violations_submission_schema`) AND the audit submission schemas (`register_submission_schemas`); bind the control socket (`control_socket::bind_at`); set the control-socket env var (`mcp_askuser_server::ENV_CONTROL_SOCKET`) to the bound path; spawn `control_socket::serve` on a `ControlState`; AND return a guard whose drop cancels the listener's `CancellationToken` (stopping `serve`, which removes the socket file).
+
+The submission SCHEMA SET — the gate AND audit submission schemas — SHALL be registered from a SINGLE shared function (`register_gate_and_audit_submission_schemas`) used by ALL THREE submission-capturing entry points (the daemon at startup, the `verify` subcommand, AND the standalone audit path), so the set cannot drift between them: a gate or audit whose schema is registered in one path but not another would silently fail to capture its verdict. The `spawn_submission_listener` helper performs the full bind → env-var → `serve` bootstrap on a submission-only `ControlState` AND SHALL be the shared bootstrap for the two DAEMON-ABSENT callers (`verify` AND the standalone audit path). The daemon retains its own bootstrap because it serves a FULL `ControlState` (github, reviewer, chatops, reload handlers) that the submission-only helper does not build; it shares the schema-set registration, not the listener. Without a listener (or, for the daemon, its running control socket), an agentic gate or submission-based audit drains `None` from `try_consume_submission` and fails closed; with it, verdicts are captured exactly as under the daemon.
+
+#### Scenario: Listener is a precondition — gates fail closed without it
+- **WHEN** an agentic gate's verdict is drained while the control-socket env var is unset (no `spawn_submission_listener` active)
+- **THEN** the drain returns no submission AND the gate result is `Errored` (fail-closed)
+- **AND** no gate reports clean for a run whose verdict was never captured
+
+#### Scenario: Listener stands up the transport for an in-process run
+- **WHEN** `spawn_submission_listener(paths)` is held for the duration of a gate or audit run
+- **THEN** the control-socket env var points at a live bound socket AND the gate/audit submission schemas are registered on the store
+- **AND** the run captures its `submit_*` verdict via `try_consume_submission` as it would under a daemon
+
+#### Scenario: Listener tears down its transient socket on drop
+- **WHEN** the listener guard is dropped at the end of an invocation
+- **THEN** its `CancellationToken` fires, `serve` stops, AND the socket file is removed
+- **AND** no daemon control socket is left behind by the invocation
+
+### Requirement: `verify` subcommand runs the pre-executor gate checks locally on a working-tree change
+
+autocoder SHALL provide a `verify <change-slug>` subcommand that runs the pre-executor verifier-gate checks — `[in]` (change-internal), `[canon]` (change-vs-canonical), `[rules]` (global-rules), AND any other realized spec-checking gate that is enabled — against a change in the LOCAL working tree, so an operator can learn whether a change would pass the server gates BEFORE pushing it. It is a new invocation surface for the existing checks, NOT a redefinition of the verifier-gate framework: it invokes the same check entry points (`preflight::change_contradiction::run_agentic_contradiction_check`, `preflight::canon_contradiction::run_agentic_canon_contradiction_check`, `preflight::global_rules::run_agentic_global_rules_check`; shared core in `preflight::corpus_check`), the same prompts, the same per-gate model configuration (`executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, `executor.global_rules_check_llm`), AND the same submission schemas the server uses, so its verdict matches what the server will enforce.
+
+`verify` SHALL stand up the submission transport in-process via `control_socket::spawn_submission_listener(paths)` as a hard precondition for the duration of the run; without it the gates fail closed and `verify` cannot pass. `verify` SHALL resolve its agentic-session timeout from `ExecutorConfig::agentic_session_timeout()` (reading `executor.agentic_session_timeout_secs`, default `3600` when omitted) — NOT a verify-local literal.
+
+The subcommand SHALL run in the repository's working directory, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It SHALL NOT run the executor, SHALL NOT write `.needs-spec-revision.json`, AND SHALL NOT make spec or source edits. It MAY create transient run artifacts (`.mcp.json`, the control socket) AND SHALL clean them up on exit. It reports findings to stdout, grouped by gate AND labeled with the gate identifier, each carrying the finding narrative the server marker's `revision_suggestion` would carry.
+
+By default `verify` SHALL run the gates ENABLED in config (so its verdict matches server enforcement); a selector MAY override (`--all` for every realized spec-checking gate, `--gate <list>` for a named subset). Exit code SHALL be CI-usable, conforming to the `gatekeepers-fail-closed` standard: `0` ONLY when every gate that ran returned no findings; non-zero when any gate finds a contradiction; AND non-zero when an enabled gate CANNOT run (model unconfigured, transport error, unregistered strategy, no submission captured) — `verify` SHALL report "gate could not run" AND fail, never reporting clean for a gate that did not actually evaluate. When the resolved gate set is EMPTY (no spec-checking gate enabled AND no selector forcing one), `verify` SHALL NOT exit `0` silently: it SHALL report that no gate evaluated the change AND exit non-zero, conforming to the `gatekeepers-contain-no-judgment` standard (code never manufactures a clean pass when nothing was evaluated).
+
+`verify` is a subcommand of the autocoder binary (so it ships the identical check logic the server runs). A check-only install SHALL be supported: it fetches a PREBUILT binary, places it on the interactive `PATH`, AND drops a minimal config carrying only what `verify` needs (the `executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, AND `executor.global_rules_check_llm` model blocks with their `enabled` flags, plus corpus locations) — so it runs on a low-powered spec-authoring machine without building from source OR running the daemon.
+
+#### Scenario: A clean change passes verify
+- **WHEN** an operator runs `verify <slug>` in a repo against a change whose deltas contradict neither themselves nor canon AND the relevant gates are enabled and configured
+- **THEN** each run gate reports clean AND the command exits `0`
+- **AND** no marker is written, no executor runs, AND no spec or source files are edited; transient run artifacts are cleaned up
+
+#### Scenario: A contradicting change is reported with a non-zero exit
+- **WHEN** `verify <slug>` runs against a change whose deltas contradict canon (or each other)
+- **THEN** the command prints the finding(s), each labeled with the gate that produced it (`[in]` / `[canon]` / `[rules]`)
+- **AND** it exits non-zero
+- **AND** the finding narrative matches what the server's `.needs-spec-revision.json` would carry
+
+#### Scenario: verify's verdict matches the server gate
+- **WHEN** `verify` runs the same enabled gate against the same change the server would
+- **THEN** it uses the same check entry point, prompts, model config, and submission schema as the server
+- **AND** a change `verify` reports clean is not subsequently kicked back by that same server gate (absent canon drift since the local run)
+
+#### Scenario: A gate that cannot run fails closed, not clean
+- **WHEN** an enabled gate cannot run during `verify` (its model is unconfigured, the agentic session errors, its strategy is unregistered, or no submission is captured)
+- **THEN** `verify` reports that the gate could not run AND exits non-zero
+- **AND** it does NOT report the change as clean
+
+#### Scenario: Without the submission listener every gate fails closed
+- **WHEN** `verify` runs but the in-process submission listener was not stood up (the control-socket env var is unset)
+- **THEN** every gate drains no submission AND is reported as unable to run (fail-closed) with a non-zero exit
+- **AND** no gate reports clean — confirming the listener is a hard precondition
+
+#### Scenario: An empty enabled-gate set is loud, not a silent pass
+- **WHEN** `verify <slug>` runs with a config in which NO spec-checking gate is enabled AND no selector forces one
+- **THEN** `verify` reports that no gate evaluated the change AND exits non-zero
+- **AND** it does NOT exit `0` — code never manufactures a clean pass for a change nothing checked
+
+#### Scenario: verify honors the unified agentic-session timeout
+- **WHEN** `verify` runs with `executor.agentic_session_timeout_secs` configured (or omitted)
+- **THEN** the gate sessions use the value resolved from `ExecutorConfig::agentic_session_timeout()` (the configured value, or `3600` when omitted)
+- **AND** `verify` does NOT use a verify-local timeout literal
+
+#### Scenario: Default runs enabled gates; selector overrides
+- **WHEN** `verify <slug>` is run with no gate selector
+- **THEN** it runs exactly the spec-checking gates enabled in config
+- **WHEN** `verify <slug> --all` or `verify <slug> --gate in,canon` is run
+- **THEN** it runs the selected gates regardless of their enabled state (reporting any that cannot run as fail-closed)
+- **AND** an unknown gate name in `--gate` is an error, not a silent skip
+
+#### Scenario: Check-only install runs without a daemon or a source build
+- **WHEN** an operator runs the check-only install on a spec-authoring machine
+- **THEN** a prebuilt `verify`-capable binary is placed on the interactive `PATH` AND a minimal config with the `executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, and `executor.global_rules_check_llm` model blocks is written
+- **AND** `verify` runs against a local repo with no daemon running and without compiling from source
+
+### Requirement: Standalone `audit run` captures submission-based audit verdicts without a daemon
+
+The standalone audit path (`audit run`) SHALL stand up the in-process submission transport via `control_socket::spawn_submission_listener(paths)` before invoking an audit, so submission-based advisory audits (architecture_advisor, drift, documentation, canon_contradiction) capture their `submit_findings` verdict through `try_consume_submission` instead of draining `None` and failing closed. Without the listener these audits are non-functional daemon-absent (they error with "no submit_findings submission"); with it, a standalone `audit run` returns findings exactly as the daemon would.
+
+#### Scenario: A daemon-absent standalone advisory audit returns findings
+- **WHEN** an operator runs `audit run <submission-based-advisory-audit>` with no daemon running
+- **THEN** the standalone path stands up the submission listener for the run AND the audit's `submit_findings` verdict is captured
+- **AND** the audit returns its findings rather than erroring "no submit_findings submission"
+
+#### Scenario: Standalone audit listener is torn down after the run
+- **WHEN** a standalone `audit run` completes
+- **THEN** the submission listener guard is dropped AND its control socket is removed
+- **AND** no daemon control socket is left behind by the standalone run
+
+### Requirement: The daemon provisions OCTOPUS.md via a dedicated pull request, per-repo configurable
+The daemon SHALL provision `OCTOPUS.md` AND the `AGENTS.md` reference to it into a managed repository through the established push + pull-request flow — the SAME path any change rides — NOT during server provisioning (`autocoder install`, which writes host config, a systemd unit, AND a system user, and never touches a managed repository's working tree), AND NOT via a commit on the base branch outside a pull request.
+
+**Where the write happens.** The daemon SHALL write `OCTOPUS.md` AND refresh the `AGENTS.md` reference ON THE AGENT BRANCH — after the per-iteration base sync checks out `base_branch` AND recreates the agent branch (the daemon's per-pass workspace preparation performs the base checkout, `git pull --ff-only`, AND `git::recreate_branch` for the agent branch, AFTER `ensure_initialized` has cloned/fetched the workspace; pass work happens on the recreated agent branch thereafter). Writing on the agent branch, after base sync, is the only placement that survives the per-pass dirty-recovery step: a file written UNTRACKED before base sync is wiped by `attempt_dirty_workspace_recovery` (`git reset --hard origin/<base>` + `git clean -fd`), AND a commit landed on `base_branch` diverges from `origin/<base>` so the next `git pull --ff-only` fails, the same dirty-recovery reset discards it, AND it violates the canon prohibition on base-branch commits outside a pull request.
+
+**How it reaches the base branch.** The daemon SHALL stage the two files (`git::add_all`) AND commit them on the agent branch (`git::commit`), then ride the established push + PR-creation path (`git::push_force_with_lease` of the agent branch, then the PR-open step). The provisioning commit reaches the base branch only when the resulting pull request is merged — never by a direct base-branch commit. This bootstrap pull request MAY ride a pass that also carries change work, OR be opened on its own when no other unit is pending; either way the two files travel as ordinary committed content on the agent branch.
+
+**Honoring the per-repo PR toggle.** The daemon SHALL honor the repository's `auto_submit_pr` setting on this provisioning, exactly as it does for change work: when `auto_submit_pr` is `true` (the default) it opens a pull request carrying the two files; when `auto_submit_pr` is `false` it pushes the agent branch carrying the two files AND surfaces the branch (the `BranchPushedNoPr` outcome) without opening a pull request, leaving the operator to open it after local review.
+
+**Guide-provisioning toggle — global default, per-repo override.** Whether the daemon provisions the guide SHALL be a per-repository decision. A global default (`features.octopus_guide.enabled`, defaulting to ENABLED) sets the fleet-wide behavior, AND each repository MAY override it with its own setting; the EFFECTIVE value for a repository is its own override when set, else the global default. The default is ON because the in-repo agent guide benefits every managed repository the operator owns; the per-repo override exists so an operator can turn it OFF for a specific repository — one where they do not want metafiles, OR a third-party repository they contribute to where adding metafiles is not their decision — WITHOUT affecting the rest of the fleet. When the effective value is DISABLED for a repository, the daemon SHALL NEVER write `OCTOPUS.md` or `AGENTS.md` for it AND SHALL open no bootstrap pull request.
+
+**Idempotency — no needless pull request.** Provisioning SHALL be idempotent. When the guide is already present AND current on the base branch (the committed `OCTOPUS.md` matches the content the daemon would generate AND the managed `AGENTS.md` region is present and current), the daemon SHALL do nothing: it writes nothing, commits nothing, AND opens no pull request, so no empty PR AND no churn is produced. The daemon SHALL write the files AND open the bootstrap pull request ONLY when the guide is missing OR out of date on the base branch. When the daemon refreshes the `AGENTS.md` reference it SHALL leave any other `AGENTS.md` content the repository carries untouched; an `AGENTS.md` that does not yet exist is created carrying only the reference.
+
+The committed `OCTOPUS.md` SHALL state the in-repo workflow protocols per the `project-documentation` requirement `Managed repos carry a committed OCTOPUS.md agent guide` (the issues protocol, the OpenSpec change protocol, the canon/archive ownership rules, AND the gate model).
+
+#### Scenario: A bootstrap pull request is opened when the guide is missing and provisioning is enabled
+- **WHEN** the daemon processes a repository whose `features.octopus_guide` flag is enabled AND whose base branch has no `OCTOPUS.md` (or a stale one), with `auto_submit_pr` at its default `true`
+- **THEN** it writes `OCTOPUS.md` AND the managed `AGENTS.md` reference on the recreated agent branch (after base sync), commits both, pushes the agent branch, AND opens a pull request carrying the two files
+- **AND** the files reach the base branch only when that pull request is merged — the daemon makes no base-branch commit outside a pull request
+
+#### Scenario: BranchPushedNoPr when auto_submit_pr is false
+- **WHEN** the daemon would provision the guide for a repository whose `features.octopus_guide` flag is enabled but whose `auto_submit_pr` is `false`
+- **THEN** it writes AND commits the two files on the agent branch AND pushes that branch, but opens no pull request (the `BranchPushedNoPr` outcome), surfacing the branch so the operator can open the pull request after local review
+
+#### Scenario: No write and no pull request when provisioning is disabled
+- **WHEN** the daemon processes a repository whose effective guide-provisioning value (its per-repo override when set, else the global default) is disabled
+- **THEN** it writes neither `OCTOPUS.md` nor `AGENTS.md` AND opens no bootstrap pull request for them, leaving the repository's tree untouched by this feature
+
+#### Scenario: A per-repo override disables provisioning for one repository while the fleet default leaves others enabled
+- **WHEN** the global default is ENABLED but one repository carries its own guide-provisioning override set to disabled
+- **THEN** the daemon provisions the guide for the other repositories (whose effective value is the enabled global default) but writes nothing AND opens no bootstrap pull request for the overridden repository
+
+#### Scenario: No pull request when the guide is already current
+- **WHEN** the daemon processes a repository whose base branch already carries an `OCTOPUS.md` matching what the daemon would generate AND a current managed `AGENTS.md` reference
+- **THEN** it writes nothing, commits nothing, AND opens no bootstrap pull request — no empty PR, no churn
+
+#### Scenario: Provisioning does not write the managed-repo guide
+- **WHEN** `autocoder install` runs to provision a host
+- **THEN** it does NOT write `OCTOPUS.md` into any managed repository's working tree (the guide is provisioned through the daemon's push + pull-request flow, not by host provisioning)
 

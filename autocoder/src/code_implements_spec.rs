@@ -48,11 +48,6 @@ pub const CODE_IMPLEMENTS_SPEC_ROLE: &str = "code_implements_spec";
 /// AND source on demand AND returns its verdict through `submit_verdict`.
 pub const AGENTIC_CODE_IMPLEMENTS_SPEC_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
-/// Wall-clock cap for one code-implements-spec session. Mirrors the
-/// pre-executor gates' bound: the wrapped CLI subprocess is the thing being
-/// bounded.
-const AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// The full `--allowedTools` list the code-implements-spec sandbox grants: the
 /// read-only file tools PLUS the qualified `submit_verdict` MCP tool. Notably
 /// absent: `Bash`, `Write`, `Edit`. Exposed so tests can assert the surface.
@@ -297,6 +292,12 @@ pub struct CodeImplementsSpecCheckCtx {
     /// no-submission case retries — the advisory gate still renders FAILED
     /// TO RUN after the bound is exhausted (gatekeepers-fail-closed standard).
     pub retries: u32,
+    /// Wall-clock cap for one agentic session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the pre-executor
+    /// gates, the reviewer, AND the revision sessions). Set once at daemon
+    /// startup; a timed-out session renders FAILED TO RUN (advisory, never
+    /// blocks) per the fail-closed standard.
+    pub timeout: Duration,
     /// Test-only injected `submit_verdict` submission, bypassing the CLI
     /// subprocess AND the control socket. `Some(Some(p))` stands in for a
     /// recorded payload; `Some(None)` simulates "agent never submitted";
@@ -580,7 +581,7 @@ pub async fn run_code_implements_spec_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: AGENTIC_CODE_IMPLEMENTS_SPEC_TIMEOUT,
+        timeout: ctx.timeout,
     };
     run_code_implements_spec_check_with_runner(
         ctx,
@@ -606,6 +607,30 @@ async fn run_code_implements_spec_check_with_runner(
     changed_files: &[String],
     runner: &dyn VerdictSessionRunner,
 ) -> SpecVerificationOutcome {
+    // a61: every advisory diagnostic this gate emits carries the `[out]`
+    // verifier-gate label so the finding is attributable to the gate.
+    let label = VerifierGate::Out.label();
+    let changes = change_slugs.join(",");
+
+    // gatekeepers-contain-no-judgment + gatekeepers-fail-closed: do NOT run the
+    // agent against an empty contract, and never synthesize a pass from a
+    // missing delta. The change is typically archived in the same pass before
+    // this gate runs, so `spec_delta_paths` resolves the delta from the active
+    // OR archived location; if neither yields a delta, the gate fails CLOSED
+    // (could not verify) rather than handing the agent a "nothing to verify"
+    // prompt that can only come back `implemented`.
+    let delta_paths = spec_delta_paths(workspace_root, change_slugs);
+    if delta_paths.is_empty() {
+        let cause = "no spec-delta contract found to verify against \
+                     (the change has no specs/ delta in its active or archived location)"
+            .to_string();
+        tracing::warn!(
+            changes = %changes,
+            "{label} code-implements-spec could not run ({cause}); rendering FAILED TO RUN (advisory, never blocks)"
+        );
+        return SpecVerificationOutcome::FailedToRun { cause };
+    }
+
     let prompt = build_code_implements_spec_prompt(
         &ctx.prompt_template,
         workspace_root,
@@ -613,10 +638,6 @@ async fn run_code_implements_spec_check_with_runner(
         diff,
         changed_files,
     );
-    // a61: every advisory diagnostic this gate emits carries the `[out]`
-    // verifier-gate label so the finding is attributable to the gate.
-    let label = VerifierGate::Out.label();
-    let changes = change_slugs.join(",");
     // Bounded retry of the agentic session on the flaky no-submission case
     // (`executor.verifier_gate_retries`); a successful submission, a session
     // error, a timeout, AND an unregistered-strategy / CLI-unavailable error
@@ -738,18 +759,22 @@ fn build_code_implements_spec_prompt(
     out
 }
 
-/// Enumerate every `openspec/changes/<change>/specs/<cap>/spec.md` path
-/// (workspace-relative) across `change_slugs`, sorted by `(change, capability)`.
-/// Returns an empty `Vec` when no change has a `specs/` subdir with
-/// per-capability spec files. The agent reads them on demand via the read-only
-/// sandbox.
+/// Enumerate every `specs/<cap>/spec.md` delta path (workspace-relative) across
+/// `change_slugs`. The change is typically ARCHIVED in the same pass before the
+/// `[out]` gate runs (its `openspec/changes/<slug>/` is moved to
+/// `openspec/changes/archive/<dated>-<slug>/` and folded into canon), so the
+/// delta is resolved from the active path OR, when absent, the same-pass
+/// archived path — otherwise the gate would find nothing for every normal run.
+/// Returns an empty `Vec` when no change has a resolvable `specs/` delta; the
+/// caller treats that as a could-not-verify (fail-closed), NOT a pass. The agent
+/// reads the listed files on demand via the read-only sandbox.
 fn spec_delta_paths(workspace_root: &Path, change_slugs: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for change_slug in change_slugs {
-        let specs_dir = workspace_root
-            .join("openspec/changes")
-            .join(change_slug)
-            .join("specs");
+        let Some((specs_dir, rel_prefix)) = resolve_delta_specs_dir(workspace_root, change_slug)
+        else {
+            continue;
+        };
         let Ok(read) = std::fs::read_dir(&specs_dir) else {
             continue;
         };
@@ -766,13 +791,46 @@ fn spec_delta_paths(workspace_root: &Path, change_slugs: &[String]) -> Vec<Strin
         caps.sort_by(|a, b| a.0.cmp(&b.0));
         for (cap_name, cap_path) in caps {
             if cap_path.join("spec.md").is_file() {
-                out.push(format!(
-                    "openspec/changes/{change_slug}/specs/{cap_name}/spec.md"
-                ));
+                out.push(format!("{rel_prefix}/{cap_name}/spec.md"));
             }
         }
     }
+    out.sort();
     out
+}
+
+/// Resolve the directory holding a change's `specs/` delta, preferring the
+/// active path `openspec/changes/<slug>/specs` and falling back to the
+/// same-pass archived path `openspec/changes/archive/<dated>-<slug>/specs`
+/// (the change is archived before the `[out]` gate runs). Returns the absolute
+/// specs directory AND the workspace-relative prefix used to build the listed
+/// paths, OR `None` when neither location has a `specs/` directory. The archive
+/// directory name is `<YYYY-MM-DD>-<slug>` (an 11-char date prefix); the
+/// lexically-highest (newest-dated) match is chosen if more than one exists.
+fn resolve_delta_specs_dir(workspace_root: &Path, slug: &str) -> Option<(PathBuf, String)> {
+    let active = workspace_root
+        .join("openspec/changes")
+        .join(slug)
+        .join("specs");
+    if active.is_dir() {
+        return Some((active, format!("openspec/changes/{slug}/specs")));
+    }
+    // `<YYYY-MM-DD>-<slug>` — strip the 11-char `YYYY-MM-DD-` prefix and match
+    // the remainder against the slug EXACTLY (so slug `foo` does not match a
+    // sibling change `bar-foo`'s archive entry).
+    let archive_root = workspace_root.join("openspec/changes/archive");
+    let read = std::fs::read_dir(&archive_root).ok()?;
+    let mut matches: Vec<String> = read
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.get(11..) == Some(slug))
+        .collect();
+    matches.sort();
+    let dated = matches.pop()?;
+    let specs = archive_root.join(&dated).join("specs");
+    specs
+        .is_dir()
+        .then(|| (specs, format!("openspec/changes/archive/{dated}/specs")))
 }
 
 /// Render the advisory `## Spec Verification` section for the FAIL-CLOSED case:
@@ -866,8 +924,30 @@ mod tests {
             // Default to no retry so the canned-runner tests below run the
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
+            timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             test_submission: None,
         }
+    }
+
+    /// unified-agentic-session-timeout task 4.2 ([out] gate): the gate ctx
+    /// carries the value resolved from `executor.agentic_session_timeout_secs`,
+    /// which its CLI verdict session runner feeds to the wrapped CLI.
+    #[test]
+    fn out_gate_ctx_carries_resolved_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 4500\n")
+                .expect("executor parses");
+        let ctx = CodeImplementsSpecCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "T".into(),
+            attribution: Some("anthropic/claude-test".into()),
+            retries: 0,
+            timeout: exec.agentic_session_timeout(),
+            test_submission: None,
+        };
+        assert_eq!(ctx.timeout, exec.agentic_session_timeout());
+        assert_eq!(ctx.timeout, Duration::from_secs(4500));
     }
 
     fn write(p: &Path, body: &str) {
@@ -1003,6 +1083,9 @@ mod tests {
     async fn implemented_submission_is_consumed_and_attributed() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        // The [out] gate fails closed on a missing delta, so the agent path
+        // requires a resolvable spec-delta present.
+        write_change_spec(ws, "c1", "cap", "spec");
         let ctx = test_ctx();
         let runner = CannedVerdictRunner {
             submission: Some(serde_json::json!({
@@ -1036,6 +1119,9 @@ mod tests {
     async fn gaps_found_submission_is_consumed() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        // The [out] gate fails closed on a missing delta, so the agent path
+        // requires a resolvable spec-delta present.
+        write_change_spec(ws, "c1", "cap", "spec");
         let ctx = test_ctx();
         let runner = CannedVerdictRunner {
             submission: Some(serde_json::json!({
@@ -1070,6 +1156,9 @@ mod tests {
     async fn no_submission_is_unavailable() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        // The [out] gate fails closed on a missing delta, so the agent path
+        // requires a resolvable spec-delta present.
+        write_change_spec(ws, "c1", "cap", "spec");
         let ctx = test_ctx();
         let runner = CannedVerdictRunner { submission: None };
         let out = run_code_implements_spec_check_with_runner(
@@ -1094,6 +1183,9 @@ mod tests {
     async fn unavailable_diagnostics_carry_the_out_gate_label() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        // The [out] gate fails closed on a missing delta, so the agent path
+        // requires a resolvable spec-delta present.
+        write_change_spec(ws, "c1", "cap", "spec");
         let ctx = test_ctx();
         let runner = CannedVerdictRunner { submission: None };
         let out = run_code_implements_spec_check_with_runner(
@@ -1117,6 +1209,9 @@ mod tests {
     async fn session_error_is_unavailable() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        // The [out] gate fails closed on a missing delta, so the agent path
+        // requires a resolvable spec-delta present.
+        write_change_spec(ws, "c1", "cap", "spec");
         let ctx = test_ctx();
         let out = run_code_implements_spec_check_with_runner(
             &ctx,
@@ -1145,6 +1240,7 @@ mod tests {
     async fn no_submission_then_valid_succeeds_on_retry() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.retries = 2;
         let runner = ScriptedVerdictRunner::new(vec![None, Some(implemented_payload())]);
@@ -1171,6 +1267,7 @@ mod tests {
     async fn no_submission_every_attempt_fails_closed_after_bound() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.retries = 2;
         let runner = ScriptedVerdictRunner::new(vec![None]);
@@ -1196,6 +1293,7 @@ mod tests {
     async fn zero_retries_is_one_attempt() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.retries = 0;
         let runner = ScriptedVerdictRunner::new(vec![None]);
@@ -1221,6 +1319,7 @@ mod tests {
     async fn valid_first_attempt_does_not_retry() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.retries = 2;
         let runner = ScriptedVerdictRunner::new(vec![Some(implemented_payload())]);
@@ -1244,6 +1343,7 @@ mod tests {
     async fn session_error_is_not_retried() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.retries = 5;
         let out = run_code_implements_spec_check_with_runner(
@@ -1267,6 +1367,7 @@ mod tests {
     async fn unregistered_strategy_is_unavailable() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
         let mut ctx = test_ctx();
         ctx.model.provider = LlmProvider::Ollama;
         ctx.command = "definitely-not-a-registered-cli".into();
@@ -1281,6 +1382,79 @@ mod tests {
         assert!(
             matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
             "unregistered strategy must be Unavailable: {out:?}"
+        );
+    }
+
+    // ---- delta resolution: same-pass archive + fail-closed on missing ----
+
+    /// A runner that panics if invoked — proves the gate does NOT run the agent
+    /// when no spec-delta is resolved (it must fail closed first).
+    struct PanicVerdictRunner;
+
+    #[async_trait]
+    impl VerdictSessionRunner for PanicVerdictRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<VerdictSessionOutcome> {
+            panic!("the [out] gate must NOT run the agent when no spec-delta is resolved");
+        }
+    }
+
+    /// The change is archived in the same pass before the gate runs: the delta
+    /// lives only at `openspec/changes/archive/<dated>-<slug>/specs/`. The gate
+    /// resolves it there AND verifies — it does NOT treat the change as
+    /// having no delta.
+    #[tokio::test]
+    async fn archived_delta_is_resolved_and_verified() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // No active change dir; only the archived one.
+        write(
+            &ws.join("openspec/changes/archive/2026-06-20-c1/specs/cap/spec.md"),
+            "spec",
+        );
+        let ctx = test_ctx();
+        let runner = CannedVerdictRunner {
+            submission: Some(serde_json::json!({
+                "verdict": "implemented",
+                "summary": "ok",
+                "gaps": []
+            })),
+        };
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::Verified(_)),
+            "the same-pass-archived delta must be resolved AND verified: {out:?}"
+        );
+    }
+
+    /// No delta in EITHER the active OR the archived location: the gate fails
+    /// closed (FailedToRun) WITHOUT invoking the session runner — it never
+    /// synthesizes a pass from an empty contract. `PanicVerdictRunner` would
+    /// panic if the agent were run.
+    #[tokio::test]
+    async fn missing_delta_fails_closed_without_running_the_agent() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &PanicVerdictRunner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
+            "a missing delta must fail closed, never a synthesized pass: {out:?}"
         );
     }
 

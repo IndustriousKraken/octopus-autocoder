@@ -98,7 +98,8 @@ The daemon spawns each CLI by its canonical binary name (`claude` / `opencode` /
 | Field                       | Required | Default       | Description |
 |-----------------------------|----------|---------------|-------------|
 | `kind`                      | yes      | —             | Currently only `claude_cli` is supported. |
-| `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
+| `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. Governs the implementer only — the auxiliary agentic sessions use `agentic_session_timeout_secs`. |
+| `agentic_session_timeout_secs` | no    | `3600`        | Single wall-clock timeout (seconds) for EVERY auxiliary agentic session: the verifier gates (`[in]`/`[canon]`/`[rules]`/`[out]`), the code reviewer, AND the spec-revision sessions (the `send it` executor and the revision advisor). One source — raising this one value raises the cap for all of them, so an operator whose repositories run large refactors or spec rewrites does not hunt per-role constants. A timed-out session is a session failure surfaced per the fail-closed standard (a blocking gate holds; an advisory gate/reviewer renders failed-to-run), never a pass; the diagnostic names the timeout AND the resolved value. The implementer is NOT governed by this — it keeps `timeout_secs`. |
 | `sandbox`                   | no       | safe defaults | Tool-use restrictions (`allowed_tools`, `disallowed_bash_patterns`, `disallowed_read_paths`) applied to every executor invocation — see [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox) — **plus** the a006 OS-level sandbox credential toggles `os_hide` / `engine_deny` (both default ON) and the `allow_unsandboxed` no-mechanism opt-in (default `false`, daemon-wide). See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. Operators with override templates MAY mention `query_canonical_specs` (a21 — see `canonical_rag:`) in their prompt OR ignore the new tool entirely; the tool stays registered regardless. |
 | `perma_stuck_after_failures`| no       | `2`           | Consecutive Failed iterations after which a change is marked perma-stuck. See [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). A value of `0` is clamped to `1` with a WARN log at startup. |
@@ -691,6 +692,24 @@ features:
 **Default behaviour.** Omitting the `features.issues` block (or the entire `features:` parent block) is equivalent to `enabled: false` — the lane is off.
 
 **Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; enabling the issues lane requires a daemon restart. Public ingestion additionally needs `gh` authenticated on the host; on a failed read a WARN logs and the pass proceeds.
+
+### `features.octopus_guide` {#featuresoctopusguide}
+
+Config for the in-repo agent guide. When enabled (the default), the daemon provisions a committed `OCTOPUS.md` plus an `AGENTS.md` reference into the repository through its normal push + pull-request flow, idempotently, honoring `auto_submit_pr`. See [OPERATIONS.md → In-repo agent guide](OPERATIONS.md#octopus-guide) for the workflow.
+
+```yaml
+features:
+  octopus_guide:
+    enabled: true                 # default TRUE; set false to opt this repo out
+```
+
+| Field     | Type   | Default | Description                                                                                                                                                                                                 |
+|-----------|--------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled` | `bool` | `true`  | Master switch for guide provisioning. When `false` the daemon writes neither `OCTOPUS.md` nor `AGENTS.md` and opens no bootstrap pull request for them — for a repo where metafiles are unwelcome.          |
+
+**Default behaviour.** Omitting the `features.octopus_guide` block (or the entire `features:` parent block) is equivalent to `enabled: true` — the guide is provisioned for every managed repository.
+
+**Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; toggling guide provisioning requires a daemon restart.
 
 
 ## `canonical_rag:` (optional)

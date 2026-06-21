@@ -373,7 +373,7 @@ fn should_stop_after_commit_check(
 /// Run the reviewer step (skip-decision, agentic/oneshot review, revision
 /// partitioning) and return the review report, draft flag, and taken
 /// reviewer-revision concerns. Extracted from `execute_one_pass` (a68 split).
-async fn run_reviewer_step(
+pub(crate) async fn run_reviewer_step(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
@@ -459,19 +459,20 @@ async fn run_reviewer_step(
                             Ok(crate::code_reviewer::AgenticReviewOutcome::Discarded {
                                 reason,
                             }) => {
+                                // gatekeepers-fail-closed: a discarded review is a
+                                // VISIBLE non-passing state, never a silent omission.
+                                // Render a `## Code Review: FAILED TO RUN` section
+                                // (advisory — never blocks) instead of returning no
+                                // report (which omitted the section entirely).
                                 tracing::error!(url = %repo.url, "agentic reviewer discarded: {reason}");
                                 post_reviewer_discarded_alert(chatops_ctx, repo, &reason).await;
-                                (None, false, Vec::new())
+                                (Some(reviewer_failed_to_run_report(&reason)), false, Vec::new())
                             }
                             Err(e) => {
-                                tracing::error!(url = %repo.url, "agentic reviewer failed: {e:#}");
-                                post_reviewer_discarded_alert(
-                                    chatops_ctx,
-                                    repo,
-                                    &format!("agentic reviewer failed: {e}"),
-                                )
-                                .await;
-                                (None, false, Vec::new())
+                                let reason = format!("agentic reviewer failed: {e}");
+                                tracing::error!(url = %repo.url, "{reason:#}");
+                                post_reviewer_discarded_alert(chatops_ctx, repo, &reason).await;
+                                (Some(reviewer_failed_to_run_report(&reason)), false, Vec::new())
                             }
                         }
                     }
@@ -656,6 +657,25 @@ pub(crate) fn seed_ledger_from_processed(
 /// shows, for each verifier gate AND the reviewer: identifier, model, verdict.
 /// The reviewer is a separate quality check (not a verifier gate), so it is
 /// appended as its own row beneath the three gate rows.
+/// Build the VISIBLE failed-to-run reviewer report for a discarded/errored
+/// agentic review. Per the gatekeepers-fail-closed standard the reviewer (a
+/// gatekeeper) must render an explicit failed-to-run result rather than omit
+/// its section: the `## Code Review: FAILED TO RUN` markdown lands in the PR
+/// body AND the `FailedToRun` verdict drives the gate-ledger reviewer line.
+/// Advisory — it carries no concerns AND is not a `Block`, so it never drafts
+/// or blocks the PR.
+pub(crate) fn reviewer_failed_to_run_report(reason: &str) -> ReviewReport {
+    ReviewReport {
+        verdict: ReviewVerdict::FailedToRun,
+        markdown: format!(
+            "## Code Review: FAILED TO RUN\n\n{reason}\n\n_The reviewer could not produce a verdict, so this PR was NOT reviewed (advisory — the reviewer never blocks). Re-run the review once the cause is resolved._\n"
+        ),
+        concerns: Vec::new(),
+        per_change_sections: Vec::new(),
+        attribution: None,
+    }
+}
+
 pub(crate) fn render_gate_verdicts_with_reviewer(
     ledger: &crate::gate_ledger::GateLedger,
     review_report: Option<&ReviewReport>,
@@ -666,6 +686,7 @@ pub(crate) fn render_gate_verdicts_with_reviewer(
             ReviewVerdict::Pass => "PASS",
             ReviewVerdict::Concerns => "CONCERNS",
             ReviewVerdict::Block => "BLOCK",
+            ReviewVerdict::FailedToRun => "FAILED TO RUN",
         };
         out.push_str("- reviewer ");
         out.push_str(verdict);

@@ -152,9 +152,44 @@ autocoder audit run --workspace /path/to/checkout --audit architecture_advisor
 
 **Daemon-present path.** The CLI probes for the control socket at `/tmp/autocoder/control/control.sock`. When the socket is reachable, the CLI sends a `queue_audit` action with the workspace path; the daemon resolves the workspace to a managed repo and appends the audit-type to that repo's `pending_audit_runs` queue. The CLI prints the daemon's ack (`✓ Queued <audit> for <url>. Will run on the next polling iteration (~Nm).`) and exits 0. When the workspace is NOT in the daemon's repo list, the CLI prints an error naming the workspace and the daemon's known repos and exits non-zero — the CLI does NOT fall back to standalone mode in that case, because the daemon owns the workspace's lifecycle when present and a standalone invocation would race the daemon.
 
-**Daemon-absent path.** When the socket is missing or refusing connections, the CLI builds a minimal audit registry, looks up the audit by name, constructs an in-memory `RepositoryConfig` whose `local_path` is `--workspace`, and invokes the audit's `run` directly. Findings (and any other outcome variant) are printed to stdout. This path skips the post-hoc write-policy enforcement the scheduler does, so use it only against a workspace you control and intend to inspect by hand.
+**Daemon-absent path.** When the socket is missing or refusing connections, the CLI builds a minimal audit registry, looks up the audit by name, constructs an in-memory `RepositoryConfig` whose `local_path` is `--workspace`, and invokes the audit's `run` directly. Findings (and any other outcome variant) are printed to stdout. Before invoking the audit the CLI stands up the in-process submission transport (the same listener `verify` uses), so a submission-based advisory audit (`architecture_advisor`, `drift_audit`, `documentation_audit`, the canon-contradiction audit) captures its `submit_findings` verdict instead of erroring "no submit_findings submission" — these audits work daemon-absent. This path skips the post-hoc write-policy enforcement the scheduler does, so use it only against a workspace you control and intend to inspect by hand.
 
 Exit codes: 0 on success (queue ack OR standalone success), non-zero on any error (unknown audit, daemon refused the request, audit `run` errored, …).
+
+## `verify`
+
+Run the pre-executor verifier gates — `[in]` (change-internal), `[canon]` (change-vs-canonical), `[rules]` (change-vs-global-rules) — locally on a working-tree change, BEFORE pushing, so you learn whether the change would pass the server gates without a remote round-trip.
+
+```bash
+# Run, in the repository root, the gates ENABLED in config against a change.
+autocoder verify add-widget-endpoint
+
+# Run every spec-checking gate regardless of its enabled state.
+autocoder verify add-widget-endpoint --all
+
+# Run a named subset.
+autocoder verify add-widget-endpoint --gate in,canon
+
+# Point at an explicit config (e.g. the check-only spec-box config).
+autocoder verify add-widget-endpoint --config ~/.config/autocoder/verify.yaml
+```
+
+`verify` runs in the current working directory's repository, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It is a new invocation surface for the *exact* gate checks the server runs: the same check entry points, prompts, per-gate model config (`executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, `executor.global_rules_check_llm`), submission schemas, and the unified `executor.agentic_session_timeout_secs`. Because it reuses the gate logic rather than approximating it, a change `verify` reports clean is not subsequently kicked back by that same server gate (absent canon drift since the local run).
+
+`verify` does NOT run the executor, write `.needs-spec-revision.json`, or edit any spec or source file. The only artifacts it touches are transient run artifacts (`.mcp.json`, the control socket) which it cleans up on exit.
+
+**Gate selection.** With no selector, `verify` runs exactly the gates enabled in config (so its verdict matches what the server enforces). `--all` runs every realized spec-checking gate; `--gate <list>` runs the named subset (`in`, `canon`, `rules`). An unknown gate name is an error, not a silent skip.
+
+**Exit codes (fail-closed, no manufactured pass).** `0` only when every gate that ran is clean; `1` when any gate finds a contradiction OR an enabled gate cannot run (model unconfigured, transport error, no submission captured) — `verify` reports "gate could not run" and never reports clean for a gate that did not actually evaluate; `2` when no spec-checking gate is enabled and no selector forces one (`verify` reports that no gate evaluated the change and exits non-zero rather than manufacturing a clean pass).
+
+**Check-only install on a spec-box.** `verify` is a subcommand of the autocoder binary, so it ships the identical logic the server runs. To run it on a low-powered spec-authoring machine without building from source or running the daemon, use the check-only installer, which fetches the prebuilt binary and drops a minimal config carrying only the three gate model blocks, their enabled flags, and the global-rule corpus location:
+
+```bash
+./install-verify.sh           # latest release
+./install-verify.sh --version v0.5.0
+```
+
+`verify` is the LOCAL accelerator; the server gates remain the fail-closed enforcement (they run against fresher canon at implement time and cover every contributor). They are feedback vs. enforcement, not redundant.
 
 ## `changelog`
 

@@ -487,7 +487,7 @@ The reviewer SHALL assemble its prompt using the single-pass substitution helper
 ### Requirement: Agentic reviewer mode
 The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic`. The `reviewer.kind` field SHALL default to `agentic`: now that the `opencode` strategy makes the agentic path provider-agnostic (a60), agentic is the preferred default for every provider, not only Anthropic-shaped ones. The `oneshot` HTTP path (governed by the **AI-driven code-quality review** requirement) remains available as an explicit opt-in AND as the automatic startup fallback described below. In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
 
-The agentic session SHALL run in a read-only sandbox whose CLI tool permissions are `["Read", "Glob", "Grep"]` ONLY — NO `Bash`, NO `Write`, NO `Edit` — plus the `submit_review` MCP tool, with `ORCH_MCP_ROLE = reviewer`. The rendered prompt SHALL carry the change briefs, the unified diff, AND the list of changed file paths; it SHALL NOT pre-dump full file contents — the agent reads whatever files it needs via `Read`. Because there is no touched-file pre-dump, `reviewer.prompt_budget_chars` does NOT apply in agentic mode AND no `## Skipped (budget exhausted)` truncation occurs.
+The agentic session SHALL run in a read-only sandbox whose CLI tool permissions are `["Read", "Glob", "Grep"]` ONLY — NO `Bash`, NO `Write`, NO `Edit` — plus the `submit_review` MCP tool, with `ORCH_MCP_ROLE = reviewer`. The rendered prompt SHALL carry the review surface: for a DIFF-BASED review (the per-pass review, OR an on-demand review of a PR or commit) the change briefs, the list of changed file paths, AND a REFERENCE to the unified diff as a READABLE ARTIFACT — a path within the read-only sandbox that the agent `Read`s on demand — rather than the inlined diff body; for an on-demand TARGET review (a file, a file-set, OR a described area, with no diff) the operator's stated review focus AND the target file-path list IN PLACE OF a diff. In either case the prompt SHALL NOT pre-dump full file contents NOR inline the full diff — the agent reads whatever files AND diff hunks it needs via `Read`. Because neither file contents nor the diff are pre-dumped, the prompt size is bounded by the briefs AND path list regardless of diff size, `reviewer.prompt_budget_chars` does NOT apply in agentic mode, AND no `## Skipped (budget exhausted)` truncation occurs — nothing is dropped; the full diff remains available via the artifact. The diff artifact SHALL live where the read-only sandbox can reach it AND SHALL be cleaned up after the session (it is not committed AND does not dirty the worktree).
 
 The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule.
 
@@ -503,11 +503,17 @@ When the effective reviewer kind is `agentic` (whether defaulted OR set explicit
 - **THEN** the session is spawned through `agentic_run` with a sandbox whose CLI tool permissions are exactly `["Read", "Glob", "Grep"]` plus the `submit_review` MCP tool, AND `ORCH_MCP_ROLE = reviewer`
 - **AND** `Bash`, `Write`, AND `Edit` are NOT permitted
 
-#### Scenario: Reads files on demand with no budget truncation
+#### Scenario: Reads files and diff on demand with no budget truncation
 - **WHEN** the agentic reviewer renders its prompt from a `ReviewContext`
-- **THEN** the prompt contains the change briefs, the unified diff, AND the changed-file path list, but NOT the full contents of those files
-- **AND** the agent obtains file context by calling `Read` during the session
+- **THEN** the prompt contains the change briefs, the changed-file path list, AND a reference to the unified-diff artifact, but NOT the inlined diff body AND NOT the full contents of the changed files
+- **AND** the agent obtains the diff AND file context by calling `Read` during the session
 - **AND** `reviewer.prompt_budget_chars` is NOT consulted AND no `## Skipped (budget exhausted)` footer is produced
+
+#### Scenario: A large diff does not overflow the prompt
+- **WHEN** a pass produces a unified diff far larger than the reviewer model's context budget
+- **THEN** the diff is NOT inlined into the prompt; the prompt's size is bounded by the change briefs AND the changed-file path list plus the artifact reference
+- **AND** the full diff remains available to the agent via `Read` of the artifact, so nothing is truncated
+- **AND** the agent decides how much diff AND file context to pull (the whole diff, specific hunks, OR the changed files directly)
 
 #### Scenario: Verdict and concerns return via submit_review
 - **WHEN** the agentic reviewer finishes its analysis
@@ -537,6 +543,12 @@ When the effective reviewer kind is `agentic` (whether defaulted OR set explicit
 - **WHEN** `reviewer.kind: oneshot` is set explicitly
 - **THEN** the reviewer uses the HTTP one-shot path AND no agentic session is spawned
 - **AND** no fallback WARN fires (the operator chose `oneshot` deliberately)
+
+#### Scenario: Reviews a target file-set with no diff
+- **WHEN** the agentic reviewer is invoked on a TARGET review surface (a file-set OR a described area) carrying no unified diff
+- **THEN** the rendered prompt carries the operator's review focus AND the target file-path list in place of a diff
+- **AND** the agent reads those files on demand via `Read` AND returns its verdict via `submit_review` exactly as in the diff-based case
+- **AND** the same `ReviewResult` shape is produced
 
 ### Requirement: Reviewer flags files and functions that breach the size brightline
 The code-reviewer SHALL add an advisory, non-blocking size observation to its `ReviewReport.markdown` when the pass under review pushes a changed file or function past a size threshold, OR grows one that is already past it. For each file in the `ReviewContext`'s changed-files set, the reviewer SHALL determine, from the file's contents AND the unified diff, (a) whether the file — or a function within it — exceeds the file-size OR function-size threshold, AND (b) whether this pass added net lines to that file or function. When BOTH hold, the report SHALL note the path, the resulting line count, AND — for whole-file findings where test-only regions are identifiable — the production/test split. The file-size AND function-size targets are those defined by the `Source files and functions stay within a size budget` requirement — its single canonical home — which this requirement references rather than restating any numbers.
@@ -638,4 +650,32 @@ The populated per-change path is unchanged: when the split yields one or more su
 - **WHEN** `reviewer.mode` is `per_change` AND the split yields one or more per-change sub-contexts
 - **THEN** each sub-context is reviewed and the results are synthesized as before
 - **AND** no bundled fallback occurs
+
+### Requirement: Issue-lane passes are code-reviewed like change passes
+A polling pass that produces issue-lane commits — a worked issue whose fix-plus-archive commit rides the pass's push and PR — SHALL run the code reviewer over that work, exactly as a pass that processed a change does. An issue pass SHALL NOT be treated as an audit-only pass (one that only writes spec proposals, validated separately, and is not code-reviewed): an issue carries real code changes, so its PR SHALL receive an automatic code review like any change PR, without requiring an operator to trigger it.
+
+The reviewer step's skip SHALL be scoped to passes with no reviewable code: a pass that processed NEITHER a change NOR an issue (a genuinely audit-only pass, or one that produced nothing) skips the reviewer as before. A pass that processed an issue — alone OR alongside a change — runs the reviewer. This upholds the principle of the `Per-change review falls back to bundled when the change set is empty` requirement (a PR whose context carries a non-empty diff reaches the reviewer rather than skipping the call; no verdict is produced without a completed review) and the gatekeepers-fail-closed posture (code does not ship unreviewed by default).
+
+For an issue pass, the reviewer's brief — the role the archived-change brief plays for a change pass — SHALL be the worked issue's `issue.md` AND `tasks.md`, read from the issue's archive entry, so the reviewer has the issue's intent AND acceptance criteria as context alongside the diff and changed files. When a pass processes both a change AND an issue, the reviewer's context SHALL include both the change brief(s) AND the issue brief(s).
+
+This requirement adds the issue case to the reviewer's scope. It does NOT redefine the change-pass behavior, the reviewer transport (oneshot OR agentic), the verdict/concern handling, the `submit_review` contract, `reviewer.mode` dispatch, the per-PR caps, OR the fail-closed no-submission handling — those are exactly as the existing reviewer requirements specify, applied to the issue pass.
+
+#### Scenario: An issue-only pass is reviewed, not skipped
+- **WHEN** a pass produces only issue-lane commits (a worked issue, no processed change)
+- **THEN** the reviewer runs over the pass's diff AND changed files (a completed reviewer invocation occurs), via the configured transport
+- **AND** the emitted verdict comes from that review, NOT skipped as if the pass were audit-only
+
+#### Scenario: The reviewer's context carries the issue's brief
+- **WHEN** the reviewer runs for an issue pass
+- **THEN** its context includes the worked issue's `issue.md` AND `tasks.md`, read from the issue's archive entry, as the brief the reviewer would otherwise build from a change's archive entry
+- **AND** the issue's diff AND changed files reach the reviewer as for any reviewed pass
+
+#### Scenario: A pass with no reviewable code still skips the reviewer
+- **WHEN** a pass processed neither a change nor an issue (audit-only, or nothing)
+- **THEN** the reviewer is skipped (there is no implementer-produced code to review)
+
+#### Scenario: A mixed change-and-issue pass reviews both
+- **WHEN** a pass produces both a processed change AND a worked issue
+- **THEN** the reviewer runs AND its context includes both the change brief(s) AND the issue brief(s)
+- **AND** the verdict is derived from a completed review of the pass's combined diff
 

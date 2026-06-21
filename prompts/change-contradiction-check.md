@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are checking a single OpenSpec change for internal contradictions: requirements within this change that cannot all hold simultaneously. The change's spec-delta files (ADDED + MODIFIED + REMOVED + RENAMED blocks across every capability the change touches) are listed below; read each one with the `Read` tool.
 
 A contradiction is when honoring requirement A would prevent honoring requirement B. Examples:

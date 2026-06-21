@@ -539,6 +539,7 @@ async fn transient_error_does_not_increment_counter() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     let github_cfg = GithubConfig {

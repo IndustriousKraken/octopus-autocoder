@@ -334,6 +334,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -392,6 +393,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -457,6 +459,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                     prompt_template,
                     attribution: Some(attribution),
                     retries: cfg.executor.verifier_gate_retries,
+                    timeout: cfg.executor.agentic_session_timeout(),
                     corpus_dir,
                     #[cfg(test)]
                     test_submission: None,
@@ -516,6 +519,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 prompt_template,
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
+                timeout: cfg.executor.agentic_session_timeout(),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -551,7 +555,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
-                .context("initializing code reviewer from config")?;
+                .context("initializing code reviewer from config")?
+                // Reviewer shares the ONE auxiliary-session timeout
+                // (`executor.agentic_session_timeout_secs`) with the verifier
+                // gates AND the revision sessions; the reviewer block does not
+                // carry the executor field, so it is threaded here.
+                .with_agentic_session_timeout(cfg.executor.agentic_session_timeout());
             // a64: when the effective kind is `agentic` but the resolved
             // reviewer CLI is unavailable on this host, degrade to the
             // `oneshot` HTTP path for the boot (one loud WARN logged inside).
@@ -877,6 +886,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         global_rules_ctx: global_rules_ctx.clone(),
         code_implements_spec_ctx: code_implements_spec_ctx.clone(),
         issues_ctx: issues_ctx.clone(),
+        octopus_guide_enabled: cfg.features.octopus_guide.enabled,
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
@@ -977,34 +987,22 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         submission_store: crate::submission_store::SubmissionStore::new(),
         paths: daemon_paths.clone(),
     };
-    // a57: register the advisory audits' `submit_findings` payload schemas
-    // on the shared submission store BEFORE the listener starts handling
-    // `record_submission`, so the MCP child's submissions are validated
-    // against the role's finding schema.
-    crate::audits::register_submission_schemas(&control_state.submission_store);
-    // a58: register the agentic reviewer's `submit_review` payload schema on
-    // the same store so the reviewer MCP child's submissions are validated.
+    // Register the gate (`[in]`/`[canon]`/`[rules]`) AND advisory-audit
+    // `submit_*` payload schemas on the shared submission store BEFORE the
+    // listener starts handling `record_submission`, so the MCP child's
+    // submissions are validated against the role's schema. This is the SAME
+    // schema set `control_socket::spawn_submission_listener` registers for
+    // the daemon-absent `verify` / standalone-audit paths (single source).
+    control_socket::register_gate_and_audit_submission_schemas(
+        &control_state.submission_store,
+    );
+    // a58: the agentic reviewer's `submit_review` schema AND a63: the `[out]`
+    // gate's `submit_verdict` schema are daemon-only (neither runs under
+    // `verify` / standalone audit), so they are registered here, not in the
+    // shared helper.
     crate::code_reviewer::register_reviewer_submission_schema(
         &control_state.submission_store,
     );
-    // a59: register the contradiction check's `submit_contradictions` payload
-    // schema on the same store so its MCP child's submissions are validated.
-    crate::preflight::change_contradiction::register_contradiction_submission_schema(
-        &control_state.submission_store,
-    );
-    // a62: register the `[canon]` gate's `submit_canon_contradictions` payload
-    // schema on the same store so its MCP child's submissions are validated.
-    crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(
-        &control_state.submission_store,
-    );
-    // global-rules-gate: register the `[rules]` gate's `submit_rule_violations`
-    // payload schema on the same store so its MCP child's submissions are
-    // validated.
-    crate::preflight::global_rules::register_rule_violations_submission_schema(
-        &control_state.submission_store,
-    );
-    // a63: register the `[out]` gate's `submit_verdict` payload schema on the
-    // same store so its MCP child's submissions are validated.
     crate::code_implements_spec::register_code_implements_spec_submission_schema(
         &control_state.submission_store,
     );
@@ -1216,6 +1214,12 @@ struct SpawnDeps {
     code_implements_spec_ctx:
         Option<Arc<crate::code_implements_spec::CodeImplementsSpecCheckCtx>>,
     issues_ctx: Option<Arc<crate::lanes::gate::IssuesLaneContext>>,
+    /// GLOBAL `features.octopus_guide.enabled` default (ENABLED out of the
+    /// box). The fleet-wide fallback: each per-repo polling task resolves its
+    /// EFFECTIVE value as `repo.octopus_guide.unwrap_or(this)` and binds THAT
+    /// via `crate::octopus_guide::scope`, so the pass's guide-provisioning step
+    /// reads the per-repo effective value through `octopus_guide::enabled()`.
+    octopus_guide_enabled: bool,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
@@ -1256,6 +1260,14 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 crate::polling_loop::pending_audit_runs_basename(&workspace_for_load);
             crate::polling_loop::load_pending_audit_runs(&deps.paths, &basename)
         };
+        // Resolve the EFFECTIVE guide-provisioning flag for THIS repository
+        // before `repo` is moved into the config holder: the per-repo
+        // `octopus_guide` override wins, falling back to the global
+        // `features.octopus_guide.enabled` default carried in `deps`. This
+        // lets an operator disable the guide for one repo while the fleet
+        // default leaves others enabled.
+        let octopus_guide_enabled_for_task =
+            repo.octopus_guide.unwrap_or(deps.octopus_guide_enabled);
         let child_cancel = deps.global_cancel.child_token();
         let config_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
@@ -1411,7 +1423,14 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             // Issues lane gate (a009): bind the `features.issues` context
             // for the whole polling future; the pass reads it via
             // `lanes::gate::current()`. `None` (disabled) → lane inactive.
-            crate::lanes::gate::scope(issues_ctx_for_task, out_scoped).await;
+            let issues_scoped =
+                crate::lanes::gate::scope(issues_ctx_for_task, out_scoped);
+            // In-repo guide gate (`octopus-md-agent-guide`): bind the per-repo
+            // EFFECTIVE flag (`repo.octopus_guide` override, else the global
+            // `features.octopus_guide.enabled` default — resolved above before
+            // `repo` was moved) for the whole polling future; the pass's
+            // provisioning step reads it via `octopus_guide::enabled()`.
+            crate::octopus_guide::scope(octopus_guide_enabled_for_task, issues_scoped).await;
             {
                 let mut guard = map_for_task.lock().unwrap();
                 // Identity-guarded self-removal: remove ONLY the entry this task
@@ -2191,6 +2210,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }
@@ -2215,6 +2235,7 @@ mod tests {
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         }
     }

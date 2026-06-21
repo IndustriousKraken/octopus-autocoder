@@ -1096,6 +1096,8 @@ The default prompts shipped under `prompts/` run against any managed repository,
 
 `openspec validate --strict` is the one tool every managed repository shares — every managed repo uses OpenSpec — AND MAY be named directly. Worked examples in prompts SHALL use language-neutral phrasing (e.g. "the project's test command") rather than a concrete toolchain invocation. Multi-language enumerations (e.g. a list of source-file extensions across many languages) are already neutral AND are permitted.
 
+The default prompts SHALL each direct the agent to read `OCTOPUS.md` at the repository root when it is present, for the in-repo workflow protocols (the issues format, the OpenSpec change format, the canon/archive ownership rules, AND the gate model). The directive SHALL be a graceful no-op when `OCTOPUS.md` is absent, AND SHALL NOT depend on any particular default-prompt set: a prompt added later carries the same directive. This requirement does NOT mandate that the prompts stop restating the protocols they need inline; OCTOPUS.md is an additional in-repo reference, not a single source the prompts render from.
+
 This is design intent for prompt content, verified by review AND the drift audit's semantic judgment — NOT by a unit test asserting prompt wording (per the requirement `Tests assert behavior or derivation, never message wording`). A negative "no prompt contains `cargo`" scanner would be both unenumerable across all languages AND the prohibited wording-assertion category; the drift audit makes the judgment instead.
 
 A future change MAY add a per-repository tooling-config block that injects the exact lint/test/format commands into prompts via placeholders. This requirement establishes the language-neutral default in the meantime.
@@ -1111,6 +1113,11 @@ A future change MAY add a per-repository tooling-config block that injects the e
 - **WHEN** the drift audit reads this requirement against the prompt
 - **THEN** the command is reported as a finding: the prompt assumes a specific toolchain that does not apply to all managed repositories
 - **AND** the disposition is to replace it with language-neutral guidance, NOT to special-case the prompt per language
+
+#### Scenario: Each default prompt points the agent to OCTOPUS.md when present
+- **WHEN** the default prompts under `prompts/` are reviewed against this requirement (by a human reviewer OR the drift audit)
+- **THEN** each directs the agent to read `OCTOPUS.md` at the repository root when present, for the in-repo workflow protocols
+- **AND** the directive is a graceful no-op when `OCTOPUS.md` is absent, so a prompt run against a repo without one is unaffected
 
 ### Requirement: Source files and functions stay within a size budget
 The project SHALL treat source-file AND function length as a maintainability budget, not merely a metric an audit happens to report. A source file SHOULD stay at or under a target of roughly **500 lines** AND a function at or under roughly **50 lines**. These are judgment targets, NOT hard caps: genuinely cohesive, single-responsibility code MAY exceed them when splitting would add indirection without reducing complexity — the test is cohesion, not the line count.
@@ -1170,6 +1177,11 @@ This invariant SHALL hold by inspection — so the periodic `drift_audit` AND th
 - **The action on error follows the gatekeeper's role, but none is silent-pass.** A BLOCKING gatekeeper SHALL NOT let the gated work proceed as if it passed: it holds the work in an explicit failed-to-run state an operator clears (distinct from a "found a problem" verdict). An ADVISORY gatekeeper SHALL render an explicit "failed to run" result rather than omit its output OR report success.
 - **Transient-failure tolerance is bounded retry, NOT fail-open.** Where a gatekeeper retries transient failures to avoid wedging on a blip, it SHALL — after exhausting the retry bound — enter the errored state, never pass.
 
+The clauses above forbid turning an inability to run into a pass. A gatekeeper whose verdict is a matter of judgment SHALL delegate that judgment to an agent AND SHALL NOT manufacture the verdict in code — a manufactured verdict is fail-open even when nothing errored:
+
+- **The verdict is the agent's, surfaced verbatim — the code synthesizes none.** For a gatekeeper that delegates judgment to an agent, the code's responsibilities are exactly: initialize to the non-passing state, assemble the inputs (prompt + materials), invoke the agent, AND surface the agent's returned verdict. No code path SHALL derive, infer, OR short-circuit the verdict by inspecting the inputs — a code-authored conclusion such as "the materials to evaluate are absent, so this passes" is a manufactured pass, NOT a judgment, even though no error occurred. When a genuine agent evaluation is not possible, the outcome is the failed-to-run state (per the clauses above), NEVER a synthesized pass.
+- **The agent is never presented an option set that forecloses failure.** The verdict mechanism (the MCP submission tool's schema, AND the prompt that frames it) SHALL let the agent express a FAILING verdict with its own words ALONE. Structured detail (gap lists, concern arrays) MAY accompany a verdict but SHALL NEVER be a precondition for returning a failing verdict. A prompt OR schema constructed so that pass is the only expressible answer is fail-open by construction.
+
 A developer-facing standards doc SHALL record this invariant so contributors apply it to new gatekeepers.
 
 #### Scenario: A gatekeeper that cannot run does not pass
@@ -1191,6 +1203,16 @@ A developer-facing standards doc SHALL record this invariant so contributors app
 - **WHEN** a gatekeeper initializes a verdict OR aggregates a verdict over zero evaluated items
 - **THEN** the initial / default / zero-item result is a non-passing state (blocked / errored / unknown)
 - **AND** no code path yields approve / pass from a default OR from zero evaluated items
+
+#### Scenario: The code does not synthesize a verdict from the inputs
+- **WHEN** an agent-backed gatekeeper could reach a verdict by inspecting its inputs in code (for example, the materials to evaluate are missing or empty)
+- **THEN** the code does NOT emit a pass / approve from that inspection
+- **AND** the verdict comes only from the agent's evaluation, OR — when no genuine evaluation is possible — the outcome is the failed-to-run state, never a synthesized pass
+
+#### Scenario: The agent can always return a failing verdict
+- **WHEN** an agent-backed gatekeeper invokes its agent
+- **THEN** the verdict mechanism accepts a failing verdict accompanied by the agent's prose ALONE, with no structured detail required
+- **AND** no prompt OR schema constraint makes pass the only expressible verdict
 
 ### Requirement: Global rules are authored as minimal prose, not contract language
 The global rule corpus SHALL be a collection of project-agnostic rules that the `[rules]` gate checks changes against. Each rule SHALL be authored as minimal prose, deliberately NOT in OpenSpec's contract language: there are NO `SHALL`/`MODIFY`/`ADD`/`REMOVE`/`RENAME` deltas, NO scenarios, NO task lists, AND NO archive/compose step. A rule is interpreted by judgment, not algorithm; contract keywords add authoring friction without adding checkability, since the gate's model judges the prose directly.
@@ -1217,4 +1239,36 @@ The corpus MAY be a flat collection OR grouped into registers of related rules. 
 - **WHEN** the corpus is small
 - **THEN** the gate feeds all rules to its session
 - **AND** the format supports grouping into registers and later relevant-subset selection without changing the rule shape
+
+### Requirement: Managed repos carry a committed OCTOPUS.md agent guide
+A repository under management SHALL carry an `OCTOPUS.md` at the repository root — the conventional spot an agent guide occupies — that states the in-repo workflow protocols for any agent OR human working in the repo. Its audience is everyone who is NOT autocoder's own gated agents: a coding assistant or speccing agent run directly on the repo, AND human teammates. For autocoder's own agents the same rules are enforced by the verifier gates AND the session sandbox; OCTOPUS.md documents them but does not replace that enforcement.
+
+OCTOPUS.md SHALL be **committed into the managed repository**, not merely present in the local workspace, so it is visible to readers who never check out autocoder's agent branch. This is the inverse of autocoder's per-workspace bookkeeping files, which are kept OUT of version control via `.git/info/exclude`.
+
+OCTOPUS.md SHALL state, at minimum, the following protocols, reflecting current canon (it MAY link to the fuller OpenSpec documentation for readers with web access):
+
+- **Issues protocol.** An issue is a correction (a fix to code that is already correctly specified) that carries NO spec delta. It takes ONE of two on-disk forms: a single file `issues/<slug>.md` (the default — a description and an optional `## Tasks` checklist) OR a directory `issues/<slug>/` (containing `issue.md` AND `tasks.md`, required when the unit must carry a separate artifact such as a quarantined public report body). Neither form contains a `specs/` directory.
+- **OpenSpec change protocol.** A change lives in `openspec/changes/<slug>/` with a `proposal.md`, a `tasks.md`, an optional `design.md`, AND spec deltas at `specs/<capability>/spec.md` using `## ADDED`/`## MODIFIED`/`## REMOVED`/`## RENAMED Requirements` blocks. A `MODIFIED` block reproduces the canonical requirement's title EXACTLY AND retains every existing scenario (a dropped scenario silently deletes canon at archive). A change MUST pass `openspec validate --strict`.
+- **Canon and archive ownership.** The canonical specs under `openspec/specs/` AND the archive under `openspec/changes/archive/` are autocoder-owned: a session writes only its own change/issue planning artifacts AND code; it never edits canon directly NOR runs `openspec archive`. Autocoder folds a change's deltas into canon at archive, after the change is merged.
+- **The gate model.** A change passes through gatekeepers that fail closed: `[in]` (the change does not contradict itself), `[canon]` (the change does not contradict canon unless it explicitly modifies the contradicted requirement), `[rules]` (the change conforms to the global rules), AND `[out]` (the merged code implements the spec). An inability to run a gate is a non-passing outcome, never a pass.
+
+OCTOPUS.md SHALL be discoverable via the `AGENTS.md` convention: the repository's `AGENTS.md` SHALL reference OCTOPUS.md, without clobbering any existing `AGENTS.md` content the repository already carries.
+
+#### Scenario: A managed repo carries a committed OCTOPUS.md
+- **WHEN** a repository is under management
+- **THEN** an `OCTOPUS.md` exists at the repository root AND is committed into the repository (not merely present in the local workspace)
+- **AND** it states the issues protocol, the OpenSpec change protocol, the canon/archive ownership rules, AND the gate model
+
+#### Scenario: OCTOPUS.md states the canon/archive ownership rule
+- **WHEN** an agent reads OCTOPUS.md before planning work
+- **THEN** it is told that `openspec/specs/` AND the archive are autocoder-owned — a session writes only its own change/issue artifacts AND code, never edits canon directly, AND never runs `openspec archive` (autocoder folds the delta at archive, after merge)
+
+#### Scenario: OCTOPUS.md describes the two issue forms and the no-spec-delta rule
+- **WHEN** an agent reads OCTOPUS.md's issues section
+- **THEN** it learns that an issue is either a single file `issues/<slug>.md` OR a directory `issues/<slug>/` (with `issue.md` AND `tasks.md`), carries no spec delta, AND never contains a `specs/` directory
+
+#### Scenario: Discoverable via AGENTS.md without clobbering it
+- **WHEN** a repository already has its own `AGENTS.md`
+- **THEN** the `AGENTS.md` reference to OCTOPUS.md is present
+- **AND** the repository's pre-existing `AGENTS.md` content is left intact
 

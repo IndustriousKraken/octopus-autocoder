@@ -1,11 +1,19 @@
 //! Issues-lane artifact loading, validation, AND lifecycle (a009 §2).
 //!
-//! An issue is a directory `issues/<slug>/` containing
-//! `issue.md` (the report + diagnosis AND the acceptance criteria stated
-//! against the EXISTING specification) AND `tasks.md` (the fix steps),
-//! with NO `specs/` directory — that absence is the contract that an
-//! issue changes no spec. A unit that carries a `specs/` directory is
-//! malformed (an issue carries no delta).
+//! An issue takes ONE of two on-disk forms:
+//!   - **Single file** `issues/<slug>.md` — a description plus an OPTIONAL
+//!     `## Tasks` checklist. The default form for a small, curated
+//!     correction. Its per-issue markers are SIBLING files
+//!     (`issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`).
+//!   - **Directory** `issues/<slug>/` containing `issue.md` (the report +
+//!     diagnosis AND the acceptance criteria stated against the EXISTING
+//!     specification) AND `tasks.md` (the fix steps). Required when the
+//!     unit must carry a separate artifact (in particular a quarantined
+//!     public `report-body.md`). Its markers live INSIDE the directory.
+//!
+//! NEITHER form carries a `specs/` directory — that absence is the
+//! contract that an issue changes no spec. A directory unit that carries a
+//! `specs/` directory is malformed (an issue carries no delta).
 //!
 //! The lane lives at the repository root (`issues/`), NOT under
 //! `openspec/`: issues are autocoder's own construct, not an OpenSpec
@@ -24,10 +32,6 @@ use std::path::{Path, PathBuf};
 /// autocoder's own construct, not an OpenSpec artifact, so the lane lives at
 /// the root rather than under `openspec/`.
 pub const ISSUES_SUBDIR: &str = "issues";
-/// Pre-relocation location of the issues lane. A repository that has not yet
-/// been migrated (`git mv openspec/issues issues`) is still served from here
-/// transitionally; see [`issues_dir`]. Removed in a later release.
-const LEGACY_ISSUES_SUBDIR: &str = "openspec/issues";
 const ARCHIVE_DIR: &str = "archive";
 const ISSUE_FILE: &str = "issue.md";
 const TASKS_FILE: &str = "tasks.md";
@@ -45,50 +49,65 @@ const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
 /// (a009) units have no such file AND are not quarantined.
 pub const REPORT_BODY_FILE: &str = "report-body.md";
 
-/// `<workspace>/issues/` — the canonical issues-lane root.
-///
-/// Transitional migration: if the canonical `issues/` directory does not
-/// exist but a pre-relocation `openspec/issues/` directory does, this
-/// resolves to the legacy location (for BOTH read and write) so a repository
-/// that has not yet run `git mv openspec/issues issues` keeps working; a
-/// one-time WARN names the remedy. Once `issues/` exists the legacy path is
-/// ignored, and a fresh repository uses the canonical path. The legacy
-/// fallback is removed in a later release.
+/// `<workspace>/issues/` — the canonical issues-lane root (mirrors `changes/`).
 pub fn issues_dir(workspace: &Path) -> PathBuf {
-    let canonical = workspace.join(ISSUES_SUBDIR);
-    if canonical.exists() {
-        return canonical;
-    }
-    let legacy = workspace.join(LEGACY_ISSUES_SUBDIR);
-    if legacy.is_dir() {
-        warn_legacy_issues_dir_once(&legacy);
-        return legacy;
-    }
-    canonical
+    workspace.join(ISSUES_SUBDIR)
 }
 
-/// Emit a single process-wide WARN the first time the issues lane resolves
-/// to the pre-relocation `openspec/issues/` location, naming the migration.
-fn warn_legacy_issues_dir_once(legacy: &Path) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::warn!(
-            legacy = %legacy.display(),
-            "issues lane resolved to the pre-relocation `openspec/issues/` location; \
-             run `git mv openspec/issues issues` to migrate (the legacy fallback is \
-             removed in a later release)"
-        );
-    });
-}
-
-/// `<workspace>/issues/<slug>/`.
+/// `<workspace>/issues/<slug>/` — the directory-form unit path.
 pub fn issue_dir(workspace: &Path, slug: &str) -> PathBuf {
     issues_dir(workspace).join(slug)
+}
+
+/// `<workspace>/issues/<slug>.md` — the single-file-form unit path.
+pub fn issue_file(workspace: &Path, slug: &str) -> PathBuf {
+    issues_dir(workspace).join(format!("{slug}.md"))
 }
 
 /// `<workspace>/issues/archive/`.
 pub fn archive_root(workspace: &Path) -> PathBuf {
     issues_dir(workspace).join(ARCHIVE_DIR)
+}
+
+/// The two on-disk shapes an issue unit can take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueForm {
+    /// A single file `issues/<slug>.md`; markers are siblings.
+    SingleFile,
+    /// A directory `issues/<slug>/`; markers live inside.
+    Directory,
+}
+
+/// Resolve the on-disk form of `slug` in the active `issues/` tree.
+/// `Some(SingleFile)` when `issues/<slug>.md` exists, `Some(Directory)`
+/// when `issues/<slug>/` exists, `None` when neither does. The directory
+/// form is preferred if (anomalously) both exist, so a unit that carries a
+/// separate artifact is never mistaken for a bare single file.
+pub fn resolve_form(workspace: &Path, slug: &str) -> Option<IssueForm> {
+    if issue_dir(workspace, slug).is_dir() {
+        Some(IssueForm::Directory)
+    } else if issue_file(workspace, slug).is_file() {
+        Some(IssueForm::SingleFile)
+    } else {
+        None
+    }
+}
+
+/// Resolve a per-issue marker path for `slug`, honoring the unit's form:
+/// a sibling `issues/<slug><suffix>` for a single-file issue, OR the
+/// in-directory `issues/<slug>/<dot_name>` for a directory issue. When the
+/// unit is not yet on disk (e.g. resolving a lock path before the unit is
+/// written), the directory form is assumed — the historical default.
+///
+/// `suffix` is the sibling-form filename tail (`.in-progress`,
+/// `.perma-stuck.json`); `dot_name` is the in-directory filename (the same
+/// string — both forms use the leading-dot name, one as a sibling tail and
+/// one as a contained file).
+fn marker_path(workspace: &Path, slug: &str, dot_name: &str) -> PathBuf {
+    match resolve_form(workspace, slug) {
+        Some(IssueForm::SingleFile) => issues_dir(workspace).join(format!("{slug}{dot_name}")),
+        _ => issue_dir(workspace, slug).join(dot_name),
+    }
 }
 
 /// Why an `issues/<slug>/` unit failed to load as a well-formed issue.
@@ -142,10 +161,11 @@ impl LoadedIssue {
     }
 }
 
-/// True when `issues/<slug>/` carries a `specs/` directory (malformed —
-/// an issue carries no delta). [`load`] is the authoritative validator;
-/// this predicate is the standalone check used by callers that only need
-/// the malformed signal.
+/// True when a directory-form `issues/<slug>/` carries a `specs/`
+/// directory (malformed — an issue carries no delta). A single-file issue
+/// can never carry a `specs/` directory, so it is never malformed in this
+/// sense. [`load`] is the authoritative validator; this predicate is the
+/// standalone check used by callers that only need the malformed signal.
 #[allow(dead_code)]
 pub fn is_malformed(workspace: &Path, slug: &str) -> bool {
     issue_dir(workspace, slug).join(SPECS_DIR).is_dir()
@@ -163,19 +183,24 @@ pub struct IssuePermaStuckMarker {
     pub operator_action: String,
 }
 
-/// `issues/<slug>/.perma-stuck.json`.
+/// The park-marker path for `slug`, honoring the unit's form: the sibling
+/// `issues/<slug>.perma-stuck.json` for a single-file issue, OR the
+/// in-directory `issues/<slug>/.perma-stuck.json` for a directory issue.
 fn perma_stuck_marker_path(workspace: &Path, slug: &str) -> PathBuf {
-    issue_dir(workspace, slug).join(PERMA_STUCK_FILE)
+    marker_path(workspace, slug, PERMA_STUCK_FILE)
 }
 
-/// True when `issues/<slug>/` carries a `.perma-stuck.json` park marker —
-/// the presence-only flag [`list_ready`] consults to exclude a parked issue.
+/// True when `slug` carries a `.perma-stuck.json` park marker (in-directory
+/// OR sibling, per its form) — the presence-only flag [`list_ready`]
+/// consults to exclude a parked issue.
 pub fn is_perma_stuck(workspace: &Path, slug: &str) -> bool {
     perma_stuck_marker_path(workspace, slug).exists()
 }
 
-/// Atomically write the park marker for `slug`. The issue directory must
-/// already exist (the caller is parking a unit it just worked).
+/// Atomically write the park marker for `slug`. The issue unit must already
+/// exist (the caller is parking a unit it just worked); the marker is
+/// written in-directory for a directory issue, OR as a sibling for a
+/// single-file issue.
 pub fn write_perma_stuck(
     workspace: &Path,
     slug: &str,
@@ -187,7 +212,12 @@ pub fn write_perma_stuck(
         .parent()
         .with_context(|| format!("park-marker path has no parent: {}", path.display()))?;
     if !parent.is_dir() {
-        anyhow::bail!("issue directory does not exist: {}", parent.display());
+        anyhow::bail!("issue marker parent does not exist: {}", parent.display());
+    }
+    // The unit itself must exist (the directory for a directory issue, the
+    // sibling file for a single-file issue).
+    if resolve_form(workspace, slug).is_none() {
+        anyhow::bail!("issue unit does not exist: {slug}");
     }
     let marker = IssuePermaStuckMarker {
         slug: slug.to_string(),
@@ -205,11 +235,75 @@ pub fn write_perma_stuck(
     Ok(())
 }
 
-/// Load AND validate the `issues/<slug>/` unit. Validation order makes
-/// the malformed-`specs/` case authoritative: a unit with a `specs/`
-/// directory is rejected as malformed even if it also has `issue.md` +
-/// `tasks.md`. Returns the file bodies on success.
+/// Split a single-file issue body into the description AND an optional
+/// `## Tasks` checklist. The `## Tasks` heading (case-insensitive, allowing
+/// leading/trailing whitespace on the heading line) separates the two; the
+/// description is everything before it. When there is no `## Tasks` heading,
+/// the whole body is the description AND the task list is empty.
+fn split_single_file_body(body: &str) -> (String, String) {
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("##") {
+            if rest.trim().eq_ignore_ascii_case("tasks") {
+                // Description is every line before this heading.
+                let desc: Vec<&str> = body.lines().take(idx).collect();
+                // Tasks body is every line AFTER the heading.
+                let tasks: Vec<&str> = body.lines().skip(idx + 1).collect();
+                return (desc.join("\n"), tasks.join("\n"));
+            }
+        }
+    }
+    (body.to_string(), String::new())
+}
+
+/// Split a single-file issue body into `(description, tasks)` for callers
+/// that read an archived single-file unit directly (e.g. the reviewer's
+/// issue brief), mirroring how [`load`] splits an active single-file unit.
+pub fn split_brief(body: &str) -> (String, String) {
+    split_single_file_body(body)
+}
+
+/// Load AND validate the `issues/<slug>` unit in EITHER form. A single-file
+/// `issues/<slug>.md` is read as a description plus an optional `## Tasks`
+/// checklist; a directory `issues/<slug>/` carries `issue.md` + `tasks.md`.
+/// Validation order makes the malformed-`specs/` case authoritative for a
+/// directory unit: it is rejected as malformed even if it also has
+/// `issue.md` + `tasks.md`. Returns the file bodies on success.
 pub fn load(workspace: &Path, slug: &str) -> std::result::Result<LoadedIssue, IssueLoadError> {
+    match resolve_form(workspace, slug) {
+        Some(IssueForm::SingleFile) => load_single_file(workspace, slug),
+        Some(IssueForm::Directory) => load_directory(workspace, slug),
+        None => Err(IssueLoadError::NotFound),
+    }
+}
+
+/// Load a single-file issue `issues/<slug>.md`. A single file can never
+/// carry a `specs/` directory, so it is never malformed; a `## Tasks`
+/// section is the fix-step list. A single-file issue is curated/trusted, so
+/// it carries no quarantined public body.
+fn load_single_file(
+    workspace: &Path,
+    slug: &str,
+) -> std::result::Result<LoadedIssue, IssueLoadError> {
+    let path = issue_file(workspace, slug);
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        tracing::warn!(slug, "reading {} failed: {e}", path.display());
+        IssueLoadError::NotFound
+    })?;
+    let (issue_body, tasks_body) = split_single_file_body(&body);
+    Ok(LoadedIssue {
+        slug: slug.to_string(),
+        issue_body,
+        tasks_body,
+        report_body: None,
+    })
+}
+
+/// Load AND validate the directory-form `issues/<slug>/` unit.
+fn load_directory(
+    workspace: &Path,
+    slug: &str,
+) -> std::result::Result<LoadedIssue, IssueLoadError> {
     let dir = issue_dir(workspace, slug);
     if !dir.is_dir() {
         return Err(IssueLoadError::NotFound);
@@ -254,38 +348,57 @@ pub fn load(workspace: &Path, slug: &str) -> std::result::Result<LoadedIssue, Is
     })
 }
 
-/// List ready issue slugs: direct subdirectories of
-/// `<workspace>/issues/` that are not the `archive` directory,
-/// do not begin with `.`, do not carry an `.in-progress` lock, AND load
-/// as a well-formed issue. A malformed unit (one with a `specs/`
-/// directory) is excluded with a one-line WARN — it is rejected, not
-/// worked. Returned sorted ascending (alphabetical within the lane).
+/// List ready issue slugs in EITHER form. A unit is a top-level
+/// `<slug>.md` FILE OR a non-`archive`, non-`.`-prefixed `<slug>/`
+/// DIRECTORY under `<workspace>/issues/`. The lane's own marker siblings
+/// (`<slug>.in-progress`, `<slug>.perma-stuck.json`) AND any other
+/// non-`.md`, non-directory sibling are ignored — not mistaken for units.
+/// A unit that carries an `.in-progress` lock OR a `.perma-stuck.json`
+/// park marker (in-directory OR sibling, per its form) is skipped. A
+/// malformed directory unit (one with a `specs/` directory) is excluded
+/// with a one-line WARN. Returned sorted ascending (alphabetical).
 pub fn list_ready(workspace: &Path) -> Result<Vec<String>> {
     let root = issues_dir(workspace);
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut slugs: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&root)
         .with_context(|| format!("reading {}", root.display()))?
     {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
         let name = match entry.file_name().into_string() {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if name == ARCHIVE_DIR || name.starts_with('.') {
-            continue;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            // A directory unit: `<slug>/`, excluding `archive` and dotdirs.
+            if name == ARCHIVE_DIR || name.starts_with('.') {
+                continue;
+            }
+            slugs.push(name);
+        } else if let Some(slug) = name.strip_suffix(".md") {
+            // A single-file unit: `<slug>.md`. (Marker siblings end in
+            // `.in-progress` / `.perma-stuck.json`, not `.md`, so they are
+            // ignored here; any other non-`.md` sibling is ignored too.)
+            if slug.is_empty() || slug.starts_with('.') {
+                continue;
+            }
+            slugs.push(slug.to_string());
         }
-        if entry.path().join(shared::LOCK_FILE).exists() {
+        // Every other sibling (marker files, attachments) is ignored.
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for name in slugs {
+        if lock_path(workspace, &name).exists() {
             continue;
         }
         // A parked (perma-stuck) issue is excluded from selection until the
         // operator removes its marker, mirroring the changes lane's
-        // `.perma-stuck.json` skip.
+        // `.perma-stuck.json` skip. For a single-file issue this consults
+        // the sibling marker.
         if is_perma_stuck(workspace, &name) {
             continue;
         }
@@ -300,7 +413,7 @@ pub fn list_ready(workspace: &Path) -> Result<Vec<String>> {
             Err(e) => {
                 tracing::warn!(
                     slug = %name,
-                    "issues lane: skipping `issues/{name}/` — {e}"
+                    "issues lane: skipping `issues/{name}` — {e}"
                 );
             }
         }
@@ -309,30 +422,63 @@ pub fn list_ready(workspace: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// The `.in-progress` lock helpers, scoped to the issue's directory. The
-/// lock-file shape is the shared queue-state primitive
-/// ([`shared::acquire_lock`] / [`shared::release_lock`]); these wrappers
-/// only resolve the issue directory.
+/// The `.in-progress` lock path for `slug`, honoring its form: the sibling
+/// `issues/<slug>.in-progress` for a single-file issue, OR the in-directory
+/// `issues/<slug>/.in-progress` for a directory issue.
+fn lock_path(workspace: &Path, slug: &str) -> PathBuf {
+    marker_path(workspace, slug, shared::LOCK_FILE)
+}
+
+/// Acquire the `.in-progress` lock for `slug`, honoring its form. The
+/// lock-file write/remove is the shared queue-state primitive; these
+/// wrappers only resolve the form-aware lock path. For a directory issue
+/// the lock lives inside; for a single-file issue it is a sibling.
 pub fn lock(workspace: &Path, slug: &str) -> Result<()> {
-    shared::acquire_lock(&issue_dir(workspace, slug))
+    let path = lock_path(workspace, slug);
+    std::fs::File::create(&path)
+        .with_context(|| format!("creating lock file {}", path.display()))?;
+    Ok(())
 }
 
 pub fn unlock(workspace: &Path, slug: &str) -> Result<()> {
-    shared::release_lock(&issue_dir(workspace, slug))
+    let path = lock_path(workspace, slug);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing lock file {}", path.display())),
+    }
 }
 
-/// Archive a completed issue: move `issues/<slug>/` to
-/// `issues/archive/<UTC-YYYY-MM-DD>-<slug>/`, mirroring
-/// `changes/archive/`. Uses the shared dated-move-with-postcondition
-/// primitive. This NEVER invokes `openspec` AND NEVER touches any
-/// canonical spec — the issues lane leaves an audit trail only.
+/// Archive a completed issue in EITHER form, mirroring `changes/archive/`.
+/// A single-file issue moves `issues/<slug>.md` →
+/// `issues/archive/<UTC-date>-<slug>.md`; a directory issue moves
+/// `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/`. Transient marker
+/// siblings (`.in-progress`) of a single-file issue are dropped, not
+/// archived — the body file is the self-contained archive entry. This NEVER
+/// invokes `openspec` AND NEVER touches any canonical spec.
 pub fn archive(workspace: &Path, slug: &str) -> Result<PathBuf> {
-    let dated_name = format!("{}-{slug}", Utc::now().format("%Y-%m-%d"));
-    shared::archive_dir_with_postcondition(
-        &issue_dir(workspace, slug),
-        &archive_root(workspace),
-        &dated_name,
-    )
+    let date = Utc::now().format("%Y-%m-%d");
+    match resolve_form(workspace, slug) {
+        Some(IssueForm::SingleFile) => {
+            // Drop the transient sibling lock before the move (it is not
+            // part of the archive entry).
+            let _ = std::fs::remove_file(lock_path(workspace, slug));
+            let dated_name = format!("{date}-{slug}.md");
+            shared::archive_file_with_postcondition(
+                &issue_file(workspace, slug),
+                &archive_root(workspace),
+                &dated_name,
+            )
+        }
+        _ => {
+            let dated_name = format!("{date}-{slug}");
+            shared::archive_dir_with_postcondition(
+                &issue_dir(workspace, slug),
+                &archive_root(workspace),
+                &dated_name,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +493,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(ISSUE_FILE), "## Report\nbug\n").unwrap();
         std::fs::write(dir.join(TASKS_FILE), "- [ ] 1.1 fix it\n").unwrap();
+    }
+
+    /// Build a well-formed single-file `issues/<slug>.md` fixture
+    /// (description + `## Tasks`).
+    fn make_single_file_issue(workspace: &Path, slug: &str) {
+        std::fs::create_dir_all(issues_dir(workspace)).unwrap();
+        std::fs::write(
+            issue_file(workspace, slug),
+            "## Report\nbug in the parser\n\n## Tasks\n\n- [ ] 1.1 fix it\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -479,5 +636,124 @@ mod tests {
         assert_eq!(dest, archive_root(ws).join(format!("{today}-fix-widget")));
         // Canon untouched.
         assert_eq!(std::fs::read_to_string(&canon).unwrap(), "CANON_CONTENTS");
+    }
+
+    // ----- Single-file form (single-file-issues §4) -----
+
+    /// 4.1: a single-file issue loads, lists ready, works, AND archives to a
+    /// dated `.md` file.
+    #[test]
+    fn single_file_issue_loads_lists_and_archives() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        make_single_file_issue(ws, "fix-parser");
+
+        // Loads: description split from the `## Tasks` checklist.
+        let loaded = load(ws, "fix-parser").unwrap();
+        assert_eq!(loaded.slug, "fix-parser");
+        assert!(loaded.issue_body.contains("bug in the parser"));
+        assert!(!loaded.issue_body.contains("## Tasks"));
+        assert!(loaded.tasks_body.contains("1.1 fix it"));
+        // A curated single-file issue is never public-origin.
+        assert!(loaded.report_body.is_none());
+        assert!(!loaded.is_public_origin());
+
+        // Lists ready (the `.md` file is the unit).
+        assert_eq!(list_ready(ws).unwrap(), vec!["fix-parser".to_string()]);
+
+        // Works (lock/unlock via sibling marker — see marker test).
+        lock(ws, "fix-parser").unwrap();
+        unlock(ws, "fix-parser").unwrap();
+
+        // Archives to a dated `.md` file.
+        let dest = archive(ws, "fix-parser").unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!(dest, archive_root(ws).join(format!("{today}-fix-parser.md")));
+        assert!(dest.is_file());
+        assert!(!issue_file(ws, "fix-parser").exists(), "source moved");
+        assert!(std::fs::read_to_string(&dest).unwrap().contains("bug in the parser"));
+    }
+
+    /// A single-file issue with NO `## Tasks` section loads with an empty
+    /// task list and the whole body as the description.
+    #[test]
+    fn single_file_issue_without_tasks_section_loads() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        std::fs::create_dir_all(issues_dir(ws)).unwrap();
+        std::fs::write(issue_file(ws, "tiny"), "just fix the typo on line 3\n").unwrap();
+        let loaded = load(ws, "tiny").unwrap();
+        assert!(loaded.issue_body.contains("typo on line 3"));
+        assert!(loaded.tasks_body.trim().is_empty());
+    }
+
+    /// 4.4: a single-file issue's lock/perma-stuck markers are SIBLINGS, are
+    /// NOT mistaken for units by `list_ready`, AND a parked single-file
+    /// issue is skipped via its sibling `.perma-stuck.json`.
+    #[test]
+    fn single_file_markers_are_siblings_and_not_units() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        make_single_file_issue(ws, "fix-parser");
+
+        // Lock writes a SIBLING `.in-progress`, not an in-directory file.
+        lock(ws, "fix-parser").unwrap();
+        let sibling_lock = issues_dir(ws).join("fix-parser.in-progress");
+        assert!(sibling_lock.is_file(), "lock is a sibling file");
+        assert!(!issue_dir(ws, "fix-parser").exists(), "no unit directory exists");
+        // The locked unit is skipped, and the sibling marker is not a unit.
+        assert!(list_ready(ws).unwrap().is_empty());
+        unlock(ws, "fix-parser").unwrap();
+        assert!(!sibling_lock.exists());
+        assert_eq!(list_ready(ws).unwrap(), vec!["fix-parser".to_string()]);
+
+        // Park writes a SIBLING `.perma-stuck.json`; the parked unit is
+        // skipped; the marker is not a unit.
+        write_perma_stuck(ws, "fix-parser", 2, "gave up").unwrap();
+        let sibling_park = issues_dir(ws).join("fix-parser.perma-stuck.json");
+        assert!(sibling_park.is_file(), "park marker is a sibling file");
+        assert!(is_perma_stuck(ws, "fix-parser"));
+        assert!(
+            list_ready(ws).unwrap().is_empty(),
+            "a parked single-file issue is skipped via its sibling marker"
+        );
+        // Removing the marker re-selects it.
+        std::fs::remove_file(&sibling_park).unwrap();
+        assert_eq!(list_ready(ws).unwrap(), vec!["fix-parser".to_string()]);
+    }
+
+    /// A directory issue's markers stay INSIDE the directory (regression).
+    #[test]
+    fn directory_issue_markers_stay_inside() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        make_issue(ws, "fix-thing");
+        lock(ws, "fix-thing").unwrap();
+        assert!(
+            issue_dir(ws, "fix-thing").join(shared::LOCK_FILE).is_file(),
+            "directory lock is in-directory"
+        );
+        assert!(
+            !issues_dir(ws).join("fix-thing.in-progress").exists(),
+            "no sibling lock for a directory issue"
+        );
+        unlock(ws, "fix-thing").unwrap();
+        write_perma_stuck(ws, "fix-thing", 2, "x").unwrap();
+        assert!(issue_dir(ws, "fix-thing").join(PERMA_STUCK_FILE).is_file());
+        assert!(!issues_dir(ws).join("fix-thing.perma-stuck.json").exists());
+    }
+
+    /// `list_ready` lists BOTH forms together, sorted, ignoring marker
+    /// siblings of either.
+    #[test]
+    fn list_ready_mixes_both_forms() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        make_single_file_issue(ws, "single-b");
+        make_issue(ws, "dir-a");
+        // A stray sibling marker for a not-yet-existent slug must be ignored.
+        std::fs::write(issues_dir(ws).join("ghost.perma-stuck.json"), "{}").unwrap();
+        let ready = list_ready(ws).unwrap();
+        assert_eq!(ready, vec!["dir-a".to_string(), "single-b".to_string()]);
     }
 }

@@ -35,6 +35,13 @@ pub enum ReviewVerdict {
     Pass,
     Concerns,
     Block,
+    /// The reviewer could not produce a verdict — the agentic session was
+    /// discarded (no valid `submit_review`) or errored. Per the
+    /// gatekeepers-fail-closed standard this is a distinct, VISIBLE,
+    /// non-passing state (rendered as a `## Code Review: FAILED TO RUN`
+    /// section AND a `FAILED TO RUN` ledger line) — NOT an approval, NOT a
+    /// silent omission.
+    FailedToRun,
 }
 
 #[derive(Debug, Clone)]
@@ -120,15 +127,57 @@ pub struct ChangedFile {
     pub contents: String,
 }
 
+/// The reviewer's input is a review SURFACE that is EITHER a unified diff
+/// (the per-pass review, OR an on-demand review of a PR or commit) OR an
+/// on-demand TARGET (a file, a file-set, OR a described area) carrying NO
+/// diff. A `ReviewContext` whose `target` is `None` is a diff-based review
+/// (the historical shape); a `Some(_)` target is a no-diff target review
+/// whose surface is the operator's review focus plus the target file-path
+/// list rendered IN PLACE OF a diff. In both cases the agent reads files on
+/// demand via `Read`/`Glob`/`Grep`.
+#[derive(Debug, Clone)]
+pub enum ReviewTarget {
+    /// A concrete file-set: the operator named the files. The reviewer reads
+    /// the CURRENT content of each path on demand (no diff). `paths` are
+    /// workspace-relative.
+    Files { paths: Vec<String> },
+    /// A free-text description of functionality/area. The reviewer LOCATES
+    /// the relevant files itself via `Glob`/`Grep` during the session AND
+    /// names the files it actually reviewed in its verdict.
+    Description { focus: String },
+}
+
+impl ReviewTarget {
+    /// The operator's stated review focus rendered in place of a diff. For a
+    /// file-set this is a fixed instruction (the file list carries the
+    /// scope); for a description it is the description itself.
+    fn focus_text(&self) -> String {
+        match self {
+            ReviewTarget::Files { paths } => format!(
+                "Review the CURRENT content of the {} target file(s) listed below \
+                 (this is NOT a diff — review the files as they are now).",
+                paths.len()
+            ),
+            ReviewTarget::Description { focus } => focus.clone(),
+        }
+    }
+}
+
 /// All the material the reviewer sees: the change(s) that shipped, the
 /// resulting file state, and the unified diff. Rendering into a prompt
 /// honors `ReviewerConfig::prompt_budget_chars` in priority order
 /// (context > files > diff).
+///
+/// `target` is the on-demand TARGET review surface (a59): when `Some`, the
+/// review carries NO diff and the rendered prompt presents the operator's
+/// focus + the target file-path list in place of a diff. When `None` the
+/// context is a diff-based review and rendering is unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewContext {
     pub archived_changes: Vec<ChangeBrief>,
     pub changed_files: Vec<ChangedFile>,
     pub diff: String,
+    pub target: Option<ReviewTarget>,
 }
 
 /// Per-change reviewer call: the change being reviewed (own brief, own
@@ -222,6 +271,17 @@ pub struct CodeReviewer {
     /// [`CodeReviewer::new`] path. When `None`, the agentic session passes
     /// `model: None` (legacy behavior: the CLI picks its default).
     resolved_model: Option<crate::agentic_run::ResolvedModel>,
+    /// Wall-clock cap for one agentic reviewer session, resolved from the
+    /// SINGLE `executor.agentic_session_timeout_secs` (shared with the verifier
+    /// gates AND the revision sessions). The reviewer is built from
+    /// `ReviewerConfig`, which does not carry the executor block, so both
+    /// production construction sites (startup in `cli::run`, reload in
+    /// `control_socket::build_reviewer`) set this from `cfg.executor` via
+    /// [`CodeReviewer::with_agentic_session_timeout`]. The test-only
+    /// [`CodeReviewer::new`] path defaults it to the resolved one-hour default.
+    /// The oneshot path has no analogous timeout (the HTTP client owns it);
+    /// this bounds the wrapped CLI subprocess the way the gates bound theirs.
+    agentic_session_timeout: Duration,
 }
 
 impl CodeReviewer {
@@ -246,7 +306,23 @@ impl CodeReviewer {
             file_lines_threshold: crate::audits::code_metrics::DEFAULT_FILE_LINES_THRESHOLD,
             function_lines_threshold: crate::audits::code_metrics::DEFAULT_FUNCTION_LINES_THRESHOLD,
             resolved_model: None,
+            // Test-only constructor: default to the resolved one-hour default.
+            // No second `3600` literal — this routes through the single config
+            // default. Production overrides via `with_agentic_session_timeout`.
+            agentic_session_timeout: Duration::from_secs(
+                crate::config::default_agentic_session_timeout(),
+            ),
         }
+    }
+
+    /// Builder-style setter for the agentic reviewer session timeout, resolved
+    /// from `executor.agentic_session_timeout_secs`. Both production
+    /// construction sites call this with `cfg.executor.agentic_session_timeout()`
+    /// so the reviewer shares the ONE timeout with the verifier gates AND the
+    /// revision sessions.
+    pub fn with_agentic_session_timeout(mut self, timeout: Duration) -> Self {
+        self.agentic_session_timeout = timeout;
+        self
     }
 
     /// Builder-style setter for the advisory size-flag thresholds (a67).
@@ -271,6 +347,13 @@ impl CodeReviewer {
     /// Read the configured reviewer transport.
     pub fn kind(&self) -> ReviewerKind {
         self.kind
+    }
+
+    /// The resolved agentic reviewer session timeout (from
+    /// `executor.agentic_session_timeout_secs`). Exposed so the config-to-
+    /// call-site wiring is observable in tests.
+    pub fn agentic_session_timeout(&self) -> Duration {
+        self.agentic_session_timeout
     }
 
     /// Builder-style setter for the agentic CLI command (`reviewer.command`).
@@ -759,6 +842,12 @@ impl From<ReviewVerdict> for Verdict {
         match v {
             ReviewVerdict::Block => Verdict::Block,
             ReviewVerdict::Pass | ReviewVerdict::Concerns => Verdict::Approve,
+            // A failed-to-run review is NOT an approval. This conversion feeds
+            // the operator re-review `Verdict {Approve, Block}` contract, which
+            // a failed-to-run state should never reach in practice (a re-review
+            // produces a real verdict); map it conservatively to Block rather
+            // than waving it through as Approve.
+            ReviewVerdict::FailedToRun => Verdict::Block,
         }
     }
 }
@@ -893,11 +982,6 @@ pub const REVIEWER_ROLE: &str = "reviewer";
 /// `Bash`, NO `Write`, NO `Edit` — the reviewer reads files on demand AND
 /// returns its verdict through the `submit_review` MCP tool.
 pub const AGENTIC_REVIEW_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
-
-/// Wall-clock cap for one agentic reviewer session. The oneshot path has
-/// no analogous timeout (the HTTP client owns it); this bounds the wrapped
-/// CLI subprocess the way the audits bound theirs.
-const AGENTIC_REVIEW_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The full `--allowedTools` list the agentic reviewer sandbox grants:
 /// the read-only file tools PLUS the qualified `submit_review` MCP tool.
@@ -1075,6 +1159,12 @@ fn review_diff_artifact_rel(slug: &str) -> String {
 /// via `Read`, so the prompt stays bounded regardless of diff size,
 /// `reviewer.prompt_budget_chars` is NOT consulted here, AND no
 /// `## Skipped (budget exhausted)` truncation occurs.
+///
+/// When `ctx.target` is `Some` (a59 on-demand TARGET review) the prompt
+/// carries the operator's review focus AND the target file-path list IN
+/// PLACE OF a diff — there is no unified diff for a target. Everything else
+/// (briefs, reads-on-demand, `submit_review`) is identical to the diff-based
+/// case, so the same `ReviewResult` shape is produced either way.
 pub fn render_agentic_review_prompt(
     ctx: &ReviewContext,
     preamble: &str,
@@ -1086,8 +1176,8 @@ pub fn render_agentic_review_prompt(
         out.push_str("\n\n");
     }
     out.push_str(
-        "You are reviewing a code change for quality (security, error handling, naming, \
-         style, language idioms, obvious bugs). Do NOT assess whether the diff implements \
+        "You are reviewing code for quality (security, error handling, naming, \
+         style, language idioms, obvious bugs). Do NOT assess whether the code implements \
          any spec — that is a separate concern.\n\n",
     );
 
@@ -1108,31 +1198,75 @@ pub fn render_agentic_review_prompt(
         }
     }
 
-    out.push_str("# Changed files\n\n");
-    out.push_str(
-        "These files were modified by this pass. Their full contents are NOT inlined — use \
-         the `Read`, `Glob`, AND `Grep` tools to read whatever you need on demand.\n\n",
-    );
-    if ctx.changed_files.is_empty() {
-        out.push_str("(no changed files reported)\n");
-    } else {
-        for f in &ctx.changed_files {
-            out.push_str(&format!("- {}\n", f.path));
-        }
-    }
-    out.push('\n');
+    match &ctx.target {
+        // a59: TARGET review surface — no diff. Carry the operator's focus
+        // AND the target file-path list in place of a diff. For a
+        // `Description` target the file list is empty; the agent locates the
+        // files itself via Glob/Grep AND must name the files it reviewed.
+        Some(target) => {
+            out.push_str("# Review focus\n\n");
+            out.push_str(target.focus_text().trim_end());
+            out.push_str("\n\n");
 
-    out.push_str("# Unified diff\n\n");
-    if ctx.diff.trim().is_empty() {
-        out.push_str("(no diff produced this pass)\n\n");
-    } else {
-        out.push_str(&format!(
-            "The unified diff for this pass is written to `{diff_artifact_rel}` — it is NOT \
-             inlined here, so this prompt stays bounded regardless of how large the diff is. \
-             `Read` that file to see exactly what changed; for any file you need in full, \
-             `Read` it directly from the changed-file list above. Prioritize the hunks most \
-             relevant to a code-quality review.\n\n"
-        ));
+            out.push_str("# Target files\n\n");
+            match target {
+                ReviewTarget::Files { paths } => {
+                    out.push_str(
+                        "Review the CURRENT content of these files (there is NO diff for an \
+                         on-demand target review). Their contents are NOT inlined — use the \
+                         `Read`, `Glob`, AND `Grep` tools to read whatever you need on \
+                         demand.\n\n",
+                    );
+                    if paths.is_empty() {
+                        out.push_str("(no target files named)\n\n");
+                    } else {
+                        for p in paths {
+                            out.push_str(&format!("- {p}\n"));
+                        }
+                        out.push('\n');
+                    }
+                }
+                ReviewTarget::Description { .. } => {
+                    out.push_str(
+                        "No file list was provided — LOCATE the files relevant to the review \
+                         focus yourself using `Glob` AND `Grep`, then `Read` them. There is NO \
+                         diff for an on-demand target review. In your `submit_review` summary, \
+                         NAME the files you actually reviewed so the operator can see the scope \
+                         you chose.\n\n",
+                    );
+                }
+            }
+        }
+        // Diff-based review (the per-pass review, OR an on-demand PR/commit):
+        // unchanged rendering.
+        None => {
+            out.push_str("# Changed files\n\n");
+            out.push_str(
+                "These files were modified by this pass. Their full contents are NOT inlined — use \
+                 the `Read`, `Glob`, AND `Grep` tools to read whatever you need on demand.\n\n",
+            );
+            if ctx.changed_files.is_empty() {
+                out.push_str("(no changed files reported)\n");
+            } else {
+                for f in &ctx.changed_files {
+                    out.push_str(&format!("- {}\n", f.path));
+                }
+            }
+            out.push('\n');
+
+            out.push_str("# Unified diff\n\n");
+            if ctx.diff.trim().is_empty() {
+                out.push_str("(no diff produced this pass)\n\n");
+            } else {
+                out.push_str(&format!(
+                    "The unified diff for this pass is written to `{diff_artifact_rel}` — it is NOT \
+                     inlined here, so this prompt stays bounded regardless of how large the diff is. \
+                     `Read` that file to see exactly what changed; for any file you need in full, \
+                     `Read` it directly from the changed-file list above. Prioritize the hunks most \
+                     relevant to a code-quality review.\n\n"
+                ));
+            }
+        }
     }
 
     out.push_str(
@@ -1434,12 +1568,448 @@ pub async fn run_agentic_review(
         // opencode/agy reviewer's own store is admitted, not masked as foreign.
         cli: crate::config::default_cli_for(reviewer.provider),
         settings_dir: None,
-        timeout: AGENTIC_REVIEW_TIMEOUT,
+        timeout: reviewer.agentic_session_timeout,
         // Pass the reviewer's resolved model so the wrapped CLI runs the
         // operator-configured model, mirroring the verifier gates.
         model: reviewer.resolved_model.as_ref(),
     };
     run_agentic_review_with_runner(reviewer, ctx, &runner).await
+}
+
+// =====================================================================
+// On-demand review of a PR, commit, or target (a59)
+// =====================================================================
+
+/// The review SURFACE an on-demand review runs over (a59). Resolved by the
+/// caller (control socket / CLI) from the operator's `<target>` argument:
+/// a `pr`/`commit` resolves to a `Diff`; `files`/free-text resolves to a
+/// [`ReviewTarget`]. The orchestration in [`run_on_demand_review`] turns the
+/// surface into one or more [`ReviewContext`]s and runs the existing agentic
+/// reviewer over each.
+#[derive(Debug, Clone)]
+pub enum ReviewSurface {
+    /// A unified diff + its changed-file paths (a PR's base..head range OR a
+    /// single commit's `git show`). Reviewed exactly like the per-pass diff.
+    Diff {
+        diff: String,
+        changed_files: Vec<String>,
+    },
+    /// An on-demand TARGET review (a file-set OR a described area), carrying
+    /// no diff.
+    Target(ReviewTarget),
+}
+
+/// The operator's parsed `<target>` for an on-demand review (a59), before
+/// resolution against the repository's local clone. Built by the chatops
+/// verb / CLI subcommand parser; resolved into a [`ReviewSurface`] by
+/// [`resolve_review_surface`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewTargetSpec {
+    /// `pr <number>` — review the PR's base..head diff, resolved from the
+    /// local clone.
+    Pr { number: u64 },
+    /// `commit <sha>` — review a single commit's diff (`git show`).
+    Commit { sha: String },
+    /// `files <path> [<path> ...]` — review the current content of named
+    /// files (no diff).
+    Files { paths: Vec<String> },
+    /// A free-text description — the reviewer locates the files itself.
+    Description { focus: String },
+}
+
+impl ReviewTargetSpec {
+    /// Parse an operator `<target>` token list into a [`ReviewTargetSpec`].
+    /// `pr <N>` / `commit <sha>` / `files <path...>` are recognized by their
+    /// leading keyword; anything else is a free-text [`Description`] joining
+    /// the tokens with single spaces. Returns `Err(reason)` for a malformed
+    /// keyword form (e.g. `pr` with a non-numeric number, `files` with no
+    /// paths) so the operator sees a usage error rather than a silent
+    /// fall-through to a description.
+    pub fn parse(tokens: &[String]) -> std::result::Result<Self, String> {
+        let first = tokens.first().map(|s| s.as_str()).unwrap_or("");
+        match first {
+            "pr" => {
+                let n = tokens.get(1).ok_or_else(|| {
+                    "review pr: missing PR number. Usage: review <repo> pr <N>".to_string()
+                })?;
+                let number = n.parse::<u64>().map_err(|_| {
+                    format!("review pr: `{n}` is not a valid PR number")
+                })?;
+                if tokens.len() > 2 {
+                    return Err(
+                        "review pr: too many arguments. Usage: review <repo> pr <N>".to_string(),
+                    );
+                }
+                Ok(ReviewTargetSpec::Pr { number })
+            }
+            "commit" => {
+                let sha = tokens.get(1).ok_or_else(|| {
+                    "review commit: missing SHA. Usage: review <repo> commit <sha>".to_string()
+                })?;
+                if tokens.len() > 2 {
+                    return Err(
+                        "review commit: too many arguments. Usage: review <repo> commit <sha>"
+                            .to_string(),
+                    );
+                }
+                Ok(ReviewTargetSpec::Commit { sha: sha.clone() })
+            }
+            "files" => {
+                let paths: Vec<String> = tokens[1..].to_vec();
+                if paths.is_empty() {
+                    return Err(
+                        "review files: missing path(s). Usage: review <repo> files <path> [<path> ...]"
+                            .to_string(),
+                    );
+                }
+                Ok(ReviewTargetSpec::Files { paths })
+            }
+            "" => Err("review: missing target. Usage: review <repo> <pr N | commit SHA | files PATHS | description>".to_string()),
+            _ => Ok(ReviewTargetSpec::Description {
+                focus: tokens.join(" "),
+            }),
+        }
+    }
+}
+
+/// Resolve a [`ReviewTargetSpec`] into a [`ReviewSurface`] against the
+/// repository's local clone (a59). `pr <N>` fetches the PR head into a local
+/// ref AND produces the base..head diff; `commit <sha>` produces that
+/// commit's `git show` diff; `files` / a description produce TARGET surfaces
+/// (no diff). `base_branch` is the repo's configured base, `remote` the
+/// origin remote for PR-ref fetching. Network/git failures propagate as
+/// `Err` for the caller to surface.
+pub fn resolve_review_surface(
+    spec: &ReviewTargetSpec,
+    workspace: &Path,
+    base_branch: &str,
+    remote: &str,
+) -> Result<ReviewSurface> {
+    match spec {
+        ReviewTargetSpec::Pr { number } => {
+            let head_ref = crate::git::fetch_pull_request_head(workspace, remote, *number)?;
+            let diff = crate::git::diff_three_dot(workspace, base_branch, &head_ref)?;
+            let changed_files =
+                crate::git::diff_files_changed(workspace, base_branch, &head_ref)?;
+            Ok(ReviewSurface::Diff {
+                diff,
+                changed_files,
+            })
+        }
+        ReviewTargetSpec::Commit { sha } => {
+            let shas = vec![sha.clone()];
+            let diff = crate::git::diff_for_commits(workspace, &shas)?;
+            let changed_files = crate::git::files_for_commits(workspace, &shas)?;
+            Ok(ReviewSurface::Diff {
+                diff,
+                changed_files,
+            })
+        }
+        ReviewTargetSpec::Files { paths } => Ok(ReviewSurface::Target(ReviewTarget::Files {
+            paths: paths.clone(),
+        })),
+        ReviewTargetSpec::Description { focus } => {
+            Ok(ReviewSurface::Target(ReviewTarget::Description {
+                focus: focus.clone(),
+            }))
+        }
+    }
+}
+
+/// Default ceiling on files reviewed in ONE bounded session before the
+/// orchestration chunks a target into multiple sessions (a59 scale clause).
+/// A target at or under this count is reviewed in a single session; a larger
+/// target is split (per file or per module) into multiple sessions whose
+/// findings are aggregated into one report, so a broad area degrades into
+/// bounded sessions rather than overflowing the model's context. Only
+/// `Diff` and `Files` surfaces (whose file set is known up front) chunk; a
+/// `Description` target is one session (the agent scopes itself via
+/// Glob/Grep).
+pub const ON_DEMAND_MAX_FILES_PER_SESSION: usize = 20;
+
+/// One aggregated on-demand review report (a59). Carries the worst-of
+/// verdict across all chunk sessions, the rendered body, the per-chunk
+/// sections (one per session when chunked; one for a single bounded
+/// session), AND the count of sessions run so the caller can tell the
+/// operator what was chunked. Advisory + read-only — the caller reports it
+/// and opens no revision.
+#[derive(Debug, Clone)]
+pub struct OnDemandReviewReport {
+    pub verdict: Verdict,
+    /// The aggregated review body (summary + concerns), already rendered for
+    /// posting to chat / a PR comment.
+    pub markdown: String,
+    pub concerns: Vec<ReviewConcern>,
+    /// Number of reviewer sessions that ran (1 for a bounded target, >1 when
+    /// the target was chunked).
+    pub sessions: usize,
+    /// Per-chunk labels (file group or "all") in session order, for the
+    /// "what was chunked" log AND the aggregated body header.
+    pub chunk_labels: Vec<String>,
+    pub attribution: Option<String>,
+}
+
+/// Split `files` into bounded chunks of at most `max_per_chunk` paths each
+/// (a59 chunk-and-aggregate). A list at or under `max_per_chunk` yields a
+/// single chunk; a larger list is split into consecutive groups. Pure for
+/// testability. `max_per_chunk` is clamped to at least 1.
+pub fn chunk_target_files(files: &[String], max_per_chunk: usize) -> Vec<Vec<String>> {
+    let max = max_per_chunk.max(1);
+    if files.len() <= max {
+        return vec![files.to_vec()];
+    }
+    files.chunks(max).map(|c| c.to_vec()).collect()
+}
+
+/// Run an on-demand review over `surface` (a59). Production entry point for
+/// the `review` chatops verb AND CLI subcommand. Resolves the reviewer's CLI
+/// strategy (identical to [`run_agentic_review`]) then runs one or more
+/// bounded agentic-reviewer sessions over the surface, chunking a large
+/// target into multiple sessions AND aggregating their findings into one
+/// report. Reuses the SAME agentic-reviewer machinery (sandbox,
+/// `submit_review`, reads-on-demand) — it does NOT build a second reviewer.
+///
+/// A session that records no valid `submit_review` submission DISCARDS the
+/// review (returns `AgenticReviewOutcome::Discarded`) rather than defaulting
+/// to a clean pass, per the gatekeepers-fail-closed standard.
+pub async fn run_on_demand_review(
+    reviewer: &CodeReviewer,
+    surface: &ReviewSurface,
+    archived_changes: Vec<ChangeBrief>,
+    workspace: &Path,
+) -> Result<OnDemandReviewOutcome> {
+    let strategy = resolve_reviewer_strategy(reviewer)?;
+    let runner = CliReviewSessionRunner {
+        workspace,
+        strategy: strategy.as_ref(),
+        cli: crate::config::default_cli_for(reviewer.provider),
+        settings_dir: None,
+        timeout: reviewer.agentic_session_timeout,
+        model: reviewer.resolved_model.as_ref(),
+    };
+    run_on_demand_review_with_runner(reviewer, surface, archived_changes, &runner).await
+}
+
+/// Outcome of an on-demand review (a59). `Reviewed` carries the aggregated
+/// [`OnDemandReviewReport`]; `Discarded` means at least one chunk session
+/// produced no valid verdict, so the whole review is discarded (no
+/// clean-pass default) AND the caller surfaces the failure.
+#[derive(Debug, Clone)]
+pub enum OnDemandReviewOutcome {
+    Reviewed(OnDemandReviewReport),
+    Discarded { reason: String },
+}
+
+/// Build the per-chunk [`ReviewContext`] list for a surface (a59):
+/// - `Diff`: a single context carrying the diff + changed files when bounded;
+///   when the changed-file count exceeds `max_per_chunk` the file list is
+///   chunked AND each chunk still carries the FULL diff (the agent reads only
+///   the chunk's files but has the diff for cross-reference). Each chunk's
+///   label names the file group.
+/// - `Files`: a `ReviewTarget::Files` per chunk (no diff), chunked the same way.
+/// - `Description`: exactly one `ReviewTarget::Description` context — the agent
+///   scopes the file set itself, so there is nothing to chunk up front.
+fn build_on_demand_contexts(
+    surface: &ReviewSurface,
+    archived_changes: &[ChangeBrief],
+    max_per_chunk: usize,
+) -> Vec<(String, ReviewContext)> {
+    match surface {
+        ReviewSurface::Diff {
+            diff,
+            changed_files,
+        } => {
+            let chunks = chunk_target_files(changed_files, max_per_chunk);
+            let single = chunks.len() <= 1;
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, paths)| {
+                    let label = if single {
+                        "all".to_string()
+                    } else {
+                        format!("files {}-{}", i * max_per_chunk + 1, i * max_per_chunk + paths.len())
+                    };
+                    let ctx = ReviewContext {
+                        archived_changes: archived_changes.to_vec(),
+                        changed_files: paths
+                            .into_iter()
+                            .map(|path| ChangedFile {
+                                path,
+                                contents: String::new(),
+                            })
+                            .collect(),
+                        diff: diff.clone(),
+                        target: None,
+                    };
+                    (label, ctx)
+                })
+                .collect()
+        }
+        ReviewSurface::Target(ReviewTarget::Files { paths }) => {
+            let chunks = chunk_target_files(paths, max_per_chunk);
+            let single = chunks.len() <= 1;
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, group)| {
+                    let label = if single {
+                        "all".to_string()
+                    } else {
+                        format!("files {}-{}", i * max_per_chunk + 1, i * max_per_chunk + group.len())
+                    };
+                    let ctx = ReviewContext {
+                        archived_changes: archived_changes.to_vec(),
+                        changed_files: Vec::new(),
+                        diff: String::new(),
+                        target: Some(ReviewTarget::Files { paths: group }),
+                    };
+                    (label, ctx)
+                })
+                .collect()
+        }
+        ReviewSurface::Target(ReviewTarget::Description { focus }) => {
+            let ctx = ReviewContext {
+                archived_changes: archived_changes.to_vec(),
+                changed_files: Vec::new(),
+                diff: String::new(),
+                target: Some(ReviewTarget::Description {
+                    focus: focus.clone(),
+                }),
+            };
+            vec![("described area".to_string(), ctx)]
+        }
+    }
+}
+
+/// Mode-aware on-demand orchestration shared by production AND tests (a59).
+/// Builds the per-chunk contexts (one bounded session, OR multiple chunked
+/// sessions for a large file set), runs each through ONE agentic reviewer
+/// session, AND aggregates their findings into a single
+/// [`OnDemandReviewReport`]. Any chunk session that records no valid
+/// submission discards the WHOLE review (returns `Discarded`) — never a
+/// defaulted clean pass.
+async fn run_on_demand_review_with_runner(
+    reviewer: &CodeReviewer,
+    surface: &ReviewSurface,
+    archived_changes: Vec<ChangeBrief>,
+    runner: &dyn ReviewSessionRunner,
+) -> Result<OnDemandReviewOutcome> {
+    let contexts =
+        build_on_demand_contexts(surface, &archived_changes, ON_DEMAND_MAX_FILES_PER_SESSION);
+    let chunked = contexts.len() > 1;
+    if chunked {
+        let labels: Vec<&str> = contexts.iter().map(|(l, _)| l.as_str()).collect();
+        tracing::info!(
+            sessions = contexts.len(),
+            chunks = %labels.join(", "),
+            "on-demand review: target spans more files than one bounded session; \
+             chunking into multiple reviewer sessions"
+        );
+    }
+
+    let mut chunk_labels: Vec<String> = Vec::with_capacity(contexts.len());
+    let mut results: Vec<ReviewResult> = Vec::with_capacity(contexts.len());
+    for (label, ctx) in &contexts {
+        // Each chunk is one bounded reviewer session. The slug labels the
+        // session (used for the per-session diff artifact key); a sanitized
+        // chunk label keeps multi-session artifacts from colliding.
+        let slug = sanitize_session_slug(label);
+        let artifact_rel = review_diff_artifact_rel(&slug);
+        let prompt = render_agentic_review_prompt(ctx, "", &artifact_rel);
+        let consumed = runner.run_session(&slug, &prompt, &ctx.diff).await?;
+        match consumed {
+            None => {
+                let reason = format!(
+                    "on-demand reviewer session (chunk `{label}`) recorded no valid \
+                     submit_review submission"
+                );
+                return Ok(OnDemandReviewOutcome::Discarded { reason });
+            }
+            Some(payload) => {
+                let result = payload_to_review_result(&payload).map_err(|e| {
+                    anyhow!("recorded submit_review payload failed re-validation: {e}")
+                })?;
+                chunk_labels.push(label.clone());
+                results.push(result);
+            }
+        }
+    }
+
+    let report = aggregate_on_demand_results(results, chunk_labels, reviewer.attribution.clone());
+    Ok(OnDemandReviewOutcome::Reviewed(report))
+}
+
+/// Aggregate per-chunk on-demand [`ReviewResult`]s into one
+/// [`OnDemandReviewReport`] (a59). The aggregate verdict is `Block` when ANY
+/// chunk blocked, else `Approve`; the body concatenates each chunk's summary
+/// under a `## Chunk: <label>` heading when chunked (a single bounded session
+/// renders just its body); the concerns vec is the union across chunks.
+fn aggregate_on_demand_results(
+    results: Vec<ReviewResult>,
+    chunk_labels: Vec<String>,
+    attribution: Option<String>,
+) -> OnDemandReviewReport {
+    let sessions = results.len();
+    let mut verdict = Verdict::Approve;
+    let mut concerns: Vec<ReviewConcern> = Vec::new();
+    let mut body = String::new();
+    let chunked = sessions > 1;
+    for (idx, result) in results.into_iter().enumerate() {
+        if matches!(result.verdict, Verdict::Block) {
+            verdict = Verdict::Block;
+        }
+        for c in &result.concerns {
+            concerns.push(c.clone());
+        }
+        if chunked {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            let label = chunk_labels.get(idx).map(String::as_str).unwrap_or("chunk");
+            body.push_str(&format!(
+                "## Chunk: {label} — {}\n\n{}",
+                result.verdict.label(),
+                result.markdown.trim()
+            ));
+        } else {
+            body.push_str(result.markdown.trim());
+        }
+    }
+    if body.trim().is_empty() {
+        body.push_str("(no concerns)");
+    }
+    OnDemandReviewReport {
+        verdict,
+        markdown: body,
+        concerns,
+        sessions,
+        chunk_labels,
+        attribution,
+    }
+}
+
+/// Sanitize a chunk label into a filesystem-safe session slug for the
+/// per-session diff artifact key. Keeps alphanumerics, replaces every other
+/// run with a single `-`. An empty result falls back to `chunk`.
+fn sanitize_session_slug(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_dash = false;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "chunk".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Mode-aware orchestration shared by production AND tests. Honors
@@ -1649,6 +2219,7 @@ fn split_per_change_contexts(ctx: &ReviewContext) -> Vec<PerChangeContext> {
                 archived_changes: vec![brief.clone()],
                 changed_files: ctx.changed_files.clone(),
                 diff: ctx.diff.clone(),
+                target: None,
             },
             cross_change_preamble: build_cross_change_preamble(&brief.name, &ctx.archived_changes),
         })
@@ -1718,6 +2289,7 @@ fn verdict_label(v: ReviewVerdict) -> &'static str {
         ReviewVerdict::Pass => "Pass",
         ReviewVerdict::Concerns => "Concerns",
         ReviewVerdict::Block => "Block",
+        ReviewVerdict::FailedToRun => "Failed to run",
     }
 }
 
@@ -1727,6 +2299,9 @@ fn worst_verdict(a: ReviewVerdict, b: ReviewVerdict) -> ReviewVerdict {
             ReviewVerdict::Pass => 0,
             ReviewVerdict::Concerns => 1,
             ReviewVerdict::Block => 2,
+            // A failed-to-run review is non-passing; rank it above Block so
+            // aggregating it with any other verdict never resolves to a pass.
+            ReviewVerdict::FailedToRun => 3,
         }
     }
     if rank(a) >= rank(b) { a } else { b }
@@ -2376,6 +2951,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: diff.to_string(),
+            target: None,
         }
     }
 
@@ -2397,6 +2973,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn foo() {}".into(),
             }],
             diff: "the diff content".into(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
 
@@ -2437,6 +3014,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "FILE_SENTINEL".into(),
             }],
             diff: "DIFF_SENTINEL".into(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
@@ -2470,6 +3048,7 @@ this is not yaml: at all: ::: {{{ broken
                 },
             ],
             diff: "DIFF_SENTINEL".into(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
@@ -2503,6 +3082,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: huge,
             }],
             diff: String::new(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
@@ -2534,6 +3114,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "BODY".into(),
             }],
             diff: "DELTA".into(),
+            target: None,
         };
         let r = render_sections(&ctx, DEFAULT_PROMPT_BUDGET);
         assert!(r.change_context.contains("## Change: x"));
@@ -2577,6 +3158,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents,
             }],
             diff,
+            target: None,
         };
         let report = review_with_size_thresholds(&ctx, 50, 20).await;
         assert!(
@@ -2603,6 +3185,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents,
             }],
             diff,
+            target: None,
         };
         let report = review_with_size_thresholds(&ctx, 50, 20).await;
         assert!(
@@ -2637,6 +3220,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents,
             }],
             diff,
+            target: None,
         };
         // High file threshold so only the function advisory can fire.
         let report = review_with_size_thresholds(&ctx, 100_000, 20).await;
@@ -2977,6 +3561,42 @@ this is not yaml: at all: ::: {{{ broken
         );
     }
 
+    /// unified-agentic-session-timeout task 4.1: a reviewer built from
+    /// `ReviewerConfig` (which carries NO executor block) defaults its agentic
+    /// session timeout to the resolved one-hour default — never a role-private
+    /// literal.
+    #[test]
+    fn reviewer_defaults_agentic_session_timeout_to_one_hour() {
+        let (client, _captured) = stub_with_capture("VERDICT: Pass\n");
+        let r = CodeReviewer::new(client, "T".into());
+        assert_eq!(
+            r.agentic_session_timeout(),
+            Duration::from_secs(crate::config::default_agentic_session_timeout()),
+            "the reviewer's default must be the single resolved default (3600s)"
+        );
+    }
+
+    /// unified-agentic-session-timeout task 4.2 (reviewer): the reviewer adopts
+    /// the value resolved from `executor.agentic_session_timeout_secs` — the
+    /// SAME single source the verifier gates AND the revision sessions use —
+    /// rather than any reviewer-local constant. This is the config-to-call-site
+    /// wiring both production reviewer construction sites perform.
+    #[test]
+    fn reviewer_adopts_configured_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 5400\n")
+                .expect("executor parses");
+        let (client, _captured) = stub_with_capture("VERDICT: Pass\n");
+        let r = CodeReviewer::new(client, "T".into())
+            .with_agentic_session_timeout(exec.agentic_session_timeout());
+        assert_eq!(
+            r.agentic_session_timeout(),
+            exec.agentic_session_timeout(),
+            "the reviewer must use the resolved executor value, not a literal"
+        );
+        assert_eq!(r.agentic_session_timeout(), Duration::from_secs(5400));
+    }
+
     /// A KEYED `openai_compatible` reviewer threads its resolved key into the
     /// reviewer's model (NON-empty), which drives the opencode strategy's keyed
     /// path (provider block + `<provider>/<model>` selection).
@@ -3030,6 +3650,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: three_mb,
             }],
             diff: String::new(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
@@ -3179,6 +3800,7 @@ this is not yaml: at all: ::: {{{ broken
                         contents: format!("body of {}", b.name),
                     }],
                     diff: format!("diff of {}", b.name),
+                    target: None,
                 },
                 cross_change_preamble: build_cross_change_preamble(&b.name, &briefs),
             })
@@ -3244,6 +3866,7 @@ this is not yaml: at all: ::: {{{ broken
                     contents: huge,
                 }],
                 diff: String::new(),
+                target: None,
             },
             cross_change_preamble: String::new(),
         };
@@ -3257,6 +3880,7 @@ this is not yaml: at all: ::: {{{ broken
                     contents: "fn ok() {}".into(),
                 }],
                 diff: String::new(),
+                target: None,
             },
             cross_change_preamble: String::new(),
         };
@@ -3289,6 +3913,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: "some diff".to_string(),
+            target: None,
         };
         let result = review_pr_at_state_with(&reviewer, &ctx)
             .await
@@ -3307,6 +3932,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: "some diff".to_string(),
+            target: None,
         };
         let result = review_pr_at_state_with(&reviewer, &ctx)
             .await
@@ -3325,6 +3951,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: "some diff".to_string(),
+            target: None,
         };
         let result = review_pr_at_state_with(&reviewer, &ctx)
             .await
@@ -3348,6 +3975,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: "abc".to_string(),
+            target: None,
         };
         let report = reviewer_a.review(&ctx_a).await.unwrap();
 
@@ -3357,6 +3985,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: Vec::new(),
             changed_files: Vec::new(),
             diff: "abc".to_string(),
+            target: None,
         };
         let result = review_pr_at_state_with(&reviewer_b, &ctx_b)
             .await
@@ -3406,6 +4035,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "the union diff".into(),
+            target: None,
         };
 
         let result = review_pr_at_state_with(&reviewer, &ctx)
@@ -3466,6 +4096,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "the diff".into(),
+            target: None,
         };
 
         // Reference: a direct bundled review of the same context.
@@ -3535,6 +4166,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "the union diff".into(),
+            target: None,
         };
 
         let result = review_pr_at_state_with(&reviewer, &ctx)
@@ -3576,6 +4208,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "FILE_BODY_SENTINEL_a015".into(),
             }],
             diff: "DIFF_SENTINEL_a015".into(),
+            target: None,
         };
 
         let _ = review_pr_at_state_with(&reviewer, &ctx)
@@ -3634,6 +4267,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "the union diff".into(),
+            target: None,
         };
 
         let result = review_pr_at_state_with(&reviewer, &ctx)
@@ -3734,6 +4368,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: file_contents.clone(),
             }],
             diff: diff.clone(),
+            target: None,
         };
         reviewer.review(&ctx).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
@@ -4025,6 +4660,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "SECRET_FILE_BODY".repeat(1000),
             }],
             diff: "DIFFBODY".into(),
+            target: None,
         };
         let prompt = render_agentic_review_prompt(&ctx, "", &artifact_rel);
         assert!(prompt.contains("src/big.rs"), "path must be listed");
@@ -4060,6 +4696,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: String::new(),
             }],
             diff,
+            target: None,
         };
         let small = render_agentic_review_prompt(&mk("a".into()), "", &artifact_rel);
         let huge = render_agentic_review_prompt(&mk("x".repeat(500_000)), "", &artifact_rel);
@@ -4307,6 +4944,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: vec![brief("a-one"), brief("b-two"), brief("c-three")],
             changed_files: Vec::new(),
             diff: "d".into(),
+            target: None,
         };
         let runner = CannedRunner::new(vec![
             Some(valid_review_payload("Approve")),
@@ -4343,6 +4981,7 @@ this is not yaml: at all: ::: {{{ broken
             archived_changes: vec![brief("a-one"), brief("b-two")],
             changed_files: Vec::new(),
             diff: "d".into(),
+            target: None,
         };
         let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve")), None]);
         let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
@@ -4374,6 +5013,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "the union diff".into(),
+            target: None,
         };
         let runner = CannedRunner::new(vec![Some(valid_review_payload("Block"))]);
         let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
@@ -4426,6 +5066,7 @@ this is not yaml: at all: ::: {{{ broken
                 contents: "fn x() {}".into(),
             }],
             diff: "DIFF_SENTINEL_a015".into(),
+            target: None,
         };
         let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
         let _ = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
@@ -4487,5 +5128,299 @@ this is not yaml: at all: ::: {{{ broken
             resolve_reviewer_strategy(&claude_reviewer).is_ok(),
             "Anthropic reviewer resolves the claude strategy"
         );
+    }
+
+    // =================================================================
+    // a59: on-demand review of a PR, commit, or target
+    // =================================================================
+
+    /// `ReviewTargetSpec::parse` recognizes the keyword forms AND falls back
+    /// to a free-text description; malformed keyword forms error.
+    #[test]
+    fn review_target_spec_parses_each_form() {
+        let toks = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            ReviewTargetSpec::parse(&toks("pr 42")).unwrap(),
+            ReviewTargetSpec::Pr { number: 42 }
+        );
+        assert_eq!(
+            ReviewTargetSpec::parse(&toks("commit abc123")).unwrap(),
+            ReviewTargetSpec::Commit {
+                sha: "abc123".into()
+            }
+        );
+        assert_eq!(
+            ReviewTargetSpec::parse(&toks("files src/a.rs src/b.rs")).unwrap(),
+            ReviewTargetSpec::Files {
+                paths: vec!["src/a.rs".into(), "src/b.rs".into()]
+            }
+        );
+        // Free text → description.
+        assert_eq!(
+            ReviewTargetSpec::parse(&toks("the queue blocking logic")).unwrap(),
+            ReviewTargetSpec::Description {
+                focus: "the queue blocking logic".into()
+            }
+        );
+        // Malformed forms error.
+        assert!(ReviewTargetSpec::parse(&toks("pr notanumber")).is_err());
+        assert!(ReviewTargetSpec::parse(&toks("pr")).is_err());
+        assert!(ReviewTargetSpec::parse(&toks("files")).is_err());
+        assert!(ReviewTargetSpec::parse(&[]).is_err());
+    }
+
+    /// `chunk_target_files` keeps a bounded list whole AND splits an oversized
+    /// one into consecutive bounded groups.
+    #[test]
+    fn chunk_target_files_bounds_groups() {
+        let files: Vec<String> = (0..5).map(|i| format!("f{i}.rs")).collect();
+        // Bounded: one chunk.
+        let chunks = chunk_target_files(&files, 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 5);
+        // Oversized: split into ceil(5/2) = 3 chunks of <= 2.
+        let chunks = chunk_target_files(&files, 2);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= 2));
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 5);
+    }
+
+    /// 5.2: a `files` target runs a NO-DIFF target review — the rendered
+    /// prompt carries the focus + file list in place of a diff, AND the
+    /// session receives an empty diff. Asserts on what the runner saw.
+    #[tokio::test]
+    async fn on_demand_files_target_is_no_diff_review() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        let surface = ReviewSurface::Target(ReviewTarget::Files {
+            paths: vec!["src/queue.rs".into(), "src/lib.rs".into()],
+        });
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+        let outcome = run_on_demand_review_with_runner(&reviewer, &surface, Vec::new(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            OnDemandReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.verdict, Verdict::Approve);
+                assert_eq!(r.sessions, 1);
+            }
+            OnDemandReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+        assert_eq!(runner.session_count(), 1);
+        // The session's diff is empty (target review, no diff).
+        assert_eq!(runner.diffs.lock().unwrap().as_slice(), [String::new()]);
+        // The prompt carries the file list, NOT a unified-diff section.
+        let prompt = runner.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("# Target files"), "prompt: {prompt}");
+        assert!(prompt.contains("src/queue.rs"), "prompt names the file: {prompt}");
+        assert!(
+            !prompt.contains("# Unified diff"),
+            "a target review carries no unified-diff section: {prompt}"
+        );
+    }
+
+    /// 5.3: a description target reviews agent-located files — the prompt
+    /// carries the operator's focus AND instructs the agent to locate the
+    /// files via Glob/Grep AND to name what it reviewed.
+    #[tokio::test]
+    async fn on_demand_description_target_locates_files() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        let surface = ReviewSurface::Target(ReviewTarget::Description {
+            focus: "the [out] gate handling".into(),
+        });
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Block"))]);
+        let outcome = run_on_demand_review_with_runner(&reviewer, &surface, Vec::new(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            OnDemandReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.verdict, Verdict::Block);
+                assert_eq!(r.sessions, 1, "a description is one session — the agent self-scopes");
+            }
+            OnDemandReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+        let prompt = runner.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("the [out] gate handling"), "carries the focus: {prompt}");
+        assert!(
+            prompt.contains("Glob") && prompt.contains("Grep"),
+            "instructs the agent to locate files itself: {prompt}"
+        );
+        assert!(
+            prompt.to_lowercase().contains("name the files"),
+            "asks the agent to name the files it reviewed: {prompt}"
+        );
+    }
+
+    /// 5.1: a `pr`/`commit` diff surface runs the reviewer over the resolved
+    /// diff (a single bounded session) AND the verdict is reported.
+    #[tokio::test]
+    async fn on_demand_diff_surface_runs_reviewer_and_reports_verdict() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        let surface = ReviewSurface::Diff {
+            diff: "DIFF_BODY_a59".into(),
+            changed_files: vec!["src/x.rs".into()],
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+        let outcome = run_on_demand_review_with_runner(&reviewer, &surface, Vec::new(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            OnDemandReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.verdict, Verdict::Approve);
+                assert_eq!(r.sessions, 1);
+            }
+            OnDemandReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+        // The diff reaches the session (written to the artifact the agent reads).
+        assert_eq!(
+            runner.diffs.lock().unwrap().as_slice(),
+            ["DIFF_BODY_a59".to_string()]
+        );
+        let prompt = runner.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("# Unified diff"), "diff surface renders a diff section: {prompt}");
+    }
+
+    /// 5.4: a target spanning more files than one bounded session is split
+    /// into multiple sessions AND the findings aggregate into ONE report.
+    #[tokio::test]
+    async fn on_demand_large_target_chunks_and_aggregates() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        // 45 files at a 20-per-session ceiling → 3 chunked sessions.
+        let paths: Vec<String> = (0..45).map(|i| format!("src/f{i}.rs")).collect();
+        let surface = ReviewSurface::Target(ReviewTarget::Files { paths });
+        // One submission per chunk; the middle one Blocks so the aggregate
+        // verdict is Block (any chunk blocks → blocks).
+        let runner = CannedRunner::new(vec![
+            Some(valid_review_payload("Approve")),
+            Some(valid_review_payload("Block")),
+            Some(valid_review_payload("Approve")),
+        ]);
+        let outcome = run_on_demand_review_with_runner(&reviewer, &surface, Vec::new(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            OnDemandReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.sessions, 3, "45 files / 20-per-session → 3 chunked sessions");
+                assert_eq!(r.chunk_labels.len(), 3, "one report aggregating 3 chunks");
+                assert_eq!(r.verdict, Verdict::Block, "any chunk Block → aggregate Block");
+            }
+            OnDemandReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+        assert_eq!(runner.session_count(), 3, ">1 session ran");
+    }
+
+    /// 5.5 (fail-closed): a chunk session that records no valid verdict
+    /// discards the WHOLE review — never a defaulted clean pass.
+    #[tokio::test]
+    async fn on_demand_no_verdict_session_fails_closed() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        let surface = ReviewSurface::Diff {
+            diff: "d".into(),
+            changed_files: vec!["src/x.rs".into()],
+        };
+        // The single session records NO submission.
+        let runner = CannedRunner::new(vec![None]);
+        let outcome = run_on_demand_review_with_runner(&reviewer, &surface, Vec::new(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            OnDemandReviewOutcome::Discarded { reason } => {
+                assert!(
+                    reason.contains("no valid submit_review"),
+                    "discard reason names the missing submission: {reason}"
+                );
+            }
+            OnDemandReviewOutcome::Reviewed(_) => {
+                panic!("a no-verdict session must discard, never report a clean pass")
+            }
+        }
+    }
+
+    /// 5.1 (resolution): a `commit <sha>` target resolves to that commit's
+    /// diff + its changed files from the local clone (real git fixture).
+    #[test]
+    fn resolve_commit_target_produces_diff_and_files() {
+        use std::process::Command;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let st = Command::new("git").args(args).current_dir(&path).status().unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@e.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "a.rs"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(path.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&["add", "b.rs"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let spec = ReviewTargetSpec::Commit { sha };
+        let surface = resolve_review_surface(&spec, &path, "main", "origin").unwrap();
+        match surface {
+            ReviewSurface::Diff { diff, changed_files } => {
+                assert!(diff.contains("b.rs"), "commit diff mentions the touched file: {diff}");
+                assert!(diff.contains("fn b()"), "commit diff carries the added body: {diff}");
+                assert_eq!(changed_files, vec!["b.rs".to_string()]);
+            }
+            ReviewSurface::Target(_) => panic!("a commit resolves to a Diff surface"),
+        }
+    }
+
+    /// 5.2 / 5.3 (resolution): `files` AND a description resolve to TARGET
+    /// surfaces (no diff). No git is needed — they carry no diff.
+    #[test]
+    fn resolve_files_and_description_targets_are_diffless() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let files = resolve_review_surface(
+            &ReviewTargetSpec::Files {
+                paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            },
+            &path,
+            "main",
+            "origin",
+        )
+        .unwrap();
+        match files {
+            ReviewSurface::Target(ReviewTarget::Files { paths }) => {
+                assert_eq!(paths, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+            }
+            other => panic!("files target must resolve to a Files target surface: {other:?}"),
+        }
+
+        let desc = resolve_review_surface(
+            &ReviewTargetSpec::Description {
+                focus: "the queue logic".into(),
+            },
+            &path,
+            "main",
+            "origin",
+        )
+        .unwrap();
+        match desc {
+            ReviewSurface::Target(ReviewTarget::Description { focus }) => {
+                assert_eq!(focus, "the queue logic");
+            }
+            other => panic!("a description must resolve to a Description target surface: {other:?}"),
+        }
     }
 }

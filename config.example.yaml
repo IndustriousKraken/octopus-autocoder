@@ -104,6 +104,13 @@ executor:
   # user's PATH; for a fork/clone, symlink the canonical name to it (a wrapper
   # script can also inject flags). No per-binary path lives in this file.
   timeout_secs: 1800
+  # Single wall-clock timeout (seconds) for EVERY auxiliary agentic session:
+  # the verifier gates ([in]/[canon]/[rules]/[out]), the code reviewer, AND the
+  # spec-revision sessions (the `send it` executor and the revision advisor).
+  # Defaults to 3600 (one hour) when unset; raise this one value if your
+  # repositories run large refactors or spec rewrites that need longer than an
+  # hour. The implementer is NOT governed by this — it keeps `timeout_secs`.
+  # agentic_session_timeout_secs: 3600
   # Optional tool-use sandbox. Absent → restrictive safe defaults apply
   # (blocks curl/wget/nc/ssh/scp/git-push, denies reads of ~/.ssh and
   # ~/.claude, allows only Read/Write/Edit/Glob/Grep/Bash tools).

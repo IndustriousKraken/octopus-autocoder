@@ -555,6 +555,7 @@ mod tests {
                 implementer_cli: None,
                 command: "claude".into(),
                 timeout_secs: 60,
+                agentic_session_timeout_secs: crate::config::default_agentic_session_timeout(),
                 sandbox: None,
                 agent_env: None,
                 implementer_prompt_path: None,

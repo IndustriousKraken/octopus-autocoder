@@ -47,11 +47,6 @@ pub const CONTRADICTION_CHECK_ROLE: &str = "contradiction_check";
 /// files on demand AND returns its findings through `submit_contradictions`.
 pub const AGENTIC_CONTRADICTION_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
-/// Wall-clock cap for one contradiction-check session. Mirrors the agentic
-/// reviewer's bound (a58): the oneshot path had no analogous timeout (the
-/// HTTP client owned it); this bounds the wrapped CLI subprocess.
-const AGENTIC_CONTRADICTION_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// The full `--allowedTools` list the contradiction-check sandbox grants:
 /// the read-only file tools PLUS the qualified `submit_contradictions` MCP
 /// tool. Notably absent: `Bash`, `Write`, `Edit`. Exposed so tests can
@@ -101,6 +96,12 @@ pub struct ContradictionCheckCtx {
     /// no-submission case retries — the gate still fails closed after the
     /// bound is exhausted (gatekeepers-fail-closed standard).
     pub retries: u32,
+    /// Wall-clock cap for one agentic session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the other gates,
+    /// the reviewer, AND the revision sessions — which reuse THIS ctx's value).
+    /// Set once at daemon startup; the oneshot path had no analogous timeout
+    /// (the HTTP client owned it), this bounds the wrapped CLI subprocess.
+    pub timeout: Duration,
     /// Test-only injected `submit_contradictions` submission, bypassing the
     /// CLI subprocess AND the control socket. `Some(Some(p))` stands in for
     /// a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -438,7 +439,7 @@ pub async fn run_agentic_contradiction_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: AGENTIC_CONTRADICTION_TIMEOUT,
+        timeout: ctx.timeout,
     };
     run_agentic_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner).await
 }
@@ -649,8 +650,33 @@ mod tests {
             // Default to no retry so the canned-runner tests below run the
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
+            timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             test_submission: None,
         }
+    }
+
+    /// unified-agentic-session-timeout task 4.2 ([in] gate + revision sessions):
+    /// the `[in]` gate ctx carries the value resolved from
+    /// `executor.agentic_session_timeout_secs`. The CLI session runner reads
+    /// `ctx.timeout` (asserted here), AND the spec-revision advisor + executor
+    /// reuse THIS ctx for their model + command, so they share the very same
+    /// timeout — one configured value governs all three.
+    #[test]
+    fn in_gate_ctx_carries_resolved_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 4500\n")
+                .expect("executor parses");
+        let ctx = ContradictionCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "T".into(),
+            attribution: None,
+            retries: 0,
+            timeout: exec.agentic_session_timeout(),
+            test_submission: None,
+        };
+        assert_eq!(ctx.timeout, exec.agentic_session_timeout());
+        assert_eq!(ctx.timeout, Duration::from_secs(4500));
     }
 
     fn write(p: &Path, body: &str) {

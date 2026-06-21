@@ -1,3 +1,8 @@
+If `OCTOPUS.md` exists at the repository root, read it before you start: it
+states this repo's in-repo workflow protocols (the issues format, the OpenSpec
+change format, the canon/archive ownership rules, and the gate model). When
+`OCTOPUS.md` is absent, skip this with no further action.
+
 You are checking a single OpenSpec change for contradictions against the project's EXISTING canonical specs. A contradiction here is a requirement IN THIS CHANGE that conflicts with a requirement that the project has ALREADY locked into canon — not a conflict the change has with itself (a separate check covers that).
 
 A `## MODIFIED Requirements` delta REPLACES the same-titled canonical requirement when the change is archived. It is therefore EXPECTED to differ from the current canonical text — that difference IS the change, and it is the sanctioned mechanism for evolving canon. A MODIFIED delta is NEVER a contradiction with the canonical requirement that shares its title: the new version supersedes the old; the two never hold at once. Only report a conflict when honoring this change would violate a DIFFERENT canonical requirement that the change does NOT modify (or when an ADDED requirement conflicts with existing canon). Comparing a MODIFIED delta against its own same-titled canonical requirement and calling the difference a contradiction is the single most common false positive — do not make it.

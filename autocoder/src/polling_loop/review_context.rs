@@ -89,31 +89,30 @@ pub(crate) fn build_review_context(
     // reviewed WITH the issue's intent, like a change PR with its proposal.
     let issues_archive_root = crate::lanes::issues::archive_root(workspace);
     for slug in processed_issues {
-        let dir = match locate_archive_dir(&issues_archive_root, slug)? {
-            Some(d) => d,
+        match locate_archived_issue(&issues_archive_root, slug)? {
+            Some((proposal, tasks)) => {
+                archived_changes.push(crate::code_reviewer::ChangeBrief {
+                    name: slug.clone(),
+                    proposal,
+                    design: None,
+                    tasks,
+                });
+            }
             None => {
                 tracing::warn!(
                     issue = %slug,
-                    "issue archive directory not found while building review context; \
+                    "issue archive entry not found while building review context; \
                      reviewing the diff without the issue brief"
                 );
-                continue;
             }
-        };
-        let issue_md = std::fs::read_to_string(dir.join("issue.md")).unwrap_or_default();
-        let tasks = std::fs::read_to_string(dir.join("tasks.md")).unwrap_or_default();
-        archived_changes.push(crate::code_reviewer::ChangeBrief {
-            name: slug.clone(),
-            proposal: issue_md,
-            design: None,
-            tasks,
-        });
+        }
     }
 
     Ok(crate::code_reviewer::ReviewContext {
         archived_changes,
         changed_files,
         diff,
+        target: None,
     })
 }
 
@@ -217,6 +216,7 @@ pub(crate) fn build_per_change_contexts(
             archived_changes: vec![brief.clone()],
             changed_files,
             diff,
+            target: None,
         };
         let preamble = build_cross_change_preamble(&brief.name, &briefs);
         contexts.push(PerChangeContext {
@@ -250,6 +250,42 @@ pub(crate) fn locate_archive_dir(
         };
         if name.ends_with(&suffix) {
             return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+/// Locate an archived issue unit in EITHER form under `archive_root` and
+/// return its `(proposal, tasks)` brief content. A directory-form issue
+/// `<date>-<slug>/` reads `issue.md` (proposal) + `tasks.md` (tasks); a
+/// single-file issue `<date>-<slug>.md` reads the file as the proposal and
+/// splits out an optional `## Tasks` section as the tasks. Returns
+/// `Ok(None)` when no archived entry for `slug` exists in either form.
+fn locate_archived_issue(
+    archive_root: &Path,
+    slug: &str,
+) -> Result<Option<(String, String)>> {
+    if !archive_root.is_dir() {
+        return Ok(None);
+    }
+    let dir_suffix = format!("-{slug}");
+    let file_suffix = format!("-{slug}.md");
+    for entry in std::fs::read_dir(archive_root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() && name.ends_with(&dir_suffix) {
+            let dir = entry.path();
+            let proposal = std::fs::read_to_string(dir.join("issue.md")).unwrap_or_default();
+            let tasks = std::fs::read_to_string(dir.join("tasks.md")).unwrap_or_default();
+            return Ok(Some((proposal, tasks)));
+        }
+        if file_type.is_file() && name.ends_with(&file_suffix) {
+            let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            return Ok(Some(crate::lanes::issues::split_brief(&body)));
         }
     }
     Ok(None)
@@ -370,4 +406,46 @@ pub(crate) fn collect_reviewer_revisions(report: &ReviewReport) -> Vec<ReviewCon
         );
     }
     revisable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate_archived_issue;
+    use tempfile::TempDir;
+
+    /// single-file-issues §3.2: the reviewer issue brief locates an archived
+    /// unit in EITHER form and reads its body.
+    #[test]
+    fn locate_archived_issue_reads_both_forms() {
+        let td = TempDir::new().unwrap();
+        let archive_root = td.path().join("issues/archive");
+        std::fs::create_dir_all(&archive_root).unwrap();
+
+        // Directory form: issue.md (proposal) + tasks.md.
+        let dir = archive_root.join("2026-06-06-dir-fix");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("issue.md"), "the directory report").unwrap();
+        std::fs::write(dir.join("tasks.md"), "- [x] dir task").unwrap();
+        let (proposal, tasks) = locate_archived_issue(&archive_root, "dir-fix")
+            .unwrap()
+            .expect("directory issue located");
+        assert_eq!(proposal, "the directory report");
+        assert_eq!(tasks, "- [x] dir task");
+
+        // Single-file form: body split into proposal + `## Tasks`.
+        std::fs::write(
+            archive_root.join("2026-06-07-file-fix.md"),
+            "the file report\n\n## Tasks\n\n- [x] file task\n",
+        )
+        .unwrap();
+        let (proposal, tasks) = locate_archived_issue(&archive_root, "file-fix")
+            .unwrap()
+            .expect("single-file issue located");
+        assert!(proposal.contains("the file report"));
+        assert!(!proposal.contains("## Tasks"));
+        assert!(tasks.contains("file task"));
+
+        // Absent slug → None.
+        assert!(locate_archived_issue(&archive_root, "nope").unwrap().is_none());
+    }
 }

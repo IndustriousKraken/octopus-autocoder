@@ -480,6 +480,173 @@ pub fn socket_path(paths: &crate::paths::DaemonPaths) -> PathBuf {
     paths.control_socket_path()
 }
 
+/// Guard returned by [`spawn_submission_listener`]. Holds the
+/// `CancellationToken` for the in-process control-socket listener; on
+/// `Drop` it fires the token, which stops `serve` (the accept loop) and
+/// removes the bound socket file. Hold it for the lifetime of the gate or
+/// audit run that needs the submission transport; drop it to tear the
+/// transport down. The control-socket env var is set by
+/// `spawn_submission_listener` and is NOT cleared on drop (the process is
+/// exiting in every caller; clearing it would be a cross-thread env race).
+pub struct SubmissionListenerGuard {
+    cancel: CancellationToken,
+    /// The bound socket path, exposed so callers can confirm cleanup in
+    /// tests AND so the env var the gates read points at exactly this path.
+    socket: PathBuf,
+    /// Join handle for the spawned `serve` task; awaited on drop is not
+    /// possible (Drop is sync), so we only cancel — `serve` removes the
+    /// socket file as it unwinds.
+    _handle: JoinHandle<()>,
+}
+
+impl SubmissionListenerGuard {
+    /// The path of the bound control socket. Equals the value the
+    /// control-socket env var is set to for the duration of the guard.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+}
+
+impl Drop for SubmissionListenerGuard {
+    fn drop(&mut self) {
+        // Fire the token; `serve` observes it, breaks its accept loop, and
+        // removes the socket file. The spawned task is detached — we do not
+        // (and cannot, in a sync Drop) await it; cancellation is sufficient
+        // for the per-invocation lifecycle.
+        self.cancel.cancel();
+    }
+}
+
+/// Build a `ControlState` that carries ONLY what the submission-relay
+/// handlers (`record_submission` / `consume_submission`) need: the
+/// `submission_store` and `paths`. Every other field is a cheap, inert
+/// placeholder — the in-process listener handles ONLY submission traffic
+/// from a gate/audit's MCP child, so the github/reviewer/chatops/reload
+/// handlers are never reached. Used by [`spawn_submission_listener`].
+fn submission_only_state(
+    paths: Arc<crate::paths::DaemonPaths>,
+    submission_store: crate::submission_store::SubmissionStore,
+) -> ControlState {
+    // GithubConfig + CacheConfig are fully serde-defaulted / Default;
+    // Config requires repositories/executor/github, supplied here as the
+    // empty-repos placeholder. None of these are read on the submission
+    // path; they exist only to satisfy the struct.
+    let github: GithubConfig =
+        serde_json::from_value(serde_json::json!({})).expect("GithubConfig is fully serde-defaulted");
+    let placeholder_cfg = Config {
+        repositories: Vec::new(),
+        executor: crate::config::placeholder_executor_config(),
+        github: github.clone(),
+        reviewer: None,
+        chatops: None,
+        audits: None,
+        paths: crate::config::DaemonPathsConfig::default(),
+        cache: crate::config::CacheConfig::default(),
+        features: crate::config::FeaturesConfig::default(),
+        canonical_rag: None,
+        models: None,
+    };
+    // A no-op spawn closure: the reload handler is never invoked on the
+    // submission path, so this returning `StartupCheckFailed` is unreachable.
+    let spawn_repo: SpawnRepoFn =
+        Arc::new(|_repo: RepositoryConfig| SpawnOutcome::StartupCheckFailed);
+    ControlState {
+        github: Arc::new(ArcSwap::from_pointee(github)),
+        reviewer: Arc::new(ArcSwap::from_pointee(None)),
+        chatops: Arc::new(ArcSwap::from_pointee(None)),
+        cache: Arc::new(ArcSwap::from_pointee(crate::config::CacheConfig::default())),
+        last_config: Arc::new(ArcSwap::from_pointee(placeholder_cfg)),
+        config_path: PathBuf::new(),
+        repo_tasks: Arc::new(Mutex::new(HashMap::new())),
+        repo_tasks_changed: Arc::new(Notify::new()),
+        spawn_repo,
+        canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
+        outcome_store: crate::outcome_store::OutcomeStore::new(),
+        submission_store,
+        paths,
+    }
+}
+
+/// Register the gate AND advisory-audit `submit_*` payload schemas on
+/// `store`. This is the schema set every submission-based gate or audit
+/// validates against; it is the SINGLE source the daemon startup AND the
+/// in-process [`spawn_submission_listener`] both call (the daemon
+/// additionally registers the reviewer's and `[out]` gate's schemas, which
+/// `verify` / standalone-audit do not exercise).
+pub fn register_gate_and_audit_submission_schemas(
+    store: &crate::submission_store::SubmissionStore,
+) {
+    // The advisory audits' `submit_findings` schema.
+    crate::audits::register_submission_schemas(store);
+    // The `[in]` gate's `submit_contradictions` schema.
+    crate::preflight::change_contradiction::register_contradiction_submission_schema(store);
+    // The `[canon]` gate's `submit_canon_contradictions` schema.
+    crate::preflight::canon_contradiction::register_canon_contradiction_submission_schema(store);
+    // The `[rules]` gate's `submit_rule_violations` schema.
+    crate::preflight::global_rules::register_rule_violations_submission_schema(store);
+}
+
+/// Stand up the in-process submission transport for a single invocation,
+/// so an agentic gate or submission-based audit can capture its
+/// `submit_*` verdict over the control socket WITHOUT a running daemon.
+///
+/// This is the SINGLE source of the bootstrap sequence the daemon performs
+/// inline at startup. In order it: constructs a
+/// [`crate::submission_store::SubmissionStore`]; registers the gate
+/// submission schemas (`register_contradiction_submission_schema`,
+/// `register_canon_contradiction_submission_schema`,
+/// `register_rule_violations_submission_schema`) AND the audit submission
+/// schemas (`crate::audits::register_submission_schemas`); binds the
+/// control socket at [`socket_path`]; sets the control-socket env var
+/// ([`crate::mcp_askuser_server::ENV_CONTROL_SOCKET`]) to the bound path;
+/// spawns [`serve`] on a submission-only [`ControlState`]; AND returns a
+/// [`SubmissionListenerGuard`] whose `Drop` cancels the listener (stopping
+/// `serve`, which removes the socket file).
+///
+/// Three callers: the daemon entry point (`cli/run.rs`), the `verify`
+/// subcommand (`cli/verify.rs`), AND the standalone audit path
+/// (`cli/audit.rs::run_standalone`). Without the listener, an agentic gate
+/// or submission-based audit drains `None` from `try_consume_submission`
+/// and fails closed; with it, verdicts are captured exactly as under the
+/// daemon.
+pub fn spawn_submission_listener(
+    paths: &crate::paths::DaemonPaths,
+) -> Result<SubmissionListenerGuard> {
+    let submission_store = crate::submission_store::SubmissionStore::new();
+    // Register the gate AND advisory-audit submission schemas (single source).
+    register_gate_and_audit_submission_schemas(&submission_store);
+
+    let path = socket_path(paths);
+    let listener = bind_at(&path)?;
+    // SAFETY: the callers (verify / standalone audit / daemon startup) set
+    // this env var before spawning any agentic session that reads it; in
+    // the verify/audit CLI paths the process is single-threaded at this
+    // point. The guard intentionally does NOT clear it on drop (the
+    // process exits; a clear would race other threads).
+    unsafe {
+        std::env::set_var(
+            crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+            path.as_os_str(),
+        );
+    }
+
+    let cancel = CancellationToken::new();
+    let state = submission_only_state(Arc::new(paths.clone()), submission_store);
+    let serve_cancel = cancel.clone();
+    let serve_path = path.clone();
+    let handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = serve(listener, serve_path, state, serve_cancel).await {
+            tracing::error!("in-process submission listener exited: {e:#}");
+        }
+    });
+
+    Ok(SubmissionListenerGuard {
+        cancel,
+        socket: path,
+        _handle: handle,
+    })
+}
+
 /// Bind the listener at the canonical socket path and accept connections
 /// until `cancel` fires. Removes the socket file on shutdown.
 pub async fn listen(state: ControlState, cancel: CancellationToken) -> Result<()> {
@@ -634,6 +801,11 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "revision_execute" => handle_revision_execute(&parsed, state),
         "queue_clear_survey" => handle_queue_clear_survey(&parsed, state),
         "promote_issue_candidate" => handle_promote_issue_candidate(&parsed, state),
+        "review_target" => handle_review_target(&parsed, state).await,
+        "recent_commits_log" => handle_recent_commits_log(&parsed, state),
+        "survival_analysis" => handle_survival_analysis(&parsed, state),
+        "provenance_lookup" => handle_provenance_lookup(&parsed, state),
+        "rollback_recovery" => handle_rollback_recovery(&parsed, state).await,
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
@@ -656,6 +828,44 @@ fn find_repo(state: &ControlState, url_arg: &str) -> std::result::Result<Reposit
         .find(|r| r.url == url_arg)
         .cloned()
         .ok_or_else(|| format!("no repository configured with url `{url_arg}`"))
+}
+
+/// Look up the configured repository whose `url` exactly matches OR
+/// case-insensitively contains `selector` (a59). Mirrors the chatops
+/// `match_repo` selector so the on-demand `review_target` action resolves a
+/// repo identically whether the caller already resolved an exact URL (the
+/// chatops dispatcher) OR passed a raw substring (the `autocoder review`
+/// CLI). An exact-URL match is preferred; otherwise a unique substring match
+/// resolves; zero or multiple matches return a clear error.
+fn find_repo_by_substring(
+    state: &ControlState,
+    selector: &str,
+) -> std::result::Result<RepositoryConfig, String> {
+    let cfg = state.last_config.load_full();
+    // Exact URL match first (the chatops path submits the resolved URL).
+    if let Some(r) = cfg.repositories.iter().find(|r| r.url == selector) {
+        return Ok(r.clone());
+    }
+    let needle = selector.to_ascii_lowercase();
+    let matches: Vec<&RepositoryConfig> = cfg
+        .repositories
+        .iter()
+        .filter(|r| r.url.to_ascii_lowercase().contains(&needle))
+        .collect();
+    match matches.len() {
+        0 => Err(format!(
+            "no configured repository matches `{selector}` (by URL or substring)"
+        )),
+        1 => Ok(matches[0].clone()),
+        _ => {
+            let urls: Vec<&str> = matches.iter().map(|r| r.url.as_str()).collect();
+            Err(format!(
+                "`{selector}` matched {} repositories: {}. Use a more specific substring.",
+                urls.len(),
+                urls.join(", ")
+            ))
+        }
+    }
 }
 
 /// Look up the configured repository whose resolved workspace path
@@ -1043,6 +1253,123 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// The literal wildcard target accepted by the marker-clear actions. A
+/// `change` value of `*` selects a bulk sweep; a `url` value of `*` makes
+/// the sweep fleet-wide (every configured repository). The sweep path is
+/// intercepted BEFORE `resolve_change_prefix` is ever called, because a
+/// literal `*` matches no directory prefix (it would resolve to `NoMatch`
+/// and silently clear nothing).
+const CLEAR_WILDCARD: &str = "*";
+
+/// Which marker file a wildcard sweep removes.
+#[derive(Debug, Clone, Copy)]
+enum SweepMarkerKind {
+    /// `.perma-stuck.json` (also removes any companion `.ignore-for-queue.json`).
+    PermaStuck,
+    /// `.needs-spec-revision.json`.
+    Revision,
+}
+
+impl SweepMarkerKind {
+    /// Enumerate the changes in one workspace that carry this kind's marker.
+    /// Uses the same per-kind enumeration `queue::list_marker_excluded`
+    /// reports for status, so the sweep names exactly the changes status
+    /// surfaces.
+    fn list_marked(self, workspace: &Path) -> Result<Vec<String>> {
+        let (perma, revision) = queue::list_marker_excluded(workspace)?;
+        Ok(match self {
+            SweepMarkerKind::PermaStuck => perma,
+            SweepMarkerKind::Revision => revision,
+        })
+    }
+
+    /// Remove this kind's marker from one change. For `PermaStuck`, this
+    /// also removes any companion `.ignore-for-queue.json` (matching the
+    /// exact-form behavior). Returns `true` when an accompanying
+    /// ignore-for-queue marker was also removed.
+    fn remove_from(self, workspace: &Path, change: &str) -> Result<bool> {
+        match self {
+            SweepMarkerKind::PermaStuck => {
+                queue::remove_perma_stuck_marker(workspace, change)?;
+                queue::remove_ignore_for_queue_marker_idempotent(workspace, change)
+            }
+            SweepMarkerKind::Revision => {
+                queue::remove_revision_marker(workspace, change)?;
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Execute a wildcard marker-clear sweep. `url` is either the wildcard
+/// sentinel (`*` → every configured repository) or a single concrete URL
+/// (one repository). For each repository, every change carrying `kind`'s
+/// marker is removed; a per-repository read/remove failure is collected
+/// and reported alongside the successes WITHOUT aborting the sweep. The
+/// response carries a `results` array (one entry per repository) so the
+/// chatops formatter can enumerate what was cleared, report an empty repo
+/// as "nothing to clear", AND surface per-repo failures fail-loud.
+fn sweep_marker_clear(url: &str, kind: SweepMarkerKind, state: &ControlState) -> Value {
+    // Resolve the repository set. A `*` url enumerates every configured
+    // repository; a concrete url resolves the one repository (an unknown
+    // url is an error, mirroring the single-target path).
+    let repos: Vec<RepositoryConfig> = if url == CLEAR_WILDCARD {
+        state.last_config.load_full().repositories.clone()
+    } else {
+        match find_repo(state, url) {
+            Ok(r) => vec![r],
+            Err(e) => return json!({"ok": false, "error": e}),
+        }
+    };
+
+    let mut results: Vec<Value> = Vec::with_capacity(repos.len());
+    for repo in &repos {
+        let workspace_path = workspace::resolve_path(&state.paths, repo);
+        // Enumerate the changes carrying this marker kind. A read failure
+        // is collected per-repo, not fatal: the sweep continues.
+        let marked = match kind.list_marked(&workspace_path) {
+            Ok(m) => m,
+            Err(e) => {
+                results.push(json!({
+                    "url": repo.url,
+                    "error": format!("could not read markers: {e:#}"),
+                }));
+                continue;
+            }
+        };
+        let mut cleared: Vec<String> = Vec::new();
+        let mut removed_ignore = false;
+        let mut errors: Vec<String> = Vec::new();
+        for change in marked {
+            match kind.remove_from(&workspace_path, &change) {
+                Ok(also_ignore) => {
+                    removed_ignore |= also_ignore;
+                    cleared.push(change);
+                }
+                Err(e) => errors.push(format!("{change}: {e:#}")),
+            }
+        }
+        cleared.sort();
+        if errors.is_empty() {
+            results.push(json!({
+                "url": repo.url,
+                "cleared": cleared,
+                "removed_ignore_for_queue": removed_ignore,
+            }));
+        } else {
+            // Some markers cleared, some failed: report both — the cleared
+            // set AND the per-change failures — without aborting the sweep.
+            results.push(json!({
+                "url": repo.url,
+                "cleared": cleared,
+                "removed_ignore_for_queue": removed_ignore,
+                "error": errors.join("; "),
+            }));
+        }
+    }
+    json!({"ok": true, "results": results})
+}
+
 fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
     let url = match require_str(parsed, "url") {
         Ok(u) => u,
@@ -1052,6 +1379,13 @@ fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "error": e}),
     };
+    // Wildcard sweep MUST be intercepted before `resolve_change_prefix`: a
+    // literal `*` matches no directory prefix and would resolve to NoMatch
+    // (a silent "nothing to clear"). The sweep enumerates the marker
+    // directories directly instead.
+    if change == CLEAR_WILDCARD {
+        return sweep_marker_clear(&url, SweepMarkerKind::PermaStuck, state);
+    }
     let repo = match find_repo(state, &url) {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
@@ -1115,6 +1449,11 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "error": e}),
     };
+    // Wildcard sweep — see `handle_clear_perma_stuck`. Intercepted before
+    // `resolve_change_prefix` so a literal `*` never resolves to NoMatch.
+    if change == CLEAR_WILDCARD {
+        return sweep_marker_clear(&url, SweepMarkerKind::Revision, state);
+    }
     let repo = match find_repo(state, &url) {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e}),
@@ -2522,6 +2861,549 @@ fn handle_promote_issue_candidate(parsed: &Value, state: &ControlState) -> Value
     }
 }
 
+/// Handle the `review_target` action (a59): run an on-demand code review of
+/// a PR, commit, or target against the repository's local clone, then report
+/// the verdict + concerns back. The review reuses the existing agentic
+/// reviewer (sandbox, `submit_review`, reads-on-demand) AND is advisory +
+/// read-only — it opens NO revision, modifies NO code, changes NO marker.
+///
+/// A session that fails to produce a valid verdict SURFACES the failure
+/// (gatekeepers-fail-closed) instead of reporting a clean pass: the response
+/// carries `ok: false` with the discard reason, so the chatops reply / CLI
+/// exit code shows the failure rather than a fabricated approval.
+///
+/// For a `pr` target the verdict is ALSO posted as a PR comment (best
+/// effort) when a github token resolves; a comment-post failure logs a WARN
+/// and never changes the chat verdict.
+async fn handle_review_target(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let target_tokens: Vec<String> = match parsed.get("target").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => {
+            return json!({"ok": false, "error": "missing `target` field (array of tokens)"});
+        }
+    };
+    let spec = match crate::code_reviewer::ReviewTargetSpec::parse(&target_tokens) {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo_by_substring(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = crate::workspace::resolve_path(&state.paths, &repo);
+    if !workspace.is_dir() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "workspace {} does not exist yet; the daemon must clone the repo before an \
+                 on-demand review can run",
+                workspace.display()
+            ),
+        });
+    }
+
+    // The on-demand review reuses the AGENTIC reviewer machinery; it has no
+    // oneshot-HTTP equivalent (the read-on-demand sandbox + submit_review is
+    // the whole point). A disabled or oneshot reviewer surfaces a clear error
+    // rather than silently doing nothing.
+    let reviewer = match state.reviewer.load_full().as_ref() {
+        Some(r) => r.clone(),
+        None => {
+            return json!({
+                "ok": false,
+                "error": "reviewer is not configured/enabled; on-demand review requires an \
+                          agentic reviewer (set reviewer.enabled and reviewer.kind: agentic)",
+            });
+        }
+    };
+    if reviewer.kind() != crate::config::ReviewerKind::Agentic {
+        return json!({
+            "ok": false,
+            "error": "on-demand review requires the agentic reviewer transport, but the \
+                      reviewer resolved to `oneshot` (its CLI may be unavailable on this host). \
+                      Install the reviewer CLI or set reviewer.kind: agentic.",
+        });
+    }
+
+    // Resolve the target into a review SURFACE against the local clone. The
+    // remote PR refs live on `origin`.
+    let surface = match crate::code_reviewer::resolve_review_surface(
+        &spec,
+        &workspace,
+        &repo.base_branch,
+        "origin",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("resolving review target: {e:#}")});
+        }
+    };
+
+    // Run the review. No archived-change briefs are loaded for an on-demand
+    // review — the surface (diff or target) is the reviewer's whole context.
+    let outcome = match crate::code_reviewer::run_on_demand_review(
+        reviewer.as_ref(),
+        &surface,
+        Vec::new(),
+        &workspace,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("on-demand review failed: {e:#}")});
+        }
+    };
+
+    let report = match outcome {
+        crate::code_reviewer::OnDemandReviewOutcome::Reviewed(r) => r,
+        crate::code_reviewer::OnDemandReviewOutcome::Discarded { reason } => {
+            // Gatekeepers-fail-closed: a no-verdict session surfaces the
+            // failure; it does NOT report a clean pass.
+            return json!({
+                "ok": false,
+                "discarded": true,
+                "error": reason,
+            });
+        }
+    };
+
+    // Optional PR comment for a `pr` target (best effort; never alters the
+    // chat verdict).
+    if let crate::code_reviewer::ReviewTargetSpec::Pr { number } = &spec {
+        post_on_demand_pr_comment(state, &repo, *number, &report).await;
+    }
+
+    json!({
+        "ok": true,
+        "verdict": report.verdict.label(),
+        "body": report.markdown,
+        "sessions": report.sessions,
+        "chunks": report.chunk_labels,
+        "attribution": report.attribution,
+    })
+}
+
+/// Best-effort PR-comment post for an on-demand `pr` review (a59). Resolves
+/// the github token AND posts the verdict + body as a PR comment. Every
+/// failure (token resolve, URL parse, HTTP) logs a WARN and returns — the
+/// chat verdict already carries the result, so a comment-post failure must
+/// not fail the review.
+async fn post_on_demand_pr_comment(
+    state: &ControlState,
+    repo: &RepositoryConfig,
+    pr_number: u64,
+    report: &crate::code_reviewer::OnDemandReviewReport,
+) {
+    let github_cfg = state.github.load_full();
+    let (owner, repo_name) = match github::parse_repo_url(&repo.url) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "on-demand review: parse_repo_url failed: {e:#}");
+            return;
+        }
+    };
+    let token = match github_credentials::resolve_token(&github_cfg, &owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "on-demand review: github token resolve failed: {e:#}");
+            return;
+        }
+    };
+    let body = format!(
+        "## On-demand code review\n\n**Verdict: {}**\n\n{}",
+        report.verdict.label(),
+        report.markdown
+    );
+    use crate::forge::Forge;
+    if let Err(e) = crate::forge::GithubForge::with_api_base(github::DEFAULT_API_BASE)
+        .post_comment(&token, &owner, &repo_name, pr_number, &body)
+        .await
+    {
+        tracing::warn!(
+            url = %repo.url,
+            pr_number,
+            "on-demand review: PR comment post failed: {e:#}"
+        );
+    }
+}
+
+/// Handle the `recent_commits_log` action (code-rollback-recovery's
+/// read-only `log` command). Resolves the repo by substring (the same way
+/// `review` does), reads the base branch's most recent `count` commits
+/// (newest-first), AND returns them. Modifies NOTHING — no branch,
+/// workspace, or marker is touched.
+fn handle_recent_commits_log(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    // Optional count; default to a small page (20).
+    let count = parsed
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(20);
+    let repo = match find_repo_by_substring(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = workspace::resolve_path(&state.paths, &repo);
+    if !workspace.is_dir() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "workspace {} does not exist yet; the daemon must clone the repo before its log \
+                 can be read",
+                workspace.display()
+            ),
+        });
+    }
+    match git::recent_commits(&workspace, &repo.base_branch, count) {
+        Ok(entries) => {
+            let commits: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "short_sha": e.short_sha,
+                        "subject": e.subject,
+                        "date": e.date,
+                    })
+                })
+                .collect();
+            json!({
+                "ok": true,
+                "url": repo.url,
+                "base_branch": repo.base_branch,
+                "commits": commits,
+            })
+        }
+        Err(e) => json!({"ok": false, "error": format!("reading commit log: {e:#}")}),
+    }
+}
+
+/// Handle the `survival_analysis` action (review-survival-provenance's
+/// `survives` command). Resolves the repo by substring (same as `review` /
+/// `log`), then reports which of a past PR's OR commit's changes still
+/// survive verbatim at `HEAD` (per-file pre-filter + line-level blame).
+/// The request carries exactly one of `pr` (number) / `commit` (sha). The
+/// optional `detect_moves` flag enables `git blame -M -C`. Read-only:
+/// touches no branch, workspace, or marker.
+fn handle_survival_analysis(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let target = match parsed.get("pr").and_then(|v| v.as_u64()) {
+        Some(n) => crate::survival::SurvivalTarget::Pr { number: n },
+        None => match parsed.get("commit").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => {
+                crate::survival::SurvivalTarget::Commit { sha: s.to_string() }
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "error": "missing target: provide exactly one of `pr` (number) or `commit` (sha)",
+                });
+            }
+        },
+    };
+    let detect_moves = parsed
+        .get("detect_moves")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let repo = match find_repo_by_substring(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = workspace::resolve_path(&state.paths, &repo);
+    if !workspace.is_dir() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "workspace {} does not exist yet; the daemon must clone the repo before survival \
+                 analysis can run",
+                workspace.display()
+            ),
+        });
+    }
+    match crate::survival::analyze_survival(
+        &workspace,
+        &repo.base_branch,
+        "origin",
+        &target,
+        detect_moves,
+    ) {
+        Ok(report) => json!({
+            "ok": true,
+            "url": repo.url,
+            "report": report.render(),
+            "review_focus_paths": report.review_focus_paths(),
+            "surviving_lines": report.total_surviving_lines(),
+        }),
+        Err(e) => json!({"ok": false, "error": format!("survival analysis failed: {e:#}")}),
+    }
+}
+
+/// Handle the `provenance_lookup` action (review-survival-provenance's
+/// `blame` command). Resolves the repo by substring, then runs `git blame`
+/// at `HEAD` for the requested `path` line range (`start`..=`end`),
+/// reporting each line's introducing commit AND the PR when the commit's
+/// subject names one (no fabricated PR). Read-only.
+fn handle_provenance_lookup(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let path = match require_str(parsed, "path") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let start = parsed.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let end = parsed
+        .get("end")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(start as u64) as usize;
+    if start == 0 || end == 0 || start > end {
+        return json!({
+            "ok": false,
+            "error": "line range invalid: start/end must be >= 1 and start <= end",
+        });
+    }
+    let detect_moves = parsed
+        .get("detect_moves")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let repo = match find_repo_by_substring(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace = workspace::resolve_path(&state.paths, &repo);
+    if !workspace.is_dir() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "workspace {} does not exist yet; the daemon must clone the repo before \
+                 provenance can be read",
+                workspace.display()
+            ),
+        });
+    }
+    match crate::survival::analyze_provenance(&workspace, &path, start, end, detect_moves) {
+        Ok(report) => json!({
+            "ok": true,
+            "url": repo.url,
+            "report": report.render(),
+        }),
+        Err(e) => json!({"ok": false, "error": format!("provenance lookup failed: {e:#}")}),
+    }
+}
+
+/// Parse the rollback depth (count OR sha) from a request. Exactly one of
+/// `count` / `sha` must be present.
+fn parse_rollback_depth(parsed: &Value) -> std::result::Result<crate::rollback::RollbackDepth, String> {
+    let count = parsed.get("count").and_then(|v| v.as_u64());
+    let sha = parsed.get("sha").and_then(|v| v.as_str()).map(|s| s.to_string());
+    match (count, sha) {
+        (Some(_), Some(_)) => {
+            Err("provide EITHER `count` OR `sha`, not both".to_string())
+        }
+        (Some(n), None) => Ok(crate::rollback::RollbackDepth::Count(n as usize)),
+        (None, Some(s)) => Ok(crate::rollback::RollbackDepth::Sha(s)),
+        (None, None) => Err("missing rollback depth: provide `count` (last N commits) OR `sha` (target commit)".to_string()),
+    }
+}
+
+/// Handle the `rollback_recovery` action (code-rollback-recovery). Rolls the
+/// repo's CODE back by a count OR to a SHA WHILE unarchiving the
+/// changes/issues archived in the range, riding the normal push + PR flow
+/// (honoring `auto_submit_pr`). A `dry_run: true` request (the CLI default)
+/// returns the preview — exactly what WOULD be rolled back AND unarchived —
+/// without changing any branch, workspace, archive, or canon.
+async fn handle_rollback_recovery(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let depth = match parse_rollback_depth(parsed) {
+        Ok(d) => d,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let dry_run = parsed.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let repo = match find_repo_by_substring(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let github_cfg = state.github.load_full();
+    let workspace = workspace::resolve_path(&state.paths, &repo);
+
+    // Initialize the workspace (clone if needed; sync the base branch) so the
+    // plan is resolved against the live base-branch tip.
+    let fork_url = match github_cfg.fork_owner.as_deref() {
+        Some(owner) => match crate::github::derive_fork_url(&repo.url, owner) {
+            Ok(u) => Some(u),
+            Err(e) => return json!({"ok": false, "error": format!("deriving fork url: {e:#}")}),
+        },
+        None => None,
+    };
+    let fork_arg = fork_url.as_deref().map(|u| (u, repo.agent_branch.as_str()));
+    if let Err(e) =
+        workspace::ensure_initialized(&state.paths, &workspace, &repo.url, fork_arg)
+    {
+        return json!({"ok": false, "error": format!("workspace init failed: {e:#}")});
+    }
+
+    // Resolve the plan against a clean base branch. The base must reflect the
+    // remote tip; reset to it so a stale local base does not skew the range.
+    if let Err(e) = git::checkout(&workspace, &repo.base_branch) {
+        return json!({"ok": false, "error": format!("checkout base branch failed: {e:#}")});
+    }
+    if let Err(e) = git::reset_hard_to_remote(&workspace, &repo.base_branch) {
+        // Non-fatal in a fresh clone that already matches; log + proceed.
+        tracing::warn!(
+            url = %repo.url,
+            "rollback: reset --hard to origin/{} failed (proceeding with local base): {e:#}",
+            repo.base_branch
+        );
+    }
+
+    let plan = match crate::rollback::resolve_plan(&workspace, &repo.base_branch, &depth) {
+        Ok(p) => p,
+        Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+    };
+    let preview = crate::rollback::format_preview(&workspace, &plan);
+    let collisions = crate::rollback::detect_collisions(&workspace, &plan);
+
+    if dry_run {
+        return json!({
+            "ok": true,
+            "dry_run": true,
+            "url": repo.url,
+            "preview": preview,
+            "code_only": plan.is_code_only(),
+            "commit_count": plan.commit_count(),
+            "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "has_collisions": !collisions.is_empty(),
+        });
+    }
+
+    // A collision is fail-loud (never silently overwrite active work).
+    if !collisions.is_empty() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "rollback aborted: {} in-range unit(s) collide with existing active directories. \
+                 Resolve them, then retry. Preview:\n{preview}",
+                collisions.len()
+            ),
+        });
+    }
+
+    // Prepare the rolled-back state on a FRESH agent branch at the base tip,
+    // so the rollback rides the normal push + PR flow rather than
+    // force-pushing the base branch.
+    if let Err(e) = git::recreate_branch(&workspace, &repo.agent_branch) {
+        return json!({"ok": false, "error": format!("recreating agent branch failed: {e:#}")});
+    }
+    if let Err(e) = crate::rollback::prepare_rolled_back_tree(&workspace, &plan) {
+        return json!({"ok": false, "error": format!("preparing rolled-back tree: {e:#}")});
+    }
+
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    if let Err(e) = git::push_force_with_lease(&workspace, &repo.agent_branch, push_remote) {
+        return json!({"ok": false, "error": format!("pushing rolled-back branch failed: {e:#}")});
+    }
+
+    let pr_body = crate::rollback::build_pr_body(&workspace, &plan);
+    let title = format!(
+        "rollback: restore code ({} commit(s)){}",
+        plan.commit_count(),
+        if plan.is_code_only() {
+            " — code-only".to_string()
+        } else {
+            format!(
+                " + unarchive {} change(s) / {} issue(s)",
+                plan.changes.len(),
+                plan.issues.len()
+            )
+        }
+    );
+
+    // Honor `auto_submit_pr`: open a PR by default, OR surface the pushed
+    // branch with no PR (`BranchPushedNoPr`) when an install set it false.
+    if !repo.auto_submit_pr {
+        let (owner, repo_name) = match crate::github::parse_repo_url(&repo.url) {
+            Ok(p) => p,
+            Err(e) => return json!({"ok": false, "error": format!("parsing repo url: {e:#}")}),
+        };
+        let branch_url = crate::polling_loop::compose_branch_url(
+            repo.forge.as_ref(),
+            &repo.url,
+            &owner,
+            &repo_name,
+            &repo.agent_branch,
+        );
+        let pr_base = repo
+            .upstream
+            .as_ref()
+            .map(|u| u.branch.as_str())
+            .unwrap_or(&repo.base_branch);
+        let suggested =
+            crate::polling_loop::push_only_command(repo.forge.as_ref(), pr_base, &repo.agent_branch);
+        return json!({
+            "ok": true,
+            "dry_run": false,
+            "outcome": "branch_pushed_no_pr",
+            "url": repo.url,
+            "branch_url": branch_url,
+            "suggested_command": suggested,
+            "code_only": plan.is_code_only(),
+            "commit_count": plan.commit_count(),
+            "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "preview": preview,
+        });
+    }
+
+    match crate::polling_loop::open_triage_pull_request(
+        &state.paths,
+        &repo,
+        &github_cfg,
+        &repo.agent_branch,
+        &repo.base_branch,
+        &title,
+        &pr_body,
+    )
+    .await
+    {
+        Ok(pr_url) => json!({
+            "ok": true,
+            "dry_run": false,
+            "outcome": "pr_opened",
+            "url": repo.url,
+            "pr_url": pr_url,
+            "code_only": plan.is_code_only(),
+            "commit_count": plan.commit_count(),
+            "changes": plan.changes.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+            "issues": plan.issues.iter().map(|u| u.slug.clone()).collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({"ok": false, "error": format!("opening rollback PR: {e:#}")}),
+    }
+}
+
 /// Handle the `query_canonical_specs` action (a21). Looks up the
 /// workspace's `CanonicalRagStore` in the daemon's registry; on hit,
 /// runs the query and returns ranked chunks. Every error path is
@@ -2795,7 +3677,10 @@ pub async fn handle_reload(state: &ControlState) -> Value {
 
     // --- reviewer ---
     if yaml_repr(&current.reviewer) != yaml_repr(&new_cfg.reviewer) {
-        match build_reviewer(new_cfg.reviewer.as_ref()) {
+        match build_reviewer(
+            new_cfg.reviewer.as_ref(),
+            new_cfg.executor.agentic_session_timeout(),
+        ) {
             Ok(slot) => {
                 state.reviewer.store(Arc::new(slot));
                 applied.push("reviewer".to_string());
@@ -3025,11 +3910,18 @@ fn apply_repository_changes(
     delta
 }
 
-fn build_reviewer(cfg: Option<&ReviewerConfig>) -> Result<Option<Arc<CodeReviewer>>> {
+fn build_reviewer(
+    cfg: Option<&ReviewerConfig>,
+    agentic_session_timeout: std::time::Duration,
+) -> Result<Option<Arc<CodeReviewer>>> {
     match cfg {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
-                .context("initializing code reviewer from new config")?;
+                .context("initializing code reviewer from new config")?
+                // Reviewer shares the ONE auxiliary-session timeout with the
+                // verifier gates AND the revision sessions; the reviewer block
+                // does not carry the executor field, so it is threaded here.
+                .with_agentic_session_timeout(agentic_session_timeout);
             // a64: re-evaluate agentic-CLI availability on reload via the
             // existing `reviewer:` hot-reload path; an unavailable CLI
             // degrades to `oneshot` for this boot with one loud WARN.
@@ -3553,6 +4445,38 @@ github:
         cancel.cancel();
     }
 
+    /// a59: the `review_target` action is wired AND validates its target —
+    /// a malformed PR number is rejected with ok:false before any review runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_target_rejects_malformed_target() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"review_target","url":"git@github.com:owner/repo.git","target":["pr","notanumber"]}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("not a valid PR number"), "error: {err}");
+        cancel.cancel();
+    }
+
+    /// a59: an unknown repo substring is rejected with ok:false (the
+    /// substring selector resolves zero repos).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_target_unknown_repo_errors() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"review_target","url":"nope-no-such-repo","target":["pr","1"]}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("no configured repository"), "error: {err}");
+        cancel.cancel();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dispatch_returns_error_on_unparseable_json() {
         let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
@@ -4030,6 +4954,216 @@ github:
         });
         let resp = send_request(&socket, &req.to_string()).await;
         assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        cancel.cancel();
+    }
+
+    // -------------------------------------------------------------
+    // bulk-clear-markers: wildcard sweep at the control-socket handler.
+    // -------------------------------------------------------------
+
+    /// Build YAML for two repositories at explicit `local_path`s so the
+    /// fleet-wide sweep tests have a real multi-repo config to enumerate.
+    fn two_repo_yaml(ws_a: &Path, ws_b: &Path) -> String {
+        format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo-a.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+  - url: "git@github.com:owner/repo-b.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+  token:
+    value: "ghp_fixture"
+"#,
+            ws_a.display(),
+            ws_b.display(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_wildcard_clears_all_in_one_repo() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        make_change(&workspace, "a07-bar");
+        make_change(&workspace, "a08-clean");
+        write_marker_file(&workspace, "a06-foo", ".perma-stuck.json");
+        write_marker_file(&workspace, "a07-bar", ".perma-stuck.json");
+        // a06 also carries a companion ignore-for-queue marker — the sweep
+        // must remove it too (matching the exact-form behavior).
+        write_marker_file(&workspace, "a06-foo", ".ignore-for-queue.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let results = resp["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1, "one repo in the config");
+        let cleared: Vec<&str> = results[0]["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(cleared, vec!["a06-foo", "a07-bar"]);
+        assert_eq!(
+            results[0]["removed_ignore_for_queue"],
+            serde_json::Value::Bool(true)
+        );
+        // Both markers AND the companion ignore-for-queue are gone.
+        assert!(
+            !workspace
+                .join("openspec/changes/a06-foo/.perma-stuck.json")
+                .exists()
+        );
+        assert!(
+            !workspace
+                .join("openspec/changes/a06-foo/.ignore-for-queue.json")
+                .exists()
+        );
+        assert!(
+            !workspace
+                .join("openspec/changes/a07-bar/.perma-stuck.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_wildcard_empty_repo_reports_nothing_to_clear() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a08-clean");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        // Fail-loud, never silent: ok=true with an explicit empty `cleared`
+        // (the chatops formatter renders this as "nothing to clear").
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let results = resp["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["cleared"].as_array().unwrap().is_empty());
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_fleet_wildcard_sweeps_every_repo() {
+        let dir = TempDir::new().unwrap();
+        let ws_a = dir.path().join("ws-a");
+        let ws_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        make_change(&ws_a, "a06-foo");
+        write_marker_file(&ws_a, "a06-foo", ".needs-spec-revision.json");
+        make_change(&ws_b, "a07-bar");
+        write_marker_file(&ws_b, "a07-bar", ".needs-spec-revision.json");
+        make_change(&ws_b, "a08-baz");
+        write_marker_file(&ws_b, "a08-baz", ".needs-spec-revision.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&two_repo_yaml(&ws_a, &ws_b)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "*",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let results = resp["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 2, "both repos enumerated: {resp}");
+        // Every marker across both repos is removed.
+        assert!(
+            !ws_a
+                .join("openspec/changes/a06-foo/.needs-spec-revision.json")
+                .exists()
+        );
+        assert!(
+            !ws_b
+                .join("openspec/changes/a07-bar/.needs-spec-revision.json")
+                .exists()
+        );
+        assert!(
+            !ws_b
+                .join("openspec/changes/a08-baz/.needs-spec-revision.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    /// 5.5 (load-bearing): a `*` target must NOT be passed to
+    /// `resolve_change_prefix`. We assert the wildcard branch is taken
+    /// *before* resolution by constructing a workspace where prefix
+    /// resolution of a literal `*` would return `NoMatch` (no change dir is
+    /// named `*`, and `*` is not a prefix of any marked change), then
+    /// confirming the sweep STILL clears the marked change. If the handler
+    /// routed `*` through `resolve_change_prefix`, it would NoMatch and
+    /// clear nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_wildcard_bypasses_resolve_change_prefix() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        write_marker_file(&workspace, "a06-foo", ".perma-stuck.json");
+
+        // Pre-condition: prove that resolving a literal `*` against this
+        // workspace is a NoMatch. If the handler called this, the sweep
+        // would clear nothing.
+        let resolved = queue::resolve_change_prefix(
+            &workspace,
+            "*",
+            queue::ChangePrefixMarkerScope::PermaStuck,
+        );
+        assert!(
+            matches!(
+                resolved,
+                Err(queue::ResolvePrefixError::NoMatch { .. })
+            ),
+            "literal '*' must NoMatch through the resolver: {resolved:?}"
+        );
+
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let cleared: Vec<&str> = resp["results"][0]["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // The sweep succeeded DESPITE the resolver returning NoMatch for `*`
+        // — proving the wildcard branch is taken before resolution.
+        assert_eq!(cleared, vec!["a06-foo"]);
+        assert!(
+            !workspace
+                .join("openspec/changes/a06-foo/.perma-stuck.json")
+                .exists()
+        );
         cancel.cancel();
     }
 
@@ -4861,6 +5995,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         {
@@ -5124,6 +6259,7 @@ github:
             spec_storage: None,
             upstream: None,
             auto_submit_pr: true,
+            octopus_guide: None,
             sandbox: None,
         };
         let gh = GithubConfig {
@@ -5376,5 +6512,93 @@ github:
         .await;
         assert_eq!(resp["submission"], serde_json::Value::Null);
         cancel.cancel();
+    }
+
+    /// The listener is a HARD precondition: with the control-socket env var
+    /// unset (no `spawn_submission_listener` active), a submission drain
+    /// returns `None` — exactly what makes a gate / audit fail closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_listener_consume_returns_none_fail_closed() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by ENV_LOCK; we restore by clearing below.
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+        }
+        let drained = crate::audits::try_consume_submission(
+            Path::new("/tmp/myrepo"),
+            "some-change",
+        )
+        .await;
+        assert!(
+            drained.is_none(),
+            "with no listener the drain MUST be None (the gate/audit fails closed)"
+        );
+    }
+
+    /// `spawn_submission_listener` stands up the transport in-process: it
+    /// sets the env var to a live bound socket, registers the gate + audit
+    /// schemas, and a recorded submission round-trips via the same
+    /// `try_consume_submission` path the gates / audits use under a daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_listener_stands_up_transport_and_captures_submission() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let guard = spawn_submission_listener(&paths).expect("listener stands up");
+
+        // The env var points at the live socket.
+        let env_socket = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET)
+            .expect("env var set by the helper");
+        assert_eq!(
+            PathBuf::from(&env_socket),
+            guard.socket_path().to_path_buf(),
+            "env var must name the bound socket"
+        );
+        assert!(guard.socket_path().exists(), "socket file must be live");
+
+        // Simulate the MCP child relaying a `submit_findings` payload over the
+        // socket. `architecture_advisor`'s role/schema is registered by the
+        // helper via `register_submission_schemas`.
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "myrepo",
+            "change": "some-change",
+            "role": "architecture_advisor",
+            "payload": {"findings": []},
+        });
+        let resp = send_request(guard.socket_path(), &rec.to_string()).await;
+        assert_eq!(
+            resp["ok"],
+            serde_json::Value::Bool(true),
+            "record must succeed against the helper-registered schema: {resp}"
+        );
+
+        // The audit/gate drain path captures it (basename == "myrepo").
+        let drained = crate::audits::try_consume_submission(
+            Path::new("/some/where/myrepo"),
+            "some-change",
+        )
+        .await;
+        assert!(
+            drained.is_some(),
+            "with the listener up, the submission is captured"
+        );
+
+        // Drop tears the transport down and removes the socket file.
+        let socket = guard.socket_path().to_path_buf();
+        drop(guard);
+        // Cancellation → serve unwinds → removes the file. Poll briefly.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !socket.exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "the socket file must be removed on guard drop");
+        // Clean up the env var we set (serialized by ENV_LOCK).
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+        }
     }
 }

@@ -502,6 +502,7 @@ async fn pr_opened_notification_noop_without_chatops() {
         spec_storage: None,
         upstream: None,
         auto_submit_pr: true,
+        octopus_guide: None,
         sandbox: None,
     };
     maybe_post_pr_opened(

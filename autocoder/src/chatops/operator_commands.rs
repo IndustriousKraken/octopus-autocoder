@@ -12,7 +12,14 @@
 //!   - `status` (bare — per-repo menu of every configured repository)
 //!   - `status <repo-substring>`
 //!   - `clear-perma-stuck <repo-substring> <change-slug>`
+//!   - `clear-perma-stuck <repo-substring> *`  (every `.perma-stuck.json`
+//!                                            marker in the one repo)
+//!   - `clear-perma-stuck *`                    (fleet-wide sweep across all
+//!                                            configured repositories)
 //!   - `clear-revision <repo-substring> <change-slug>`
+//!   - `clear-revision <repo-substring> *`      (every `.needs-spec-revision.json`
+//!                                            marker in the one repo)
+//!   - `clear-revision *`                        (fleet-wide sweep)
 //!   - `wipe-workspace <repo-substring>`     (first step)
 //!   - `confirm`                              (second step; only within 60s
 //!                                            of a wipe-workspace in the
@@ -403,7 +410,84 @@ pub enum OperatorCommand {
     ClearSurvey {
         repo_substring: String,
     },
+    /// `@<bot> review <repo-substring> <target>` (a59). On-demand code
+    /// review of a PR, commit, file-set, or described area. `<target>` is
+    /// the remaining tokens: `pr <N>` / `commit <sha>` / `files <path...>`
+    /// / a free-text description. The dispatcher submits the `review_target`
+    /// control-socket action (which runs the agentic reviewer against the
+    /// resolved surface) AND reports the verdict + concerns back. Advisory +
+    /// read-only — opens no revision, changes no code or marker.
+    ReviewTarget {
+        repo_substring: String,
+        target_tokens: Vec<String>,
+    },
+    /// `@<bot> log <repo-substring> [<count>]` (code-rollback-recovery).
+    /// Lists the matched repo's recent base-branch commits (short SHA,
+    /// subject, date; newest first) so an operator choosing a rollback
+    /// depth can see the history. Read-only — submits the
+    /// `recent_commits_log` control-socket action; changes nothing.
+    Log {
+        repo_substring: String,
+        count: Option<usize>,
+    },
+    /// `@<bot> survives <repo-substring> <pr <N> | commit <sha>>`
+    /// (review-survival-provenance). Reports which of a past PR's or
+    /// commit's changes still survive verbatim at `HEAD`, naming the
+    /// surviving files AND line regions so the operator can review only
+    /// still-live code. Read-only — submits the `survival_analysis`
+    /// control-socket action; modifies no branch, workspace, or marker.
+    Survives {
+        repo_substring: String,
+        /// `Ok(number)` for a PR target, `Err(sha)` for a commit target.
+        target: SurvivalChatTarget,
+    },
+    /// `@<bot> blame <repo-substring> <path> <line>[-<line>]`
+    /// (review-survival-provenance). Reports, per line at `HEAD`, the
+    /// introducing commit (short SHA, subject, date) AND the PR when the
+    /// commit subject names one (no fabricated PR). Read-only — submits the
+    /// `provenance_lookup` control-socket action.
+    Blame {
+        repo_substring: String,
+        path: String,
+        start: usize,
+        end: usize,
+    },
+    /// `@<bot> rollback <repo-substring> <N | sha SHA>` (code-rollback-recovery).
+    /// First step of the destructive two-step confirm: the dispatcher runs a
+    /// dry-run preview AND records a pending confirmation keyed by channel
+    /// (60s TTL), mirroring `wipe-workspace`. The second step
+    /// (`rollback-confirm`) performs the rollback.
+    Rollback {
+        repo_substring: String,
+        /// `Ok(count)` for a numeric depth, `Err(sha)` for a target SHA.
+        depth: RollbackChatDepth,
+    },
+    /// Second step of the destructive `rollback` flow: consumes the pending
+    /// confirmation recorded by the matching `rollback` command AND submits
+    /// the actual `rollback_recovery` action.
+    RollbackConfirm {
+        repo_substring: Option<String>,
+    },
     Help,
+}
+
+/// The rollback depth as parsed from a chatops `rollback` verb: a numeric
+/// commit count OR a target SHA. (A standalone type rather than reusing
+/// `crate::rollback::RollbackDepth` so the chatops layer stays free of a
+/// daemon-module dependency.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackChatDepth {
+    Count(usize),
+    Sha(String),
+}
+
+/// The survival target parsed from a chatops `survives` verb: a PR number
+/// OR a commit SHA. A standalone chatops-layer type (the daemon maps it to
+/// `crate::survival::SurvivalTarget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurvivalChatTarget {
+    Pr(u64),
+    Commit(String),
 }
 
 /// One repository whose per-repo status could not be fully assembled
@@ -432,6 +516,77 @@ enum ParseOutcome {
 
 fn parse_command_outcome(message: &str, bot_mention: &str) -> ParseOutcome {
     parse_command_outcome_in_thread(message, bot_mention, None)
+}
+
+/// The wildcard sentinel token for the marker-clear verbs. A bare `*` in
+/// the change-slug OR repo-substring position selects a bulk-clear sweep
+/// instead of a single named target. It is recognized BEFORE the
+/// change-slug / repo-substring regex check, so it is never rejected as a
+/// malformed argument; every non-`*` token is still sanitized as before.
+pub const CLEAR_WILDCARD: &str = "*";
+
+/// Which marker-clear verb a [`parse_marker_clear`] call is parsing.
+#[derive(Debug, Clone, Copy)]
+enum ClearKind {
+    PermaStuck,
+    Revision,
+}
+
+/// Parse the argument tail for a `clear-perma-stuck` / `clear-revision`
+/// verb, recognizing the `*` wildcard sentinel in the repo-substring AND
+/// change-slug positions before applying the sanitizing regex. Accepted
+/// shapes:
+///
+/// - `clear-<kind> *`              → fleet-wide sweep (repo `*`, change `*`)
+/// - `clear-<kind> <repo> *`       → repo-wide sweep (sanitized repo, change `*`)
+/// - `clear-<kind> <repo> <change>`→ exact single-target (both sanitized)
+///
+/// A `*` in the repo position is ONLY valid as the lone `clear-<kind> *`
+/// form — a `clear-<kind> * <change>` is rejected (`None`), because a
+/// fleet-wide clear of a single named change is not a supported shape.
+/// Every non-`*` token is regex-checked exactly as the exact form; a
+/// malformed slug or repo substring is still rejected with `✗ invalid …`.
+fn parse_marker_clear(rest: &[&str], kind: ClearKind) -> ParseOutcome {
+    let build = |repo: String, change: String| match kind {
+        ClearKind::PermaStuck => OperatorCommand::ClearPermaStuck {
+            repo_substring: repo,
+            change,
+        },
+        ClearKind::Revision => OperatorCommand::ClearRevision {
+            repo_substring: repo,
+            change,
+        },
+    };
+    match rest.len() {
+        // `clear-<kind> *` — fleet-wide sweep across every configured repo.
+        1 if rest[0] == CLEAR_WILDCARD => ParseOutcome::Ok(build(
+            CLEAR_WILDCARD.to_string(),
+            CLEAR_WILDCARD.to_string(),
+        )),
+        2 => {
+            // The repo position accepts `*` ONLY in the lone one-arg form;
+            // here (two args) it must be a sanitized substring.
+            if rest[0] == CLEAR_WILDCARD {
+                return ParseOutcome::None;
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            // The change position accepts the `*` sentinel (repo-wide sweep)
+            // BEFORE the slug regex; any other value is sanitized as before.
+            if rest[1] == CLEAR_WILDCARD {
+                return ParseOutcome::Ok(build(
+                    rest[0].to_string(),
+                    CLEAR_WILDCARD.to_string(),
+                ));
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            ParseOutcome::Ok(build(rest[0].to_string(), rest[1].to_string()))
+        }
+        _ => ParseOutcome::None,
+    }
 }
 
 /// True when `message` is addressed to the bot (begins with the bot mention).
@@ -502,36 +657,8 @@ fn parse_command_outcome_in_thread(
             }
             _ => ParseOutcome::None,
         },
-        "clear-perma-stuck" => {
-            if rest.len() != 2 {
-                return ParseOutcome::None;
-            }
-            if !repo_substring_regex().is_match(rest[0]) {
-                return ParseOutcome::Invalid(invalid_repo_substring_reply());
-            }
-            if !change_slug_regex().is_match(rest[1]) {
-                return ParseOutcome::Invalid(invalid_change_slug_reply());
-            }
-            ParseOutcome::Ok(OperatorCommand::ClearPermaStuck {
-                repo_substring: rest[0].to_string(),
-                change: rest[1].to_string(),
-            })
-        }
-        "clear-revision" => {
-            if rest.len() != 2 {
-                return ParseOutcome::None;
-            }
-            if !repo_substring_regex().is_match(rest[0]) {
-                return ParseOutcome::Invalid(invalid_repo_substring_reply());
-            }
-            if !change_slug_regex().is_match(rest[1]) {
-                return ParseOutcome::Invalid(invalid_change_slug_reply());
-            }
-            ParseOutcome::Ok(OperatorCommand::ClearRevision {
-                repo_substring: rest[0].to_string(),
-                change: rest[1].to_string(),
-            })
-        }
+        "clear-perma-stuck" => parse_marker_clear(&rest, ClearKind::PermaStuck),
+        "clear-revision" => parse_marker_clear(&rest, ClearKind::Revision),
         "ignore-and-continue" => {
             if rest.len() != 2 {
                 return ParseOutcome::None;
@@ -953,6 +1080,238 @@ fn parse_command_outcome_in_thread(
             };
             ParseOutcome::Ok(OperatorCommand::SendItOnAudit { thread_ts: ts })
         }
+        "review" => {
+            // `@<bot> review <repo-substring> <target...>` (a59). The repo
+            // substring is the first whitespace token after `review`; the
+            // target is every remaining token (`pr <N>` / `commit <sha>` /
+            // `files <path...>` / a free-text description). The target's
+            // internal shape is validated daemon-side by
+            // `ReviewTargetSpec::parse`, so the parser only enforces that a
+            // repo substring AND at least one target token are present.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ review: missing repo. Usage: @<bot> review <repo> <pr N | commit SHA | files PATHS | description>"
+                        .to_string(),
+                ));
+            }
+            // a40: strip a single pair of surrounding backticks from the repo
+            // substring before the regex check (matching the tokenized path).
+            let repo_substring = rest[0].trim_matches('`');
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let target_tokens: Vec<String> = rest[1..].iter().map(|s| s.to_string()).collect();
+            if target_tokens.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ review: missing target. Usage: @<bot> review <repo> <pr N | commit SHA | files PATHS | description>"
+                        .to_string(),
+                ));
+            }
+            ParseOutcome::Ok(OperatorCommand::ReviewTarget {
+                repo_substring: repo_substring.to_string(),
+                target_tokens,
+            })
+        }
+        "log" => {
+            // `@<bot> log <repo-substring> [<count>]` (code-rollback-recovery).
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ log: missing repo. Usage: @<bot> log <repo> [<count>]".to_string(),
+                ));
+            }
+            let repo_substring = rest[0].trim_matches('`');
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let count = match rest.get(1) {
+                None => None,
+                Some(tok) => match tok.parse::<usize>() {
+                    Ok(n) if n >= 1 => Some(n),
+                    _ => {
+                        return ParseOutcome::Invalid(Reply::Sync(
+                            "✗ log: count must be a positive integer. Usage: @<bot> log <repo> [<count>]"
+                                .to_string(),
+                        ));
+                    }
+                },
+            };
+            if rest.len() > 2 {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ log: too many arguments. Usage: @<bot> log <repo> [<count>]".to_string(),
+                ));
+            }
+            ParseOutcome::Ok(OperatorCommand::Log {
+                repo_substring: repo_substring.to_string(),
+                count,
+            })
+        }
+        "survives" => {
+            // `@<bot> survives <repo-substring> <pr <N> | commit <sha>>`
+            // (review-survival-provenance). Read-only.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ survives: missing repo. Usage: @<bot> survives <repo> <pr N | commit SHA>"
+                        .to_string(),
+                ));
+            }
+            let repo_substring = rest[0].trim_matches('`');
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let kind = match rest.get(1) {
+                None => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ survives: missing target. Usage: @<bot> survives <repo> <pr N | commit SHA>"
+                            .to_string(),
+                    ));
+                }
+                Some(k) => k.to_ascii_lowercase(),
+            };
+            let target = match kind.as_str() {
+                "pr" => {
+                    let n = match rest.get(2).and_then(|s| s.trim_matches('`').parse::<u64>().ok()) {
+                        Some(n) if n >= 1 => n,
+                        _ => {
+                            return ParseOutcome::Invalid(Reply::Sync(
+                                "✗ survives: `pr` needs a positive PR number. Usage: @<bot> survives <repo> pr <N>"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    SurvivalChatTarget::Pr(n)
+                }
+                "commit" => {
+                    let sha = match rest.get(2) {
+                        Some(s) if !s.trim().is_empty() => s.trim_matches('`').to_string(),
+                        _ => {
+                            return ParseOutcome::Invalid(Reply::Sync(
+                                "✗ survives: `commit` needs a SHA. Usage: @<bot> survives <repo> commit <SHA>"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() < 4 {
+                        return ParseOutcome::Invalid(Reply::Sync(
+                            "✗ survives: that does not look like a commit SHA (expected >= 4 hex chars)."
+                                .to_string(),
+                        ));
+                    }
+                    SurvivalChatTarget::Commit(sha)
+                }
+                _ => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ survives: target must be `pr <N>` or `commit <SHA>`. Usage: @<bot> survives <repo> <pr N | commit SHA>"
+                            .to_string(),
+                    ));
+                }
+            };
+            ParseOutcome::Ok(OperatorCommand::Survives {
+                repo_substring: repo_substring.to_string(),
+                target,
+            })
+        }
+        "blame" => {
+            // `@<bot> blame <repo-substring> <path> <line>[-<line>]`
+            // (review-survival-provenance). Read-only.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ blame: missing repo. Usage: @<bot> blame <repo> <path> <line>[-<line>]"
+                        .to_string(),
+                ));
+            }
+            let repo_substring = rest[0].trim_matches('`');
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let path = match rest.get(1) {
+                Some(p) if !p.trim().is_empty() => p.trim_matches('`').to_string(),
+                _ => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ blame: missing path. Usage: @<bot> blame <repo> <path> <line>[-<line>]"
+                            .to_string(),
+                    ));
+                }
+            };
+            let line_tok = match rest.get(2) {
+                Some(t) => t.trim_matches('`'),
+                None => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ blame: missing line. Usage: @<bot> blame <repo> <path> <line>[-<line>]"
+                            .to_string(),
+                    ));
+                }
+            };
+            let (start, end) = match parse_line_range(line_tok) {
+                Ok(r) => r,
+                Err(e) => return ParseOutcome::Invalid(Reply::Sync(e)),
+            };
+            ParseOutcome::Ok(OperatorCommand::Blame {
+                repo_substring: repo_substring.to_string(),
+                path,
+                start,
+                end,
+            })
+        }
+        "rollback" => {
+            // `@<bot> rollback <repo-substring> <N | sha SHA>`
+            // (code-rollback-recovery). Destructive two-step confirm.
+            if rest.is_empty() {
+                return ParseOutcome::Invalid(Reply::Sync(
+                    "✗ rollback: missing repo. Usage: @<bot> rollback <repo> <N | sha SHA>"
+                        .to_string(),
+                ));
+            }
+            let repo_substring = rest[0].trim_matches('`');
+            if !repo_substring_regex().is_match(repo_substring) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            let depth = match rest.get(1) {
+                None => {
+                    return ParseOutcome::Invalid(Reply::Sync(
+                        "✗ rollback: missing depth. Usage: @<bot> rollback <repo> <N | sha SHA>"
+                            .to_string(),
+                    ));
+                }
+                Some(tok) if tok.eq_ignore_ascii_case("sha") => {
+                    let sha = match rest.get(2) {
+                        Some(s) if !s.trim().is_empty() => s.trim_matches('`').to_string(),
+                        _ => {
+                            return ParseOutcome::Invalid(Reply::Sync(
+                                "✗ rollback: `sha` needs a commit SHA. Usage: @<bot> rollback <repo> sha <SHA>"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() < 4 {
+                        return ParseOutcome::Invalid(Reply::Sync(
+                            "✗ rollback: that does not look like a commit SHA (expected >= 4 hex chars)."
+                                .to_string(),
+                        ));
+                    }
+                    RollbackChatDepth::Sha(sha)
+                }
+                Some(tok) => match tok.parse::<usize>() {
+                    Ok(n) if n >= 1 => RollbackChatDepth::Count(n),
+                    _ => {
+                        return ParseOutcome::Invalid(Reply::Sync(
+                            "✗ rollback: depth must be a positive integer count OR `sha <SHA>`. \
+                             Usage: @<bot> rollback <repo> <N | sha SHA>"
+                                .to_string(),
+                        ));
+                    }
+                },
+            };
+            ParseOutcome::Ok(OperatorCommand::Rollback {
+                repo_substring: repo_substring.to_string(),
+                depth,
+            })
+        }
+        "rollback-confirm" => {
+            // Second step. An explicit repo substring is optional; the
+            // authoritative target was captured at `rollback` time.
+            let repo_substring = rest.first().map(|s| s.trim_matches('`').to_string());
+            ParseOutcome::Ok(OperatorCommand::RollbackConfirm { repo_substring })
+        }
         _ => ParseOutcome::None,
     }
 }
@@ -987,6 +1346,30 @@ pub fn parse_command_in_thread(
     match parse_command_outcome_in_thread(message, bot_mention, thread_ts) {
         ParseOutcome::Ok(cmd) => Some(cmd),
         ParseOutcome::None | ParseOutcome::Invalid(_) => None,
+    }
+}
+
+/// Parse a `blame` line token: a single 1-based line `N` OR an inclusive
+/// range `M-N` (with `M <= N`). Returns `(start, end)`. Errors with an
+/// operator-facing message on a malformed token, a zero line, OR an
+/// inverted range.
+pub fn parse_line_range(tok: &str) -> Result<(usize, usize), String> {
+    let bad = || {
+        "✗ blame: line must be a positive number `N` or a range `M-N` (M <= N).".to_string()
+    };
+    if let Some((a, b)) = tok.split_once('-') {
+        let start: usize = a.trim().parse().map_err(|_| bad())?;
+        let end: usize = b.trim().parse().map_err(|_| bad())?;
+        if start == 0 || end == 0 || start > end {
+            return Err(bad());
+        }
+        Ok((start, end))
+    } else {
+        let n: usize = tok.trim().parse().map_err(|_| bad())?;
+        if n == 0 {
+            return Err(bad());
+        }
+        Ok((n, n))
     }
 }
 
@@ -1577,6 +1960,69 @@ fn format_queue_one_liner(
 /// workspace path) pass through `slack_escape` belt-and-braces so a
 /// hostile commit subject can't smuggle `<!channel>` past the parser's
 /// allowlist.
+/// Render the `recent_commits_log` response (code-rollback-recovery) into a
+/// chatops reply: one line per commit, newest first.
+pub fn format_log_reply(resp: &serde_json::Value) -> String {
+    let base = resp.get("base_branch").and_then(|v| v.as_str()).unwrap_or("?");
+    let empty = Vec::new();
+    let commits = resp.get("commits").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let mut out = format!("Recent commits on `{base}` (newest first):\n");
+    if commits.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for c in commits {
+        let sha = c.get("short_sha").and_then(|v| v.as_str()).unwrap_or("");
+        let date = c.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let subject = c.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("  `{sha}`  {date}  {subject}\n"));
+    }
+    out
+}
+
+/// Render the dry-run preview of a `rollback_recovery` response into the
+/// confirmation message that prompts the operator for `rollback-confirm`.
+pub fn format_rollback_confirmation(resp: &serde_json::Value) -> String {
+    let preview = resp.get("preview").and_then(|v| v.as_str()).unwrap_or("(no preview)");
+    let has_collisions = resp
+        .get("has_collisions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut out = String::from("⚠️ Rollback requested.\n\n");
+    out.push_str(preview);
+    if has_collisions {
+        out.push_str(
+            "\n✗ This rollback cannot proceed: in-range unit(s) collide with active \
+             directories (see above). Resolve them first.\n",
+        );
+    } else {
+        out.push_str(
+            "\nReply `@<bot> rollback-confirm` within 60s to perform this rollback.\n",
+        );
+    }
+    out
+}
+
+/// Render the outcome of a confirmed `rollback_recovery` response.
+pub fn format_rollback_outcome(resp: &serde_json::Value) -> String {
+    match resp.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
+        "pr_opened" => {
+            let pr = resp.get("pr_url").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("✓ Rollback PR opened: {pr}")
+        }
+        "branch_pushed_no_pr" => {
+            let branch = resp.get("branch_url").and_then(|v| v.as_str()).unwrap_or("?");
+            let suggested = resp
+                .get("suggested_command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "✓ Rollback branch pushed (auto_submit_pr is false): {branch}\nRun: {suggested}"
+            )
+        }
+        other => format!("✓ Rollback complete (outcome: {other})"),
+    }
+}
+
 pub fn format_wipe_confirmation(
     workspace_path: &Path,
     repo_url: &str,
@@ -1704,6 +2150,111 @@ pub fn format_no_match(substring: &str, configured: &[RepoIdentity]) -> String {
     )
 }
 
+/// Dispatch a marker-clear WILDCARD sweep (`clear-<kind> *` or
+/// `clear-<kind> <repo> *`). A `*` repo substring is fleet-wide: the
+/// control-socket handler enumerates every configured repository itself,
+/// so this path does NOT call `match_repo` (there is no single repo to
+/// resolve). A concrete repo substring is resolved to its unique URL
+/// first; ambiguity / no-match is reported exactly as the single-target
+/// path does. The submitted action carries `change: "*"`, the sentinel the
+/// control-socket handler branches on BEFORE the single-slug resolver.
+///
+/// The handler returns a structured `results` array (one entry per
+/// repository, each with `cleared` change names AND an optional `error`),
+/// which [`format_marker_sweep_reply`] renders fail-loud: every repo is
+/// enumerated, an empty repo is reported as "nothing to clear", AND a
+/// per-repo failure is listed alongside the successes.
+async fn dispatch_marker_sweep(
+    action: &str,
+    marker_label: &str,
+    repo_substring: &str,
+    repositories: &[RepoIdentity],
+    submitter: &dyn ActionSubmitter,
+) -> String {
+    let url = if repo_substring == CLEAR_WILDCARD {
+        // Fleet-wide: the handler resolves the repo set; we forward the
+        // sentinel so it knows to enumerate every configured repository.
+        CLEAR_WILDCARD.to_string()
+    } else {
+        match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r.url.clone(),
+            RepoMatch::Multiple(ms) => return format_multiple_matches(repo_substring, &ms),
+            RepoMatch::None => return format_no_match(repo_substring, repositories),
+        }
+    };
+    let resp = submitter
+        .submit(serde_json::json!({
+            "action": action,
+            "url": url,
+            "change": CLEAR_WILDCARD,
+        }))
+        .await;
+    if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no error message)");
+        return format!("✗ {err}");
+    }
+    format_marker_sweep_reply(marker_label, &resp)
+}
+
+/// Format a wildcard marker-sweep reply from the control-socket response.
+/// Fail-loud: every repository in the `results` array is enumerated; a
+/// repository whose `cleared` list is empty (and that did not error) is
+/// reported as an explicit "nothing to clear"; a per-repository `error`
+/// is reported alongside the successes. An entirely empty sweep (no repos,
+/// or every repo clean) still produces a non-empty reply.
+fn format_marker_sweep_reply(marker_label: &str, resp: &serde_json::Value) -> String {
+    let results = resp.get("results").and_then(|v| v.as_array());
+    let results = match results {
+        Some(r) => r,
+        None => return format!("✓ swept {marker_label}: nothing to clear"),
+    };
+    if results.is_empty() {
+        return format!("✓ swept {marker_label}: no repositories to clear");
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(results.len() + 1);
+    let mut total_cleared = 0usize;
+    let mut any_error = false;
+    for entry in results {
+        let label = entry
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(short_repo_label)
+            .unwrap_or_else(|| "(unknown repo)".to_string());
+        if let Some(err) = entry.get("error").and_then(|v| v.as_str()) {
+            any_error = true;
+            lines.push(format!("  • {label}: ✗ {err}"));
+            continue;
+        }
+        let cleared: Vec<String> = entry
+            .get("cleared")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if cleared.is_empty() {
+            lines.push(format!("  • {label}: nothing to clear"));
+        } else {
+            total_cleared += cleared.len();
+            lines.push(format!("  • {label}: cleared {}", cleared.join(", ")));
+        }
+    }
+    let header = if any_error {
+        format!(
+            "Swept {marker_label} — cleared {total_cleared} marker(s), with errors:"
+        )
+    } else {
+        format!("✓ swept {marker_label} — cleared {total_cleared} marker(s):")
+    };
+    lines.insert(0, header);
+    lines.join("\n")
+}
+
 /// Render the ETA clause for an `audit` ack from the daemon's response.
 /// Prefers an explicit `seconds_until_next_iteration` field (`< 30` →
 /// `imminently`) and falls back to `~Nm` from `poll_interval_sec`. When
@@ -1738,8 +2289,8 @@ pub fn format_help_reply() -> String {
     out.push_str("Available commands (mention the bot to invoke):\n");
     out.push_str("  • `status <repo>` — current markers, throttled alerts, queue snapshot, last iteration\n");
     out.push_str("  • `status` (no repo) — list every watched repository with queue summary, busy state, and last-iteration time. Use `status <repo>` for the per-repo detail.\n");
-    out.push_str("  • `clear-perma-stuck <repo> <change>` — clear `.perma-stuck.json` for a change\n");
-    out.push_str("  • `clear-revision <repo> <change>` — clear `.needs-spec-revision.json` for a change\n");
+    out.push_str("  • `clear-perma-stuck <repo> <change>` — clear `.perma-stuck.json` for a change. `clear-perma-stuck <repo> *` clears every such marker in one repo; `clear-perma-stuck *` clears them across all configured repos\n");
+    out.push_str("  • `clear-revision <repo> <change>` — clear `.needs-spec-revision.json` for a change. `clear-revision <repo> *` clears every such marker in one repo; `clear-revision *` clears them across all configured repos\n");
     out.push_str("  • `ignore-and-continue <repo> <change>` — skip a broken change AND let siblings proceed (stamps `.ignore-for-queue.json`)\n");
     out.push_str("  • `clear-ignore <repo> <change>` — remove `.ignore-for-queue.json`; queue resumes blocking on the original marker\n");
     out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `confirm` (60s TTL)\n");
@@ -1756,6 +2307,12 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `clear-survey <repo>` — operator-recovery: wipe every brownfield-survey state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: fetch+rebase the workspace's base branch onto upstream (no push)\n");
+    out.push_str("  • `review <repo> <pr N | commit SHA | files PATHS | description>` — on-demand code review of a PR, commit, file-set, or described area; reports the verdict (advisory, read-only)\n");
+    out.push_str("  • `log <repo> [<count>]` — list a repo's recent base-branch commits (newest first); read-only, picks a rollback depth\n");
+    out.push_str("  • `survives <repo> <pr N | commit SHA>` — report which of a past PR's/commit's changes still survive verbatim at HEAD (read-only; under-reports, never over-reports)\n");
+    out.push_str("  • `blame <repo> <path> <line>[-<line>]` — trace current line(s) to the introducing commit (short SHA, subject, date) and PR when discoverable (read-only)\n");
+    out.push_str("  • `rollback <repo> <N | sha SHA>` — destructive: roll the code back by N commits (or to a SHA) WHILE unarchiving the changes/issues archived in the range; previews, then awaits `rollback-confirm` (60s TTL)\n");
+    out.push_str("  • `rollback-confirm` — second step for `rollback` (same channel, within 60s)\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -1952,6 +2509,57 @@ impl ConfirmationStore {
     }
 }
 
+/// A pending code-rollback confirmation: the captured repo URL AND the
+/// depth (count OR sha) the operator chose, with a hard expiry. Mirrors
+/// [`ConfirmationStore`] but carries the rollback depth so the confirm step
+/// re-submits the exact operation the operator previewed.
+#[derive(Debug, Clone)]
+struct PendingRollback {
+    repo_url: String,
+    depth: RollbackChatDepth,
+    expires_at: Instant,
+}
+
+/// In-memory per-channel pending-confirmation tracker for the destructive
+/// `rollback` flow. Separate from [`ConfirmationStore`] so a pending wipe
+/// AND a pending rollback can coexist on the same channel without clobbering
+/// each other.
+#[derive(Debug, Default)]
+pub struct RollbackConfirmationStore {
+    pending: Mutex<HashMap<String, PendingRollback>>,
+}
+
+impl RollbackConfirmationStore {
+    fn record(
+        &self,
+        channel_id: &str,
+        repo_url: String,
+        depth: RollbackChatDepth,
+        ttl: Duration,
+    ) {
+        let mut g = self.pending.lock().unwrap();
+        g.insert(
+            channel_id.to_string(),
+            PendingRollback {
+                repo_url,
+                depth,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+
+    /// Take the pending rollback for `channel_id`, returning `(repo_url,
+    /// depth)` and consuming the entry. `None` when absent OR expired.
+    fn take_valid(&self, channel_id: &str) -> Option<(String, RollbackChatDepth)> {
+        let mut g = self.pending.lock().unwrap();
+        let entry = g.remove(channel_id)?;
+        if Instant::now() > entry.expires_at {
+            return None;
+        }
+        Some((entry.repo_url, entry.depth))
+    }
+}
+
 // ====================================================================
 // Action-submission abstraction
 // ====================================================================
@@ -1987,6 +2595,9 @@ pub trait ActionSubmitter: Send + Sync {
 ///     posts the "no pending wipe-workspace confirmation" error.
 pub struct OperatorCommandDispatcher {
     pending: ConfirmationStore,
+    /// Pending code-rollback confirmations (code-rollback-recovery). Keyed
+    /// by channel, with the same 60s TTL as the wipe flow.
+    rollback_pending: RollbackConfirmationStore,
     /// Directory under which the audit-thread state files live (the
     /// dispatcher resolves `send it` requests against
     /// `<audit_thread_state_dir>/audit-threads/<thread_ts>.json`).
@@ -2052,6 +2663,7 @@ impl OperatorCommandDispatcher {
     pub fn new(paths: &crate::paths::DaemonPaths) -> Self {
         Self {
             pending: ConfirmationStore::new(),
+            rollback_pending: RollbackConfirmationStore::default(),
             audit_thread_state_dir: crate::audits::threads::default_state_root(paths),
             proposal_request_state_dir:
                 crate::proposal_requests::default_state_root(paths),
@@ -2408,6 +3020,22 @@ impl OperatorCommandDispatcher {
                 repo_substring,
                 change,
             } => {
+                // Wildcard sweep: `change == "*"` selects bulk clearing.
+                // `repo_substring == "*"` makes it fleet-wide (every
+                // configured repo); otherwise it is scoped to the one
+                // resolved repo. The control-socket handler enumerates the
+                // marker directories and returns a structured `results`
+                // array we format here.
+                if change == CLEAR_WILDCARD {
+                    return dispatch_marker_sweep(
+                        "clear_perma_stuck_marker",
+                        ".perma-stuck.json",
+                        &repo_substring,
+                        repositories,
+                        submitter,
+                    )
+                    .await;
+                }
                 let repo = match match_repo(&repo_substring, repositories) {
                     RepoMatch::Unique(r) => r,
                     RepoMatch::Multiple(ms) => {
@@ -2462,6 +3090,17 @@ impl OperatorCommandDispatcher {
                 repo_substring,
                 change,
             } => {
+                // Wildcard sweep — see the ClearPermaStuck arm above.
+                if change == CLEAR_WILDCARD {
+                    return dispatch_marker_sweep(
+                        "clear_revision_marker",
+                        ".needs-spec-revision.json",
+                        &repo_substring,
+                        repositories,
+                        submitter,
+                    )
+                    .await;
+                }
                 let repo = match match_repo(&repo_substring, repositories) {
                     RepoMatch::Unique(r) => r,
                     RepoMatch::Multiple(ms) => {
@@ -2717,6 +3356,180 @@ impl OperatorCommandDispatcher {
                     submitter,
                 )
                 .await
+            }
+            OperatorCommand::ReviewTarget {
+                repo_substring,
+                target_tokens,
+            } => {
+                self.dispatch_review_target(
+                    &repo_substring,
+                    &target_tokens,
+                    repositories,
+                    submitter,
+                )
+                .await
+            }
+            OperatorCommand::Log {
+                repo_substring,
+                count,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let mut req = serde_json::json!({
+                    "action": "recent_commits_log",
+                    "url": repo.url,
+                });
+                if let Some(n) = count {
+                    req["count"] = serde_json::json!(n);
+                }
+                let resp = submitter.submit(req).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ log failed: {err}");
+                }
+                format_log_reply(&resp)
+            }
+            OperatorCommand::Survives {
+                repo_substring,
+                target,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let mut req = serde_json::json!({
+                    "action": "survival_analysis",
+                    "url": repo.url,
+                });
+                match &target {
+                    SurvivalChatTarget::Pr(n) => req["pr"] = serde_json::json!(n),
+                    SurvivalChatTarget::Commit(s) => req["commit"] = serde_json::json!(s),
+                }
+                let resp = submitter.submit(req).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ survives failed: {err}");
+                }
+                resp.get("report")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no survival report)")
+                    .to_string()
+            }
+            OperatorCommand::Blame {
+                repo_substring,
+                path,
+                start,
+                end,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let req = serde_json::json!({
+                    "action": "provenance_lookup",
+                    "url": repo.url,
+                    "path": path,
+                    "start": start,
+                    "end": end,
+                });
+                let resp = submitter.submit(req).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ blame failed: {err}");
+                }
+                resp.get("report")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no provenance report)")
+                    .to_string()
+            }
+            OperatorCommand::Rollback {
+                repo_substring,
+                depth,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                // Step 1: dry-run preview. The control socket reports exactly
+                // what WOULD be rolled back AND unarchived without changing
+                // anything.
+                let mut req = serde_json::json!({
+                    "action": "rollback_recovery",
+                    "url": repo.url,
+                    "dry_run": true,
+                });
+                match &depth {
+                    RollbackChatDepth::Count(n) => req["count"] = serde_json::json!(n),
+                    RollbackChatDepth::Sha(s) => req["sha"] = serde_json::json!(s),
+                }
+                let resp = submitter.submit(req).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ rollback preview failed: {err}");
+                }
+                // Record the pending confirmation (60s TTL) so `rollback-confirm`
+                // re-submits the exact previewed operation.
+                self.rollback_pending.record(
+                    channel_id,
+                    repo.url.clone(),
+                    depth.clone(),
+                    Duration::from_secs(WIPE_CONFIRM_TTL_SECS),
+                );
+                format_rollback_confirmation(&resp)
+            }
+            OperatorCommand::RollbackConfirm { .. } => {
+                let (url, depth) = match self.rollback_pending.take_valid(channel_id) {
+                    Some(pair) => pair,
+                    None => {
+                        return "✗ no pending rollback confirmation in this channel \
+                                (or it expired — re-issue the original `rollback` command)"
+                            .to_string();
+                    }
+                };
+                let mut req = serde_json::json!({
+                    "action": "rollback_recovery",
+                    "url": url,
+                    "dry_run": false,
+                });
+                match &depth {
+                    RollbackChatDepth::Count(n) => req["count"] = serde_json::json!(n),
+                    RollbackChatDepth::Sha(s) => req["sha"] = serde_json::json!(s),
+                }
+                let resp = submitter.submit(req).await;
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    return format!("✗ rollback failed: {err}");
+                }
+                format_rollback_outcome(&resp)
             }
             OperatorCommand::Help => format_help_reply(),
             // The `propose` verb is routed via `handle_message_with_context`
@@ -3907,6 +4720,63 @@ impl OperatorCommandDispatcher {
         )
     }
 
+    /// Handle the `review` verb (a59). Resolves the repo substring, submits
+    /// the `review_target` control-socket action (which runs the agentic
+    /// reviewer against the resolved PR/commit/target surface), AND formats
+    /// the verdict + concerns reply. The action runs the review inline, so
+    /// the returned reply already carries the verdict — there is no separate
+    /// lifecycle thread. A session that produced no valid verdict comes back
+    /// as `ok: false` (gatekeepers-fail-closed), which this surfaces as a
+    /// failure reply, NOT a clean pass.
+    async fn dispatch_review_target(
+        &self,
+        repo_substring: &str,
+        target_tokens: &[String],
+        repositories: &[RepoIdentity],
+        submitter: &dyn ActionSubmitter,
+    ) -> String {
+        let repo = match match_repo(repo_substring, repositories) {
+            RepoMatch::Unique(r) => r,
+            RepoMatch::Multiple(ms) => {
+                return format_multiple_matches(repo_substring, &ms);
+            }
+            RepoMatch::None => return format_no_match(repo_substring, repositories),
+        };
+        let resp = submitter
+            .submit(serde_json::json!({
+                "action": "review_target",
+                "url": repo.url,
+                "target": target_tokens,
+            }))
+            .await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            // A discarded (no-verdict) session is a failure, never a clean
+            // pass — surface it as such.
+            return format!("✗ review failed: {err}");
+        }
+        let verdict = resp.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
+        let body = resp.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let sessions = resp.get("sessions").and_then(|v| v.as_u64()).unwrap_or(1);
+        let chunk_clause = if sessions > 1 {
+            format!(" ({sessions} chunked sessions)")
+        } else {
+            String::new()
+        };
+        let mut out = format!(
+            "Code review of {url}: **{verdict}**{chunk_clause}",
+            url = short_repo_label(&repo.url),
+        );
+        if !body.trim().is_empty() {
+            out.push_str("\n\n");
+            out.push_str(body.trim());
+        }
+        out
+    }
+
     /// Handle the `send it` verb. The verb has FOUR valid thread contexts,
     /// consulted in this order (a `thread_ts` resolves to at most one record
     /// across the four sets):
@@ -4597,6 +5467,120 @@ mod tests {
                 assert!(text.starts_with("✗ invalid change name"), "{text}");
             }
             other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------
+    // bulk-clear-markers: wildcard sentinel acceptance at the parser.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_clear_perma_stuck_repo_wildcard() {
+        // `clear-perma-stuck <repo> *` — wildcard in the change position is
+        // accepted (NOT rejected by the change-slug regex), stored as the
+        // `*` sentinel with the repo substring sanitized as normal.
+        let cmd =
+            parse_command(&format!("{BOT} clear-perma-stuck myrepo *"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearPermaStuck {
+                repo_substring: "myrepo".into(),
+                change: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_perma_stuck_fleet_wildcard() {
+        // `clear-perma-stuck *` — lone wildcard is the fleet-wide form:
+        // both repo and change are the sentinel.
+        let cmd = parse_command(&format!("{BOT} clear-perma-stuck *"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearPermaStuck {
+                repo_substring: "*".into(),
+                change: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_revision_repo_wildcard() {
+        let cmd = parse_command(&format!("{BOT} clear-revision myrepo *"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearRevision {
+                repo_substring: "myrepo".into(),
+                change: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_revision_fleet_wildcard() {
+        let cmd = parse_command(&format!("{BOT} clear-revision *"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearRevision {
+                repo_substring: "*".into(),
+                change: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_wildcard_in_repo_position_with_change_rejected() {
+        // `clear-<kind> * <change>` is NOT a supported shape: a fleet-wide
+        // clear of a single named change is undefined. Rejected as None.
+        assert!(
+            parse_command(&format!("{BOT} clear-perma-stuck * a06-foo"), BOT).is_none()
+        );
+        assert!(
+            parse_command(&format!("{BOT} clear-revision * a06-foo"), BOT).is_none()
+        );
+    }
+
+    #[test]
+    fn parse_clear_wildcard_accepts_star_but_non_star_change_still_sanitized() {
+        // The `*` carve-out is narrow: a malformed change slug in the same
+        // position (non-`*`) is still rejected by the regex.
+        let outcome = parse_command_outcome(
+            &format!("{BOT} clear-perma-stuck myrepo a06;rm"),
+            BOT,
+        );
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.starts_with("✗ invalid change name"), "{text}");
+            }
+            other => panic!("expected Invalid for malformed slug, got {other:?}"),
+        }
+        // But the bare `*` in the same position is accepted.
+        assert!(
+            parse_command(&format!("{BOT} clear-perma-stuck myrepo *"), BOT).is_some()
+        );
+    }
+
+    #[test]
+    fn parse_clear_wildcard_accepts_star_but_non_star_repo_still_sanitized() {
+        // A malformed repo substring (non-`*`) is still regex-rejected even
+        // when the change position is the `*` wildcard.
+        let outcome = parse_command_outcome(
+            &format!("{BOT} clear-revision my repo *"),
+            BOT,
+        );
+        // `my repo *` tokenizes to 3 args (`my`, `repo`, `*`) → unsupported
+        // shape → None. A genuinely malformed single repo token is the
+        // covered case:
+        assert!(matches!(outcome, ParseOutcome::None));
+        let bad_repo = parse_command_outcome(
+            &format!("{BOT} clear-revision bad~repo *"),
+            BOT,
+        );
+        match bad_repo {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.starts_with("✗ invalid repo substring"), "{text}");
+            }
+            other => panic!("expected Invalid for malformed repo, got {other:?}"),
         }
     }
 
@@ -6477,6 +7461,117 @@ mod tests {
         assert!(text.contains("a99-nope"));
     }
 
+    // -------------------------------------------------------------
+    // bulk-clear-markers: dispatcher forwards the `*` sentinel and the
+    // resolved/fleet url, then renders the structured sweep `results`.
+    // -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_clear_perma_stuck_repo_wildcard_forwards_star() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "clear_perma_stuck_marker",
+            serde_json::json!({
+                "ok": true,
+                "results": [
+                    {"url": "git@github.com:acme/myrepo.git", "cleared": ["a06-foo", "a07-bar"]},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-perma-stuck myrepo *"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("cleared 2 marker(s)"), "{text}");
+        assert!(text.contains("a06-foo"), "{text}");
+        assert!(text.contains("a07-bar"), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "clear_perma_stuck_marker");
+        // Repo substring resolved to the unique repo's URL; change is the
+        // wildcard sentinel.
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["change"], "*");
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_revision_fleet_wildcard_forwards_star_url() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "clear_revision_marker",
+            serde_json::json!({
+                "ok": true,
+                "results": [
+                    {"url": "git@github.com:acme/myrepo.git", "cleared": ["a06-foo"]},
+                    {"url": "git@github.com:acme/widgets.git", "cleared": []},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-revision *"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        // Each repo is enumerated; the clean repo is reported "nothing to
+        // clear" rather than omitted.
+        assert!(text.contains("a06-foo"), "{text}");
+        assert!(text.contains("nothing to clear"), "{text}");
+        assert!(text.contains("widgets"), "{text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        // Fleet-wide: the dispatcher forwards the `*` url sentinel (does
+        // NOT resolve a single repo).
+        assert_eq!(calls[0]["url"], "*");
+        assert_eq!(calls[0]["change"], "*");
+    }
+
+    #[tokio::test]
+    async fn dispatch_clear_perma_stuck_wildcard_reports_per_repo_failure() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "clear_perma_stuck_marker",
+            serde_json::json!({
+                "ok": true,
+                "results": [
+                    {"url": "git@github.com:acme/myrepo.git", "cleared": ["a06-foo"]},
+                    {"url": "git@github.com:acme/widgets.git", "error": "could not read markers: boom"},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-perma-stuck *"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        // The success AND the failure both appear; the failure does not
+        // hide the cleared repo.
+        assert!(text.contains("a06-foo"), "{text}");
+        assert!(text.contains("could not read markers"), "{text}");
+        assert!(text.contains("with errors"), "{text}");
+    }
+
     #[tokio::test]
     async fn dispatch_no_match_replies_with_configured_list() {
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
@@ -6565,6 +7660,121 @@ mod tests {
         assert_eq!(calls[0]["action"], "queue_audit");
         assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
         assert_eq!(calls[0]["audit_type"], "security_bug_audit");
+    }
+
+    // ---------- review verb (on-demand-code-review) ----------
+
+    #[test]
+    fn parse_review_pr_target() {
+        let cmd = parse_command(&format!("{BOT} review myrepo pr 42"), BOT).unwrap();
+        match cmd {
+            OperatorCommand::ReviewTarget {
+                repo_substring,
+                target_tokens,
+            } => {
+                assert_eq!(repo_substring, "myrepo");
+                assert_eq!(target_tokens, vec!["pr".to_string(), "42".to_string()]);
+            }
+            other => panic!("expected ReviewTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_review_files_target_keeps_all_paths() {
+        let cmd =
+            parse_command(&format!("{BOT} review widgets files src/a.rs src/b.rs"), BOT).unwrap();
+        match cmd {
+            OperatorCommand::ReviewTarget { target_tokens, .. } => {
+                assert_eq!(
+                    target_tokens,
+                    vec![
+                        "files".to_string(),
+                        "src/a.rs".to_string(),
+                        "src/b.rs".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected ReviewTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_review_missing_target_is_invalid() {
+        let outcome = parse_command_outcome(&format!("{BOT} review myrepo"), BOT);
+        assert!(matches!(outcome, ParseOutcome::Invalid(_)), "{outcome:?}");
+    }
+
+    /// 5.1: the `review` dispatch submits `review_target` with the resolved
+    /// URL + target tokens AND reports the returned verdict.
+    #[tokio::test]
+    async fn dispatch_review_reports_verdict() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "review_target",
+            serde_json::json!({
+                "ok": true,
+                "verdict": "Block",
+                "body": "found an injection risk",
+                "sessions": 1,
+                "chunks": ["all"],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} review myrepo pr 7"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Block"), "verdict reported: {text}");
+        assert!(text.contains("injection risk"), "concern body reported: {text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "review_target");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(
+            calls[0]["target"],
+            serde_json::json!(["pr", "7"]),
+            "target tokens forwarded verbatim"
+        );
+    }
+
+    /// 5.5: a discarded (no-verdict) session comes back ok:false; the reply
+    /// surfaces the failure, NOT a clean pass.
+    #[tokio::test]
+    async fn dispatch_review_discarded_surfaces_failure() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "review_target",
+            serde_json::json!({
+                "ok": false,
+                "discarded": true,
+                "error": "session recorded no valid submit_review submission",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} review myrepo files src/x.rs"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.starts_with("✗"), "a discarded review is a failure reply: {text}");
+        assert!(text.contains("no valid submit_review"), "surfaces the reason: {text}");
+        assert!(
+            !text.to_lowercase().contains("approve") && !text.contains("✓"),
+            "must NOT report a clean pass: {text}"
+        );
     }
 
     #[tokio::test]
@@ -10198,5 +11408,306 @@ mod tests {
             submitter.calls().is_empty(),
             "a degenerate candidate must not submit an empty-channel promotion"
         );
+    }
+
+    // ================================================================
+    // code-rollback-recovery: `log` + `rollback` verbs
+    // ================================================================
+
+    #[test]
+    fn parse_log_happy_path_with_count() {
+        let cmd = parse_command(&format!("{BOT} log myrepo 5"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Log {
+                repo_substring: "myrepo".into(),
+                count: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_log_default_count_none() {
+        let cmd = parse_command(&format!("{BOT} log myrepo"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Log {
+                repo_substring: "myrepo".into(),
+                count: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_log_missing_repo_is_invalid() {
+        // Missing repo surfaces an Invalid (usage) reply, not a parse-None.
+        assert!(parse_command(&format!("{BOT} log"), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_survives_pr_form() {
+        let cmd = parse_command(&format!("{BOT} survives myrepo pr 42"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Survives {
+                repo_substring: "myrepo".into(),
+                target: SurvivalChatTarget::Pr(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_survives_commit_form() {
+        let cmd = parse_command(&format!("{BOT} survives myrepo commit deadbeef"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Survives {
+                repo_substring: "myrepo".into(),
+                target: SurvivalChatTarget::Commit("deadbeef".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_survives_bad_target_is_rejected() {
+        // A target that is neither `pr` nor `commit` must NOT parse.
+        assert!(parse_command(&format!("{BOT} survives myrepo banana"), BOT).is_none());
+        // `pr` with a non-numeric value, and `commit` with a non-hex value.
+        assert!(parse_command(&format!("{BOT} survives myrepo pr x"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} survives myrepo commit zz"), BOT).is_none());
+        // Missing target entirely.
+        assert!(parse_command(&format!("{BOT} survives myrepo"), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_blame_single_line_and_range() {
+        let single = parse_command(&format!("{BOT} blame myrepo src/a.rs 10"), BOT).unwrap();
+        assert_eq!(
+            single,
+            OperatorCommand::Blame {
+                repo_substring: "myrepo".into(),
+                path: "src/a.rs".into(),
+                start: 10,
+                end: 10,
+            }
+        );
+        let range = parse_command(&format!("{BOT} blame myrepo src/a.rs 4-9"), BOT).unwrap();
+        assert_eq!(
+            range,
+            OperatorCommand::Blame {
+                repo_substring: "myrepo".into(),
+                path: "src/a.rs".into(),
+                start: 4,
+                end: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_blame_bad_inputs_are_rejected() {
+        // Missing path / line.
+        assert!(parse_command(&format!("{BOT} blame myrepo"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} blame myrepo src/a.rs"), BOT).is_none());
+        // Inverted range, zero line, and non-numeric.
+        assert!(parse_command(&format!("{BOT} blame myrepo src/a.rs 9-4"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} blame myrepo src/a.rs 0"), BOT).is_none());
+        assert!(parse_command(&format!("{BOT} blame myrepo src/a.rs x"), BOT).is_none());
+    }
+
+    #[test]
+    fn parse_line_range_helper() {
+        assert_eq!(parse_line_range("7").unwrap(), (7, 7));
+        assert_eq!(parse_line_range("3-8").unwrap(), (3, 8));
+        assert_eq!(parse_line_range("5-5").unwrap(), (5, 5));
+        assert!(parse_line_range("0").is_err());
+        assert!(parse_line_range("8-3").is_err());
+        assert!(parse_line_range("a-b").is_err());
+    }
+
+    #[test]
+    fn parse_rollback_count_form() {
+        let cmd = parse_command(&format!("{BOT} rollback myrepo 3"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Rollback {
+                repo_substring: "myrepo".into(),
+                depth: RollbackChatDepth::Count(3),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rollback_sha_form() {
+        let cmd = parse_command(&format!("{BOT} rollback myrepo sha deadbeef"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Rollback {
+                repo_substring: "myrepo".into(),
+                depth: RollbackChatDepth::Sha("deadbeef".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rollback_confirm() {
+        let cmd = parse_command(&format!("{BOT} rollback-confirm"), BOT).unwrap();
+        assert_eq!(cmd, OperatorCommand::RollbackConfirm { repo_substring: None });
+    }
+
+    #[test]
+    fn parse_rollback_bad_depth_is_rejected() {
+        // A non-numeric, non-`sha` depth must NOT parse to a command.
+        assert!(parse_command(&format!("{BOT} rollback myrepo banana"), BOT).is_none());
+        // `sha` with no value must NOT parse.
+        assert!(parse_command(&format!("{BOT} rollback myrepo sha"), BOT).is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_log_lists_commits_and_is_read_only() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "recent_commits_log",
+            serde_json::json!({
+                "ok": true,
+                "base_branch": "main",
+                "commits": [
+                    {"short_sha": "aaa1111", "date": "2026-06-20", "subject": "newest"},
+                    {"short_sha": "bbb2222", "date": "2026-06-19", "subject": "older"},
+                ],
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} log myrepo 2"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        // Newest-first order is preserved.
+        let newest = text.find("newest").unwrap();
+        let older = text.find("older").unwrap();
+        assert!(newest < older, "newest must precede older: {text}");
+        // The only submitted action is the read-only log lister.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "recent_commits_log");
+    }
+
+    #[tokio::test]
+    async fn dispatch_survives_submits_read_only_action_and_returns_report() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "survival_analysis",
+            serde_json::json!({
+                "ok": true,
+                "report": "Survival of PR #7 at HEAD\n  ✓ src/a.rs\n",
+                "review_focus_paths": ["src/a.rs"],
+                "surviving_lines": 4,
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} survives myrepo pr 7"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Survival of PR #7"), "report surfaced: {text}");
+        // The ONLY submitted action is the read-only survival analyzer with
+        // the PR target carried through.
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "survival_analysis");
+        assert_eq!(calls[0]["pr"], serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn dispatch_blame_submits_read_only_action_and_returns_report() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "provenance_lookup",
+            serde_json::json!({
+                "ok": true,
+                "report": "Provenance of `src/a.rs` at HEAD:\n  L1  `abc1234`  2026-01-01  add (#5)  (PR #5)\n",
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} blame myrepo src/a.rs 1-2"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("Provenance of `src/a.rs`"), "report surfaced: {text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "provenance_lookup");
+        assert_eq!(calls[0]["path"], serde_json::json!("src/a.rs"));
+        assert_eq!(calls[0]["start"], serde_json::json!(1));
+        assert_eq!(calls[0]["end"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rollback_two_step_previews_then_acts() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        // One canned rollback_recovery response that carries both the
+        // preview (used for the dry-run step) AND the outcome (used for the
+        // confirm step). The dispatcher selects the dry_run flag per step.
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 2 commits; unarchive feature-a",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/9",
+            }),
+        );
+        // Step 1: rollback → preview + pending confirmation recorded.
+        let preview_reply = dispatcher
+            .handle_message(&format!("{BOT} rollback myrepo 2"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let preview_text = unwrap_sync(preview_reply);
+        assert!(preview_text.contains("WOULD roll back 2 commits"), "{preview_text}");
+        assert!(preview_text.contains("rollback-confirm"), "{preview_text}");
+        // The first submitted call MUST be a dry-run.
+        assert_eq!(submitter.calls()[0]["dry_run"], serde_json::json!(true));
+
+        // Step 2: rollback-confirm → acts (dry_run false) AND reports the PR.
+        let act_reply = dispatcher
+            .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let act_text = unwrap_sync(act_reply);
+        assert!(act_text.contains("Rollback PR opened: http://x/pr/9"), "{act_text}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 2, "exactly one dry-run + one act");
+        assert_eq!(calls[1]["dry_run"], serde_json::json!(false));
+        assert_eq!(calls[1]["count"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rollback_confirm_without_pending_errors() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("no pending rollback confirmation"), "{text}");
+        // No action was submitted (nothing to confirm).
+        assert!(submitter.calls().is_empty());
     }
 }

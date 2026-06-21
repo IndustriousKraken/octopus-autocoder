@@ -40,6 +40,7 @@ use serde::Deserialize;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The MCP role AND submission routing key the canon-contradiction check
 /// uses. The per-execution MCP child advertises `submit_canon_contradictions`
@@ -92,6 +93,10 @@ pub struct CanonContradictionCheckCtx {
     /// no-submission case retries — the gate still fails closed after the
     /// bound is exhausted (gatekeepers-fail-closed standard).
     pub retries: u32,
+    /// Wall-clock cap for one agentic session, resolved from the SINGLE
+    /// `executor.agentic_session_timeout_secs` (shared with the other gates,
+    /// the reviewer, AND the revision sessions). Set once at daemon startup.
+    pub timeout: Duration,
     /// Test-only injected `submit_canon_contradictions` submission, bypassing
     /// the CLI subprocess AND the control socket. `Some(Some(p))` stands in
     /// for a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -341,7 +346,7 @@ pub async fn run_agentic_canon_contradiction_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: crate::preflight::corpus_check::CORPUS_CHECK_TIMEOUT,
+        timeout: ctx.timeout,
         subject_noun: "change-vs-canonical-check",
     };
     run_agentic_canon_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner)
@@ -461,7 +466,7 @@ pub async fn run_agentic_issue_contract_change_check(
         strategy: strategy.as_ref(),
         model: &ctx.model,
         settings_dir: None,
-        timeout: crate::preflight::corpus_check::CORPUS_CHECK_TIMEOUT,
+        timeout: ctx.timeout,
         subject_noun: "issue contract-change check",
     };
     run_agentic_issue_contract_change_check_with_runner(ctx, workspace_root, issue_slug, &runner)
@@ -701,8 +706,31 @@ mod tests {
             // Default to no retry so the canned-runner tests below run the
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
+            timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             test_submission: None,
         }
+    }
+
+    /// unified-agentic-session-timeout task 4.2 ([canon] gate): the gate ctx
+    /// carries the value resolved from `executor.agentic_session_timeout_secs`,
+    /// which both `[canon]` session runners (the contradiction check AND the
+    /// issue contract-change check) feed to the CLI session.
+    #[test]
+    fn canon_gate_ctx_carries_resolved_agentic_session_timeout() {
+        let exec: crate::config::ExecutorConfig =
+            serde_yml::from_str("kind: claude_cli\nagentic_session_timeout_secs: 4500\n")
+                .expect("executor parses");
+        let ctx = CanonContradictionCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "T".into(),
+            attribution: None,
+            retries: 0,
+            timeout: exec.agentic_session_timeout(),
+            test_submission: None,
+        };
+        assert_eq!(ctx.timeout, exec.agentic_session_timeout());
+        assert_eq!(ctx.timeout, Duration::from_secs(4500));
     }
 
     fn write(p: &Path, body: &str) {

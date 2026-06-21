@@ -479,6 +479,35 @@ async fn prepare_workspace_for_pass(
     // workspace (a previously-registered store is left alone). Fail-open
     // — any error logs WARN and the store is omitted from the registry.
     crate::rag::workspace_init_hook(workspace).await;
+
+    // In-repo agent guide provisioning (`octopus-md-agent-guide`). Runs HERE,
+    // after the base sync recreated the agent branch, so the write lands ON
+    // THE AGENT BRANCH (never wiped by dirty-recovery, never a base commit).
+    // Gated per-repo by `features.octopus_guide.enabled` (default ENABLED) via
+    // the task-local scope installed at daemon startup. Idempotent: a commit
+    // is produced ONLY when the guide is absent or stale, so it rides the
+    // pass's existing push + PR path (honoring `auto_submit_pr`) without
+    // churning an empty PR when the guide is already current. Best-effort:
+    // a write/commit failure logs WARN and the pass proceeds.
+    match crate::octopus_guide::provision_on_agent_branch(
+        workspace,
+        crate::octopus_guide::enabled(),
+    ) {
+        Ok(crate::octopus_guide::ProvisionOutcome::Committed) => {
+            tracing::info!(
+                url = repo.url.as_str(),
+                "octopus_guide: provisioned OCTOPUS.md + AGENTS.md reference on agent branch (rides this pass's push + PR)"
+            );
+        }
+        Ok(crate::octopus_guide::ProvisionOutcome::AlreadyCurrent)
+        | Ok(crate::octopus_guide::ProvisionOutcome::Disabled) => {}
+        Err(e) => {
+            tracing::warn!(
+                url = repo.url.as_str(),
+                "octopus_guide: provisioning failed (pass proceeds): {e:#}"
+            );
+        }
+    }
     Ok(())
 }
 

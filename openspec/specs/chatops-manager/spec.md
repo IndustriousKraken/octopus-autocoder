@@ -396,6 +396,8 @@ The dispatcher SHALL receive `&[RepoIdentity]` rather than `&[RepositoryConfig]`
 ### Requirement: Argument sanitization at parser entry
 The parser SHALL sanitize every operator-supplied argument before passing it to file-path construction or control-socket dispatch. As a pre-sanitization hygiene step, the parser SHALL strip a single pair of surrounding backticks from each token returned by whitespace splitting (`token.trim_matches('\`')`) BEFORE applying the regex check; this accommodates the alert templates that wrap change slugs AND repo identifiers in single backticks for chat readability AND that operators routinely copy verbatim. Embedded (mid-token) backticks SHALL NOT be stripped; they continue to fail the regex check. Change-slug arguments SHALL match `^[a-zA-Z0-9_-]{1,64}$`; repo-substring arguments SHALL match `^[a-zA-Z0-9._/-]{1,128}$`. Malformed arguments (including arguments whose inner content fails the regex AFTER backtick stripping) SHALL produce `Some(Reply::Sync("✗ invalid <field>: ..."))` and SHALL NOT result in any file-system or control-socket call.
 
+EXCEPTION — the wildcard sentinel: for the marker-clear verbs (`clear-perma-stuck` AND `clear-revision`) ONLY, a bare `*` token in the change-slug position OR the repo-substring position is a recognized WILDCARD SENTINEL — it is NOT a change-slug NOR a repo-substring. The parser SHALL recognize `*` for these two verbs BEFORE the regex check AND SHALL NOT reject it as malformed; the bulk-clear behavior it selects is governed by the orchestrator-cli "Marker-clear operator commands accept wildcard targets" requirement. This exception is narrow: it applies to `*` for those two verbs only. Every other token — every non-`*` argument, AND every argument of every other verb — is sanitized exactly as above (a non-matching argument is still rejected with `✗ invalid <field>` AND still reaches neither the filesystem nor the control socket).
+
 #### Scenario: Path-traversal in change name is rejected
 - **WHEN** `handle_message("<@UBOT> clear-perma-stuck myrepo ../../etc/passwd", ...)` is called
 - **THEN** the return value is `Some(Reply::Sync(text))` where `text` begins with `✗ invalid change name`
@@ -447,6 +449,12 @@ The parser SHALL sanitize every operator-supplied argument before passing it to 
 - **THEN** the strip step removes the leading backtick AND the regex check sees `a37-foo`
 - **AND** the parser returns `Ok(OperatorCommand::ClearRevision { repo_substring: "myrepo", change: "a37-foo" })`
 - **AND** the same shape applies symmetrically when only the trailing backtick is present (`a37-foo\``)
+
+#### Scenario: Wildcard sentinel is accepted for the marker-clear verbs
+- **WHEN** `handle_message("<@UBOT> clear-revision myrepo *", ...)` OR `handle_message("<@UBOT> clear-revision *", ...)` is called
+- **THEN** the `*` is recognized as the wildcard sentinel — it is NOT rejected as `✗ invalid change name` / `✗ invalid repo substring`
+- **AND** the parser returns the marker-clear command in its wildcard form
+- **AND** a non-`*` token in the same position is still regex-checked (a malformed slug or repo substring is still rejected)
 
 ### Requirement: Help verb returns the verb list
 The dispatcher SHALL recognize `@<bot> help` (case-insensitive) as a verb and return `Some(Reply::Sync(text))` where `text` enumerates every currently-supported verb, its syntax, and a one-line description, plus a one-line pointer to the README's confirmation-flow section for the destructive verbs.
