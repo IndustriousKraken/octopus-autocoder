@@ -2434,23 +2434,24 @@ The threat model is unchanged from existing chatops behavior: write access to th
 #### Scenario: wipe-workspace two-step confirmation
 - **WHEN** an operator posts `@<bot> wipe-workspace your-repo`
   in channel `C` AND `your-repo` resolves to a unique repo
-- **THEN** the bot posts a warning
-  `⚠️ This will delete /tmp/workspaces/<sanitized-url>
-  (forces a re-clone on the next iteration). Reply 'confirm'
-  within 60 seconds.`
+- **THEN** the bot posts a warning naming the workspace path it
+  would delete (and that a re-clone follows on the next
+  iteration) AND prompting the operator to reply with the
+  canonical confirm verb (`@<bot> confirm`) within the
+  confirmation window
 - **AND** the bot stores an in-memory pending-confirmation
   entry keyed by `C` with a 60-second expiry
-- **WHEN** the operator (any channel member) replies
-  `confirm` in `C` within 60 seconds
+- **WHEN** the operator (any channel member) replies with the
+  confirm verb (`@<bot> confirm`, or the bare/deprecated alias)
+  in `C` within 60 seconds
 - **THEN** the bot submits the `WipeWorkspace` action,
-  removes the pending entry, AND posts
-  `✓ wiped /tmp/workspaces/<sanitized-url>; next iteration
-  will re-clone`
-- **AND** if no `confirm` reply arrives within 60 seconds,
-  the pending entry expires AND a subsequent `confirm` reply
-  is treated as if there were no pending confirmation
-  (`✗ no pending wipe-workspace confirmation in this
-  channel (or it expired)`)
+  removes the pending entry, AND posts a success confirmation
+  naming the wiped workspace
+- **AND** if no confirm reply arrives within 60 seconds, the
+  pending entry expires AND a subsequent confirm reply is
+  treated as if there were no pending confirmation (the bot
+  reports there is no pending confirmation in the channel —
+  the op-agnostic message shared by every two-step confirm)
 
 #### Scenario: Cross-channel confirmations do not match
 - **WHEN** the wipe-workspace command is issued in channel A
