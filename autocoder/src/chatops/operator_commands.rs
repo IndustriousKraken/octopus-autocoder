@@ -2042,15 +2042,21 @@ pub fn format_rollback_confirmation(resp: &serde_json::Value) -> String {
     let mut out = String::from("⚠️ Rollback requested.\n\n");
     out.push_str(preview);
     if has_collisions {
+        // Collisions are advisory, NOT a blocker: a confirmed rollback RECONCILES
+        // in-range units that already have active directories to the rollback
+        // target (resolving duplicates) rather than aborting. Surface the note and
+        // STILL offer the confirm — mirroring the CLI confirmed path
+        // (`cli/rollback.rs`) and the `unconditional-rollback` canon. The dry-run
+        // already recorded the pending confirmation, so `rollback-confirm` works.
         out.push_str(
-            "\n✗ This rollback cannot proceed: in-range unit(s) collide with active \
-             directories (see above). Resolve them first.\n",
-        );
-    } else {
-        out.push_str(
-            "\nReply `@<bot> rollback-confirm` within 60s to perform this rollback.\n",
+            "\n⚠️ Some in-range units already have active directories. A confirmed \
+             rollback RECONCILES these to the rollback target (resolving duplicates) \
+             rather than aborting — they do NOT block it.\n",
         );
     }
+    out.push_str(
+        "\nReply `@<bot> rollback-confirm` within 60s to perform this rollback.\n",
+    );
     out
 }
 
@@ -6671,6 +6677,29 @@ mod tests {
         match match_repo("", &repos) {
             RepoMatch::Unique(_) => {}
             other => panic!("expected Unique (single repo), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_preview_offers_confirm_regardless_of_collisions() {
+        // The confirm prompt MUST be offered whether or not the dry-run detected
+        // collisions — a confirmed rollback reconciles collisions to the target,
+        // so they never suppress the confirm (the prior behavior dead-ended the
+        // preview, leaving the operator unable to confirm). Behavioral contract:
+        // the actionable `rollback-confirm` verb is present in both cases; we do
+        // not assert prose wording.
+        for has_collisions in [true, false] {
+            let resp = serde_json::json!({
+                "ok": true,
+                "dry_run": true,
+                "preview": "WOULD roll back 5 commits",
+                "has_collisions": has_collisions,
+            });
+            let msg = format_rollback_confirmation(&resp);
+            assert!(
+                msg.contains("rollback-confirm"),
+                "confirm must be offered (has_collisions={has_collisions}): {msg}"
+            );
         }
     }
 
