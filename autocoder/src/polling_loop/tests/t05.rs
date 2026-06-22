@@ -67,6 +67,11 @@ async fn cancellation_during_sleep_exits() {
         on_iteration_sleep: Some(iteration_sleep.clone()),
     };
     let paths_for_run = std::sync::Arc::new(crate::testing::test_daemon_paths().1);
+    // Serialize on the github-api-base test hook: the spawned `run_with_hooks`
+    // loop reads the process-wide override via its open-PR pre-check. Hold the
+    // guard in the test body (NOT moved into the task) so it serializes against
+    // other tests that install the override. See `test_hooks::lock`.
+    let _hook = test_hooks::lock();
     let handle = tokio::spawn(async move {
         run_with_hooks(
             paths_for_run,
@@ -485,6 +490,12 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         recreate_fork_on_reinit: false,
         command_authorization: Default::default(),
     };
+
+    // Serialize on the github-api-base test hook: `execute_one_pass` reads the
+    // process-wide override via its open-PR pre-check, so this test must not run
+    // while another test has the override installed (else the pre-check request
+    // would land on that test's mockito server). See `test_hooks::lock`.
+    let _hook = test_hooks::lock();
 
     // Iteration 1: pass through commits succeeds, push fails → alert
     // is posted and `.alert-state.json` is written.

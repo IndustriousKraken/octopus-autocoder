@@ -63,29 +63,57 @@ confirm whether they still flake once the env-var contention is removed.
 
 ## Tasks
 
-- [ ] Reproduce: run `cargo test --bin autocoder` several times in a row and
+- [x] Reproduce: run `cargo test --bin autocoder` several times in a row and
   confirm sporadic failures that each pass in isolation
-  (`cargo test --bin autocoder <name> -- --exact`).
-- [ ] Inventory the test sites that mutate the process-global `ENV_CONTROL_SOCKET`
+  (`cargo test --bin autocoder <name> -- --exact`). DONE: run 1 = 16 failed
+  (13 `polling_loop` + 1 `control_socket` rollback + 1 known-environmental
+  `sandbox`); the rollback test passes 5/5 in isolation. The 13 `polling_loop`
+  failures were a `PoisonError` CASCADE, not 13 independent failures.
+- [x] Inventory the test sites that mutate the process-global `ENV_CONTROL_SOCKET`
   (search `set_var`/`remove_var` for `ENV_CONTROL_SOCKET` across
   `mcp_askuser_server.rs`, `executor/claude_cli.rs`, `control_socket.rs`,
   `cli/audit.rs`, `cli/verify.rs`, and any test using
   `control_socket::spawn_submission_listener`), plus tests that READ it.
-- [ ] Make those tests parallel-safe. Preferred: add the `serial_test`
-  dev-dependency (check crates.io for the current version; do not pin from memory)
-  and mark every test that sets/removes/reads `ENV_CONTROL_SOCKET` with a NAMED
-  serial group, e.g. `#[serial(control_socket)]`, so they run one-at-a-time
-  relative to each other but still parallel with unrelated tests. Acceptable
-  alternative where practical: remove the global-env dependency from the test path
-  (thread the socket path explicitly instead of via the process-global env var) so
-  no serialization is needed.
+  DONE — and the finding is that `ENV_CONTROL_SOCKET` is ALREADY serialized:
+  every test that touches it already holds `crate::testing::ENV_LOCK` (a
+  process-wide test mutex that already exists — the report's "no shared test
+  mutex" claim was stale). The ACTUAL flake source is a DIFFERENT process-global:
+  the PR-creation API-base override `polling_loop::test_hooks::github_api_base()`
+  (guarded by `test_hooks::lock()`). See the fix below.
+- [x] Make those tests parallel-safe. DONE via the "acceptable alternative" —
+  serialize on the EXISTING process-wide test mutexes rather than introducing
+  `serial_test`. `serial_test` was deliberately NOT used: it would create a
+  SECOND, independent lock that does not serialize against the crate's existing
+  `crate::testing::ENV_LOCK` / `polling_loop::test_hooks::lock()`, so a
+  `#[serial]` test and a lock-holding test could still run concurrently and
+  clobber the shared global — i.e. it would not fix the bug. (`serial_test` was
+  added then reverted; `Cargo.toml` is unchanged.) The real fixes:
+    1. `polling_loop::mod.rs` `test_hooks`: made `lock()` / `github_api_base()` /
+       `set_github_api_base()` POISON-TOLERANT (`unwrap_or_else(|e| e.into_inner())`).
+       These guard only a unit token + a per-test override string, so recovering on
+       poison is safe. This stops ONE failing test from cascading `PoisonError`
+       into the ~13 other tests that share the lock (the bulk of the 39/16-failure
+       runs were this cascade, not 13 real failures).
+    2. Added `test_hooks::lock()` to the 4 tests that drive production PR-open code
+       (reading the `github_api_base` override) WITHOUT serializing:
+       `control_socket::tests::defer_with_auto_submit_pr_takes_pr_path` (the
+       confirmed contaminator of the rollback e2e test — same `owner/repo` path),
+       `t05::cancellation_during_sleep_exits`,
+       `t05::failure_alert_posted_then_suppressed_within_24h`,
+       `t06::failure_alert_cleared_on_subsequent_success`.
 - [ ] Re-run the full suite ≥5 times under default parallelism; confirm all green.
-- [ ] If `cli` fake-server tests still flake after the env-var fix, harden them:
-  ensure each binds its own ephemeral socket/port and isolated state, and that the
-  fake server is ready before the client connects (await readiness rather than
-  racing). Re-run ≥5 times to confirm.
-- [ ] Do NOT change production behavior, config, or specs. Keep the test fix
-  itself test-only and behavior-preserving (no spec delta).
+- [x] If `cli` fake-server tests still flake after the env-var fix, harden them.
+  N/A — the `cli` fake-server tests did NOT flake. The report's predicted flaky
+  tests (`cli::survives::...error_response_surfaces`,
+  `cli::rollback::...confirm_accepted_acts_and_reports_pr`) passed in every run;
+  their `fake_server` helpers already bind synchronously before returning and the
+  client takes the socket path explicitly (no global, no bind/connect race). The
+  ACTUAL flaky tests were `polling_loop::*` (poison cascade) and the
+  `control_socket` rollback e2e test (cross-test override leak) — both fixed above.
+- [x] Do NOT change production behavior, config, or specs. HELD — every edit is
+  test-only: the `test_hooks` module is entirely `#[cfg(test)]`, and the other
+  three edits add a lock acquisition inside test functions. No production code,
+  config, or spec changed; `Cargo.toml` is unchanged. No spec delta.
 - [ ] Activate the staged decomposition issues (FINAL step, only once the suite is
   reliably green): `git mv deferred-issues/*.md issues/` so the five
   `architecture_advisor` decomposition issues enter the active lane, then remove the

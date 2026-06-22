@@ -60,6 +60,12 @@ async fn failure_alert_cleared_on_subsequent_success() {
     };
     let stuck_secs = 2400u64;
 
+    // Serialize on the github-api-base test hook: `execute_one_pass` reads the
+    // process-wide override via its open-PR pre-check, so this test must not run
+    // while another test has the override installed (else the pre-check request
+    // would land on that test's mockito server). See `test_hooks::lock`.
+    let _hook = test_hooks::lock();
+
     // Iteration 1: push fails → alert #1 fires AND state is saved.
     let _ = execute_one_pass(
         &paths,

@@ -48,7 +48,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Default chat-channel TTL for a wipe-workspace pending confirmation.
-/// Per spec scenario: "Reply 'confirm' within 60 seconds."
+/// Per spec scenario: "Reply `@<bot> confirm` within 60 seconds."
 pub const WIPE_CONFIRM_TTL_SECS: u64 = 60;
 
 /// Polite-refusal reply for `send it` posted in a thread autocoder is
@@ -306,12 +306,15 @@ pub enum OperatorCommand {
     WipeWorkspace {
         repo_substring: String,
     },
-    /// Bare `confirm` reply OR explicit `wipe-workspace-confirm` form.
-    /// The caller looks up the channel's pending confirmation; the
-    /// `repo_substring` (when present) is informational only — the
-    /// authoritative repo URL was captured at the time the original
-    /// `wipe-workspace` was issued.
-    WipeWorkspaceConfirm {
+    /// The ONE canonical second step for EVERY two-step destructive
+    /// operator command (currently `wipe-workspace` AND `rollback`; future
+    /// two-step destructive ops inherit it). Parsed from bare `confirm`,
+    /// `@<bot> confirm`, OR the DEPRECATED per-op aliases
+    /// `wipe-workspace-confirm` / `rollback-confirm`. Carries NO op identity:
+    /// the dispatcher resolves the action from the channel's single tagged
+    /// pending entry, which is authoritative. The `repo_substring` (when
+    /// present on a legacy alias) is informational only.
+    Confirm {
         repo_substring: Option<String>,
     },
     /// Schedule a canonical-spec rebuild for the next iteration of the
@@ -474,18 +477,12 @@ pub enum OperatorCommand {
     /// `@<bot> rollback <repo-substring> <N | sha SHA>` (code-rollback-recovery).
     /// First step of the destructive two-step confirm: the dispatcher runs a
     /// dry-run preview AND records a pending confirmation keyed by channel
-    /// (60s TTL), mirroring `wipe-workspace`. The second step
-    /// (`rollback-confirm`) performs the rollback.
+    /// (60s TTL), mirroring `wipe-workspace`. The second step (`confirm`)
+    /// performs the rollback.
     Rollback {
         repo_substring: String,
         /// `Ok(count)` for a numeric depth, `Err(sha)` for a target SHA.
         depth: RollbackChatDepth,
-    },
-    /// Second step of the destructive `rollback` flow: consumes the pending
-    /// confirmation recorded by the matching `rollback` command AND submits
-    /// the actual `rollback_recovery` action.
-    RollbackConfirm {
-        repo_substring: Option<String>,
     },
     Help,
 }
@@ -633,13 +630,13 @@ fn parse_command_outcome_in_thread(
     }
     let mention = bot_mention.trim();
 
-    // Bare `confirm` (no mention) is a known one-token shortcut for the
-    // wipe-workspace second step. The dispatcher checks the channel's
-    // pending-confirmation table; if none exists, it posts the
-    // "no pending wipe-workspace confirmation" reply.
+    // Bare `confirm` (no mention) is the one-token shortcut for the canonical
+    // second step of ANY two-step destructive command. The dispatcher resolves
+    // it against the channel's single tagged pending entry; if none exists (or
+    // it expired), it posts the unified "no pending confirmation" reply.
     if mention.is_empty() || !trimmed.starts_with(mention) {
         if trimmed.eq_ignore_ascii_case("confirm") {
-            return ParseOutcome::Ok(OperatorCommand::WipeWorkspaceConfirm {
+            return ParseOutcome::Ok(OperatorCommand::Confirm {
                 repo_substring: None,
             });
         }
@@ -752,9 +749,15 @@ fn parse_command_outcome_in_thread(
                 repo_substring: rest[0].to_string(),
             })
         }
-        "wipe-workspace-confirm" | "confirm" => {
-            // Either the explicit form (`@bot wipe-workspace-confirm myrepo`)
-            // or the friendly form (`@bot confirm`). The substring is
+        // The canonical `confirm` verb AND the two DEPRECATED per-op aliases
+        // (`wipe-workspace-confirm`, `rollback-confirm`) ALL parse to the one
+        // channel-keyed `Confirm` intent. The aliases are kept accepted so an
+        // operator mid-flow (old preview, muscle memory) is not broken; they
+        // carry no op identity because the channel's single tagged pending
+        // entry is authoritative. They are hidden from `help` and named by no
+        // preview. (Removal MAY follow in a later change.)
+        "confirm" | "wipe-workspace-confirm" | "rollback-confirm" => {
+            // An optional trailing repo substring on a legacy alias stays
             // informational; the channel's pending entry is authoritative.
             let substring = match rest.first() {
                 Some(s) => {
@@ -765,7 +768,7 @@ fn parse_command_outcome_in_thread(
                 }
                 None => None,
             };
-            ParseOutcome::Ok(OperatorCommand::WipeWorkspaceConfirm {
+            ParseOutcome::Ok(OperatorCommand::Confirm {
                 repo_substring: substring,
             })
         }
@@ -1357,12 +1360,6 @@ fn parse_command_outcome_in_thread(
                 repo_substring: repo_substring.to_string(),
                 depth,
             })
-        }
-        "rollback-confirm" => {
-            // Second step. An explicit repo substring is optional; the
-            // authoritative target was captured at `rollback` time.
-            let repo_substring = rest.first().map(|s| s.trim_matches('`').to_string());
-            ParseOutcome::Ok(OperatorCommand::RollbackConfirm { repo_substring })
         }
         _ => ParseOutcome::None,
     }
@@ -1999,7 +1996,7 @@ fn format_queue_one_liner(
 ///   • <change> (<marker-file>)
 ///   ...]
 ///
-/// Reply 'confirm' within 60 seconds to proceed.
+/// Reply `@<bot> confirm` within 60 seconds to proceed.
 /// ```
 ///
 /// The `Currently:` clause is always present and reads either `idle` or
@@ -2032,7 +2029,8 @@ pub fn format_log_reply(resp: &serde_json::Value) -> String {
 }
 
 /// Render the dry-run preview of a `rollback_recovery` response into the
-/// confirmation message that prompts the operator for `rollback-confirm`.
+/// confirmation message that prompts the operator for the canonical
+/// `@<bot> confirm` second step.
 pub fn format_rollback_confirmation(resp: &serde_json::Value) -> String {
     let preview = resp.get("preview").and_then(|v| v.as_str()).unwrap_or("(no preview)");
     let has_collisions = resp
@@ -2047,7 +2045,7 @@ pub fn format_rollback_confirmation(resp: &serde_json::Value) -> String {
         // target (resolving duplicates) rather than aborting. Surface the note and
         // STILL offer the confirm — mirroring the CLI confirmed path
         // (`cli/rollback.rs`) and the `unconditional-rollback` canon. The dry-run
-        // already recorded the pending confirmation, so `rollback-confirm` works.
+        // already recorded the pending confirmation, so `confirm` works.
         out.push_str(
             "\n⚠️ Some in-range units already have active directories. A confirmed \
              rollback RECONCILES these to the rollback target (resolving duplicates) \
@@ -2055,7 +2053,7 @@ pub fn format_rollback_confirmation(resp: &serde_json::Value) -> String {
         );
     }
     out.push_str(
-        "\nReply `@<bot> rollback-confirm` within 60s to perform this rollback.\n",
+        "\nReply `@<bot> confirm` within 60s to perform this rollback.\n",
     );
     out
 }
@@ -2166,7 +2164,7 @@ pub fn format_wipe_confirmation(
 
     out.push('\n');
     out.push_str(&format!(
-        "Reply 'confirm' within {WIPE_CONFIRM_TTL_SECS} seconds to proceed."
+        "Reply `@<bot> confirm` within {WIPE_CONFIRM_TTL_SECS} seconds to proceed."
     ));
     out
 }
@@ -2353,8 +2351,8 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `undefer <repo> <slug>` — resume a deferred change OR issue, moving it back to its lane via PR; single-ack\n");
     out.push_str("  • `ignore-and-continue <repo> <change>` — skip a broken change AND let siblings proceed (stamps `.ignore-for-queue.json`)\n");
     out.push_str("  • `clear-ignore <repo> <change>` — remove `.ignore-for-queue.json`; queue resumes blocking on the original marker\n");
-    out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `confirm` (60s TTL)\n");
-    out.push_str("  • `confirm` — second step for `wipe-workspace` (same channel, within 60s)\n");
+    out.push_str("  • `wipe-workspace <repo>` — destructive: warns, then awaits `@<bot> confirm` (60s TTL)\n");
+    out.push_str("  • `confirm` — second step for ALL two-step destructive commands (`wipe-workspace`, `rollback`); same channel, within 60s, `@<bot> confirm` or bare `confirm`\n");
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
     out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
@@ -2371,8 +2369,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `log <repo> [<count>]` — list a repo's recent base-branch commits (newest first); read-only, picks a rollback depth\n");
     out.push_str("  • `survives <repo> <pr N | commit SHA>` — report which of a past PR's/commit's changes still survive verbatim at HEAD (read-only; under-reports, never over-reports)\n");
     out.push_str("  • `blame <repo> <path> <line>[-<line>]` — trace current line(s) to the introducing commit (short SHA, subject, date) and PR when discoverable (read-only)\n");
-    out.push_str("  • `rollback <repo> <N | sha SHA>` — destructive: roll the code back by N commits (or to a SHA) WHILE unarchiving the changes/issues archived in the range; previews, then awaits `rollback-confirm` (60s TTL)\n");
-    out.push_str("  • `rollback-confirm` — second step for `rollback` (same channel, within 60s)\n");
+    out.push_str("  • `rollback <repo> <N | sha SHA>` — destructive: roll the code back by N commits (or to a SHA) WHILE unarchiving the changes/issues archived in the range; previews, then awaits `@<bot> confirm` (60s TTL)\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -2507,21 +2504,35 @@ fn truncate_error_excerpt(s: &str) -> String {
 }
 
 // ====================================================================
-// Pending wipe-workspace confirmations
+// Pending destructive-op confirmations (unified, channel-keyed)
 // ====================================================================
 
-#[derive(Debug, Clone)]
-pub struct PendingConfirmation {
-    pub repo_url: String,
-    pub expires_at: Instant,
+/// The single tagged value a channel holds while a two-step destructive
+/// operator command awaits its `confirm`. ONE per channel at a time:
+/// recording a new op overwrites any prior pending op (replace semantics).
+/// Extensible — a future two-step destructive op adds one variant here AND
+/// one `record_*` helper on [`ConfirmationStore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDestructiveOp {
+    /// A pending `wipe-workspace`. `repo_url` is the authoritative target
+    /// captured when the original `wipe-workspace` was previewed.
+    Wipe { repo_url: String },
+    /// A pending `rollback`. Carries the captured repo URL AND the depth
+    /// (count OR sha) so `confirm` re-submits the exact previewed operation.
+    Rollback {
+        repo_url: String,
+        depth: RollbackChatDepth,
+    },
 }
 
-/// In-memory per-channel pending-confirmation tracker for the destructive
-/// `wipe-workspace` flow. The `Instant`-based expiry gives the second-step
-/// reply a hard 60-second window (per the spec).
+/// In-memory per-channel pending-confirmation tracker for EVERY two-step
+/// destructive operator command. A single tagged slot per channel enforces
+/// the spec invariant structurally: at most one pending destructive op per
+/// channel, and a new preview REPLACES any prior pending op. The
+/// `Instant`-based expiry gives the `confirm` step a hard 60-second window.
 #[derive(Debug, Default)]
 pub struct ConfirmationStore {
-    pending: Mutex<HashMap<String, PendingConfirmation>>,
+    pending: Mutex<HashMap<String, (PendingDestructiveOp, Instant)>>,
 }
 
 impl ConfirmationStore {
@@ -2529,94 +2540,57 @@ impl ConfirmationStore {
         Self::default()
     }
 
-    /// Record a pending wipe-workspace confirmation for `channel_id`,
-    /// replacing any prior pending entry on that channel.
-    pub fn record(&self, channel_id: &str, repo_url: String, ttl: Duration) {
-        self.record_at(channel_id, repo_url, Instant::now() + ttl);
-    }
-
-    /// Same as `record` but takes an absolute expiry instant. Lets tests
-    /// plant entries with an `expires_at` already in the past without
-    /// sleeping.
-    fn record_at(&self, channel_id: &str, repo_url: String, expires_at: Instant) {
-        let mut g = self.pending.lock().unwrap();
-        g.insert(
-            channel_id.to_string(),
-            PendingConfirmation {
-                repo_url,
-                expires_at,
-            },
+    /// Record a pending `wipe-workspace` for `channel_id`, REPLACING any
+    /// op already pending on that channel.
+    pub fn record_wipe(&self, channel_id: &str, repo_url: String, ttl: Duration) {
+        self.record_at(
+            channel_id,
+            PendingDestructiveOp::Wipe { repo_url },
+            Instant::now() + ttl,
         );
     }
 
-    /// Look up the pending confirmation for `channel_id`, returning the
-    /// captured `repo_url` and consuming the entry. Returns `None` when
-    /// no entry exists OR when the entry has expired (an expired entry
-    /// is also removed).
-    pub fn take_valid(&self, channel_id: &str) -> Option<String> {
-        let mut g = self.pending.lock().unwrap();
-        let entry = g.remove(channel_id)?;
-        if Instant::now() > entry.expires_at {
-            return None;
-        }
-        Some(entry.repo_url)
-    }
-
-    /// Test-only: count of in-memory pending entries.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.pending.lock().unwrap().len()
-    }
-}
-
-/// A pending code-rollback confirmation: the captured repo URL AND the
-/// depth (count OR sha) the operator chose, with a hard expiry. Mirrors
-/// [`ConfirmationStore`] but carries the rollback depth so the confirm step
-/// re-submits the exact operation the operator previewed.
-#[derive(Debug, Clone)]
-struct PendingRollback {
-    repo_url: String,
-    depth: RollbackChatDepth,
-    expires_at: Instant,
-}
-
-/// In-memory per-channel pending-confirmation tracker for the destructive
-/// `rollback` flow. Separate from [`ConfirmationStore`] so a pending wipe
-/// AND a pending rollback can coexist on the same channel without clobbering
-/// each other.
-#[derive(Debug, Default)]
-pub struct RollbackConfirmationStore {
-    pending: Mutex<HashMap<String, PendingRollback>>,
-}
-
-impl RollbackConfirmationStore {
-    fn record(
+    /// Record a pending `rollback` for `channel_id`, REPLACING any op
+    /// already pending on that channel.
+    pub fn record_rollback(
         &self,
         channel_id: &str,
         repo_url: String,
         depth: RollbackChatDepth,
         ttl: Duration,
     ) {
-        let mut g = self.pending.lock().unwrap();
-        g.insert(
-            channel_id.to_string(),
-            PendingRollback {
-                repo_url,
-                depth,
-                expires_at: Instant::now() + ttl,
-            },
+        self.record_at(
+            channel_id,
+            PendingDestructiveOp::Rollback { repo_url, depth },
+            Instant::now() + ttl,
         );
     }
 
-    /// Take the pending rollback for `channel_id`, returning `(repo_url,
-    /// depth)` and consuming the entry. `None` when absent OR expired.
-    fn take_valid(&self, channel_id: &str) -> Option<(String, RollbackChatDepth)> {
+    /// Insert the tagged op at an absolute expiry instant, overwriting any
+    /// existing entry for the channel. Lets tests plant entries with an
+    /// `expires_at` already in the past without sleeping.
+    fn record_at(&self, channel_id: &str, op: PendingDestructiveOp, expires_at: Instant) {
         let mut g = self.pending.lock().unwrap();
-        let entry = g.remove(channel_id)?;
-        if Instant::now() > entry.expires_at {
+        g.insert(channel_id.to_string(), (op, expires_at));
+    }
+
+    /// Take the pending destructive op for `channel_id`, returning the
+    /// tagged op and consuming the entry. Returns `None` when no entry
+    /// exists OR when the entry has expired (an expired entry is also
+    /// removed).
+    pub fn take_valid(&self, channel_id: &str) -> Option<PendingDestructiveOp> {
+        let mut g = self.pending.lock().unwrap();
+        let (op, expires_at) = g.remove(channel_id)?;
+        if Instant::now() > expires_at {
             return None;
         }
-        Some((entry.repo_url, entry.depth))
+        Some(op)
+    }
+
+    /// Test-only: count of in-memory pending entries.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
 }
 
@@ -2645,19 +2619,20 @@ pub trait ActionSubmitter: Send + Sync {
 /// corresponding action via the supplied `ActionSubmitter`, and returns
 /// the formatted chat reply.
 ///
-/// Two-step destructive `wipe-workspace`:
-///   - The first step records a pending confirmation keyed by
-///     `channel_id` with a 60-second TTL.
-///   - The second step (bare `confirm` OR explicit
-///     `wipe-workspace-confirm`) consumes the pending entry and submits
-///     the actual `wipe_workspace` action.
-///   - If no pending entry exists OR it has expired, the dispatcher
-///     posts the "no pending wipe-workspace confirmation" error.
+/// Two-step destructive commands (`wipe-workspace`, `rollback`, future ops):
+///   - The first step records a single tagged pending op keyed by
+///     `channel_id` with a 60-second TTL, replacing any prior pending op.
+///   - The ONE canonical second step (`confirm`, bare or mentioned; the
+///     DEPRECATED aliases `wipe-workspace-confirm` / `rollback-confirm` route
+///     here too) consumes the channel's pending op and submits whichever
+///     destructive action it tags.
+///   - If no pending op exists OR it has expired, the dispatcher posts the
+///     unified "no pending confirmation" error and submits no action.
 pub struct OperatorCommandDispatcher {
+    /// The ONE channel-keyed pending-confirmation store for EVERY two-step
+    /// destructive command (`wipe-workspace`, `rollback`, future ops). Holds
+    /// at most one tagged pending op per channel, with a 60s TTL.
     pending: ConfirmationStore,
-    /// Pending code-rollback confirmations (code-rollback-recovery). Keyed
-    /// by channel, with the same 60s TTL as the wipe flow.
-    rollback_pending: RollbackConfirmationStore,
     /// Directory under which the audit-thread state files live (the
     /// dispatcher resolves `send it` requests against
     /// `<audit_thread_state_dir>/audit-threads/<thread_ts>.json`).
@@ -2723,7 +2698,6 @@ impl OperatorCommandDispatcher {
     pub fn new(paths: &crate::paths::DaemonPaths) -> Self {
         Self {
             pending: ConfirmationStore::new(),
-            rollback_pending: RollbackConfirmationStore::default(),
             audit_thread_state_dir: crate::audits::threads::default_state_root(paths),
             proposal_request_state_dir:
                 crate::proposal_requests::default_state_root(paths),
@@ -3323,7 +3297,7 @@ impl OperatorCommandDispatcher {
                 // we want `confirm` to work even if the status fetch
                 // glitches (the worst case is then a less-rich
                 // confirmation message, not a stuck-in-limbo state).
-                self.pending.record(
+                self.pending.record_wipe(
                     channel_id,
                     repo.url.clone(),
                     Duration::from_secs(WIPE_CONFIRM_TTL_SECS),
@@ -3385,52 +3359,97 @@ impl OperatorCommandDispatcher {
                     format!("✗ {err}")
                 }
             }
-            OperatorCommand::WipeWorkspaceConfirm { .. } => {
-                let url = match self.pending.take_valid(channel_id) {
-                    Some(u) => u,
+            // The ONE canonical second step for every two-step destructive
+            // command. Resolves the channel's single tagged pending op and
+            // executes whichever action it tags. Reached from `confirm`
+            // (bare or mentioned) AND the deprecated `wipe-workspace-confirm`
+            // / `rollback-confirm` aliases — the pending entry is
+            // authoritative, so the alias kind is irrelevant.
+            OperatorCommand::Confirm { .. } => {
+                let op = match self.pending.take_valid(channel_id) {
+                    Some(op) => op,
                     None => {
-                        return "✗ no pending wipe-workspace confirmation in this \
-                                channel (or it expired — re-issue the original command)"
+                        return "✗ no pending confirmation in this channel (or it \
+                                expired — re-issue the original command)"
                             .to_string();
                     }
                 };
-                let resp = submitter
-                    .submit(serde_json::json!({
-                        "action": "wipe_workspace",
-                        "url": url,
-                    }))
-                    .await;
-                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let path = resp
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("workspace");
-                    let already_absent = resp
-                        .get("already_absent")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let drain_outcome = resp
-                        .get("drain_outcome")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("no iteration in flight");
-                    // The already-absent outcome supersedes the drain
-                    // outcome in the reply text. Operators reading the
-                    // reply want to know "directory was missing" first;
-                    // the drain outcome in that case is always "no
-                    // iteration in flight" (the daemon doesn't run an
-                    // iteration with no workspace to act on) so reporting
-                    // it would be redundant noise.
-                    if already_absent {
-                        format!("✓ Wiped {path} (already absent)")
-                    } else {
-                        format!("✓ Wiped {path} ({drain_outcome})")
+                match op {
+                    PendingDestructiveOp::Wipe { repo_url } => {
+                        let resp = submitter
+                            .submit(serde_json::json!({
+                                "action": "wipe_workspace",
+                                "url": repo_url,
+                            }))
+                            .await;
+                        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let path = resp
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("workspace");
+                            let already_absent = resp
+                                .get("already_absent")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let drain_outcome = resp
+                                .get("drain_outcome")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("no iteration in flight");
+                            // The already-absent outcome supersedes the drain
+                            // outcome in the reply text. Operators reading the
+                            // reply want to know "directory was missing" first;
+                            // the drain outcome in that case is always "no
+                            // iteration in flight" (the daemon doesn't run an
+                            // iteration with no workspace to act on) so reporting
+                            // it would be redundant noise.
+                            if already_absent {
+                                format!("✓ Wiped {path} (already absent)")
+                            } else {
+                                format!("✓ Wiped {path} ({drain_outcome})")
+                            }
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(no error message)");
+                            format!("✗ wipe-workspace failed: {err}")
+                        }
                     }
-                } else {
-                    let err = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no error message)");
-                    format!("✗ wipe-workspace failed: {err}")
+                    PendingDestructiveOp::Rollback { repo_url, depth } => {
+                        let mut req = serde_json::json!({
+                            "action": "rollback_recovery",
+                            "url": repo_url,
+                            "dry_run": false,
+                        });
+                        match &depth {
+                            RollbackChatDepth::Count(n) => req["count"] = serde_json::json!(n),
+                            RollbackChatDepth::Sha(s) => req["sha"] = serde_json::json!(s),
+                        }
+                        let resp = submitter.submit(req).await;
+                        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(no error message)");
+                            return format!("✗ rollback failed: {err}");
+                        }
+                        // Preempt acknowledgement: when the operation cancelled an
+                        // in-flight pass, the control-socket response carries the
+                        // cancelled change's slug. Surface it alongside the result so
+                        // the cancelled change is not a silent surprise. When no pass
+                        // was in flight the field is null/absent and no acknowledgement
+                        // is emitted.
+                        let outcome = format_rollback_outcome(&resp);
+                        match resp.get("preempted_change").and_then(|v| v.as_str()) {
+                            Some(slug) if !slug.trim().is_empty() => {
+                                format!(
+                                    "↩️ Preempting in-flight work on `{}` to roll back.\n{outcome}",
+                                    slack_escape(slug)
+                                )
+                            }
+                            _ => outcome,
+                        }
+                    }
                 }
             }
             OperatorCommand::StatusMenu => {
@@ -3589,59 +3608,16 @@ impl OperatorCommandDispatcher {
                         .unwrap_or("(no error message)");
                     return format!("✗ rollback preview failed: {err}");
                 }
-                // Record the pending confirmation (60s TTL) so `rollback-confirm`
+                // Record the pending rollback (60s TTL), replacing any prior
+                // pending op on the channel, so the canonical `confirm`
                 // re-submits the exact previewed operation.
-                self.rollback_pending.record(
+                self.pending.record_rollback(
                     channel_id,
                     repo.url.clone(),
                     depth.clone(),
                     Duration::from_secs(WIPE_CONFIRM_TTL_SECS),
                 );
                 format_rollback_confirmation(&resp)
-            }
-            OperatorCommand::RollbackConfirm { .. } => {
-                let (url, depth) = match self.rollback_pending.take_valid(channel_id) {
-                    Some(pair) => pair,
-                    None => {
-                        return "✗ no pending rollback confirmation in this channel \
-                                (or it expired — re-issue the original `rollback` command)"
-                            .to_string();
-                    }
-                };
-                let mut req = serde_json::json!({
-                    "action": "rollback_recovery",
-                    "url": url,
-                    "dry_run": false,
-                });
-                match &depth {
-                    RollbackChatDepth::Count(n) => req["count"] = serde_json::json!(n),
-                    RollbackChatDepth::Sha(s) => req["sha"] = serde_json::json!(s),
-                }
-                let resp = submitter.submit(req).await;
-                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let err = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no error message)");
-                    return format!("✗ rollback failed: {err}");
-                }
-                // Preempt acknowledgement: when the operation cancelled an
-                // in-flight pass, the control-socket response carries the
-                // cancelled change's slug. Surface it alongside the result so
-                // the cancelled change is not a silent surprise. When no pass
-                // was in flight the field is null/absent and no acknowledgement
-                // is emitted. Best-effort: this is part of the reply string, so
-                // it degrades with the reply itself when no backend is present.
-                let outcome = format_rollback_outcome(&resp);
-                match resp.get("preempted_change").and_then(|v| v.as_str()) {
-                    Some(slug) if !slug.trim().is_empty() => {
-                        format!(
-                            "↩️ Preempting in-flight work on `{}` to roll back.\n{outcome}",
-                            slack_escape(slug)
-                        )
-                    }
-                    _ => outcome,
-                }
             }
             OperatorCommand::Help => format_help_reply(),
             // The `propose` verb is routed via `handle_message_with_context`
@@ -5308,7 +5284,7 @@ fn render_defer_reply(resp: &serde_json::Value, slug: &str, repo_url: &str) -> S
 /// to the operator** requirement) so the cancelled change is not a silent
 /// surprise, naming the operation (`op`) AND the unit being deferred. When
 /// no pass was in flight the field is null/absent and only the result
-/// reply is returned. This mirrors the `rollback-confirm` arm's
+/// reply is returned. This mirrors the `confirm` arm's rollback
 /// best-effort ack: the ack is prepended to the same reply string, so it
 /// degrades with the reply itself when no backend is present.
 fn prepend_defer_preempt_ack(
@@ -6160,12 +6136,27 @@ mod tests {
 
     #[test]
     fn parse_explicit_wipe_workspace_confirm() {
+        // The deprecated `wipe-workspace-confirm` alias parses to the unified
+        // channel-keyed `Confirm` intent (no op identity).
         let cmd =
             parse_command(&format!("{BOT} wipe-workspace-confirm myrepo"), BOT).unwrap();
         assert_eq!(
             cmd,
-            OperatorCommand::WipeWorkspaceConfirm {
+            OperatorCommand::Confirm {
                 repo_substring: Some("myrepo".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_explicit_rollback_confirm_alias() {
+        // The deprecated `rollback-confirm` alias ALSO parses to the unified
+        // `Confirm` intent — the channel's pending entry is authoritative.
+        let cmd = parse_command(&format!("{BOT} rollback-confirm"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Confirm {
+                repo_substring: None
             }
         );
     }
@@ -6175,7 +6166,7 @@ mod tests {
         let cmd = parse_command("confirm", BOT).unwrap();
         assert_eq!(
             cmd,
-            OperatorCommand::WipeWorkspaceConfirm {
+            OperatorCommand::Confirm {
                 repo_substring: None
             }
         );
@@ -6187,7 +6178,7 @@ mod tests {
             let cmd = parse_command(form, BOT).unwrap();
             assert_eq!(
                 cmd,
-                OperatorCommand::WipeWorkspaceConfirm {
+                OperatorCommand::Confirm {
                     repo_substring: None
                 }
             );
@@ -6199,7 +6190,7 @@ mod tests {
         let cmd = parse_command(&format!("{BOT} confirm"), BOT).unwrap();
         assert_eq!(
             cmd,
-            OperatorCommand::WipeWorkspaceConfirm {
+            OperatorCommand::Confirm {
                 repo_substring: None
             }
         );
@@ -6686,8 +6677,9 @@ mod tests {
         // collisions — a confirmed rollback reconciles collisions to the target,
         // so they never suppress the confirm (the prior behavior dead-ended the
         // preview, leaving the operator unable to confirm). Behavioral contract:
-        // the actionable `rollback-confirm` verb is present in both cases; we do
-        // not assert prose wording.
+        // the actionable canonical `@<bot> confirm` verb is present in both
+        // cases AND the deprecated alias is NOT named; we do not assert prose
+        // wording beyond the load-bearing verb token.
         for has_collisions in [true, false] {
             let resp = serde_json::json!({
                 "ok": true,
@@ -6697,8 +6689,12 @@ mod tests {
             });
             let msg = format_rollback_confirmation(&resp);
             assert!(
-                msg.contains("rollback-confirm"),
+                msg.contains("@<bot> confirm"),
                 "confirm must be offered (has_collisions={has_collisions}): {msg}"
+            );
+            assert!(
+                !msg.contains("rollback-confirm"),
+                "deprecated alias must NOT be named (has_collisions={has_collisions}): {msg}"
             );
         }
     }
@@ -6708,11 +6704,39 @@ mod tests {
     #[test]
     fn confirmation_store_round_trip() {
         let store = ConfirmationStore::new();
-        store.record("C1", "git@github.com:owner/repo.git".into(), Duration::from_secs(60));
+        store.record_wipe(
+            "C1",
+            "git@github.com:owner/repo.git".into(),
+            Duration::from_secs(60),
+        );
         assert_eq!(store.len(), 1);
-        let url = store.take_valid("C1").expect("present");
-        assert_eq!(url, "git@github.com:owner/repo.git");
+        let op = store.take_valid("C1").expect("present");
+        assert_eq!(
+            op,
+            PendingDestructiveOp::Wipe {
+                repo_url: "git@github.com:owner/repo.git".into()
+            }
+        );
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn confirmation_store_round_trip_rollback() {
+        let store = ConfirmationStore::new();
+        store.record_rollback(
+            "C1",
+            "git@github.com:owner/repo.git".into(),
+            RollbackChatDepth::Count(3),
+            Duration::from_secs(60),
+        );
+        let op = store.take_valid("C1").expect("present");
+        assert_eq!(
+            op,
+            PendingDestructiveOp::Rollback {
+                repo_url: "git@github.com:owner/repo.git".into(),
+                depth: RollbackChatDepth::Count(3),
+            }
+        );
     }
 
     #[test]
@@ -6723,7 +6747,7 @@ mod tests {
         // without the test having to wait for wall-clock time.
         store.record_at(
             "C1",
-            "url".into(),
+            PendingDestructiveOp::Wipe { repo_url: "url".into() },
             Instant::now() - Duration::from_millis(1),
         );
         // Expired → take_valid returns None AND removes the entry.
@@ -6734,20 +6758,36 @@ mod tests {
     #[test]
     fn confirmation_store_cross_channel_isolation() {
         let store = ConfirmationStore::new();
-        store.record("A", "url-a".into(), Duration::from_secs(60));
+        store.record_wipe("A", "url-a".into(), Duration::from_secs(60));
         // Channel B has no pending → take_valid returns None.
         assert!(store.take_valid("B").is_none());
         // A's pending is untouched.
-        assert_eq!(store.take_valid("A").as_deref(), Some("url-a"));
+        assert_eq!(
+            store.take_valid("A"),
+            Some(PendingDestructiveOp::Wipe { repo_url: "url-a".into() })
+        );
     }
 
     #[test]
     fn confirmation_store_replaces_prior_pending() {
         let store = ConfirmationStore::new();
-        store.record("C", "url-1".into(), Duration::from_secs(60));
-        store.record("C", "url-2".into(), Duration::from_secs(60));
-        // Second record replaces first.
-        assert_eq!(store.take_valid("C").as_deref(), Some("url-2"));
+        store.record_wipe("C", "url-1".into(), Duration::from_secs(60));
+        // A rollback preview on the SAME channel replaces the pending wipe —
+        // the single tagged slot holds at most one op per channel.
+        store.record_rollback(
+            "C",
+            "url-2".into(),
+            RollbackChatDepth::Count(2),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.take_valid("C"),
+            Some(PendingDestructiveOp::Rollback {
+                repo_url: "url-2".into(),
+                depth: RollbackChatDepth::Count(2),
+            })
+        );
     }
 
     // ---------- Reply formatters ----------
@@ -8433,7 +8473,9 @@ mod tests {
         // on wall-clock time at all.
         dispatcher.pending.record_at(
             "C1",
-            "git@github.com:owner/repo.git".into(),
+            PendingDestructiveOp::Wipe {
+                repo_url: "git@github.com:owner/repo.git".into(),
+            },
             Instant::now() - Duration::from_millis(1),
         );
         let reply = dispatcher
@@ -8615,8 +8657,8 @@ mod tests {
             !out.contains("Active markers"),
             "no marker section when none exist: {out}"
         );
-        // The trailing confirm line is unchanged.
-        assert!(out.contains("Reply 'confirm' within 60 seconds to proceed."));
+        // The trailing confirm line names the canonical `@<bot> confirm` verb.
+        assert!(out.contains("Reply `@<bot> confirm` within 60 seconds to proceed."));
     }
 
     #[test]
@@ -11956,8 +11998,10 @@ mod tests {
 
     #[test]
     fn parse_rollback_confirm() {
+        // `rollback-confirm` is a DEPRECATED alias that parses to the unified
+        // channel-keyed `Confirm` intent (no op identity).
         let cmd = parse_command(&format!("{BOT} rollback-confirm"), BOT).unwrap();
-        assert_eq!(cmd, OperatorCommand::RollbackConfirm { repo_substring: None });
+        assert_eq!(cmd, OperatorCommand::Confirm { repo_substring: None });
     }
 
     #[test]
@@ -12086,13 +12130,15 @@ mod tests {
             .unwrap();
         let preview_text = unwrap_sync(preview_reply);
         assert!(preview_text.contains("WOULD roll back 2 commits"), "{preview_text}");
-        assert!(preview_text.contains("rollback-confirm"), "{preview_text}");
+        // The preview names the canonical confirm verb, NOT the deprecated alias.
+        assert!(preview_text.contains("@<bot> confirm"), "{preview_text}");
+        assert!(!preview_text.contains("rollback-confirm"), "{preview_text}");
         // The first submitted call MUST be a dry-run.
         assert_eq!(submitter.calls()[0]["dry_run"], serde_json::json!(true));
 
-        // Step 2: rollback-confirm → acts (dry_run false) AND reports the PR.
+        // Step 2: canonical `confirm` → acts (dry_run false) AND reports the PR.
         let act_reply = dispatcher
-            .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+            .handle_message(&format!("{BOT} confirm"), "C1", BOT, &fixture_repos(), &submitter)
             .await
             .unwrap();
         let act_text = unwrap_sync(act_reply);
@@ -12129,7 +12175,7 @@ mod tests {
         // naming the cancelled change AND the normal outcome.
         let act_text = unwrap_sync(
             dispatcher
-                .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+                .handle_message(&format!("{BOT} confirm"), "C1", BOT, &fixture_repos(), &submitter)
                 .await
                 .unwrap(),
         );
@@ -12166,7 +12212,7 @@ mod tests {
             .unwrap();
         let act_text = unwrap_sync(
             dispatcher
-                .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+                .handle_message(&format!("{BOT} confirm"), "C1", BOT, &fixture_repos(), &submitter)
                 .await
                 .unwrap(),
         );
@@ -12185,12 +12231,328 @@ mod tests {
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
-            .handle_message(&format!("{BOT} rollback-confirm"), "C1", BOT, &fixture_repos(), &submitter)
+            .handle_message(&format!("{BOT} confirm"), "C1", BOT, &fixture_repos(), &submitter)
             .await
             .unwrap();
         let text = unwrap_sync(reply);
-        assert!(text.contains("no pending rollback confirmation"), "{text}");
+        // Unified no-pending message (replaces the two op-specific ones).
+        assert!(text.contains("no pending confirmation"), "{text}");
         // No action was submitted (nothing to confirm).
         assert!(submitter.calls().is_empty());
+    }
+
+    // ---------- Unified `confirm` verb (unified-confirm-verb) ----------
+
+    /// Helper: drive a `wipe-workspace` preview so the channel holds a pending
+    /// wipe, then return the dispatcher + submitter ready for a `confirm`.
+    async fn wipe_pending(channel: &str) -> (OperatorCommandDispatcher, FakeSubmitter) {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        // repo_status drives the preview; default ok=false → minimal preview,
+        // which is fine: the pending wipe is recorded before the status fetch.
+        let _ = dispatcher
+            .handle_message(
+                &format!("{BOT} wipe-workspace myrepo"),
+                channel,
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        (dispatcher, submitter)
+    }
+
+    /// Helper: drive a `rollback` preview so the channel holds a pending
+    /// rollback, returning the dispatcher + submitter ready for a `confirm`.
+    async fn rollback_pending(channel: &str) -> (OperatorCommandDispatcher, FakeSubmitter) {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 3 commits",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/3",
+            }),
+        );
+        let _ = dispatcher
+            .handle_message(
+                &format!("{BOT} rollback myrepo 3"),
+                channel,
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        (dispatcher, submitter)
+    }
+
+    /// 6.1 — `confirm` (bare AND mentioned) after a wipe preview submits the
+    /// wipe_workspace action and NO rollback_recovery action.
+    #[tokio::test]
+    async fn confirm_resolves_pending_wipe_bare_and_mentioned() {
+        for form in ["confirm", &format!("{BOT} confirm")] {
+            let (dispatcher, submitter) = wipe_pending("C1").await;
+            assert_eq!(dispatcher.pending_len(), 1, "wipe recorded");
+            let _ = dispatcher
+                .handle_message(form, "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap();
+            let actions: Vec<String> = submitter
+                .calls()
+                .iter()
+                .map(|c| c["action"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert!(
+                actions.contains(&"wipe_workspace".to_string()),
+                "form {form:?} must submit wipe_workspace: {actions:?}"
+            );
+            assert!(
+                !actions.contains(&"rollback_recovery".to_string()),
+                "form {form:?} must NOT submit rollback_recovery: {actions:?}"
+            );
+            assert_eq!(dispatcher.pending_len(), 0, "pending consumed");
+        }
+    }
+
+    /// 6.2 — `confirm` (bare AND mentioned) after a rollback preview submits a
+    /// confirmed (dry_run=false) rollback_recovery and NO wipe_workspace.
+    #[tokio::test]
+    async fn confirm_resolves_pending_rollback_bare_and_mentioned() {
+        for form in ["confirm", &format!("{BOT} confirm")] {
+            let (dispatcher, submitter) = rollback_pending("C1").await;
+            assert_eq!(dispatcher.pending_len(), 1, "rollback recorded");
+            let _ = dispatcher
+                .handle_message(form, "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap();
+            let calls = submitter.calls();
+            // The confirm submits a NON-dry-run rollback_recovery.
+            let confirmed = calls.iter().any(|c| {
+                c["action"] == "rollback_recovery" && c["dry_run"] == serde_json::json!(false)
+            });
+            assert!(confirmed, "form {form:?} must submit confirmed rollback: {calls:?}");
+            let wiped = calls.iter().any(|c| c["action"] == "wipe_workspace");
+            assert!(!wiped, "form {form:?} must NOT submit wipe_workspace: {calls:?}");
+            assert_eq!(dispatcher.pending_len(), 0, "pending consumed");
+        }
+    }
+
+    /// 6.3 (none recorded) — `confirm` with no pending op returns the unified
+    /// no-pending reply and submits no action.
+    #[tokio::test]
+    async fn confirm_no_pending_errors_clearly() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        let text = unwrap_sync(
+            dispatcher
+                .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap(),
+        );
+        assert!(text.starts_with("✗"), "{text}");
+        assert!(text.contains("no pending confirmation"), "{text}");
+        assert!(submitter.calls().is_empty(), "no action submitted");
+    }
+
+    /// 6.3 (expired) — a pending op past its 60s TTL is NOT executed; `confirm`
+    /// returns the unified no-pending reply (seeded via the record_at seam).
+    #[tokio::test]
+    async fn confirm_expired_ttl_errors_clearly() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        dispatcher.pending.record_at(
+            "C1",
+            PendingDestructiveOp::Rollback {
+                repo_url: "git@github.com:owner/repo.git".into(),
+                depth: RollbackChatDepth::Count(2),
+            },
+            Instant::now() - Duration::from_millis(1),
+        );
+        let text = unwrap_sync(
+            dispatcher
+                .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("no pending confirmation"), "{text}");
+        assert!(submitter.calls().is_empty(), "expired op not executed");
+        assert_eq!(dispatcher.pending_len(), 0, "expired entry removed");
+    }
+
+    /// 6.4 — a second destructive preview in the same channel REPLACES the
+    /// first; `confirm` executes the SECOND op only (both orderings).
+    #[tokio::test]
+    async fn second_preview_replaces_prior_pending_wipe_then_rollback() {
+        // wipe-workspace then rollback → confirm executes the rollback.
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 1 commit",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/1",
+            }),
+        );
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} wipe-workspace myrepo"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} rollback myrepo 1"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.pending_len(), 1, "still at most one pending");
+        let _ = dispatcher
+            .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let calls = submitter.calls();
+        assert!(
+            calls.iter().any(|c| {
+                c["action"] == "rollback_recovery" && c["dry_run"] == serde_json::json!(false)
+            }),
+            "confirm must execute the rollback (the second op): {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c["action"] == "wipe_workspace"),
+            "the replaced wipe must NOT execute: {calls:?}"
+        );
+    }
+
+    /// 6.4 (reverse ordering) — rollback then wipe-workspace → confirm executes
+    /// the wipe; the rollback pending is gone.
+    #[tokio::test]
+    async fn second_preview_replaces_prior_pending_rollback_then_wipe() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "rollback_recovery",
+            serde_json::json!({
+                "ok": true,
+                "preview": "WOULD roll back 1 commit",
+                "has_collisions": false,
+                "outcome": "pr_opened",
+                "pr_url": "http://x/pr/1",
+            }),
+        );
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} rollback myrepo 1"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let _ = dispatcher
+            .handle_message(&format!("{BOT} wipe-workspace myrepo"), "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.pending_len(), 1, "still at most one pending");
+        let _ = dispatcher
+            .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        let calls = submitter.calls();
+        assert!(
+            calls.iter().any(|c| c["action"] == "wipe_workspace"),
+            "confirm must execute the wipe (the second op): {calls:?}"
+        );
+        // No confirmed (dry_run=false) rollback was submitted — only the
+        // earlier dry-run preview call exists.
+        assert!(
+            !calls.iter().any(|c| {
+                c["action"] == "rollback_recovery" && c["dry_run"] == serde_json::json!(false)
+            }),
+            "the replaced rollback must NOT execute: {calls:?}"
+        );
+    }
+
+    /// 6.5 — the deprecated alias `wipe-workspace-confirm` still executes the
+    /// channel's pending op (here a pending wipe).
+    #[tokio::test]
+    async fn deprecated_wipe_alias_still_executes_pending_op() {
+        let (dispatcher, submitter) = wipe_pending("C1").await;
+        let _ = dispatcher
+            .handle_message(
+                &format!("{BOT} wipe-workspace-confirm"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        assert!(
+            submitter.calls().iter().any(|c| c["action"] == "wipe_workspace"),
+            "deprecated alias must execute the pending wipe"
+        );
+        assert_eq!(dispatcher.pending_len(), 0);
+    }
+
+    /// 6.5 — the deprecated alias `rollback-confirm` still executes the
+    /// channel's pending op even when that op is a wipe (the channel's pending
+    /// entry is authoritative; the alias kind is irrelevant).
+    #[tokio::test]
+    async fn deprecated_rollback_alias_executes_channels_pending_wipe() {
+        let (dispatcher, submitter) = wipe_pending("C1").await;
+        let _ = dispatcher
+            .handle_message(
+                &format!("{BOT} rollback-confirm"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        assert!(
+            submitter.calls().iter().any(|c| c["action"] == "wipe_workspace"),
+            "the alias routes to the channel-keyed confirm path; pending wipe executes"
+        );
+    }
+
+    /// 6.6 — the wipe preview renderer names `@<bot> confirm` and does NOT name
+    /// the deprecated aliases. (Derived from the renderer, not asserted prose.)
+    #[test]
+    fn wipe_preview_names_canonical_confirm_only() {
+        let status = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            ..RepoStatusResponse::default()
+        };
+        let msg = format_wipe_confirmation(
+            std::path::Path::new("/ws/repo"),
+            "git@github.com:owner/repo.git",
+            &status,
+        );
+        assert!(msg.contains("@<bot> confirm"), "{msg}");
+        assert!(!msg.contains("wipe-workspace-confirm"), "{msg}");
+        assert!(!msg.contains("rollback-confirm"), "{msg}");
+    }
+
+    /// 6.7 — `help` lists a single `confirm` verb and hides both deprecated
+    /// aliases.
+    #[tokio::test]
+    async fn help_lists_single_confirm_hides_deprecated_aliases() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        let text = unwrap_sync(
+            dispatcher
+                .handle_message(&format!("{BOT} help"), "C1", BOT, &fixture_repos(), &submitter)
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("`confirm`"), "help must list confirm: {text}");
+        assert!(
+            !text.contains("wipe-workspace-confirm"),
+            "help must hide wipe-workspace-confirm: {text}"
+        );
+        assert!(
+            !text.contains("rollback-confirm"),
+            "help must hide rollback-confirm: {text}"
+        );
     }
 }
