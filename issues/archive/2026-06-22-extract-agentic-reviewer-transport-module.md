@@ -16,16 +16,16 @@ Markdown, verdicts, concerns) is identical.
 
 ## Tasks
 
-- [ ] Move the agentic reviewer transport block into its own module: the
+- [x] Move the agentic reviewer transport block into its own module: the
   role/tooling consts and `agentic_review_allowed_tools`, the `Raw*` review
   submission types, `payload_to_review_result`, `render_review_submission_markdown`,
   `render_agentic_review_prompt`, the `ReviewSessionRunner` trait,
   `CliReviewSessionRunner`, the `run_agentic_review_*` orchestration, and
   `resolve_reviewer_strategy`. Re-locate via the SYMBOL names — line numbers have
   drifted (this file was recently modified).
-- [ ] Re-export the items that callers outside the reviewer reference so existing
+- [x] Re-export the items that callers outside the reviewer reference so existing
   paths keep compiling.
-- [ ] Verify: `cargo build` and the existing suite pass; reviewer Markdown,
+- [x] Verify: `cargo build` and the existing suite pass; reviewer Markdown,
   verdicts, and concerns are unchanged.
 
 ## Constraints (behavior-preserving refactor)
