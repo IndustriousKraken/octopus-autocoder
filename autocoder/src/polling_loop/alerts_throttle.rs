@@ -312,6 +312,13 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                     b = f.requirement_b,
                     s = f.summary,
                 ));
+                // Surface the concrete edit plan on its own labeled line,
+                // distinct from the why-summary. Empty → identity + summary
+                // only (the suggested fix is additive).
+                if !f.suggested_fix.trim().is_empty() {
+                    findings_block
+                        .push_str(&format!("     Suggested fix: {fix}\n", fix = f.suggested_fix));
+                }
             }
             // a49: append the `*Contradiction-check: <provider>/<model>*`
             // attribution when the daemon knows the configured model.
@@ -436,6 +443,13 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                     cap = f.canonical_capability,
                     s = f.summary,
                 ));
+                // Surface the concrete edit plan on its own labeled line,
+                // distinct from the why-summary. Empty → identity + summary
+                // only (the suggested fix is additive).
+                if !f.suggested_fix.trim().is_empty() {
+                    findings_block
+                        .push_str(&format!("     Suggested fix: {fix}\n", fix = f.suggested_fix));
+                }
             }
             // a49: append the `*Canon-contradiction-check: <provider>/<model>*`
             // attribution when the daemon knows the configured model.

@@ -106,6 +106,57 @@ pub(crate) fn render_transcript(messages: &[ThreadMessage]) -> String {
     out
 }
 
+/// Fetches a thread transcript. Production reads it from the chatops backend;
+/// tests inject a fetcher that fails a scripted number of times so the
+/// bounded-retry + fail-closed behavior is exercised without a real backend.
+#[async_trait]
+trait TranscriptFetcher: Send + Sync {
+    async fn fetch(&self, channel: &str, thread_ts: &str) -> Result<Vec<ThreadMessage>>;
+}
+
+/// Production transcript fetcher: reads the thread from the chatops backend.
+struct ChatOpsTranscriptFetcher<'a> {
+    ctx: &'a ChatOpsContext,
+}
+
+#[async_trait]
+impl TranscriptFetcher for ChatOpsTranscriptFetcher<'_> {
+    async fn fetch(&self, channel: &str, thread_ts: &str) -> Result<Vec<ThreadMessage>> {
+        self.ctx.chatops.fetch_thread_transcript(channel, thread_ts).await
+    }
+}
+
+/// Fetch the thread transcript with a bounded retry (`retries` ADDITIONAL
+/// attempts beyond the first, short backoff between attempts). The transcript
+/// carries the operator's chosen DIRECTION, so a revision must never run
+/// against an empty discussion — a transient failure is absorbed here; only a
+/// PERSISTENT failure (every attempt failed) surfaces as `Err` to the caller,
+/// which decides whether to fail closed (executor) or degrade-but-answer
+/// (advisor). Keys ONLY on fetch success/failure — never on provider-specific
+/// error text.
+async fn fetch_transcript_bounded(
+    fetcher: &dyn TranscriptFetcher,
+    channel: &str,
+    thread_ts: &str,
+    retries: u32,
+) -> Result<Vec<ThreadMessage>> {
+    let attempts = retries.saturating_add(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..attempts {
+        match fetcher.fetch(channel, thread_ts).await {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last_err = Some(e);
+                // Short backoff between attempts; none after the final one.
+                if attempt + 1 < attempts {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("transcript fetch failed")))
+}
+
 /// Best-effort threaded reply. Logs + swallows the error so a failed reply
 /// never aborts the surrounding iteration.
 async fn post_reply(
@@ -282,20 +333,26 @@ pub async fn process_pending_revision_advise(
         }
     };
     // Re-fetch the transcript each reply so multi-round discussion works
-    // without a held session (task 3.2). Best-effort: a fetch error degrades
-    // to a transcript-less single-turn answer.
-    let transcript = match ctx
-        .chatops
-        .fetch_thread_transcript(&request.channel, &request.thread_ts)
-        .await
+    // without a held session (task 3.2), with the SAME bounded retry the
+    // executor uses. The advisor WRITES NOTHING, so a persistent failure does
+    // NOT abort it (unlike the executor): it answers from the degraded thread
+    // AND surfaces that it did (task 5.3).
+    let fetcher = ChatOpsTranscriptFetcher { ctx };
+    let (transcript, degraded) = match fetch_transcript_bounded(
+        &fetcher,
+        &request.channel,
+        &request.thread_ts,
+        cc_ctx.revision_transcript_fetch_retries,
+    )
+    .await
     {
-        Ok(t) => t,
+        Ok(t) => (t, false),
         Err(e) => {
             tracing::warn!(
                 change = %request.change_slug,
-                "revision-advise: transcript fetch failed (degrading to single-turn): {e:#}"
+                "revision-advise: transcript fetch failed after bounded retry (degrading to single-turn; advisor still answers): {e:#}"
             );
-            Vec::new()
+            (Vec::new(), true)
         }
     };
     let runner = CliAdvisorRunner {
@@ -303,7 +360,7 @@ pub async fn process_pending_revision_advise(
         model: &cc_ctx.model,
         timeout: cc_ctx.timeout,
     };
-    advise_with_runner(workspace, ctx, request, &transcript, &runner).await
+    advise_with_runner(workspace, ctx, request, &transcript, degraded, &runner).await
 }
 
 /// Orchestration shared by production AND tests: build the prompt, run the
@@ -315,6 +372,7 @@ async fn advise_with_runner(
     ctx: &ChatOpsContext,
     request: &RevisionAdviseRequest,
     transcript: &[ThreadMessage],
+    degraded: bool,
     runner: &dyn AdvisorSessionRunner,
 ) -> Result<()> {
     let prompt =
@@ -332,6 +390,16 @@ async fn advise_with_runner(
             format!("✗ The revision advisor session failed: {e}")
         }
     };
+    // The advisor writes nothing, so a degraded thread is acceptable — but it
+    // SHALL surface that it answered from a partial thread (task 5.3) so the
+    // operator can weigh the answer accordingly.
+    let answer = if degraded {
+        format!(
+            "⚠️ I could not load the full discussion thread, so this answer is from a partial view of it.\n\n{answer}"
+        )
+    } else {
+        answer
+    };
     post_reply(Some(ctx), &request.channel, &request.thread_ts, &answer).await;
     Ok(())
 }
@@ -347,15 +415,113 @@ pub(crate) fn revision_branch_name(agent_branch: &str, change_slug: &str) -> Str
     format!("{agent_branch}-spec-revision-{change_slug}")
 }
 
+/// Render the marker's CURRENT structured findings as the explicit set the
+/// revision MUST resolve (task 4): "resolve EACH of these contradictions: …",
+/// each naming the conflicting requirement identity (and, for `[canon]`, the
+/// canonical capability) plus the why-summary AND the gate's suggested fix when
+/// present. Empty when the marker records no structured findings (an older
+/// marker, or a non-contradiction hold) — the prompt then falls back to the
+/// narrative + transcript.
+fn render_findings_to_resolve(
+    findings: &[crate::spec_revision::ContradictionFindingRecord],
+) -> String {
+    use crate::spec_revision::ContradictionGate;
+    if findings.is_empty() {
+        return String::new();
+    }
+    let n = findings.len();
+    let mut out = format!(
+        "\n# The contradictions this revision MUST resolve ({n})\n\n\
+         These are the change's CURRENT contradictions, recorded in the marker \
+         above. Resolve EVERY one — not only the first:\n\n"
+    );
+    for (i, f) in findings.iter().enumerate() {
+        match f.gate {
+            ContradictionGate::In => {
+                out.push_str(&format!(
+                    "{idx}. [in] within-change conflict:\n   \
+                     Requirement A: {a}\n   Requirement B: {b}\n",
+                    idx = i + 1,
+                    a = f.requirement_a,
+                    b = f.requirement_b,
+                ));
+            }
+            ContradictionGate::Canon => {
+                out.push_str(&format!(
+                    "{idx}. [canon] change-vs-canon conflict:\n   \
+                     Change requirement: {a}\n   \
+                     Conflicting canonical requirement: {b} (capability: {cap})\n",
+                    idx = i + 1,
+                    a = f.requirement_a,
+                    b = f.requirement_b,
+                    cap = f.canonical_capability,
+                ));
+            }
+        }
+        if !f.summary.trim().is_empty() {
+            out.push_str(&format!("   Why: {}\n", f.summary));
+        }
+        if !f.suggested_fix.trim().is_empty() {
+            out.push_str(&format!("   Suggested fix: {}\n", f.suggested_fix));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the specific requirement(s) a revision is NOT clearing (the
+/// escalation report, task 6.3): each surviving finding named by its conflicting
+/// requirement identity (and capability for `[canon]`), so a persistent
+/// non-convergence is legible rather than an opaque repeating failure.
+fn render_surviving_findings(
+    survivors: &[&crate::spec_revision::ContradictionFindingRecord],
+) -> String {
+    use crate::spec_revision::ContradictionGate;
+    let mut out = String::new();
+    for (i, f) in survivors.iter().enumerate() {
+        match f.gate {
+            ContradictionGate::In => {
+                out.push_str(&format!(
+                    "{idx}. [in] still conflicting: `{a}` vs `{b}`\n",
+                    idx = i + 1,
+                    a = f.requirement_a,
+                    b = f.requirement_b,
+                ));
+            }
+            ContradictionGate::Canon => {
+                out.push_str(&format!(
+                    "{idx}. [canon] still conflicting: change requirement `{a}` vs canonical `{b}` (capability: {cap})\n",
+                    idx = i + 1,
+                    a = f.requirement_a,
+                    b = f.requirement_b,
+                    cap = f.canonical_capability,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Build the executor session prompt: the marching orders (edit the change's
 /// spec deltas along the discussed direction), the artifacts to read, the
-/// discussion so far, AND the hard guardrails (scope, no tasks.md).
+/// discussion so far, the CURRENT contradiction set the revision MUST resolve
+/// (read from the durable marker), AND the hard guardrails (scope, no
+/// tasks.md). The transcript supplies the operator's chosen DIRECTION; the
+/// marker supplies WHAT must be resolved (task 4).
 pub(crate) fn build_executor_prompt(
     workspace: &Path,
     change_slug: &str,
     transcript: &[ThreadMessage],
 ) -> String {
     let paths = spec_delta_paths(workspace, change_slug);
+    // The marker is the durable source of truth for what currently contradicts.
+    // Read it best-effort; an unreadable/absent marker leaves the prompt
+    // grounded in the narrative + transcript (degraded but still actionable).
+    let marker_findings = crate::spec_revision::read_marker(workspace, change_slug)
+        .ok()
+        .flatten()
+        .map(|m| m.contradictions)
+        .unwrap_or_default();
     let mut out = String::new();
     out.push_str(
         "You are autocoder's spec-revision EXECUTOR. An operator discussed a \
@@ -369,6 +535,7 @@ pub(crate) fn build_executor_prompt(
         "Read its contradiction narrative first: `{}`\n",
         marker_rel_path(change_slug)
     ));
+    out.push_str(&render_findings_to_resolve(&marker_findings));
     if paths.is_empty() {
         out.push_str(
             "This change has no per-capability spec deltas; edit \
@@ -408,8 +575,14 @@ pub(crate) fn build_executor_prompt(
 pub(crate) enum ReGateOutcome {
     /// Both gates ran AND found no contradiction. Open the PR.
     Clean,
-    /// A gate found a remaining contradiction. Open NO PR; report this text.
-    Contradiction(String),
+    /// A gate found a remaining contradiction. Open NO PR. Carries the
+    /// re-gate's CURRENT structured findings (the durable source of truth the
+    /// marker is refreshed with, AND the identity the escalation tracks) AND a
+    /// pre-formatted human-readable summary for the thread reply.
+    Contradiction {
+        findings: Vec<crate::spec_revision::ContradictionFindingRecord>,
+        text: String,
+    },
     /// A gate could not be evaluated (disabled / errored). Fail closed: open
     /// NO PR; report this cause (the operator fixes the gate AND retries).
     CouldNotRun(String),
@@ -434,6 +607,14 @@ struct GatesReGateRunner {
 #[async_trait]
 impl ReGateRunner for GatesReGateRunner {
     async fn regate(&self, workspace: &Path, change_slug: &str) -> ReGateOutcome {
+        use crate::spec_revision::ContradictionFindingRecord;
+        // Accumulate the CURRENT findings of BOTH gates so the executor can
+        // resolve every remaining contradiction in one converge iteration AND
+        // the refreshed marker carries the full present set. An `Errored` from
+        // either gate fails closed (the revision was NOT verified).
+        let mut records: Vec<ContradictionFindingRecord> = Vec::new();
+        let mut summaries: Vec<String> = Vec::new();
+
         // `[in]` gate.
         if let Some(ctx) = &self.in_ctx {
             match change_contradiction::run_agentic_contradiction_check(ctx, workspace, change_slug)
@@ -441,7 +622,7 @@ impl ReGateRunner for GatesReGateRunner {
             {
                 ContradictionCheckOutcome::Clean => {}
                 ContradictionCheckOutcome::Found(findings) => {
-                    return ReGateOutcome::Contradiction(format!(
+                    summaries.push(format!(
                         "[in] gate still finds {} change-internal contradiction(s): {}",
                         findings.len(),
                         findings
@@ -450,6 +631,7 @@ impl ReGateRunner for GatesReGateRunner {
                             .collect::<Vec<_>>()
                             .join("; ")
                     ));
+                    records.extend(findings.iter().map(ContradictionFindingRecord::from));
                 }
                 ContradictionCheckOutcome::Errored { cause } => {
                     return ReGateOutcome::CouldNotRun(format!("[in] gate could not run: {cause}"));
@@ -471,7 +653,7 @@ impl ReGateRunner for GatesReGateRunner {
             {
                 CanonContradictionCheckOutcome::Clean => {}
                 CanonContradictionCheckOutcome::Found(findings) => {
-                    return ReGateOutcome::Contradiction(format!(
+                    summaries.push(format!(
                         "[canon] gate still finds {} change-vs-canon contradiction(s): {}",
                         findings.len(),
                         findings
@@ -480,6 +662,7 @@ impl ReGateRunner for GatesReGateRunner {
                             .collect::<Vec<_>>()
                             .join("; ")
                     ));
+                    records.extend(findings.iter().map(ContradictionFindingRecord::from));
                 }
                 CanonContradictionCheckOutcome::Errored { cause } => {
                     return ReGateOutcome::CouldNotRun(format!(
@@ -488,9 +671,16 @@ impl ReGateRunner for GatesReGateRunner {
                 }
             }
         }
-        // No `[canon]` ctx → the `[in]` gate alone passed. a03 reuses a02's
+        // No `[canon]` ctx → only the `[in]` gate ran. a03 reuses a02's
         // invocation: if `[canon]` is disabled there is nothing more to check.
-        ReGateOutcome::Clean
+        if records.is_empty() {
+            ReGateOutcome::Clean
+        } else {
+            ReGateOutcome::Contradiction {
+                findings: records,
+                text: summaries.join("\n"),
+            }
+        }
     }
 }
 
@@ -710,25 +900,22 @@ pub async fn process_pending_revision_execute(
         }
     };
     let canon_ctx = canon_contradiction::current();
-    // The discussed direction lives in the thread; re-fetch it so the edit
-    // session is grounded in the conversation (best-effort).
-    let transcript = match chatops_ctx {
-        Some(ctx) => match ctx
-            .chatops
-            .fetch_thread_transcript(&request.channel, &request.thread_ts)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    change = %request.change_slug,
-                    "revision-execute: transcript fetch failed (degrading to transcript-less): {e:#}"
-                );
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
+    // The discussed direction lives in the thread; re-fetch it with a bounded
+    // retry so a transient failure does not derail the revision. NEVER REVISE
+    // BLIND (task 5): on a PERSISTENT failure the executor opens NO PR and
+    // reports it could not read the discussion, instead of silently revising
+    // against an empty thread. A revision without a chat backend at all is also
+    // refused — there is no direction to ground it.
+    let Some(ctx) = chatops_ctx else {
+        // No chat backend → no thread to read, AND nowhere to report. Refuse to
+        // revise blind rather than running against an empty discussion.
+        tracing::warn!(
+            change = %request.change_slug,
+            "revision-execute: no chat backend; cannot read the discussion thread — not revising blind"
+        );
+        return Ok(());
     };
+    let fetcher = ChatOpsTranscriptFetcher { ctx };
     let edit = CliEditRunner {
         command: in_ctx.command.clone(),
         model: &in_ctx.model,
@@ -744,15 +931,75 @@ pub async fn process_pending_revision_execute(
         regate: &regate,
         pr: &pr,
     };
-    run_revision_execute(
+    execute_with_deps(
         &deps,
+        &fetcher,
         workspace,
         repo,
         github_cfg,
-        chatops_ctx,
+        ctx,
+        request,
+        in_ctx.revision_transcript_fetch_retries,
+        in_ctx.revision_converge_attempts,
+        &state_root,
+    )
+    .await
+}
+
+/// Fetch the thread transcript with a bounded retry, then run the revision
+/// (orchestration shared by production AND tests). NEVER REVISES BLIND (task
+/// 5): on a PERSISTENT fetch failure the executor opens NO PR AND reports it
+/// could not read the discussion, instead of degrading to an empty thread.
+/// Extracted so the transcript-retry + fail-closed behavior is exercised with
+/// an injected [`TranscriptFetcher`] + [`ExecutorDeps`] without a real chatops
+/// backend, a CLI subprocess, or GitHub.
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_deps(
+    deps: &ExecutorDeps<'_>,
+    fetcher: &dyn TranscriptFetcher,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    ctx: &ChatOpsContext,
+    request: &RevisionExecuteRequest,
+    transcript_fetch_retries: u32,
+    converge_attempts: u32,
+    state_root: &Path,
+) -> Result<()> {
+    let transcript = match fetch_transcript_bounded(
+        fetcher,
+        &request.channel,
+        &request.thread_ts,
+        transcript_fetch_retries,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                change = %request.change_slug,
+                "revision-execute: transcript fetch failed after bounded retry — not revising blind (no PR): {e:#}"
+            );
+            post_reply(
+                Some(ctx),
+                &request.channel,
+                &request.thread_ts,
+                "✗ send it: could not read the discussion thread — not revising blind. No PR opened; `send it` again in a moment.",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    run_revision_execute(
+        deps,
+        workspace,
+        repo,
+        github_cfg,
+        Some(ctx),
         request,
         &transcript,
-        &state_root,
+        converge_attempts,
+        state_root,
     )
     .await
 }
@@ -760,7 +1007,12 @@ pub async fn process_pending_revision_execute(
 /// Orchestration shared by production AND tests. Recreates the revision
 /// branch, runs the edit session, enforces the scope guardrails, re-gates,
 /// AND either opens a PR (clean) or reports back (contradiction / could-not-
-/// run). Always restores the base-branch checkout on exit.
+/// run). May converge across a bounded number of edit→re-gate attempts within
+/// one `send it` (`converge_attempts` ADDITIONAL passes beyond the first),
+/// accumulating fixes on the same revision branch; refreshes the durable
+/// marker with each re-gate's current findings; AND escalates by naming a
+/// finding identity that survives the bound. Always restores the base-branch
+/// checkout on exit.
 #[allow(clippy::too_many_arguments)]
 async fn run_revision_execute(
     deps: &ExecutorDeps<'_>,
@@ -770,6 +1022,7 @@ async fn run_revision_execute(
     chatops_ctx: Option<&ChatOpsContext>,
     request: &RevisionExecuteRequest,
     transcript: &[ThreadMessage],
+    converge_attempts: u32,
     state_root: &Path,
 ) -> Result<()> {
     let change_slug = &request.change_slug;
@@ -804,98 +1057,162 @@ async fn run_revision_execute(
         return Ok(());
     }
 
-    // Edit the change's spec deltas along the discussed direction.
-    let prompt = build_executor_prompt(workspace, change_slug, transcript);
-    if let Err(e) = deps.edit.revise(workspace, &prompt).await {
-        restore_base(workspace, repo);
-        post_reply(
-            chatops_ctx,
-            &request.channel,
-            &request.thread_ts,
-            &format!("✗ send it: the revision session failed: {e}"),
-        )
-        .await;
-        return Ok(());
-    }
+    // Bounded converge loop within one `send it` (task 6): up to
+    // `converge_attempts` ADDITIONAL edit→scope-check→re-gate passes beyond the
+    // first, accumulating fixes on the SAME revision branch so a change with
+    // multiple contradictions is resolved in one trigger. Each edit re-reads
+    // the change's spec deltas as they now stand, AND its prompt enumerates the
+    // marker's CURRENT findings (refreshed below). The loop ends on a clean
+    // re-gate (→ PR), or on a terminal condition (edit failure, scope
+    // violation, gate could-not-run, OR the budget exhausted with a
+    // contradiction remaining).
+    let max_iterations = converge_attempts.saturating_add(1);
+    // Identities seen on the PRIOR re-gate, used to detect a finding that
+    // SURVIVES an attempt (escalation, task 6.3) — keyed on structured
+    // identity, never on message text.
+    let mut prev_identities: Vec<crate::spec_revision::ContradictionIdentity> = Vec::new();
+    for iteration in 0..max_iterations {
+        let remaining = max_iterations - iteration - 1;
 
-    // Scope + guardrail enforcement.
-    let entries = match git::status_entries(workspace) {
-        Ok(e) => e,
-        Err(e) => {
+        // Edit the change's spec deltas along the discussed direction (the
+        // prompt also enumerates the marker's current findings to resolve).
+        let prompt = build_executor_prompt(workspace, change_slug, transcript);
+        if let Err(e) = deps.edit.revise(workspace, &prompt).await {
             restore_base(workspace, repo);
             post_reply(
                 chatops_ctx,
                 &request.channel,
                 &request.thread_ts,
-                &format!("✗ send it: could not read the revision's git status: {e}"),
+                &format!("✗ send it: the revision session failed: {e}"),
             )
             .await;
             return Ok(());
         }
-    };
-    let (leaked, tasks_edited) = classify_revision_changes(&entries, change_slug);
-    if !leaked.is_empty() || tasks_edited {
-        restore_base(workspace, repo);
-        let mut why = Vec::new();
-        if !leaked.is_empty() {
-            why.push(format!("wrote outside the change directory: {}", leaked.join(", ")));
-        }
-        if tasks_edited {
-            why.push("edited tasks.md (not allowed — the revision touches spec deltas only)".to_string());
-        }
-        post_reply(
-            chatops_ctx,
-            &request.channel,
-            &request.thread_ts,
-            &format!(
-                "✗ send it: the revision session violated its scope and was discarded ({}). No PR opened.",
-                why.join("; ")
-            ),
-        )
-        .await;
-        return Ok(());
-    }
-    if !has_in_scope_edit(&entries, change_slug) {
-        restore_base(workspace, repo);
-        post_reply(
-            chatops_ctx,
-            &request.channel,
-            &request.thread_ts,
-            &format!("✗ send it: the revision session made no spec-delta edits for `{change_slug}`. Reply to discuss the direction, then `send it` again."),
-        )
-        .await;
-        return Ok(());
-    }
 
-    // Re-gate BEFORE opening the PR (design D5): an operator-directed revision
-    // cannot itself ship a new contradiction.
-    match deps.regate.regate(workspace, change_slug).await {
-        ReGateOutcome::Clean => {}
-        ReGateOutcome::Contradiction(text) => {
+        // Scope + guardrail enforcement.
+        let entries = match git::status_entries(workspace) {
+            Ok(e) => e,
+            Err(e) => {
+                restore_base(workspace, repo);
+                post_reply(
+                    chatops_ctx,
+                    &request.channel,
+                    &request.thread_ts,
+                    &format!("✗ send it: could not read the revision's git status: {e}"),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        let (leaked, tasks_edited) = classify_revision_changes(&entries, change_slug);
+        if !leaked.is_empty() || tasks_edited {
             restore_base(workspace, repo);
+            let mut why = Vec::new();
+            if !leaked.is_empty() {
+                why.push(format!("wrote outside the change directory: {}", leaked.join(", ")));
+            }
+            if tasks_edited {
+                why.push("edited tasks.md (not allowed — the revision touches spec deltas only)".to_string());
+            }
             post_reply(
                 chatops_ctx,
                 &request.channel,
                 &request.thread_ts,
                 &format!(
-                    "✗ send it: the revision still fails the gates — no PR opened.\n{text}\nReply to discuss further, then `send it` again."
+                    "✗ send it: the revision session violated its scope and was discarded ({}). No PR opened.",
+                    why.join("; ")
                 ),
             )
             .await;
             return Ok(());
         }
-        ReGateOutcome::CouldNotRun(cause) => {
+        if !has_in_scope_edit(&entries, change_slug) {
             restore_base(workspace, repo);
             post_reply(
                 chatops_ctx,
                 &request.channel,
                 &request.thread_ts,
-                &format!(
-                    "✗ send it: could not verify the revision (gate held) — no PR opened.\n{cause}"
-                ),
+                &format!("✗ send it: the revision session made no spec-delta edits for `{change_slug}`. Reply to discuss the direction, then `send it` again."),
             )
             .await;
             return Ok(());
+        }
+
+        // Re-gate BEFORE opening the PR (design D5): an operator-directed
+        // revision cannot itself ship a new contradiction.
+        match deps.regate.regate(workspace, change_slug).await {
+            ReGateOutcome::Clean => break,
+            ReGateOutcome::Contradiction { findings, text } => {
+                // Refresh the durable marker with the CURRENT findings,
+                // replacing the prior set, so the next edit (this loop) AND a
+                // future `send it` are grounded in the present contradiction
+                // (task 3). Best-effort: a write failure is logged AND never
+                // changes the revision outcome. The marker is gitignored
+                // untracked state and survives `restore_base`, so the refresh
+                // persists for the next `send it`.
+                if let Err(e) = crate::spec_revision::refresh_marker_contradictions(
+                    workspace,
+                    change_slug,
+                    &findings,
+                ) {
+                    tracing::warn!(
+                        change = %change_slug,
+                        "revision-execute: refreshing the marker's contradiction set failed (continuing): {e:#}"
+                    );
+                }
+
+                // Identities that SURVIVED this attempt (present now AND on the
+                // prior re-gate) — the escalation set (task 6.3).
+                let current_identities: Vec<crate::spec_revision::ContradictionIdentity> =
+                    findings.iter().map(|f| f.identity()).collect();
+                let survivors: Vec<&crate::spec_revision::ContradictionFindingRecord> = findings
+                    .iter()
+                    .filter(|f| prev_identities.contains(&f.identity()))
+                    .collect();
+
+                if remaining == 0 {
+                    // Budget exhausted with a contradiction remaining → restore
+                    // base AND report. When a finding identity survived the
+                    // bounded attempts, NAME it specifically (escalation)
+                    // rather than an identical generic "still fails" line.
+                    restore_base(workspace, repo);
+                    let body = if !survivors.is_empty() {
+                        format!(
+                            "✗ send it: the revision is NOT clearing {} contradiction(s) that survived {} attempt(s) — no PR opened.\n{}\nThis is a persistent non-convergence; discuss the direction further, then `send it` again.",
+                            survivors.len(),
+                            max_iterations,
+                            render_surviving_findings(&survivors),
+                        )
+                    } else {
+                        format!(
+                            "✗ send it: the revision still fails the gates after {} attempt(s) — no PR opened.\n{text}\nReply to discuss further, then `send it` again.",
+                            max_iterations,
+                        )
+                    };
+                    post_reply(chatops_ctx, &request.channel, &request.thread_ts, &body).await;
+                    return Ok(());
+                }
+
+                // Budget remains → re-edit + re-gate again on the SAME branch
+                // (the refreshed marker now grounds the next edit).
+                prev_identities = current_identities;
+                continue;
+            }
+            ReGateOutcome::CouldNotRun(cause) => {
+                // A gate that could not run is TERMINAL (the revision was not
+                // verified) — no converge retry would change that.
+                restore_base(workspace, repo);
+                post_reply(
+                    chatops_ctx,
+                    &request.channel,
+                    &request.thread_ts,
+                    &format!(
+                        "✗ send it: could not verify the revision (gate held) — no PR opened.\n{cause}"
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
         }
     }
 
@@ -1207,7 +1524,7 @@ mod tests {
             answer: "I recommend aligning to canon's term.".into(),
             seen_prompt: Mutex::new(None),
         };
-        advise_with_runner(ws, &ctx, &req, &[], &runner).await.unwrap();
+        advise_with_runner(ws, &ctx, &req, &[], false, &runner).await.unwrap();
         let replies = chat.replies.lock().unwrap();
         assert_eq!(replies.len(), 1);
         assert!(replies[0].contains("aligning to canon"), "{}", replies[0]);
@@ -1241,7 +1558,7 @@ mod tests {
             answer: "second answer".into(),
             seen_prompt: Mutex::new(None),
         };
-        advise_with_runner(ws, &ctx, &req, &transcript, &runner)
+        advise_with_runner(ws, &ctx, &req, &transcript, false, &runner)
             .await
             .unwrap();
         let seen = runner.seen_prompt.lock().unwrap().clone().unwrap();
@@ -1282,6 +1599,10 @@ mod tests {
         );
         run_git(&ws, &["add", "-A"]);
         run_git(&ws, &["commit", "-q", "-m", "seed change"]);
+        // Mirror production: the marker is registered in .git/info/exclude at
+        // workspace init, so `git clean -fd` (in restore_base) does NOT delete
+        // it — the refresh persists for the next `send it`.
+        crate::workspace::ensure_git_info_excluded(&ws, ".needs-spec-revision.json").unwrap();
         // The contradiction marker is written post-commit (untracked).
         write(
             &ws.join(format!(
@@ -1349,6 +1670,79 @@ mod tests {
         ) -> Result<String> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.url.clone())
+        }
+    }
+
+    /// Edit runner that performs a real in-scope spec-delta edit each call,
+    /// records every prompt it receives, AND counts invocations. Lets the
+    /// converge + resolve-all tests assert the data flow (how many edits ran,
+    /// what the edit was grounded in) without a CLI.
+    struct RecordingEdit {
+        prompts: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl EditSessionRunner for RecordingEdit {
+        async fn revise(&self, ws: &Path, prompt: &str) -> Result<()> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            // A real in-scope edit so the scope/has-edit guards pass; the body
+            // varies per call so successive edits are distinct git states.
+            let n = self.prompts.lock().unwrap().len();
+            std::fs::write(
+                ws.join("openspec/changes/c1/specs/cap/spec.md"),
+                format!("## ADDED Requirements\n\n### Requirement: A\nRevision pass {n}.\n"),
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    /// Re-gate runner that plays back a SCRIPTED sequence of outcomes (one per
+    /// call); the last entry repeats once the script is exhausted. Drives the
+    /// converge-loop + escalation tests.
+    struct ScriptedReGate {
+        script: Vec<ReGateOutcome>,
+        calls: std::sync::Arc<Mutex<usize>>,
+    }
+    #[async_trait]
+    impl ReGateRunner for ScriptedReGate {
+        async fn regate(&self, _ws: &Path, _slug: &str) -> ReGateOutcome {
+            let mut g = self.calls.lock().unwrap();
+            let idx = (*g).min(self.script.len() - 1);
+            *g += 1;
+            self.script[idx].clone()
+        }
+    }
+
+    /// Transcript fetcher that fails its first `fail_count` calls, then returns
+    /// `messages`; counts calls. `fail_count == u32::MAX` fails every attempt.
+    struct ScriptedTranscriptFetcher {
+        fail_count: u32,
+        messages: Vec<ThreadMessage>,
+        calls: std::sync::Arc<Mutex<u32>>,
+    }
+    #[async_trait]
+    impl TranscriptFetcher for ScriptedTranscriptFetcher {
+        async fn fetch(&self, _channel: &str, _thread_ts: &str) -> Result<Vec<ThreadMessage>> {
+            let mut g = self.calls.lock().unwrap();
+            let n = *g;
+            *g += 1;
+            if n < self.fail_count {
+                Err(anyhow!("simulated transcript fetch failure (attempt {n})"))
+            } else {
+                Ok(self.messages.clone())
+            }
+        }
+    }
+
+    /// A `[canon]` finding record for the converge/escalation tests.
+    fn canon_record(a: &str, b: &str, cap: &str) -> crate::spec_revision::ContradictionFindingRecord {
+        crate::spec_revision::ContradictionFindingRecord {
+            gate: crate::spec_revision::ContradictionGate::Canon,
+            requirement_a: a.into(),
+            requirement_b: b.into(),
+            canonical_capability: cap.into(),
+            summary: format!("{a} conflicts with {b}"),
+            suggested_fix: String::new(),
         }
     }
 
@@ -1434,6 +1828,7 @@ mod tests {
             Some(&ctx),
             &execute_request("9.9"),
             &[],
+             0,
             state_dir.path(),
         )
         .await
@@ -1468,7 +1863,17 @@ mod tests {
             edit: &EditSpec {
                 body: "## ADDED Requirements\n\n### Requirement: A\nStill conflicting.\n".into(),
             },
-            regate: &CannedReGate(ReGateOutcome::Contradiction("A still conflicts with canon B".into())),
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![crate::spec_revision::ContradictionFindingRecord {
+                    gate: crate::spec_revision::ContradictionGate::Canon,
+                    requirement_a: "A".into(),
+                    requirement_b: "canon B".into(),
+                    canonical_capability: "cap".into(),
+                    summary: "A still conflicts with canon B".into(),
+                    suggested_fix: String::new(),
+                }],
+                text: "A still conflicts with canon B".into(),
+            }),
             pr: &FakePr {
                 url: "https://example/pr/x".into(),
                 calls: calls.clone(),
@@ -1482,6 +1887,7 @@ mod tests {
             Some(&ctx),
             &execute_request("9.9"),
             &[],
+             0,
             state_dir.path(),
         )
         .await
@@ -1523,6 +1929,7 @@ mod tests {
             Some(&ctx),
             &execute_request("9.9"),
             &[],
+             0,
             state_dir.path(),
         )
         .await
@@ -1559,6 +1966,7 @@ mod tests {
             Some(&ctx),
             &execute_request("9.9"),
             &[],
+             0,
             state_dir.path(),
         )
         .await
@@ -1607,6 +2015,7 @@ mod tests {
             Some(&ctx),
             &execute_request("9.9"),
             &[],
+             0,
             state_dir.path(),
         )
         .await
@@ -1614,5 +2023,375 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0, "an acted thread does not re-run");
         let replies = chat.replies.lock().unwrap();
         assert!(replies.iter().any(|r| r.contains("already been opened")), "{replies:?}");
+    }
+
+    // ---------- fail-closed transcript (task 5) ----------
+
+    /// A transcript fetch that fails EVERY attempt → the edit session is NOT
+    /// invoked, NO PR is opened, AND a thread reply is posted (fail-closed; the
+    /// executor never revises blind).
+    #[tokio::test]
+    async fn execute_fail_closed_transcript_skips_edit_and_pr() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        let fetcher = ScriptedTranscriptFetcher {
+            fail_count: u32::MAX, // fail every attempt
+            messages: Vec::new(),
+            calls: std::sync::Arc::new(Mutex::new(0)),
+        };
+        execute_with_deps(
+            &deps,
+            &fetcher,
+            &ws,
+            &repo,
+            &gh,
+            &ctx,
+            &execute_request("9.9"),
+            2, // transcript_fetch_retries
+            0,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            edit_prompts.lock().unwrap().is_empty(),
+            "the edit session must NOT run when the thread cannot be read"
+        );
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR when revising blind is refused");
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("could not read the discussion")),
+            "must report it could not read the thread: {replies:?}"
+        );
+    }
+
+    /// A transcript fetch that FAILS then SUCCEEDS within the retry budget → the
+    /// revision proceeds (the edit session runs, the clean re-gate opens a PR).
+    #[tokio::test]
+    async fn execute_transcript_fail_then_succeed_proceeds() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr { url: "https://example/pr/ok".into(), calls: pr_calls.clone() },
+        };
+        let fetcher = ScriptedTranscriptFetcher {
+            fail_count: 1, // fail attempt 0, succeed attempt 1
+            messages: vec![msg(false, "align to canon")],
+            calls: std::sync::Arc::new(Mutex::new(0)),
+        };
+        execute_with_deps(
+            &deps,
+            &fetcher,
+            &ws,
+            &repo,
+            &gh,
+            &ctx,
+            &execute_request("9.9"),
+            2, // transcript_fetch_retries (>= the one failure)
+            0,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            edit_prompts.lock().unwrap().len(),
+            1,
+            "the revision proceeds once the transcript loads on retry"
+        );
+        assert_eq!(*pr_calls.lock().unwrap(), 1, "a clean re-gate opens the PR");
+    }
+
+    // ---------- resolve-all grounding (task 4) ----------
+
+    /// A marker recording TWO structured findings grounds the edit session in
+    /// BOTH (the prompt enumerates each finding identity to resolve). Asserts
+    /// the data flow — both identities reach the session — not prose wording.
+    #[tokio::test]
+    async fn executor_grounds_edit_in_all_marker_findings() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Overwrite the fixture marker with TWO structured contradictions.
+        crate::spec_revision::refresh_marker_contradictions(
+            &ws,
+            "c1",
+            &[
+                canon_record("change-req-ONE", "canon-req-ONE", "alpha"),
+                canon_record("change-req-TWO", "canon-req-TWO", "beta"),
+            ],
+        )
+        .unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr { url: "https://example/pr/2".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        let prompts = edit_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "one edit pass");
+        // BOTH finding identities were threaded to the edit session.
+        assert!(prompts[0].contains("change-req-ONE"), "first finding must reach the session: {}", prompts[0]);
+        assert!(prompts[0].contains("canon-req-ONE"), "{}", prompts[0]);
+        assert!(prompts[0].contains("change-req-TWO"), "second finding must reach the session: {}", prompts[0]);
+        assert!(prompts[0].contains("canon-req-TWO"), "{}", prompts[0]);
+    }
+
+    // ---------- converge loop + marker refresh (tasks 3 + 6) ----------
+
+    /// A re-gate that returns Contradiction THEN Clean opens a PR within ONE
+    /// `send it`: the edit runner is called twice, the PR is opened once, with
+    /// no second operator trigger. `revision_converge_attempts >= 1`.
+    #[tokio::test]
+    async fn converge_contradiction_then_clean_opens_pr_in_one_send_it() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let regate_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &ScriptedReGate {
+                script: vec![
+                    ReGateOutcome::Contradiction {
+                        findings: vec![canon_record("A", "canon-A", "cap")],
+                        text: "still conflicting".into(),
+                    },
+                    ReGateOutcome::Clean,
+                ],
+                calls: regate_calls.clone(),
+            },
+            pr: &FakePr { url: "https://example/pr/converge".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            2, // converge_attempts → up to 3 passes
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(edit_prompts.lock().unwrap().len(), 2, "edit ran twice (re-edit on contradiction)");
+        assert_eq!(*regate_calls.lock().unwrap(), 2, "re-gated twice");
+        assert_eq!(*pr_calls.lock().unwrap(), 1, "the clean re-gate opens the PR in one send it");
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("https://example/pr/converge")),
+            "the PR link is reported: {replies:?}"
+        );
+    }
+
+    /// With `revision_converge_attempts: 0` (single-pass), the first re-gate
+    /// contradiction reports back as today — no re-edit, no PR.
+    #[tokio::test]
+    async fn converge_zero_reports_first_contradiction() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let regate_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &ScriptedReGate {
+                script: vec![ReGateOutcome::Contradiction {
+                    findings: vec![canon_record("A", "canon-A", "cap")],
+                    text: "still conflicting".into(),
+                }],
+                calls: regate_calls.clone(),
+            },
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0, // single-pass
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(edit_prompts.lock().unwrap().len(), 1, "single-pass: edit ran once");
+        assert_eq!(*regate_calls.lock().unwrap(), 1, "single-pass: re-gated once");
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR on the first contradiction");
+        let replies = chat.replies.lock().unwrap();
+        assert!(replies.iter().any(|r| r.contains("no PR opened")), "{replies:?}");
+    }
+
+    /// A re-gate Contradiction refreshes the durable marker with the CURRENT
+    /// findings, REPLACING the prior set (task 3). The fixture marker carries a
+    /// stale prior set; after a single-pass contradiction the marker records the
+    /// NEW finding. Asserts the marker's structured findings, not wording.
+    #[tokio::test]
+    async fn regate_contradiction_refreshes_marker_with_current_findings() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Seed the marker with a STALE prior contradiction.
+        crate::spec_revision::refresh_marker_contradictions(
+            &ws,
+            "c1",
+            &[canon_record("STALE-change", "STALE-canon", "old-cap")],
+        )
+        .unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("NEW-change", "NEW-canon", "new-cap")],
+                text: "the current contradiction".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        let marker = crate::spec_revision::read_marker(&ws, "c1").unwrap().unwrap();
+        assert_eq!(marker.contradictions.len(), 1, "the set is replaced, not appended");
+        assert_eq!(marker.contradictions[0].requirement_a, "NEW-change");
+        assert_eq!(marker.contradictions[0].requirement_b, "NEW-canon");
+    }
+
+    // ---------- escalation (task 6.3) ----------
+
+    /// The SAME finding identity surviving the bounded attempts produces an
+    /// exhaustion report that NAMES that finding's identity (the conflicting
+    /// requirements), not an identical generic "still fails" line. Asserts the
+    /// reported identity, not prose wording.
+    #[tokio::test]
+    async fn escalation_names_surviving_finding_identity() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let regate_calls = std::sync::Arc::new(Mutex::new(0));
+        // The SAME finding identity every re-gate (only the summary phrasing
+        // differs), so it survives the bounded attempts.
+        let mut stuck_then = canon_record("STUCK-change", "STUCK-canon", "stuck-cap");
+        stuck_then.summary = "phrasing changes but identity is the same".into();
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &ScriptedReGate {
+                script: vec![
+                    ReGateOutcome::Contradiction {
+                        findings: vec![canon_record("STUCK-change", "STUCK-canon", "stuck-cap")],
+                        text: "still fails".into(),
+                    },
+                    ReGateOutcome::Contradiction {
+                        findings: vec![stuck_then],
+                        text: "still fails".into(),
+                    },
+                ],
+                calls: regate_calls.clone(),
+            },
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            1, // one additional attempt → 2 passes, both contradict the same identity
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR when the contradiction persists");
+        let replies = chat.replies.lock().unwrap();
+        // The escalation NAMES the surviving requirement identity.
+        assert!(
+            replies.iter().any(|r| r.contains("STUCK-change") && r.contains("STUCK-canon")),
+            "the escalation must name the stuck requirement identity: {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("not clearing") || r.contains("persistent")),
+            "the escalation must say the revision is not clearing it: {replies:?}"
+        );
     }
 }

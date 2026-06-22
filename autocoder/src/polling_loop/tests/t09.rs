@@ -64,7 +64,9 @@ async fn contradiction_preflight_no_submission_holds_fail_closed() {
 
 /// Sanity test for the marker's `revision_suggestion` text shape —
 /// uses the public `build_contradiction_revision_suggestion` helper
-/// directly.
+/// directly. Asserts every finding (and its labeled suggested fix, when
+/// present) reaches the marker, and that an absent suggested fix degrades
+/// gracefully to identity + summary.
 #[test]
 fn revision_suggestion_text_enumerates_findings() {
     let findings = vec![
@@ -72,11 +74,14 @@ fn revision_suggestion_text_enumerates_findings() {
             requirement_a: "A1".into(),
             requirement_b: "B1".into(),
             summary: "S1".into(),
+            suggested_fix: "FIX1".into(),
         },
         crate::preflight::change_contradiction::ContradictionFinding {
             requirement_a: "A2".into(),
             requirement_b: "B2".into(),
             summary: "S2".into(),
+            // No suggested fix — must still render identity + summary.
+            suggested_fix: String::new(),
         },
     ];
     let text = build_contradiction_revision_suggestion(&findings);
@@ -87,6 +92,14 @@ fn revision_suggestion_text_enumerates_findings() {
     assert!(text.contains("2. Requirement A: A2"));
     assert!(text.contains("   Requirement B: B2"));
     assert!(text.contains("   S2"));
+    // The non-empty suggested fix is rendered on its own labeled line, distinct
+    // from the summary; the empty one is omitted (no bare label, no error).
+    assert!(text.contains("Suggested fix: FIX1"));
+    assert_eq!(
+        text.matches("Suggested fix:").count(),
+        1,
+        "exactly one suggested-fix line — the empty one renders nothing: {text}"
+    );
     assert!(text.contains("clear-revision"));
 }
 
@@ -326,7 +339,9 @@ async fn canon_preflight_no_submission_holds_fail_closed() {
 
 /// Sanity test for the `[canon]` gate marker's `revision_suggestion` text
 /// shape — uses the `build_canon_contradiction_revision_suggestion` helper
-/// directly. Each finding names the conflicting canonical requirement.
+/// directly. Each finding names the conflicting canonical requirement; the
+/// labeled suggested fix is rendered when present and gracefully omitted when
+/// absent.
 #[test]
 fn canon_revision_suggestion_text_enumerates_findings() {
     let findings = vec![
@@ -335,12 +350,15 @@ fn canon_revision_suggestion_text_enumerates_findings() {
             canonical_capability: "cap1".into(),
             canonical_requirement: "Canon1".into(),
             summary: "S1".into(),
+            suggested_fix: "FIX1".into(),
         },
         crate::preflight::canon_contradiction::CanonContradictionFinding {
             change_requirement: "CR2".into(),
             canonical_capability: "cap2".into(),
             canonical_requirement: "Canon2".into(),
             summary: "S2".into(),
+            // No suggested fix — must still render identity + summary.
+            suggested_fix: String::new(),
         },
     ];
     let text = build_canon_contradiction_revision_suggestion(&findings);
@@ -351,6 +369,14 @@ fn canon_revision_suggestion_text_enumerates_findings() {
     assert!(text.contains("2. Change requirement: CR2"));
     assert!(text.contains("Conflicting canonical requirement: Canon2 (capability: cap2)"));
     assert!(text.contains("   S2"));
+    // The non-empty suggested fix is rendered on its own labeled line, distinct
+    // from the summary; the empty one is omitted (no bare label, no error).
+    assert!(text.contains("Suggested fix: FIX1"));
+    assert_eq!(
+        text.matches("Suggested fix:").count(),
+        1,
+        "exactly one suggested-fix line — the empty one renders nothing: {text}"
+    );
     assert!(text.contains("clear-revision"));
 }
 
