@@ -1056,7 +1056,7 @@ fn submit_review_tool() -> serde_json::Value {
 fn submit_contradictions_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "submit_contradictions",
-        "description": "Return the change-internal contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Each entry names the two conflicting requirements AND a one-line summary of why they cannot both hold simultaneously. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "description": "Return the change-internal contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Report EVERY distinct contradiction in this one call — do not stop after the first. Each entry names the two conflicting requirements, a one-line `summary` of why they cannot both hold, AND a `suggested_fix` — a concrete edit plan (which requirement(s) to add/modify/rename/remove, with a sketch of the resulting text) distinct from the summary. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1067,7 +1067,8 @@ fn submit_contradictions_tool() -> serde_json::Value {
                         "properties": {
                             "requirement_a": { "type": "string" },
                             "requirement_b": { "type": "string" },
-                            "summary": { "type": "string" }
+                            "summary": { "type": "string" },
+                            "suggested_fix": { "type": "string" }
                         },
                         "required": ["requirement_a", "requirement_b", "summary"]
                     }
@@ -1089,7 +1090,7 @@ fn submit_contradictions_tool() -> serde_json::Value {
 fn submit_canon_contradictions_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "submit_canon_contradictions",
-        "description": "Return the change-vs-canonical contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Each entry names the requirement IN THIS CHANGE (`change_requirement`), the canonical capability slug AND requirement title it conflicts with (`canonical_capability`, `canonical_requirement`), AND a one-line `summary` of why the two cannot both hold. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "description": "Return the change-vs-canonical contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Report EVERY distinct contradiction in this one call — including the case where one change requirement conflicts with more than one canonical requirement, possibly across more than one capability — do not stop after the first. Each entry names the requirement IN THIS CHANGE (`change_requirement`), the canonical capability slug AND requirement title it conflicts with (`canonical_capability`, `canonical_requirement`), a one-line `summary` of why the two cannot both hold, AND a `suggested_fix` — a concrete edit plan (which requirement(s) to add/modify/rename/remove, with a sketch of the resulting text) distinct from the summary. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1101,7 +1102,8 @@ fn submit_canon_contradictions_tool() -> serde_json::Value {
                             "change_requirement": { "type": "string" },
                             "canonical_capability": { "type": "string" },
                             "canonical_requirement": { "type": "string" },
-                            "summary": { "type": "string" }
+                            "summary": { "type": "string" },
+                            "suggested_fix": { "type": "string" }
                         },
                         "required": ["change_requirement", "canonical_capability", "canonical_requirement", "summary"]
                     }

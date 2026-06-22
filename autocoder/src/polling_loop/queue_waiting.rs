@@ -311,6 +311,7 @@ async fn resume_spec_needs_revision(
         unarchivable_deltas: Vec::new(),
         revision_suggestion: revision_suggestion.clone(),
         gate_error: None,
+        contradictions: Vec::new(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(

@@ -593,6 +593,8 @@ pub(crate) fn cc_test_ctx(
         attribution,
         retries: 0,
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
+        revision_transcript_fetch_retries: 0,
+        revision_converge_attempts: 0,
         test_submission: Some(submission),
     }
 }

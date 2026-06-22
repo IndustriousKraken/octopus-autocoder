@@ -20,18 +20,18 @@ and `ControlState` stay reachable at their current paths.
 
 ## Tasks
 
-- [ ] Factor the shared enqueue body out of the `handle_queue_*` handlers
+- [x] Factor the shared enqueue body out of the `handle_queue_*` handlers
   (`handle_queue_proposal_request`, `_changelog_`, `_brownfield_`, `_scout_`,
   `_spec_it_`, `_sync_upstream_`, `_brownfield_survey_`, `_brownfield_batch_`, and
   the matching clear/revision handlers) into one generic helper; each handler then
   supplies only its queue selector and request-record constructor. Re-locate via
   the function NAMES — line numbers have drifted.
-- [ ] Replace the hand-maintained `match action.as_str()` arm list in
+- [x] Replace the hand-maintained `match action.as_str()` arm list in
   `dispatch_request` with a table-driven dispatch (action → handler).
-- [ ] Move the handler bodies behind the table into a submodule (e.g. a
+- [x] Move the handler bodies behind the table into a submodule (e.g. a
   `control_socket/` directory module or `control_socket/handlers.rs`), keeping
   `dispatch_request` and `ControlState` at their current paths.
-- [ ] Verify: `cargo build` and the existing suite pass; control-socket JSON
+- [x] Verify: `cargo build` and the existing suite pass; control-socket JSON
   responses unchanged.
 
 ## Constraints (behavior-preserving refactor)

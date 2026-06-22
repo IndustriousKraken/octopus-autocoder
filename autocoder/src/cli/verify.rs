@@ -282,6 +282,10 @@ fn build_ctxs(cfg: &Config, paths: &crate::paths::DaemonPaths) -> Result<GateCtx
                 attribution: None,
                 retries,
                 timeout,
+                revision_transcript_fetch_retries: cfg
+                    .executor
+                    .revision_transcript_fetch_retries,
+                revision_converge_attempts: cfg.executor.revision_converge_attempts,
                 #[cfg(test)]
                 test_submission: None,
             })
@@ -498,6 +502,8 @@ mod tests {
             attribution: None,
             retries: 0,
             timeout: std::time::Duration::from_secs(3600),
+            revision_transcript_fetch_retries: 0,
+            revision_converge_attempts: 0,
             test_submission: submission,
         }
     }

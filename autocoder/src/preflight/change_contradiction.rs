@@ -102,6 +102,20 @@ pub struct ContradictionCheckCtx {
     /// Set once at daemon startup; the oneshot path had no analogous timeout
     /// (the HTTP client owned it), this bounds the wrapped CLI subprocess.
     pub timeout: Duration,
+    /// Bounded retry of the `@<bot> send it` spec-revision session's thread-
+    /// transcript fetch (`executor.revision_transcript_fetch_retries`). The
+    /// revision sessions reuse THIS ctx (model + command + timeout + retries),
+    /// so this knob rides along: the executor MUST NOT revise against an empty
+    /// discussion, so a persistent fetch failure (after this bound) makes it
+    /// open NO PR and report it could not read the thread; the read-only
+    /// advisor applies the same retry but never aborts. Counts ADDITIONAL
+    /// attempts; `0` is one attempt.
+    pub revision_transcript_fetch_retries: u32,
+    /// Additional in-`send it` edit→re-gate attempts the spec-revision
+    /// executor may make beyond the first (`executor.revision_converge_attempts`),
+    /// accumulating fixes on the same revision branch so a multi-contradiction
+    /// change is resolved in one `send it`. `0` preserves single-pass behavior.
+    pub revision_converge_attempts: u32,
     /// Test-only injected `submit_contradictions` submission, bypassing the
     /// CLI subprocess AND the control socket. `Some(Some(p))` stands in for
     /// a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -174,7 +188,12 @@ pub fn load_prompt_template(override_path: Option<&Path>) -> Result<String> {
 pub struct ContradictionFinding {
     pub requirement_a: String,
     pub requirement_b: String,
+    /// One-line explanation of WHY the two requirements conflict.
     pub summary: String,
+    /// Concrete edit plan — WHAT to change AND HOW — distinct from the
+    /// why-`summary`. Empty when the agent (or an older daemon) omitted it;
+    /// the field is additive, never a parse-or-render precondition.
+    pub suggested_fix: String,
 }
 
 /// One entry as it arrives in the `submit_contradictions` payload.
@@ -183,6 +202,10 @@ struct RawContradiction {
     requirement_a: String,
     requirement_b: String,
     summary: String,
+    /// Optional concrete edit plan. Defaults to empty when the payload omits
+    /// it so an older payload (no `suggested_fix`) still parses (back-compat).
+    #[serde(default)]
+    suggested_fix: String,
 }
 
 /// The `submit_contradictions` payload shape.
@@ -223,6 +246,7 @@ pub(crate) fn payload_to_contradictions(
             requirement_a: c.requirement_a,
             requirement_b: c.requirement_b,
             summary: c.summary,
+            suggested_fix: c.suggested_fix,
         })
         .collect())
 }
@@ -651,6 +675,8 @@ mod tests {
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
+            revision_transcript_fetch_retries: 0,
+            revision_converge_attempts: 0,
             test_submission: None,
         }
     }
@@ -673,6 +699,8 @@ mod tests {
             attribution: None,
             retries: 0,
             timeout: exec.agentic_session_timeout(),
+            revision_transcript_fetch_retries: 0,
+            revision_converge_attempts: 0,
             test_submission: None,
         };
         assert_eq!(ctx.timeout, exec.agentic_session_timeout());
@@ -719,6 +747,40 @@ mod tests {
         assert_eq!(out[0].requirement_a, "A");
         assert_eq!(out[0].requirement_b, "B");
         assert_eq!(out[0].summary, "A and B cannot both hold");
+    }
+
+    /// A payload carrying `suggested_fix` maps the field through to the finding,
+    /// distinct from the why-`summary`.
+    #[test]
+    fn suggested_fix_is_mapped_when_present() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                {
+                    "requirement_a": "A",
+                    "requirement_b": "B",
+                    "summary": "why they conflict",
+                    "suggested_fix": "MODIFY B to drop the conflicting clause"
+                }
+            ]
+        });
+        let out = payload_to_contradictions(&payload).expect("deserializes");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].summary, "why they conflict");
+        assert_eq!(out[0].suggested_fix, "MODIFY B to drop the conflicting clause");
+    }
+
+    /// Back-compat (task 5.3): a payload that OMITS `suggested_fix` still parses,
+    /// with the field defaulting to empty — an older daemon's payload is valid.
+    #[test]
+    fn missing_suggested_fix_defaults_to_empty() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "A", "requirement_b": "B", "summary": "s" }
+            ]
+        });
+        let out = payload_to_contradictions(&payload).expect("legacy payload still parses");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].suggested_fix, "", "absent suggested_fix defaults to empty");
     }
 
     #[test]

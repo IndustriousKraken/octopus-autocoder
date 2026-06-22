@@ -1458,12 +1458,48 @@ pub struct ExecutorConfig {
     /// never fail-open).
     #[serde(default = "default_verifier_gate_retries")]
     pub verifier_gate_retries: u32,
+    /// Bounded retry of the `@<bot> send it` spec-revision session's thread-
+    /// transcript fetch. The transcript carries the operator's chosen
+    /// direction, so a revision MUST NOT run against an empty discussion (it
+    /// would guess, and a wrong guess lands a PR the operator did not want).
+    /// A transient fetch failure is absorbed by this bounded retry; a
+    /// persistent failure makes the executor open NO PR AND report that it
+    /// could not read the discussion (fail-closed on an unreadable thread).
+    /// Counts ADDITIONAL attempts: `2` (the default) is up to 3 total. The
+    /// read-only advisor applies the same retry but never aborts — it answers
+    /// from the degraded thread and says so. `0` is one attempt.
+    #[serde(default = "default_revision_transcript_fetch_retries")]
+    pub revision_transcript_fetch_retries: u32,
+    /// Additional in-`send it` edit→re-gate attempts the spec-revision
+    /// executor may make beyond the first, accumulating fixes on the same
+    /// revision branch so a change with multiple contradictions is resolved in
+    /// ONE `send it` rather than one contradiction per operator trigger. `0`
+    /// (single-pass) preserves the historical behavior: the first re-gate
+    /// contradiction reports back. `2` (the default) is up to 3 total
+    /// edit→re-gate passes. When the SAME conflicting requirement survives the
+    /// bound, the report names that specific requirement (escalation).
+    #[serde(default = "default_revision_converge_attempts")]
+    pub revision_converge_attempts: u32,
 }
 
 /// Default for [`ExecutorConfig::verifier_gate_retries`]: 2 additional
 /// attempts (up to 3 total) per agentic verifier-gate session on a
 /// no-submission outcome.
 pub fn default_verifier_gate_retries() -> u32 {
+    2
+}
+
+/// Default for [`ExecutorConfig::revision_transcript_fetch_retries`]: 2
+/// additional attempts (up to 3 total) to read the revision thread before the
+/// executor fails closed on an unreadable thread.
+pub fn default_revision_transcript_fetch_retries() -> u32 {
+    2
+}
+
+/// Default for [`ExecutorConfig::revision_converge_attempts`]: 2 additional
+/// in-`send it` edit→re-gate passes (up to 3 total) before the executor
+/// restores base AND reports the remaining contradiction.
+pub fn default_revision_converge_attempts() -> u32 {
     2
 }
 
@@ -2112,6 +2148,8 @@ pub fn placeholder_executor_config() -> ExecutorConfig {
         code_implements_spec_check_prompt_path: None,
         code_implements_spec_check_llm: None,
         verifier_gate_retries: default_verifier_gate_retries(),
+        revision_transcript_fetch_retries: default_revision_transcript_fetch_retries(),
+        revision_converge_attempts: default_revision_converge_attempts(),
         implementer: None,
         changelog_stylist: None,
         implementer_revision: None,
@@ -4728,6 +4766,8 @@ github:
             "code_implements_spec_check_prompt_path",
             "code_implements_spec_check_llm",
             "verifier_gate_retries",
+            "revision_transcript_fetch_retries",
+            "revision_converge_attempts",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -4884,6 +4924,40 @@ github:
             exec.agentic_session_timeout(),
             std::time::Duration::from_secs(7200),
             "the configured value is what the single resolver returns"
+        );
+    }
+
+    /// Task 7.6: the two spec-revision knobs default when absent AND parse when
+    /// explicitly set; `revision_converge_attempts: 0` is a valid (single-pass)
+    /// value.
+    #[test]
+    fn revision_knobs_default_when_absent() {
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n")
+            .expect("minimal executor parses with the revision fields omitted");
+        assert_eq!(
+            exec.revision_transcript_fetch_retries,
+            default_revision_transcript_fetch_retries(),
+            "unset transcript-retry field takes the serde default"
+        );
+        assert_eq!(
+            exec.revision_converge_attempts,
+            default_revision_converge_attempts(),
+            "unset converge-attempts field takes the serde default"
+        );
+        assert_eq!(default_revision_transcript_fetch_retries(), 2);
+        assert_eq!(default_revision_converge_attempts(), 2);
+    }
+
+    #[test]
+    fn revision_knobs_parse_explicit_values() {
+        let exec: ExecutorConfig = serde_yml::from_str(
+            "kind: claude_cli\nrevision_transcript_fetch_retries: 4\nrevision_converge_attempts: 0\n",
+        )
+        .expect("explicit revision knobs parse");
+        assert_eq!(exec.revision_transcript_fetch_retries, 4);
+        assert_eq!(
+            exec.revision_converge_attempts, 0,
+            "0 is a valid converge-attempts value (single-pass)"
         );
     }
 

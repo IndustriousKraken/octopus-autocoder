@@ -85,3 +85,26 @@ OpenSpec: implements the deltas in `specs/executor/spec.md`,
   under parallel load — re-run / isolate any failure before treating it as real).
 - [ ] 6.2 `openspec validate executor-outcome-legibility-and-retry --strict` from
   the repo root.
+
+## 7. Reviewer no-submission discard surfaces + persists its output
+
+- [ ] 7.1 In `autocoder/src/code_reviewer.rs`, on the no-submission path where the
+  caller forms `AgenticReviewOutcome::Discarded { reason }`
+  (~`code_reviewer.rs:2057-2075`), include the session's captured output in the
+  reason: assemble the `AgenticRunOutcome`'s `final_answer` (if non-empty) +
+  `stderr` (if non-empty) + exit/signal (when both empty), truncated, raw — reuse
+  `agentic_run::failure_excerpt`. Today `run_session` (`code_reviewer.rs:1429`)
+  returns only the consumed submission and DROPS the outcome — thread the outcome
+  (or the assembled excerpt) out so the discard reason can carry it. A timed-out
+  session keeps its distinct timeout reason (`code_reviewer.rs:1423`).
+- [ ] 7.2 Persist the reviewer session's captured output to a discoverable
+  per-session log under the run-logs directory, mirroring the audit-log pattern
+  (`audits/<type>-<timestamp>.log` → a reviewer equivalent), regardless of outcome.
+  When the surfaced discard reason is truncated, name that log path (as the
+  executor's reason does).
+- [ ] 7.3 Test: a reviewer session that records no submission with non-empty
+  captured output yields a `Discarded` whose reason includes that output
+  (truncated); an empty-output no-submission surfaces the exit/signal; a timeout
+  keeps the timeout reason; a reviewer run writes the per-session log. Assert
+  behavior (the reason carries the captured fields / the log exists), not wording.
+  Drive via the existing reviewer test-runner seam (`run_agentic_review_with_runner`).

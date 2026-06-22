@@ -61,6 +61,29 @@ is merged. A change must not pre-apply its own ADDED delta into
 `openspec/specs/` — doing so makes the archive abort on a duplicate
 requirement.
 
+## Binding contract vs. implementation guidance
+
+The binding contract is the canonical requirements and scenarios under
+`openspec/specs/` — and nothing else. `proposal.md` and `design.md` record the
+why and the how (including which libraries, versions, or approach); they are
+implementation GUIDANCE, not contract.
+
+"Autocoder-owned / immutable" means do NOT EDIT canon or an archived change's
+artifacts — it does NOT freeze the implementation choices those files record. A
+library, version, or approach named in a `proposal.md` or `design.md` (even an
+archived one) MAY be changed in the current code — swap a library, replace a
+deprecated dependency, adjust an approach — to address review feedback or
+maintenance, with NO new change required, as long as no canonical requirement
+changes. Changing a dependency in the current `Cargo.toml` is editing code, not
+rewriting the archive. A reviewer asking to replace a deprecated library is in
+scope for a revision; do it, rather than declining because a design doc named
+the old one.
+
+If a library or approach is genuinely binding (a project-internal component, a
+mandated SDK, a required wire format), that constraint lives in a spec
+requirement, where it IS the contract — it is never inferred from a passing
+mention in a design doc.
+
 ## The gate model (gatekeepers fail closed)
 
 A change passes through gatekeepers before its work lands. Each fails closed —

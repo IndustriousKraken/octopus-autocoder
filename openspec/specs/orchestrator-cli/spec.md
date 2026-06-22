@@ -7803,7 +7803,15 @@ A non-`send it` `@<bot>` reply whose `thread_ts` matches a `RevisionThreadState`
 - **AND** no agent session was held between the two replies
 
 ### Requirement: Send it in a revision thread runs the spec-revision executor
-`@<bot> send it` in a revision thread SHALL run the spec-revision executor: a write-scoped agentic session that edits the flagged change's spec deltas along the direction the thread converged on, then re-runs the `[in]` AND `[canon]` checks against the revised change before producing any output. On a clean re-gate the executor SHALL open a PR carrying the change's spec-delta revision AND report the PR link in the thread; on a re-gate that still finds a contradiction the executor SHALL open NO PR AND report the remaining contradiction in the thread (the operator may discuss further AND `send it` again). The executor SHALL NOT commit a spec revision to the base branch outside the PR — human review of the PR is the merge gate — AND SHALL NOT auto-edit a `tasks.md` to dodge the executor's unimplementable-tasks flag (that separate marker keeps its operator-authored invariant). The revision is to the change's spec deltas to achieve canon-consistency, performed under operator direction (the thread) AND human review (the PR).
+`@<bot> send it` in a revision thread SHALL run the spec-revision executor: a write-scoped agentic session that edits the flagged change's spec deltas to resolve the contradiction, then re-runs the `[in]` AND `[canon]` checks against the revised change before producing any output.
+
+The executor SHALL be grounded in two sources: the operator's direction, reconstructed from the thread transcript, AND the change's CURRENT contradiction set, read from the `.needs-spec-revision.json` marker (per "The spec-revision marker carries the current contradiction set"). The executor SHALL address EVERY contradiction the marker currently records, not only one.
+
+Because the operator's direction lives in the thread, the executor SHALL read the transcript with a bounded retry; if the transcript still cannot be read, the executor SHALL NOT revise blind — it SHALL open NO PR AND report in the thread that it could not read the discussion so the operator can retry. A revision SHALL never be performed against an empty discussion.
+
+The executor MAY re-edit and re-run the gates up to a small bounded number of attempts within a single `send it`, accumulating fixes on the revision branch, so a change with multiple contradictions is resolved in one `send it` rather than one per round. On a clean re-gate the executor SHALL open a PR carrying the change's spec-delta revision AND report the PR link in the thread; when the bounded attempts are exhausted AND a contradiction remains, the executor SHALL open NO PR AND report the remaining contradiction in the thread (the operator may discuss further AND `send it` again). When the SAME conflicting requirement survives the bounded attempts, the report SHALL name that specific requirement AND that the revision is not clearing it, rather than an identical generic failure, so a persistent non-convergence is legible rather than an opaque loop.
+
+The executor SHALL NOT commit a spec revision to the base branch outside the PR — human review of the PR is the merge gate — AND SHALL NOT auto-edit a `tasks.md` to dodge the executor's unimplementable-tasks flag (that separate marker keeps its operator-authored invariant). The revision is to the change's spec deltas to achieve canon-consistency, performed under operator direction (the thread) AND human review (the PR).
 
 #### Scenario: Send-it revises, re-gates clean, and opens a PR
 - **WHEN** an operator `send it`s a revision thread AND the executor's revision passes the re-run `[in]` and `[canon]` checks
@@ -7820,6 +7828,26 @@ A non-`send it` `@<bot>` reply whose `thread_ts` matches a `RevisionThreadState`
 - **WHEN** the spec-revision executor runs
 - **THEN** it revises the change's spec deltas to resolve the contradiction
 - **AND** it does NOT auto-edit a `tasks.md` to make an unimplementable-tasks flag pass (that marker's operator-authored flow is untouched)
+
+#### Scenario: An unreadable thread aborts rather than revising blind
+- **WHEN** an operator `send it`s a revision thread AND the thread transcript cannot be read after the bounded retry
+- **THEN** the executor opens NO PR AND does not run a revision against an empty discussion
+- **AND** it reports in the thread that it could not read the discussion so the operator can retry
+
+#### Scenario: The executor resolves every contradiction the marker records
+- **WHEN** the marker records more than one contradiction AND an operator `send it`s
+- **THEN** the executor's revision addresses every recorded contradiction, not only the first
+- **AND** a single `send it` can clear a marker that records multiple contradictions
+
+#### Scenario: A bounded converge loop resolves multiple contradictions in one send it
+- **WHEN** the first edit's re-gate still finds a contradiction AND the bounded attempt budget is not exhausted
+- **THEN** the executor re-edits AND re-gates again within the same `send it`, accumulating fixes
+- **AND** it opens a PR once a re-gate is clean, without requiring the operator to `send it` again
+
+#### Scenario: Persistent non-convergence names the stuck requirement
+- **WHEN** the same conflicting requirement survives the bounded attempts
+- **THEN** the thread report names that specific requirement AND states the revision is not clearing it
+- **AND** it does not repeat an identical generic "still fails" message that hides which requirement is stuck
 
 ### Requirement: Architecture advisory audit
 autocoder SHALL register an `architecture_advisor` audit in the periodic-audit framework, replacing `architecture_brightline` AND `architecture_consultative`. The audit is `requires_head_change = true` AND `WritePolicy::None`.
@@ -8517,4 +8545,64 @@ The operation SHALL be idempotent at its edges: deferring a slug already in the 
 - **THEN** the operation returns a clear not-found error AND performs no move
 - **WHEN** an operator defers a slug that names BOTH a change AND an issue in the same repo
 - **THEN** the operation returns a clear ambiguous error naming both candidate locations AND performs no move
+
+### Requirement: The spec-revision marker carries the current contradiction set
+The `.needs-spec-revision.json` marker SHALL be the durable record of what currently contradicts in a flagged change, kept current as the contradiction is worked, so a revision is always grounded in the present contradiction rather than a stale one. The marker is first written by the gate or pre-flight that flags the change. When a `@<bot> send it` re-gate still finds contradictions, the daemon SHALL refresh the marker's recorded contradiction set to that re-gate's CURRENT findings, replacing the prior set, so a subsequent revision attempt — including one that cannot read the chat thread — is grounded in the current contradiction rather than the original pre-flight finding.
+
+The marker SHALL record the contradictions with enough structure to enumerate each distinct conflict — the conflicting requirement, and for a `[canon]` finding the conflicting canonical requirement's capability — so the executor can address each one. The refresh SHALL be best-effort: a failure to write the marker is logged AND does not change the revision outcome. The refresh updates the marker's findings; it does NOT clear the marker (clearing remains its own concern) AND does NOT commit it (the marker remains gitignored runtime state, never carried into the PR).
+
+#### Scenario: A re-gate that still contradicts refreshes the marker
+- **WHEN** a `send it` re-gate still finds one or more contradictions
+- **THEN** the daemon refreshes `.needs-spec-revision.json` so its recorded contradiction set reflects that re-gate's current findings, replacing the prior set
+- **AND** the refresh does not open or block a PR, and a failure to write it does not change the revision outcome
+
+#### Scenario: A later revision attempt is grounded in the refreshed marker
+- **WHEN** a subsequent `send it` runs after the marker was refreshed — including when the chat thread cannot be read
+- **THEN** the executor is grounded in the marker's current findings, not the original pre-flight narrative
+- **AND** it does not re-attempt a fix for a contradiction that the prior re-gate already superseded
+
+### Requirement: Contradiction gates report every contradiction in a single pass
+The `[in]` (change-internal) AND `[canon]` (change-vs-canonical) contradiction gates SHALL enumerate the COMPLETE set of contradictions found in a single evaluation AND SHALL NOT stop after the first. A single requirement the change introduces or modifies MAY conflict with more than one other requirement — with another requirement in the same change (for `[in]`), or with more than one canonical requirement, possibly across more than one capability (for `[canon]`); each distinct conflict SHALL be reported as its own finding.
+
+The gate prompts SHALL direct an exhaustive sweep. The `[in]` prompt SHALL direct the agent to evaluate every requirement in the change against every other requirement in the change. The `[canon]` prompt SHALL direct the agent to read the canonical specs of EVERY capability whose invariants the change's behavior bears on — not only the capability that shares the delta's name or is most obviously related — so a change requirement that violates an invariant in a second capability is not missed. The single-element JSON example in each prompt SHALL be presented as illustrative of a set, so it does not anchor the agent toward reporting exactly one finding.
+
+The submission tools (`submit_contradictions`, `submit_canon_contradictions`) accept an unbounded array, AND every downstream surface — the `.needs-spec-revision.json` marker's `revision_suggestion` AND the chatops alert — SHALL carry every submitted finding without truncation or cap.
+
+Completeness SHALL NOT erode precision: the gates' existing false-positive guardrails remain in force, in particular that a `## MODIFIED Requirements` delta is never a contradiction with the same-titled canonical requirement it supersedes. An exhaustive sweep reports every REAL conflict; it does not invent conflicts to lengthen the list.
+
+#### Scenario: Every submitted finding reaches the marker and the alert
+- **WHEN** a gate session submits multiple distinct contradictions in one pass
+- **THEN** the `.needs-spec-revision.json` marker's `revision_suggestion` enumerates all of them
+- **AND** the chatops alert lists all of them
+- **AND** none is dropped or truncated away by a per-run cap
+
+#### Scenario: One requirement conflicting with multiple canonical requirements yields one finding each
+- **WHEN** a requirement the change introduces or modifies conflicts with two distinct canonical requirements — including the case where the second is in a different capability than the first
+- **THEN** the `[canon]` gate reports two findings, one naming each conflicting canonical requirement
+- **AND** it does not report only the first and consider the change evaluated
+
+#### Scenario: Exhaustiveness preserves the MODIFIED guardrail
+- **WHEN** a change carries a `## MODIFIED Requirements` delta of a canonical requirement AND also has one genuine conflict with a different, unmodified canonical requirement
+- **THEN** the `[canon]` gate reports the one genuine conflict
+- **AND** it does NOT report the MODIFIED delta as a contradiction with the same-titled canonical requirement it supersedes
+
+### Requirement: Contradiction gate findings carry a concrete, actionable suggested fix
+Each contradiction a gate reports SHALL carry a concrete suggested fix — a specific proposed edit that would resolve it — recorded distinctly from the one-line summary of WHY the two requirements conflict. The summary states why they conflict; the suggested fix states WHAT to change and HOW, so an operator can tell what the revision would actually do from the first output rather than re-deriving it.
+
+The submission tools SHALL accept a `suggested_fix` field per finding, alongside the existing identity AND summary fields. The gate prompts SHALL direct the agent to produce, for each contradiction, a concrete edit plan — which requirement(s) to ADD, MODIFY, RENAME, or REMOVE, and a sketch of the resulting text — NOT a restatement of the contradiction. The marker's `revision_suggestion` AND the chatops alert SHALL render each finding's suggested fix prominently AND labeled distinctly from its summary. A finding whose `suggested_fix` is absent (an older daemon, or a model omission) SHALL still render its identity AND summary — the suggested fix is additive, never a parse-or-render precondition.
+
+#### Scenario: A finding's suggested fix appears in the operator-facing output
+- **WHEN** a gate reports a contradiction carrying a `suggested_fix`
+- **THEN** the marker's `revision_suggestion` AND the chatops alert show that concrete proposed edit — naming the requirement(s) to change and the resulting text — labeled distinctly from the summary
+- **AND** the output is not merely a restatement of the contradiction
+
+#### Scenario: Summary and suggested fix are distinct fields
+- **WHEN** a finding is recorded
+- **THEN** its summary (why the two conflict) AND its suggested fix (what edit resolves it) are carried as separate fields
+- **AND** the operator-facing rendering presents both, each labeled
+
+#### Scenario: A finding without a suggested fix still renders
+- **WHEN** a finding is reported with no `suggested_fix`
+- **THEN** the marker AND alert still render the finding's identity AND summary
+- **AND** no parse or render error occurs (the suggested fix is additive)
 

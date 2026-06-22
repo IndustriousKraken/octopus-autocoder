@@ -175,7 +175,13 @@ pub struct CanonContradictionFinding {
     pub change_requirement: String,
     pub canonical_capability: String,
     pub canonical_requirement: String,
+    /// One-line explanation of WHY the change's requirement and the canonical
+    /// requirement cannot both hold.
     pub summary: String,
+    /// Concrete edit plan — WHAT to change AND HOW — distinct from the
+    /// why-`summary`. Empty when the agent (or an older daemon) omitted it;
+    /// the field is additive, never a parse-or-render precondition.
+    pub suggested_fix: String,
 }
 
 /// One entry as it arrives in the `submit_canon_contradictions` payload.
@@ -185,6 +191,10 @@ struct RawCanonContradiction {
     canonical_capability: String,
     canonical_requirement: String,
     summary: String,
+    /// Optional concrete edit plan. Defaults to empty when the payload omits
+    /// it so an older payload (no `suggested_fix`) still parses (back-compat).
+    #[serde(default)]
+    suggested_fix: String,
 }
 
 /// The `submit_canon_contradictions` payload shape.
@@ -225,6 +235,7 @@ pub(crate) fn payload_to_canon_contradictions(
             canonical_capability: c.canonical_capability,
             canonical_requirement: c.canonical_requirement,
             summary: c.summary,
+            suggested_fix: c.suggested_fix,
         })
         .collect())
 }
@@ -789,6 +800,47 @@ mod tests {
         assert_eq!(out[0].canonical_capability, "security");
         assert_eq!(out[0].canonical_requirement, "All secrets in env vars");
         assert_eq!(out[0].summary, "the change re-allows what canon forbids");
+    }
+
+    /// A payload carrying `suggested_fix` maps the field through to the finding,
+    /// distinct from the why-`summary`.
+    #[test]
+    fn suggested_fix_is_mapped_when_present() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                {
+                    "change_requirement": "A",
+                    "canonical_capability": "security",
+                    "canonical_requirement": "B",
+                    "summary": "why they conflict",
+                    "suggested_fix": "turn the delta into a coherent MODIFIED of B"
+                }
+            ]
+        });
+        let out = payload_to_canon_contradictions(&payload).expect("deserializes");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].summary, "why they conflict");
+        assert_eq!(out[0].suggested_fix, "turn the delta into a coherent MODIFIED of B");
+    }
+
+    /// Back-compat (task 5.3): a payload that OMITS `suggested_fix` still parses,
+    /// with the field defaulting to empty — an older daemon's payload is valid.
+    #[test]
+    fn missing_suggested_fix_defaults_to_empty() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                {
+                    "change_requirement": "A",
+                    "canonical_capability": "security",
+                    "canonical_requirement": "B",
+                    "summary": "s"
+                }
+            ]
+        });
+        let out =
+            payload_to_canon_contradictions(&payload).expect("legacy payload still parses");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].suggested_fix, "", "absent suggested_fix defaults to empty");
     }
 
     #[test]

@@ -335,6 +335,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
                 timeout: cfg.executor.agentic_session_timeout(),
+                revision_transcript_fetch_retries: cfg
+                    .executor
+                    .revision_transcript_fetch_retries,
+                revision_converge_attempts: cfg.executor.revision_converge_attempts,
                 #[cfg(test)]
                 test_submission: None,
             },

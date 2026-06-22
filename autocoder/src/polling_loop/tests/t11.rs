@@ -554,9 +554,12 @@ async fn end_of_rebuild_success_with_drift_posts_pr_url_message() {
 
 /// A threading-capable fake backend: `post_notification_with_thread` returns a
 /// canned `thread_ts` so the contradiction poster can stamp a
-/// `RevisionThreadState`. All other trait methods are minimal/unreachable.
+/// `RevisionThreadState`, AND records the `thread_body` it was handed so a test
+/// can assert what the operator-facing alert renders. All other trait methods
+/// are minimal/unreachable.
 struct TrackingThreadBackend {
     thread_ts: Option<String>,
+    bodies: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -584,8 +587,9 @@ impl crate::chatops::ChatOpsBackend for TrackingThreadBackend {
         &self,
         _channel: &str,
         _top_line: &str,
-        _thread_body: &str,
+        thread_body: &str,
     ) -> Result<Option<String>> {
+        self.bodies.lock().unwrap().push(thread_body.to_string());
         Ok(self.thread_ts.clone())
     }
 }
@@ -593,6 +597,7 @@ impl crate::chatops::ChatOpsBackend for TrackingThreadBackend {
 fn tracking_ctx(thread_ts: Option<&str>) -> (Arc<TrackingThreadBackend>, ChatOpsContext) {
     let backend = Arc::new(TrackingThreadBackend {
         thread_ts: thread_ts.map(|s| s.to_string()),
+        bodies: std::sync::Mutex::new(Vec::new()),
     });
     let ctx = ChatOpsContext {
         chatops: backend.clone(),
@@ -615,6 +620,7 @@ async fn contradiction_alert_records_revision_thread_state() {
         requirement_a: "A".into(),
         requirement_b: "B".into(),
         summary: "A and B cannot both hold".into(),
+        suggested_fix: "MODIFY B to drop the config.yaml clause".into(),
     }];
     maybe_post_contradiction_findings_alert(
         &paths,
@@ -653,6 +659,7 @@ async fn degraded_contradiction_alert_records_no_revision_thread_state() {
         requirement_a: "A".into(),
         requirement_b: "B".into(),
         summary: "x".into(),
+        suggested_fix: String::new(),
     }];
     maybe_post_contradiction_findings_alert(
         &paths,
@@ -670,6 +677,154 @@ async fn degraded_contradiction_alert_records_no_revision_thread_state() {
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert_eq!(count, 0, "a degraded post records no RevisionThreadState");
+}
+
+/// contradiction-gate-findings-complete-and-actionable (task 5.1 + 5.2, `[in]`
+/// alert): a submission of N (>2) findings — a mix of present + absent
+/// `suggested_fix` — reaches the chatops alert in full. Every finding's
+/// identity is present, none dropped; each non-empty suggested fix is rendered
+/// labeled distinctly from the summary; the one with no suggested fix still
+/// renders its identity + summary with no error.
+#[tokio::test]
+async fn in_contradiction_alert_carries_every_finding_and_suggested_fix() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (backend, ctx) = tracking_ctx(Some("1748.in-complete"));
+
+    let findings = vec![
+        crate::preflight::change_contradiction::ContradictionFinding {
+            requirement_a: "ReqA1".into(),
+            requirement_b: "ReqB1".into(),
+            summary: "WHY-ONE".into(),
+            suggested_fix: "EDIT-PLAN-ONE".into(),
+        },
+        crate::preflight::change_contradiction::ContradictionFinding {
+            requirement_a: "ReqA2".into(),
+            requirement_b: "ReqB2".into(),
+            summary: "WHY-TWO".into(),
+            suggested_fix: "EDIT-PLAN-TWO".into(),
+        },
+        crate::preflight::change_contradiction::ContradictionFinding {
+            requirement_a: "ReqA3".into(),
+            requirement_b: "ReqB3".into(),
+            summary: "WHY-THREE".into(),
+            // No suggested fix — must still render identity + summary.
+            suggested_fix: String::new(),
+        },
+    ];
+    let suggestion = build_contradiction_revision_suggestion(&findings);
+    maybe_post_contradiction_findings_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "in-complete",
+        &findings,
+        &suggestion,
+        None,
+    )
+    .await;
+
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies
+        .last()
+        .expect("the alert must post a thread body");
+    // Every finding's identity + summary reaches the alert — none dropped.
+    for f in &findings {
+        assert!(body.contains(&f.requirement_a), "missing {}: {body}", f.requirement_a);
+        assert!(body.contains(&f.requirement_b), "missing {}: {body}", f.requirement_b);
+        assert!(body.contains(&f.summary), "missing summary {}: {body}", f.summary);
+    }
+    // Each non-empty suggested fix is surfaced, labeled distinctly from the summary.
+    assert!(body.contains("Suggested fix: EDIT-PLAN-ONE"), "body: {body}");
+    assert!(body.contains("Suggested fix: EDIT-PLAN-TWO"), "body: {body}");
+    // The empty-fix finding renders no bare "Suggested fix:" label (graceful
+    // degradation): every labeled fix line carries non-empty content.
+    for line in body.lines().filter(|l| l.contains("Suggested fix:")) {
+        let after = line.split("Suggested fix:").nth(1).unwrap_or("").trim();
+        assert!(
+            !after.is_empty(),
+            "a Suggested fix line must carry content (no bare label): {line:?}"
+        );
+    }
+}
+
+/// contradiction-gate-findings-complete-and-actionable (task 5.1 + 5.2,
+/// `[canon]` alert): the same completeness + suggested-fix-rendering guarantees
+/// for the `[canon]` gate's alert, including a finding whose conflict is in a
+/// SECOND capability.
+#[tokio::test]
+async fn canon_contradiction_alert_carries_every_finding_and_suggested_fix() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (backend, ctx) = tracking_ctx(Some("1748.canon-complete"));
+
+    let findings = vec![
+        crate::preflight::canon_contradiction::CanonContradictionFinding {
+            change_requirement: "ChangeReq1".into(),
+            canonical_capability: "executor".into(),
+            canonical_requirement: "CanonReq1".into(),
+            summary: "WHY-ONE".into(),
+            suggested_fix: "EDIT-PLAN-ONE".into(),
+        },
+        // Same change requirement conflicting with a canonical requirement in a
+        // SECOND, different capability — must be reported as its own finding.
+        crate::preflight::canon_contradiction::CanonContradictionFinding {
+            change_requirement: "ChangeReq1".into(),
+            canonical_capability: "sandbox".into(),
+            canonical_requirement: "CanonReq2".into(),
+            summary: "WHY-TWO".into(),
+            suggested_fix: "EDIT-PLAN-TWO".into(),
+        },
+        crate::preflight::canon_contradiction::CanonContradictionFinding {
+            change_requirement: "ChangeReq3".into(),
+            canonical_capability: "security".into(),
+            canonical_requirement: "CanonReq3".into(),
+            summary: "WHY-THREE".into(),
+            // No suggested fix — must still render identity + summary.
+            suggested_fix: String::new(),
+        },
+    ];
+    let suggestion = build_canon_contradiction_revision_suggestion(&findings);
+    maybe_post_canon_contradiction_findings_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "canon-complete",
+        &findings,
+        &suggestion,
+        None,
+    )
+    .await;
+
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies
+        .last()
+        .expect("the alert must post a thread body");
+    // Every finding's identity + summary reaches the alert — none dropped,
+    // including the second-capability conflict.
+    for f in &findings {
+        assert!(body.contains(&f.canonical_requirement), "missing {}: {body}", f.canonical_requirement);
+        assert!(body.contains(&f.canonical_capability), "missing {}: {body}", f.canonical_capability);
+        assert!(body.contains(&f.summary), "missing summary {}: {body}", f.summary);
+    }
+    // The two-capability conflict on the same change requirement yields two
+    // distinct findings, each naming its canonical requirement.
+    assert!(body.contains("CanonReq1"), "body: {body}");
+    assert!(body.contains("CanonReq2"), "body: {body}");
+    // Each non-empty suggested fix is surfaced, labeled distinctly from the summary.
+    assert!(body.contains("Suggested fix: EDIT-PLAN-ONE"), "body: {body}");
+    assert!(body.contains("Suggested fix: EDIT-PLAN-TWO"), "body: {body}");
+    // The empty-fix finding renders no bare "Suggested fix:" label (graceful
+    // degradation): every labeled fix line carries non-empty content.
+    for line in body.lines().filter(|l| l.contains("Suggested fix:")) {
+        let after = line.split("Suggested fix:").nth(1).unwrap_or("").trim();
+        assert!(
+            !after.is_empty(),
+            "a Suggested fix line must carry content (no bare label): {line:?}"
+        );
+    }
 }
 
 #[tokio::test]

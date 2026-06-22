@@ -8,15 +8,15 @@ The daemon SHALL provide a second work lane, `issues/`, for corrections — fixe
 
 NEITHER form SHALL contain a `specs/` directory — that absence is the contract that an issue changes no spec; a unit carrying a `specs/` directory is malformed. A public-origin issue (one carrying an untrusted public report body) SHALL use the directory form so the quarantined `report-body.md` stays a separate file from the maintainer-approved task, preserving the quarantine boundary; collapsing an untrusted body into the single-file form is NOT permitted.
 
-The lane SHALL be gated by a `features.issues` flag that is ON by default, because the issues lane is one of the two fundamental work paths; an operator who tracks corrections in an external system SHALL disable it by setting `features.issues.enabled: false`. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
+The lane SHALL be gated by a `features.issues.enabled` field that defaults to `true`, because the issues lane is one of the two fundamental work paths; an operator who tracks corrections in an external system SHALL disable it by setting `features.issues.enabled: false`. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
 
 #### Scenario: An enabled lane works a committed issue
-- **WHEN** `features.issues` is on AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
+- **WHEN** `features.issues.enabled` is `true` AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
 - **THEN** the issue is selected and worked
 - **AND** no spec delta is required for it
 
 #### Scenario: A single-file issue is a valid unit
-- **WHEN** `features.issues` is on AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
+- **WHEN** `features.issues.enabled` is `true` AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
 - **THEN** it loads as a well-formed issue AND is worked like a directory-form issue
 - **AND** its `## Tasks` checklist (when present) is the fix-step list the implementer follows
 
@@ -36,7 +36,7 @@ The lane SHALL be gated by a `features.issues` flag that is ON by default, becau
 
 #### Scenario: The lane is enabled by default
 - **WHEN** the config has no `features.issues` entry
-- **THEN** the issues lane is active AND `issues/<slug>.md` files and `issues/<slug>/` directories are worked (the schema's default-on representation)
+- **THEN** the issues lane is active AND `issues/<slug>.md` files and `issues/<slug>/` directories are worked (the schema's default-on representation: `features.issues.enabled` defaults to `true`)
 
 #### Scenario: An operator disables the lane
 - **WHEN** the config sets `features.issues.enabled: false`

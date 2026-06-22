@@ -17,15 +17,15 @@ reply text and `send it` context ordering are identical.
 
 ## Tasks
 
-- [ ] Extract the `send it` cascade and its audit/survey state-machine logic
+- [x] Extract the `send it` cascade and its audit/survey state-machine logic
   (`dispatch_send_it_on_audit`, `try_send_it_on_survey`,
   `try_send_it_on_issue_candidate`, `try_send_it_on_revision`, and the audit-thread
   lookup) into its own module, out of `operator_commands.rs`. Re-locate via the
   function NAMES — line numbers have drifted.
-- [ ] Preserve the context resolution order exactly: audit → survey →
+- [x] Preserve the context resolution order exactly: audit → survey →
   issue-candidate → revision → canonical refusal. The extraction must not reorder
   or drop any context.
-- [ ] Verify: `cargo build` and the existing suite pass; chatops replies and the
+- [x] Verify: `cargo build` and the existing suite pass; chatops replies and the
   `send it` ordering are unchanged.
 
 ## Constraints (behavior-preserving refactor)

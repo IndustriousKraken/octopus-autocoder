@@ -845,6 +845,8 @@ mod tests {
             code_implements_spec_check_prompt_path: None,
             code_implements_spec_check_llm: None,
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
+            revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
+            revision_converge_attempts: crate::config::default_revision_converge_attempts(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,

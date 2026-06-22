@@ -32,6 +32,7 @@ pub(crate) async fn handle_archivability_preflight(
         unarchivable_deltas: violations.clone(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
+        contradictions: Vec::new(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -152,6 +153,13 @@ pub(crate) async fn handle_contradiction_preflight(
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
+        // The durable marker carries the structured findings (additive to the
+        // prose) so a later `send it` — even one that cannot read the chat
+        // thread — is grounded in the present contradiction set.
+        contradictions: findings
+            .iter()
+            .map(crate::spec_revision::ContradictionFindingRecord::from)
+            .collect(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -175,9 +183,12 @@ pub(crate) async fn handle_contradiction_preflight(
 
 /// Compose the auto-generated `revision_suggestion` text written into
 /// the marker file when the contradiction pre-flight catches one or
-/// more findings. Numbers each finding 1..N, includes the LLM's
-/// `requirement_a`, `requirement_b`, AND `summary`, AND closes with
-/// operator-action guidance.
+/// more findings. Renders EVERY finding 1..N (no cap), each with the LLM's
+/// `requirement_a`, `requirement_b`, the `summary` (WHY they conflict), AND —
+/// when present — the `suggested_fix` on its own labeled line (WHAT to change),
+/// then closes with a single short operator-action line so the per-finding
+/// fixes are the prominent content. A finding with an empty `suggested_fix`
+/// renders its identity + summary only.
 pub(crate) fn build_contradiction_revision_suggestion(
     findings: &[crate::preflight::change_contradiction::ContradictionFinding],
 ) -> String {
@@ -188,17 +199,20 @@ pub(crate) fn build_contradiction_revision_suggestion(
     );
     for (i, f) in findings.iter().enumerate() {
         out.push_str(&format!(
-            "{idx}. Requirement A: {a}\n   Requirement B: {b}\n   {summary}\n\n",
+            "{idx}. Requirement A: {a}\n   Requirement B: {b}\n   {summary}\n",
             idx = i + 1,
             a = f.requirement_a,
             b = f.requirement_b,
             summary = f.summary,
         ));
+        if !f.suggested_fix.trim().is_empty() {
+            out.push_str(&format!("   Suggested fix: {fix}\n", fix = f.suggested_fix));
+        }
+        out.push('\n');
     }
     out.push_str(
-        "Edit the conflicting requirements so they can hold simultaneously,\n\
-         OR REMOVE one of them. Push the spec change AND clear this marker\n\
-         via @<bot> clear-revision <repo> <change>.\n",
+        "Apply the suggested fix above (or edit the conflicting requirements so they can both \
+         hold), push the spec change, AND clear this marker via @<bot> clear-revision <repo> <change>.\n",
     );
     out
 }
@@ -242,6 +256,7 @@ pub(crate) async fn handle_gate_error(
             gate: label.to_string(),
             cause: cause.to_string(),
         }),
+        contradictions: Vec::new(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -320,6 +335,13 @@ pub(crate) async fn handle_canon_contradiction_preflight(
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
+        // The durable marker carries the structured findings (additive to the
+        // prose) so a later `send it` — even one that cannot read the chat
+        // thread — is grounded in the present contradiction set.
+        contradictions: findings
+            .iter()
+            .map(crate::spec_revision::ContradictionFindingRecord::from)
+            .collect(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
@@ -342,10 +364,13 @@ pub(crate) async fn handle_canon_contradiction_preflight(
 }
 
 /// Compose the auto-generated `revision_suggestion` text written into the
-/// marker file when the `[canon]` gate catches one or more findings. Numbers
-/// each finding 1..N, naming the change's requirement AND the conflicting
-/// canonical requirement (by capability + title), AND closes with
-/// operator-action guidance.
+/// marker file when the `[canon]` gate catches one or more findings. Renders
+/// EVERY finding 1..N (no cap), each naming the change's requirement AND the
+/// conflicting canonical requirement (by capability + title), the `summary`
+/// (WHY they conflict), AND — when present — the `suggested_fix` on its own
+/// labeled line (WHAT to change), then closes with a single short
+/// operator-action line so the per-finding fixes are the prominent content. A
+/// finding with an empty `suggested_fix` renders its identity + summary only.
 pub(crate) fn build_canon_contradiction_revision_suggestion(
     findings: &[crate::preflight::canon_contradiction::CanonContradictionFinding],
 ) -> String {
@@ -357,19 +382,21 @@ pub(crate) fn build_canon_contradiction_revision_suggestion(
     for (i, f) in findings.iter().enumerate() {
         out.push_str(&format!(
             "{idx}. Change requirement: {cr}\n   \
-             Conflicting canonical requirement: {canon_req} (capability: {cap})\n   {summary}\n\n",
+             Conflicting canonical requirement: {canon_req} (capability: {cap})\n   {summary}\n",
             idx = i + 1,
             cr = f.change_requirement,
             canon_req = f.canonical_requirement,
             cap = f.canonical_capability,
             summary = f.summary,
         ));
+        if !f.suggested_fix.trim().is_empty() {
+            out.push_str(&format!("   Suggested fix: {fix}\n", fix = f.suggested_fix));
+        }
+        out.push('\n');
     }
     out.push_str(
-        "Revise this change so its requirements are consistent with canon (align the\n\
-         delta with the canonical requirement, OR turn it into a coherent MODIFIED\n\
-         delta of that canonical requirement). Push the spec change AND clear this\n\
-         marker via @<bot> clear-revision <repo> <change>.\n",
+        "Apply the suggested fix above (or align the delta with canon / turn it into a coherent \
+         MODIFIED delta), push the spec change, AND clear this marker via @<bot> clear-revision <repo> <change>.\n",
     );
     out
 }
@@ -440,6 +467,7 @@ pub(crate) async fn handle_rules_violations_preflight(
         unarchivable_deltas: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
+        contradictions: Vec::new(),
     };
     if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
         tracing::warn!(
