@@ -16,6 +16,11 @@ The principle is therefore: surface the captured evidence RAW (never parse it fo
 the decision), and retry any no-result failure a bounded number of times with
 backoff (never classify it).
 
+The same gap — and the same fix — applies to the agentic reviewer, which is the
+worst case: it runs in capture mode (writes no log) and DISCARDS its session
+output, so a no-submission failure surfaces only "recorded no valid `submit_review`
+submission" with no recoverable diagnostic anywhere.
+
 ## What Changes
 
 - **Assembled, legible failure reason.** On any non-success executor outcome, the
@@ -34,19 +39,26 @@ backoff (never classify it).
   no-result rule". Provider knowledge stays in the strategy that owns it.
 - **The operator-facing failure notification carries the assembled reason** rather
   than a bare exit code.
+- **Reviewer failures are legible too.** On a reviewer no-submission discard, the
+  discard reason now carries the captured session output (assembled, truncated,
+  raw — the same principle) instead of throwing it away, and the reviewer persists
+  its output to a discoverable per-session log (mirroring the audit logs).
 
 ## Impact
 
 - Affected capabilities: `executor` (the assembled reason in the failure contract;
   the optional `CliStrategy::is_retryable` hook), `orchestrator-cli` (the bounded
   no-result retry loop AND the `executor.session_retries` knob), `chatops-manager`
-  (the failure notification surfaces the assembled reason).
+  (the failure notification surfaces the assembled reason), `code-reviewer` (the
+  reviewer no-submission discard surfaces + persists its captured output).
 - Affected code: `autocoder/src/executor/claude_cli.rs` (failure-reason assembly;
   reuse `agentic_run::failure_excerpt`), `autocoder/src/agentic_run.rs`
   (`AgenticRunOutcome`, the `CliStrategy` trait, `failure_excerpt`),
   `autocoder/src/polling_loop/outcome.rs` (the no-committable-result signal +
   retry loop), `autocoder/src/config.rs` (`executor.session_retries`),
   `autocoder/src/revisions.rs` + the pass/alert notification paths (render the
-  assembled reason).
+  assembled reason), AND `autocoder/src/code_reviewer.rs` (`run_session` retains +
+  surfaces the captured output on a discard instead of dropping it at the
+  no-submission path, and persists a per-session reviewer log).
 - Provider-agnostic by construction: no code parses error strings; classification,
   if any, is encapsulated per strategy.
