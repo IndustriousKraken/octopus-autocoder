@@ -20,7 +20,7 @@ committed and audit-written issue units.
 
 ## What Changes
 
-- The `features.issues` flag defaults to ON. An operator disables the lane by
+- The `features.issues.enabled` field defaults to `true`. An operator disables the lane by
   setting `features.issues.enabled: false`.
 - The install wizard's issues-lane gate inverts from opt-in to opt-out: the lane
   is on by default, and the prompt offers to disable it for operators who track
