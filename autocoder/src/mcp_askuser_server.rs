@@ -906,7 +906,20 @@ fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
 /// stderr breadcrumb this does NOT depend on the wrapped CLI forwarding the
 /// MCP child's stderr (opencode may not), so it is the reliable source of
 /// truth. A failure to record MUST NOT change the gate outcome.
-fn relay_advertised_tool(role: &str, tool: Option<&str>) -> Result<()> {
+fn relay_advertised_tool(_role: &str, _tool: Option<&str>) -> Result<()> {
+    // EXPERIMENT (stall isolation — revert with `git checkout` after testing):
+    // The body below was injected into the MCP `tools/list` hot path at
+    // v1.3.0-33 and is the prime suspect for opencode+kimi `[in]`-gate sessions
+    // reading the spec files and then stalling without calling
+    // `submit_contradictions`. It does a SYNCHRONOUS, BLOCKING control-socket
+    // round-trip while the single-threaded MCP stdio loop is mid-handshake, so a
+    // slow/contended daemon response stalls the loop opencode is waiting on.
+    // This record is observability-only ("MUST NOT change the gate outcome"), so
+    // skipping it is safe; the stderr breadcrumb at the call site still fires.
+    // If kimi submits again with this no-op in place, this blocking relay is the
+    // v33 regression.
+    Ok(())
+    /* ORIGINAL BODY (restore to re-enable the daemon-side advertised-tool record):
     let socket_path = std::env::var(ENV_CONTROL_SOCKET).map_err(|_| {
         anyhow!("{ENV_CONTROL_SOCKET} not set; cannot record advertised tool")
     })?;
@@ -919,8 +932,8 @@ fn relay_advertised_tool(role: &str, tool: Option<&str>) -> Result<()> {
         "action": "record_advertised_tool",
         "workspace_basename": workspace_basename,
         "change": change,
-        "role": role,
-        "tool": tool,
+        "role": _role,
+        "tool": _tool,
     });
     let resp = relay_to_control_socket(Path::new(&socket_path), &request)?;
     if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -931,6 +944,7 @@ fn relay_advertised_tool(role: &str, tool: Option<&str>) -> Result<()> {
         return Err(anyhow!("{err}"));
     }
     Ok(())
+    */
 }
 
 /// The advisory-audit roles whose per-execution MCP child advertises the
