@@ -312,15 +312,28 @@ fn handle_request<W: Write>(
                         "[autocoder-mcp] role={role} advertised submission tool: NONE (no tool matched this role)"
                     ),
                 }
-                // Daemon-side record (source of truth for mode a). Best-effort:
-                // a failure to relay is logged to stderr and dropped — it MUST
-                // NOT fail the MCP child or alter the gate outcome, exactly like
-                // the submission relay's own error handling.
-                if let Err(e) = relay_advertised_tool(&role, advertised) {
-                    eprintln!(
-                        "[autocoder-mcp] role={role} advertised-tool relay failed (best-effort, ignored): {e:#}"
-                    );
-                }
+                // Daemon-side record (source of truth for mode a), FIRE-AND-FORGET
+                // on a detached thread. `relay_advertised_tool` does a blocking
+                // control-socket round-trip; running it inline here stalled the
+                // single-threaded MCP `tools/list` reply the wrapped CLI waits on,
+                // which made opencode drop this server's tools before the relay
+                // returned (the v1.3.0-33 `[in]`-gate stall: `submit_contradictions`
+                // went unadvertised, so kimi read the specs and could not submit).
+                // Detaching lets `tools/list` return immediately. Best-effort: a
+                // relay failure is logged to the child's stderr and dropped — it
+                // MUST NOT alter the gate outcome. The MCP child outlives
+                // `tools/list`, so the thread has time to finish; if the process
+                // exits first the record is simply lost (acceptable for telemetry).
+                // `advertised` is `Option<&'static str>` (Send + 'static); clone the
+                // role String so the thread owns its capture.
+                let role_for_relay = role.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = relay_advertised_tool(&role_for_relay, advertised) {
+                        eprintln!(
+                            "[autocoder-mcp] role={role_for_relay} advertised-tool relay failed (best-effort, ignored): {e:#}"
+                        );
+                    }
+                });
                 if let Some(tool) = submission_tool_for_role(&role) {
                     tools.push(tool);
                 }
@@ -906,20 +919,13 @@ fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
 /// stderr breadcrumb this does NOT depend on the wrapped CLI forwarding the
 /// MCP child's stderr (opencode may not), so it is the reliable source of
 /// truth. A failure to record MUST NOT change the gate outcome.
-fn relay_advertised_tool(_role: &str, _tool: Option<&str>) -> Result<()> {
-    // EXPERIMENT (stall isolation — revert with `git checkout` after testing):
-    // The body below was injected into the MCP `tools/list` hot path at
-    // v1.3.0-33 and is the prime suspect for opencode+kimi `[in]`-gate sessions
-    // reading the spec files and then stalling without calling
-    // `submit_contradictions`. It does a SYNCHRONOUS, BLOCKING control-socket
-    // round-trip while the single-threaded MCP stdio loop is mid-handshake, so a
-    // slow/contended daemon response stalls the loop opencode is waiting on.
-    // This record is observability-only ("MUST NOT change the gate outcome"), so
-    // skipping it is safe; the stderr breadcrumb at the call site still fires.
-    // If kimi submits again with this no-op in place, this blocking relay is the
-    // v33 regression.
-    Ok(())
-    /* ORIGINAL BODY (restore to re-enable the daemon-side advertised-tool record):
+/// NOTE: this does a SYNCHRONOUS, BLOCKING control-socket round-trip. It MUST be
+/// called fire-and-forget (off the MCP stdio thread) — never inline in a request
+/// handler. Running it inline in `tools/list` at v1.3.0-33 stalled the single-
+/// threaded MCP reply that the wrapped CLI waits on; opencode then gave up on this
+/// server's tools before the relay returned, so the `[in]` gate's
+/// `submit_contradictions` went unadvertised and kimi could not submit.
+fn relay_advertised_tool(role: &str, tool: Option<&str>) -> Result<()> {
     let socket_path = std::env::var(ENV_CONTROL_SOCKET).map_err(|_| {
         anyhow!("{ENV_CONTROL_SOCKET} not set; cannot record advertised tool")
     })?;
@@ -932,8 +938,8 @@ fn relay_advertised_tool(_role: &str, _tool: Option<&str>) -> Result<()> {
         "action": "record_advertised_tool",
         "workspace_basename": workspace_basename,
         "change": change,
-        "role": _role,
-        "tool": _tool,
+        "role": role,
+        "tool": tool,
     });
     let resp = relay_to_control_socket(Path::new(&socket_path), &request)?;
     if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -944,7 +950,6 @@ fn relay_advertised_tool(_role: &str, _tool: Option<&str>) -> Result<()> {
         return Err(anyhow!("{err}"));
     }
     Ok(())
-    */
 }
 
 /// The advisory-audit roles whose per-execution MCP child advertises the
