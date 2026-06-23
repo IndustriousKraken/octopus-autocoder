@@ -2695,6 +2695,73 @@ github:
         cancel.cancel();
     }
 
+    // verifier-gates-persist-session-log task 4.1/5.4: the
+    // `record_advertised_tool` action records, daemon-side, which submit tool
+    // the MCP child advertised for a session's role — `Some(tool)` when one
+    // matched, `None` when none did — keyed by (workspace_basename, change) and
+    // surviving consume, so a no-submission consume can report mode (a). Assert
+    // the recorded store facts, not log wording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_advertised_tool_records_some_and_none_daemon_side() {
+        let (_dir, socket, state, _cfg, cancel) = fixture_listener(BASE_YAML).await;
+
+        // Role whose MCP child advertised a submit tool.
+        let with = serde_json::json!({
+            "action": "record_advertised_tool",
+            "workspace_basename": "repo",
+            "change": "a30-with",
+            "role": "reviewer",
+            "tool": "submit_review",
+        });
+        let resp = send_request(&socket, &with.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            state.submission_store.advertised_tool("repo", "a30-with"),
+            Some(("reviewer".into(), Some("submit_review".into()))),
+            "the advertised tool is recorded daemon-side with its role"
+        );
+
+        // Role whose MCP child advertised NO submit tool (tool omitted/null —
+        // this is the mode (a) fact). Best-effort: still records ok.
+        let without = serde_json::json!({
+            "action": "record_advertised_tool",
+            "workspace_basename": "repo",
+            "change": "a30-none",
+            "role": "implementer",
+            "tool": serde_json::Value::Null,
+        });
+        let resp = send_request(&socket, &without.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            state.submission_store.advertised_tool("repo", "a30-none"),
+            Some(("implementer".into(), None)),
+            "a role with no matching tool records None — mode (a) is determinable"
+        );
+
+        // The advertised-tool fact survives a no-submission consume, so the
+        // consume diagnostic can report advertised + relayed + consumed
+        // together. A consume that finds no live submission returns null AND the
+        // advertised record persists for the diagnostic to read.
+        let con = r#"{"action":"consume_submission","workspace_basename":"repo","change":"a30-none"}"#;
+        let resp = send_request(&socket, con).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true));
+        assert_eq!(
+            resp["submission"],
+            serde_json::Value::Null,
+            "no live submission for this held session"
+        );
+        assert!(
+            !state.submission_store.was_ever_relayed("repo", "a30-none"),
+            "never relayed — mode (b)/(a): advertised=none, relayed=no, consumed=none"
+        );
+        assert_eq!(
+            state.submission_store.advertised_tool("repo", "a30-none"),
+            Some(("implementer".into(), None)),
+            "the advertised-tool fact survives the consume so the diagnostic can report it"
+        );
+        cancel.cancel();
+    }
+
     // a56: a payload that fails the role's registered schema is rejected
     // (nothing stored) with a reason suitable for the relay to surface.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

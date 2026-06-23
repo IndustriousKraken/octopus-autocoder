@@ -443,6 +443,108 @@ impl AuditLogWriter {
     }
 }
 
+/// Sanitize a log-name component (gate label, change/subject slug) so it is
+/// safe in a filename: any character that is not ASCII-alphanumeric, `-`, or
+/// `_` becomes `-`. Keeps `<gate>-<subject>-<timestamp>.log` portable AND
+/// never lets a subject containing `/` escape the gate-logs directory.
+fn sanitize_log_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    if cleaned.is_empty() {
+        "session".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Persist a finished agentic session's FULL captured output to a discoverable
+/// per-session log file under `dir`, named `<name>-<UTC-RFC3339-with-Z>.log`,
+/// and return the written path. The directory is created if absent. Mirrors
+/// [`AuditLogWriter::open`]'s timestamp mechanism EXACTLY (the same
+/// `Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)` with `:`→`-`), so
+/// the gate logs share the audit logs' per-run-log naming convention rather
+/// than inventing a third timestamping scheme.
+///
+/// This is the shared session-log writer the verifier gates use (the planned
+/// reviewer session log SHOULD converge on this same helper rather than a
+/// fourth bespoke writer — the seam is the captured [`AgenticRunOutcome`] +
+/// the `(dir, name)` pair). It persists the RAW captured output (streamed
+/// actions / final answer, captured stderr, the process exit status, AND the
+/// timed-out flag); it NEVER parses the output for a decision, so it is
+/// provider-agnostic. Returns the written path so callers can name it in a
+/// fail-closed alert / WARN.
+pub fn persist_session_log(
+    dir: &Path,
+    name: &str,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating session log dir {}", dir.display()))?;
+    // Same timestamp mechanism as the audit run-log writer (mirror, do not
+    // invent): RFC3339 with a `Z` suffix, `:`→`-` so the filename is portable
+    // on case-insensitive filesystems.
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let safe_ts = timestamp.replace(':', "-");
+    let safe_name = sanitize_log_component(name);
+    let path = dir.join(format!("{safe_name}-{safe_ts}.log"));
+    let exit = match outcome.exit_status {
+        Some(s) => s
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal/none".to_string()),
+        None => "none".to_string(),
+    };
+    let mut body = String::new();
+    body.push_str(&format!("timed_out: {}\n", outcome.timed_out));
+    body.push_str(&format!("exit_status: {exit}\n"));
+    if let Some(answer) = outcome.final_answer.as_deref() {
+        body.push_str("\n## final_answer\n");
+        body.push_str(answer);
+        body.push('\n');
+    }
+    body.push_str("\n## stdout\n");
+    body.push_str(&outcome.stdout);
+    if !outcome.stdout.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("\n## stderr\n");
+    body.push_str(&outcome.stderr);
+    if !outcome.stderr.ends_with('\n') {
+        body.push('\n');
+    }
+    std::fs::write(&path, body)
+        .with_context(|| format!("writing session log {}", path.display()))?;
+    Ok(path)
+}
+
+/// Persist a verifier-gate session's captured output under the workspace's
+/// `gates/` log directory ([`crate::paths::DaemonPaths::gate_logs_dir`]),
+/// named `<gate>-<subject>-<timestamp>.log`, and return the written path.
+/// Thin convenience over [`persist_session_log`] that resolves the gate-logs
+/// directory from `paths` + the workspace basename so every gate writes its
+/// log to the same discoverable sibling of the audit logs.
+pub fn persist_gate_session_log(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    gate_label: &str,
+    subject: &str,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
+) -> Result<PathBuf> {
+    let basename = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let dir = paths.gate_logs_dir(basename);
+    let name = format!(
+        "{}-{}",
+        sanitize_log_component(gate_label),
+        sanitize_log_component(subject)
+    );
+    persist_session_log(&dir, &name, outcome)
+}
+
 /// Registry of all audits the daemon knows about. Built once at startup
 /// in `cli::run::execute` and shared (via `Arc`) with every polling
 /// task. The scheduler iterates `audits.iter()` in declaration order.
@@ -1781,6 +1883,74 @@ mod tests {
     /// guard: a writing audit (`OpenSpecOnly`) mounted read-only silently
     /// produced 0 proposals, and the specs-writing harness reported the dead
     /// run as a passing "no findings" — discarding a real security finding.
+    // ---- shared session-log writer (verifier-gates-persist-session-log) ----
+
+    /// 5.1: given a captured outcome (non-empty stdout/stderr, an exit status,
+    /// timed-out flag), the writer creates a file under the given dir whose
+    /// content includes that captured output. Asserts file existence + captured
+    /// content presence (data flow), not exact formatting.
+    #[test]
+    fn persist_session_log_writes_captured_output() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("gates");
+        let outcome = crate::agentic_run::AgenticRunOutcome {
+            stdout: "STDOUT_MARKER streamed actions".to_string(),
+            stderr: "STDERR_MARKER the real error".to_string(),
+            final_answer: Some("FINAL_ANSWER_MARKER".to_string()),
+            timed_out: false,
+            ..Default::default()
+        };
+        let path = persist_session_log(&dir, "in-c1", &outcome).expect("writes a log");
+        assert!(path.exists(), "log file must exist: {}", path.display());
+        assert!(path.starts_with(&dir), "log must live under the given dir");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("STDOUT_MARKER"), "captured stdout present: {body}");
+        assert!(body.contains("STDERR_MARKER"), "captured stderr present: {body}");
+        assert!(body.contains("FINAL_ANSWER_MARKER"), "final answer present: {body}");
+        assert!(body.contains("timed_out: false"), "timed-out flag present: {body}");
+    }
+
+    /// 5.1: a timed-out / no-final-answer outcome still writes a log carrying
+    /// the timeout indicator (so a timeout is auditable).
+    #[test]
+    fn persist_session_log_records_timeout_indicator() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("gates");
+        let outcome = crate::agentic_run::AgenticRunOutcome {
+            stdout: String::new(),
+            stderr: "killed after timeout".to_string(),
+            timed_out: true,
+            ..Default::default()
+        };
+        let path = persist_session_log(&dir, "out-c2", &outcome).expect("writes a log");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("timed_out: true"), "timeout indicator present: {body}");
+        assert!(body.contains("killed after timeout"), "captured stderr present: {body}");
+    }
+
+    /// 5.1: the gate-log convenience resolves the workspace's `gates/` dir from
+    /// `DaemonPaths` AND names the file `<gate>-<subject>-<timestamp>.log`.
+    #[test]
+    fn persist_gate_session_log_lands_under_gates_dir() {
+        let (_tmp, paths) = crate::testing::test_daemon_paths();
+        let ws = paths.cache.join("workspaces").join("github_com_o_r");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = crate::agentic_run::AgenticRunOutcome {
+            stdout: "session output".to_string(),
+            ..Default::default()
+        };
+        let path =
+            persist_gate_session_log(&paths, &ws, "in", "my-change", &outcome).expect("writes");
+        assert!(
+            path.starts_with(paths.gate_logs_dir("github_com_o_r")),
+            "log must live under the workspace's gates/ dir: {}",
+            path.display()
+        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("in-my-change-"), "log named by gate+subject: {name}");
+        assert!(name.ends_with(".log"), "log has .log extension: {name}");
+    }
+
     #[test]
     fn write_policy_workspace_writable_mapping() {
         assert!(

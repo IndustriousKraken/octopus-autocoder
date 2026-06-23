@@ -262,6 +262,12 @@ pub struct GlobalRulesCheckCtx {
     /// The resolved local directory holding the global rule corpus (a path, or a
     /// clone of the configured git repo). Read at prompt-build time.
     pub corpus_dir: PathBuf,
+    /// Resolved daemon paths, used to persist the gate session's full captured
+    /// output to a discoverable per-session log under `gates/`
+    /// (verifier-gates-persist-session-log). `None` only for test/standalone
+    /// contexts that opt out; production wires it from the daemon's
+    /// `DaemonPaths`. The session log is written for EVERY outcome.
+    pub paths: Option<Arc<crate::paths::DaemonPaths>>,
     /// Test-only injected `submit_rule_violations` submission, bypassing the CLI
     /// subprocess AND the control socket. `Some(Some(p))` stands in for a
     /// recorded payload; `Some(None)` simulates "agent never submitted"; `None`
@@ -413,6 +419,9 @@ pub async fn run_agentic_global_rules_check(
         settings_dir: None,
         timeout: ctx.timeout,
         subject_noun: "global-rules-check",
+        gate: VerifierGate::Rules,
+        subject_slug: change_slug,
+        paths: ctx.paths.clone(),
     };
     run_agentic_global_rules_check_with_runner(ctx, workspace_root, change_slug, &runner).await
 }
@@ -531,6 +540,7 @@ impl CorpusCheckSessionRunner for CannedRuleViolationRunner {
         Ok(crate::preflight::corpus_check::CorpusCheckSessionOutcome {
             submission: self.submission.clone(),
             stdout_excerpt: String::new(),
+            log_path: None,
         })
     }
 }
@@ -566,6 +576,7 @@ mod tests {
             retries: 0,
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             corpus_dir,
+            paths: None,
             test_submission: None,
         }
     }
@@ -586,6 +597,7 @@ mod tests {
             retries: 0,
             timeout: exec.agentic_session_timeout(),
             corpus_dir: PathBuf::from("/tmp/does-not-matter"),
+            paths: None,
             test_submission: None,
         };
         assert_eq!(ctx.timeout, exec.agentic_session_timeout());

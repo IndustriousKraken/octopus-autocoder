@@ -204,6 +204,16 @@ impl DaemonPaths {
         self.run_logs_dir(workspace_basename).join("audits")
     }
 
+    /// `<logs>/runs/<basename>/gates/` — per-session verifier-gate logs
+    /// for the named workspace. Sibling of [`Self::audit_logs_dir`]: a
+    /// verifier gate (`[in]`/`[canon]`/`[rules]`/`[out]`) persists its
+    /// agentic session's full captured output here, named
+    /// `<gate>-<subject>-<timestamp>.log`, so a held change is diagnosable
+    /// AND a surprising clean/finding result is auditable.
+    pub fn gate_logs_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.run_logs_dir(workspace_basename).join("gates")
+    }
+
     /// `<state>/iteration-pending/` — root for per-change
     /// iteration-request markers (a27a1). The marker is pure daemon
     /// bookkeeping (written by the polling-loop's `IterationRequested`
@@ -821,6 +831,10 @@ mod tests {
         assert_eq!(
             p.audit_logs_dir("github_com_owner_repo"),
             PathBuf::from("/srv/logs/runs/github_com_owner_repo/audits")
+        );
+        assert_eq!(
+            p.gate_logs_dir("github_com_owner_repo"),
+            PathBuf::from("/srv/logs/runs/github_com_owner_repo/gates")
         );
         assert_eq!(
             p.workspaces_dir(),

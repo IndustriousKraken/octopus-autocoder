@@ -70,6 +70,11 @@ pub fn allowed_tools_for_role(role: &str) -> Vec<String> {
 pub struct CorpusCheckSessionOutcome {
     pub submission: Option<serde_json::Value>,
     pub stdout_excerpt: String,
+    /// Path of the persisted per-session log (written for every outcome;
+    /// `None` only when persistence was not wired or the write failed). Threaded
+    /// into the fail-closed cause so the WARN + alert name it
+    /// (verifier-gates-persist-session-log).
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 impl SessionSubmission for CorpusCheckSessionOutcome {
@@ -109,6 +114,16 @@ pub struct CliCorpusCheckSessionRunner<'a> {
     /// Human-readable noun for diagnostics (e.g. `change-vs-canonical-check`,
     /// `global-rules-check`). Used only in the timeout error message.
     pub subject_noun: &'static str,
+    /// The verifier gate this runner serves (`Canon` / `Rules`). Used as the
+    /// persisted session log's filename prefix so the log is attributable to
+    /// the gate (verifier-gates-persist-session-log).
+    pub gate: VerifierGate,
+    /// The subject slug (change OR issue) the session evaluates, used as the
+    /// session-log subject (`<gate>-<subject>-<timestamp>.log`).
+    pub subject_slug: &'a str,
+    /// Resolved daemon paths for persisting the session log under `gates/`.
+    /// `None` skips persistence (no log path is threaded into the outcome).
+    pub paths: Option<std::sync::Arc<crate::paths::DaemonPaths>>,
 }
 
 #[async_trait]
@@ -168,11 +183,23 @@ impl CorpusCheckSessionRunner for CliCorpusCheckSessionRunner<'_> {
         crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
 
         let outcome = result.with_context(|| format!("spawning {} subprocess", self.subject_noun))?;
+        // Persist the FULL captured output to a discoverable per-session log
+        // BEFORE the timeout/no-submission branches form their result, so a log
+        // is written for EVERY outcome (clean, findings, no-submission, timeout,
+        // error). Best-effort; never alters the gate's disposition.
+        let log_path = crate::verifier_gate::persist_gate_log(
+            self.paths.as_deref(),
+            self.gate,
+            self.workspace,
+            self.subject_slug,
+            &outcome,
+        );
         if outcome.timed_out {
             return Err(anyhow!(
-                "{} session timed out after {}s",
+                "{} session timed out after {}s{}",
                 self.subject_noun,
-                self.timeout.as_secs()
+                self.timeout.as_secs(),
+                crate::verifier_gate::log_path_suffix(log_path.as_deref())
             ));
         }
         // Include stderr — opencode/agy write their real failure there, leaving
@@ -182,6 +209,7 @@ impl CorpusCheckSessionRunner for CliCorpusCheckSessionRunner<'_> {
         Ok(CorpusCheckSessionOutcome {
             submission,
             stdout_excerpt,
+            log_path,
         })
     }
 }
@@ -241,8 +269,9 @@ pub async fn run_corpus_check_with_runner(
         Ok(outcome) => match outcome.submission {
             None => {
                 let cause = format!(
-                    "session ended with no submission (excerpt: {})",
-                    outcome.stdout_excerpt
+                    "session ended with no submission (excerpt: {}){}",
+                    outcome.stdout_excerpt,
+                    crate::verifier_gate::log_path_suffix(outcome.log_path.as_deref())
                 );
                 tracing::warn!(
                     subject = %subject_slug,
@@ -328,6 +357,7 @@ mod tests {
             Ok(CorpusCheckSessionOutcome {
                 submission: self.submission.clone(),
                 stdout_excerpt: String::new(),
+                log_path: None,
             })
         }
     }
@@ -352,6 +382,46 @@ mod tests {
         let out =
             run_corpus_check_with_runner(VerifierGate::Rules, "c1", 0, "PROMPT", &runner).await;
         assert!(matches!(out, CorpusCheckSession::Errored { .. }));
+    }
+
+    /// A runner that reports a persisted session-log path, so the shared
+    /// corpus-check orchestration's log-path threading (covering BOTH the
+    /// `[canon]` AND `[rules]` gates) is exercised without a subprocess
+    /// (verifier-gates-persist-session-log task 5.2/5.3).
+    struct LoggedRunner {
+        submission: Option<serde_json::Value>,
+        log_path: Option<std::path::PathBuf>,
+    }
+    #[async_trait]
+    impl CorpusCheckSessionRunner for LoggedRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<CorpusCheckSessionOutcome> {
+            Ok(CorpusCheckSessionOutcome {
+                submission: self.submission.clone(),
+                stdout_excerpt: String::new(),
+                log_path: self.log_path.clone(),
+            })
+        }
+    }
+
+    /// 5.2/5.3: a no-submission hold threads the persisted session-log path into
+    /// the shared fail-closed `Errored.cause` (the WARN + alert render it).
+    /// Asserts the PATH is present (data flow), not the wording.
+    #[tokio::test]
+    async fn no_submission_cause_names_the_session_log_path() {
+        let log = std::path::PathBuf::from("/logs/runs/repo/gates/canon-c1-ts.log");
+        let runner = LoggedRunner {
+            submission: None,
+            log_path: Some(log.clone()),
+        };
+        let out =
+            run_corpus_check_with_runner(VerifierGate::Canon, "c1", 0, "PROMPT", &runner).await;
+        match out {
+            CorpusCheckSession::Errored { cause } => assert!(
+                cause.contains(&log.display().to_string()),
+                "the fail-closed cause must name the session log path; got: {cause}"
+            ),
+            CorpusCheckSession::Submitted(_) => panic!("expected Errored"),
+        }
     }
 
     #[tokio::test]

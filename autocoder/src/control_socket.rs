@@ -869,6 +869,9 @@ const DISPATCH: &[(&str, Handler)] = &[
     ("record_submission", |p, s| {
         Box::pin(async move { handle_record_submission(p, s) })
     }),
+    ("record_advertised_tool", |p, s| {
+        Box::pin(async move { handle_record_advertised_tool(p, s) })
+    }),
     ("consume_submission", |p, s| {
         Box::pin(async move { handle_consume_submission(p, s) })
     }),

@@ -27,7 +27,60 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// Persist a verifier-gate session's full captured output to a discoverable
+/// per-session log under the workspace's `gates/` directory and return the
+/// written path — shared by all four gates ([in]/[canon]/[rules]/[out]) so
+/// each persists the same way (verifier-gates-persist-session-log). Delegates
+/// to [`crate::audits::persist_gate_session_log`] (the shared session-log
+/// writer, which mirrors the audit run-log writer's timestamp mechanism); the
+/// gate's stable label is the filename prefix so a log is attributable to the
+/// gate that produced it.
+///
+/// Best-effort by contract: when `paths` is `None` (a test/standalone context
+/// that opted out) it returns `None` without writing; a write FAILURE logs a
+/// WARN and returns `None` — it NEVER alters the gate's disposition or
+/// fail-closed posture (this is observability only). The captured output is
+/// persisted RAW; nothing here parses it for a decision.
+pub(crate) fn persist_gate_log(
+    paths: Option<&crate::paths::DaemonPaths>,
+    gate: VerifierGate,
+    workspace: &Path,
+    subject: &str,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
+) -> Option<PathBuf> {
+    let paths = paths?;
+    match crate::audits::persist_gate_session_log(
+        paths,
+        workspace,
+        gate.id(),
+        subject,
+        outcome,
+    ) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!(
+                subject = %subject,
+                "{} failed to persist gate session log (continuing — observability only): {e:#}",
+                gate.label()
+            );
+            None
+        }
+    }
+}
+
+/// Render a " (session log: <path>)" suffix for a fail-closed cause / WARN /
+/// alert, naming the persisted session log so an operator can open it. Empty
+/// when no log path is available (persistence opted out or failed), so the
+/// existing cause text is unchanged in that case.
+pub(crate) fn log_path_suffix(log_path: Option<&Path>) -> String {
+    match log_path {
+        Some(p) => format!(" (session log: {})", p.display()),
+        None => String::new(),
+    }
+}
 
 /// One session outcome at the gate's runner boundary, abstracted so the
 /// shared retry loop ([`run_session_with_retry`]) can tell a productive

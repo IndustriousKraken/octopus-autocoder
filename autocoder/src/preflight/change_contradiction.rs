@@ -116,6 +116,12 @@ pub struct ContradictionCheckCtx {
     /// accumulating fixes on the same revision branch so a multi-contradiction
     /// change is resolved in one `send it`. `0` preserves single-pass behavior.
     pub revision_converge_attempts: u32,
+    /// Resolved daemon paths, used to persist the gate session's full captured
+    /// output to a discoverable per-session log under `gates/`
+    /// (verifier-gates-persist-session-log). `None` only for test/standalone
+    /// contexts that opt out of persistence; production wires it from the
+    /// daemon's `DaemonPaths`. The session log is written for EVERY outcome.
+    pub paths: Option<Arc<crate::paths::DaemonPaths>>,
     /// Test-only injected `submit_contradictions` submission, bypassing the
     /// CLI subprocess AND the control socket. `Some(Some(p))` stands in for
     /// a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -267,11 +273,14 @@ pub fn register_contradiction_submission_schema(
 }
 
 /// Outcome of one contradiction-check session: the consumed submission (or
-/// `None` when the agent recorded nothing valid) AND a truncated stdout
-/// excerpt for the no-submission fail-closed WARN.
+/// `None` when the agent recorded nothing valid), a truncated stdout excerpt
+/// for the no-submission fail-closed WARN, AND the path of the persisted
+/// per-session log (written for every outcome; `None` only when persistence
+/// was not wired or the write failed).
 struct ContradictionSessionOutcome {
     submission: Option<serde_json::Value>,
     stdout_excerpt: String,
+    log_path: Option<PathBuf>,
 }
 
 impl crate::verifier_gate::SessionSubmission for ContradictionSessionOutcome {
@@ -300,6 +309,11 @@ struct CliContradictionSessionRunner<'a> {
     model: &'a ResolvedModel,
     settings_dir: Option<&'a Path>,
     timeout: Duration,
+    /// Resolved daemon paths for persisting the session log under `gates/`.
+    /// `None` skips persistence (no log path is threaded into the outcome).
+    paths: Option<Arc<crate::paths::DaemonPaths>>,
+    /// The change slug, used as the log subject (`in-<change>-<timestamp>.log`).
+    change_slug: &'a str,
 }
 
 #[async_trait]
@@ -354,10 +368,23 @@ impl ContradictionSessionRunner for CliContradictionSessionRunner<'_> {
         crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
 
         let outcome = result.context("spawning contradiction-check subprocess")?;
+        // Persist the FULL captured output to a discoverable per-session log
+        // BEFORE the timeout/no-submission branches form their result, so a
+        // log is written for EVERY outcome (clean, findings, no-submission,
+        // timeout, error). Best-effort: a write failure leaves `log_path` None
+        // and is logged, never altering the gate's disposition.
+        let log_path = crate::verifier_gate::persist_gate_log(
+            self.paths.as_deref(),
+            VerifierGate::In,
+            self.workspace,
+            self.change_slug,
+            &outcome,
+        );
         if outcome.timed_out {
             return Err(anyhow!(
-                "contradiction-check session timed out after {}s",
-                self.timeout.as_secs()
+                "contradiction-check session timed out after {}s{}",
+                self.timeout.as_secs(),
+                crate::verifier_gate::log_path_suffix(log_path.as_deref())
             ));
         }
         // Include stderr — opencode/agy write their real failure there, leaving
@@ -368,6 +395,7 @@ impl ContradictionSessionRunner for CliContradictionSessionRunner<'_> {
         Ok(ContradictionSessionOutcome {
             submission,
             stdout_excerpt,
+            log_path,
         })
     }
 }
@@ -389,6 +417,7 @@ impl ContradictionSessionRunner for CannedContradictionRunner {
         Ok(ContradictionSessionOutcome {
             submission: self.submission.clone(),
             stdout_excerpt: String::new(),
+            log_path: None,
         })
     }
 }
@@ -464,6 +493,8 @@ pub async fn run_agentic_contradiction_check(
         model: &ctx.model,
         settings_dir: None,
         timeout: ctx.timeout,
+        paths: ctx.paths.clone(),
+        change_slug,
     };
     run_agentic_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner).await
 }
@@ -507,8 +538,9 @@ async fn run_agentic_contradiction_check_with_runner(
         Ok(outcome) => match outcome.submission {
             None => {
                 let cause = format!(
-                    "session ended with no submit_contradictions submission (excerpt: {})",
-                    outcome.stdout_excerpt
+                    "session ended with no submit_contradictions submission (excerpt: {}){}",
+                    outcome.stdout_excerpt,
+                    crate::verifier_gate::log_path_suffix(outcome.log_path.as_deref())
                 );
                 tracing::warn!(
                     change = %change_slug,
@@ -652,6 +684,7 @@ mod tests {
             Ok(ContradictionSessionOutcome {
                 submission: self.script[idx].clone(),
                 stdout_excerpt: String::new(),
+                log_path: None,
             })
         }
     }
@@ -677,6 +710,7 @@ mod tests {
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            paths: None,
             test_submission: None,
         }
     }
@@ -701,6 +735,7 @@ mod tests {
             timeout: exec.agentic_session_timeout(),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            paths: None,
             test_submission: None,
         };
         assert_eq!(ctx.timeout, exec.agentic_session_timeout());
@@ -854,6 +889,74 @@ mod tests {
             matches!(out, ContradictionCheckOutcome::Clean),
             "empty submission is clean: {out:?}"
         );
+    }
+
+    /// A runner that stands in for the CLI but ALSO reports a persisted session
+    /// log path, so the orchestration's log-path threading is exercised without
+    /// a subprocess (verifier-gates-persist-session-log task 5.2/5.3).
+    struct LoggedContradictionRunner {
+        submission: Option<serde_json::Value>,
+        log_path: Option<PathBuf>,
+    }
+
+    #[async_trait]
+    impl ContradictionSessionRunner for LoggedContradictionRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<ContradictionSessionOutcome> {
+            Ok(ContradictionSessionOutcome {
+                submission: self.submission.clone(),
+                stdout_excerpt: String::new(),
+                log_path: self.log_path.clone(),
+            })
+        }
+    }
+
+    /// 5.2/5.3: a no-submission hold threads the persisted session-log path into
+    /// the fail-closed `Errored.cause`, so the WARN + chatops alert (which render
+    /// `Cause: {cause}`) name the log. Asserts the PATH is present (data flow),
+    /// not the surrounding wording.
+    #[tokio::test]
+    async fn no_submission_cause_names_the_session_log_path() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let log = ws.join("gates").join("in-c1-2026-01-01T00-00-00Z.log");
+        let ctx = test_ctx();
+        let runner = LoggedContradictionRunner {
+            submission: None,
+            log_path: Some(log.clone()),
+        };
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        match out {
+            ContradictionCheckOutcome::Errored { cause } => {
+                assert!(
+                    cause.contains(&log.display().to_string()),
+                    "the fail-closed cause must name the session log path; got: {cause}"
+                );
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    /// 5.2: when no log was persisted (the path is `None`), the cause is
+    /// unchanged — the suffix is empty, so the disposition/wording is preserved.
+    #[tokio::test]
+    async fn no_submission_without_log_path_has_no_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = LoggedContradictionRunner {
+            submission: None,
+            log_path: None,
+        };
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        match out {
+            ContradictionCheckOutcome::Errored { cause } => {
+                assert!(
+                    !cause.contains("session log:"),
+                    "no log path → no session-log suffix; got: {cause}"
+                );
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
     }
 
     /// A session that records NO submission FAILS CLOSED (Errored → held).

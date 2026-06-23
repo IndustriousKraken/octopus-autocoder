@@ -214,6 +214,7 @@ pub(crate) fn out_gate_ctx(
         attribution: Some("anthropic/claude-test".into()),
         retries: 0,
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
+        paths: None,
         test_submission: Some(submission),
     }
 }
@@ -595,6 +596,7 @@ pub(crate) fn cc_test_ctx(
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         revision_transcript_fetch_retries: 0,
         revision_converge_attempts: 0,
+        paths: None,
         test_submission: Some(submission),
     }
 }
@@ -619,6 +621,7 @@ pub(crate) fn canon_test_ctx(
         attribution,
         retries: 0,
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
+        paths: None,
         test_submission: Some(submission),
     }
 }
@@ -646,6 +649,7 @@ pub(crate) fn gr_test_ctx(
         retries: 0,
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         corpus_dir,
+        paths: None,
         test_submission: Some(submission),
     }
 }

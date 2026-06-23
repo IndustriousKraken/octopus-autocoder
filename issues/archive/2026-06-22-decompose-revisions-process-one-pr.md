@@ -16,15 +16,15 @@ longer one ~900-line function. Outcome semantics and PR outcomes are identical.
 
 ## Tasks
 
-- [ ] In `process_one_pr`, factor the repeated post-processing shared across the
+- [x] In `process_one_pr`, factor the repeated post-processing shared across the
   executor-outcome arms (`Completed`, `AskUser`, `Failed`, `PreconditionUnmet`,
   `SpecNeedsRevision`, `IterationRequested`, `Aborted`) into a helper so each arm
   carries only its unique logic. Re-locate via the function NAME — line numbers
   have drifted.
-- [ ] Split the remaining body along its internal phases into smaller functions so
+- [x] Split the remaining body along its internal phases into smaller functions so
   the orchestration is no longer one ~900-line function, keeping the outcome
   semantics identical.
-- [ ] Verify: `cargo build` and the existing suite pass; PR outcomes for every
+- [x] Verify: `cargo build` and the existing suite pass; PR outcomes for every
   executor outcome are unchanged.
 
 ## Constraints (behavior-preserving refactor)

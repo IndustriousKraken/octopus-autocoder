@@ -298,6 +298,12 @@ pub struct CodeImplementsSpecCheckCtx {
     /// startup; a timed-out session renders FAILED TO RUN (advisory, never
     /// blocks) per the fail-closed standard.
     pub timeout: Duration,
+    /// Resolved daemon paths, used to persist the gate session's full captured
+    /// output to a discoverable per-session log under `gates/`
+    /// (verifier-gates-persist-session-log). `None` only for test/standalone
+    /// contexts that opt out; production wires it from the daemon's
+    /// `DaemonPaths`. The session log is written for EVERY outcome.
+    pub paths: Option<Arc<crate::paths::DaemonPaths>>,
     /// Test-only injected `submit_verdict` submission, bypassing the CLI
     /// subprocess AND the control socket. `Some(Some(p))` stands in for a
     /// recorded payload; `Some(None)` simulates "agent never submitted";
@@ -361,6 +367,11 @@ pub enum SpecVerificationOutcome {
 struct VerdictSessionOutcome {
     submission: Option<serde_json::Value>,
     stdout_excerpt: String,
+    /// Path of the persisted per-session log (written for every outcome;
+    /// `None` only when persistence was not wired or the write failed). Threaded
+    /// into the advisory FAILED-TO-RUN cause so the surfacing names it
+    /// (verifier-gates-persist-session-log).
+    log_path: Option<PathBuf>,
 }
 
 impl crate::verifier_gate::SessionSubmission for VerdictSessionOutcome {
@@ -389,6 +400,12 @@ struct CliVerdictSessionRunner<'a> {
     model: &'a ResolvedModel,
     settings_dir: Option<&'a Path>,
     timeout: Duration,
+    /// Resolved daemon paths for persisting the session log under `gates/`.
+    /// `None` skips persistence (no log path is threaded into the outcome).
+    paths: Option<Arc<crate::paths::DaemonPaths>>,
+    /// The session-log subject (the joined change slugs), used as
+    /// `out-<subject>-<timestamp>.log`.
+    subject: String,
 }
 
 #[async_trait]
@@ -443,10 +460,22 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
         crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
 
         let outcome = result.context("spawning code-implements-spec subprocess")?;
+        // Persist the FULL captured output to a discoverable per-session log
+        // BEFORE the timeout/no-submission branches form their result, so a log
+        // is written for EVERY outcome (verified, no-submission, timeout,
+        // error). Best-effort; never alters the advisory disposition.
+        let log_path = crate::verifier_gate::persist_gate_log(
+            self.paths.as_deref(),
+            VerifierGate::Out,
+            self.workspace,
+            &self.subject,
+            &outcome,
+        );
         if outcome.timed_out {
             return Err(anyhow!(
-                "code-implements-spec session timed out after {}s",
-                self.timeout.as_secs()
+                "code-implements-spec session timed out after {}s{}",
+                self.timeout.as_secs(),
+                crate::verifier_gate::log_path_suffix(log_path.as_deref())
             ));
         }
         // Include stderr — opencode/agy write their real failure there, leaving
@@ -457,6 +486,7 @@ impl VerdictSessionRunner for CliVerdictSessionRunner<'_> {
         Ok(VerdictSessionOutcome {
             submission,
             stdout_excerpt,
+            log_path,
         })
     }
 }
@@ -478,6 +508,7 @@ impl VerdictSessionRunner for CannedVerdictRunner {
         Ok(VerdictSessionOutcome {
             submission: self.submission.clone(),
             stdout_excerpt: String::new(),
+            log_path: None,
         })
     }
 }
@@ -517,6 +548,7 @@ impl VerdictSessionRunner for ScriptedVerdictRunner {
         Ok(VerdictSessionOutcome {
             submission: self.script[idx].clone(),
             stdout_excerpt: String::new(),
+            log_path: None,
         })
     }
 }
@@ -582,6 +614,8 @@ pub async fn run_code_implements_spec_check(
         model: &ctx.model,
         settings_dir: None,
         timeout: ctx.timeout,
+        paths: ctx.paths.clone(),
+        subject: change_slugs.join(","),
     };
     run_code_implements_spec_check_with_runner(
         ctx,
@@ -662,8 +696,9 @@ async fn run_code_implements_spec_check_with_runner(
         Ok(outcome) => match outcome.submission {
             None => {
                 let cause = format!(
-                    "session ended with no submit_verdict submission (excerpt: {})",
-                    outcome.stdout_excerpt
+                    "session ended with no submit_verdict submission (excerpt: {}){}",
+                    outcome.stdout_excerpt,
+                    crate::verifier_gate::log_path_suffix(outcome.log_path.as_deref())
                 );
                 tracing::warn!(
                     changes = %changes,
@@ -925,6 +960,7 @@ mod tests {
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
+            paths: None,
             test_submission: None,
         }
     }
@@ -944,6 +980,7 @@ mod tests {
             attribution: Some("anthropic/claude-test".into()),
             retries: 0,
             timeout: exec.agentic_session_timeout(),
+            paths: None,
             test_submission: None,
         };
         assert_eq!(ctx.timeout, exec.agentic_session_timeout());
@@ -1147,6 +1184,57 @@ mod tests {
                 assert_eq!(v.gaps.len(), 1);
             }
             other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    /// A runner that reports a persisted session-log path, exercising the
+    /// advisory FAILED-TO-RUN cause's log-path threading without a subprocess
+    /// (verifier-gates-persist-session-log task 5.2/5.3).
+    struct LoggedVerdictRunner {
+        submission: Option<serde_json::Value>,
+        log_path: Option<PathBuf>,
+    }
+
+    #[async_trait]
+    impl VerdictSessionRunner for LoggedVerdictRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<VerdictSessionOutcome> {
+            Ok(VerdictSessionOutcome {
+                submission: self.submission.clone(),
+                stdout_excerpt: String::new(),
+                log_path: self.log_path.clone(),
+            })
+        }
+    }
+
+    /// 5.2/5.3: a no-submission `[out]` session renders FAILED TO RUN whose
+    /// `cause` names the persisted session-log path (the advisory PR-body
+    /// section + WARN surface it). Asserts the PATH is present (data flow).
+    #[tokio::test]
+    async fn no_submission_failed_to_run_cause_names_log_path() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_change_spec(ws, "c1", "cap", "spec");
+        let log = ws.join("gates").join("out-c1-ts.log");
+        let ctx = test_ctx();
+        let runner = LoggedVerdictRunner {
+            submission: None,
+            log_path: Some(log.clone()),
+        };
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        match out {
+            SpecVerificationOutcome::FailedToRun { cause } => assert!(
+                cause.contains(&log.display().to_string()),
+                "the FAILED TO RUN cause must name the session log path; got: {cause}"
+            ),
+            other => panic!("expected FailedToRun, got {other:?}"),
         }
     }
 

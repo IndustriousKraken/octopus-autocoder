@@ -97,6 +97,12 @@ pub struct CanonContradictionCheckCtx {
     /// `executor.agentic_session_timeout_secs` (shared with the other gates,
     /// the reviewer, AND the revision sessions). Set once at daemon startup.
     pub timeout: Duration,
+    /// Resolved daemon paths, used to persist the gate session's full captured
+    /// output to a discoverable per-session log under `gates/`
+    /// (verifier-gates-persist-session-log). `None` only for test/standalone
+    /// contexts that opt out; production wires it from the daemon's
+    /// `DaemonPaths`. The session log is written for EVERY outcome.
+    pub paths: Option<Arc<crate::paths::DaemonPaths>>,
     /// Test-only injected `submit_canon_contradictions` submission, bypassing
     /// the CLI subprocess AND the control socket. `Some(Some(p))` stands in
     /// for a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -281,6 +287,7 @@ impl CorpusCheckSessionRunner for CannedCanonContradictionRunner {
         Ok(crate::preflight::corpus_check::CorpusCheckSessionOutcome {
             submission: self.submission.clone(),
             stdout_excerpt: String::new(),
+            log_path: None,
         })
     }
 }
@@ -359,6 +366,9 @@ pub async fn run_agentic_canon_contradiction_check(
         settings_dir: None,
         timeout: ctx.timeout,
         subject_noun: "change-vs-canonical-check",
+        gate: VerifierGate::Canon,
+        subject_slug: change_slug,
+        paths: ctx.paths.clone(),
     };
     run_agentic_canon_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner)
         .await
@@ -479,6 +489,9 @@ pub async fn run_agentic_issue_contract_change_check(
         settings_dir: None,
         timeout: ctx.timeout,
         subject_noun: "issue contract-change check",
+        gate: VerifierGate::Canon,
+        subject_slug: issue_slug,
+        paths: ctx.paths.clone(),
     };
     run_agentic_issue_contract_change_check_with_runner(ctx, workspace_root, issue_slug, &runner)
         .await
@@ -695,6 +708,7 @@ mod tests {
             Ok(CorpusCheckSessionOutcome {
                 submission: self.script[idx].clone(),
                 stdout_excerpt: String::new(),
+                log_path: None,
             })
         }
     }
@@ -718,6 +732,7 @@ mod tests {
             // session exactly once; the retry behavior has its own tests.
             retries: 0,
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
+            paths: None,
             test_submission: None,
         }
     }
@@ -738,6 +753,7 @@ mod tests {
             attribution: None,
             retries: 0,
             timeout: exec.agentic_session_timeout(),
+            paths: None,
             test_submission: None,
         };
         assert_eq!(ctx.timeout, exec.agentic_session_timeout());
