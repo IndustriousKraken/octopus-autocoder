@@ -286,6 +286,7 @@ fn build_ctxs(cfg: &Config, paths: &crate::paths::DaemonPaths) -> Result<GateCtx
                     .executor
                     .revision_transcript_fetch_retries,
                 revision_converge_attempts: cfg.executor.revision_converge_attempts,
+                paths: Some(std::sync::Arc::new(paths.clone())),
                 #[cfg(test)]
                 test_submission: None,
             })
@@ -313,6 +314,7 @@ fn build_ctxs(cfg: &Config, paths: &crate::paths::DaemonPaths) -> Result<GateCtx
                 attribution: None,
                 retries,
                 timeout,
+                paths: Some(std::sync::Arc::new(paths.clone())),
                 #[cfg(test)]
                 test_submission: None,
             })
@@ -350,6 +352,7 @@ fn build_ctxs(cfg: &Config, paths: &crate::paths::DaemonPaths) -> Result<GateCtx
                 retries,
                 timeout,
                 corpus_dir,
+                paths: Some(std::sync::Arc::new(paths.clone())),
                 #[cfg(test)]
                 test_submission: None,
             })
@@ -504,6 +507,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(3600),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            paths: None,
             test_submission: submission,
         }
     }

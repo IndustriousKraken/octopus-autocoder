@@ -291,10 +291,39 @@ fn handle_request<W: Write>(
                 .and_then(|t| t.as_array())
                 .cloned()
                 .unwrap_or_default();
-            if let Some(role) = std::env::var(ENV_ROLE).ok().filter(|s| !s.is_empty())
-                && let Some(tool) = submission_tool_for_role(&role)
-            {
-                tools.push(tool);
+            // verifier-gates-persist-session-log task 4.1: record which
+            // submission tool (if any) this MCP child advertised for the
+            // session's role, so a held no-submission gate is diagnosable —
+            // "tool never advertised" (mode a) vs "advertised but not called"
+            // (mode b). The DAEMON-SIDE record (via the control socket) is the
+            // source of truth: it does not depend on the wrapped CLI forwarding
+            // the MCP child's stderr (opencode may not), unlike the eprintln
+            // breadcrumb below — which is kept as a redundant, harmless trace
+            // for the claude-cli path that does forward stderr. No control-flow
+            // change: the advertised set is built above exactly as before; this
+            // only observes it, and the daemon record is best-effort/fail-open.
+            if let Some(role) = std::env::var(ENV_ROLE).ok().filter(|s| !s.is_empty()) {
+                let advertised = submission_tool_name_for_role(&role);
+                match advertised {
+                    Some(tool) => eprintln!(
+                        "[autocoder-mcp] role={role} advertised submission tool: {tool}"
+                    ),
+                    None => eprintln!(
+                        "[autocoder-mcp] role={role} advertised submission tool: NONE (no tool matched this role)"
+                    ),
+                }
+                // Daemon-side record (source of truth for mode a). Best-effort:
+                // a failure to relay is logged to stderr and dropped — it MUST
+                // NOT fail the MCP child or alter the gate outcome, exactly like
+                // the submission relay's own error handling.
+                if let Err(e) = relay_advertised_tool(&role, advertised) {
+                    eprintln!(
+                        "[autocoder-mcp] role={role} advertised-tool relay failed (best-effort, ignored): {e:#}"
+                    );
+                }
+                if let Some(tool) = submission_tool_for_role(&role) {
+                    tools.push(tool);
+                }
             }
             let result = serde_json::json!({ "tools": tools });
             emit_result(writer, id, result)?;
@@ -859,6 +888,46 @@ fn relay_submission(role: &str, payload: &serde_json::Value) -> Result<()> {
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("daemon rejected record_submission");
+        return Err(anyhow!("{err}"));
+    }
+    Ok(())
+}
+
+/// Relay (daemon-side) which submission tool this MCP child advertised for
+/// the session's `role` at `tools/list` time, via the control-socket
+/// `record_advertised_tool` action — a sibling of [`relay_submission`]
+/// (verifier-gates-persist-session-log task 4.1). `tool` is `Some(name)`
+/// when a `submit_*` tool matched the role, `None` when none did (mode a is
+/// exactly that fact). Keyed by the same `(workspace_basename, change)` the
+/// submission relay uses, so `consume_submission` can cross-reference it.
+///
+/// Best-effort/fail-open: any failure (socket unset, transport error, daemon
+/// rejection) is returned as `Err` for the caller to log-and-drop. Unlike the
+/// stderr breadcrumb this does NOT depend on the wrapped CLI forwarding the
+/// MCP child's stderr (opencode may not), so it is the reliable source of
+/// truth. A failure to record MUST NOT change the gate outcome.
+fn relay_advertised_tool(role: &str, tool: Option<&str>) -> Result<()> {
+    let socket_path = std::env::var(ENV_CONTROL_SOCKET).map_err(|_| {
+        anyhow!("{ENV_CONTROL_SOCKET} not set; cannot record advertised tool")
+    })?;
+    let workspace_basename = std::env::var(ENV_WORKSPACE_BASENAME).map_err(|_| {
+        anyhow!("{ENV_WORKSPACE_BASENAME} not set; cannot route advertised-tool record")
+    })?;
+    let change = std::env::var(ENV_CHANGE)
+        .map_err(|_| anyhow!("{ENV_CHANGE} not set; cannot route advertised-tool record"))?;
+    let request = serde_json::json!({
+        "action": "record_advertised_tool",
+        "workspace_basename": workspace_basename,
+        "change": change,
+        "role": role,
+        "tool": tool,
+    });
+    let resp = relay_to_control_socket(Path::new(&socket_path), &request)?;
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon rejected record_advertised_tool");
         return Err(anyhow!("{err}"));
     }
     Ok(())
@@ -1521,6 +1590,14 @@ mod tests {
         assert_eq!(
             submission_tool_name_for_role("global_rules_check"),
             Some("submit_rule_violations")
+        );
+        // a63: the `[out]` gate gets `submit_verdict`. (This lookup is also the
+        // source of the no-submission diagnosability record — the advertised
+        // tool a gate's MCP child names for its role,
+        // verifier-gates-persist-session-log task 4.1.)
+        assert_eq!(
+            submission_tool_name_for_role("code_implements_spec"),
+            Some("submit_verdict")
         );
         // a75: the canon-internal contradiction AUDIT gets the symmetric
         // `submit_canon_internal_contradictions` (distinct from a62's

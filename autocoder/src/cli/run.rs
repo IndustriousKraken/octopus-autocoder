@@ -339,6 +339,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                     .executor
                     .revision_transcript_fetch_retries,
                 revision_converge_attempts: cfg.executor.revision_converge_attempts,
+                paths: Some(daemon_paths.clone()),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -398,6 +399,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
                 timeout: cfg.executor.agentic_session_timeout(),
+                paths: Some(daemon_paths.clone()),
                 #[cfg(test)]
                 test_submission: None,
             },
@@ -465,6 +467,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                     retries: cfg.executor.verifier_gate_retries,
                     timeout: cfg.executor.agentic_session_timeout(),
                     corpus_dir,
+                    paths: Some(daemon_paths.clone()),
                     #[cfg(test)]
                     test_submission: None,
                 },
@@ -524,6 +527,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 attribution: Some(attribution),
                 retries: cfg.executor.verifier_gate_retries,
                 timeout: cfg.executor.agentic_session_timeout(),
+                paths: Some(daemon_paths.clone()),
                 #[cfg(test)]
                 test_submission: None,
             },

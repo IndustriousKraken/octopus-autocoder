@@ -2474,6 +2474,52 @@ pub(crate) fn handle_record_submission(parsed: &Value, state: &ControlState) -> 
     }
 }
 
+/// Handle the `record_advertised_tool` action
+/// (verifier-gates-persist-session-log task 4.1). Records which submission
+/// tool the per-execution MCP child advertised for the session's role at
+/// `tools/list` time — `tool` present when a `submit_*` tool matched the
+/// role, absent/null when none did. Stored daemon-side keyed by
+/// `(workspace_basename, change)` so a held no-submission `consume` can
+/// report "tool never advertised" (mode a) without depending on the wrapped
+/// CLI forwarding the MCP child's stderr (opencode may not). Sibling of
+/// [`handle_record_submission`] AND, like it, best-effort: a malformed
+/// request returns `{"ok":false,...}` but never changes a gate outcome
+/// (the MCP child treats the relay as fire-and-forget). Observability only.
+pub(crate) fn handle_record_advertised_tool(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let role = match require_str(parsed, "role") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    // `tool` is optional: null/absent means "no submit tool matched this role"
+    // (mode a is the very fact we are recording).
+    let tool = parsed
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    tracing::info!(
+        workspace_basename = %workspace_basename,
+        change = %change,
+        role = %role,
+        advertised_tool = tool.as_deref().unwrap_or("none"),
+        "advertised submission tool recorded via MCP tools/list"
+    );
+    state.submission_store.record_advertised_tool(
+        workspace_basename,
+        change,
+        role,
+        tool,
+    );
+    json!({"ok": true})
+}
+
 /// Handle the `consume_submission` action (a56). Atomically reads AND
 /// removes the stored submission for `(workspace_basename, change)`.
 /// Returns `{"ok":true,"submission":null}` when no entry exists (absence
@@ -2492,6 +2538,46 @@ pub(crate) fn handle_consume_submission(parsed: &Value, state: &ControlState) ->
         .submission_store
         .consume(&workspace_basename, &change)
         .unwrap_or(Value::Null);
+    // verifier-gates-persist-session-log tasks 4.1 + 4.2: when the consume
+    // finds no live submission, report all three daemon-side facts together so a
+    // held no-submission gate is fully diagnosable from the daemon's own logs,
+    // with NO dependence on the wrapped CLI forwarding the MCP child's stderr:
+    //   advertised — which submit tool the MCP child advertised for the role at
+    //     tools/list (or "none advertised for role"): mode (a) tool-never-
+    //     advertised vs the tool being available.
+    //   relayed    — whether a schema-valid submission ever reached the daemon:
+    //     mode (c) relayed-but-not-consumed vs mode (b) never-relayed.
+    //   consumed   — none (this branch is the no-live-submission case).
+    // All keyed by (workspace_basename, change) and surviving the consume.
+    // Observability only: the returned value is unchanged.
+    if submission.is_null() {
+        let ever_relayed = state
+            .submission_store
+            .was_ever_relayed(&workspace_basename, &change);
+        let advertised = state
+            .submission_store
+            .advertised_tool(&workspace_basename, &change);
+        let advertised_desc = match &advertised {
+            Some((role, Some(tool))) => format!("{tool} (role {role})"),
+            Some((role, None)) => format!("none advertised for role {role}"),
+            None => "no advertisement recorded for this session".to_string(),
+        };
+        tracing::info!(
+            workspace_basename = %workspace_basename,
+            change = %change,
+            submission_advertised = %advertised_desc,
+            submission_relayed = ever_relayed,
+            submission_consumed = false,
+            "consume_submission found no live submission (advertised={}, relayed={}, consumed=none): {}",
+            advertised_desc,
+            ever_relayed,
+            if ever_relayed {
+                "a submission WAS relayed to the daemon but is not present at consume (relayed-but-not-consumed)"
+            } else {
+                "no submission was ever relayed for this session (never-relayed)"
+            }
+        );
+    }
     json!({"ok": true, "submission": submission})
 }
 
