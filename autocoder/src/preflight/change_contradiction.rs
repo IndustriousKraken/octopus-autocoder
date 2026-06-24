@@ -595,10 +595,11 @@ fn build_contradiction_prompt(
         }
     }
     out.push_str(
-        "\nWhen your analysis is complete, call the `submit_contradictions` MCP tool exactly \
-         once with `{ contradictions: [{ requirement_a, requirement_b, summary }] }` (an empty \
-         array means \"no contradictions found\"). Do NOT print the result to stdout — the \
-         daemon reads it ONLY from `submit_contradictions`.\n",
+        "\nNarrate your reasoning freely as you work, but your FINAL action MUST be a single \
+         `submit_contradictions` tool call carrying EVERY contradiction you found \
+         (`{ contradictions: [{ requirement_a, requirement_b, summary, suggested_fix }] }`; an \
+         empty array means \"no contradictions found\"). The daemon records the outcome ONLY \
+         from that tool call — do NOT end your turn without making it.\n",
     );
     out
 }
