@@ -984,7 +984,15 @@ async fn execute_with_deps(
                 Some(ctx),
                 &request.channel,
                 &request.thread_ts,
-                "✗ send it: could not read the discussion thread — not revising blind. No PR opened; `send it` again in a moment.",
+                &format!(
+                    "✗ send it: could not read the discussion thread — not revising \
+                     blind. No PR opened.\nReason: {e:#}\n• If this mentions \
+                     `missing_scope` / `not_in_channel`, the Slack bot lacks the \
+                     channel-history scope — add `channels:history` (public) or \
+                     `groups:history` (private), reinstall the app, and invite the \
+                     bot to this channel.\n• If it mentions `ratelimited` / `http \
+                     429`, `send it` again in a moment."
+                ),
             )
             .await;
             return Ok(());
