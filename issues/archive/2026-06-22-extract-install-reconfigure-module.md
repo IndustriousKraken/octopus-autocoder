@@ -15,17 +15,17 @@ three-section allowlist, and all printed guidance stay byte-for-byte unchanged.
 
 ## Tasks
 
-- [ ] Move the `--reconfigure` subsystem (`resolve_existing_config_path`,
+- [x] Move the `--reconfigure` subsystem (`resolve_existing_config_path`,
   `execute_reconfigure`, `section_label`, `print_restart_guidance`,
   `reconfigure_audits`, `reconfigure_reviewer`, `reconfigure_chatops`,
   `apply_in_place_patch`, `prior_file_mode`, and the `ReconfigureSection` plumbing)
   into a new `autocoder/src/cli/reconfigure.rs`; register it in
   `autocoder/src/cli/mod.rs`. Re-locate via the SYMBOL names — line numbers have
   drifted.
-- [ ] Update the `execute_inner` call site in `install.rs` to call into the new
+- [x] Update the `execute_inner` call site in `install.rs` to call into the new
   module. The `--reconfigure` flag, its three-section allowlist, and all printed
   guidance must stay byte-for-byte unchanged.
-- [ ] Verify: `cargo build` and the existing suite pass; the `--reconfigure` CLI
+- [x] Verify: `cargo build` and the existing suite pass; the `--reconfigure` CLI
   surface and guidance output are unchanged.
 
 ## Constraints (behavior-preserving refactor)
