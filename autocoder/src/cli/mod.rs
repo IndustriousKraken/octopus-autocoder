@@ -88,6 +88,7 @@ pub mod inspect;
 pub mod install;
 pub mod log;
 pub mod pkg_manager;
+pub mod reconfigure;
 pub mod reload;
 pub mod review;
 pub mod rewind;
