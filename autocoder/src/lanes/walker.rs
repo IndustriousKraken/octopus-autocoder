@@ -237,10 +237,23 @@ async fn fail_and_maybe_park(
     perma_stuck_threshold: u32,
     reason: String,
 ) -> IssueStep {
-    // Persist the failure, then read the consecutive-failure count to decide
-    // whether this issue has stopped making progress.
-    let _ = state::record_failure(paths, workspace, slug, &reason);
-    let count = state::failure_count(paths, workspace, slug);
+    // Persist the failure AND use the count it RETURNS to decide whether this
+    // issue has stopped making progress. Re-reading from disk would consult
+    // stale state if the write failed, so the park decision tracks the
+    // function's own return value (mirroring `handle_failure_counter`). When
+    // the write fails, log at WARN and do NOT park: the threshold cannot be
+    // confirmed without a durable counter.
+    let count = match state::record_failure(paths, workspace, slug, &reason) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                issue = %slug,
+                "issues lane: failed to record consecutive-failure state: {e:#}"
+            );
+            return IssueStep::Failed { reason };
+        }
+    };
     if count >= perma_stuck_threshold {
         park_issue(
             paths,
@@ -836,6 +849,49 @@ mod tests {
         );
         // A parked issue is excluded from selection.
         assert!(!issues::list_ready(&ws).unwrap().contains(&"flaky".to_string()));
+    }
+
+    /// The park decision must track the consecutive-failure counter as it
+    /// advances pass-by-pass (the count RETURNED by `record_failure`), parking
+    /// exactly when it reaches the threshold — not before, and never failing to
+    /// park because of a stale disk re-read. Drives three failures at
+    /// threshold 3 and asserts the counter increments each pass, the issue is
+    /// NOT parked below the threshold, AND it parks on the threshold pass.
+    #[tokio::test]
+    async fn failure_counter_advances_and_parks_at_threshold() {
+        let (_td, ws) = workspace_with_issue("creeper");
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let exec = AlwaysFailIssueExecutor;
+
+        // Pass 1: counter → 1, below threshold 3, not parked.
+        let s1 =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "creeper", 3).await;
+        assert!(matches!(s1, IssueStep::Failed { .. }));
+        assert_eq!(state::failure_count(&paths, &ws, "creeper"), 1);
+        assert!(!issues::is_perma_stuck(&ws, "creeper"));
+
+        // Pass 2: counter → 2, still below threshold, not parked.
+        let s2 =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "creeper", 3).await;
+        assert!(matches!(s2, IssueStep::Failed { .. }));
+        assert_eq!(state::failure_count(&paths, &ws, "creeper"), 2);
+        assert!(!issues::is_perma_stuck(&ws, "creeper"));
+
+        // Pass 3: counter reaches threshold 3 → parked. The returned count
+        // drove the decision; parking then clears the counter so a later
+        // unpark grants a fresh attempt budget.
+        let s3 =
+            process_one_issue(&paths, &ws, &repo_cfg(), &exec, None, None, "creeper", 3).await;
+        assert!(matches!(s3, IssueStep::Failed { .. }));
+        assert!(
+            issues::is_perma_stuck(&ws, "creeper"),
+            "parked once the returned count reached the threshold"
+        );
+        assert_eq!(
+            state::failure_count(&paths, &ws, "creeper"),
+            0,
+            "parking clears the counter"
+        );
     }
 
     #[tokio::test]
