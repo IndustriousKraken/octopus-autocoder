@@ -74,21 +74,22 @@ pub fn record_failure(
     entry.count += 1;
     entry.last_reason = reason.to_string();
     entry.last_failed_at = Utc::now();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        // Atomic write: serialize to a temp file in the same directory, then
-        // rename it onto `<slug>.json`. A crash between the temp write and the
-        // rename leaves the previous valid file intact — there is no window in
-        // which `<slug>.json` is truncated. Mirrors
-        // `crate::failure_state::save_entry`.
-        let tmp = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("creating tempfile in {}", parent.display()))?;
-        serde_json::to_writer_pretty(&tmp, &entry)
-            .with_context(|| format!("serializing issue failure state for {}", path.display()))?;
-        tmp.persist(&path)
-            .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    // Atomic write: serialize to a temp file in the same directory, then
+    // rename it onto `<slug>.json`. A crash between the temp write and the
+    // rename leaves the previous valid file intact — there is no window in
+    // which `<slug>.json` is truncated. Mirrors
+    // `crate::failure_state::save_entry`.
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, &entry)
+        .with_context(|| format!("serializing issue failure state for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
     Ok(entry.count)
 }
 
