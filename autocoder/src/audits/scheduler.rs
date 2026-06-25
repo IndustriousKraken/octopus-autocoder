@@ -28,7 +28,8 @@ use super::threads::{
 };
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, AuditRegistry, Finding, Severity,
-    VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, format_audit_notification, truncate_chars,
+    VALIDATION_ERROR_HISTORY_EXCERPT, WritePolicy, format_audit_notification, make_audit_id,
+    truncate_chars,
 };
 use crate::alert_state::AlertCategory;
 use crate::alerts::handle_predictable_failure;
@@ -973,8 +974,12 @@ async fn dispatch_reported_to_chatops(
         return;
     }
     let retry_clause = format_retry_clause(retries_used, max_validation_retries);
+    // One timestamp drives both the notification's truncation-pointer audit_id
+    // AND the stamped excerpt's, so the thread body and the stamped excerpt
+    // carry the identical pointer when truncated.
+    let now = Utc::now();
     let notification =
-        format_audit_notification(audit_type, repo_url, findings, notify_on_clean, Utc::now());
+        format_audit_notification(audit_type, repo_url, findings, notify_on_clean, now);
     if notification.should_thread {
         let top_line = format!("{}{retry_clause}", notification.top_line);
         match ctx
@@ -997,6 +1002,7 @@ async fn dispatch_reported_to_chatops(
                     &ctx.channel,
                     &thread_ts,
                     &notification.thread_body,
+                    now,
                 );
             }
             Ok(None) => {
@@ -1047,13 +1053,20 @@ fn stamp_audit_thread_state(
     channel: &str,
     thread_ts: &str,
     findings_body: &str,
+    now: chrono::DateTime<Utc>,
 ) {
+    // `findings_body` is the already-rendered, rich, body-bearing thread body.
+    // The excerpt cap funnels it through the SAME helper the thread body used,
+    // so a truncated excerpt carries the identical pointer (built from the same
+    // `now`-derived audit_id) — the operator and the triage agent see the same
+    // rich findings.
+    let audit_id = make_audit_id(repo_url, audit_type, now);
     let state = AuditThreadState {
         thread_ts: thread_ts.to_string(),
         channel: channel.to_string(),
         repo_url: repo_url.to_string(),
         audit_type: audit_type.to_string(),
-        findings_excerpt: cap_findings_excerpt(findings_body),
+        findings_excerpt: cap_findings_excerpt(findings_body, &audit_id),
         posted_at: Utc::now(),
         status: AuditThreadStatus::Open,
         reason: None,

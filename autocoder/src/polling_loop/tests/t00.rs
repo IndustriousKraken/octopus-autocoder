@@ -693,3 +693,93 @@ async fn a43_chat_spec_only_opens_pr_without_warning() {
         "no warning expected"
     );
 }
+
+/// Executor that captures the `TriageContext` handed to `run_triage` and then
+/// completes with no diff. Lets the test assert what the triage agent actually
+/// received without driving the wrapped CLI.
+#[derive(Default)]
+struct CapturingTriageExecutor {
+    captured: std::sync::Mutex<Option<crate::executor::TriageContext>>,
+}
+
+#[async_trait::async_trait]
+impl Executor for CapturingTriageExecutor {
+    async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+        unreachable!("the triage drain only invokes run_triage")
+    }
+    async fn resume(&self, _h: crate::executor::ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+        unreachable!()
+    }
+    async fn run_triage(
+        &self,
+        _workspace: &Path,
+        ctx: &crate::executor::TriageContext,
+    ) -> Result<ExecutorOutcome> {
+        *self.captured.lock().unwrap() = Some(ctx.clone());
+        // No writes → empty diff → the drain posts a no-content reply and
+        // flips the thread to Acted; no PR is opened.
+        Ok(ExecutorOutcome::Completed { final_answer: None })
+    }
+}
+
+/// 4.3: on `send it`, the triage drain reads the stamped rich excerpt into
+/// `TriageContext.findings` verbatim — the divergence body reaches the
+/// executor, NOT the thin title-only form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn triage_receives_rich_body_bearing_excerpt_on_send_it() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td, paths) = crate::testing::test_daemon_paths();
+
+    // Stamp an audit-thread state carrying the RICH, body-bearing excerpt
+    // (title line + divergence paragraph), exactly as the scheduler would.
+    let divergence =
+        "spec requires 3 retries; code retries once; a transient timeout drops the change";
+    let excerpt = format!("  🔴 [cap] req (src/x.rs:1)\n{divergence}");
+    let thread_ts = "T-rich-excerpt";
+    let state = crate::audits::threads::AuditThreadState {
+        thread_ts: thread_ts.into(),
+        channel: "C_TEST".into(),
+        repo_url: "git@github.com:owner/fixture.git".into(),
+        audit_type: "drift_audit".into(),
+        findings_excerpt: excerpt.clone(),
+        posted_at: chrono::Utc::now(),
+        status: crate::audits::threads::AuditThreadStatus::TriagePending,
+        reason: None,
+    };
+    let state_root = crate::audits::threads::default_state_root(&paths);
+    crate::audits::threads::write_state(&state_root, &state).unwrap();
+
+    let executor = CapturingTriageExecutor::default();
+    let chatops = Arc::new(RecordingChatOps {
+        replies: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = recording_ctx(&chatops);
+
+    process_audit_triages(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &executor,
+        &triage_github_cfg(),
+        Some(&ctx),
+        &[thread_ts.to_string()],
+    )
+    .await
+    .expect("triage drain must succeed");
+
+    let captured = executor
+        .captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("run_triage must have been invoked");
+    assert_eq!(
+        captured.findings, excerpt,
+        "TriageContext.findings must equal the stamped excerpt verbatim"
+    );
+    assert!(
+        captured.findings.contains(divergence),
+        "the divergence body must reach triage, not just the title: {}",
+        captured.findings
+    );
+}
