@@ -879,6 +879,27 @@ github:
     }
 
     #[test]
+    fn missing_git_binary_blocks_startup() {
+        // `git` is a REQUIRED dependency: a host without it must fail the
+        // preflight loudly at startup rather than discovering the absence
+        // mid-pass when a `git` spawn ENOENTs. Confirms the daemon validates
+        // `git` availability up front.
+        let probe = FakeProbe {
+            present: vec!["claude".into(), "gh".into(), "ollama".into()], // git absent
+            ..FakeProbe::all_present()
+        };
+        let report = build_report(&base_cfg(), &probe);
+        let git = find(&report, "git").expect("git must be checked");
+        assert_eq!(git.status, DepStatus::Missing);
+        assert!(git.is_blocking(), "missing git must block startup");
+        assert_eq!(doctor_exit_code(&report), 1);
+        // The blocking error names git AND how to install it.
+        let msg = report.blocking_error_message();
+        assert!(msg.contains("git"), "{msg}");
+        assert!(msg.contains("install git") || msg.contains("apt-get install git"), "{msg}");
+    }
+
+    #[test]
     fn executor_cli_missing_blocks() {
         let probe = FakeProbe {
             present: vec!["git".into(), "gh".into(), "ollama".into()], // claude (executor) absent

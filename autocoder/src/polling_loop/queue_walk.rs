@@ -318,6 +318,37 @@ async fn apply_pending_outcome(
             return WalkControl::Halt;
         }
         Err(e) => {
+            // A vanished workspace `current_dir` at post-executor time (the
+            // workspace dir was evicted/recreated between the executor run and
+            // the post-executor `git status`) is a RECOVERABLE environmental
+            // condition, not a per-change defect. Route it like the mid-
+            // iteration recovery path (transient; the next iteration's
+            // workspace-init re-clones it) instead of bumping the per-change
+            // failure counter / writing a perma-stuck marker, so it does not
+            // linger as a terminal `last failure` in `status`.
+            if git::is_missing_workspace_dir(&e) {
+                let class = classify_recovery_failure(&e);
+                tracing::warn!(
+                    url = repo.url.as_str(),
+                    change = %change,
+                    class = class.log_tag(),
+                    "post-executor workspace directory vanished; treating as transient (re-init next iteration), not a per-change failure: {e:#}"
+                );
+                handle_classified_recovery_failure(
+                    paths,
+                    workspace,
+                    &repo.url,
+                    chatops_ctx,
+                    chatops_ctx
+                        .map(|c| c.failure_alerts_enabled)
+                        .unwrap_or(false),
+                    AlertCategory::WorkspaceInitFailure,
+                    &e,
+                    class,
+                )
+                .await;
+                return WalkControl::Halt;
+            }
             // The per-change processing function returned Err from a
             // non-executor source (e.g. queue::archive collision,
             // post-executor commit failure, lock I/O, an unlock
