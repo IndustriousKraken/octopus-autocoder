@@ -191,7 +191,24 @@ fn corpus_clone_name(url: &str) -> String {
 /// cloned into `cache_dir` (reused on subsequent startups). Returns the resolved
 /// directory OR a fail-fast error (the caller turns this into a daemon-startup
 /// failure so the misconfig surfaces before polling).
+///
+/// A LOCAL path may begin with `~/` or `$HOME/` (or be a bare `~` / `$HOME`); it
+/// is expanded to the operator's home directory before the exists/is-dir checks
+/// (global-rules-corpus-home-expansion). A git-URL corpus value is NOT subject
+/// to expansion.
 pub fn resolve_corpus(corpus: &str, cache_dir: &Path) -> Result<PathBuf> {
+    resolve_corpus_with_home(corpus, cache_dir, expansion_home_dir().as_deref())
+}
+
+/// Inner resolver with the home directory INJECTED, so the leading-home
+/// expansion of a local corpus path is unit-testable without mutating the
+/// process-global `HOME`. The public [`resolve_corpus`] supplies the real home
+/// via [`expansion_home_dir`]; `home` is `None` when it could not be determined.
+fn resolve_corpus_with_home(
+    corpus: &str,
+    cache_dir: &Path,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
     let corpus = corpus.trim();
     if corpus.is_empty() {
         return Err(anyhow!("executor.global_rules.corpus is empty"));
@@ -220,7 +237,17 @@ pub fn resolve_corpus(corpus: &str, cache_dir: &Path) -> Result<PathBuf> {
         }
         Ok(target)
     } else {
-        let path = PathBuf::from(corpus);
+        // global-rules-corpus-home-expansion: expand a leading `~/` or `$HOME/`
+        // (or a bare `~` / `$HOME`) BEFORE constructing the `PathBuf` so a drop-in
+        // config such as `~/.config/autocoder/global-rules` (the value the
+        // check-only installer's `install-verify.sh` writes) resolves to
+        // `<home>/.config/autocoder/global-rules` rather than a literal `~`
+        // directory. Expansion is leading-only AND conservative (see
+        // [`expand_leading_home`]); when the home dir is unknown the value is left
+        // as-is so the existing `path does not exist` error still surfaces. The
+        // exists AND is-dir checks run against the EXPANDED path.
+        let expanded = expand_leading_home(corpus, home);
+        let path = PathBuf::from(expanded);
         if !path.exists() {
             return Err(anyhow!(
                 "executor.global_rules.corpus path does not exist: {}",
@@ -234,6 +261,44 @@ pub fn resolve_corpus(corpus: &str, cache_dir: &Path) -> Result<PathBuf> {
             ));
         }
         Ok(path)
+    }
+}
+
+/// The home directory used for leading-home expansion of a LOCAL corpus path:
+/// `$HOME` when set AND non-empty, else `None` (so [`expand_leading_home`]
+/// leaves a `~/...` value unexpanded and the existing `path does not exist`
+/// error still surfaces — no new error kind). Mirrors the `$HOME`-only home
+/// resolution used elsewhere in the crate (`crate::paths`).
+fn expansion_home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Expand a leading `~/` or `$HOME/` (or a bare `~` / `$HOME` that is the entire
+/// value) in a LOCAL corpus path to `home`, concatenating the remainder onto the
+/// resolved home dir. Leading-only AND conservative: a tilde ELSEWHERE in the
+/// value, the `~user` form, and any value without a leading home token are
+/// returned unchanged. When `home` is `None` (the home dir could not be
+/// determined) the value is returned unexpanded.
+fn expand_leading_home(value: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return value.to_string();
+    };
+    // A bare home token that is the ENTIRE value expands to the home dir itself.
+    if value == "~" || value == "$HOME" {
+        return home.to_string_lossy().into_owned();
+    }
+    // Only a LEADING `~/` or `$HOME/` is expanded; the remainder is joined onto
+    // the home dir. Anything else (a mid-string tilde, the `~user` form, an
+    // already-absolute path) is left untouched.
+    match value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("$HOME/"))
+    {
+        Some(remainder) => home.join(remainder).to_string_lossy().into_owned(),
+        None => value.to_string(),
     }
 }
 
@@ -704,6 +769,163 @@ mod tests {
         assert!(is_git_url("ssh://git@host/acme/rules"));
         assert!(!is_git_url("/var/lib/autocoder/rules"));
         assert!(!is_git_url("./rules"));
+    }
+
+    // ---- leading-home expansion (global-rules-corpus-home-expansion) ----
+
+    /// task 2.1: a `~/<subdir>` corpus value resolves to `<home>/<subdir>` and
+    /// passes the exists/is-dir checks. Exercises the inner resolver with the
+    /// home dir injected (no process-global `HOME` mutation).
+    #[test]
+    fn resolve_corpus_tilde_path_expands_to_home() {
+        let home = TempDir::new().unwrap();
+        let cache = home.path().join("cache");
+        std::fs::create_dir_all(home.path().join(".config/autocoder/global-rules")).unwrap();
+        let resolved = resolve_corpus_with_home(
+            "~/.config/autocoder/global-rules",
+            &cache,
+            Some(home.path()),
+        )
+        .expect("a ~/ path with an existing subdir resolves");
+        assert_eq!(resolved, home.path().join(".config/autocoder/global-rules"));
+    }
+
+    /// task 2.2: a `$HOME/<subdir>` corpus value resolves the same way.
+    #[test]
+    fn resolve_corpus_dollar_home_path_expands_to_home() {
+        let home = TempDir::new().unwrap();
+        let cache = home.path().join("cache");
+        std::fs::create_dir_all(home.path().join(".config/autocoder/global-rules")).unwrap();
+        let resolved = resolve_corpus_with_home(
+            "$HOME/.config/autocoder/global-rules",
+            &cache,
+            Some(home.path()),
+        )
+        .expect("a $HOME/ path with an existing subdir resolves");
+        assert_eq!(resolved, home.path().join(".config/autocoder/global-rules"));
+    }
+
+    /// task 2.3: an already-absolute local path with no leading home token is a
+    /// no-op — returned unchanged even when a home dir is available.
+    #[test]
+    fn resolve_corpus_absolute_path_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let corpus = tmp.path().join("rules");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let cache = tmp.path().join("cache");
+        // A different, unrelated home dir must not affect an absolute value.
+        let other_home = TempDir::new().unwrap();
+        let resolved = resolve_corpus_with_home(
+            corpus.to_str().unwrap(),
+            &cache,
+            Some(other_home.path()),
+        )
+        .expect("an absolute existing dir resolves");
+        assert_eq!(resolved, corpus);
+    }
+
+    /// task 2.4: a git-URL corpus value is unaffected by expansion — it takes
+    /// the git-URL (reuse) branch, and a tilde elsewhere in the URL is not
+    /// mangled. Uses the reuse-existing-clone path so no network/clone runs.
+    #[test]
+    fn resolve_corpus_git_url_is_unaffected_by_expansion() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        // A git URL that merely CONTAINS a tilde elsewhere.
+        let url = "https://example.com/~acme/rules.git";
+        assert!(is_git_url(url), "fixture must be detected as a git URL");
+        // Pre-create the clone target so the git branch reuses it (no clone).
+        let target = cache.join(corpus_clone_name(url));
+        std::fs::create_dir_all(&target).unwrap();
+        let home = TempDir::new().unwrap();
+        let resolved = resolve_corpus_with_home(url, &cache, Some(home.path()))
+            .expect("a git URL with an existing clone reuses it");
+        assert_eq!(
+            resolved, target,
+            "git URL must resolve to the clone dir, untouched by home expansion"
+        );
+    }
+
+    /// task 2.5 (optional edge): when the home dir cannot be determined, a
+    /// `~/...` value falls through to the existing `path does not exist` error
+    /// (no new error kind), with the UNEXPANDED value reported.
+    #[test]
+    fn resolve_corpus_tilde_without_home_falls_through_to_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        let err = resolve_corpus_with_home("~/.config/autocoder/global-rules", &cache, None)
+            .expect_err("an unexpandable ~/ path must fail the existence check");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not exist"), "got: {msg}");
+        // The value is left UNEXPANDED, so the literal `~` is reported.
+        assert!(
+            msg.contains("~/.config/autocoder/global-rules"),
+            "the unexpanded value must be reported: {msg}"
+        );
+    }
+
+    /// The public `resolve_corpus` reads the real `$HOME` via
+    /// `expansion_home_dir`; this confirms the env wiring end-to-end. Serialized
+    /// on the crate-wide `ENV_LOCK` because it mutates the process-global `HOME`.
+    #[test]
+    fn resolve_corpus_reads_home_env_for_tilde_expansion() {
+        let _g = crate::testing::ENV_LOCK.lock().unwrap();
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/autocoder/global-rules")).unwrap();
+        let cache = home.path().join("cache");
+        let prior_home = std::env::var_os("HOME");
+        // SAFETY: env mutation is gated by ENV_LOCK above, then restored.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let resolved = resolve_corpus("~/.config/autocoder/global-rules", &cache);
+        unsafe {
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            resolved.expect("resolves against the live HOME"),
+            home.path().join(".config/autocoder/global-rules")
+        );
+    }
+
+    // ---- expand_leading_home: conservative, leading-only ----
+
+    #[test]
+    fn expand_leading_home_handles_leading_tokens() {
+        let home = PathBuf::from("/home/op");
+        let h = Some(home.as_path());
+        assert_eq!(expand_leading_home("~/a/b", h), "/home/op/a/b");
+        assert_eq!(expand_leading_home("$HOME/a/b", h), "/home/op/a/b");
+        // A bare token that is the WHOLE value expands to the home dir itself.
+        assert_eq!(expand_leading_home("~", h), "/home/op");
+        assert_eq!(expand_leading_home("$HOME", h), "/home/op");
+    }
+
+    #[test]
+    fn expand_leading_home_leaves_non_leading_and_user_forms_untouched() {
+        let home = PathBuf::from("/home/op");
+        let h = Some(home.as_path());
+        // `~user` form: not a leading `~/`, left as-is.
+        assert_eq!(expand_leading_home("~alice/rules", h), "~alice/rules");
+        // Tilde NOT at the start of the value.
+        assert_eq!(expand_leading_home("/etc/~/rules", h), "/etc/~/rules");
+        // `$HOME` not at the start.
+        assert_eq!(expand_leading_home("/opt/$HOME/rules", h), "/opt/$HOME/rules");
+        // An already-absolute path with no home token.
+        assert_eq!(expand_leading_home("/var/lib/rules", h), "/var/lib/rules");
+        // A relative path with no home token.
+        assert_eq!(expand_leading_home("./rules", h), "./rules");
+    }
+
+    #[test]
+    fn expand_leading_home_none_home_leaves_value_unexpanded() {
+        assert_eq!(expand_leading_home("~/rules", None), "~/rules");
+        assert_eq!(expand_leading_home("$HOME/rules", None), "$HOME/rules");
+        assert_eq!(expand_leading_home("~", None), "~");
+        assert_eq!(expand_leading_home("/abs/rules", None), "/abs/rules");
     }
 
     // ---- prompt construction ----

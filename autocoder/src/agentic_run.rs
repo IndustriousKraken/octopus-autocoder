@@ -90,6 +90,75 @@ pub fn failure_excerpt(outcome: &AgenticRunOutcome, max: usize) -> String {
     raw.chars().take(max).collect()
 }
 
+/// Per-stream truncation budget for [`failure_reason`]. Each captured stream
+/// (final message, stderr) is truncated to this many chars so a large stack
+/// trace can neither flood the operator's chat channel nor bloat the stored
+/// outcome; the full output stays recoverable in the per-run / per-session log.
+/// The exact value is an implementation detail, not a spec'd number.
+pub const FAILURE_REASON_MAX: usize = 2000;
+
+/// Render the process exit status / terminating signal as a short, legible
+/// label. Always-available evidence: when both the final message AND stderr
+/// are empty (e.g. a process killed by a signal before emitting anything),
+/// this is the SOLE content of the assembled reason, so an empty-output death
+/// is still legible rather than blank. Surfaced raw — never parsed.
+fn exit_status_label(outcome: &AgenticRunOutcome) -> String {
+    if outcome.timed_out {
+        return "timed out".to_string();
+    }
+    match outcome.exit_status {
+        // `ExitStatus`'s Display renders "exit status: N" for a normal exit and
+        // "signal: N (SIGNAME)" for a signal death on Unix — legible AND it
+        // names the terminating signal, so a signal-killed process is surfaced
+        // (named) rather than blank.
+        Some(status) => format!("{status}"),
+        None => "process terminated with no exit status".to_string(),
+    }
+}
+
+/// Assemble a legible, provider-agnostic failure reason from a finished
+/// session's captured evidence, for an operator-facing failure surface — the
+/// executor's `Failed { reason }` AND the reviewer's no-submission discard. The
+/// SINGLE assembler so both surfaces build the reason one way.
+///
+/// Combines, in priority order, each captured stream truncated to `max`:
+/// 1. the agent's final message — the parsed `final_answer` (streaming) when
+///    non-empty, else the captured `stdout` (capture mode has no parsed answer,
+///    so the agent's prose lands there) when non-empty;
+/// 2. the captured `stderr`, labeled, when non-empty;
+/// 3. ALWAYS the process exit status / terminating signal, which is the sole
+///    content when 1 AND 2 are both empty.
+///
+/// The content is surfaced RAW: this never parses, matches, or classifies the
+/// captured text for any decision, which keeps the reason provider-agnostic
+/// across every wrapped CLI and model (a 529 overload notice, a panic trace, a
+/// dropped socket — all surfaced as-is for a human to read).
+pub fn failure_reason(outcome: &AgenticRunOutcome, max: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // The agent's final message: prefer the parsed `final_answer` (streaming);
+    // fall back to captured stdout (capture-mode runs carry no parsed answer).
+    let final_msg = outcome
+        .final_answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let s = outcome.stdout.trim();
+            (!s.is_empty()).then_some(s)
+        });
+    if let Some(msg) = final_msg {
+        parts.push(msg.chars().take(max).collect());
+    }
+    let stderr = outcome.stderr.trim();
+    if !stderr.is_empty() {
+        let excerpt: String = stderr.chars().take(max).collect();
+        parts.push(format!("stderr: {excerpt}"));
+    }
+    // Always present, and the sole content when the streams above are empty.
+    parts.push(exit_status_label(outcome));
+    parts.join(" | ")
+}
+
 /// Output handling for a run. `Streaming` adds `--verbose --output-format
 /// stream-json`, parses each event, and writes the structured log
 /// incrementally. `Capture` reads stdout/stderr at exit with no parsing.
@@ -195,6 +264,21 @@ pub struct SessionStoreCtx<'a> {
 pub trait CliStrategy: Send + Sync {
     fn build_command(&self, ctx: &BuildContext<'_>) -> Command;
     fn apply_model_selection(&self, cmd: &mut Command, model: Option<&ResolvedModel>);
+
+    /// OPTIONAL, defaulted retry hint for the orchestrator's bounded
+    /// no-committable-result retry (executor-outcome-legibility-and-retry).
+    /// Returns `None` by default — the strategy expresses no opinion, AND the
+    /// orchestrator falls back to its bounded no-committable-result rule (NOT
+    /// treated as "never retry"). A strategy that DOES know its provider's
+    /// signals MAY override this to encode them (`Some(false)` to stop retrying
+    /// a clearly-fatal failure, `Some(true)` to retry past the no-result
+    /// guard), keeping any provider-specific retry knowledge encapsulated in the
+    /// strategy that owns it so the core retry path stays provider-agnostic. The
+    /// `claude` strategy does NOT override it: `None` is correct (it defers to
+    /// the bounded no-result rule).
+    fn is_retryable(&self, _outcome: &crate::executor::ExecutorOutcome) -> Option<bool> {
+        None
+    }
 
     /// Apply this CLI's native headless-resume mechanism to a freshly-built
     /// command so the next invocation continues the session named by
@@ -1957,6 +2041,93 @@ mod tests {
         assert_eq!(failure_excerpt(&mk("", ""), 200), "");
         // truncation honored.
         assert_eq!(failure_excerpt(&mk("", "abcdefgh"), 3).chars().count(), 3);
+    }
+
+    /// Task 5.1: the assembled failure reason surfaces, by behavior (which
+    /// captured fields appear), the agent's final message, the labeled stderr,
+    /// AND always the exit status / signal — asserted on which fields appear,
+    /// NOT on exact wording.
+    #[test]
+    fn failure_reason_assembles_captured_evidence() {
+        use std::os::unix::process::ExitStatusExt;
+        let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8); // wait-status: code in high byte
+        // A non-empty final_answer is included (and truncated to budget).
+        let with_answer = AgenticRunOutcome {
+            final_answer: Some("upstream 529 Overloaded".into()),
+            exit_status: Some(exit(1)),
+            ..Default::default()
+        };
+        let r = failure_reason(&with_answer, FAILURE_REASON_MAX);
+        assert!(r.contains("upstream 529 Overloaded"), "final message surfaced: {r}");
+        assert!(r.contains("exit status: 1"), "exit status always present: {r}");
+
+        // Non-empty stderr is included, labeled.
+        let with_stderr = AgenticRunOutcome {
+            stderr: "thread 'main' panicked at lib.rs".into(),
+            exit_status: Some(exit(101)),
+            ..Default::default()
+        };
+        let r = failure_reason(&with_stderr, FAILURE_REASON_MAX);
+        assert!(r.contains("stderr:"), "stderr is labeled: {r}");
+        assert!(r.contains("panicked"), "stderr content surfaced: {r}");
+        assert!(r.contains("exit status: 101"), "exit status present: {r}");
+
+        // Capture-mode prose lands on stdout (no parsed final_answer) — surfaced
+        // as the final message.
+        let capture_prose = AgenticRunOutcome {
+            stdout: "I could not call submit because the API was overloaded".into(),
+            exit_status: Some(exit(0)),
+            ..Default::default()
+        };
+        let r = failure_reason(&capture_prose, FAILURE_REASON_MAX);
+        assert!(r.contains("could not call submit"), "stdout prose surfaced: {r}");
+
+        // BOTH streams empty with a non-zero exit → the exit status is the
+        // SOLE content (an empty-output death is still legible).
+        let empty = AgenticRunOutcome {
+            exit_status: Some(exit(137)),
+            ..Default::default()
+        };
+        let r = failure_reason(&empty, FAILURE_REASON_MAX);
+        assert_eq!(r, "exit status: 137", "empty output → exit status only: {r}");
+
+        // A signal-killed process surfaces the terminating signal (named).
+        let killed = AgenticRunOutcome {
+            exit_status: Some(std::process::ExitStatus::from_raw(9)), // signal 9, no exit code
+            ..Default::default()
+        };
+        let r = failure_reason(&killed, FAILURE_REASON_MAX);
+        assert!(r.contains("signal: 9"), "terminating signal surfaced: {r}");
+
+        // Per-stream truncation honored.
+        let long = AgenticRunOutcome {
+            stderr: "x".repeat(50),
+            exit_status: Some(exit(1)),
+            ..Default::default()
+        };
+        let r = failure_reason(&long, 5);
+        // "stderr: xxxxx | exit status 1" — the stderr body is capped at 5.
+        assert!(r.contains("stderr: xxxxx |"), "stderr truncated to budget: {r}");
+        assert!(!r.contains("xxxxxx"), "no untruncated stderr: {r}");
+    }
+
+    /// Task 2.1 / scenario "Default retry hint expresses no opinion": a
+    /// `CliStrategy` that does not override `is_retryable` (the `claude`
+    /// strategy) returns `None` for every outcome, so the orchestrator falls
+    /// back to its bounded no-committable-result rule.
+    #[test]
+    fn claude_strategy_default_retry_hint_is_none() {
+        let strat = ClaudeStrategy::new("claude".into(), Vec::new());
+        assert_eq!(
+            strat.is_retryable(&crate::executor::ExecutorOutcome::Failed {
+                reason: "boom".into()
+            }),
+            None
+        );
+        assert_eq!(
+            strat.is_retryable(&crate::executor::ExecutorOutcome::Completed { final_answer: None }),
+            None
+        );
     }
 
     #[test]

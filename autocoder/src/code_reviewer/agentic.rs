@@ -336,18 +336,37 @@ pub enum AgenticReviewOutcome {
     Discarded { reason: String },
 }
 
+/// One reviewer session's result (executor-outcome-legibility-and-retry): the
+/// consumed `submit_review` payload (`None` on a no-submission discard) PLUS
+/// the assembled, truncated diagnostic from the session's captured output —
+/// the agent's final message / stderr / exit-signal, raw — surfaced in the
+/// discard reason on the `None` arm so the operator can tell WHY the session
+/// failed to submit (an upstream-API overload notice, prose emitted instead of
+/// a tool call, a schema-rejected submission, etc.). The diagnostic is empty
+/// when a submission was consumed (the `Some` arm ignores it).
+pub(crate) struct ReviewSessionOutput {
+    pub submission: Option<Value>,
+    /// Assembled from the session's captured `final_answer`/`stdout`/`stderr`/
+    /// exit-signal via [`crate::agentic_run::failure_reason`], truncated, raw.
+    /// Names the persisted per-session log path when present so the full output
+    /// is recoverable from disk.
+    pub no_submission_diagnostic: String,
+}
+
 /// Abstracts "run ONE agentic reviewer session AND drain its submission"
 /// so the orchestration ([`run_agentic_review_with_runner`]) is unit-
 /// testable without spawning a CLI. Production is
 /// [`CliReviewSessionRunner`]; tests inject canned submissions.
 #[async_trait]
 pub(crate) trait ReviewSessionRunner: Send + Sync {
-    /// Run one session against `prompt` AND return the consumed
-    /// `submit_review` payload, or `None` when the agent recorded no valid
-    /// submission. `slug` labels the session (empty for bundled). `diff` is
-    /// the session's unified diff, which the runner writes to the
-    /// read-only-readable artifact the prompt references (and removes after).
-    async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>>;
+    /// Run one session against `prompt` AND return its [`ReviewSessionOutput`]:
+    /// the consumed `submit_review` payload (`None` when the agent recorded no
+    /// valid submission) plus the no-submission diagnostic. `slug` labels the
+    /// session (empty for bundled). `diff` is the session's unified diff, which
+    /// the runner writes to the read-only-readable artifact the prompt
+    /// references (and removes after).
+    async fn run_session(&self, slug: &str, prompt: &str, diff: &str)
+    -> Result<ReviewSessionOutput>;
 }
 
 /// Production session runner: writes the per-execution MCP config
@@ -369,11 +388,21 @@ pub(crate) struct CliReviewSessionRunner<'a> {
     /// default). `None` only on the test-only path where no config was
     /// resolved; production always carries `Some`.
     pub(crate) model: Option<&'a crate::agentic_run::ResolvedModel>,
+    /// Daemon paths for the per-session reviewer log under `reviews/`
+    /// (executor-outcome-legibility-and-retry). `None` on the test-only path
+    /// (no `DaemonPaths` resolved) → the log is skipped; production threads it
+    /// from the reviewer's stored paths.
+    pub(crate) paths: Option<&'a std::sync::Arc<crate::paths::DaemonPaths>>,
 }
 
 #[async_trait]
 impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
-    async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>> {
+    async fn run_session(
+        &self,
+        slug: &str,
+        prompt: &str,
+        diff: &str,
+    ) -> Result<ReviewSessionOutput> {
         // Write the unified diff to the artifact the prompt references, so the
         // read-only agent `Read`s it on demand instead of receiving it inlined
         // (which would overflow the model's context on a large pass). The
@@ -456,13 +485,70 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         }
 
         let outcome = result.context("spawning agentic reviewer subprocess")?;
+
+        // Persist the session's FULL captured output to a discoverable per-
+        // session log under `reviews/`, mirroring the audit-log pattern,
+        // REGARDLESS of outcome (a recorded submission, a no-submission discard,
+        // OR a timeout) — so the full output is recoverable from disk when the
+        // surfaced reason is truncated. Best-effort: a log-write failure is
+        // logged, never fatal.
+        let log_path = self.paths.and_then(|paths| {
+            match crate::audits::persist_reviewer_session_log(paths, self.workspace, slug, &outcome)
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        slug = %slug,
+                        "failed to persist reviewer session log (continuing): {e:#}"
+                    );
+                    None
+                }
+            }
+        });
+
+        // A timed-out session keeps its distinct timeout reason rather than the
+        // assembled no-submission diagnostic.
         if outcome.timed_out {
             return Err(anyhow!(
                 "agentic reviewer session timed out after {}s",
                 self.timeout.as_secs()
             ));
         }
-        Ok(crate::audits::try_consume_submission(self.workspace, REVIEWER_ROLE).await)
+
+        let submission = crate::audits::try_consume_submission(self.workspace, REVIEWER_ROLE).await;
+        // On a no-submission outcome, assemble the captured-evidence diagnostic
+        // (final message / stderr / exit-signal, raw, truncated) so the discard
+        // reason surfaces WHY the session failed to submit. Name the per-session
+        // log path so the full (untruncated) output is recoverable from disk.
+        let no_submission_diagnostic = if submission.is_none() {
+            let mut diag = crate::agentic_run::failure_reason(
+                &outcome,
+                crate::agentic_run::FAILURE_REASON_MAX,
+            );
+            if let Some(path) = &log_path {
+                diag.push_str(&format!(" (full session log: {})", path.display()));
+            }
+            diag
+        } else {
+            String::new()
+        };
+        Ok(ReviewSessionOutput {
+            submission,
+            no_submission_diagnostic,
+        })
+    }
+}
+
+/// Append the captured-session diagnostic to a no-submission discard `base`
+/// reason (executor-outcome-legibility-and-retry). Empty diagnostic (a
+/// canned-test runner, or no captured output) leaves the base reason unchanged,
+/// so the existing "recorded no valid submit_review submission" wording is
+/// preserved; a non-empty diagnostic is appended so the operator sees WHY.
+pub(crate) fn append_diagnostic(base: String, diagnostic: &str) -> String {
+    if diagnostic.trim().is_empty() {
+        base
+    } else {
+        format!("{base}: {diagnostic}")
     }
 }
 
@@ -509,6 +595,9 @@ pub async fn run_agentic_review(
         // Pass the reviewer's resolved model so the wrapped CLI runs the
         // operator-configured model, mirroring the verifier gates.
         model: reviewer.resolved_model.as_ref(),
+        // Daemon paths for the per-session `reviews/` log (None on the
+        // test-only no-config path → the log is skipped).
+        paths: reviewer.paths.as_ref(),
     };
     run_agentic_review_with_runner(reviewer, ctx, &runner).await
 }
@@ -560,18 +649,23 @@ pub(crate) async fn run_agentic_review_with_runner(
         let session_slug = slug.as_deref().unwrap_or("");
         let artifact_rel = review_diff_artifact_rel(session_slug);
         let prompt = render_agentic_review_prompt(session_ctx, preamble, &artifact_rel);
-        let consumed = runner
+        let session = runner
             .run_session(session_slug, &prompt, &session_ctx.diff)
             .await?;
-        match consumed {
+        match session.submission {
             None => {
-                let reason = match slug {
+                let base = match slug {
                     Some(s) => format!(
                         "agentic reviewer session for `{s}` recorded no valid submit_review submission"
                     ),
                     None => "agentic reviewer session recorded no valid submit_review submission"
                         .to_string(),
                 };
+                // Surface the captured session output (assembled, truncated,
+                // raw) so the discard is diagnosable rather than a bare "no
+                // submission" — the same surface-the-evidence principle as the
+                // executor failure reason.
+                let reason = append_diagnostic(base, &session.no_submission_diagnostic);
                 return Ok(AgenticReviewOutcome::Discarded { reason });
             }
             Some(payload) => {

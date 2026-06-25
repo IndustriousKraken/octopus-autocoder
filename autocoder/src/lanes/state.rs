@@ -12,7 +12,7 @@
 //! incremented on a failed issue run AND cleared when the issue archives.
 
 use crate::paths::DaemonPaths;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -74,12 +74,22 @@ pub fn record_failure(
     entry.count += 1;
     entry.last_reason = reason.to_string();
     entry.last_failed_at = Utc::now();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let raw = serde_json::to_string_pretty(&entry)?;
-    std::fs::write(&path, raw).with_context(|| format!("writing {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    // Atomic write: serialize to a temp file in the same directory, then
+    // rename it onto `<slug>.json`. A crash between the temp write and the
+    // rename leaves the previous valid file intact — there is no window in
+    // which `<slug>.json` is truncated. Mirrors
+    // `crate::failure_state::save_entry`.
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, &entry)
+        .with_context(|| format!("serializing issue failure state for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
     Ok(entry.count)
 }
 
@@ -109,6 +119,28 @@ mod tests {
         assert_eq!(failure_count(&paths, ws, "iss"), 0);
         // Idempotent clear.
         clear(&paths, ws, "iss").unwrap();
+    }
+
+    #[test]
+    fn record_failure_leaves_no_torn_or_temp_file() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let ws = Path::new("/tmp/some-workspace-basename");
+        record_failure(&paths, ws, "iss", "boom").unwrap();
+
+        // The per-repo issues-state directory must contain exactly the single
+        // `<slug>.json` entry — no leftover NamedTempFile sibling, which would
+        // prove the write was not atomically persisted/cleaned up.
+        let dir = repo_dir(&paths, ws);
+        let want = slug_file(&paths, ws, "iss");
+        let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![want],
+            "issues-state dir should hold only the slug file, no temp leftover"
+        );
     }
 
     #[test]

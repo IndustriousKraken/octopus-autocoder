@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 /// path so the triage prompt can ship the full content the operator saw.
 pub const FINDINGS_EXCERPT_CAP: usize = 35_000;
 
+// The excerpt cap MUST equal the thread-body cap so the stamped excerpt and the
+// posted thread body truncate at the same boundary (the
+// `audit-triage-carries-full-findings` requirement). Enforced at compile time.
+const _: () = assert!(FINDINGS_EXCERPT_CAP == crate::audits::AUDIT_THREAD_BODY_CHAR_CAP);
+
 /// One audit-notification thread's tracked state. Written by the
 /// scheduler when a threaded audit notification posts; consulted by the
 /// chatops dispatcher when `@<bot> send it` arrives.
@@ -178,15 +183,21 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
     Ok(removed)
 }
 
-/// Truncate `findings` to the audit-thread excerpt cap so the stored
-/// state file remains bounded. Callers MUST funnel the full findings
-/// body through this before constructing an `AuditThreadState`.
-pub fn cap_findings_excerpt(findings: &str) -> String {
-    if findings.chars().count() <= FINDINGS_EXCERPT_CAP {
-        findings.to_string()
-    } else {
-        findings.chars().take(FINDINGS_EXCERPT_CAP).collect()
-    }
+/// Truncate `findings` to the audit-thread excerpt cap so the stored state
+/// file remains bounded, appending the same pointer-to-daemon-log tail (naming
+/// `audit_id`) the posted thread body uses when truncation occurs — so the
+/// stamped excerpt and the thread body cap identically (the
+/// `audit-triage-carries-full-findings` requirement). Delegates to the shared
+/// [`crate::audits::cap_audit_findings_body`] so the cap value AND the tail
+/// text are a single source. A body within the cap is returned verbatim.
+///
+/// The delegate is idempotent: the usual input here is the posted thread body,
+/// which the formatter already capped, so an already-capped body is returned
+/// unchanged — the excerpt is byte-identical to the thread body and never gains
+/// a nested second tail. Callers MUST still funnel the full findings body
+/// through this before constructing an `AuditThreadState`.
+pub fn cap_findings_excerpt(findings: &str, audit_id: &str) -> String {
+    crate::audits::cap_audit_findings_body(findings, audit_id)
 }
 
 #[cfg(test)]
@@ -270,12 +281,22 @@ mod tests {
     }
 
     #[test]
-    fn cap_findings_excerpt_truncates_at_cap() {
+    fn cap_findings_excerpt_truncates_at_cap_with_pointer() {
         let s: String = std::iter::repeat_n('x', FINDINGS_EXCERPT_CAP + 100).collect();
-        let capped = cap_findings_excerpt(&s);
-        assert_eq!(capped.chars().count(), FINDINGS_EXCERPT_CAP);
-        // Short strings pass through verbatim.
-        assert_eq!(cap_findings_excerpt("hello"), "hello");
+        let audit_id = "owner_repo:drift_audit:2026-06-25T00:00:00Z";
+        let capped = cap_findings_excerpt(&s, audit_id);
+        // Truncated to the cap AND carrying the pointer-to-daemon-log tail, so
+        // the result runs past the bare cap by exactly the tail length.
+        assert!(capped.chars().count() > FINDINGS_EXCERPT_CAP);
+        assert!(capped.starts_with(&"x".repeat(FINDINGS_EXCERPT_CAP)));
+        assert!(
+            capped.contains(&format!(
+                "[truncated; full findings at journalctl -u autocoder | grep audit_id={audit_id}]"
+            )),
+            "capped excerpt must carry the documented pointer tail: {capped}"
+        );
+        // Short strings pass through verbatim (no pointer appended).
+        assert_eq!(cap_findings_excerpt("hello", "id"), "hello");
     }
 
     #[test]

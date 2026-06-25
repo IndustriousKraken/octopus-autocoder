@@ -8642,3 +8642,130 @@ To make these distinguishable, the MCP submission server SHALL record which subm
 - **THEN** the daemon's recording distinguishes "a submission was relayed but not consumed" from "no submission was ever relayed"
 - **AND** an operator can therefore tell called-but-not-relayed (mode c) from advertised-but-not-called (mode b)
 
+### Requirement: The audit-thread excerpt handed to triage carries each finding's full body
+
+The excerpt stamped into the audit-thread state SHALL carry the same rich,
+body-bearing rendering as the posted audit thread body: per finding, the
+`severity glyph + subject + anchor` title line FOLLOWED BY that finding's full
+`body` field when non-empty. Because that stamped excerpt is exactly the value
+handed to the triage executor as `TriageContext.findings` when an operator runs
+`send it` in the audit thread (per the existing "`send it` verb in an audit thread
+schedules a triage executor run" AND "Triage mode runs the executor with an
+explore-then-classify prompt" requirements), the downstream triage agent SHALL
+receive the divergence reasoning the audit already produced — what the spec
+requires, what the code does, and why — rather than a one-line title it would
+otherwise have to re-derive.
+
+This requirement constrains the CONTENT of the stamped excerpt AND of
+`TriageContext.findings`; it does NOT add, remove, OR reorder any
+`TriageContext` field, NOR change how `send it` schedules or how triage mode runs.
+The stamped excerpt remains subject to its existing 35,000-character cap: when the
+rich rendering would exceed 35,000 characters it is truncated to that cap and ends
+with the existing pointer-to-daemon-log tail, mirroring the thread-body truncation.
+A finding whose `body` is empty contributes only its one-line title, with no stray
+blank-body artifact.
+
+#### Scenario: The stamped excerpt carries the finding bodies
+
+- **WHEN** a `drift_audit` posts an audit notification whose findings carry divergence `body` paragraphs
+- **THEN** the excerpt stamped into the audit-thread state contains each finding's title line AND its full `body` paragraph
+- **AND** the stamped excerpt is the rich body-bearing form, not the title-only string
+
+#### Scenario: Triage receives the rich excerpt on `send it`
+
+- **WHEN** an operator runs `@<bot> send it` in the audit thread AND the next polling iteration drains the triage and invokes `run_triage`
+- **THEN** the `TriageContext.findings` value equals the stamped rich excerpt — the divergence body text is present
+- **AND** the triage agent is NOT handed the title-only form
+
+#### Scenario: The stamped excerpt is still capped at 35,000 characters
+
+- **WHEN** the rich rendering stamped as the excerpt would exceed 35,000 characters
+- **THEN** the stamped excerpt is truncated to 35,000 characters AND ends with the existing pointer-to-daemon-log tail
+- **AND** the 35,000 cap value AND the tail text are unchanged by this requirement
+
+### Requirement: Check-only install writes its config to the default discovery path so verify needs no `--config`
+The check-only install SHALL write its minimal config to the standard location `autocoder` auto-discovers — the same discovery the `run` subcommand uses when `--config` is omitted, which on a user install is `~/.config/autocoder/config.yaml`. A check-only config is an ordinary autocoder config (the same schema, carrying only the subset `verify` needs) AND SHALL NOT use a distinct filename. Consequently `autocoder verify <change-slug>` SHALL resolve this config via auto-discovery with NO `--config` flag. An explicit `--config <path>` SHALL continue to override discovery, so the installer's `--config` option AND CI invocations that pass an explicit path are unaffected. The installer's post-install summary SHALL present the next-step invocation that MATCHES where it wrote the config: the flagless `autocoder verify <change-slug>` when the config went to the default discovery path, OR `autocoder verify <change-slug> --config <path>` when an explicit `--config <path>` directed it elsewhere — so the suggested command always resolves the config the installer just wrote.
+
+Writing the minimal config to the standard discovery path is safe because the check-only spec-authoring machine does not run the daemon, so there is no separate daemon `config.yaml` at that path for it to collide with; the existing "config already exists, leave it untouched" guard still prevents clobbering any pre-existing config.
+
+#### Scenario: Check-only config lands at the auto-discovered path
+- **WHEN** the check-only install completes on a user spec-authoring machine with no `--config` override
+- **THEN** the minimal config is written to `~/.config/autocoder/config.yaml`
+- **AND** `autocoder verify <change-slug>` run in a repository resolves that config via auto-discovery with no `--config` flag
+
+#### Scenario: An explicit --config still overrides discovery
+- **WHEN** an operator runs `autocoder verify <change-slug> --config <path>`
+- **THEN** the config at `<path>` is used, overriding auto-discovery
+- **AND** the installer's `--config <path>` option likewise writes the minimal config to that path
+- **AND** the installer's post-install summary shows the matching `autocoder verify <change-slug> --config <path>` invocation
+
+#### Scenario: The post-install summary shows the flagless invocation when the config went to the discovery path
+- **WHEN** the check-only install finishes having written its config to the default discovery path (no `--config` override)
+- **THEN** its printed next-step command is `autocoder verify <change-slug>` with no `--config` flag
+
+### Requirement: Executor sessions with no committable result are bounded-retried with backoff
+The orchestrator SHALL retry an executor session that FAILED and produced no committable result, up to `executor.session_retries` additional attempts with backoff between attempts, before surfacing the failure. This is provider-agnostic: it does NOT classify or parse the failure to decide — a transient failure clears on a retry, while a deterministic failure recurs through all attempts and is then surfaced with its assembled reason.
+
+The "no committable result" guard SHALL reuse the existing success signal — a clean working tree (`git status --porcelain` empty, the same signal that maps a no-diff `Completed` to `Failed`). A session that DID produce a committable result (a non-empty diff the flow could open a PR from) SHALL NOT be retried, even on a failed outcome; it is surfaced with whatever it produced. The orchestrator SHALL consult the strategy's optional `CliStrategy::is_retryable(&outcome)` hint: `Some(false)` SHALL short-circuit (no retry); `Some(true)` SHALL retry even when a committable result exists — UNLESS `executor.session_retries` is `0`, in which case the hint is suppressed and no retry occurs; `None` SHALL apply the no-committable-result rule above.
+
+`executor.session_retries` SHALL be an attempt-count configuration value (additional whole-session re-invocations beyond the first; small default; `0` disables retry entirely, including suppressing any `Some(true)` strategy hint — `session_retries` is the absolute bound on total additional attempts). It is distinct from `executor.timeout_secs` (a per-attempt duration) and from the gate-scoped verifier-gate retries (which cover a different, no-submission case). A retry-in-progress SHALL be observably distinct from a terminal failure in the operator-facing surface. This bounded in-pass retry SHALL NOT alter the daemon's separate next-pass re-pickup scheduling.
+
+#### Scenario: A no-result failure is retried up to the bound
+- **WHEN** an executor session returns a failed outcome AND left no committable result (clean working tree) AND `executor.session_retries` is a positive N
+- **THEN** the orchestrator re-invokes the session up to N additional times, with backoff between attempts
+- **AND** if an attempt produces a committable result the retry loop stops and that result is used
+- **AND** if all attempts are exhausted the failure is surfaced with its assembled reason
+
+#### Scenario: A failure that produced committable work is not retried
+- **WHEN** an executor session returns a failed outcome BUT left a committable result (non-empty working-tree diff) AND `CliStrategy::is_retryable` returns `None` or `Some(false)`
+- **THEN** the orchestrator does NOT re-invoke the session
+- **AND** the outcome is handled with the work it produced (not blindly re-run)
+
+#### Scenario: Retry is disabled when the bound is zero
+- **WHEN** `executor.session_retries` is `0` AND a session fails with no committable result
+- **THEN** the orchestrator does not retry and surfaces the failure immediately with its assembled reason
+
+#### Scenario: The strategy retry hint overrides the default rule
+- **WHEN** the resolved `CliStrategy::is_retryable(&outcome)` returns `Some(false)` for a failed no-result session
+- **THEN** the orchestrator does NOT retry (the strategy has declared the failure non-retryable)
+- **WHEN** it returns `Some(true)` for a failed session that DID produce a committable result AND `executor.session_retries` is positive
+- **THEN** the orchestrator retries (the strategy has overridden the committable-result guard; retries remain subject to the `session_retries` count)
+
+### Requirement: `executor.session_retries` bounds whole-session retries
+The configuration SHALL expose `executor.session_retries`, an unsigned attempt count of additional whole-session re-invocations the orchestrator may perform on a no-committable-result failure (see "Executor sessions with no committable result are bounded-retried with backoff"). It SHALL have a small positive default when absent and SHALL accept `0` to disable retry. It SHALL NOT be conflated with `executor.timeout_secs` (a duration) or the verifier-gate retry count (a different scope).
+
+#### Scenario: Default applied when unset
+- **WHEN** the configuration omits `executor.session_retries`
+- **THEN** the resolved value is the small positive default (retry is enabled with a bounded count)
+
+#### Scenario: Explicit zero disables retry
+- **WHEN** the configuration sets `executor.session_retries: 0`
+- **THEN** no whole-session retry is performed for any reason — including a failed session that a `Some(true)` strategy hint would otherwise cause to retry
+
+### Requirement: Local rule-corpus path expands a leading ~ or $HOME
+When `executor.global_rules.corpus` is configured as a LOCAL DIRECTORY PATH (a value that is NOT detected as a git URL), autocoder SHALL expand a leading `~/` or `$HOME/` in that value to the operator's home directory BEFORE the directory is resolved and existence-checked. A bare `~` or `$HOME` that is the entire value SHALL expand to the home directory itself. This makes a configured corpus such as `~/.config/autocoder/global-rules` — the value the check-only installer's `install-verify.sh` writes — resolve to `<home>/.config/autocoder/global-rules` rather than a literal `~` directory, so the default check-only config resolves as written.
+
+The expansion is leading-only AND conservative: only a value beginning with `~/` or `$HOME/`, or equal to a bare `~` / `$HOME`, is expanded; a tilde elsewhere in the value, the `~user` form, and any already-absolute path are left untouched. When the home directory cannot be determined, the value SHALL be left unexpanded so the existing `path does not exist` error still surfaces (no new error kind is introduced). The exists AND is-directory checks SHALL run against the expanded path, so their diagnostics report the expanded location.
+
+A git-URL corpus value SHALL be UNAFFECTED: a value detected as a git URL takes the clone/reuse branch and is NOT subject to home expansion. This requirement adds the expansion guarantee for local paths only; it does not change which values are treated as git URLs, nor the corpus-resolvability contract that an enabled `[rules]` gate requires a resolvable corpus.
+
+#### Scenario: A ~/ corpus path expands to the home directory
+- **WHEN** `executor.global_rules.corpus` is the local path `~/.config/autocoder/global-rules` AND the operator's home directory contains that subdirectory
+- **THEN** autocoder expands the leading `~/` to the home directory and resolves the corpus to `<home>/.config/autocoder/global-rules`
+- **AND** the directory-exists check passes against the expanded path
+- **AND** no `path does not exist` error is raised for a literal `~` directory
+
+#### Scenario: A $HOME/ corpus path expands the same way
+- **WHEN** `executor.global_rules.corpus` is the local path `$HOME/.config/autocoder/global-rules` AND that subdirectory exists under the operator's home directory
+- **THEN** autocoder expands the leading `$HOME/` to the home directory and resolves to the same `<home>/.config/autocoder/global-rules` path
+- **AND** the resolved corpus passes the exists AND is-directory checks
+
+#### Scenario: An absolute local path is unchanged
+- **WHEN** `executor.global_rules.corpus` is an already-absolute local directory path with no leading `~/` or `$HOME/`
+- **THEN** expansion is a no-op AND the value is resolved and existence-checked exactly as before
+
+#### Scenario: A git-URL corpus value is unaffected
+- **WHEN** `executor.global_rules.corpus` is a value detected as a git URL
+- **THEN** autocoder takes the clone/reuse branch and does NOT apply home expansion
+- **AND** the resolved corpus is the local clone, exactly as before this change
+
