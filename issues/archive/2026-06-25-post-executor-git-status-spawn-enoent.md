@@ -33,23 +33,23 @@ recoverable transient.
 
 ## Tasks
 
-- [ ] Make the spawn error actionable: when `run_git` (or its post-executor
+- [x] Make the spawn error actionable: when `run_git` (or its post-executor
   caller) hits an `ENOENT` on spawn, distinguish "`git` not found on PATH" from
   "workspace directory missing" — check whether the `current_dir` exists and
   whether `git` resolves — and report which, instead of a bare
   `No such file or directory`.
-- [ ] Treat a missing workspace cwd at post-executor time as a TRANSIENT,
+- [x] Treat a missing workspace cwd at post-executor time as a TRANSIENT,
   recoverable condition (classify it like the workspace-init/dirty recovery path
   so the workspace is re-initialized on the next iteration) rather than a terminal
   post-executor failure that lingers as `last failure` in status.
-- [ ] Confirm the daemon validates `git` availability at startup (dependency
+- [x] Confirm the daemon validates `git` availability at startup (dependency
   preflight, `dependency_preflight.rs`); if it does not, add it, so a genuinely
   missing `git` binary fails fast and loudly at startup instead of mid-pass.
 
 ## Tests
 
-- [ ] `run_git` / `status_entries` invoked with a non-existent `current_dir`
+- [x] `run_git` / `status_entries` invoked with a non-existent `current_dir`
   returns an error that names the missing-workspace cause (not a bare ENOENT).
-- [ ] The post-executor path, given a vanished workspace, classifies the failure
+- [x] The post-executor path, given a vanished workspace, classifies the failure
   as transient/recoverable (re-init next iteration), asserted via the recovery
   classification rather than message text.
