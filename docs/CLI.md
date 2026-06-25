@@ -170,8 +170,10 @@ autocoder verify add-widget-endpoint --all
 # Run a named subset.
 autocoder verify add-widget-endpoint --gate in,canon
 
-# Point at an explicit config (e.g. the check-only spec-box config).
-autocoder verify add-widget-endpoint --config ~/.config/autocoder/verify.yaml
+# A check-only install drops its config at the standard auto-discovered path
+# (~/.config/autocoder/config.yaml), so the flagless form above resolves it
+# with NO --config. Pass --config only to point at a config elsewhere.
+autocoder verify add-widget-endpoint --config /path/to/config.yaml
 ```
 
 `verify` runs in the current working directory's repository, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It is a new invocation surface for the *exact* gate checks the server runs: the same check entry points, prompts, per-gate model config (`executor.change_internal_contradiction_check_llm`, `executor.change_canonical_contradiction_check_llm`, `executor.global_rules_check_llm`), submission schemas, and the unified `executor.agentic_session_timeout_secs`. Because it reuses the gate logic rather than approximating it, a change `verify` reports clean is not subsequently kicked back by that same server gate (absent canon drift since the local run).
@@ -182,7 +184,7 @@ autocoder verify add-widget-endpoint --config ~/.config/autocoder/verify.yaml
 
 **Exit codes (fail-closed, no manufactured pass).** `0` only when every gate that ran is clean; `1` when any gate finds a contradiction OR an enabled gate cannot run (model unconfigured, transport error, no submission captured) — `verify` reports "gate could not run" and never reports clean for a gate that did not actually evaluate; `2` when no spec-checking gate is enabled and no selector forces one (`verify` reports that no gate evaluated the change and exits non-zero rather than manufacturing a clean pass).
 
-**Check-only install on a spec-box.** `verify` is a subcommand of the autocoder binary, so it ships the identical logic the server runs. To run it on a low-powered spec-authoring machine without building from source or running the daemon, use the check-only installer, which fetches the prebuilt binary and drops a minimal config carrying only the three gate model blocks, their enabled flags, and the global-rule corpus location:
+**Check-only install on a spec-box.** `verify` is a subcommand of the autocoder binary, so it ships the identical logic the server runs. To run it on a low-powered spec-authoring machine without building from source or running the daemon, use the check-only installer, which fetches the prebuilt binary and drops a minimal config carrying only the three gate model blocks, their enabled flags, and the global-rule corpus location. It writes that config to the standard auto-discovered path (`~/.config/autocoder/config.yaml`), so `autocoder verify <change-slug>` then resolves it with no `--config` flag:
 
 ```bash
 ./install-verify.sh           # latest release

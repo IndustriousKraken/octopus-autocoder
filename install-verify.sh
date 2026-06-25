@@ -24,11 +24,19 @@ STEP="init"
 trap 'echo "install-verify.sh failed during step: ${STEP}" >&2' ERR
 
 VERSION="${AUTOCODER_VERSION:-}"
-CONFIG_PATH="${HOME}/.config/autocoder/verify.yaml"
+# Default to the STANDARD discovery location autocoder auto-resolves (the same
+# path `run`/`verify` find when `--config` is omitted), so a check-only install
+# makes `autocoder verify <change-slug>` work with NO `--config` flag. A check-
+# only config is an ordinary autocoder config — just a minimal subset — so it
+# does not warrant a distinct filename.
+CONFIG_PATH="${HOME}/.config/autocoder/config.yaml"
+# Tracks whether the operator pointed `--config` somewhere explicit; when they
+# did, the post-install summary suggests the matching `--config <path>` form.
+CONFIG_OVERRIDDEN=0
 while (( $# )); do
   case "$1" in
     --version) VERSION="$2"; shift 2;;
-    --config) CONFIG_PATH="$2"; shift 2;;
+    --config) CONFIG_PATH="$2"; CONFIG_OVERRIDDEN=1; shift 2;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -123,6 +131,17 @@ YAML
   echo "wrote minimal verify config to ${CONFIG_PATH}"
 fi
 
+# Suggest the next-step invocation that MATCHES where the config landed: the
+# flagless form when it went to the standard discovery path (auto-discovered,
+# no `--config` needed), or the explicit `--config <path>` form when the
+# operator directed it elsewhere — so the printed command always resolves the
+# config this installer just wrote.
+if (( CONFIG_OVERRIDDEN )); then
+  NEXT_STEP="autocoder verify <change-slug> --config ${CONFIG_PATH}"
+else
+  NEXT_STEP="autocoder verify <change-slug>"
+fi
+
 cat <<EOF
 
 autocoder (verify-only) installed:
@@ -130,7 +149,7 @@ autocoder (verify-only) installed:
   config:  ${CONFIG_PATH}
 
 Ensure ${HOME}/.local/bin is on your PATH, then in a repository run:
-  autocoder verify <change-slug> --config ${CONFIG_PATH}
+  ${NEXT_STEP}
 
 verify is the LOCAL accelerator: it runs the same gate checks the server
 runs, so you learn whether a change would pass before pushing. The server

@@ -1607,8 +1607,17 @@ fn resolve_run_config_path_inner(
 /// The default config-file locations, checked in order: the server-mode path,
 /// then the dev-mode XDG path.
 fn default_config_candidates() -> Vec<PathBuf> {
+    default_config_candidates_for(std::env::var_os("HOME"))
+}
+
+/// Pure form of [`default_config_candidates`] with `HOME` injected, so the
+/// dev-mode candidate is testable without mutating the process environment.
+/// The dev-mode path is `<HOME>/.config/autocoder/config.yaml` — exactly where
+/// the check-only installer (`install-verify.sh`) writes its minimal config, so
+/// flagless `autocoder verify <slug>` discovers it.
+fn default_config_candidates_for(home: Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let mut cands = vec![PathBuf::from(crate::cli::install::DEFAULT_SERVER_CONFIG_PATH)];
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         cands.push(PathBuf::from(home).join(".config/autocoder/config.yaml"));
     }
     cands
@@ -2164,6 +2173,70 @@ mod tests {
         )
         .expect_err("no config anywhere must error");
         assert!(format!("{err}").contains("--config"), "{err}");
+    }
+
+    /// The dev-mode discovery candidate is `<HOME>/.config/autocoder/config.yaml`
+    /// — exactly where the check-only installer (`install-verify.sh`) now writes
+    /// its minimal config (`check-only-install-writes-default-config`). Guards
+    /// the installer/verify contract from one side: if this suffix ever drifts,
+    /// the installer must move in lockstep or flagless `verify` breaks.
+    #[test]
+    fn dev_mode_discovery_candidate_is_installer_path() {
+        let cands = default_config_candidates_for(Some(std::ffi::OsString::from("/home/spec-author")));
+        let expected = PathBuf::from("/home/spec-author/.config/autocoder/config.yaml");
+        assert!(
+            cands.contains(&expected),
+            "dev-mode discovery must include the installer's path {}; got {cands:?}",
+            expected.display()
+        );
+        // No HOME → only the server-mode path remains (no panic, no dev path).
+        let none = default_config_candidates_for(None);
+        assert_eq!(none.len(), 1, "without HOME only the server path is a candidate");
+    }
+
+    /// `verify` (which calls `resolve_run_config_path`) resolves the config the
+    /// check-only installer drops at the standard discovery path with NO
+    /// `--config` flag — and an explicit `--config <path>` still overrides
+    /// discovery (`check-only-install-writes-default-config`, tasks 3.1/3.2).
+    #[test]
+    fn discovery_resolves_installer_config_and_explicit_overrides() {
+        // The candidate set the daemon/verify discovery walks: the server path,
+        // then the dev-mode path the installer writes on a user spec-box.
+        let installer_path =
+            PathBuf::from("/home/spec-author/.config/autocoder/config.yaml");
+        let candidates = vec![
+            PathBuf::from(crate::cli::install::DEFAULT_SERVER_CONFIG_PATH),
+            installer_path.clone(),
+        ];
+
+        // No `--config`, no systemd unit: discovery finds the file the installer
+        // wrote (the server path does not exist on a spec-box).
+        let resolved = resolve_run_config_path_inner(
+            None,
+            None,
+            &candidates,
+            &|p| p == installer_path.as_path(),
+        )
+        .expect("discovery resolves the installer's config");
+        assert_eq!(
+            resolved, installer_path,
+            "flagless verify must resolve the installer's discovery-path config"
+        );
+
+        // An explicit `--config <path>` wins even when a different discoverable
+        // config exists — verify --config <path> uses exactly <path>.
+        let explicit = PathBuf::from("/somewhere/else/custom.yaml");
+        let resolved = resolve_run_config_path_inner(
+            Some(explicit.clone()),
+            None,
+            &candidates,
+            &|_| true,
+        )
+        .expect("explicit path resolves");
+        assert_eq!(
+            resolved, explicit,
+            "an explicit --config must override discovery"
+        );
     }
 
     /// Build a remote + workspace clone pair. The workspace has `origin`
