@@ -131,6 +131,161 @@ pub(crate) async fn handle_outcome(
     }
 }
 
+/// Backoff base for the in-pass bounded executor retry
+/// (executor-outcome-legibility-and-retry). Exponential per attempt
+/// (`base * 2^(attempt-1)`, capped); a small default so a short transient (an
+/// upstream-API blip) gets a couple of quick re-tries before the failure is
+/// surfaced, while the daemon's separate next-pass re-pickup still covers a
+/// longer outage.
+pub(crate) const EXECUTOR_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// Run the executor for `change` under the bounded no-committable-result retry
+/// (executor-outcome-legibility-and-retry). Re-invokes `executor.run` up to
+/// `executor.session_retries()` ADDITIONAL times, with backoff between
+/// attempts, while the outcome is a no-committable-result failure AND the
+/// strategy's `is_retryable` hint does not veto — then returns the final
+/// outcome for [`handle_outcome`]. The caller holds `.in-progress` across the
+/// whole loop, so a retrying failure stays observably "working" (the retained
+/// lock + busy marker), distinct from a terminal, retries-exhausted failure.
+///
+/// The "no committable result" guard reuses the existing success signal — a
+/// clean working tree (`has_executor_changes` false), the same signal that maps
+/// a no-diff `Completed` to `Failed`. A session that produced committable work
+/// is never blindly re-run. No error classification: a transient clears on a
+/// retry; a deterministic failure recurs through every attempt and is surfaced
+/// with its assembled reason. This is an IN-PASS retry — it does not alter the
+/// daemon's separate next-pass re-pickup scheduling.
+pub(crate) async fn run_executor_with_retry(
+    executor: &dyn Executor,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    change: &str,
+    backoff_base: Duration,
+) -> Result<ExecutorOutcome> {
+    let session_retries = executor.session_retries();
+    let mut attempt: u32 = 0;
+    loop {
+        let outcome = executor.run(workspace, change).await;
+        // `session_retries == 0` returns here on the first pass (retry disabled,
+        // AND any `Some(true)` strategy hint suppressed — the bound is absolute).
+        if attempt >= session_retries {
+            return outcome;
+        }
+        let retry = match &outcome {
+            Ok(o) => should_retry_executor_outcome(executor, repo, workspace, change, o),
+            // An infrastructure `Err` (e.g. a spawn failure) is not a
+            // no-committable-result agent failure; surface it without re-running.
+            Err(_) => false,
+        };
+        if !retry {
+            return outcome;
+        }
+        attempt += 1;
+        // Observably distinct from a terminal failure: this WARN (plus the
+        // retained lock + busy marker) marks a retry-in-progress; no failure
+        // notification is posted until the loop's FINAL outcome reaches
+        // `handle_outcome`.
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            attempt,
+            session_retries,
+            "executor produced no committable result; retrying in-pass (bounded) before surfacing the failure"
+        );
+        tokio::time::sleep(retry_backoff(attempt, backoff_base)).await;
+    }
+}
+
+/// Exponential backoff for the Nth retry attempt (1-indexed): `base *
+/// 2^(attempt-1)`, capped at 60s. `base == 0` (tests) yields zero delay.
+fn retry_backoff(attempt: u32, base: Duration) -> Duration {
+    let factor = 1u32
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    base.saturating_mul(factor).min(Duration::from_secs(60))
+}
+
+/// Decide whether a (successful-call) executor outcome is a no-committable-
+/// result failure the bounded retry should re-run. Consults the strategy's
+/// `is_retryable` hint, then the clean-working-tree guard.
+fn should_retry_executor_outcome(
+    executor: &dyn Executor,
+    repo: &RepositoryConfig,
+    workspace: &Path,
+    change: &str,
+    outcome: &ExecutorOutcome,
+) -> bool {
+    let hint = executor.is_retryable(outcome);
+    match outcome {
+        ExecutorOutcome::Failed { .. } => match hint {
+            Some(false) => false,
+            // Retry even when a committable result exists (the strategy has
+            // overridden the guard); still bounded by `session_retries`.
+            Some(true) => true,
+            None => !workspace_has_committable_result(workspace, change),
+        },
+        ExecutorOutcome::Completed { .. } => match hint {
+            // A `Some(false)` hint vetoes — consistent with the `Failed` arm.
+            Some(false) => false,
+            // A `Some(true)` hint retries even when a committable result exists,
+            // overriding the no-result guard AND the self-heal guard below —
+            // consistent with the `Failed` arm AND the spec's "`Some(true)`
+            // SHALL retry even when a committable result exists" (a general
+            // statement, not scoped to the `Failed` outcome). Still bounded by
+            // `session_retries` (the loop suppresses it when the bound is 0).
+            Some(true) => true,
+            // No strategy opinion: a no-diff `Completed` is the no-op-completion
+            // failure `handle_completed_outcome` maps to `Failed`; retry it under
+            // the no-result rule. A `Completed` WITH a diff is a real success —
+            // never retried. A self-heal `Completed` (every task `[x]`) is NOT a
+            // failure (it is archived) AND re-running an agent that believes it
+            // is done would not help, so skip it.
+            None => {
+                if tasks_all_complete(repo, workspace, change) {
+                    false
+                } else {
+                    !workspace_has_committable_result(workspace, change)
+                }
+            }
+        },
+        // Deliberate halt / progress / shutdown signals are never blindly
+        // re-run.
+        _ => false,
+    }
+}
+
+/// Whether the executor left a committable result — a non-empty working-tree
+/// diff attributable to the executor (ignoring autocoder's own meta-files). A
+/// clean tree → no committable result → eligible for the no-result retry.
+fn workspace_has_committable_result(workspace: &Path, change: &str) -> bool {
+    let status = match git::status_porcelain(workspace) {
+        Ok(s) => s,
+        Err(e) => {
+            // A git failure (corrupt repo, lock contention) yields an empty
+            // status, which reads as "no committable result" → the session
+            // becomes retry-eligible. That is self-limiting (a re-run hits the
+            // same git failure), but WARN so a spurious retry is diagnosable
+            // rather than silent.
+            tracing::warn!(
+                workspace = %workspace.display(),
+                change = %change,
+                "git status failed while checking for a committable result; \
+                 treating as no result (retry-eligible): {e:#}"
+            );
+            String::new()
+        }
+    };
+    has_executor_changes(&status, change)
+}
+
+/// Whether every `tasks.md` checkbox for `change` is `[x]` — the self-heal
+/// signal that distinguishes a complete change (re-running would not help) from
+/// a genuine no-op `Completed`.
+fn tasks_all_complete(repo: &RepositoryConfig, workspace: &Path, change: &str) -> bool {
+    let spec_root = crate::spec_root::SpecRoot::for_repo(repo, workspace);
+    tasks_md_all_complete(&spec_root, change).unwrap_or(false)
+}
+
 /// Handle `ExecutorOutcome::Completed`: unlock, inspect the working tree,
 /// run the self-heal / lazy-archive probes, then archive+commit. Extracted
 /// verbatim from `handle_outcome` (a68 function-size split).

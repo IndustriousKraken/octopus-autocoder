@@ -123,7 +123,9 @@ executor:
     model: claude-sonnet-4-5
   global_rules:
     # Path to a local rule-corpus directory, OR a git URL autocoder clones.
-    # Edit to point at your corpus before running the [rules] gate.
+    # A local path may begin with ~/ or $HOME/ (expanded to your home dir);
+    # a git URL is used as-is. Edit to point at your corpus before running
+    # the [rules] gate.
     corpus: ~/.config/autocoder/global-rules
 
 github: {}

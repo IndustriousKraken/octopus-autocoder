@@ -1480,6 +1480,29 @@ pub struct ExecutorConfig {
     /// bound, the report names that specific requirement (escalation).
     #[serde(default = "default_revision_converge_attempts")]
     pub revision_converge_attempts: u32,
+    /// Additional whole-session re-invocations the orchestrator may perform when
+    /// an executor session FAILS and produced no committable result — a clean
+    /// working tree (executor-outcome-legibility-and-retry). A transient
+    /// (upstream-API overload, dropped socket) clears on a retry; a
+    /// deterministic failure recurs through all attempts and is then surfaced
+    /// with its assembled reason. NO error classification — the bound is the
+    /// only knob. Counts ADDITIONAL attempts beyond the first: `2` (the default)
+    /// is up to 3 total; `0` disables retry entirely (including suppressing any
+    /// `Some(true)` strategy hint — `session_retries` is the absolute bound on
+    /// total additional attempts). Distinct from `executor.timeout_secs` (a
+    /// per-attempt duration, NOT an attempt count) AND from
+    /// `executor.verifier_gate_retries` (gate-scoped, a different no-submission
+    /// case). Modeled on `default_verifier_gate_retries`.
+    #[serde(default = "default_executor_session_retries")]
+    pub session_retries: u32,
+}
+
+/// Default for [`ExecutorConfig::session_retries`]: 2 additional whole-session
+/// re-invocations (up to 3 total) on a no-committable-result failure before the
+/// failure is surfaced. A small positive default so retry is enabled with a
+/// bounded count; `0` disables it.
+pub fn default_executor_session_retries() -> u32 {
+    2
 }
 
 /// Default for [`ExecutorConfig::verifier_gate_retries`]: 2 additional
@@ -2150,6 +2173,7 @@ pub fn placeholder_executor_config() -> ExecutorConfig {
         verifier_gate_retries: default_verifier_gate_retries(),
         revision_transcript_fetch_retries: default_revision_transcript_fetch_retries(),
         revision_converge_attempts: default_revision_converge_attempts(),
+        session_retries: default_executor_session_retries(),
         implementer: None,
         changelog_stylist: None,
         implementer_revision: None,
@@ -4768,6 +4792,7 @@ github:
             "verifier_gate_retries",
             "revision_transcript_fetch_retries",
             "revision_converge_attempts",
+            "session_retries",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -4886,6 +4911,30 @@ github:
         // Reviewer and ChatOps blocks are commented out by default.
         assert!(cfg.reviewer.is_none(), "reviewer must be off by default");
         assert!(cfg.chatops.is_none(), "chatops must be off by default");
+    }
+
+    // ---- executor-outcome-legibility-and-retry: session_retries ----
+
+    /// Task 5.3: `executor.session_retries` takes the small positive default
+    /// when absent (retry enabled with a bounded count).
+    #[test]
+    fn session_retries_default_applied_when_absent() {
+        let exec: ExecutorConfig = serde_yml::from_str("kind: claude_cli\n")
+            .expect("minimal executor parses with session_retries omitted");
+        assert_eq!(exec.session_retries, default_executor_session_retries());
+        assert!(exec.session_retries > 0, "default enables a bounded retry");
+    }
+
+    /// Task 5.3: an explicit `0` disables retry; a positive value is parsed
+    /// verbatim.
+    #[test]
+    fn session_retries_explicit_value_is_parsed() {
+        let zero: ExecutorConfig = serde_yml::from_str("kind: claude_cli\nsession_retries: 0\n")
+            .expect("session_retries: 0 parses");
+        assert_eq!(zero.session_retries, 0, "explicit 0 disables retry");
+        let five: ExecutorConfig = serde_yml::from_str("kind: claude_cli\nsession_retries: 5\n")
+            .expect("session_retries: 5 parses");
+        assert_eq!(five.session_retries, 5);
     }
 
     // ---- unified-agentic-session-timeout ----

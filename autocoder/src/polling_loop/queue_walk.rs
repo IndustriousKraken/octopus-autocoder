@@ -479,7 +479,15 @@ pub(crate) async fn process_one_pending_change(
     // logs at WARN and does NOT prevent the executor from running.
     maybe_post_start_of_work(workspace, repo, chatops_ctx, change).await;
 
-    let outcome = executor.run(workspace, change).await;
+    // executor-outcome-legibility-and-retry: re-invoke the session up to
+    // `executor.session_retries()` times on a no-committable-result failure,
+    // with backoff, BEFORE handing the outcome to `handle_outcome`. The
+    // `.in-progress` lock taken above is held across the whole loop (only the
+    // final outcome's `handle_outcome` drops it), so a retry-in-progress stays
+    // observably "working" rather than surfacing as a terminal failure.
+    let outcome =
+        run_executor_with_retry(executor, repo, workspace, change, EXECUTOR_RETRY_BACKOFF_BASE)
+            .await;
     let result = handle_outcome(
         paths,
         workspace,

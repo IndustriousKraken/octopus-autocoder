@@ -64,8 +64,15 @@ The queue engine SHALL atomically lock and unlock changes via filesystem markers
 
 #### Scenario: Unlocking after any executor outcome
 - **WHEN** the executor returns ANY outcome (`Completed`, `AskUser`, `Failed`) OR the executor invocation panics
+- **AND** the orchestrator is NOT executing an in-pass bounded retry (i.e. this is the final outcome of the retry loop, or retry is disabled)
 - **THEN** the queue engine deletes the `.in-progress` file
 - **AND** the deletion is idempotent (no error if the file is already absent)
+
+#### Scenario: Lock is retained during in-pass bounded retry
+- **WHEN** the executor returns `Failed` mid-loop during an in-pass bounded retry (i.e. retry attempts remain)
+- **THEN** the queue engine SHALL NOT delete `.in-progress` until the retry loop completes
+- **AND** the `.in-progress` file persists across retry attempts to prevent concurrent pickup by other workers
+- **AND** only the final outcome of the retry loop (either a non-Failed outcome or all attempts exhausted) triggers the deletion described in "Unlocking after any executor outcome"
 
 #### Scenario: Stale lock cleanup on startup
 - **WHEN** the orchestrator initializes a workspace at process startup
