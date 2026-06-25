@@ -190,8 +190,12 @@ pub fn prune_stale_entries(state_dir_root: &Path, max_age: Duration) -> Result<u
 /// `audit-triage-carries-full-findings` requirement). Delegates to the shared
 /// [`crate::audits::cap_audit_findings_body`] so the cap value AND the tail
 /// text are a single source. A body within the cap is returned verbatim.
-/// Callers MUST funnel the full findings body through this before constructing
-/// an `AuditThreadState`.
+///
+/// The delegate is idempotent: the usual input here is the posted thread body,
+/// which the formatter already capped, so an already-capped body is returned
+/// unchanged — the excerpt is byte-identical to the thread body and never gains
+/// a nested second tail. Callers MUST still funnel the full findings body
+/// through this before constructing an `AuditThreadState`.
 pub fn cap_findings_excerpt(findings: &str, audit_id: &str) -> String {
     crate::audits::cap_audit_findings_body(findings, audit_id)
 }

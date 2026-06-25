@@ -1612,6 +1612,14 @@ pub const AUDIT_THREAD_CHAR_THRESHOLD: usize = 300;
 /// envelope overhead.
 pub const AUDIT_THREAD_BODY_CHAR_CAP: usize = 35_000;
 
+/// Stable prefix of the truncation pointer tail — everything up to the
+/// `audit_id` value. One source for BOTH emitting the tail in
+/// [`cap_audit_findings_body`] AND detecting an already-capped body in that
+/// helper's idempotency guard, so the emitted tail and the guard can never
+/// drift apart.
+const AUDIT_TRUNCATION_POINTER_PREFIX: &str =
+    "… [truncated; full findings at journalctl -u autocoder | grep audit_id=";
+
 /// Truncate a rendered audit-findings body to [`AUDIT_THREAD_BODY_CHAR_CAP`],
 /// appending the pointer-to-daemon-log tail naming `audit_id` when (and only
 /// when) truncation occurs. This is the SINGLE source of the cap value AND the
@@ -1620,14 +1628,35 @@ pub const AUDIT_THREAD_BODY_CHAR_CAP: usize = 35_000;
 /// ([`threads::cap_findings_excerpt`]), so the operator and the triage agent
 /// always see identical truncation behaviour. A body within the cap is returned
 /// verbatim, with no tail.
+///
+/// The cap is IDEMPOTENT. The posted thread body funnels through this helper in
+/// the formatter and then, when stamped as the excerpt, funnels through it a
+/// second time. A body whose final line is already the truncation pointer tail
+/// was capped by that earlier pass, so it is returned unchanged rather than
+/// truncated again and given a nested second tail: the stamped excerpt is
+/// byte-identical to the already-capped thread body it came from, carrying
+/// exactly one tail. (On the live path the first cap already cuts at exactly
+/// the 35,000-char boundary, so the second pass's `take` would re-derive the
+/// same body prefix and re-append an identical tail even without this guard —
+/// the guard makes that invariant explicit and cheap, and keeps it holding even
+/// if the two passes' inputs ever diverged, addressing the double-truncation
+/// review concern.)
 pub fn cap_audit_findings_body(body: &str, audit_id: &str) -> String {
     if body.chars().count() <= AUDIT_THREAD_BODY_CHAR_CAP {
         return body.to_string();
     }
+    // Idempotency guard: a body whose last line is the truncation pointer tail
+    // has already been capped by a prior pass through this helper. Re-capping it
+    // would only discard that tail and append an identical one.
+    if body
+        .lines()
+        .last()
+        .is_some_and(|last| last.starts_with(AUDIT_TRUNCATION_POINTER_PREFIX))
+    {
+        return body.to_string();
+    }
     let truncated: String = body.chars().take(AUDIT_THREAD_BODY_CHAR_CAP).collect();
-    format!(
-        "{truncated}\n\n… [truncated; full findings at journalctl -u autocoder | grep audit_id={audit_id}]"
-    )
+    format!("{truncated}\n\n{AUDIT_TRUNCATION_POINTER_PREFIX}{audit_id}]")
 }
 
 /// Output of [`format_audit_notification`]. The scheduler decides which
@@ -3111,6 +3140,42 @@ mod tests {
         assert!(
             excerpt.contains(pointer),
             "stamped excerpt must carry the pointer tail too"
+        );
+        // The cap is idempotent: stamping the already-capped thread body as the
+        // excerpt does NOT truncate a second time or append a nested second
+        // pointer tail. The excerpt is byte-identical to the thread body and
+        // carries EXACTLY ONE tail — precluding the double-truncation artifact.
+        assert_eq!(
+            excerpt, n.thread_body,
+            "stamped excerpt must equal the already-capped thread body verbatim"
+        );
+        assert_eq!(
+            excerpt.matches(pointer).count(),
+            1,
+            "exactly one pointer tail in the excerpt — no nested second tail: {}",
+            excerpt.chars().rev().take(200).collect::<String>(),
+        );
+    }
+
+    /// The shared cap is IDEMPOTENT: capping a body that already ends in the
+    /// truncation pointer tail returns it unchanged — it does NOT truncate a
+    /// second time or append a nested second tail. This is the invariant that
+    /// keeps the stamped excerpt byte-identical to the posted thread body on the
+    /// live path, where the body funnels through the cap in the formatter and
+    /// again when it is stamped as the excerpt (the double-truncation concern).
+    #[test]
+    fn cap_audit_findings_body_is_idempotent_no_nested_tail() {
+        let huge = "Z".repeat(AUDIT_THREAD_BODY_CHAR_CAP + 2_000);
+        let audit_id = "owner_repo:drift_audit:2026-06-25T00:00:00Z";
+        let once = cap_audit_findings_body(&huge, audit_id);
+        let twice = cap_audit_findings_body(&once, audit_id);
+        assert_eq!(once, twice, "double-capping must be a no-op");
+        let pointer = "[truncated; full findings at journalctl -u autocoder | grep audit_id=";
+        assert_eq!(
+            twice.matches(pointer).count(),
+            1,
+            "exactly one pointer tail — no nested second tail: {}",
+            twice.chars().rev().take(200).collect::<String>(),
         );
     }
 
