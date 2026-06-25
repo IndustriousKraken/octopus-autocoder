@@ -224,22 +224,30 @@ fn should_retry_executor_outcome(
             Some(true) => true,
             None => !workspace_has_committable_result(workspace, change),
         },
-        ExecutorOutcome::Completed { .. } => {
-            // A no-diff `Completed` is the no-op-completion failure
-            // `handle_completed_outcome` maps to `Failed`; retry it under the
-            // no-result rule. A `Completed` WITH a diff is a real success — never
-            // retried. A self-heal `Completed` (every task `[x]`) is NOT a
+        ExecutorOutcome::Completed { .. } => match hint {
+            // A `Some(false)` hint vetoes — consistent with the `Failed` arm.
+            Some(false) => false,
+            // A `Some(true)` hint retries even when a committable result exists,
+            // overriding the no-result guard AND the self-heal guard below —
+            // consistent with the `Failed` arm AND the spec's "`Some(true)`
+            // SHALL retry even when a committable result exists" (a general
+            // statement, not scoped to the `Failed` outcome). Still bounded by
+            // `session_retries` (the loop suppresses it when the bound is 0).
+            Some(true) => true,
+            // No strategy opinion: a no-diff `Completed` is the no-op-completion
+            // failure `handle_completed_outcome` maps to `Failed`; retry it under
+            // the no-result rule. A `Completed` WITH a diff is a real success —
+            // never retried. A self-heal `Completed` (every task `[x]`) is NOT a
             // failure (it is archived) AND re-running an agent that believes it
-            // is done would not help, so skip it. A `Some(false)` hint still
-            // vetoes.
-            if matches!(hint, Some(false)) {
-                return false;
+            // is done would not help, so skip it.
+            None => {
+                if tasks_all_complete(repo, workspace, change) {
+                    false
+                } else {
+                    !workspace_has_committable_result(workspace, change)
+                }
             }
-            if tasks_all_complete(repo, workspace, change) {
-                return false;
-            }
-            !workspace_has_committable_result(workspace, change)
-        }
+        },
         // Deliberate halt / progress / shutdown signals are never blindly
         // re-run.
         _ => false,
@@ -250,7 +258,23 @@ fn should_retry_executor_outcome(
 /// diff attributable to the executor (ignoring autocoder's own meta-files). A
 /// clean tree → no committable result → eligible for the no-result retry.
 fn workspace_has_committable_result(workspace: &Path, change: &str) -> bool {
-    let status = git::status_porcelain(workspace).unwrap_or_default();
+    let status = match git::status_porcelain(workspace) {
+        Ok(s) => s,
+        Err(e) => {
+            // A git failure (corrupt repo, lock contention) yields an empty
+            // status, which reads as "no committable result" → the session
+            // becomes retry-eligible. That is self-limiting (a re-run hits the
+            // same git failure), but WARN so a spurious retry is diagnosable
+            // rather than silent.
+            tracing::warn!(
+                workspace = %workspace.display(),
+                change = %change,
+                "git status failed while checking for a committable result; \
+                 treating as no result (retry-eligible): {e:#}"
+            );
+            String::new()
+        }
+    };
     has_executor_changes(&status, change)
 }
 

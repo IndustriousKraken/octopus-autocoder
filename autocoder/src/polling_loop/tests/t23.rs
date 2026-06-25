@@ -149,3 +149,55 @@ async fn zero_bound_suppresses_some_true_hint() {
     let _ = run_executor_with_retry(&exec, &repo, &ws, "chg", Duration::ZERO).await;
     assert_eq!(exec.runs(), 1, "zero bound caps additional attempts even with Some(true)");
 }
+
+/// A `Completed` outcome that produced a committable result is NOT retried by
+/// default (no `is_retryable` opinion) — a `Completed` with a diff is a real
+/// success, never blindly re-run.
+#[tokio::test]
+async fn completed_with_committable_result_not_retried_by_default() {
+    let (_dir, ws) = clean_workspace();
+    let repo = fixture_repo(&ws);
+    let mut exec = RetryFake::failing(2);
+    exec.completed = true; // returns `Completed`
+    exec.writes_result = true; // committable result present
+    let _ = run_executor_with_retry(&exec, &repo, &ws, "chg", Duration::ZERO).await;
+    assert_eq!(
+        exec.runs(),
+        1,
+        "a Completed with a committable result is a real success, not retried"
+    );
+}
+
+/// A strategy `is_retryable` of `Some(true)` retries a `Completed` outcome even
+/// when it produced a committable result, consistent with the `Failed` arm AND
+/// the spec's "`Some(true)` retries even when a committable result exists" —
+/// closing the prior asymmetry where the `Completed` arm ignored a `Some(true)`
+/// hint. Still bounded by `session_retries`.
+#[tokio::test]
+async fn completed_some_true_retries_past_committable_result() {
+    let (_dir, ws) = clean_workspace();
+    let repo = fixture_repo(&ws);
+    let mut exec = RetryFake::failing(2);
+    exec.completed = true; // returns `Completed`
+    exec.writes_result = true; // committable result present each run
+    exec.retry_hint = Some(true);
+    let _ = run_executor_with_retry(&exec, &repo, &ws, "chg", Duration::ZERO).await;
+    assert_eq!(
+        exec.runs(),
+        3,
+        "Some(true) retries a Completed past the committable-result guard"
+    );
+}
+
+/// A strategy `is_retryable` of `Some(false)` vetoes retry on a `Completed`
+/// no-result outcome, consistent with the `Failed` arm.
+#[tokio::test]
+async fn completed_some_false_vetoes_retry() {
+    let (_dir, ws) = clean_workspace();
+    let repo = fixture_repo(&ws);
+    let mut exec = RetryFake::failing(2);
+    exec.completed = true; // returns `Completed`, clean tree (no committable result)
+    exec.retry_hint = Some(false);
+    let _ = run_executor_with_retry(&exec, &repo, &ws, "chg", Duration::ZERO).await;
+    assert_eq!(exec.runs(), 1, "Some(false) declares the Completed non-retryable");
+}
