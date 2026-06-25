@@ -437,9 +437,10 @@ executor:
   # resolvable) when `global_rules_check` is enabled. The directory holds rule
   # files — flat, OR grouped into register subdirectories — each a one-sentence
   # rule + optional rationale; the file's path (without extension) is the rule's
-  # stable id. See `docs/GLOBAL-RULES.md`.
+  # stable id. A LOCAL path may begin with `~/` or `$HOME/` (expanded to the
+  # operator's home dir); a git-URL value is used as-is. See `docs/GLOBAL-RULES.md`.
   # global_rules:
-  #   corpus: /etc/autocoder/global-rules           # a local path …
+  #   corpus: ~/.config/autocoder/global-rules      # a local path (~ / $HOME ok) …
   #   # corpus: https://github.com/acme/eng-rules.git  # … OR a git repo URL
   #
   # Code-implements-spec verification — the `[out]` gate of the verifier

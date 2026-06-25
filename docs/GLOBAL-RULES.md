@@ -111,6 +111,14 @@ executor:
     # corpus: https://github.com/acme/eng-rules.git  # … OR a git repo URL
 ```
 
+A **local** corpus path may begin with `~/` or `$HOME/` (or be a bare `~` /
+`$HOME`); autocoder expands the leading token to the operator's home directory
+before resolving the path — so `corpus: ~/.config/autocoder/global-rules` (the
+value the check-only installer's `install-verify.sh` writes) resolves to
+`<home>/.config/autocoder/global-rules`. Expansion is leading-only: a tilde
+elsewhere in the value and the `~user` form are left untouched. A **git-URL**
+corpus is used as-is — it is never subject to home expansion.
+
 Enabling `global_rules_check` without **both** a configured
 `global_rules_check_llm` **and** a resolvable `global_rules.corpus` fails the
 daemon at startup (fail-fast), exactly as the `[canon]` gate does for a missing
