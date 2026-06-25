@@ -499,6 +499,73 @@ async fn agentic_per_change_empty_split_fallback_passes_diff_and_files() {
     );
 }
 
+/// executor-outcome-legibility-and-retry §7.3: a reviewer session that records
+/// no submission BUT carried captured output yields a `Discarded` whose reason
+/// INCLUDES that output (surfaced raw), rather than only the bare "recorded no
+/// valid submit_review submission". Driven via the existing test-runner seam;
+/// asserts the captured text appears, not exact wording.
+#[tokio::test]
+async fn agentic_no_submission_discard_surfaces_captured_output() {
+    let (client, _) = stub_with_capture("");
+    let reviewer = CodeReviewer::new(client, "t".to_string());
+    // The runner's session carries no submission AND a captured-output
+    // diagnostic (as the production runner would assemble via `failure_reason`).
+    let runner = CannedRunner::new_with_diagnostics(vec![(
+        None,
+        "stderr: 529 Overloaded | exit status: 1".to_string(),
+    )]);
+    let outcome = run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+        .await
+        .unwrap();
+    match outcome {
+        AgenticReviewOutcome::Discarded { reason } => {
+            assert!(
+                reason.contains("529 Overloaded"),
+                "the discard reason surfaces the captured session output: {reason}"
+            );
+            assert!(
+                reason.contains("no valid submit_review"),
+                "the discard still names the no-submission disposition: {reason}"
+            );
+        }
+        AgenticReviewOutcome::Reviewed(_) => {
+            panic!("a missing submission must discard, never produce a verdict")
+        }
+    }
+}
+
+/// executor-outcome-legibility-and-retry §7.3: a reviewer session persists its
+/// captured output to a discoverable per-session log under `reviews/`,
+/// mirroring the audit-log file pattern — so an operator can open it without
+/// re-running the review. Tests the shared persist helper the production runner
+/// calls (the production runner spawns a CLI, which cannot run in-test).
+#[test]
+fn reviewer_session_writes_discoverable_log() {
+    let (_td, paths) = crate::testing::test_daemon_paths();
+    let ws = tempfile::TempDir::new().unwrap();
+    let outcome = crate::agentic_run::AgenticRunOutcome {
+        stdout: "prose instead of a tool call".into(),
+        stderr: "529 Overloaded".into(),
+        ..Default::default()
+    };
+    let path = crate::audits::persist_reviewer_session_log(&paths, ws.path(), "bundled", &outcome)
+        .expect("the reviewer session log is written");
+    assert!(path.exists(), "the per-session log file exists at {}", path.display());
+    let basename = ws.path().file_name().and_then(|n| n.to_str()).unwrap();
+    assert!(
+        path.starts_with(paths.reviewer_logs_dir(basename)),
+        "the log lives under the workspace's reviews/ dir: {}",
+        path.display()
+    );
+    assert!(
+        path.extension().and_then(|e| e.to_str()) == Some("log"),
+        "the file uses the .log extension: {}",
+        path.display()
+    );
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("529 Overloaded"), "the captured stderr is persisted: {body}");
+}
+
 /// a015 (agentic path): the empty-input guard on
 /// `synthesize_agentic_per_change` makes the "never a defaulted Approve"
 /// invariant explicit. Called with an empty `reviews` vec it returns

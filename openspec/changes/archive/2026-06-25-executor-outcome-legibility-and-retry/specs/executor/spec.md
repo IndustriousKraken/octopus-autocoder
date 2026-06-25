@@ -58,7 +58,24 @@ The trait SHALL also expose an OPTIONAL, defaulted retry hint `is_retryable(&Exe
 - **AND** the orchestrator falls back to its bounded no-committable-result retry rule rather than treating `None` as "never retry"
 
 ### Requirement: CLI-wrapping executor backend (`claude_cli`)
-This MODIFIED entry updates only the `Outcome mapping from CLI exit code` scenario to align the concrete backend's `reason` assembly with the updated `Backend-agnostic execution contract`. All other scenarios in this requirement are unchanged.
+autocoder SHALL provide a concrete `Executor` implementation that wraps
+an external command-line agent tool as a child process. The backend is
+selected via `executor.kind: claude_cli` in the configuration. Every
+spawn SHALL include the sandbox flags described under "Tool-use
+sandbox is applied at every spawn". On a non-success outcome the backend
+SHALL assemble its `Failed { reason }` from the captured evidence per the
+updated `Backend-agnostic execution contract`; this MODIFIED entry changes
+ONLY the `Outcome mapping from CLI exit code` scenario's `reason` assembly,
+and all other scenarios are restated unchanged.
+
+#### Scenario: ClaudeCliExecutor instantiation
+- **WHEN** autocoder initializes AND `executor.kind` is `claude_cli`
+- **THEN** autocoder instantiates a `ClaudeCliExecutor` configured
+  from `executor.command` (default `claude`), `executor.timeout_secs`
+  (default 1800), and a resolved `ExecutorSandboxConfig` (operator
+  value or per-field default)
+- **AND** the executor is wrapped in `Arc<dyn Executor>` and shared
+  across all spawned polling tasks
 
 #### Scenario: Outcome mapping from CLI exit code
 - **WHEN** `Executor::run(workspace, change)` is called
@@ -67,3 +84,20 @@ This MODIFIED entry updates only the `Outcome mapping from CLI exit code` scenar
 - **AND** on non-zero child exit, the call returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is assembled from the captured evidence — the agent's final message (if non-empty), the captured standard-error (if non-empty), and the process exit status — in that priority order, each truncated to a bounded budget, surfaced RAW without parsing or error-classification
 - **AND** if the configured `executor.timeout_secs` elapses, the child process is killed and the call returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is assembled from whatever evidence was captured before the kill — the agent's final message (if non-empty), the captured standard-error (if non-empty), and the terminating signal — in that priority order, each truncated to a bounded budget, surfaced RAW without parsing or error-classification
 - **AND** the temp settings file is deleted after the child exits
+
+#### Scenario: Resume not supported in this phase
+- **WHEN** `Executor::resume(handle, answer)` is called on the
+  foundation `ClaudeCliExecutor` (prior to the
+  `chatops-escalation` change)
+- **THEN** the call returns `Err(_)` whose text indicates resume
+  is not supported until the `chatops-escalation` change retrofits
+  real resume semantics
+- **AND** no child process is spawned and no workspace state is
+  modified
+
+(Note: in the in-tree implementation today, `resume` is wired
+through `chatops-escalation` already. This scenario reflects the
+historical foundation-phase contract preserved for spec
+continuity. The active `resume` path uses the same sandbox
+generation as `run`, per the "Resume applies the same sandbox"
+scenario above.)

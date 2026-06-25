@@ -502,6 +502,17 @@ executor:
   # conflicting requirement survives the bound, the report names that specific
   # requirement (escalation).
   # revision_converge_attempts: 2
+  #
+  # Additional whole-session re-invocations the orchestrator may perform when an
+  # executor session FAILS and produced no committable result — a clean working
+  # tree. A transient (upstream-API overload, dropped socket) clears on a retry;
+  # a deterministic failure recurs through all attempts and is then surfaced
+  # with its assembled, legible reason. NO error classification — the bound is
+  # the only knob. Counts ADDITIONAL attempts beyond the first: `2` (the
+  # default) is up to 3 total; `0` disables retry entirely. Distinct from
+  # `timeout_secs` (a per-attempt duration) AND `verifier_gate_retries`
+  # (gate-scoped, a different no-submission case).
+  # session_retries: 2
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once

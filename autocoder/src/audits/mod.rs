@@ -545,6 +545,29 @@ pub fn persist_gate_session_log(
     persist_session_log(&dir, &name, outcome)
 }
 
+/// Persist an agentic-reviewer session's captured output under the workspace's
+/// `reviews/` log directory ([`crate::paths::DaemonPaths::reviewer_logs_dir`]),
+/// named `<slug>-<timestamp>.log`, and return the written path
+/// (executor-outcome-legibility-and-retry). Thin convenience over
+/// [`persist_session_log`] — the same shared session-log writer the audits AND
+/// verifier gates use — so the reviewer log shares the run-log naming
+/// convention rather than inventing a fourth bespoke writer. `slug` is the
+/// session label (the chunk label, or `bundled` for a single-session pass).
+pub fn persist_reviewer_session_log(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    slug: &str,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
+) -> Result<PathBuf> {
+    let basename = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let dir = paths.reviewer_logs_dir(basename);
+    let name = if slug.trim().is_empty() { "bundled" } else { slug };
+    persist_session_log(&dir, name, outcome)
+}
+
 /// Registry of all audits the daemon knows about. Built once at startup
 /// in `cli::run::execute` and shared (via `Arc`) with every polling
 /// task. The scheduler iterates `audits.iter()` in declaration order.

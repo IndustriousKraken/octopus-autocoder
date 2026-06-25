@@ -2624,6 +2624,7 @@ pub async fn handle_reload(state: &ControlState) -> Value {
         match build_reviewer(
             new_cfg.reviewer.as_ref(),
             new_cfg.executor.agentic_session_timeout(),
+            &state.paths,
         ) {
             Ok(slot) => {
                 state.reviewer.store(Arc::new(slot));
@@ -2857,6 +2858,7 @@ fn apply_repository_changes(
 fn build_reviewer(
     cfg: Option<&ReviewerConfig>,
     agentic_session_timeout: std::time::Duration,
+    paths: &Arc<crate::paths::DaemonPaths>,
 ) -> Result<Option<Arc<CodeReviewer>>> {
     match cfg {
         Some(rcfg) if rcfg.enabled => {
@@ -2865,7 +2867,10 @@ fn build_reviewer(
                 // Reviewer shares the ONE auxiliary-session timeout with the
                 // verifier gates AND the revision sessions; the reviewer block
                 // does not carry the executor field, so it is threaded here.
-                .with_agentic_session_timeout(agentic_session_timeout);
+                .with_agentic_session_timeout(agentic_session_timeout)
+                // Daemon paths for the per-session `reviews/` log
+                // (executor-outcome-legibility-and-retry).
+                .with_paths(paths.clone());
             // a64: re-evaluate agentic-CLI availability on reload via the
             // existing `reviewer:` hot-reload path; an unavailable CLI
             // degrades to `oneshot` for this boot with one loud WARN.

@@ -39,6 +39,30 @@ pub trait Executor: Send + Sync {
         self.run(workspace, change).await
     }
 
+    /// Additional whole-session re-invocations the orchestrator may perform on
+    /// a no-committable-result failure (executor-outcome-legibility-and-retry).
+    /// Sourced from `executor.session_retries`; the production backend overrides
+    /// this. Default `0` (no retry) preserves the historical single-attempt
+    /// behavior for every other backend AND test double. The orchestrator's
+    /// in-pass bounded retry reads this rather than threading the config through
+    /// the polling-loop call chain — the executor is already threaded
+    /// everywhere as `&dyn Executor`.
+    fn session_retries(&self) -> u32 {
+        0
+    }
+
+    /// OPTIONAL retry hint the orchestrator consults before applying its
+    /// bounded no-committable-result rule, surfaced from the backend's
+    /// `CliStrategy::is_retryable` (executor-outcome-legibility-and-retry).
+    /// `Some(false)` short-circuits (no retry); `Some(true)` retries even when
+    /// a committable result exists (still bounded by `session_retries`); `None`
+    /// (the default, AND what the `claude` strategy returns) applies the
+    /// no-committable-result rule. Default `None` so provider knowledge stays in
+    /// the strategy that owns it and the core path is provider-agnostic.
+    fn is_retryable(&self, _outcome: &ExecutorOutcome) -> Option<bool> {
+        None
+    }
+
     /// Triage-mode invocation for the `audit-reply-acts` flow: the
     /// operator typed `@<bot> send it` in an audit thread, so the
     /// daemon spawns the executor against the audit's findings to

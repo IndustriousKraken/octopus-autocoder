@@ -153,6 +153,13 @@ pub struct ClaudeCliExecutor {
     /// a temp home so the surgical session prune is exercised without touching
     /// the operator's real store.
     session_home: Option<PathBuf>,
+    /// Additional whole-session re-invocations the orchestrator may perform on
+    /// a no-committable-result failure (executor-outcome-legibility-and-retry).
+    /// Resolved from `executor.session_retries`; surfaced via
+    /// [`Executor::session_retries`]. `0` disables retry. The test constructors
+    /// default it to `0` (no retry) so the implementer-flow tests are
+    /// unaffected unless they opt in.
+    session_retries: u32,
 }
 
 /// Opaque payload stashed inside `ResumeHandle.0` for this backend.
@@ -203,6 +210,7 @@ impl ClaudeCliExecutor {
             settings_dir: None,
             cli: crate::config::CliKind::Claude,
             session_home: None,
+            session_retries: 0,
         }
     }
 
@@ -289,6 +297,7 @@ impl ClaudeCliExecutor {
             settings_dir: None,
             cli,
             session_home: None,
+            session_retries: cfg.session_retries,
         })
     }
 
@@ -316,6 +325,7 @@ impl ClaudeCliExecutor {
             settings_dir: None,
             cli: crate::config::CliKind::Claude,
             session_home: None,
+            session_retries: 0,
         }
     }
 
@@ -933,12 +943,17 @@ impl ClaudeCliExecutor {
             });
         }
         if !status.success() {
-            let reason: String = outcome.stderr.trim().chars().take(200).collect();
-            let reason = if reason.is_empty() {
-                format!("executor exited with {status}")
-            } else {
-                reason
-            };
+            // Assemble a legible, provider-agnostic reason from the captured
+            // evidence (executor-outcome-legibility-and-retry): the agent's
+            // final message (an upstream-API overload notice, etc.), the
+            // captured stderr (a panic trace), AND always the exit status /
+            // signal — surfaced RAW, never parsed, so a transient infrastructure
+            // blip is distinguishable from a real failure without reading
+            // server-side logs. Replaces the bare "executor exited with N".
+            let reason = crate::agentic_run::failure_reason(
+                &outcome,
+                crate::agentic_run::FAILURE_REASON_MAX,
+            );
             return Ok(ClassifiedOutcome {
                 outcome: ExecutorOutcome::Failed { reason },
                 tool_recorded: false,
@@ -1504,6 +1519,21 @@ fn map_recorded_outcome(
 
 #[async_trait]
 impl Executor for ClaudeCliExecutor {
+    /// Surface the configured `executor.session_retries` so the orchestrator's
+    /// in-pass bounded retry reads it without threading the config through the
+    /// polling-loop call chain.
+    fn session_retries(&self) -> u32 {
+        self.session_retries
+    }
+
+    /// Delegate the retry hint to the resolved `CliStrategy` so any
+    /// provider-specific signal stays encapsulated in the strategy that owns it.
+    /// The `claude` strategy does not override it, so this returns `None` (defer
+    /// to the orchestrator's bounded no-committable-result rule).
+    fn is_retryable(&self, outcome: &ExecutorOutcome) -> Option<bool> {
+        self.implementer_strategy().is_retryable(outcome)
+    }
+
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
         let prompt = self.build_prompt(workspace, change)?;
         // Best-effort: any stale marker from a prior crash gets cleared so
@@ -2551,6 +2581,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2606,6 +2637,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2660,6 +2692,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2728,6 +2761,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2787,6 +2821,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2848,6 +2883,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2908,6 +2944,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -2968,6 +3005,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: Some(crate::config::PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
@@ -3033,6 +3071,7 @@ mod tests {
             verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: Some(crate::config::PromptOverrideBlock {

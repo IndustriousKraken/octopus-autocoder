@@ -23,9 +23,13 @@ pub use agentic::{
     AgenticReviewOutcome, REVIEWER_ROLE, render_agentic_review_prompt, run_agentic_review,
 };
 pub(crate) use agentic::{
-    CliReviewSessionRunner, ReviewSessionRunner, payload_to_review_result,
+    CliReviewSessionRunner, ReviewSessionRunner, append_diagnostic, payload_to_review_result,
     resolve_reviewer_strategy,
 };
+// Only the test runner (`CannedRunner`) names this type directly; the
+// production orchestration uses it via the trait's return value (inferred).
+#[cfg(test)]
+pub(crate) use agentic::ReviewSessionOutput;
 
 /// Built-in default prompt template, embedded at compile time so the
 /// binary runs without requiring `prompts/` on the filesystem. The
@@ -294,6 +298,13 @@ pub struct CodeReviewer {
     /// The oneshot path has no analogous timeout (the HTTP client owns it);
     /// this bounds the wrapped CLI subprocess the way the gates bound theirs.
     agentic_session_timeout: Duration,
+    /// Daemon paths for the per-session reviewer log under `reviews/`
+    /// (executor-outcome-legibility-and-retry). `Some` when built at a
+    /// production site (threaded via [`CodeReviewer::with_paths`]); `None` for
+    /// the test-only [`CodeReviewer::new`] path → the agentic session skips the
+    /// per-session log. The reviewer block does not carry the daemon paths, so
+    /// they are threaded in alongside the agentic-session timeout.
+    paths: Option<std::sync::Arc<crate::paths::DaemonPaths>>,
 }
 
 impl CodeReviewer {
@@ -324,7 +335,18 @@ impl CodeReviewer {
             agentic_session_timeout: Duration::from_secs(
                 crate::config::default_agentic_session_timeout(),
             ),
+            paths: None,
         }
+    }
+
+    /// Builder-style setter for the daemon paths the agentic reviewer writes
+    /// its per-session `reviews/` log under (executor-outcome-legibility-and-
+    /// retry). Both production construction sites (startup in `cli::run`, reload
+    /// in `control_socket::build_reviewer`) call this; the test-only `new` path
+    /// leaves it `None` (the per-session log is then skipped).
+    pub fn with_paths(mut self, paths: std::sync::Arc<crate::paths::DaemonPaths>) -> Self {
+        self.paths = Some(paths);
+        self
     }
 
     /// Builder-style setter for the agentic reviewer session timeout, resolved
@@ -1298,6 +1320,7 @@ pub async fn run_on_demand_review(
         settings_dir: None,
         timeout: reviewer.agentic_session_timeout,
         model: reviewer.resolved_model.as_ref(),
+        paths: reviewer.paths.as_ref(),
     };
     run_on_demand_review_with_runner(reviewer, surface, archived_changes, &runner).await
 }
@@ -1429,13 +1452,16 @@ async fn run_on_demand_review_with_runner(
         let slug = sanitize_session_slug(label);
         let artifact_rel = review_diff_artifact_rel(&slug);
         let prompt = render_agentic_review_prompt(ctx, "", &artifact_rel);
-        let consumed = runner.run_session(&slug, &prompt, &ctx.diff).await?;
-        match consumed {
+        let session = runner.run_session(&slug, &prompt, &ctx.diff).await?;
+        match session.submission {
             None => {
-                let reason = format!(
+                let base = format!(
                     "on-demand reviewer session (chunk `{label}`) recorded no valid \
                      submit_review submission"
                 );
+                // Surface the captured session output so the discard is
+                // diagnosable rather than a bare "no submission".
+                let reason = append_diagnostic(base, &session.no_submission_diagnostic);
                 return Ok(OnDemandReviewOutcome::Discarded { reason });
             }
             Some(payload) => {
@@ -3849,17 +3875,24 @@ this is not yaml: at all: ::: {{{ broken
     }
 
     /// Test session runner: records the slugs + prompts it saw AND returns
-    /// canned submissions (front-of-queue), bypassing any CLI spawn.
+    /// canned sessions (front-of-queue), bypassing any CLI spawn. Each canned
+    /// session is `(submission, no_submission_diagnostic)`; `new` defaults the
+    /// diagnostic to empty (so existing tests keep the bare discard wording),
+    /// while `new_with_diagnostics` injects a captured-output diagnostic for the
+    /// no-submission-surfacing test.
     struct CannedRunner {
-        submissions: Mutex<VecDeque<Option<serde_json::Value>>>,
+        submissions: Mutex<VecDeque<(Option<serde_json::Value>, String)>>,
         slugs: Mutex<Vec<String>>,
         prompts: Mutex<Vec<String>>,
         diffs: Mutex<Vec<String>>,
     }
     impl CannedRunner {
         fn new(subs: Vec<Option<serde_json::Value>>) -> Self {
+            Self::new_with_diagnostics(subs.into_iter().map(|s| (s, String::new())).collect())
+        }
+        fn new_with_diagnostics(sessions: Vec<(Option<serde_json::Value>, String)>) -> Self {
             Self {
-                submissions: Mutex::new(subs.into_iter().collect()),
+                submissions: Mutex::new(sessions.into_iter().collect()),
                 slugs: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
                 diffs: Mutex::new(Vec::new()),
@@ -3871,12 +3904,21 @@ this is not yaml: at all: ::: {{{ broken
     }
     #[async_trait]
     impl ReviewSessionRunner for CannedRunner {
-        async fn run_session(&self, slug: &str, prompt: &str, diff: &str) -> Result<Option<Value>> {
+        async fn run_session(
+            &self,
+            slug: &str,
+            prompt: &str,
+            diff: &str,
+        ) -> Result<ReviewSessionOutput> {
             self.slugs.lock().unwrap().push(slug.to_string());
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.diffs.lock().unwrap().push(diff.to_string());
-            let next = self.submissions.lock().unwrap().pop_front();
-            Ok(next.unwrap_or(None))
+            let (submission, no_submission_diagnostic) =
+                self.submissions.lock().unwrap().pop_front().unwrap_or((None, String::new()));
+            Ok(ReviewSessionOutput {
+                submission,
+                no_submission_diagnostic,
+            })
         }
     }
 

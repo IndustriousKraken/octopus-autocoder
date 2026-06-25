@@ -568,7 +568,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 // (`executor.agentic_session_timeout_secs`) with the verifier
                 // gates AND the revision sessions; the reviewer block does not
                 // carry the executor field, so it is threaded here.
-                .with_agentic_session_timeout(cfg.executor.agentic_session_timeout());
+                .with_agentic_session_timeout(cfg.executor.agentic_session_timeout())
+                // Daemon paths for the per-session `reviews/` log
+                // (executor-outcome-legibility-and-retry); the reviewer block
+                // does not carry them, so they are threaded here.
+                .with_paths(daemon_paths.clone());
             // a64: when the effective kind is `agentic` but the resolved
             // reviewer CLI is unavailable on this host, degrade to the
             // `oneshot` HTTP path for the boot (one loud WARN logged inside).

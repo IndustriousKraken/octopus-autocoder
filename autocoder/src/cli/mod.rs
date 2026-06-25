@@ -53,6 +53,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
             revision_transcript_fetch_retries:
                 crate::config::default_revision_transcript_fetch_retries(),
             revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+            session_retries: crate::config::default_executor_session_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,

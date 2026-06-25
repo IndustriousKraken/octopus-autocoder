@@ -6,6 +6,8 @@ TBD - created by archiving change orchestrator-architecture. Update Purpose afte
 ### Requirement: Backend-agnostic execution contract
 The orchestrator SHALL invoke implementations through a trait-shaped abstraction that takes a workspace path and an OpenSpec change name and returns an outcome enum. The architecture-level spec does NOT name a concrete backend; concrete implementations (CLI wrappers, MCP-connected agents, future native loops) are introduced by separate implementation changes.
 
+When a backend terminates abnormally, the non-empty `reason` SHALL be ASSEMBLED from the evidence the backend captured — the agent's final message, the captured standard-error stream, and the process exit status or terminating signal — surfaced RAW and each truncated to a bounded budget. The orchestrator SHALL NOT parse, match, or classify provider-specific error text to construct the reason; it surfaces the captured evidence for a human to interpret, which keeps the contract provider-agnostic across every wrapped CLI and model.
+
 #### Scenario: Successful implementation
 - **WHEN** the orchestrator calls `Executor::run(workspace, change_name)` with a valid workspace path and an unarchived change name
 - **AND** the underlying backend reports successful completion of the implementation
@@ -21,7 +23,16 @@ The orchestrator SHALL invoke implementations through a trait-shaped abstraction
 #### Scenario: Backend failure
 - **WHEN** the underlying backend terminates abnormally (non-zero exit, crash, malformed output, network error, or an enclosing timeout fires)
 - **THEN** the call returns `Ok(ExecutorOutcome::Failed { reason })` with a non-empty `reason` string OR `Err(_)` for unrecoverable infrastructure errors that prevent the executor from determining outcome
-- **AND** the orchestrator unlocks the change (removes `.in-progress`) and does NOT archive it
+- **AND** the `reason` is assembled from the captured evidence — the agent's final message (if non-empty), the captured standard-error (if non-empty), and the process exit status or terminating signal — in that priority order, each truncated to a bounded budget, surfaced RAW without parsing or error-classification
+- **AND** the orchestrator reports a final failed outcome to the queue engine (which removes `.in-progress`); the change is NOT archived
+
+#### Scenario: Failure reason includes the captured final message and standard-error
+- **WHEN** a backend fails AND captured a final message and/or standard-error output
+- **THEN** the assembled `reason` includes that captured text, truncated to a bounded budget, so the operator sees the actual cause (e.g. an upstream-API message such as an overload notice, or a panic trace) rather than only an exit code
+
+#### Scenario: Failure reason surfaces the exit status when no output was captured
+- **WHEN** a backend terminates abnormally AND both the agent's final message and the captured standard-error are empty (e.g. the process was killed by a signal before emitting anything)
+- **THEN** the assembled `reason` surfaces the process exit status or terminating signal, so an empty-output death is still legible rather than blank
 
 ### Requirement: Resume after ask-user
 The executor SHALL support resuming a previously halted implementation when a human answer becomes available.
@@ -41,7 +52,11 @@ autocoder SHALL provide a concrete `Executor` implementation that wraps
 an external command-line agent tool as a child process. The backend is
 selected via `executor.kind: claude_cli` in the configuration. Every
 spawn SHALL include the sandbox flags described under "Tool-use
-sandbox is applied at every spawn".
+sandbox is applied at every spawn". On a non-success outcome the backend
+SHALL assemble its `Failed { reason }` from the captured evidence per the
+updated `Backend-agnostic execution contract`; this MODIFIED entry changes
+ONLY the `Outcome mapping from CLI exit code` scenario's `reason` assembly,
+and all other scenarios are restated unchanged.
 
 #### Scenario: ClaudeCliExecutor instantiation
 - **WHEN** autocoder initializes AND `executor.kind` is `claude_cli`
@@ -54,19 +69,10 @@ sandbox is applied at every spawn".
 
 #### Scenario: Outcome mapping from CLI exit code
 - **WHEN** `Executor::run(workspace, change)` is called
-- **THEN** the executor generates the per-iteration sandbox settings
-  file in a temp dir, then spawns the configured command as a tokio
-  child process inside the workspace with the sandbox flags and
-  the prompt on stdin
-- **AND** on child exit code 0, the call returns
-  `Ok(ExecutorOutcome::Completed)` (the executor does NOT inspect
-  the workspace for diff)
-- **AND** on non-zero child exit, the call returns
-  `Ok(ExecutorOutcome::Failed { reason })` where `reason` contains
-  the first 200 characters of captured stderr
-- **AND** if the configured `executor.timeout_secs` elapses, the
-  child process is killed and the call returns
-  `Ok(ExecutorOutcome::Failed { reason: "timeout" })`
+- **THEN** the executor generates the per-iteration sandbox settings file in a temp dir, then spawns the configured command as a tokio child process inside the workspace with the sandbox flags and the prompt on stdin
+- **AND** on child exit code 0, the call returns `Ok(ExecutorOutcome::Completed)` (the executor does NOT inspect the workspace for diff)
+- **AND** on non-zero child exit, the call returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is assembled from the captured evidence — the agent's final message (if non-empty), the captured standard-error (if non-empty), and the process exit status — in that priority order, each truncated to a bounded budget, surfaced RAW without parsing or error-classification
+- **AND** if the configured `executor.timeout_secs` elapses, the child process is killed and the call returns `Ok(ExecutorOutcome::Failed { reason })` where `reason` is assembled from whatever evidence was captured before the kill — the agent's final message (if non-empty), the captured standard-error (if non-empty), and the terminating signal — in that priority order, each truncated to a bounded budget, surfaced RAW without parsing or error-classification
 - **AND** the temp settings file is deleted after the child exits
 
 #### Scenario: Resume not supported in this phase
@@ -1341,6 +1347,8 @@ The agentic-run primitive SHALL select its CLI invocation through a `CliStrategy
 
 This change SHALL implement the `claude` strategy AND reproduce today's invocation exactly: `--settings <sandbox-file>`, `--allowedTools <combined>`, `--permission-mode acceptEdits`, AND — in streaming mode — `--verbose --output-format stream-json`, with MCP delivered via `.mcp.json`. The `claude` strategy SHALL select the model via `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` ONLY when a model is configured; when no model is configured it SHALL set none of them, preserving the executor's current CLI-default behavior. A role whose provider resolves to a CLI with no registered strategy SHALL return a clear error naming that CLI; this change registers only the `claude` strategy, so any non-`claude` resolution errors until that CLI's strategy is added (the `opencode` strategy is added by a later change).
 
+The trait SHALL also expose an OPTIONAL, defaulted retry hint `is_retryable(&ExecutorOutcome) -> Option<bool>` whose default body returns `None`. A strategy MAY override it to encode its own provider's retry signals; `None` means the strategy expresses no opinion, AND the orchestrator's bounded no-committable-result retry rule (see orchestrator-cli) applies. This keeps any provider-specific retry knowledge encapsulated in the strategy that owns it, so the core retry path stays provider-agnostic.
+
 #### Scenario: Claude strategy with no model preserves CLI-default behavior
 - **WHEN** the `claude` strategy builds an invocation with `model: None` (the executor's current state)
 - **THEN** none of `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` is set
@@ -1354,6 +1362,11 @@ This change SHALL implement the `claude` strategy AND reproduce today's invocati
 - **WHEN** a role's model resolves (via the registry rule) to a CLI that has no registered strategy (e.g. `opencode`, before its strategy is added)
 - **THEN** strategy resolution returns an error naming the CLI
 - **AND** no subprocess is spawned
+
+#### Scenario: Default retry hint expresses no opinion
+- **WHEN** a `CliStrategy` does not override `is_retryable` (the `claude` strategy)
+- **THEN** `is_retryable(outcome)` returns `None` for every outcome
+- **AND** the orchestrator falls back to its bounded no-committable-result retry rule rather than treating `None` as "never retry"
 
 ### Requirement: Per-execution MCP child exposes a per-role submission tool via control-socket relay
 The per-execution MCP child SHALL support a per-role structured-submission tool family that relays a schema-validated payload to the daemon over the control socket, paralleling the existing `outcome_*` / `record_outcome` relay. The MCP child SHALL read an `ORCH_MCP_ROLE` value from its environment (written into `.mcp.json` by the config writer) AND advertise only that role's `submit_*` tool alongside the common tools; a child with no role advertises no submission tool.

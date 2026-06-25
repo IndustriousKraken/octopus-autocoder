@@ -214,6 +214,17 @@ impl DaemonPaths {
         self.run_logs_dir(workspace_basename).join("gates")
     }
 
+    /// `<logs>/runs/<basename>/reviews/` — per-session agentic-reviewer logs
+    /// for the named workspace. Sibling of [`Self::audit_logs_dir`] and
+    /// [`Self::gate_logs_dir`]: the agentic reviewer (which runs in capture
+    /// mode and writes no streaming log) persists each session's full captured
+    /// output here, named `<slug>-<timestamp>.log`
+    /// (executor-outcome-legibility-and-retry), so a no-submission discard is
+    /// diagnosable from disk even when the surfaced reason is truncated.
+    pub fn reviewer_logs_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.run_logs_dir(workspace_basename).join("reviews")
+    }
+
     /// `<state>/iteration-pending/` — root for per-change
     /// iteration-request markers (a27a1). The marker is pure daemon
     /// bookkeeping (written by the polling-loop's `IterationRequested`
@@ -599,6 +610,7 @@ mod tests {
                 verifier_gate_retries: crate::config::default_verifier_gate_retries(),
                 revision_transcript_fetch_retries: crate::config::default_revision_transcript_fetch_retries(),
                 revision_converge_attempts: crate::config::default_revision_converge_attempts(),
+                session_retries: crate::config::default_executor_session_retries(),
                 implementer: None,
                 changelog_stylist: None,
                 implementer_revision: None,
