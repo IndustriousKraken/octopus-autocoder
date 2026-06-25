@@ -8642,3 +8642,64 @@ To make these distinguishable, the MCP submission server SHALL record which subm
 - **THEN** the daemon's recording distinguishes "a submission was relayed but not consumed" from "no submission was ever relayed"
 - **AND** an operator can therefore tell called-but-not-relayed (mode c) from advertised-but-not-called (mode b)
 
+### Requirement: The audit-thread excerpt handed to triage carries each finding's full body
+
+The excerpt stamped into the audit-thread state SHALL carry the same rich,
+body-bearing rendering as the posted audit thread body: per finding, the
+`severity glyph + subject + anchor` title line FOLLOWED BY that finding's full
+`body` field when non-empty. Because that stamped excerpt is exactly the value
+handed to the triage executor as `TriageContext.findings` when an operator runs
+`send it` in the audit thread (per the existing "`send it` verb in an audit thread
+schedules a triage executor run" AND "Triage mode runs the executor with an
+explore-then-classify prompt" requirements), the downstream triage agent SHALL
+receive the divergence reasoning the audit already produced — what the spec
+requires, what the code does, and why — rather than a one-line title it would
+otherwise have to re-derive.
+
+This requirement constrains the CONTENT of the stamped excerpt AND of
+`TriageContext.findings`; it does NOT add, remove, OR reorder any
+`TriageContext` field, NOR change how `send it` schedules or how triage mode runs.
+The stamped excerpt remains subject to its existing 35,000-character cap: when the
+rich rendering would exceed 35,000 characters it is truncated to that cap and ends
+with the existing pointer-to-daemon-log tail, mirroring the thread-body truncation.
+A finding whose `body` is empty contributes only its one-line title, with no stray
+blank-body artifact.
+
+#### Scenario: The stamped excerpt carries the finding bodies
+
+- **WHEN** a `drift_audit` posts an audit notification whose findings carry divergence `body` paragraphs
+- **THEN** the excerpt stamped into the audit-thread state contains each finding's title line AND its full `body` paragraph
+- **AND** the stamped excerpt is the rich body-bearing form, not the title-only string
+
+#### Scenario: Triage receives the rich excerpt on `send it`
+
+- **WHEN** an operator runs `@<bot> send it` in the audit thread AND the next polling iteration drains the triage and invokes `run_triage`
+- **THEN** the `TriageContext.findings` value equals the stamped rich excerpt — the divergence body text is present
+- **AND** the triage agent is NOT handed the title-only form
+
+#### Scenario: The stamped excerpt is still capped at 35,000 characters
+
+- **WHEN** the rich rendering stamped as the excerpt would exceed 35,000 characters
+- **THEN** the stamped excerpt is truncated to 35,000 characters AND ends with the existing pointer-to-daemon-log tail
+- **AND** the 35,000 cap value AND the tail text are unchanged by this requirement
+
+### Requirement: Check-only install writes its config to the default discovery path so verify needs no `--config`
+The check-only install SHALL write its minimal config to the standard location `autocoder` auto-discovers — the same discovery the `run` subcommand uses when `--config` is omitted, which on a user install is `~/.config/autocoder/config.yaml`. A check-only config is an ordinary autocoder config (the same schema, carrying only the subset `verify` needs) AND SHALL NOT use a distinct filename. Consequently `autocoder verify <change-slug>` SHALL resolve this config via auto-discovery with NO `--config` flag. An explicit `--config <path>` SHALL continue to override discovery, so the installer's `--config` option AND CI invocations that pass an explicit path are unaffected. The installer's post-install summary SHALL present the next-step invocation that MATCHES where it wrote the config: the flagless `autocoder verify <change-slug>` when the config went to the default discovery path, OR `autocoder verify <change-slug> --config <path>` when an explicit `--config <path>` directed it elsewhere — so the suggested command always resolves the config the installer just wrote.
+
+Writing the minimal config to the standard discovery path is safe because the check-only spec-authoring machine does not run the daemon, so there is no separate daemon `config.yaml` at that path for it to collide with; the existing "config already exists, leave it untouched" guard still prevents clobbering any pre-existing config.
+
+#### Scenario: Check-only config lands at the auto-discovered path
+- **WHEN** the check-only install completes on a user spec-authoring machine with no `--config` override
+- **THEN** the minimal config is written to `~/.config/autocoder/config.yaml`
+- **AND** `autocoder verify <change-slug>` run in a repository resolves that config via auto-discovery with no `--config` flag
+
+#### Scenario: An explicit --config still overrides discovery
+- **WHEN** an operator runs `autocoder verify <change-slug> --config <path>`
+- **THEN** the config at `<path>` is used, overriding auto-discovery
+- **AND** the installer's `--config <path>` option likewise writes the minimal config to that path
+- **AND** the installer's post-install summary shows the matching `autocoder verify <change-slug> --config <path>` invocation
+
+#### Scenario: The post-install summary shows the flagless invocation when the config went to the discovery path
+- **WHEN** the check-only install finishes having written its config to the default discovery path (no `--config` override)
+- **THEN** its printed next-step command is `autocoder verify <change-slug>` with no `--config` flag
+

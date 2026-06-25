@@ -1612,6 +1612,53 @@ pub const AUDIT_THREAD_CHAR_THRESHOLD: usize = 300;
 /// envelope overhead.
 pub const AUDIT_THREAD_BODY_CHAR_CAP: usize = 35_000;
 
+/// Stable prefix of the truncation pointer tail — everything up to the
+/// `audit_id` value. One source for BOTH emitting the tail in
+/// [`cap_audit_findings_body`] AND detecting an already-capped body in that
+/// helper's idempotency guard, so the emitted tail and the guard can never
+/// drift apart.
+const AUDIT_TRUNCATION_POINTER_PREFIX: &str =
+    "… [truncated; full findings at journalctl -u autocoder | grep audit_id=";
+
+/// Truncate a rendered audit-findings body to [`AUDIT_THREAD_BODY_CHAR_CAP`],
+/// appending the pointer-to-daemon-log tail naming `audit_id` when (and only
+/// when) truncation occurs. This is the SINGLE source of the cap value AND the
+/// tail text shared by the posted thread body
+/// ([`format_audit_notification`]) AND the stamped audit-thread excerpt
+/// ([`threads::cap_findings_excerpt`]), so the operator and the triage agent
+/// always see identical truncation behaviour. A body within the cap is returned
+/// verbatim, with no tail.
+///
+/// The cap is IDEMPOTENT. The posted thread body funnels through this helper in
+/// the formatter and then, when stamped as the excerpt, funnels through it a
+/// second time. A body whose final line is already the truncation pointer tail
+/// was capped by that earlier pass, so it is returned unchanged rather than
+/// truncated again and given a nested second tail: the stamped excerpt is
+/// byte-identical to the already-capped thread body it came from, carrying
+/// exactly one tail. (On the live path the first cap already cuts at exactly
+/// the 35,000-char boundary, so the second pass's `take` would re-derive the
+/// same body prefix and re-append an identical tail even without this guard —
+/// the guard makes that invariant explicit and cheap, and keeps it holding even
+/// if the two passes' inputs ever diverged, addressing the double-truncation
+/// review concern.)
+pub fn cap_audit_findings_body(body: &str, audit_id: &str) -> String {
+    if body.chars().count() <= AUDIT_THREAD_BODY_CHAR_CAP {
+        return body.to_string();
+    }
+    // Idempotency guard: a body whose last line is the truncation pointer tail
+    // has already been capped by a prior pass through this helper. Re-capping it
+    // would only discard that tail and append an identical one.
+    if body
+        .lines()
+        .last()
+        .is_some_and(|last| last.starts_with(AUDIT_TRUNCATION_POINTER_PREFIX))
+    {
+        return body.to_string();
+    }
+    let truncated: String = body.chars().take(AUDIT_THREAD_BODY_CHAR_CAP).collect();
+    format!("{truncated}\n\n{AUDIT_TRUNCATION_POINTER_PREFIX}{audit_id}]")
+}
+
 /// Output of [`format_audit_notification`]. The scheduler decides which
 /// `ChatOpsBackend` method to invoke based on `should_thread`:
 /// `true`  → `post_notification_with_thread(top_line, thread_body)`;
@@ -1678,16 +1725,12 @@ pub fn format_audit_notification_with_attribution(
     };
 
     // Length cap: truncate to 35,000 chars and append a pointer naming
-    // the audit_id operators can grep in the daemon log.
+    // the audit_id operators can grep in the daemon log. The stamped
+    // audit-thread excerpt funnels through the SAME helper so the operator
+    // and the triage agent see identical truncation behaviour.
     if thread_body.chars().count() > AUDIT_THREAD_BODY_CHAR_CAP {
         let audit_id = make_audit_id(repo_url, audit_type, now);
-        let truncated: String = thread_body
-            .chars()
-            .take(AUDIT_THREAD_BODY_CHAR_CAP)
-            .collect();
-        thread_body = format!(
-            "{truncated}\n\n… [truncated; full findings at journalctl -u autocoder | grep audit_id={audit_id}]"
-        );
+        thread_body = cap_audit_findings_body(&thread_body, &audit_id);
     }
 
     // a49: append the attribution line AFTER the truncation cap so it is
@@ -1757,15 +1800,21 @@ fn format_audit_top_line(
     }
 }
 
-/// Render the per-finding body the thread reply carries. Same shape as
-/// the prior `format_findings_message` body (severity glyph + subject +
-/// optional `(anchor)`) so operators reading the thread see the same
-/// content they used to see inline.
+/// Render the rich per-finding body the thread reply carries. Each finding
+/// renders its `severity glyph + subject + optional (anchor)` title line
+/// FOLLOWED BY the finding's full `body` (e.g. a `drift_audit` finding's
+/// divergence paragraph — what the spec requires, what the code does, and why
+/// the gap matters) when the body is non-empty, so the operator AND the
+/// downstream triage agent see the audit's reasoning, not merely the one-line
+/// title. Findings are separated by a blank line so each finding's title and
+/// body read as one unit. A finding whose `body` is empty (or whitespace-only)
+/// renders its title alone, with no stray blank line or empty-body placeholder.
 fn format_audit_thread_body(findings: &[Finding]) -> String {
     let mut out = String::new();
     for (i, f) in findings.iter().enumerate() {
         if i > 0 {
-            out.push('\n');
+            // Blank line between findings so each title+body reads as one unit.
+            out.push_str("\n\n");
         }
         let glyph = f.severity.glyph();
         out.push_str("  ");
@@ -1776,6 +1825,14 @@ fn format_audit_thread_body(findings: &[Finding]) -> String {
             out.push_str(" (");
             out.push_str(anchor);
             out.push(')');
+        }
+        // The finding's full body beneath its title, when present. Trimming
+        // keeps a body-less finding from emitting a stray blank-body artifact
+        // (and keeps the blank-line separator between findings exact).
+        let body = f.body.trim();
+        if !body.is_empty() {
+            out.push('\n');
+            out.push_str(body);
         }
     }
     out
@@ -2871,8 +2928,6 @@ mod tests {
             drift_finding("spec X says A; code says B."),
             drift_finding("spec Y says C; code says D."),
         ];
-        // Threshold for threading: 5 lines OR 300 chars. With 2 short
-        // findings, the body is 2 lines and a few dozen chars — inline.
         let n = format_audit_notification(
             "drift_audit",
             "git@github.com:o/r.git",
@@ -2890,7 +2945,16 @@ mod tests {
             "top_line must report 2 divergences: {}",
             n.top_line
         );
-        assert!(!n.should_thread, "two short divergences inline");
+        // The rich renderer emits each finding's divergence body beneath its
+        // title line, so two findings span more than the 3-line threshold and
+        // route through the threaded path — AND the body text is present
+        // verbatim, not reduced to the title.
+        assert!(
+            n.should_thread,
+            "two findings with divergence bodies → >3 lines → thread"
+        );
+        assert!(n.thread_body.contains("spec X says A; code says B."));
+        assert!(n.thread_body.contains("spec Y says C; code says D."));
     }
 
     #[test]
@@ -3004,6 +3068,165 @@ mod tests {
             !n.thread_body.contains("[truncated"),
             "small body must not get a truncation pointer: {}",
             n.thread_body
+        );
+    }
+
+    /// 4.1: a `drift_audit` finding's divergence `body` appears in BOTH the
+    /// rendered thread body AND the stamped findings excerpt — not just the
+    /// one-line title.
+    #[test]
+    fn drift_finding_body_present_in_thread_body_and_excerpt() {
+        let divergence = "Spec `retry-on-timeout` requires 3 retries; the code retries once; \
+             a transient timeout therefore drops the change.";
+        let findings = vec![drift_finding(divergence)];
+        let n = format_audit_notification(
+            "drift_audit",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        // The thread body carries the title line AND the full divergence body.
+        assert!(
+            n.thread_body.contains("[capX] reqY"),
+            "title line must still render: {}",
+            n.thread_body
+        );
+        assert!(
+            n.thread_body.contains(divergence),
+            "the divergence body must appear in the thread body, not just the title: {}",
+            n.thread_body
+        );
+        // The stamped excerpt funnels the SAME thread body through the excerpt
+        // cap (exactly the value `stamp_audit_thread_state` writes), so it
+        // carries the divergence too — never the thin title-only string.
+        let audit_id = make_audit_id("git@github.com:o/r.git", "drift_audit", ts());
+        let excerpt = threads::cap_findings_excerpt(&n.thread_body, &audit_id);
+        assert!(
+            excerpt.contains(divergence),
+            "the stamped excerpt must carry the divergence body: {excerpt}"
+        );
+    }
+
+    /// 4.2: a rendered body exceeding the 35,000-char cap is truncated to the
+    /// cap with the existing pointer-to-daemon-log tail — for BOTH the thread
+    /// body AND the stamped excerpt.
+    #[test]
+    fn over_cap_body_truncates_with_pointer_for_body_and_excerpt() {
+        // One finding whose divergence body alone blows past the cap.
+        let huge_body = "X".repeat(AUDIT_THREAD_BODY_CHAR_CAP + 5_000);
+        let findings = vec![drift_finding(&huge_body)];
+        let n = format_audit_notification(
+            "drift_audit",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        let pointer = "[truncated; full findings at journalctl -u autocoder | grep audit_id=";
+        // Thread body: capped to ~cap + tail, carries the pointer tail.
+        assert!(n.thread_body.chars().count() > AUDIT_THREAD_BODY_CHAR_CAP);
+        assert!(n.thread_body.chars().count() < AUDIT_THREAD_BODY_CHAR_CAP + 1_000);
+        assert!(
+            n.thread_body.contains(pointer),
+            "thread body must carry the pointer tail: {}",
+            n.thread_body.chars().rev().take(200).collect::<String>(),
+        );
+        // Stamped excerpt: same cap value, same pointer tail.
+        let audit_id = make_audit_id("git@github.com:o/r.git", "drift_audit", ts());
+        let excerpt = threads::cap_findings_excerpt(&n.thread_body, &audit_id);
+        assert!(excerpt.chars().count() > AUDIT_THREAD_BODY_CHAR_CAP);
+        assert!(excerpt.chars().count() < AUDIT_THREAD_BODY_CHAR_CAP + 1_000);
+        assert!(
+            excerpt.contains(pointer),
+            "stamped excerpt must carry the pointer tail too"
+        );
+        // The cap is idempotent: stamping the already-capped thread body as the
+        // excerpt does NOT truncate a second time or append a nested second
+        // pointer tail. The excerpt is byte-identical to the thread body and
+        // carries EXACTLY ONE tail — precluding the double-truncation artifact.
+        assert_eq!(
+            excerpt, n.thread_body,
+            "stamped excerpt must equal the already-capped thread body verbatim"
+        );
+        assert_eq!(
+            excerpt.matches(pointer).count(),
+            1,
+            "exactly one pointer tail in the excerpt — no nested second tail: {}",
+            excerpt.chars().rev().take(200).collect::<String>(),
+        );
+    }
+
+    /// The shared cap is IDEMPOTENT: capping a body that already ends in the
+    /// truncation pointer tail returns it unchanged — it does NOT truncate a
+    /// second time or append a nested second tail. This is the invariant that
+    /// keeps the stamped excerpt byte-identical to the posted thread body on the
+    /// live path, where the body funnels through the cap in the formatter and
+    /// again when it is stamped as the excerpt (the double-truncation concern).
+    #[test]
+    fn cap_audit_findings_body_is_idempotent_no_nested_tail() {
+        let huge = "Z".repeat(AUDIT_THREAD_BODY_CHAR_CAP + 2_000);
+        let audit_id = "owner_repo:drift_audit:2026-06-25T00:00:00Z";
+        let once = cap_audit_findings_body(&huge, audit_id);
+        let twice = cap_audit_findings_body(&once, audit_id);
+        assert_eq!(once, twice, "double-capping must be a no-op");
+        let pointer = "[truncated; full findings at journalctl -u autocoder | grep audit_id=";
+        assert_eq!(
+            twice.matches(pointer).count(),
+            1,
+            "exactly one pointer tail — no nested second tail: {}",
+            twice.chars().rev().take(200).collect::<String>(),
+        );
+    }
+
+    /// 4.4: a finding whose `body` is empty renders only its one-line title —
+    /// no stray blank line / empty-body placeholder — in both the thread body
+    /// and the stamped excerpt.
+    #[test]
+    fn body_less_finding_renders_title_only_no_blank_artifact() {
+        let findings = vec![
+            Finding {
+                severity: Severity::High,
+                subject: "first with body".into(),
+                body: "the divergence reasoning".into(),
+                anchor: Some("src/a.rs:1".into()),
+            },
+            Finding {
+                severity: Severity::Low,
+                subject: "second body-less".into(),
+                body: String::new(),
+                anchor: Some("src/b.rs:2".into()),
+            },
+        ];
+        let n = format_audit_notification("drift_audit", "u", &findings, false, ts());
+        // The body-less finding's title renders...
+        assert!(
+            n.thread_body.contains("second body-less (src/b.rs:2)"),
+            "{}",
+            n.thread_body
+        );
+        // ...and it is the final text — no trailing blank line / empty-body
+        // placeholder after it.
+        assert!(
+            n.thread_body.ends_with("second body-less (src/b.rs:2)"),
+            "no stray blank-body artifact after the title-only finding: {:?}",
+            n.thread_body
+        );
+        // Findings are separated by exactly one blank line: the first finding's
+        // title + body form one unit, then a blank line, then the body-less
+        // title — no extra artifact between them.
+        assert!(
+            n.thread_body
+                .contains("the divergence reasoning\n\n  • second body-less (src/b.rs:2)"),
+            "findings must be blank-line separated with no extra artifact: {:?}",
+            n.thread_body
+        );
+        // The same shape survives into the stamped excerpt.
+        let audit_id = make_audit_id("u", "drift_audit", ts());
+        let excerpt = threads::cap_findings_excerpt(&n.thread_body, &audit_id);
+        assert!(
+            excerpt.ends_with("second body-less (src/b.rs:2)"),
+            "excerpt: {excerpt:?}"
         );
     }
 
