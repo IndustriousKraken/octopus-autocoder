@@ -187,9 +187,14 @@ autocoder verify add-widget-endpoint --config /path/to/config.yaml
 **Check-only install on a spec-box.** `verify` is a subcommand of the autocoder binary, so it ships the identical logic the server runs. To run it on a low-powered spec-authoring machine without building from source or running the daemon, use the check-only installer, which fetches the prebuilt binary and drops a minimal config carrying only the three gate model blocks, their enabled flags, and the global-rule corpus location. It writes that config to the standard auto-discovered path (`~/.config/autocoder/config.yaml`), so `autocoder verify <change-slug>` then resolves it with no `--config` flag:
 
 ```bash
-./install-verify.sh           # latest release
-./install-verify.sh --version v0.5.0
+# One-liner (no checkout needed):
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/master/install-verify.sh | bash -s -- --version vX.Y.Z
+
+# Or from a checkout:
+./install-verify.sh --version vX.Y.Z
 ```
+
+`--version` is required in practice: `verify` ships only in `-dev` prereleases, which the default `releases/latest` lookup skips. List the newest tag with `curl -fsSL "https://api.github.com/repos/IndustriousKraken/octopus-autocoder/releases?per_page=15" | grep '"tag_name"' | head -1`.
 
 `verify` is the LOCAL accelerator; the server gates remain the fail-closed enforcement (they run against fresher canon at implement time and cover every contributor). They are feedback vs. enforcement, not redundant.
 
