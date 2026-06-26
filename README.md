@@ -16,6 +16,22 @@ curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder
 
 The one-liner downloads a pre-built binary, verifies its SHA-256, places it at `/usr/local/bin/autocoder` (or `~/.local/bin/autocoder` if `sudo` is unavailable or `--user` is passed), then execs `autocoder install`. **The bootstrap script is intentionally tiny (~75 lines, no operator prompts).** Everything else — the configuration wizard, `useradd`/`systemctl`/`apt-get`, optional Claude CLI bootstrap — lives in the `autocoder install` Rust subcommand which ships with `cargo test` coverage.
 
+### Spec-box (verify-only) install
+
+To run just `autocoder verify` (the local pre-push gate checks) on a spec-authoring machine — no daemon, no system user, no build from source:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/octopus-autocoder/master/install-verify.sh | bash -s -- --version vX.Y.Z
+```
+
+This drops the binary at `~/.local/bin/autocoder` plus a minimal config at `~/.config/autocoder/config.yaml` (just the three gate model blocks + corpus path). **`--version` is required:** `verify` currently ships only in `-dev` prereleases, which the default `releases/latest` lookup skips. Find the newest tag with:
+
+```bash
+curl -fsSL "https://api.github.com/repos/IndustriousKraken/octopus-autocoder/releases?per_page=15" | grep '"tag_name"' | head -1
+```
+
+See [docs/CLI.md → verify](docs/CLI.md#verify) for the gate details.
+
 By default `autocoder install` picks **server mode** on Linux when systemd is detected (`/run/systemd/system` present): it creates an `autocoder` system user, writes `/etc/autocoder/config.yaml` + `/etc/autocoder/secrets.env`, renders `/etc/systemd/system/autocoder.service`, and offers to start it. Otherwise it picks **dev mode** and writes to `~/.config/autocoder/` instead, with no system-user / systemd work. Either mode can be forced with `--mode server` or `--mode dev`.
 
 For automation (Ansible, Terraform, cloud-init), pass `--non-interactive` along with `--repo-url`, `--token-env-var`, `--chatops-backend`, and `--reviewer-provider`. Anything after `--` on the `install.sh` command line is forwarded to the subcommand:
