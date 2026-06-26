@@ -1265,21 +1265,7 @@ On a unique repo match AND `features.brownfield_survey.enabled: true` for that r
 - **AND** no action is submitted
 
 ### Requirement: Inbound listener routes `send it` to `BrownfieldBatchAction` when posted in a brownfield-survey thread
-The existing `send it` verb (per the canonical `audit-reply-acts` mechanism; the audit-thread handler itself is defined by `send it verb in an audit thread` and is NOT redefined here) SHALL gain a SECOND recognized context: when posted as a reply inside a brownfield-survey lifecycle thread, the listener SHALL submit a `BrownfieldBatchAction { survey_request_id, channel, thread_ts }` INSTEAD OF the canonical audit-triage action.
-
-At parse time, the listener SHALL look up the parent thread's `ts` against FOUR sets of per-workspace state:
-
-1. Audit-thread set — the existing canonical audit-thread state (its routing is defined by `send it verb in an audit thread`, not redefined here).
-2. Brownfield-survey set — `BrownfieldSurveyState.thread_ts` values across the workspace's stored surveys.
-3. Issue-candidate set — the `thread_ts` values recorded on stored issue-candidate states (per `Inbound listener routes send it to issue-candidate promotion when posted in an issue-candidate thread`).
-4. Revision-thread set — the `thread_ts` values recorded on stored `RevisionThreadState` entries (per `Inbound listener routes send it to the spec-revision executor when posted in a revision thread`).
-
-The four-set lookup applies ONLY to a `send it` posted as a thread reply (a non-empty parent `thread_ts`). A `send it` at top level (not a thread reply) is NOT a thread context at all — it parses as the unknown-verb fallback (the `?` reaction), per `send it verb in an audit thread`. For a thread reply: if the parent thread matches an audit thread, the audit-thread handler fires (as defined by `send it verb in an audit thread`); if it matches a brownfield-survey thread, the new `BrownfieldBatchAction` is submitted; if it matches an issue-candidate thread, the issue-candidate promotion fires; if it matches a revision thread, the spec-revision executor fires. If a thread reply matches NONE of the four tracked sets, the listener posts the untracked-thread refusal, whose text names all four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread).
-
-#### Scenario: Send-it in an audit thread (regression check)
-- **WHEN** an operator posts `@<bot> send it` as a reply inside a tracked audit thread
-- **THEN** the existing canonical audit-triage action is submitted, as defined by `send it verb in an audit thread` (this requirement does not redefine the audit-thread routing)
-- **AND** the brownfield-survey, issue-candidate, and revision routing do not apply
+The existing `send it` verb (its full thread-context dispatch order AND the untracked-thread refusal are defined by `Inbound listener dispatches send it by thread context AND refuses untracked threads`, NOT restated here; the audit-thread handler itself is defined by `send it verb in an audit thread schedules a triage executor run`) SHALL recognize a brownfield-survey lifecycle thread as one of its contexts: when posted as a reply whose parent `thread_ts` matches a `BrownfieldSurveyState.thread_ts`, the listener SHALL submit a `BrownfieldBatchAction { survey_request_id, channel, thread_ts }` INSTEAD OF the other contexts' handlers ONLY when the survey's `BrownfieldSurveyState.status` is `Pending`; if the status is `InProgress` or `Completed`, the bot replies with the duplicate-refusal defined in Scenario B and submits no action.
 
 #### Scenario: Send-it in a brownfield-survey thread
 - **WHEN** an operator posts `@<bot> send it` as a reply inside a brownfield-survey lifecycle thread
@@ -1291,18 +1277,6 @@ The four-set lookup applies ONLY to a `send it` posted as a thread reply (a non-
 - **WHEN** the survey's `status` is already `InProgress` OR `Completed`
 - **THEN** the bot replies `✗ send it: a brownfield batch is already <in progress | completed> for survey <request_id>.`
 - **AND** no duplicate `BrownfieldBatchAction` is submitted
-
-#### Scenario: Send-it in a revision thread fires the revision executor
-- **WHEN** an operator posts `@<bot> send it` as a reply whose `thread_ts` matches a stored `RevisionThreadState`
-- **THEN** the spec-revision executor fires for that change (per the revision-executor requirement)
-- **AND** neither the audit-triage, brownfield-batch, nor issue-candidate handler is invoked
-
-#### Scenario: Send-it in an unrecognized thread is refused; at top level it is the `?` fallback
-- **WHEN** an operator posts `@<bot> send it` as a reply in a thread that matches none of the four tracked contexts (audit, survey, issue-candidate, revision)
-- **THEN** the bot replies with the untracked-thread rejection message naming the four valid contexts AND no action is submitted
-- **WHEN** an operator posts `@<bot> send it` at top level (not a thread reply)
-- **THEN** it parses as the unknown-verb fallback (the `?` reaction, per `send it verb in an audit thread`), NOT the untracked-thread refusal
-- **AND** no action is submitted
 
 ### Requirement: Inbound listener recognizes the `clear-survey` verb
 The inbound listener SHALL recognize `@<bot> clear-survey <repo-substring>` as an operator-recovery verb (alongside `clear-perma-stuck`, `clear-revision`, `clear-scout`, `wipe-workspace`, etc.). The listener SHALL parse the repo-substring per the existing match rule AND submit `ClearSurveyAction { repo_url, channel, thread_ts }`.
@@ -1582,7 +1556,7 @@ When an operator triggers an audit on demand (the `audit` verb), the daemon SHAL
 - **THEN** the notification is delivered as a non-threaded post rather than dropped
 
 ### Requirement: Inbound listener routes `send it` to the spec-revision executor when posted in a revision thread
-The `send it` verb SHALL recognize a FOURTH thread context — a spec-revision thread — alongside the audit, brownfield-survey, and issue-candidate contexts. When `@<bot> send it` is posted as a reply whose `thread_ts` matches a stored `RevisionThreadState`, the dispatcher SHALL run the spec-revision executor for that change INSTEAD OF the other contexts' handlers. A `thread_ts` resolves to at most one record across the four sets.
+The `send it` verb SHALL recognize a spec-revision thread as one of its thread contexts (the full dispatch order AND the untracked-thread refusal are defined by `Inbound listener dispatches send it by thread context AND refuses untracked threads`, NOT restated here): when `@<bot> send it` is posted as a reply whose `thread_ts` matches a stored `RevisionThreadState`, the dispatcher SHALL run the spec-revision executor for that change INSTEAD OF the other contexts' handlers.
 
 A reply in a revision thread that is an `@<bot>` mention but is NOT the `send it` verb SHALL route to the read-only revision advisor (per the revision-advisor requirement), so the operator can discuss the revision before triggering it. A bare reply with no mention is not seen by the listener (consistent with the other contexts).
 
@@ -1596,50 +1570,20 @@ A reply in a revision thread that is an `@<bot>` mention but is NOT the `send it
 - **THEN** the dispatcher routes it to the read-only revision advisor
 - **AND** no spec file is written by that reply
 
-#### Scenario: Send-it in an untracked thread names four contexts
-- **WHEN** an operator posts `@<bot> send it` in a thread matching no audit, survey, issue-candidate, OR revision record
-- **THEN** the bot posts the untracked-thread refusal naming the four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread)
-- **AND** no action is submitted
-
 ### Requirement: Inbound listener routes `send it` to issue-candidate promotion when posted in an issue-candidate thread
+The `send it` verb SHALL recognize an issue-candidate thread as one of its thread contexts (the full dispatch order AND the untracked-thread refusal are defined by `Inbound listener dispatches send it by thread context AND refuses untracked threads`, NOT restated here): when `@<bot> send it` is posted as a reply whose `thread_ts` matches a posted issue-candidate's recorded thread, the dispatcher SHALL promote that candidate INSTEAD OF the other contexts' handlers.
 
-The `send it` verb SHALL recognize an issue-candidate thread as one of its thread contexts: when `@<bot> send it` is posted as a reply whose `thread_ts` matches a posted issue-candidate's recorded thread, the dispatcher SHALL promote that candidate INSTEAD OF the audit-triage, brownfield-batch, OR spec-revision actions. This requirement DEFINES the issue-candidate routing that the canonical `send it`-context requirements already reference: the `Inbound listener routes send it to BrownfieldBatchAction when posted in a brownfield-survey thread` requirement enumerates the full thread-context set (audit, brownfield-survey, issue-candidate, AND spec-revision) AND cites this requirement for the issue-candidate branch, but the branch itself was not previously defined OR wired.
-
-At parse time, after the audit-thread lookup AND the brownfield-survey lookup both miss, the dispatcher SHALL look up the reply's `thread_ts` against the issue-candidate set — the `thread_ts` values recorded on stored candidate states — BEFORE the spec-revision lookup (matching the context order the canonical brownfield-survey requirement states). A `thread_ts` resolves to at most one record across the four sets.
-
-On a match whose candidate `status` is the posted (not-yet-promoted) state, the dispatcher SHALL submit the promotion control-socket action carrying the candidate identity AND the originating `channel`/`thread_ts`, AND reply with the write-and-queue confirmation. On a match whose candidate is already promoted, the dispatcher SHALL reply that the candidate is already promoted AND submit nothing. When a thread reply matches NONE of the four sets, the dispatcher SHALL post the untracked-thread refusal, whose text names all four valid contexts (audit thread, brownfield-survey thread, issue-candidate thread, spec-revision thread). A `send it` at top level (not a thread reply) is NOT a thread context — it parses as the unknown-verb fallback (the `?` reaction), per the canonical brownfield-survey requirement, NOT the untracked-thread refusal.
-
-#### Scenario: Send-it in an audit thread is unchanged
-
-- **WHEN** an operator posts `@<bot> send it` as a reply inside an audit thread
-- **THEN** the existing audit-triage action is submitted
-- **AND** the issue-candidate lookup is not consulted
+On a match whose candidate `status` is the posted (not-yet-promoted) state, the dispatcher SHALL submit the promotion control-socket action carrying the candidate identity AND the originating `channel`/`thread_ts`, AND reply with the write-and-queue confirmation. On a match whose candidate is already promoted, the dispatcher SHALL reply that the candidate is already promoted AND submit nothing.
 
 #### Scenario: Send-it promotes a posted issue candidate
-
-- **WHEN** an operator posts `@<bot> send it` as a reply whose `thread_ts`
-  matches a stored issue candidate whose status is the posted (not-yet-promoted)
-  state
-- **THEN** the dispatcher submits the promotion control-socket action carrying
-  the candidate identity AND the originating `channel`/`thread_ts`
-- **AND** on success the bot replies that it wrote `issues/<slug>/` AND queued
-  it for the issues lane
+- **WHEN** an operator posts `@<bot> send it` as a reply whose `thread_ts` matches a stored issue candidate whose status is the posted (not-yet-promoted) state
+- **THEN** the dispatcher submits the promotion control-socket action carrying the candidate identity AND the originating `channel`/`thread_ts`
+- **AND** on success the bot replies that it wrote `issues/<slug>/` AND queued it for the issues lane
 
 #### Scenario: Send-it on an already-promoted candidate takes no new action
-
-- **WHEN** an operator posts `@<bot> send it` in an issue-candidate thread whose
-  candidate is already promoted
+- **WHEN** an operator posts `@<bot> send it` in an issue-candidate thread whose candidate is already promoted
 - **THEN** the bot replies that the candidate is already promoted
 - **AND** no promotion action is submitted
-
-#### Scenario: Send-it in an untracked thread names all four contexts
-
-- **WHEN** an operator posts `@<bot> send it` as a reply in a thread that
-  matches no audit, survey, issue-candidate, OR spec-revision record
-- **THEN** the bot posts the untracked-thread refusal naming the four valid
-  contexts (audit thread, brownfield-survey thread, issue-candidate thread,
-  spec-revision thread)
-- **AND** no action is submitted
 
 ### Requirement: Preempting in-flight work is acknowledged to the operator
 When a workspace-mutating operator command (e.g. the confirmed `rollback` verb) preempts a repository's in-flight pass — cancelling the change that pass was working — the chatops surface SHALL acknowledge the preempt to the operator before, or alongside, the operation's result, so the cancelled change is not a silent surprise. The acknowledgement SHALL name the operation being performed AND the change that was cancelled (e.g. "preempting in-flight work on `<slug>` to roll back"). The change slug SHALL come from the busy marker's recorded `change` field, which the operation reads before preempting.
@@ -1853,4 +1797,33 @@ A failure that the orchestrator is still retrying within its bounded retry (see 
 #### Scenario: A retrying failure is distinguishable from a terminal one
 - **WHEN** a session has failed but the orchestrator is retrying it within the bounded retry
 - **THEN** the operator-facing surface distinguishes the retry-in-progress state from a terminal, retries-exhausted failure
+
+### Requirement: Inbound listener dispatches `send it` by thread context AND refuses untracked threads
+This requirement is the SINGLE canonical owner of the `send it` thread-context dispatch order AND the untracked-thread refusal. The per-context routing requirements (audit, brownfield-survey, issue-candidate, AND spec-revision) define ONLY their own positive branch AND cite this requirement for the lookup order AND the refusal; they SHALL NOT restate the four-set lookup OR the untracked-thread refusal text.
+
+When `@<bot> send it` (case-insensitive on `send it`) arrives as a thread reply (a non-empty parent `thread_ts`), the listener SHALL look the parent `thread_ts` up against FOUR per-workspace sets, in this order, matching AT MOST ONE record across all four:
+
+1. Audit-thread set (per `send it verb in an audit thread schedules a triage executor run`).
+2. Brownfield-survey set — `BrownfieldSurveyState.thread_ts` values (per `Inbound listener routes send it to BrownfieldBatchAction when posted in a brownfield-survey thread`).
+3. Issue-candidate set — the `thread_ts` values recorded on stored issue-candidate states (per `Inbound listener routes send it to issue-candidate promotion when posted in an issue-candidate thread`).
+4. Revision-thread set — the `thread_ts` values recorded on stored `RevisionThreadState` entries (per `Inbound listener routes send it to the spec-revision executor when posted in a revision thread`).
+
+On a match, the corresponding context's handler fires, as defined by that context's requirement. If the reply matches NONE of the four tracked sets, the listener SHALL post the untracked-thread refusal `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.` AND submit no control-socket action.
+
+A `send it` at TOP LEVEL (no parent `thread_ts`, not a thread reply) is NOT a thread context: it parses as the unknown-verb fallback (the `?` reaction, per `Unrecognised verbs get a \`?\` reaction`), NOT the untracked-thread refusal.
+
+#### Scenario: Lookup walks the four sets in order, matching at most one
+- **WHEN** an operator posts `@<bot> send it` as a thread reply
+- **THEN** the listener looks the parent `thread_ts` up against the audit, brownfield-survey, issue-candidate, AND revision sets in that order
+- **AND** at most one record matches across the four sets, AND that context's handler fires
+
+#### Scenario: Untracked thread reply is politely refused
+- **WHEN** an operator posts `@<bot> send it` as a reply in a thread that matches none of the four tracked sets (audit, brownfield-survey, issue-candidate, revision)
+- **THEN** the bot replies `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.`
+- **AND** no control-socket action is submitted
+
+#### Scenario: Top-level send it is the `?` fallback, not the refusal
+- **WHEN** an operator posts `@<bot> send it` at top level (no parent `thread_ts`, not a thread reply)
+- **THEN** it parses as the unknown-verb fallback (the `?` reaction)
+- **AND** it is NOT the untracked-thread refusal AND no action is submitted
 
