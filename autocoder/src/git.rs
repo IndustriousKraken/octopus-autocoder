@@ -8,6 +8,63 @@ use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// Marker phrase embedded in the error a `git` spawn produces when the cause
+/// is a vanished `current_dir` — the workspace directory no longer exists
+/// (workspace-cache eviction, a rebuild, or fork recreation removed/recreated
+/// it between operations). Load-bearing across the `git` ↔ recovery-
+/// classification boundary: [`crate::recovery_classification`] matches on this
+/// phrase to treat the condition as transient/recoverable, AND the
+/// post-executor queue-walk routes it to the re-init path rather than the
+/// per-change failure counter. Keep it stable.
+pub const MISSING_WORKSPACE_DIR_MARKER: &str = "workspace directory is missing";
+
+/// Build an actionable error from a `git` spawn (`Command::output()`)
+/// failure. A bare `ENOENT` ("No such file or directory") raised by the spawn
+/// itself — NOT by git returning a non-zero status — has two distinct causes
+/// the raw OS message cannot tell apart:
+///
+/// 1. the `git` binary is not on the daemon's `PATH`, OR
+/// 2. the `current_dir(workspace)` no longer exists — the workspace was
+///    removed/recreated between operations.
+///
+/// Probe both AND name which applies, so an operator can tell "install git"
+/// from "the workspace vanished", AND so the recovery classifier can treat the
+/// vanished-workspace case as transient (it re-initializes next iteration)
+/// while a genuinely-missing `git` stays a permanent missing-prerequisite.
+fn spawn_error(workspace: &Path, op: &str, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        // Check the cwd first: in production the `git` binary is almost always
+        // present (other git ops in the same pass succeed), so a vanished
+        // workspace is the likelier cause of an unexpected ENOENT.
+        if !workspace.exists() {
+            return anyhow!(
+                "spawning `git {op}`: {MISSING_WORKSPACE_DIR_MARKER} ({} — \
+                 `current_dir` does not exist; the workspace was removed or \
+                 recreated between operations): {err}",
+                workspace.display(),
+            );
+        }
+        if !crate::sandbox::which("git") {
+            return anyhow!(
+                "spawning `git {op}`: the `git` binary was not found on PATH \
+                 (install git or ensure the daemon's PATH covers it): {err}"
+            );
+        }
+    }
+    // Any other spawn failure (or an ENOENT we could not attribute to either
+    // cause): keep the original spawn context unchanged.
+    anyhow::Error::new(err).context(format!("spawning `git {op}`"))
+}
+
+/// True when `err`'s display carries the [`MISSING_WORKSPACE_DIR_MARKER`] —
+/// i.e. a `run_git` spawn failed because the workspace `current_dir` had
+/// vanished. Used by the recovery classifier AND the post-executor queue-walk
+/// to route this recoverable environmental condition away from terminal
+/// failure handling.
+pub fn is_missing_workspace_dir(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(MISSING_WORKSPACE_DIR_MARKER)
+}
+
 /// Run a git command inside `workspace` and return captured `Output` on
 /// success. On non-zero exit, builds an error string that surfaces the
 /// failed command's diagnostic output: prefer stderr, fall back to
@@ -16,12 +73,19 @@ use std::process::{Command, Output};
 /// parentheses when both streams are empty. This is the contract that
 /// keeps the self-heal flow's `git commit` "nothing to commit, working
 /// tree clean" message visible: that diagnostic line is stdout-only.
+///
+/// A spawn failure (the `git` binary or the workspace `current_dir` is
+/// absent) is routed through [`spawn_error`] so the returned error names the
+/// actual cause instead of a bare ENOENT.
 fn run_git(workspace: &Path, op: &str, args: &[&str]) -> Result<Output> {
-    let output = Command::new("git")
+    let output = match Command::new("git")
         .args(args)
         .current_dir(workspace)
         .output()
-        .with_context(|| format!("spawning `git {op}`"))?;
+    {
+        Ok(output) => output,
+        Err(e) => return Err(spawn_error(workspace, op, e)),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1457,6 +1521,42 @@ mod tests {
         let (_dir, path) = fixture_repo();
         let s = status_porcelain(&path).unwrap();
         assert_eq!(s, "", "expected empty porcelain on clean tree, got {s:?}");
+    }
+
+    #[test]
+    fn run_git_on_missing_workspace_names_the_vanished_cwd() {
+        // A `git status` whose `current_dir` no longer exists fails on SPAWN
+        // with a bare ENOENT. The returned error must NAME the missing-
+        // workspace cause (so an operator can tell it apart from "git not on
+        // PATH") rather than surfacing the bare OS message alone.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("vanished-workspace");
+        assert!(!missing.exists(), "the fixture path must not exist");
+
+        let err =
+            status_porcelain(&missing).expect_err("status on a vanished cwd must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(MISSING_WORKSPACE_DIR_MARKER),
+            "error should name the missing-workspace cause, got: {msg}"
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error should name the vanished path, got: {msg}"
+        );
+        assert!(
+            is_missing_workspace_dir(&err),
+            "the detection helper must recognize this error: {msg}"
+        );
+
+        // `status_entries` (the structured parser) routes through the same
+        // `run_git` spawn path and must surface the same actionable cause.
+        let err2 =
+            status_entries(&missing).expect_err("status_entries on a vanished cwd must error");
+        assert!(
+            is_missing_workspace_dir(&err2),
+            "status_entries error should name the missing-workspace cause: {err2:#}"
+        );
     }
 
     #[test]

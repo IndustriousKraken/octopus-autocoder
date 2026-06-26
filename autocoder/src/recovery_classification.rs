@@ -85,6 +85,16 @@ pub fn classify_recovery_failure(err: &anyhow::Error) -> RecoveryFailureClass {
         return class;
     }
 
+    // A `git` spawn that failed because the workspace `current_dir` vanished
+    // (the workspace was evicted/recreated between operations) is recoverable:
+    // the next iteration re-initializes the workspace. Classify it transient
+    // EXPLICITLY so it is never mistaken for a missing-`git`-binary permanent
+    // failure (both surface as a bare ENOENT). Checked before the permanent
+    // patterns so the attribution is unambiguous.
+    if crate::git::is_missing_workspace_dir(err) {
+        return RecoveryFailureClass::Transient;
+    }
+
     if has_any_substring(&composite, PERMANENT_SUBSTRINGS) {
         return RecoveryFailureClass::Permanent;
     }
@@ -390,6 +400,51 @@ mod tests {
     fn missing_claude_binary_is_permanent() {
         let err = anyhow!("failed to spawn `claude`: No such file or directory");
         permanent(&err);
+    }
+
+    #[test]
+    fn missing_git_binary_on_path_is_permanent() {
+        // A genuinely-absent `git` binary is a missing prerequisite: permanent
+        // (operator must install it). This is the OTHER half of the ENOENT
+        // distinction — same syscall failure, opposite classification from a
+        // vanished workspace dir.
+        let err = anyhow!(
+            "spawning `git status --porcelain`: the `git` binary was not found on \
+             PATH (install git or ensure the daemon's PATH covers it): No such \
+             file or directory (os error 2)"
+        );
+        permanent(&err);
+    }
+
+    // ---- Transient: vanished workspace `current_dir` at git-spawn time ----
+
+    #[test]
+    fn missing_workspace_dir_spawn_error_is_transient() {
+        // The error `crate::git::run_git` produces when the workspace
+        // `current_dir` has vanished must classify Transient (re-init next
+        // iteration), NOT permanent — even though it too surfaces as a bare
+        // ENOENT.
+        let err = anyhow!(
+            "spawning `git status --porcelain`: {} (/cache/ws/foo — `current_dir` \
+             does not exist; the workspace was removed or recreated between \
+             operations): No such file or directory (os error 2)",
+            crate::git::MISSING_WORKSPACE_DIR_MARKER
+        );
+        transient(&err);
+    }
+
+    #[test]
+    fn vanished_workspace_from_run_git_classifies_transient() {
+        // End-to-end: a real `git status` against a vanished workspace dir
+        // classifies Transient via the recovery classifier — asserted on the
+        // CLASSIFICATION, not the message text. This is the post-executor
+        // contract: the daemon re-initializes the workspace next iteration
+        // instead of recording a terminal per-change failure.
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("vanished-workspace");
+        let err = crate::git::status_porcelain(&missing)
+            .expect_err("status on a vanished workspace must error");
+        transient(&err);
     }
 
     // ---- Default-to-transient for unclassified errors ----
