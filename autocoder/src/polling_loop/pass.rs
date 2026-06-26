@@ -16,7 +16,7 @@ pub async fn execute_one_pass(
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
@@ -221,7 +221,7 @@ async fn run_revision_dispatchers(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
 ) {
     if revision_cap > 0 {
         let chatops_ctx_for_revisions = chatops_ctx.map(|c| crate::revisions::ChatOpsCtx {

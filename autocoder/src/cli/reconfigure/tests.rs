@@ -33,7 +33,9 @@ fn baseline_answers() -> WizardAnswers {
         reviewer_api_base_url: None,
         audits: HashMap::new(),
         canonical_rag: None,
-        issues_enabled: false,
+        // Default: issues lane on, represented by an absent `features.issues`
+        // entry (so the baseline fixture serializes no `features:` block).
+        issues_enabled: true,
     }
 }
 

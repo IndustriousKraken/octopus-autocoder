@@ -147,7 +147,7 @@ Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, w
 
 ## Issues lane {#issues-lane}
 
-The issues lane is a second work lane for **corrections** — fixes that don't warrant a spec change — running alongside the OpenSpec changes queue. It is **off by default**. Enable it with `features.issues.enabled: true` (the install wizard offers a `[y/N]` gate; `--issues-lane enabled` non-interactively — see [CONFIG.md → features.issues](CONFIG.md#featuresissues)). `features.*` is not part of the `autocoder reload` hot-reload set, so enabling it takes a daemon restart. When the lane is on, per-iteration unit selection is `issues > changes > audits`.
+The issues lane is one of the two fundamental work lanes — for **corrections** (fixes that don't warrant a spec change) — running alongside the OpenSpec changes queue. It is **on by default**. Disable it with `features.issues.enabled: false` (the install wizard offers a `[Y/n]` gate; `--issues-lane disabled` non-interactively — see [CONFIG.md → features.issues](CONFIG.md#featuresissues)) — for operators who track corrections in an external tracker. `features.*` is not part of the `autocoder reload` hot-reload set, so changing it takes a daemon restart. When the lane is on, per-iteration unit selection is `issues > changes > audits`.
 
 ### Two entry points
 
@@ -244,9 +244,9 @@ ignores subsequent automatic triggers on that PR. Close + re-open or merge
 as-is to reset the cap.
 
 **Revision cap (human, a000).** Authorized human `@<bot> revise` triggers
-are bounded by a **separate** per-PR cap, `executor.max_revise_triggers_per_pr`
-(default `10`), tracked with a distinct counter. This closes the
-previously-uncapped human-revise path. Past the cap, further `@<bot> revise`
+are bounded by a **separate**, optional per-PR cap, `executor.max_revise_triggers_per_pr`
+(default unlimited; opt-in with a positive integer), tracked with a distinct
+counter. Past the cap, further `@<bot> revise`
 triggers on that PR are declined with exactly one
 `🛑 Human-revision cap reached` notice and do **not** invoke the executor.
 The human cap, the automatic cap, and the re-review cap

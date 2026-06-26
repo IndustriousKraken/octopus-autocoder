@@ -386,7 +386,7 @@ async fn audit_only_iteration_pushes_and_opens_pr() {
         u32::MAX,
         u32::MAX,
         0,  // revision_cap: disabled in tests
-        10, // human_revise_cap: irrelevant (dispatcher disabled)
+        Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
         &registry,
         None,
         &std::collections::HashMap::new(),
@@ -536,7 +536,7 @@ async fn audit_only_pr_suppressed_when_iteration_pending_marker_present() {
         u32::MAX,
         u32::MAX,
         0,
-        10, // human_revise_cap: irrelevant (dispatcher disabled)
+        Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
         &registry,
         None,
         &std::collections::HashMap::new(),

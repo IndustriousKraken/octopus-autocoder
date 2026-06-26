@@ -552,7 +552,7 @@ pub(crate) async fn run_iteration_work(
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,

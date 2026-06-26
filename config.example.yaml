@@ -269,14 +269,17 @@ executor:
   # alias (existing configs load unchanged).
   # max_auto_revisions_per_pr: 5
 
-  # a000: per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted on.
+  # OPTIONAL per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted
+  # on (human-revise-cap-opt-in). Default is UNLIMITED — a human revise is
+  # a deliberate, authorized operator action, so it is never capped unless
+  # you opt in (mirroring the opt-in `reviewer.max_code_reviews_per_pr`).
   # Distinct from `max_auto_revisions_per_pr` (reviewer-initiated
-  # revisions) AND `reviewer.max_code_reviews_per_pr` (re-reviews). Closes
-  # the previously-uncapped human-revise path: past this many authorized
-  # human revisions on one PR, further `@<bot> revise` triggers are
-  # declined (one notice) without invoking the executor. The count lives in
-  # the per-PR state file; the cap is read live from config. Default `10`.
-  # max_revise_triggers_per_pr: 10
+  # revisions) AND `reviewer.max_code_reviews_per_pr` (re-reviews). Set a
+  # positive integer to cap: past that many authorized human revisions on
+  # one PR, further `@<bot> revise` triggers are declined (one notice)
+  # without invoking the executor. The count lives in the per-PR state
+  # file; the cap is read live from config.
+  # max_revise_triggers_per_pr: 10   # opt-in; default is unlimited
 
   # Seconds the `@<bot> wipe-workspace` flow waits for the in-flight
   # per-repo polling iteration to drain (release its busy marker) after
@@ -1056,11 +1059,12 @@ github:
 #     # max_capabilities: 20
 #
 #   issues:
-#     # The issues lane (a009/a010). UNLIKE the chatops-verb features above —
-#     # which are inert until explicitly invoked — enabling this changes the
-#     # daemon's behavior autonomously, so it is OFF by default and opt-in.
+#     # The issues lane (a009/a010). One of the two fundamental work paths
+#     # (behavior-preserving corrections, including audit-found fixes), so it
+#     # is ON by default and opt-out. Set `enabled: false` to disable it —
+#     # for operators who track corrections in an external tracker.
 #     #
-#     # When `true`, two things turn on:
+#     # When `true` (the default), lane processing is on:
 #     #   1. Lane processing. Per-iteration unit selection becomes
 #     #      `issues > changes > audits`: any ready `openspec/issues/<slug>/`
 #     #      directory is worked into a fix PR before the changes queue. With no
@@ -1079,8 +1083,8 @@ github:
 #     # `features.*` is not hot-reloadable: enabling this needs a daemon
 #     # restart, not `autocoder reload`. Ingestion also needs `gh` authenticated
 #     # on the host; on a failed read a WARN logs and the pass proceeds.
-#     # Default: false.
-#     # enabled: true
+#     # Default: true.
+#     # enabled: false
 #
 #     # Workspace-relative path to a custom issue-flavored implementer prompt
 #     # template. Resolved via the uniform Prompt overrides table.
