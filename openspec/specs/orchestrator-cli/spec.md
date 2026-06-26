@@ -3261,18 +3261,15 @@ Every LLM-driven audit that writes a proposal (`missing_tests_audit` AND `securi
 - **AND** the proposal commit proceeds normally
 
 ### Requirement: `send it` verb in an audit thread schedules a triage executor run
-The chatops listener SHALL recognize `@<bot> send it` (case-insensitive on `send it`) as the `SendItOnAudit` command ONLY when the message arrives with a non-empty `thread_ts` AND the `thread_ts` matches a tracked audit-thread state with `status: Open` OR `status: TriageFailed`. Same text outside a thread SHALL parse as the unknown-verb fallback (existing `?` reaction). When recognized, the dispatcher SHALL submit a `trigger_audit_action` control-socket action AND flip the audit-thread state's `status` to `TriagePending`. The next polling iteration drains the triage queue and runs the executor in triage mode.
+The chatops listener SHALL recognize `@<bot> send it` (case-insensitive on `send it`) as the `SendItOnAudit` command ONLY when the message arrives with a non-empty `thread_ts` AND the `thread_ts` matches ANY tracked audit-thread state (regardless of status). Same text outside a thread SHALL parse as the unknown-verb fallback (existing `?` reaction). The dispatcher SHALL submit a `trigger_audit_action` control-socket action AND flip the audit-thread state's `status` to `TriagePending` ONLY when the matched state has `status: Open` OR `status: TriageFailed` (and `posted_at` within 7 days); all other statuses produce the per-status refusal defined in the scenarios below. The next polling iteration drains the triage queue and runs the executor in triage mode.
+
+The audit-thread set is the FIRST of the four `send it` thread-context sets; the full dispatch order across all four contexts (audit, brownfield-survey, issue-candidate, spec-revision) AND the untracked-thread refusal for a reply matching none of them are defined by `chatops-manager`'s `Inbound listener dispatches send it by thread context AND refuses untracked threads` — this requirement defines ONLY the audit-thread branch AND does NOT restate the untracked-thread refusal.
 
 #### Scenario: Send-it in tracked, open audit thread schedules triage
 - **WHEN** an operator posts `@<bot> send it` as a thread reply where `thread_ts` matches an `AuditThreadState` with `status: Open` AND `posted_at` within the last 7 days
 - **THEN** the dispatcher submits `trigger_audit_action` with the `thread_ts`
 - **AND** the state file's `status` is updated to `TriagePending`
 - **AND** the bot replies in the thread `✓ Triage scheduled for <audit_type> on <repo_url>. The next polling iteration will run it (~Nm).`
-
-#### Scenario: Send-it in untracked thread is politely refused
-- **WHEN** an operator posts `@<bot> send it` in a thread that matches no audit-thread, brownfield-survey, issue-candidate, OR spec-revision state
-- **THEN** the bot replies `✗ This reply is in a thread autocoder is not tracking. The \`send it\` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.`
-- **AND** no control-socket action is submitted
 
 #### Scenario: Send-it on stale audit thread is politely refused
 - **WHEN** an operator posts `@<bot> send it` in a tracked thread whose `posted_at` is older than 7 days
@@ -3285,7 +3282,7 @@ The chatops listener SHALL recognize `@<bot> send it` (case-insensitive on `send
 - **AND** no new triage is scheduled
 
 #### Scenario: Send-it on TriageFailed thread re-attempts triage
-- **WHEN** an operator posts `@<bot> send it` in a thread with `status: TriageFailed`
+- **WHEN** an operator posts `@<bot> send it` in a thread with `status: TriageFailed` AND `posted_at` within the last 7 days
 - **THEN** the dispatcher treats the request like the Open case (triage re-scheduled)
 - **AND** the state's `status` is reset to `TriagePending` for the new attempt
 
@@ -4472,12 +4469,14 @@ The migration runs at daemon startup BEFORE any polling task starts. Errors duri
 - **AND** subsequent startups skip the scan
 
 ### Requirement: Spec-delta archivability pre-flight check
-Before invoking the executor against any change, autocoder SHALL verify that every spec-delta block in the change's `specs/<capability>/spec.md` files satisfies the header preconditions that `openspec archive` enforces at archive time. The check is mechanical AND cheap: parse each delta block, compare its `### Requirement: <title>` headers against the canonical `openspec/specs/<capability>/spec.md` for the same capability, AND verify per-kind preconditions:
+Before invoking the executor against any change, autocoder SHALL verify that every spec-delta block in the change's `specs/<capability>/spec.md` files satisfies the header preconditions that `openspec archive` enforces at archive time. The check is mechanical AND cheap: parse each delta block, compare its `### Requirement: <title>` headers against the canonical `openspec/specs/<capability>/spec.md` for the same capability, AND verify per-kind preconditions.
 
-- **ADDED**: title MUST NOT exist in canonical (duplicate-add → flag).
-- **MODIFIED**: title MUST exist in canonical, exact match character-for-character (the a07-incident class — invented MODIFIED titles → flag).
-- **REMOVED**: title MUST exist in canonical (remove-nothing → flag).
-- **RENAMED**: `from:` title MUST exist; `to:` title MUST NOT exist.
+Because `openspec archive` applies a change's `## RENAMED Requirements` blocks BEFORE its `## MODIFIED`/`## REMOVED` blocks (rename-then-modify), the MODIFIED and REMOVED preconditions SHALL be checked against the canonical headers AS ADJUSTED BY this change's OWN `## RENAMED` blocks, NOT against raw canon. autocoder SHALL compute an **effective header set** for each capability = the canonical headers, MINUS every in-change RENAMED `from:` title whose `from:` exists in canonical, PLUS every in-change RENAMED `to:` title whose `from:` exists in canonical. A MODIFIED or REMOVED title is "present" iff it is in that effective set:
+
+- **ADDED**: title MUST NOT exist in canonical (duplicate-add → flag). Unchanged — checked against raw canonical headers.
+- **MODIFIED**: title MUST be present in the effective header set, exact match character-for-character (the a07-incident class — invented MODIFIED titles → flag). A MODIFIED title equal to an in-change RENAMED `to:` title (whose `from:` is canonical) is treated as present AND SHALL NOT be flagged; a MODIFIED title that is neither in raw canonical NOR an in-change rename `to:` target is still flagged.
+- **REMOVED**: title MUST be present in the effective header set (remove-nothing → flag). A REMOVED title equal to an in-change RENAMED `to:` title (whose `from:` is canonical) is treated as present AND SHALL NOT be flagged; a REMOVED title that is neither in raw canonical NOR an in-change rename `to:` target is still flagged.
+- **RENAMED**: `from:` title MUST exist; `to:` title MUST NOT exist. Unchanged — both checked against raw canonical headers (the `from:` must be canonical; the `to:` must not yet exist, because the rename creates it).
 
 On ANY precondition violation, autocoder SHALL write `.needs-spec-revision.json` with the existing schema EXTENDED by an `unarchivable_deltas: [{ capability, kind, header, reason }]` field, post the existing chatops alert under `AlertCategory::SpecNeedsRevision` (subject to the 24h throttle, body enumerating the violations), AND halt the queue walk for this iteration per the existing same-repo blocking policy. The executor SHALL NOT be invoked for this change OR any subsequent change in the same iteration. The principal cost savings: no LLM call against a change whose deltas would fail at archive time.
 
@@ -4534,6 +4533,25 @@ The check runs on EVERY change before EVERY executor invocation. No caching — 
 - **AND** between iterations N AND N+1 the canonical spec is updated such that the change's delta is no longer archivable (e.g. a sibling change archived AND renamed the requirement the MODIFIED targets)
 - **THEN** the pre-flight on iteration N+1 catches the new mismatch AND flags the change
 - **AND** the check does NOT memoize prior passes
+
+#### Scenario: MODIFIED targeting an in-change rename target passes pre-flight
+- **WHEN** a change's `specs/<cap>/spec.md` contains a `## RENAMED Requirements` block renaming `from: "A"` `to: "B"` where `A` exists in canonical AND `B` does not
+- **AND** the SAME change's `specs/<cap>/spec.md` contains a `## MODIFIED Requirements` block with header `### Requirement: B`
+- **THEN** the pre-flight computes the effective header set (canonical minus `A`, plus `B`) AND finds `B` present in it
+- **AND** the MODIFIED `B` block is NOT flagged (it matches the in-change rename target, mirroring `openspec archive`'s rename-then-modify order)
+- **AND** the RENAMED `from: "A"` `to: "B"` block is itself NOT flagged (`A` is canonical, `B` is not)
+- **AND** the pre-flight returns an empty Vec AND the executor IS invoked
+
+#### Scenario: REMOVED targeting an in-change rename target passes pre-flight
+- **WHEN** a change renames `from: "A"` `to: "B"` (where `A` is canonical AND `B` is not) AND in the same capability has a `## REMOVED Requirements` block with header `### Requirement: B`
+- **THEN** `B` is present in the effective header set (canonical minus `A`, plus `B`)
+- **AND** the REMOVED `B` block is NOT flagged
+- **AND** the pre-flight returns an empty Vec
+
+#### Scenario: MODIFIED title neither in canon nor an in-change rename target is still flagged
+- **WHEN** a change's `## MODIFIED Requirements` block has header `### Requirement: C` where `C` is absent from canonical AND is NOT the `to:` title of any in-change RENAMED block
+- **THEN** `C` is absent from the effective header set
+- **AND** the pre-flight flags it with `kind=Modified`, `reason="header not found in canonical openspec/specs/<cap>/spec.md ..."` (the a07 protection is retained — rename resolution does not weaken it)
 
 ### Requirement: Ignore-for-queue marker downgrades blocking-marker behavior without unblocking the change itself
 autocoder SHALL recognize a per-change `.ignore-for-queue.json` marker file at `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`. The marker downgrades any sibling operator-action marker (`.perma-stuck.json`, `.needs-spec-revision.json`) on the same change from "blocks subsequent queue processing" to "still excludes this change from `list_pending`, but doesn't block siblings." The marker is the operator's explicit "I know this change is broken; skip it AND proceed with the rest" signal.
