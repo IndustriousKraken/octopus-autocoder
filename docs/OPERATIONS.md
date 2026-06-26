@@ -147,7 +147,7 @@ Cadence-based scheduling fires audits on `daily`/`weekly`/`monthly` intervals, w
 
 ## Issues lane {#issues-lane}
 
-The issues lane is a second work lane for **corrections** — fixes that don't warrant a spec change — running alongside the OpenSpec changes queue. It is **off by default**. Enable it with `features.issues.enabled: true` (the install wizard offers a `[y/N]` gate; `--issues-lane enabled` non-interactively — see [CONFIG.md → features.issues](CONFIG.md#featuresissues)). `features.*` is not part of the `autocoder reload` hot-reload set, so enabling it takes a daemon restart. When the lane is on, per-iteration unit selection is `issues > changes > audits`.
+The issues lane is one of the two fundamental work lanes — for **corrections** (fixes that don't warrant a spec change) — running alongside the OpenSpec changes queue. It is **on by default**. Disable it with `features.issues.enabled: false` (the install wizard offers a `[Y/n]` gate; `--issues-lane disabled` non-interactively — see [CONFIG.md → features.issues](CONFIG.md#featuresissues)) — for operators who track corrections in an external tracker. `features.*` is not part of the `autocoder reload` hot-reload set, so changing it takes a daemon restart. When the lane is on, per-iteration unit selection is `issues > changes > audits`.
 
 ### Two entry points
 

@@ -38,7 +38,7 @@ After a successful patch, the subcommand prints `Patched <section> in <path>. To
 
 If neither the systemd probe nor `<default-config-dir>/config.yaml` resolves to an existing file, `--reconfigure` exits non-zero with `no existing install detected; run install.sh for first-time setup`.
 
-**`--issues-lane <enabled|disabled>`** (non-interactive) opts into the issues lane (`features.issues.enabled`). The default is `disabled`, mirroring the interactive yes/no gate the wizard shows after the periodic-audits prompts; an install that omits the flag produces the same lane-off config, so existing IaC is unaffected. Enabling the lane is a deliberate choice — it changes daemon behavior autonomously. See [CONFIG.md → features.issues](CONFIG.md#featuresissues).
+**`--issues-lane <enabled|disabled>`** (non-interactive) toggles the issues lane (`features.issues.enabled`). The default is `enabled`, mirroring the interactive yes/no gate the wizard shows after the periodic-audits prompts; an install that omits the flag gains the active lane (no `features.issues` entry is written). Pass `disabled` to opt out — the issues lane is one of the two fundamental work paths, and opting out is for operators who track corrections in an external tracker (Jira, Linear, and similar). See [CONFIG.md → features.issues](CONFIG.md#featuresissues).
 
 ## `check-config`
 

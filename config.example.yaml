@@ -1056,11 +1056,12 @@ github:
 #     # max_capabilities: 20
 #
 #   issues:
-#     # The issues lane (a009/a010). UNLIKE the chatops-verb features above —
-#     # which are inert until explicitly invoked — enabling this changes the
-#     # daemon's behavior autonomously, so it is OFF by default and opt-in.
+#     # The issues lane (a009/a010). One of the two fundamental work paths
+#     # (behavior-preserving corrections, including audit-found fixes), so it
+#     # is ON by default and opt-out. Set `enabled: false` to disable it —
+#     # for operators who track corrections in an external tracker.
 #     #
-#     # When `true`, two things turn on:
+#     # When `true` (the default), lane processing is on:
 #     #   1. Lane processing. Per-iteration unit selection becomes
 #     #      `issues > changes > audits`: any ready `openspec/issues/<slug>/`
 #     #      directory is worked into a fix PR before the changes queue. With no
@@ -1079,8 +1080,8 @@ github:
 #     # `features.*` is not hot-reloadable: enabling this needs a daemon
 #     # restart, not `autocoder reload`. Ingestion also needs `gh` authenticated
 #     # on the host; on a failed read a WARN logs and the pass proceeds.
-#     # Default: false.
-#     # enabled: true
+#     # Default: true.
+#     # enabled: false
 #
 #     # Workspace-relative path to a custom issue-flavored implementer prompt
 #     # template. Resolved via the uniform Prompt overrides table.

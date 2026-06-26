@@ -675,21 +675,21 @@ features:
 
 Config for the issues lane (a009/a010) — both the curated entry (a maintainer commits `issues/<slug>/` directly) AND the public ingestion path (the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it`). See [OPERATIONS.md → Issues lane](OPERATIONS.md) for the workflow.
 
-Unlike the chatops-verb features above — which are inert until invoked, hence `enabled: true` by default — the issues lane is **OFF by default**. Enabling it changes daemon behavior autonomously: per-iteration unit selection becomes `issues > changes > audits`, AND (when `features.scout.include_issues` is also true — the default) each pass runs an LLM triage over open GitHub issue bodies (untrusted public input) and posts candidates to chatops. That is automatic token spend and untrusted-input processing, so it is opt-in.
+The issues lane is one of the two fundamental work paths, so it is **ON by default**. When enabled, per-iteration unit selection becomes `issues > changes > audits`. This does NOT turn on autonomous public-issue triage — that LLM triage over open GitHub issue bodies (untrusted public input) is separately gated by `features.scout.include_issues`, which stays opt-in. An operator who tracks corrections in an external tracker (Jira, Linear, and similar) opts out by setting `enabled: false`.
 
 ```yaml
 features:
   issues:
-    enabled: true                 # default FALSE; opt-in — enables lane processing + public ingestion
+    enabled: false                # default TRUE; set false to opt out of the lane
     prompt_path: null             # default null; relative path to a custom issue-implementer prompt
 ```
 
 | Field         | Type             | Default | Description                                                                                                                                                                                                                                                                            |
 |---------------|------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `enabled`     | `bool`           | `false` | Master switch for the issues lane. When `false` (default) the daemon short-circuits the entire issues subsystem — no lane processing AND no public ingestion. The install wizard surfaces this as a yes/no gate (or `--issues-lane <enabled\|disabled>` non-interactively).             |
+| `enabled`     | `bool`           | `true`  | Master switch for the issues lane. When `true` (default) the daemon works committed issue units, with per-iteration unit selection `issues > changes > audits`. Set `false` to short-circuit the lane. The install wizard surfaces this as a yes/no gate (or `--issues-lane <enabled\|disabled>` non-interactively). |
 | `prompt_path` | `Option<String>` | `None`  | Workspace-relative path to a custom issue-flavored implementer prompt template. Resolved via the uniform [Prompt overrides](#prompt-overrides) table; falls back to the embedded `prompts/implementer-issue.md` when missing or empty.                                                  |
 
-**Default behaviour.** Omitting the `features.issues` block (or the entire `features:` parent block) is equivalent to `enabled: false` — the lane is off.
+**Default behaviour.** Omitting the `features.issues` block (or the entire `features:` parent block) is equivalent to `enabled: true` — the lane is on. Set `features.issues.enabled: false` to disable it.
 
 **Not hot-reloadable.** `features.*` is not part of the `autocoder reload` safe subset; enabling the issues lane requires a daemon restart. Public ingestion additionally needs `gh` authenticated on the host; on a failed read a WARN logs and the pass proceeds.
 

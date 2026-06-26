@@ -231,15 +231,17 @@ impl AuditCadenceArg {
 }
 
 /// Issues-lane toggle in non-interactive mode (a009/a010). Mirrors the
-/// interactive "Enable the issues lane? [y/N]" gate; `disabled` (the default)
-/// matches the conservative interactive default so IaC scripts that predate the
-/// flag keep producing a lane-off install.
+/// interactive "Keep the issues lane on? [Y/n]" gate; `enabled` (the default)
+/// matches the interactive default-on so an IaC script that omits the flag
+/// gains the active issues lane — the lane is one of the two fundamental work
+/// paths. An operator who tracks corrections in an external tracker passes
+/// `disabled`.
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
 pub enum IssuesLaneArg {
-    /// Same as the default: the issues lane stays off.
-    #[default]
+    /// Write `features.issues.enabled: false` (opt out of the lane).
     Disabled,
-    /// Write `features.issues.enabled: true`.
+    /// Same as the default: the issues lane stays on.
+    #[default]
     Enabled,
 }
 
@@ -1015,17 +1017,23 @@ pub async fn run_wizard(
     let audits = run_audit_prompts(io).await?;
     let canonical_rag = run_rag_prompts(io, prefill).await?;
 
-    // Issues lane (a009/a010). Opt-in gate, default NO: unlike the chatops-verb
-    // features, enabling it changes daemon behavior autonomously (per-iteration
-    // unit selection AND read-only triage of public issues), so the prompt
-    // states the effects and the operator chooses informed.
+    // Issues lane (a009/a010). Opt-out gate, default YES: the issues lane is
+    // one of the two fundamental work paths (behavior-preserving corrections,
+    // including audit-found fixes), so it is ON by default. An operator who
+    // tracks corrections in an external tracker opts out. The prompt states the
+    // effect (unit-selection precedence) AND clarifies what default-on does NOT
+    // turn on (autonomous public-issue triage), so the operator chooses informed.
     io.print("\nIssues lane\n");
     io.print(
-        "  When enabled, per-iteration unit selection becomes issues > changes > audits,\n  \
-         and (with features.scout.include_issues on) the bot triages open GitHub issues\n  \
-         read-only into chatops candidates you promote with `send it`. Off by default.\n",
+        "  The issues lane is on by default — it is one of the two fundamental\n  \
+         work paths, where behavior-preserving corrections (including audit-found\n  \
+         fixes) are worked. When on, per-iteration unit selection becomes\n  \
+         issues > changes > audits. This does NOT turn on autonomous triage of\n  \
+         open GitHub issues — that stays separately gated by\n  \
+         features.scout.include_issues. Disable the lane if you track corrections\n  \
+         in an external tracker (Jira, Linear, and similar).\n",
     );
-    let issues_enabled = io.confirm("\n  Enable the issues lane?", false).await?;
+    let issues_enabled = io.confirm("\n  Keep the issues lane on?", true).await?;
 
     Ok(WizardAnswers {
         repo_url,
@@ -1507,9 +1515,11 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
         })
     };
 
-    // Issues lane (a009/a010). Only the opt-in case writes anything: with the
-    // flag false, `features` stays at its default AND is omitted from the YAML
-    // (the top-level `features` field's `skip_serializing_if = is_default`).
+    // Issues lane (a009/a010). The lane is on by default, so only the opt-out
+    // case writes anything: with the flag true, `features` stays at its default
+    // AND is omitted from the YAML (the top-level `features` field's
+    // `skip_serializing_if = is_default`); setting it false makes `features`
+    // non-default, so `features.issues.enabled: false` is serialized.
     cfg.features.issues.enabled = answers.issues_enabled;
 
     // Canonical-spec RAG (a21).
@@ -2173,7 +2183,10 @@ mod tests {
             reviewer_api_base_url: None,
             audits: HashMap::new(),
             canonical_rag: None,
-            issues_enabled: false,
+            // Default: the issues lane is on, represented by the absence of a
+            // `features.issues` entry — so the baseline serializes no `features:`
+            // block, matching the schema's default-on representation.
+            issues_enabled: true,
         }
     }
 
@@ -2645,9 +2658,10 @@ mod tests {
     // ---- issues lane (a009/a010) wizard gate ----
 
     #[tokio::test]
-    async fn non_interactive_no_issues_flag_leaves_lane_off() {
-        // No --issues-lane → lane off, AND the features block is omitted
-        // entirely (IaC scripts that pre-date the flag are unaffected).
+    async fn non_interactive_no_issues_flag_keeps_lane_on() {
+        // No --issues-lane → lane ON (the default), AND the features block is
+        // omitted entirely (default-on is the absence of a features.issues
+        // entry). An install that omits the flag gains the active lane.
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
         let mut io = ScriptedIo::new(vec![]);
@@ -2660,11 +2674,13 @@ mod tests {
             "default install must omit the features block:\n{yaml}"
         );
         let cfg: Config = serde_yml::from_str(&yaml).unwrap();
-        assert!(!cfg.features.issues.enabled);
+        assert!(cfg.features.issues.enabled, "no-flag install resolves to an on lane");
     }
 
     #[tokio::test]
-    async fn non_interactive_issues_lane_enabled_writes_flag() {
+    async fn non_interactive_issues_lane_enabled_keeps_lane_on() {
+        // --issues-lane enabled matches the default → the resolved lane is on,
+        // represented by the absence of a features.issues entry.
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
         let mut io = ScriptedIo::new(vec![]);
@@ -2675,12 +2691,19 @@ mod tests {
         execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
             .await
             .unwrap();
-        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
-        assert!(cfg.features.issues.enabled, "--issues-lane enabled must set the flag");
+        let yaml = load_yaml(&tmp);
+        assert!(
+            !yaml.contains("features:"),
+            "--issues-lane enabled is the default → omit the features block:\n{yaml}"
+        );
+        let cfg: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(cfg.features.issues.enabled, "--issues-lane enabled resolves to an on lane");
     }
 
     #[tokio::test]
-    async fn non_interactive_issues_lane_disabled_leaves_lane_off() {
+    async fn non_interactive_issues_lane_disabled_writes_disable_flag() {
+        // --issues-lane disabled is the opt-out → features.issues.enabled: false
+        // is written, and the resolved lane is off.
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
         let mut io = ScriptedIo::new(vec![]);
@@ -2691,32 +2714,45 @@ mod tests {
         execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
             .await
             .unwrap();
-        let cfg: Config = serde_yml::from_str(&load_yaml(&tmp)).unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            yaml.contains("enabled: false"),
+            "opt-out must write the explicit disable flag:\n{yaml}"
+        );
+        let cfg: Config = serde_yml::from_str(&yaml).unwrap();
         assert!(!cfg.features.issues.enabled);
     }
 
     #[tokio::test]
-    async fn assemble_config_writes_issues_flag_when_opted_in() {
-        // The interactive opt-in funnels through assemble_config the same way.
+    async fn assemble_config_keeps_lane_on_by_default() {
+        // Keeping the default (issues_enabled true) resolves to an on lane with
+        // no features.issues entry (the schema's default-on representation).
         let ans = WizardAnswers { issues_enabled: true, ..baseline_answers() };
         let cfg = assemble_config(&ans).unwrap();
         assert!(cfg.features.issues.enabled);
         let yaml = serialize_config(&cfg).unwrap();
+        assert!(
+            !yaml.contains("features:"),
+            "default-on lane must omit the features block:\n{yaml}"
+        );
         let round: Config = serde_yml::from_str(&yaml).unwrap();
-        assert!(round.features.issues.enabled, "serialized yaml carries the flag:\n{yaml}");
+        assert!(round.features.issues.enabled, "round-trips to an on lane:\n{yaml}");
     }
 
     #[tokio::test]
-    async fn assemble_config_omits_features_when_issues_declined() {
-        // The interactive default (decline) leaves issues_enabled false → the
-        // features block is omitted (FeaturesConfig::is_default skip).
-        let cfg = assemble_config(&baseline_answers()).unwrap();
+    async fn assemble_config_writes_disable_flag_when_opted_out() {
+        // Opting out (issues_enabled false) writes features.issues.enabled: false
+        // and round-trips to an off lane.
+        let ans = WizardAnswers { issues_enabled: false, ..baseline_answers() };
+        let cfg = assemble_config(&ans).unwrap();
         assert!(!cfg.features.issues.enabled);
         let yaml = serialize_config(&cfg).unwrap();
         assert!(
-            !yaml.contains("features:"),
-            "declined issues lane must omit the features block:\n{yaml}"
+            yaml.contains("enabled: false"),
+            "opt-out must write the explicit disable flag:\n{yaml}"
         );
+        let round: Config = serde_yml::from_str(&yaml).unwrap();
+        assert!(!round.features.issues.enabled, "round-trips to an off lane:\n{yaml}");
     }
 
     #[tokio::test]

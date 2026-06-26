@@ -823,11 +823,16 @@ impl BrownfieldSurveyFeatureConfig {
 }
 
 /// Config for the issues lane (a009). The lane is gated by this flag,
-/// OFF by default — unlike the chatops-verb features above, an enabled
-/// issues lane changes the daemon's per-iteration unit selection
-/// (`issues > changes > audits`), so it is opt-in. `prompt_path`
-/// overrides the embedded issue-flavored implementer prompt template
-/// (`prompts/implementer-issue.md`) per the uniform a24 pattern.
+/// ON by default — the issues lane is one of the two fundamental work
+/// paths (behavior-preserving corrections, including audit-found fixes),
+/// so it is opt-out: an operator who tracks corrections in an external
+/// system (Jira, Linear, and similar) disables it with
+/// `features.issues.enabled: false`. Enabling the lane makes the daemon's
+/// per-iteration unit selection `issues > changes > audits`; it does NOT
+/// turn on autonomous public-issue triage (separately gated by
+/// `features.scout.include_issues`). `prompt_path` overrides the embedded
+/// issue-flavored implementer prompt template (`prompts/implementer-issue.md`)
+/// per the uniform a24 pattern.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IssuesFeatureConfig {
@@ -847,7 +852,7 @@ impl Default for IssuesFeatureConfig {
 }
 
 fn default_issues_enabled() -> bool {
-    false
+    true
 }
 
 /// Config for the in-repo OCTOPUS.md agent-guide provisioning
@@ -9764,7 +9769,7 @@ features:
     // -----------------------------------------------------------------
 
     #[test]
-    fn features_issues_block_omitted_is_off_by_default() {
+    fn features_issues_block_omitted_is_on_by_default() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -9777,14 +9782,41 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("absent features block parses");
-        // The issues lane is OFF by default — unlike the chatops-verb
-        // features, an enabled lane changes per-iteration unit selection.
+        // The issues lane is ON by default — it is one of the two
+        // fundamental work paths, so an absent `features.issues` block
+        // resolves to an enabled lane (the schema's default-on
+        // representation).
         assert!(
-            !cfg.features.issues.enabled,
-            "issues lane must default to OFF"
+            cfg.features.issues.enabled,
+            "issues lane must default to ON"
         );
         assert!(cfg.features.issues.prompt_path.is_none());
         assert_eq!(cfg.features.issues, IssuesFeatureConfig::default());
+    }
+
+    #[test]
+    fn features_issues_explicit_disable_round_trips() {
+        // An explicit `enabled: false` resolves to a disabled lane,
+        // overriding the default-on representation.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  issues:
+    enabled: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit disable parses");
+        assert!(
+            !cfg.features.issues.enabled,
+            "explicit enabled: false must disable the lane"
+        );
     }
 
     #[test]
