@@ -242,10 +242,15 @@ fn parse_rename_marker(line: &str, marker: &str) -> Option<String> {
     let body = line.trim_start_matches('-').trim_start();
     let rest = body.strip_prefix(marker)?;
     let header = rest.trim().trim_matches('`').trim();
+    // OpenSpec's rename schema writes FROM/TO as a full `### Requirement: <title>`
+    // line (its parser *requires* the prefix), but canonical titles are compared
+    // bare — strip the prefix so they match. A bare title (no prefix) passes
+    // through unchanged.
+    let header = parse_requirement_line(header).unwrap_or_else(|| header.to_string());
     if header.is_empty() {
         None
     } else {
-        Some(header.to_string())
+        Some(header)
     }
 }
 
@@ -882,6 +887,23 @@ mod tests {
     #[test]
     fn parse_renamed_from_to_without_backticks() {
         let md = "## RENAMED Requirements\n\n- FROM: Old Name\n  TO: New Name\n";
+        let out = parse_capability_deltas(md);
+        assert_eq!(
+            out,
+            vec![DeltaEntry::Renamed {
+                from: "Old Name".into(),
+                to: "New Name".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_renamed_strips_requirement_prefix() {
+        // OpenSpec's rename schema requires the `### Requirement:` prefix inside
+        // FROM/TO. The prefix must be stripped so titles match bare canonical
+        // headers (else the archivability pre-flight false-flags "from-title not
+        // found" for a delta openspec archives cleanly).
+        let md = "## RENAMED Requirements\n\n- FROM: `### Requirement: Old Name`\n- TO: `### Requirement: New Name`\n";
         let out = parse_capability_deltas(md);
         assert_eq!(
             out,
