@@ -157,6 +157,25 @@ an inability to run a gate is a non-passing outcome, never a pass:
 - `[rules]` — the change conforms to the global engineering rules.
 - `[out]` — the merged code implements the spec.
 
+## Verify a change locally before pushing
+
+Before you push a change, you MAY run `autocoder verify <change-slug>` to learn
+whether it will pass the server gates before the server evaluates it. `verify`
+runs the same `[in]` / `[canon]` / `[rules]` gates the daemon runs pre-executor,
+against the change in your local working tree. It is READ-ONLY: it does not run
+the executor, edit specs, or write markers.
+
+`verify` is a feedback ACCELERATOR, not a replacement for the server gates. The
+server gates remain the fail-closed enforcement — they run against fresher canon
+at implement time AND cover every contributor — so a local pass is an early
+signal, not a guarantee. You still push and let the server decide.
+
+The `verify` subcommand ships in the autocoder binary AND is usable without
+running the daemon via the check-only install. A gate that reports it
+"could not run" (fail-closed: model unconfigured, transport error, or no
+resolvable rule corpus) is an environment/config condition, not a spec defect —
+fix the config, not the change.
+
 ## Further reading
 
 For the fuller OpenSpec documentation, see https://github.com/Fission-AI/OpenSpec.
@@ -472,6 +491,39 @@ mod tests {
         assert!(out.contains("OCTOPUS.md"), "current region present: {out}");
         // Idempotent: recomposing the result is a no-op.
         assert_eq!(compose_agents_md(Some(&out)), out);
+    }
+
+    #[test]
+    fn octopus_md_documents_local_verify_precheck() {
+        // The provisioned guide bytes must point readers at the local verify
+        // pre-check and frame it correctly. Asserted on the produced content
+        // by meaning (key phrases), not a brittle full-string match.
+        assert!(
+            OCTOPUS_MD.contains("autocoder verify <change-slug>"),
+            "guide must tell readers to run the local verify pre-check"
+        );
+        assert!(
+            OCTOPUS_MD.contains("[in]")
+                && OCTOPUS_MD.contains("[canon]")
+                && OCTOPUS_MD.contains("[rules]"),
+            "verify section must name the gates it runs locally"
+        );
+        assert!(
+            OCTOPUS_MD.contains("ACCELERATOR") || OCTOPUS_MD.contains("accelerator"),
+            "verify must be framed as a feedback accelerator"
+        );
+        assert!(
+            OCTOPUS_MD.contains("not a replacement for the server gates"),
+            "verify must be framed as not a replacement for the server gates"
+        );
+        assert!(
+            OCTOPUS_MD.contains("check-only install"),
+            "verify section must note it is usable via the check-only install"
+        );
+        assert!(
+            OCTOPUS_MD.contains("could not run"),
+            "verify section must distinguish a gate that could not run from a spec defect"
+        );
     }
 
     #[test]
