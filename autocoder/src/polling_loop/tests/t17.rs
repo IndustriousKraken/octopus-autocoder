@@ -166,7 +166,7 @@ async fn audit_only_pr_suppressed_mixed_audit_and_iteration_wip() {
         u32::MAX,
         u32::MAX,
         0,
-        10, // human_revise_cap: irrelevant (dispatcher disabled)
+        Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
         &registry,
         None,
         &std::collections::HashMap::new(),

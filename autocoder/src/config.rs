@@ -1286,17 +1286,21 @@ pub struct ExecutorConfig {
         alias = "max_revisions_per_pr"
     )]
     pub max_auto_revisions_per_pr: u32,
-    /// a000: per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted
-    /// on. Distinct from `max_auto_revisions_per_pr` (which bounds
-    /// reviewer-initiated automatic revisions) AND from
-    /// `reviewer.max_code_reviews_per_pr` (re-reviews). Closes the
-    /// previously-uncapped human-revise path: past this many authorized
-    /// human revisions on one PR, further `@<bot> revise` triggers are
-    /// declined without invoking the executor. The count is tracked in
-    /// the per-PR state file; the cap is read live from config (so a
-    /// reload applies to subsequent triggers). Default `10`.
-    #[serde(default = "default_max_revise_triggers_per_pr")]
-    pub max_revise_triggers_per_pr: u32,
+    /// human-revise-cap-opt-in: OPTIONAL per-PR cap on HUMAN-initiated
+    /// `@<bot> revise` triggers acted on. `None` (the default) means
+    /// UNLIMITED — a human `@<bot> revise` is a deliberate, authorized
+    /// operator action, so it is never capped by default (mirroring the
+    /// opt-in `reviewer.max_code_reviews_per_pr`). When set to a positive
+    /// `N` it acts as an opt-in ceiling: past `N` authorized human
+    /// revisions on one PR, further `@<bot> revise` triggers are declined
+    /// without invoking the executor. Distinct from
+    /// `max_auto_revisions_per_pr` (reviewer-initiated automatic revisions)
+    /// AND `reviewer.max_code_reviews_per_pr` (re-reviews). The count is
+    /// tracked in the per-PR state file; the cap is read live from config
+    /// (so a reload applies to subsequent triggers). A legacy config that
+    /// sets an explicit integer still parses as `Some(n)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_revise_triggers_per_pr: Option<u32>,
     /// Seconds the `wipe_workspace` control-socket handler waits for the
     /// in-flight per-repo iteration to drain (release its busy marker)
     /// after firing the per-iteration cancel token. The wipe runs
@@ -1753,11 +1757,6 @@ fn default_max_auto_revisions_per_pr() -> u32 {
     5
 }
 
-/// Default per-PR cap on human-initiated `@<bot> revise` triggers (a000).
-fn default_max_revise_triggers_per_pr() -> u32 {
-    10
-}
-
 impl ExecutorConfig {
     /// Effective perma-stuck threshold. `None` → 2 (the default). Any
     /// configured value is clamped to `>=1` so the agent always gets at
@@ -2152,7 +2151,7 @@ pub fn placeholder_executor_config() -> ExecutorConfig {
         startup_jitter_max_secs: None,
         inter_iteration_jitter_pct: None,
         max_auto_revisions_per_pr: 5,
-        max_revise_triggers_per_pr: 10,
+        max_revise_triggers_per_pr: Some(10),
         wipe_drain_timeout_secs: default_wipe_drain_timeout_secs(),
         output_format: default_output_format(),
         log_retention_days: default_log_retention_days(),
@@ -6675,7 +6674,7 @@ github:
     }
 
     #[test]
-    fn max_revise_triggers_per_pr_defaults_to_10() {
+    fn max_revise_triggers_per_pr_defaults_to_none() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -6688,7 +6687,8 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config should parse");
-        assert_eq!(cfg.executor.max_revise_triggers_per_pr, 10);
+        // human-revise-cap-opt-in: absent → None (unlimited), not a number.
+        assert_eq!(cfg.executor.max_revise_triggers_per_pr, None);
     }
 
     #[test]
@@ -6706,7 +6706,8 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).expect("config should parse");
-        assert_eq!(cfg.executor.max_revise_triggers_per_pr, 3);
+        // human-revise-cap-opt-in: an explicit integer resolves to Some(n).
+        assert_eq!(cfg.executor.max_revise_triggers_per_pr, Some(3));
     }
 
     #[test]

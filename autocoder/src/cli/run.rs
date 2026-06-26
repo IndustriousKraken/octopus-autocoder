@@ -1212,7 +1212,7 @@ struct SpawnDeps {
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
