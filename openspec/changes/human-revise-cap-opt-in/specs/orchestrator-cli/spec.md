@@ -1,7 +1,7 @@
 ## RENAMED Requirements
 
-- FROM: `Human-initiated PR revisions are rate-capped per PR`
-- TO: `Human-initiated PR revisions are optionally rate-capped per PR`
+- FROM: `### Requirement: Human-initiated PR revisions are rate-capped per PR`
+- TO: `### Requirement: Human-initiated PR revisions are optionally rate-capped per PR`
 
 ## MODIFIED Requirements
 
