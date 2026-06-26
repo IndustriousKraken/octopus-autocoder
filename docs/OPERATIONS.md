@@ -244,9 +244,9 @@ ignores subsequent automatic triggers on that PR. Close + re-open or merge
 as-is to reset the cap.
 
 **Revision cap (human, a000).** Authorized human `@<bot> revise` triggers
-are bounded by a **separate** per-PR cap, `executor.max_revise_triggers_per_pr`
-(default `10`), tracked with a distinct counter. This closes the
-previously-uncapped human-revise path. Past the cap, further `@<bot> revise`
+are bounded by a **separate**, optional per-PR cap, `executor.max_revise_triggers_per_pr`
+(default unlimited; opt-in with a positive integer), tracked with a distinct
+counter. Past the cap, further `@<bot> revise`
 triggers on that PR are declined with exactly one
 `🛑 Human-revision cap reached` notice and do **not** invoke the executor.
 The human cap, the automatic cap, and the re-review cap

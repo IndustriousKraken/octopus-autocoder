@@ -269,14 +269,17 @@ executor:
   # alias (existing configs load unchanged).
   # max_auto_revisions_per_pr: 5
 
-  # a000: per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted on.
+  # OPTIONAL per-PR cap on HUMAN-initiated `@<bot> revise` triggers acted
+  # on (human-revise-cap-opt-in). Default is UNLIMITED — a human revise is
+  # a deliberate, authorized operator action, so it is never capped unless
+  # you opt in (mirroring the opt-in `reviewer.max_code_reviews_per_pr`).
   # Distinct from `max_auto_revisions_per_pr` (reviewer-initiated
-  # revisions) AND `reviewer.max_code_reviews_per_pr` (re-reviews). Closes
-  # the previously-uncapped human-revise path: past this many authorized
-  # human revisions on one PR, further `@<bot> revise` triggers are
-  # declined (one notice) without invoking the executor. The count lives in
-  # the per-PR state file; the cap is read live from config. Default `10`.
-  # max_revise_triggers_per_pr: 10
+  # revisions) AND `reviewer.max_code_reviews_per_pr` (re-reviews). Set a
+  # positive integer to cap: past that many authorized human revisions on
+  # one PR, further `@<bot> revise` triggers are declined (one notice)
+  # without invoking the executor. The count lives in the per-PR state
+  # file; the cap is read live from config.
+  # max_revise_triggers_per_pr: 10   # opt-in; default is unlimited
 
   # Seconds the `@<bot> wipe-workspace` flow waits for the in-flight
   # per-repo polling iteration to drain (release its busy marker) after
