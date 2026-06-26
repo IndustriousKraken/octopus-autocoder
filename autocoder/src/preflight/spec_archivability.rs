@@ -138,6 +138,32 @@ pub fn check_spec_deltas_archivable(
         // a dedicated reason.
         let canonical_headers = load_canonical_headers(workspace_root, &cap_name);
 
+        // Build the per-capability **effective header set** that the
+        // MODIFIED/REMOVED preconditions are checked against. `openspec
+        // archive` applies a change's `## RENAMED Requirements` BEFORE its
+        // `## MODIFIED`/`## REMOVED` blocks (rename-then-modify), so a
+        // MODIFIED/REMOVED title equal to an in-change RENAMED `to:`
+        // (whose `from:` is canonical) is perfectly archivable — the
+        // rename creates it first. Mirror that ordering: start from raw
+        // canon, then for each in-change rename whose `from:` exists in
+        // canon, drop `from:` and add `to:`. Renames whose `from:` is NOT
+        // canonical are invalid on their own (flagged in the RENAMED arm)
+        // and must NOT perturb the effective set. ADDED and RENAMED are
+        // still evaluated against raw canon below, so the a07 protection
+        // and the rename-validity checks are unchanged.
+        let effective_headers: Option<HashSet<String>> = canonical_headers.as_ref().map(|canon| {
+            let mut effective = canon.clone();
+            for delta in &deltas {
+                if let DeltaEntry::Renamed { from, to } = delta
+                    && canon.contains(from)
+                {
+                    effective.remove(from);
+                    effective.insert(to.clone());
+                }
+            }
+            effective
+        });
+
         for delta in deltas {
             match delta {
                 DeltaEntry::Added { header } => {
@@ -156,9 +182,12 @@ pub fn check_spec_deltas_archivable(
                     // No canonical → ADDED is fine (creating a new capability).
                 }
                 DeltaEntry::Modified { header } => {
-                    match canonical_headers.as_ref() {
-                        Some(canon) => {
-                            if !canon.contains(&header) {
+                    // Checked against the rename-adjusted effective set so a
+                    // MODIFIED equal to an in-change RENAMED `to:` (whose
+                    // `from:` is canonical) is treated as present.
+                    match effective_headers.as_ref() {
+                        Some(effective) => {
+                            if !effective.contains(&header) {
                                 violations.push(UnarchivableDelta {
                                     capability: cap_name.clone(),
                                     kind: DeltaKind::Modified,
@@ -182,9 +211,12 @@ pub fn check_spec_deltas_archivable(
                     }
                 }
                 DeltaEntry::Removed { header } => {
-                    match canonical_headers.as_ref() {
-                        Some(canon) => {
-                            if !canon.contains(&header) {
+                    // Same rename-adjusted effective set as MODIFIED: a
+                    // REMOVED equal to an in-change RENAMED `to:` (whose
+                    // `from:` is canonical) is present and not flagged.
+                    match effective_headers.as_ref() {
+                        Some(effective) => {
+                            if !effective.contains(&header) {
                                 violations.push(UnarchivableDelta {
                                     capability: cap_name.clone(),
                                     kind: DeltaKind::Removed,
@@ -650,5 +682,116 @@ mod tests {
         );
         let v = check_spec_deltas_archivable(ws, "c1").unwrap();
         assert!(v.is_empty(), "empty delta block must be a no-op, got {v:#?}");
+    }
+
+    // ---------- Rename-then-modify: effective header set ----------
+    //
+    // `openspec archive` applies a change's RENAMED blocks BEFORE its
+    // MODIFIED/REMOVED blocks. The pre-flight mirrors that by checking
+    // MODIFIED/REMOVED against the rename-adjusted effective header set
+    // (canon MINUS each in-change rename `from:`, PLUS each `to:`).
+
+    #[test]
+    fn rename_then_modify_in_same_capability_passes() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // Canon has A; the change renames A → B AND modifies B. At archive
+        // time the rename creates B, then the modify lands on it — fully
+        // archivable, so the pre-flight must NOT flag it.
+        write_canonical_spec(
+            ws,
+            "cap",
+            "## Requirements\n\n### Requirement: A\nBody.\n",
+        );
+        write_change_spec(
+            ws,
+            "c1",
+            "cap",
+            concat!(
+                "## RENAMED Requirements\n\n- FROM: `A`\n  TO: `B`\n\n",
+                "## MODIFIED Requirements\n\n### Requirement: B\nReplacement body SHALL.\n",
+            ),
+        );
+        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        assert!(v.is_empty(), "rename+modify must pass pre-flight, got {v:#?}");
+    }
+
+    #[test]
+    fn rename_then_remove_in_same_capability_passes() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // Canon has A; the change renames A → B AND removes B. The rename
+        // creates B, then REMOVED deletes it — archivable, not flagged.
+        write_canonical_spec(
+            ws,
+            "cap",
+            "## Requirements\n\n### Requirement: A\nBody.\n",
+        );
+        write_change_spec(
+            ws,
+            "c1",
+            "cap",
+            concat!(
+                "## RENAMED Requirements\n\n- FROM: `A`\n  TO: `B`\n\n",
+                "## REMOVED Requirements\n\n### Requirement: B\n",
+            ),
+        );
+        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        assert!(v.is_empty(), "rename+remove must pass pre-flight, got {v:#?}");
+    }
+
+    #[test]
+    fn modified_plain_missing_still_flagged_with_rename_present() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // Canon has A. The change renames A → B (valid) but ALSO modifies
+        // C — a header that is neither in canon NOR any in-change rename
+        // `to:` target. The rename resolution must NOT weaken the a07
+        // protection: C is still flagged with kind=Modified.
+        write_canonical_spec(
+            ws,
+            "cap",
+            "## Requirements\n\n### Requirement: A\nBody.\n",
+        );
+        write_change_spec(
+            ws,
+            "c1",
+            "cap",
+            concat!(
+                "## RENAMED Requirements\n\n- FROM: `A`\n  TO: `B`\n\n",
+                "## MODIFIED Requirements\n\n### Requirement: C\nBody SHALL.\n",
+            ),
+        );
+        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        assert_eq!(v.len(), 1, "only the bogus MODIFIED C should flag, got {v:#?}");
+        assert_eq!(v[0].kind, DeltaKind::Modified);
+        assert_eq!(v[0].header, "C");
+        assert!(v[0].reason.contains("header not found in canonical"));
+    }
+
+    #[test]
+    fn rename_from_missing_still_flagged_despite_effective_set() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // The RENAMED `from:` (X) is absent from raw canon. The RENAMED
+        // check is unchanged (raw canon), so it is still flagged; and the
+        // effective set only applies renames whose `from:` is canonical,
+        // so this invalid rename does not perturb it.
+        write_canonical_spec(
+            ws,
+            "cap",
+            "## Requirements\n\n### Requirement: Unrelated\nBody.\n",
+        );
+        write_change_spec(
+            ws,
+            "c1",
+            "cap",
+            "## RENAMED Requirements\n\n- FROM: `X`\n  TO: `Y`\n",
+        );
+        let v = check_spec_deltas_archivable(ws, "c1").unwrap();
+        assert_eq!(v.len(), 1, "rename with missing from must flag, got {v:#?}");
+        assert_eq!(v[0].kind, DeltaKind::Renamed);
+        assert_eq!(v[0].header, "from X to Y");
+        assert!(v[0].reason.contains("from-title not found"));
     }
 }
