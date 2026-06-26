@@ -299,6 +299,19 @@ impl<'a> ReviseCtx<'a> {
                         .handle_code_review_comment(comment, state, latest_seen)
                         .await;
                 }
+                // never-silent-when-addressed: a comment whose first token is
+                // `@<bot>` but whose verb is neither `revise` nor
+                // `code-review`, from an AUTHORIZED commenter, earns a
+                // one-time command-affordance reply (deduplicated by comment
+                // id). Bot-authored comments were already filtered above. A
+                // non-addressing comment (`is_addressed_but_unrecognized` is
+                // false) OR an unauthorized author falls through to the silent
+                // skip below — matching the access-control gate's policy.
+                if is_addressed_but_unrecognized(&comment.body, bot_username)
+                    && is_comment_authorized(comment, &self.github_cfg.command_authorization)
+                {
+                    self.maybe_post_affordance_reply(comment).await;
+                }
                 advance_seen(latest_seen, comment.created_at);
                 return Ok(CommentFlow::Continue);
             }
@@ -446,6 +459,47 @@ impl<'a> ReviseCtx<'a> {
         state.last_seen_comment_at = comment.created_at;
         write_state(paths, workspace, state)?;
         Ok(())
+    }
+
+    /// never-silent-when-addressed: post the one-time command-affordance
+    /// reply for an addressed-but-unrecognized comment, deduplicated by
+    /// comment id via the alert-state file's `affordance_replies` map so the
+    /// every-iteration comment fetch posts it at most once. Best-effort: a
+    /// post failure leaves the dedup entry unrecorded so a later iteration
+    /// can retry; a save failure is logged but does not abort the loop. The
+    /// reply itself is bot-authored, so it is filtered before parsing on the
+    /// next pass (no recursion) — the dedup map is the primary guard and the
+    /// bot-author filter the backstop.
+    async fn maybe_post_affordance_reply(&self, comment: &github::IssueComment) {
+        let comment_id = comment.id.to_string();
+        let mut alert_state =
+            crate::alert_state::AlertState::load_or_default(self.paths, self.workspace);
+        if alert_state.affordance_reply_already_posted(&comment_id) {
+            return;
+        }
+        let body = compose_affordance_reply(self.bot_username);
+        if let Err(e) = self
+            .forge
+            .post_comment(self.token, self.owner, self.repo_name, self.pr.number, &body)
+            .await
+        {
+            tracing::warn!(
+                url = %self.repo.url,
+                pr_number = self.pr.number,
+                comment_id = %comment_id,
+                "failed to post command-affordance PR comment: {e:#}"
+            );
+            return;
+        }
+        alert_state.record_affordance_reply(&comment_id, Utc::now());
+        if let Err(e) = alert_state.save(self.paths, self.workspace) {
+            tracing::warn!(
+                url = %self.repo.url,
+                pr_number = self.pr.number,
+                comment_id = %comment_id,
+                "failed to persist affordance-reply dedup state: {e:#}"
+            );
+        }
     }
 
     /// Dispatch a `@<bot> code-review` verb comment (a33). Handles the

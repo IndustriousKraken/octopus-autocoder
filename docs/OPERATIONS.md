@@ -199,8 +199,28 @@ next polling iteration, the daemon:
 
 The trigger pattern is strict: the comment body's first non-whitespace
 token must be `@<bot>` (case-insensitive on the username) and the next
-token must be `revise` (case-insensitive). Comments like `@<bot> looks
-good` are conversational and are ignored.
+token must be `revise` (case-insensitive).
+
+### Unrecognized commands get a one-time affordance reply
+
+The bot never drops a request silently when it is **addressed**. When an
+**authorized** commenter's comment leads with `@<bot>` but the verb is
+neither `revise` nor `code-review` — a forgotten verb (`@<bot> looks good`)
+or a typo (`@<bot> revize ...`) — the daemon posts **one** affordance reply
+naming the recognized commands, instead of dropping the comment. The reply
+is deduplicated by the originating comment id, so the every-iteration
+comment fetch posts it at most once per comment, and its example syntax is
+not the first line, so the reply can never re-trigger a command.
+
+This applies only to comments that **address** the bot as their first
+token. A comment that does not (a plain review comment, or `cc @<bot>`
+where the mention is not leading) is ignored with no reply — ordinary PR
+discussion is never acknowledged. An **unauthorized** addressed-but-unknown
+comment follows the authorization gate's policy below (no reply by
+default), not the affordance path. This is the forge-PR form of the
+cross-surface "never silent when addressed" invariant — its chatops
+counterpart is the `?` reaction (see
+[CHATOPS.md](CHATOPS.md#unrecognised-verbs-get-a--reaction-no-text-reply)).
 
 ### Authorizing PR-comment triggers
 

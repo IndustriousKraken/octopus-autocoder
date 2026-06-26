@@ -435,6 +435,12 @@ When the bot opens a PR (from a normal queue iteration, from a `send it` triage,
 
 **Per-PR caps.** Authorized human `@<bot> revise` requests can be bounded by the optional `executor.max_revise_triggers_per_pr` (default unlimited; opt-in with a positive integer) — once set, past the cap further requests are declined with one notice and do not invoke the executor. This is **separate** from the **automatic** reviewer-initiated revision cap (default 5; up to 20 via `executor.max_auto_revisions_per_pr`, legacy alias `executor.max_revisions_per_pr`) and the re-review cap (`reviewer.max_code_reviews_per_pr`); all three are independent. Full spec in [OPERATIONS.md → Revising an open PR via comment](OPERATIONS.md#revising-an-open-pr-via-comment).
 
+### Unrecognized PR commands get a one-time affordance reply
+
+A forge PR has no bot-reaction affordance, so the [never-silent-when-addressed invariant](#unrecognised-verbs-get-a--reaction-no-text-reply) takes the form of a reply there. When an **authorized** commenter addresses the bot on a PR with an unrecognized command — the comment's first token is `@<bot>` but the verb is neither `revise` nor `code-review` (a forgotten verb like `@<bot> looks good`, or a mistyped `@<bot> revize ...`) — the bot posts **one** affordance reply listing the recognized commands, deduplicated by the originating comment id so the every-iteration comment fetch posts it at most once per comment. A `revise`/`code-review` comment still triggers its action as before.
+
+A comment that does **not** address the bot as its first token (a plain review comment, or `cc @<bot>` where the mention is not leading) is ignored with no reply — ordinary PR discussion is never acknowledged. An **unauthorized** addressed-but-unknown comment follows the [authorization gate's policy](OPERATIONS.md#authorizing-pr-comment-triggers) (no reply by default), not this invariant — so a public PR can't turn the bot into a reply machine for arbitrary mentions.
+
 ---
 
 ## Operator recovery commands
@@ -721,6 +727,10 @@ You type the short name; the bot resolves it. The match is case-insensitive subs
 ### Unrecognised verbs get a `?` reaction, no text reply
 
 Random chat that happens to mention the bot but doesn't match a known verb (typos, drive-by mentions, AskUser-thread replies, etc.) gets a single `?`-emoji reaction on the original message — no text reply, no thread spam. The reaction is a quiet "this didn't parse" signal: discoverable for the operator who typed the command, ignorable for everyone else. Type `@<bot> help` for the current verb list.
+
+The `?` reaction fires only after the AskUser-thread-reply path declines: a reply inside a tracked thread is handled there first, and only a message that matches no thread *and* no verb falls through to the reaction.
+
+**The invariant — never silent when addressed.** Addressing the bot with an unrecognized command always yields an acknowledgment, never silence: a `?` reaction in chatops, and an [affordance reply on a PR](#unrecognized-pr-commands-get-a-one-time-affordance-reply). "Addressed" means the bot mention is the *leading* token of a command attempt. Incidental mentions (`cc @<bot> fyi`, where the mention is not first) and ordinary conversation with no mention are **not** acknowledged — the listener drops them before dispatch, so they get neither a reaction nor a reply. A `?` reaction counts as an acknowledgment; "silent" means no signal of any kind.
 
 ### Mobile vs desktop mention forms
 
