@@ -7,7 +7,7 @@ The trailing argument SHALL be parsed as follows: a non-negative integer `N` set
 
 On a valid parse the dispatcher SHALL submit a `PrioritizeAction { repo_url, change_slug, priority, channel, thread_ts }` over the daemon's Unix-domain control socket, where `priority` is `Some(N)` for a numeric argument AND `None` for `clear`/`none`. The action handler SHALL write (atomic tempfile + rename) `<workspace>/openspec/changes/<change-slug>/.priority.json` carrying `{ priority: N }` when `priority` is `Some`, OR remove that file when `priority` is `None`. The `.priority.json` marker is untracked daemon bookkeeping — gitignored, never committed, parallel to `.iteration-pending.json`. The handler SHALL refuse (polite error, no file written/removed) when the named change-slug does not resolve to a pending change in the workspace. The verb SHALL participate in the existing event-dedup cache so a redelivered Slack event submits exactly one `PrioritizeAction`.
 
-The dispatcher SHALL reply with a confirmation ack: on a set, `✓ Prioritized <change-slug> at priority <N>. It will be worked ahead of unprioritized changes (lower number = higher priority); a change already mid-iteration still goes first.`; on a clear, `✓ Cleared priority on <change-slug>. It returns to the default alphabetical order.`
+The dispatcher SHALL reply with a confirmation ack: on a set, `✓ Prioritized <change-slug> at priority <N>. It will be worked ahead of unprioritized changes (lower number = higher priority); a change already mid-iteration still goes first.`; on a clear, `✓ Cleared priority on <change-slug>. It returns to the default alphabetical order (or remains in mid-iteration position if it is currently mid-iteration).`
 
 #### Scenario: Setting a numeric priority writes the marker
 - **WHEN** the operator runs `@<bot> prioritize myrepo a07-foo 3`
@@ -21,7 +21,8 @@ The dispatcher SHALL reply with a confirmation ack: on a set, `✓ Prioritized <
 - **AND** `a07-foo` has a `.priority.json` marker
 - **THEN** the dispatcher submits a `PrioritizeAction` with `priority = None`
 - **AND** the handler removes `<workspace>/openspec/changes/a07-foo/.priority.json`
-- **AND** the reply is `✓ Cleared priority on a07-foo. It returns to the default alphabetical order.`
+- **AND** the reply is `✓ Cleared priority on a07-foo. It returns to the default alphabetical order (or remains in mid-iteration position if it is currently mid-iteration).`
+- **NOTE** if `a07-foo` also carries `.iteration-pending.json`, the queue-engine places it in tier 1 (mid-iteration) regardless; the ack's "alphabetical" clause applies only to changes without that marker
 
 #### Scenario: Malformed priority argument is refused
 - **WHEN** the operator runs `@<bot> prioritize myrepo a07-foo -1` (or a non-numeric token that is not `clear`/`none`, or omits the argument entirely)
@@ -40,7 +41,7 @@ The dispatcher SHALL reply with a confirmation ack: on a set, `✓ Prioritized <
 
 #### Scenario: Help verb lists the prioritize verb
 - **WHEN** an operator runs `@<bot> help`
-- **THEN** the help text lists `prioritize` with its syntax `prioritize <repo> <change> <N>|clear` AND a one-line description (`rank a pending change ahead of the default alphabetical order; lower N = higher priority`)
+- **THEN** the help text lists `prioritize` with its syntax `prioritize <repo> <change> <N>|clear|none` AND a one-line description (`rank a pending change ahead of the default alphabetical order; lower N = higher priority`)
 
 ### Requirement: Status reply surfaces the change-queue priority ordering
 The `@<bot> status` reply's queue section SHALL annotate every pending change that carries a `.priority.json` marker with its priority value, rendered as a trailing `(priority <N>)` after the change name, so the operator can see the effective queue order they set. This annotation applies in BOTH the queue one-liner form AND the per-line fallback form. Pending changes WITHOUT a `.priority.json` marker render exactly as they do today (no annotation). The annotation reflects only the changes lane; the issues AND audits lanes are unaffected.
