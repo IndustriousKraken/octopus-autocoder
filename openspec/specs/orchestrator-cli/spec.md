@@ -7771,10 +7771,14 @@ If implementing the issue would require a contract change, the audit SHALL re-ro
 - **AND** the issue is committed on its structural validity (an `issue.md` and `tasks.md`, no `specs/`), with the implement-time issue kick-back — a separate always-on mechanism, NOT the `[canon]` gate — remaining as the backstop
 
 ### Requirement: Spec-revision contradiction alert is a tracked, discussable thread
-When autocoder posts a `SpecNeedsRevision` chatops alert for a CONTRADICTION marker — a `.needs-spec-revision.json` whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty (a `[in]` / `[canon]` semantic finding, NOT the executor's unimplementable-tasks flag NOR a gate-error hold) — autocoder SHALL capture the posted message's `channel` AND `thread_ts` in a `RevisionThreadState` keyed to the repository AND change slug, so a later reply can be matched to the change. The alert body SHALL advertise that the operator may reply in the thread to discuss the revision OR post `@<bot> send it` to have the change revised and a PR opened. A degraded post that returns no `thread_ts` SHALL still write the marker AND alert but SHALL NOT record a `RevisionThreadState` (the alert is simply not reply-matchable — graceful degradation, never an error). The `clear-revision` verb remains the unchanged manual escape.
+When autocoder posts a `SpecNeedsRevision` chatops alert for a CONTRADICTION marker — a `.needs-spec-revision.json` whose `unimplementable_tasks` array is empty AND whose `gate_error` is empty AND whose `unarchivable_deltas` array is empty (a `[in]` / `[canon]` / `[rules]` semantic finding, NOT the executor's unimplementable-tasks flag, NOR a gate-error hold, NOR an unarchivable-deltas archivability hold) — autocoder SHALL capture the posted message's `channel` AND `thread_ts` in a `RevisionThreadState` keyed to the repository AND change slug, so a later reply can be matched to the change. When the post is reply-matchable (a `thread_ts` is returned AND a `RevisionThreadState` is recorded), the alert body SHALL advertise that the operator may reply in the thread to discuss the revision OR post `@<bot> send it` to have the change revised and a PR opened. A degraded contradiction post (no `thread_ts`) is not reply-matchable, so its body SHALL NOT advertise `@<bot> send it` as an actionable path.
+
+A MANUAL-FIX marker — one whose `unarchivable_deltas` array is non-empty (the `Spec-delta archivability pre-flight check` hold) OR whose `gate_error` is populated (a verifier gate that could not run) — is NOT a contradiction marker: `send it`'s revision executor cannot fix a delta-header/canon mismatch or a broken gate. For such a marker autocoder SHALL NOT record a `RevisionThreadState`, AND the alert body SHALL state that the change is held for a MANUAL spec fix (naming the cause — unarchivable spec deltas, or a verifier gate that could not run), that `@<bot> send it` cannot revise it, AND that the operator should fix it manually and then post `@<bot> clear-revision` to clear the hold. Because no `RevisionThreadState` is recorded, a later `@<bot> send it` in that thread falls through to the existing generic untracked-thread refusal (per `chatops-manager`'s `send it` routing) — this requirement does NOT add a new `send it` thread context and does NOT change that generic refusal.
+
+A degraded post that returns no `thread_ts` SHALL still write the marker AND alert but SHALL NOT record a `RevisionThreadState` (the alert is simply not reply-matchable — graceful degradation, never an error). The `clear-revision` verb remains the unchanged manual escape for all marker causes.
 
 #### Scenario: A contradiction alert is tracked and advertises the thread
-- **WHEN** autocoder posts the `SpecNeedsRevision` alert for a marker with empty `unimplementable_tasks` AND empty `gate_error`
+- **WHEN** autocoder posts the `SpecNeedsRevision` alert for a marker with empty `unimplementable_tasks` AND empty `gate_error` AND empty `unarchivable_deltas`
 - **THEN** it records a `RevisionThreadState` carrying the alert's `channel`, `thread_ts`, repository, AND change slug
 - **AND** the alert body states that a reply discusses the revision AND that `@<bot> send it` revises the change and opens a PR
 
@@ -7787,6 +7791,17 @@ When autocoder posts a `SpecNeedsRevision` chatops alert for a CONTRADICTION mar
 - **WHEN** the alert post returns no `thread_ts`
 - **THEN** the marker AND alert are still produced
 - **AND** no `RevisionThreadState` is recorded (the thread is simply not reply-matchable)
+- **AND** the alert body does not advertise `@<bot> send it` as an actionable path (it cannot be matched)
+
+#### Scenario: An unarchivable-deltas alert explains the manual fix and is not tracked
+- **WHEN** autocoder posts the `SpecNeedsRevision` alert for a marker whose `unarchivable_deltas` is non-empty — even though its `unimplementable_tasks` AND `gate_error` are both empty
+- **THEN** no `RevisionThreadState` is recorded for it (it is NOT a contradiction marker AND is NOT `send it`-able)
+- **AND** the alert body states that the change is held for unarchivable spec deltas, that `@<bot> send it` cannot revise it, AND that the operator should fix the delta header(s) to match canonical and then post `@<bot> clear-revision`
+
+#### Scenario: A gate-error alert explains the manual fix and is not tracked
+- **WHEN** autocoder posts the `SpecNeedsRevision` alert for a marker whose `gate_error` is populated
+- **THEN** no `RevisionThreadState` is recorded for it (it is NOT a contradiction marker AND is NOT `send it`-able)
+- **AND** the alert body states that the change is held because a verifier gate could not run, that `@<bot> send it` cannot revise it, AND that the operator should fix the gate and then post `@<bot> clear-revision`
 
 ### Requirement: Revision advisor discusses a flagged change read-only
 A non-`send it` `@<bot>` reply whose `thread_ts` matches a `RevisionThreadState` SHALL run a read-only agentic session — the revision advisor — reconstructed from the flagged change's spec deltas, the relevant canonical specs, the marker's contradiction narrative, AND the thread transcript so far. The advisor SHALL answer the operator's question — typically whether to align the change to canon's existing vocabulary OR to MODIFY the contradicted canonical requirement, and how — AND SHALL write nothing to the workspace. The session SHALL be stateless: each reply reconstructs the advisor from the on-disk artifacts AND the thread transcript; no agent session is persisted between replies.
@@ -8870,4 +8885,47 @@ Before this requirement the spec-revision executor stamped no marker, so a `stat
 #### Scenario: A pass and a revision do not run concurrently on one workspace
 - **WHEN** a spec-revision holds the per-repo busy marker for a repo
 - **THEN** a normal pass for that repo cannot acquire the marker until the revision releases it, per `Per-repo busy marker prevents concurrent work`
+
+### Requirement: Repeated revision non-convergence recommends decomposition
+The daemon SHALL track the number of CONSECUTIVE failed `send it` rounds for a change — a round being a `send it` whose spec-revision executor exhausts its bounded converge attempts with a contradiction remaining (the budget-exhausted outcome of `Send it in a revision thread runs the spec-revision executor`). The count SHALL be carried in or alongside the change's `.needs-spec-revision.json` marker, AND SHALL reset to zero when the change clears (a clean re-gate that opens a PR) OR when the marker is cleared (via `@<bot> clear-revision` or removal of the marker file).
+
+When the consecutive-failure count reaches a configurable threshold (default 3), the budget-exhausted failure reply SHALL — IN ADDITION to naming the remaining contradiction as it already does — recommend that the operator DECOMPOSE the change into smaller changes, stating that a change failing repeated revision rounds is likely too large or too interconnected to converge via `send it`. This is additive to the existing failure reply: the operator MAY still `send it` again (the existing path is unchanged), but decomposition is presented as the recommended path after repeated non-convergence. Below the threshold the failure reply is UNCHANGED.
+
+#### Scenario: At the threshold the reply recommends decomposition
+- **WHEN** a change reaches the configured number of consecutive failed `send it` rounds (default 3)
+- **THEN** the budget-exhausted failure reply names the remaining contradiction AND additionally recommends decomposing the change into smaller changes
+- **AND** the reply states that repeated non-convergence indicates the change is likely too large or interconnected to converge via `send it`
+
+#### Scenario: Below the threshold the reply is unchanged
+- **WHEN** a change has fewer than the configured number of consecutive failed rounds
+- **THEN** the failure reply names the remaining contradiction AND invites another `send it`, exactly as before
+- **AND** it does NOT include the decomposition recommendation
+
+#### Scenario: The consecutive-failure count resets when the change clears or is cleared
+- **WHEN** a change's revision re-gates clean and a PR is opened, OR the change's `.needs-spec-revision.json` marker is cleared
+- **THEN** the consecutive-failure count for that change resets to zero
+- **AND** a subsequent first failure does not immediately trigger the decomposition recommendation
+
+### Requirement: The spec-revision executor persists incremental progress across send-it rounds
+The spec-revision executor SHALL preserve forward progress across `send it` rounds instead of restarting from base each round. Concretely: when a `send it` exhausts its bounded converge attempts with a contradiction remaining, the executor SHALL persist the round's accumulated spec-delta edits on the REVISION BRANCH — NEVER the base branch (human review of the PR remains the sole merge gate, per `Send it in a revision thread runs the spec-revision executor`) — AND the next `send it` for that change SHALL resume from the persisted revision branch rather than recreating it from base. Fixes therefore accumulate across rounds, making convergence monotonic rather than restarting from the same contradictory base every round.
+
+Persistence is GUARDED to avoid locking in a regression. The executor SHALL persist a round's edits ONLY when the round did not INCREASE the change-internal contradiction set — that is, when no change-internal contradiction identity is present after the round that was absent before it (using the same contradiction-identity comparison the executor already performs for survivor detection). When a round INCREASES the contradiction set, the executor SHALL DISCARD that round's edits, reverting to the prior persisted state (or to base when no prior round persisted), so a regression is never carried forward.
+
+This requirement does NOT change any other terminal behavior of the spec-revision executor: a clean re-gate still opens a PR and reports the link; an unreadable thread still refuses without revising blind; a scope/edit-guardrail violation still discards; a gate that could-not-run is still terminal. The `.needs-spec-revision.json` marker SHALL remain until a clean re-gate, AND no PR SHALL open until a re-gate is clean. The only behavior this requirement changes is the fate of a non-regressing failed round's EDITS — previously discarded, now persisted on the revision branch for the next round to build on.
+
+#### Scenario: A non-regressing failed round persists and the next send it resumes from it
+- **WHEN** a `send it` exhausts its converge attempts with a contradiction remaining AND the round did not increase the change-internal contradiction set
+- **THEN** the round's accumulated spec-delta edits are persisted on the revision branch (never the base branch)
+- **AND** the next `send it` for that change resumes from the persisted revision branch rather than recreating it from base
+- **AND** no PR is opened and the `.needs-spec-revision.json` marker remains
+
+#### Scenario: A regressing round is discarded rather than persisted
+- **WHEN** a failed round introduces a change-internal contradiction identity that was absent before the round
+- **THEN** the round's edits are discarded, reverting to the prior persisted state (or to base when no prior round persisted)
+- **AND** the regression is not carried forward into the next `send it`
+
+#### Scenario: The merge gate and marker semantics are unchanged
+- **WHEN** the executor persists progress on a failed round
+- **THEN** it does NOT commit the revision to the base branch outside the PR, and it does NOT open a PR
+- **AND** the `.needs-spec-revision.json` marker remains until a re-gate is clean, at which point a PR is opened for human review
 

@@ -11527,6 +11527,40 @@ mod tests {
         assert!(submitter.calls().is_empty());
     }
 
+    /// send-it-explains-manual-fix-markers task 4.4 (routing unchanged): a
+    /// manual-fix hold (unarchivable-deltas / gate-error) records NO
+    /// `RevisionThreadState`, so `send it` in its thread matches no tracked
+    /// context AND falls through to the generic untracked-thread refusal —
+    /// exactly as before. The tracked-CONTRADICTION half (still runs the
+    /// executor) is covered by `send_it_in_revision_thread_runs_revision_execute`.
+    #[tokio::test]
+    async fn send_it_in_manual_fix_thread_falls_through_to_generic_refusal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No revision-thread state is written — the manual-fix posters never
+        // record one. The dispatcher therefore sees an untracked thread.
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_audit_thread_state_dir(tmp.path().to_path_buf())
+            .with_revision_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message_in_thread(
+                &format!("{BOT} send it"),
+                "C_OPS",
+                Some("1748.manualfix"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let text = unwrap_sync(reply);
+        assert!(text.contains("not tracking"), "generic refusal expected: {text}");
+        assert!(
+            !submitter.calls().iter().any(|c| c["action"] == "revision_execute"),
+            "a manual-fix thread must not fire the revision executor"
+        );
+    }
+
     /// Regression: an audit-thread match takes precedence over a revision
     /// match for the same `thread_ts` (audit lookup runs first).
     #[tokio::test]

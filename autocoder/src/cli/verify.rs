@@ -286,6 +286,7 @@ fn build_ctxs(cfg: &Config, paths: &crate::paths::DaemonPaths) -> Result<GateCtx
                     .executor
                     .revision_transcript_fetch_retries,
                 revision_converge_attempts: cfg.executor.revision_converge_attempts,
+                revision_nonconvergence_threshold: cfg.executor.revision_nonconvergence_threshold,
                 paths: Some(std::sync::Arc::new(paths.clone())),
                 #[cfg(test)]
                 test_submission: None,
@@ -507,6 +508,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(3600),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            revision_nonconvergence_threshold: 3,
             paths: None,
             test_submission: submission,
         }

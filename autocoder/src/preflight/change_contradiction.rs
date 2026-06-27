@@ -116,6 +116,12 @@ pub struct ContradictionCheckCtx {
     /// accumulating fixes on the same revision branch so a multi-contradiction
     /// change is resolved in one `send it`. `0` preserves single-pass behavior.
     pub revision_converge_attempts: u32,
+    /// Consecutive failed `send it` rounds on one change before the
+    /// spec-revision executor's budget-exhausted reply ALSO recommends
+    /// decomposing the change (`executor.revision_nonconvergence_threshold`).
+    /// Rides on THIS ctx (which the revision sessions reuse for their model +
+    /// command) alongside the other revision knobs. `3` is the default.
+    pub revision_nonconvergence_threshold: u32,
     /// Resolved daemon paths, used to persist the gate session's full captured
     /// output to a discoverable per-session log under `gates/`
     /// (verifier-gates-persist-session-log). `None` only for test/standalone
@@ -711,6 +717,7 @@ mod tests {
             timeout: Duration::from_secs(crate::config::default_agentic_session_timeout()),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            revision_nonconvergence_threshold: 3,
             paths: None,
             test_submission: None,
         }
@@ -736,6 +743,7 @@ mod tests {
             timeout: exec.agentic_session_timeout(),
             revision_transcript_fetch_retries: 0,
             revision_converge_attempts: 0,
+            revision_nonconvergence_threshold: 3,
             paths: None,
             test_submission: None,
         };
