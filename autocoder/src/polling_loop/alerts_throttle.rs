@@ -280,8 +280,11 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
 ) {
     let label = crate::verifier_gate::VerifierGate::In.label();
     // a03: the contradiction marker (empty unimplementable_tasks, empty
-    // gate_error) is a TRACKED revision thread — post via the thread-returning
-    // path AND stamp a RevisionThreadState so a later reply can be matched.
+    // gate_error, AND empty unarchivable_deltas) is a TRACKED revision thread —
+    // post via the thread-returning path AND stamp a RevisionThreadState so a
+    // later reply can be matched. A non-empty unarchivable_deltas array is a
+    // MANUAL-FIX hold, not a contradiction (`maybe_post_unarchivable_deltas_alert`
+    // keeps the untracked path), so `send it`'s executor cannot revise it.
     let findings = findings.to_vec();
     let attribution = attribution.map(|a| a.to_string());
     post_tracked_revision_alert(
@@ -380,7 +383,7 @@ pub(crate) async fn maybe_post_gate_error_alert(
                 })
                 .unwrap_or_default();
             gate.label_line(&format!(
-                "⚠️ `{repo_url}`: {label} gate FAILED TO RUN on `{change}` — change HELD (NOT evaluated; this is NOT a finding)\n\nThe gate could not run, so the change is held rather than waved through (gatekeepers fail closed).\nCause: {cause}\n\nOperator action:\n  1. Fix the gate — e.g. install/authenticate the configured CLI, or check the daemon control socket.\n  2. `@<bot> clear-revision <repo> <change>` to retry (clearing without fixing the gate will re-hold).\n\nmarker: {marker}{attribution_suffix}",
+                "⚠️ `{repo_url}`: {label} gate FAILED TO RUN on `{change}` — change HELD (NOT evaluated; this is NOT a finding)\n\nThe gate could not run, so the change is held rather than waved through (gatekeepers fail closed).\nCause: {cause}\n\nThis is a MANUAL fix — `@<bot> send it` cannot revise it (it cannot fix a broken gate). Fix the gate, then clear the hold:\nOperator action:\n  1. Fix the gate — e.g. install/authenticate the configured CLI, or check the daemon control socket.\n  2. `@<bot> clear-revision <repo> <change>` to retry (clearing without fixing the gate will re-hold).\n\nmarker: {marker}{attribution_suffix}",
                 repo_url = repo.url,
                 label = label,
                 change = change,
@@ -578,7 +581,7 @@ pub(crate) async fn maybe_post_unarchivable_deltas_alert(
                 ));
             }
             format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nThis is a MANUAL spec fix — `@<bot> send it` cannot revise it (it cannot reconcile a delta header with canonical). Fix the delta header(s), then clear the hold:\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
                 repo_url = repo.url,
                 change = change,
                 violations_block = violations_block,

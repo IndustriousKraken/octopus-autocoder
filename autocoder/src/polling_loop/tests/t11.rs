@@ -580,7 +580,10 @@ impl crate::chatops::ChatOpsBackend for TrackingThreadBackend {
     ) -> Result<Option<crate::chatops::HumanReply>> {
         Ok(None)
     }
-    async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
+    async fn post_notification(&self, _channel: &str, text: &str) -> Result<()> {
+        // Record the untracked-path body too (the manual-fix posters go through
+        // `post_notification`, not the threaded path) so a test can assert on it.
+        self.bodies.lock().unwrap().push(text.to_string());
         Ok(())
     }
     async fn post_notification_with_thread(
@@ -858,5 +861,145 @@ async fn unimplementable_tasks_alert_records_no_revision_thread_state() {
     assert_eq!(
         count, 0,
         "an unimplementable-tasks alert must not record a RevisionThreadState"
+    );
+}
+
+// ---- send-it-explains-manual-fix-markers: manual-fix alerts are untracked
+//      AND explain the manual remediation in their body ----
+
+/// Count `RevisionThreadState` files under the daemon state dir (0 == none).
+fn revision_state_count(paths: &DaemonPaths) -> usize {
+    let dir = crate::revision_thread::state_dir(&paths.state);
+    std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0)
+}
+
+/// Task 4.1: an unarchivable-deltas alert records NO `RevisionThreadState`, AND
+/// the body names the unarchivable-deltas cause, says `@<bot> send it` cannot
+/// revise it, AND points the operator at `clear-revision`.
+#[tokio::test]
+async fn unarchivable_deltas_alert_explains_manual_fix_and_is_untracked() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    // A thread_ts is supplied, but the manual-fix poster uses the untracked
+    // (`post_notification`) path, so no thread is ever recorded regardless.
+    let (backend, ctx) = tracking_ctx(Some("1748.unarch"));
+
+    let violations = vec![crate::preflight::spec_archivability::UnarchivableDelta {
+        capability: "code-reviewer".into(),
+        kind: crate::preflight::spec_archivability::DeltaKind::Modified,
+        header: "Reviewer prompt budget is operator-configurable".into(),
+        reason: "header not found in canonical openspec/specs/code-reviewer/spec.md".into(),
+    }];
+    maybe_post_unarchivable_deltas_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "held-unarch",
+        &violations,
+        "fix the delta header to match canonical",
+    )
+    .await;
+
+    assert_eq!(
+        revision_state_count(&paths),
+        0,
+        "a manual-fix unarchivable-deltas alert must record no RevisionThreadState"
+    );
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies.last().expect("the alert must post a body");
+    assert!(
+        body.contains("unarchivable spec deltas"),
+        "body must name the unarchivable-deltas cause: {body}"
+    );
+    assert!(
+        body.contains("send it") && body.contains("cannot revise"),
+        "body must say `@<bot> send it` cannot revise it: {body}"
+    );
+    assert!(
+        body.contains("clear-revision"),
+        "body must point at the clear-revision remediation: {body}"
+    );
+}
+
+/// Task 4.2: a gate-error alert records NO `RevisionThreadState`, AND the body
+/// names the gate-error cause, says `@<bot> send it` cannot revise it, AND
+/// points the operator at `clear-revision`.
+#[tokio::test]
+async fn gate_error_alert_explains_manual_fix_and_is_untracked() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (backend, ctx) = tracking_ctx(Some("1748.gateerr"));
+
+    maybe_post_gate_error_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "held-gate",
+        crate::verifier_gate::VerifierGate::In,
+        "CLI strategy unavailable",
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        revision_state_count(&paths),
+        0,
+        "a gate-error alert must record no RevisionThreadState"
+    );
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies.last().expect("the alert must post a body");
+    assert!(
+        body.contains("FAILED TO RUN") && body.contains("CLI strategy unavailable"),
+        "body must name the gate-error cause: {body}"
+    );
+    assert!(
+        body.contains("send it") && body.contains("cannot revise"),
+        "body must say `@<bot> send it` cannot revise it: {body}"
+    );
+    assert!(
+        body.contains("clear-revision"),
+        "body must point at the clear-revision remediation: {body}"
+    );
+}
+
+/// Task 4.3 (regression): a CONTRADICTION marker still records a
+/// `RevisionThreadState` AND its alert body still advertises `@<bot> send it`
+/// — the manual-fix change must not have disturbed the tracked path.
+#[tokio::test]
+async fn contradiction_alert_still_tracks_and_advertises_send_it() {
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    let tmp_ws = tempfile::TempDir::new().unwrap();
+    let repo = fixture_repo(tmp_ws.path());
+    let (backend, ctx) = tracking_ctx(Some("1748.contra"));
+
+    let findings = vec![crate::preflight::change_contradiction::ContradictionFinding {
+        requirement_a: "A".into(),
+        requirement_b: "B".into(),
+        summary: "A and B cannot both hold".into(),
+        suggested_fix: String::new(),
+    }];
+    maybe_post_contradiction_findings_alert(
+        &paths,
+        Some(&ctx),
+        &repo,
+        "contra-demo",
+        &findings,
+        "align the change",
+        None,
+    )
+    .await;
+
+    // The tracked path still stamps a RevisionThreadState.
+    crate::revision_thread::read_state(&paths.state, "1748.contra")
+        .unwrap()
+        .expect("a contradiction alert must still record a RevisionThreadState");
+    // ...and its body still advertises `@<bot> send it` as an actionable path.
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies.last().expect("the alert must post a body");
+    assert!(
+        body.contains("@<bot> send it"),
+        "a contradiction alert must still advertise `@<bot> send it`: {body}"
     );
 }
