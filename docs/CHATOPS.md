@@ -691,14 +691,17 @@ queue: 1 pending (a10-baz), 0 waiting, 0 excluded
 
 #### `currently:` line variants
 
-The `currently:` line surfaces the daemon's live busy-marker contents. It distinguishes between "truly idle," "working on a named change," "running an audit," "in a post-executor lifecycle phase," and "stale marker awaiting recovery" so an operator wondering why a pending change isn't being picked up can read the line and tell exactly what the daemon is doing:
+The `currently:` line surfaces the daemon's live busy-marker contents — and, when no marker is held, whether the repo is *parked on an open PR* rather than truly idle. It distinguishes between "truly idle," "parked on an open PR awaiting review," "working on a named change," "running an audit," "in a post-executor lifecycle phase," "in a recovery operation," and "stale marker awaiting recovery" so an operator wondering why a pending change isn't being picked up can read the line and tell exactly what the daemon is doing:
 
 ```
 currently: idle
+currently: parked: open PR #57 awaiting review — no new work until it is merged or closed
+currently: parked: open PR #57 (+2 more) awaiting review — no new work until it is merged or closed
 currently: working on a36-expense-tracking (started 3m ago)
 currently: running audit architecture_advisor (started 14m ago)
 currently: commit in progress (started 12s ago)
 currently: push in progress (started 8s ago)
+currently: recovery in progress (started 1m ago, type=rebuild-specs)
 currently: stale marker from pid 490170 (age 9m, recovery in 1m)
 currently: stale marker from pid 490170 (age 11m40s, threshold passed, recovery eligible next iteration)
 currently: stale marker from pid 490170 (age 53m, recovery eligible now)
@@ -707,14 +710,14 @@ currently: busy (stage=executor, started 30s ago)
 
 The variants are computed by branching on the marker's contents in this priority order:
 
-1. **No marker present** → `idle`.
+1. **No marker present** → `idle`, *unless* an open PR exists for the agent branch. The daemon skips every iteration while an agent-branch PR is open (the [skip-iteration gate](OPERATIONS.md#queue-blocking-policy)), and that skip happens *before* any marker is stamped — so the no-marker state splits two ways: **an open agent-branch PR exists** → `parked: open PR #<n> awaiting review — no new work until it is merged or closed` (names the lowest-numbered open PR, with a `(+N more)` suffix when several are open); **otherwise** → `idle`. The status path runs the same `list_open_prs_for_head` query the gate uses, so the park claim matches the gate's behavior exactly; if that query fails it degrades to `idle` (a WARN is logged) and never fabricates a park.
 2. **Marker present and stale** (dead pid OR age ≥ `executor.busy_marker_stale_threshold_secs`) → `stale marker from pid <pid> (age <age>, recovery <eligible-or-remaining>)`. Three sub-shapes: `recovery eligible now` when the recorded PID is no longer in `/proc` (recovery fires immediately on the next iteration); `threshold passed, recovery eligible next iteration` when the PID is still alive but past the threshold (SIGTERM fires on the next iteration per the busy-marker recovery flow); `recovery in <duration>` when the marker is past 80% of the threshold but not yet at it (recovery is upcoming, so operators see "stuck-feeling" markers as visibly transitioning rather than permanent).
 3. **Marker present and `change` non-empty** → `working on <change> (started <age> ago)`. The change branch wins over the stage-based variants because the operator wants to know the change slug before the lifecycle phase.
 4. **Marker present, `stage=executor`, `change` empty, and an audit log matches the marker's `started_at`** → `running audit <audit_type> (started <age> ago)`. The audit_type is parsed from the matching audit-log filename under `<logs_dir>/runs/<workspace>/audits/`.
 5. **Marker present and `stage` ∈ `{commit, review, push, pr}`** → `<stage> in progress (started <age> ago)`. Names the lifecycle phase so the operator sees which post-executor step is in flight.
 6. **Marker present but unclassifiable** (e.g. `stage=executor` with no matching audit log) → `busy (stage=<stage>, started <age> ago)` fallback.
 
-Why this matters: pre-spec, the line collapsed every non-`change` busy state into a misleading `currently: idle`, so an operator hitting "status myrepo" during an audit run would see `currently: idle` plus a non-empty queue and have no idea why the pending change wasn't being picked up. With the surfaced variants, the operator can distinguish "audit in flight, just wait" from "stale marker, need recovery to fire (or manual `rm`)" from "truly idle, something else is wrong." The busy-marker classification logic the stale-marker branches mirror is documented in [OPERATIONS.md](OPERATIONS.md)'s busy-marker section; the immediate-fix-by-hand path for a stale marker is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md)'s stale-marker section.
+Why this matters: pre-spec, the line collapsed every non-`change` busy state into a misleading `currently: idle`, so an operator hitting "status myrepo" during an audit run would see `currently: idle` plus a non-empty queue and have no idea why the pending change wasn't being picked up. The same blind spot hid the open-PR park — a repo with pending changes and an open PR sat at `currently: idle` for hours with no hint that the gate was holding it; an operator who *thought* they had merged the PR had nothing to go on. With the surfaced variants, the operator can distinguish "audit in flight, just wait" from "parked on an open PR, merge or close it to resume" from "stale marker, need recovery to fire (or manual `rm`)" from "truly idle, something else is wrong." The busy-marker classification logic the stale-marker branches mirror is documented in [OPERATIONS.md](OPERATIONS.md)'s busy-marker section; the immediate-fix-by-hand path for a stale marker is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md)'s stale-marker section.
 
 The age formatting matches the busy-marker convention: `Xs` under 1 minute, `Xm` under 1 hour, `XhYm` past 1 hour. Older "stuck-feeling" markers like `2h17m ago` retain their minute resolution so the operator can see meaningful progress.
 

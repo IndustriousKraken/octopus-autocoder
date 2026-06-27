@@ -1671,6 +1671,20 @@ pub struct RepoStatusResponse {
     pub latest_pr: Option<PrSummary>,
     #[serde(default)]
     pub currently_busy: Option<BusySummary>,
+    /// Numbers of the open PRs whose head is the agent branch — derived
+    /// from `list_open_prs_for_head`, the SAME query the `Skip iteration
+    /// when an open PR exists for the agent branch` gate uses. When this
+    /// is `Some(non-empty)` AND no busy marker is present, the
+    /// `currently:` line reports the open-PR park instead of `idle` (the
+    /// gate is active, so no new work runs until the PR merges or closes).
+    /// `Some(empty)` means the query ran and found no open PR (genuinely
+    /// idle); `None` means the query FAILED — the `currently:` line
+    /// degrades to the marker-based determination and never fabricates a
+    /// park. Only the numbers are carried because the park line names PRs
+    /// by number alone. `#[serde(default)]` keeps older daemons
+    /// wire-compatible with newer chatops formatters.
+    #[serde(default)]
+    pub open_agent_pr_numbers: Option<Vec<u64>>,
     pub perma_stuck_changes: Vec<MarkerEntry>,
     pub revision_marked_changes: Vec<MarkerEntry>,
     pub throttled_alerts: Vec<ThrottledAlertEntry>,
@@ -1882,7 +1896,10 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
 
         out.push('\n');
-        out.push_str(&format_currently_line(resp.currently_busy.as_ref()));
+        out.push_str(&format_currently_line_with_park(
+            resp.currently_busy.as_ref(),
+            resp.open_agent_pr_numbers.as_deref(),
+        ));
         out.push('\n');
     }
 
@@ -2564,7 +2581,10 @@ fn menu_queue_segment(label: &str, list: &[String]) -> String {
 /// marker. The `currently: ` prefix is stripped — the menu's section
 /// header already implies "currently".
 fn menu_busy_clause(resp: &RepoStatusResponse) -> String {
-    let line = format_currently_line(resp.currently_busy.as_ref());
+    let line = format_currently_line_with_park(
+        resp.currently_busy.as_ref(),
+        resp.open_agent_pr_numbers.as_deref(),
+    );
     line.strip_prefix("currently: ").unwrap_or(&line).to_string()
 }
 
@@ -5194,6 +5214,45 @@ pub fn format_currently_line(busy: Option<&BusySummary>) -> String {
     )
 }
 
+/// Render the `currently:` line, refining rule 1 (no marker present) to
+/// distinguish "parked on an open PR" from "truly idle"
+/// (status-surfaces-open-pr-park). When NO busy marker is present AND an
+/// open agent-branch PR exists, the daemon's skip-iteration gate is
+/// active — no new work runs until that PR is merged or closed — so the
+/// line names the gating PR instead of reading `idle`.
+///
+/// `open_agent_pr_numbers` is the result of `list_open_prs_for_head`
+/// carried on the status response: `Some(non-empty)` → park (naming the
+/// lowest-numbered PR, with a `(+N more)` suffix when several exist);
+/// `Some(empty)` → genuinely idle; `None` → the query FAILED, so we
+/// degrade to the marker-based determination (`idle` when no marker) and
+/// never fabricate a park.
+///
+/// When a busy marker IS present the marker-based determination always
+/// wins — an open PR never overrides `working on <change>`, a stale
+/// marker, etc. (the park is a no-marker state by construction: the gate
+/// returns before any marker is stamped).
+pub fn format_currently_line_with_park(
+    busy: Option<&BusySummary>,
+    open_agent_pr_numbers: Option<&[u64]>,
+) -> String {
+    if busy.is_none()
+        && let Some(prs) = open_agent_pr_numbers
+        && let Some(&lowest) = prs.iter().min()
+    {
+        let extra = prs.len() - 1;
+        let more = if extra > 0 {
+            format!(" (+{extra} more)")
+        } else {
+            String::new()
+        };
+        return format!(
+            "currently: parked: open PR #{lowest}{more} awaiting review — no new work until it is merged or closed"
+        );
+    }
+    format_currently_line(busy)
+}
+
 /// Compute the age of a marker as a non-negative integer of seconds.
 /// Negative deltas (clock skew, future `started_at`) clamp to 0 so the
 /// formatter never emits a negative `-5s ago`.
@@ -6883,6 +6942,108 @@ mod tests {
         b.pid_alive = true;
         let out = format_currently_line(Some(&b));
         assert!(out.contains("recovery in 3m"), "{out}");
+    }
+
+    // ---------- open-PR park (status-surfaces-open-pr-park) ----------
+
+    #[test]
+    fn currently_line_park_no_marker_open_pr_names_pr_not_idle() {
+        // 4.1: no busy marker AND an open agent-branch PR → park variant
+        // naming the lowest-numbered PR, with a (+N more) suffix. We
+        // assert the branch taken + the PR number, not the exact phrasing
+        // (wording is behavior, not a pinned string).
+        let out = format_currently_line_with_park(None, Some(&[8, 5, 12]));
+        assert!(out.contains("parked"), "must surface a park: {out}");
+        assert!(out.contains("#5"), "must name the lowest-numbered open PR: {out}");
+        assert!(out.contains("(+2 more)"), "must suffix the extra count: {out}");
+        assert!(!out.contains("idle"), "park line must never read idle: {out}");
+    }
+
+    #[test]
+    fn currently_line_park_single_open_pr_has_no_more_suffix() {
+        let out = format_currently_line_with_park(None, Some(&[42]));
+        assert!(out.contains("#42"), "{out}");
+        assert!(
+            !out.contains("more"),
+            "a single open PR must not get a (+N more) suffix: {out}"
+        );
+    }
+
+    #[test]
+    fn currently_line_park_no_marker_no_open_pr_is_idle() {
+        // 4.2: no marker AND no open PR → idle. Both the "queried, none"
+        // (Some(empty)) and the "query failed" (None) cases land on idle.
+        assert_eq!(
+            format_currently_line_with_park(None, Some(&[])),
+            "currently: idle"
+        );
+        assert_eq!(format_currently_line_with_park(None, None), "currently: idle");
+    }
+
+    #[test]
+    fn currently_line_park_busy_marker_wins_over_open_pr() {
+        // 4.3: a busy marker present beats any open-PR state — the park
+        // is a no-marker state by construction (the gate returns before a
+        // marker is stamped), so an open PR never overrides working-on.
+        let b = busy("executor", "a05-foo", 120);
+        assert_eq!(
+            format_currently_line_with_park(Some(&b), Some(&[5])),
+            "currently: working on a05-foo (started 2m ago)"
+        );
+        // And a stale dead-pid marker still wins too.
+        let mut stale = busy("executor", "a05-foo", 30);
+        stale.pid = 12345;
+        stale.pid_alive = false;
+        let out = format_currently_line_with_park(Some(&stale), Some(&[5]));
+        assert!(out.starts_with("currently: stale marker from pid 12345"), "{out}");
+    }
+
+    #[test]
+    fn format_status_park_renders_in_full_reply() {
+        // 4.1 (integration): no marker + open PR → the full reply shows
+        // the park line AND every other always-present section.
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            latest_pr: Some(PrSummary {
+                number: 57,
+                title: "agent work".into(),
+                state: "open".into(),
+                head_branch: "agent-q".into(),
+                url: "https://github.com/owner/repo/pull/57".into(),
+                age: chrono::Duration::hours(1),
+            }),
+            currently_busy: None,
+            open_agent_pr_numbers: Some(vec![57]),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("currently: parked: open PR #57"), "{out}");
+        assert!(!out.contains("currently: idle"), "must not read idle: {out}");
+        assert!(out.contains("branches: base=main, agent=agent-q"), "{out}");
+        assert!(out.contains("latest PR: #57"), "{out}");
+    }
+
+    #[test]
+    fn format_status_failed_open_pr_query_degrades_to_idle() {
+        // 4.4: a failed open-PR query (open_agent_pr_numbers = None)
+        // degrades to the marker-based determination (idle, no marker)
+        // without breaking the rest of the reply.
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            latest_pr: None,
+            currently_busy: None,
+            open_agent_pr_numbers: None,
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("currently: idle"), "{out}");
+        assert!(!out.contains("parked"), "must not fabricate a park: {out}");
+        assert!(out.contains("branches: base=main, agent=agent-q"), "{out}");
+        assert!(out.contains("latest PR: (none)"), "{out}");
     }
 
     #[test]
