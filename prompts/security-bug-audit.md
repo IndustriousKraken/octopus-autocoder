@@ -185,6 +185,14 @@ in tasks.md. Forbidden task shapes:
   verification, dashboard inspection).
 - `sudo` against live hosts; hardware or OS-version smoke tests.
 - "A human operator does X" — the implementer cannot perform these.
+- Editing the canonical specs (`openspec/specs/`), OR applying the
+  change's spec delta to canon. `tasks.md` is **code-and-tests only** —
+  the change's spec delta lives in its own
+  `specs/<capability>/spec.md` and is folded into `openspec/specs/` by
+  `openspec archive` automatically. A task such as "Apply the ADDED
+  block to `openspec/specs/<cap>/spec.md`" makes the implementer
+  pre-fold canon, after which `openspec archive` aborts on a duplicate
+  requirement AND the change goes perma-stuck. Never emit one.
 
 If a fix genuinely requires operator action (e.g., "rotate the
 compromised key"), capture it as `## Impact` notes in `proposal.md`

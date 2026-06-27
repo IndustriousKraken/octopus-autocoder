@@ -224,6 +224,14 @@ async fn build_repo_status(
     // Queue snapshot.
     resp.pending_changes = queue::list_pending(paths, workspace_path).unwrap_or_default();
     resp.waiting_changes = queue::list_waiting(workspace_path).unwrap_or_default();
+    // Priority annotations: read each prioritized pending change's
+    // `.priority.json` so the status formatter can render `(priority N)`.
+    // A corrupt marker reads as unprioritized (None) and is simply absent.
+    for change in &resp.pending_changes {
+        if let Some(p) = queue::read_priority(workspace_path, change) {
+            resp.pending_priorities.insert(change.clone(), p);
+        }
+    }
 
     // Best-effort last-iteration: failure-state's most recent entry
     // gives us a timestamp for "something happened recently"; without a
@@ -579,6 +587,45 @@ pub(crate) fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Val
     };
     match queue::remove_revision_marker(&workspace_path, &change) {
         Ok(()) => json!({"ok": true, "change": change, "url": url}),
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    }
+}
+
+/// Set or clear a change's `.priority.json` marker (prioritize-changes-in-queue).
+/// `priority` is a non-negative integer to set, OR `null`/absent to clear.
+/// Refuses (polite error, no file written/removed) when the change does
+/// not resolve to a pending change in the workspace. The marker is
+/// gitignored daemon bookkeeping — NOT committed/pushed (unlike the
+/// `.ignore-for-queue.json` flow), so there is no git step here.
+pub(crate) fn handle_prioritize(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(u) => u,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    // `priority`: a non-negative integer sets the rank; null/absent clears.
+    let priority: Option<u32> = match parsed.get("priority") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= u32::MAX as u64 => Some(n as u32),
+            _ => {
+                return json!({
+                    "ok": false,
+                    "error": "prioritize: priority must be a non-negative integer or null",
+                });
+            }
+        },
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let workspace_path = workspace::resolve_path(&state.paths, &repo);
+    match queue::set_priority(&state.paths, &workspace_path, &change, priority) {
+        Ok(()) => json!({"ok": true, "change": change, "url": url, "priority": priority}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
     }
 }

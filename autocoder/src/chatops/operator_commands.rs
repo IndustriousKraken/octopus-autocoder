@@ -184,6 +184,28 @@ fn invalid_audit_substring_reply() -> Reply {
     ))
 }
 
+fn invalid_prioritize_reply() -> Reply {
+    Reply::Sync(
+        "✗ prioritize: usage `prioritize <repo> <change> <N>|clear|none` where N is a \
+         non-negative integer (lower N = higher priority); `clear` or `none` removes the priority"
+            .to_string(),
+    )
+}
+
+/// Parse the trailing argument of `prioritize`. Returns:
+/// - `Some(Some(n))` for a non-negative integer (sets the priority),
+/// - `Some(None)` for the literal `clear`/`none` (case-insensitive; clears),
+/// - `None` for anything else (negative, non-numeric, empty) — malformed.
+///
+/// `u32::from_str` rejects a leading `-`, so `-1` lands in the malformed
+/// arm exactly as the spec requires.
+fn parse_priority_arg(tok: &str) -> Option<Option<u32>> {
+    if tok.eq_ignore_ascii_case("clear") || tok.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    tok.parse::<u32>().ok().map(Some)
+}
+
 fn missing_request_text_reply() -> Reply {
     Reply::Sync(
         "✗ propose: missing request text. Usage: @<bot> propose <repo> <free-form description>"
@@ -490,6 +512,18 @@ pub enum OperatorCommand {
         repo_substring: String,
         /// `Ok(count)` for a numeric depth, `Err(sha)` for a target SHA.
         depth: RollbackChatDepth,
+    },
+    /// `@<bot> prioritize <repo-substring> <change-slug> <N>|clear|none`
+    /// (prioritize-changes-in-queue). Stamps (or removes) the change's
+    /// `.priority.json` marker so the changes-lane queue works it ahead of
+    /// the default alphabetical order. `priority = Some(N)` sets the rank
+    /// (lower N = higher priority); `priority = None` (from the literal
+    /// `clear`/`none`) removes it. The dispatcher submits a `prioritize`
+    /// control-socket action; the handler writes/removes the marker.
+    Prioritize {
+        repo_substring: String,
+        change: String,
+        priority: Option<u32>,
     },
     Help,
 }
@@ -803,6 +837,31 @@ fn parse_command_outcome_in_thread(
             ParseOutcome::Ok(OperatorCommand::AuditNow {
                 audit_substring: rest[0].to_string(),
                 repo_substring: rest[1].to_string(),
+            })
+        }
+        "prioritize" => {
+            // `prioritize <repo> <change> <N>|clear|none` — exactly three
+            // args. A missing/extra arg is a malformed invocation; the spec
+            // requires a polite `✗ prioritize: ...` error (NOT the `?`
+            // reaction other verbs use for bad arity), so every non-3 arity
+            // returns Invalid.
+            if rest.len() != 3 {
+                return ParseOutcome::Invalid(invalid_prioritize_reply());
+            }
+            if !repo_substring_regex().is_match(rest[0]) {
+                return ParseOutcome::Invalid(invalid_repo_substring_reply());
+            }
+            if !change_slug_regex().is_match(rest[1]) {
+                return ParseOutcome::Invalid(invalid_change_slug_reply());
+            }
+            let priority = match parse_priority_arg(rest[2]) {
+                Some(p) => p,
+                None => return ParseOutcome::Invalid(invalid_prioritize_reply()),
+            };
+            ParseOutcome::Ok(OperatorCommand::Prioritize {
+                repo_substring: rest[0].to_string(),
+                change: rest[1].to_string(),
+                priority,
             })
         }
         "help" => {
@@ -1617,6 +1676,14 @@ pub struct RepoStatusResponse {
     pub throttled_alerts: Vec<ThrottledAlertEntry>,
     pub pending_changes: Vec<String>,
     pub waiting_changes: Vec<String>,
+    /// Priority value per prioritized pending change (those carrying a
+    /// `.priority.json` marker). Keyed by change slug; only prioritized
+    /// changes appear. Empty when no pending change is prioritized — the
+    /// status reply then renders the queue section exactly as before.
+    /// `#[serde(default)]` keeps older daemons wire-compatible with newer
+    /// chatops formatters (prioritize-changes-in-queue).
+    #[serde(default)]
+    pub pending_priorities: std::collections::BTreeMap<String, u32>,
     pub last_iteration: Option<LastIteration>,
 }
 
@@ -1899,6 +1966,18 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         .chain(resp.revision_marked_changes.iter())
         .map(|m| m.change.clone())
         .collect();
+    // Annotate prioritized pending changes with a trailing `(priority N)`
+    // so the rendered queue reflects the effective order. Unprioritized
+    // changes pass through unchanged. Done once here so BOTH the one-liner
+    // and the per-line fallback forms below share the annotation.
+    let pending_annotated: Vec<String> = resp
+        .pending_changes
+        .iter()
+        .map(|c| match resp.pending_priorities.get(c) {
+            Some(n) => format!("{c} (priority {n})"),
+            None => c.clone(),
+        })
+        .collect();
     let queue_has_content = !resp.pending_changes.is_empty()
         || !resp.waiting_changes.is_empty()
         || !excluded.is_empty();
@@ -1911,17 +1990,17 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         if small {
             out.push('\n');
             out.push_str(&format_queue_one_liner(
-                &resp.pending_changes,
+                &pending_annotated,
                 &resp.waiting_changes,
                 &excluded,
             ));
             out.push('\n');
         } else {
             out.push_str("\nqueue snapshot:\n");
-            if !resp.pending_changes.is_empty() {
+            if !pending_annotated.is_empty() {
                 out.push_str(&format!(
                     "  pending: {}\n",
-                    resp.pending_changes
+                    pending_annotated
                         .iter()
                         .map(|c| slack_escape(c))
                         .collect::<Vec<_>>()
@@ -2377,6 +2456,7 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `survives <repo> <pr N | commit SHA>` — report which of a past PR's/commit's changes still survive verbatim at HEAD (read-only; under-reports, never over-reports)\n");
     out.push_str("  • `blame <repo> <path> <line>[-<line>]` — trace current line(s) to the introducing commit (short SHA, subject, date) and PR when discoverable (read-only)\n");
     out.push_str("  • `rollback <repo> <N | sha SHA>` — destructive: roll the code back by N commits (or to a SHA) WHILE unarchiving the changes/issues archived in the range; previews, then awaits `@<bot> confirm` (60s TTL)\n");
+    out.push_str("  • `prioritize <repo> <change> <N>|clear|none` — rank a pending change ahead of the default alphabetical order; lower N = higher priority\n");
     out.push_str("  • `help` — this synopsis\n");
     out.push_str("See the README \"ChatOps operator commands\" section for the destructive confirmation flow.");
     out
@@ -3625,6 +3705,51 @@ impl OperatorCommandDispatcher {
                     Duration::from_secs(WIPE_CONFIRM_TTL_SECS),
                 );
                 format_rollback_confirmation(&resp)
+            }
+            OperatorCommand::Prioritize {
+                repo_substring,
+                change,
+                priority,
+            } => {
+                let repo = match match_repo(&repo_substring, repositories) {
+                    RepoMatch::Unique(r) => r,
+                    RepoMatch::Multiple(ms) => {
+                        return format_multiple_matches(&repo_substring, &ms);
+                    }
+                    RepoMatch::None => return format_no_match(&repo_substring, repositories),
+                };
+                let resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "prioritize",
+                        "url": repo.url,
+                        "change": change,
+                        "priority": priority,
+                    }))
+                    .await;
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let reply_change = resp
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&change);
+                    match priority {
+                        Some(n) => format!(
+                            "✓ Prioritized {reply_change} at priority {n}. It will be worked \
+                             ahead of unprioritized changes (lower number = higher priority); a \
+                             change already mid-iteration still goes first."
+                        ),
+                        None => format!(
+                            "✓ Cleared priority on {reply_change}. It returns to the default \
+                             alphabetical order (or remains in mid-iteration position if it is \
+                             currently mid-iteration)."
+                        ),
+                    }
+                } else {
+                    let err = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    format!("✗ {err}")
+                }
             }
             OperatorCommand::Help => format_help_reply(),
             // The `propose` verb is routed via `handle_message_with_context`
@@ -7211,6 +7336,222 @@ mod tests {
         // Single-pending one-liner form (≤5 entries triggers compact
         // queue line).
         assert!(text.contains("queue: 1 pending (a08-deploy)"), "{text}");
+    }
+
+    // =============================================================
+    // prioritize verb (prioritize-changes-in-queue)
+    // =============================================================
+
+    /// 7.3 — `prioritize <repo> <change> 3` parses to a numeric priority.
+    #[test]
+    fn parse_prioritize_numeric() {
+        let cmd = parse_command(&format!("{BOT} prioritize myrepo a07-foo 3"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Prioritize {
+                repo_substring: "myrepo".into(),
+                change: "a07-foo".into(),
+                priority: Some(3),
+            }
+        );
+    }
+
+    /// 7.3 — `clear` AND `none` (case-insensitive) parse to `priority: None`.
+    #[test]
+    fn parse_prioritize_clear_and_none() {
+        for arg in ["clear", "none", "CLEAR", "None"] {
+            let cmd =
+                parse_command(&format!("{BOT} prioritize myrepo a07-foo {arg}"), BOT).unwrap();
+            assert_eq!(
+                cmd,
+                OperatorCommand::Prioritize {
+                    repo_substring: "myrepo".into(),
+                    change: "a07-foo".into(),
+                    priority: None,
+                },
+                "arg `{arg}` should parse to priority None"
+            );
+        }
+    }
+
+    /// 7.3 — a malformed trailing argument (negative, non-numeric, OR
+    /// missing) is refused with a polite `✗ prioritize: ...` error.
+    #[test]
+    fn parse_prioritize_malformed_refused() {
+        for msg in [
+            format!("{BOT} prioritize myrepo a07-foo -1"),
+            format!("{BOT} prioritize myrepo a07-foo notanumber"),
+            format!("{BOT} prioritize myrepo a07-foo"), // missing arg
+            format!("{BOT} prioritize myrepo a07-foo 3 extra"), // extra arg
+        ] {
+            match parse_command_outcome(&msg, BOT) {
+                ParseOutcome::Invalid(Reply::Sync(text)) => {
+                    assert!(
+                        text.starts_with("✗ prioritize:"),
+                        "expected prioritize error for `{msg}`, got: {text}"
+                    );
+                }
+                other => panic!("expected Invalid for `{msg}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// 7.3 — verb is case-insensitive AND strips wrapper backticks on the
+    /// change slug (mirrors the other operator verbs).
+    #[test]
+    fn parse_prioritize_case_insensitive_and_backticks() {
+        let cmd =
+            parse_command(&format!("{BOT} PRIORITIZE myrepo `a07-foo` 2"), BOT).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::Prioritize {
+                repo_substring: "myrepo".into(),
+                change: "a07-foo".into(),
+                priority: Some(2),
+            }
+        );
+    }
+
+    /// 7.3 — a valid parse submits exactly ONE `prioritize` action carrying
+    /// the resolved URL, change, AND priority. (Slack-redelivery dedup is
+    /// generic at the listener level — see `event_dedup` — so the
+    /// verb-specific guarantee here is "one message → one action".)
+    #[tokio::test]
+    async fn dispatch_prioritize_submits_one_action_and_acks() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "prioritize",
+            serde_json::json!({
+                "ok": true,
+                "change": "a07-foo",
+                "url": "git@github.com:acme/myrepo.git",
+                "priority": 3,
+            }),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} prioritize myrepo a07-foo 3"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert_eq!(
+            text,
+            "✓ Prioritized a07-foo at priority 3. It will be worked ahead of unprioritized changes (lower number = higher priority); a change already mid-iteration still goes first."
+        );
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1, "exactly one action submitted");
+        assert_eq!(calls[0]["action"], "prioritize");
+        assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["change"], "a07-foo");
+        assert_eq!(calls[0]["priority"], 3);
+    }
+
+    /// 7.3 — `clear` submits `priority: null` AND acks the clear.
+    #[tokio::test]
+    async fn dispatch_prioritize_clear_submits_null_priority() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "prioritize",
+            serde_json::json!({"ok": true, "change": "a07-foo", "url": "git@github.com:acme/myrepo.git", "priority": null}),
+        );
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} prioritize myrepo a07-foo none"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert_eq!(
+            text,
+            "✓ Cleared priority on a07-foo. It returns to the default alphabetical order (or remains in mid-iteration position if it is currently mid-iteration)."
+        );
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0]["priority"].is_null(), "clear submits null priority");
+    }
+
+    /// 7.3 — an ambiguous repo substring lists candidates AND submits NO
+    /// action.
+    #[tokio::test]
+    async fn dispatch_prioritize_ambiguous_repo_lists_candidates() {
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        // "acme" matches BOTH fixture repos.
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} prioritize acme a07-foo 3"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let text = unwrap_sync(reply);
+        assert!(text.contains("matched multiple repos"), "{text}");
+        assert!(text.contains("myrepo"), "{text}");
+        assert!(text.contains("widgets"), "{text}");
+        assert!(
+            submitter.calls().is_empty(),
+            "no action on ambiguous repo, got {:?}",
+            submitter.calls()
+        );
+    }
+
+    /// 7.5 — a prioritized pending change renders with `(priority N)`;
+    /// unprioritized changes render unchanged.
+    #[test]
+    fn status_renders_priority_annotation() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            pending_changes: vec!["a07-foo".into(), "a09-bar".into()],
+            pending_priorities: std::collections::BTreeMap::from([("a07-foo".to_string(), 3u32)]),
+            ..RepoStatusResponse::default()
+        };
+        let text = format_status_reply(&resp);
+        assert!(text.contains("a07-foo (priority 3)"), "{text}");
+        // a09-bar has no priority annotation.
+        assert!(text.contains("a09-bar"), "{text}");
+        assert!(!text.contains("a09-bar (priority"), "{text}");
+    }
+
+    /// 7.5 — with no priority markers the queue section renders exactly as
+    /// before (no `(priority` substring anywhere).
+    #[test]
+    fn status_no_priority_markers_renders_unchanged() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            pending_changes: vec!["a07-foo".into(), "a09-bar".into()],
+            ..RepoStatusResponse::default()
+        };
+        let text = format_status_reply(&resp);
+        assert!(!text.contains("(priority"), "{text}");
+    }
+
+    /// 7.6 — `help` lists the `prioritize` verb with its syntax AND
+    /// one-line description.
+    #[test]
+    fn help_lists_prioritize_verb() {
+        let text = format_help_reply();
+        assert!(
+            text.contains("prioritize <repo> <change> <N>|clear|none"),
+            "help must show prioritize syntax: {text}"
+        );
+        assert!(
+            text.contains("lower N = higher priority"),
+            "help must show prioritize description: {text}"
+        );
     }
 
     #[tokio::test]

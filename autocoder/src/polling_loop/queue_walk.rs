@@ -402,6 +402,28 @@ pub(crate) async fn process_one_pending_change(
     // daemon-global default.
     let _sandbox_repo_guard = crate::sandbox::enter_repo(repo.sandbox.as_ref());
 
+    // Canon-editing-tasks pre-flight. Scans the change's `tasks.md` for a
+    // task that directs a direct edit to the canonical specs
+    // (`openspec/specs/`). The implementer implements code and tests only;
+    // its spec delta is folded into canon by `openspec archive`. A task that
+    // pre-folds the delta into canon makes the archive abort on a duplicate
+    // requirement, so the change goes perma-stuck — catch it here, before any
+    // executor or `[in]`/`[canon]` gate run is spent. Same marker + halt
+    // semantics as the archivability pre-flight below.
+    match handle_canon_editing_tasks_preflight(paths, workspace, repo, chatops_ctx, change).await {
+        Ok(Some(step)) => return Ok(step),
+        Ok(None) => {}
+        Err(e) => {
+            // A `tasks.md` read error is non-fatal: log + proceed (the check
+            // already treats an unreadable tasks.md as "nothing to flag").
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "canon-editing-tasks pre-flight errored; proceeding: {e:#}"
+            );
+        }
+    }
+
     // Spec-delta archivability pre-flight (a17). Catches the a07-style
     // class of failures — a `## MODIFIED Requirements` block whose
     // `### Requirement:` header doesn't exist in canonical, etc. —

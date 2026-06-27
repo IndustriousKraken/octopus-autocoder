@@ -11,6 +11,7 @@ use crate::openspec_archive::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const CHANGES_SUBDIR: &str = "openspec/changes";
@@ -21,6 +22,14 @@ const QUESTION_FILE: &str = ".question.json";
 const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
 const NEEDS_REVISION_FILE: &str = ".needs-spec-revision.json";
 const IGNORE_FOR_QUEUE_FILE: &str = ".ignore-for-queue.json";
+/// Per-change operator-priority marker (prioritize-changes-in-queue).
+/// Daemon bookkeeping written/removed by the chatops `prioritize` verb;
+/// gitignored, never committed. Lives in the change directory itself
+/// (unlike `.iteration-pending.json`, which moved to the state dir): it
+/// is gitignored, so the `git clean -fd` that wiped the unignored legacy
+/// iteration marker leaves it alone, and `git reset --hard` never touches
+/// untracked files.
+const PRIORITY_FILE: &str = ".priority.json";
 
 fn changes_dir(workspace: &Path) -> PathBuf {
     workspace.join(CHANGES_SUBDIR)
@@ -37,27 +46,38 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// a `.perma-stuck.json` marker, and contain at least a `proposal.md`
 /// file.
 ///
-/// Returns a two-tier ordering (a27a1):
-/// - First tier: entries with `.iteration-pending.json` present, sorted
-///   by the marker's `iteration_number` ascending (lower iteration first).
+/// Returns a three-tier ordering (a27a1 + prioritize-changes-in-queue):
+/// - Tier 1: entries with `.iteration-pending.json` present, sorted by
+///   the marker's `iteration_number` ascending (lower iteration first).
 ///   A corrupt marker is treated as `iteration_number: 0` for ordering;
-///   the enumeration does NOT error.
-/// - Second tier: entries WITHOUT the marker, sorted ascending by entry
-///   name (UTF-8 byte order, which is alphabetical for ASCII names).
+///   the enumeration does NOT error. A change carrying BOTH this marker
+///   AND `.priority.json` stays in THIS tier — priority never preempts
+///   in-progress work.
+/// - Tier 2: entries with a valid `.priority.json` marker (and no
+///   iteration-pending marker), sorted by the marker's `priority` value
+///   ascending (lower N = higher priority), name ascending within ties.
+///   A corrupt `.priority.json` (truncated, missing/negative `priority`)
+///   is treated as UNPRIORITIZED — the entry falls to tier 3.
+/// - Tier 3: remaining entries, sorted ascending by entry name (UTF-8
+///   byte order, which is alphabetical for ASCII names).
 ///
-/// Within each tier, ties on the primary key fall back to entry name
-/// ascending for determinism. Operators with stacked dependencies (in
-/// the unmarked tier) encode explicit order via numeric prefixes
-/// (`01-`, `02-`).
+/// When NO `.priority.json` markers are present the returned order is
+/// byte-for-byte identical to the prior two-tier (iteration-pending,
+/// then alphabetical) ordering. Within each tier, ties on the primary
+/// key fall back to entry name ascending for determinism. Operators with
+/// stacked dependencies (in the unmarked tier) encode explicit order via
+/// numeric prefixes (`01-`, `02-`).
 pub fn list_pending(paths: &crate::paths::DaemonPaths, workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
         return Ok(Vec::new());
     }
-    // Build two tiers:
-    // - marked: (iteration_number_for_ordering, name)
+    // Build three tiers:
+    // - iteration: (iteration_number_for_ordering, name)
+    // - prioritized: (priority, name)
     // - unmarked: name
-    let mut marked: Vec<(u32, String)> = Vec::new();
+    let mut iteration: Vec<(u32, String)> = Vec::new();
+    let mut prioritized: Vec<(u32, String)> = Vec::new();
     let mut unmarked: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&root)
         .with_context(|| format!("reading {}", root.display()))?
@@ -111,6 +131,9 @@ pub fn list_pending(paths: &crate::paths::DaemonPaths, workspace: &Path) -> Resu
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         if crate::iteration_pending::marker_exists(paths, basename, &name) {
+            // Tier 1: a change mid-iteration sorts first regardless of any
+            // `.priority.json` marker it may ALSO carry — priority never
+            // preempts in-progress work.
             let iteration_number =
                 match crate::iteration_pending::read_marker(paths, basename, &name) {
                     Ok(Some(m)) => m.iteration_number,
@@ -120,21 +143,92 @@ pub fn list_pending(paths: &crate::paths::DaemonPaths, workspace: &Path) -> Resu
                     Ok(None) => 0,
                     Err(_) => 0,
                 };
-            marked.push((iteration_number, name));
+            iteration.push((iteration_number, name));
+        } else if let Some(priority) = read_priority(workspace, &name) {
+            // Tier 2: a valid priority marker. A corrupt one returns None
+            // and the entry drops to tier 3.
+            prioritized.push((priority, name));
         } else {
             unmarked.push(name);
         }
     }
-    // Within marked: sort by iteration_number ascending, then by name
-    // ascending for ties.
-    marked.sort_by(|(a_n, a_name), (b_n, b_name)| {
+    // Within each marked tier: sort by the primary key ascending, then by
+    // name ascending for ties.
+    iteration.sort_by(|(a_n, a_name), (b_n, b_name)| {
         a_n.cmp(b_n).then_with(|| a_name.cmp(b_name))
     });
+    prioritized.sort_by(|(a_p, a_name), (b_p, b_name)| {
+        a_p.cmp(b_p).then_with(|| a_name.cmp(b_name))
+    });
     unmarked.sort();
-    let mut out: Vec<String> = Vec::with_capacity(marked.len() + unmarked.len());
-    out.extend(marked.into_iter().map(|(_, n)| n));
+    let mut out: Vec<String> =
+        Vec::with_capacity(iteration.len() + prioritized.len() + unmarked.len());
+    out.extend(iteration.into_iter().map(|(_, n)| n));
+    out.extend(prioritized.into_iter().map(|(_, n)| n));
     out.extend(unmarked);
     Ok(out)
+}
+
+/// On-disk shape of the `.priority.json` marker. `priority` is the
+/// operator's chosen rank (lower N = higher priority).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PriorityMarker {
+    priority: u32,
+}
+
+/// Read the priority value for `<workspace>/openspec/changes/<change>/.priority.json`.
+/// Returns `None` when the marker is absent OR corrupt (truncated JSON,
+/// missing field, or a negative `priority` that fails `u32` parsing) — a
+/// corrupt marker is treated as unprioritized for ordering. NEVER errors:
+/// enumeration must not fail on a bad marker.
+pub fn read_priority(workspace: &Path, change: &str) -> Option<u32> {
+    let path = change_dir(workspace, change).join(PRIORITY_FILE);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let marker: PriorityMarker = serde_json::from_str(&contents).ok()?;
+    Some(marker.priority)
+}
+
+/// Set or clear a change's priority marker.
+///
+/// `priority = Some(n)` atomically writes (tempfile + rename)
+/// `<workspace>/openspec/changes/<change>/.priority.json` carrying
+/// `{ "priority": n }`. `priority = None` removes the marker (idempotent —
+/// a missing marker is success).
+///
+/// Refuses (Err, NO file written or removed) when `change` does not
+/// resolve to a pending change in the workspace — prioritizing a slug
+/// that is archived, locked, waiting, perma-stuck, or otherwise not in
+/// the queue is a no-op the operator should be told about.
+pub fn set_priority(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    change: &str,
+    priority: Option<u32>,
+) -> Result<()> {
+    let pending = list_pending(paths, workspace)?;
+    if !pending.iter().any(|c| c == change) {
+        return Err(anyhow!(
+            "`{change}` is not a pending change in this workspace"
+        ));
+    }
+    let dir = change_dir(workspace, change);
+    let path = dir.join(PRIORITY_FILE);
+    match priority {
+        Some(n) => {
+            let tmp = tempfile::NamedTempFile::new_in(&dir)
+                .with_context(|| format!("creating tempfile in {}", dir.display()))?;
+            serde_json::to_writer_pretty(&tmp, &PriorityMarker { priority: n })
+                .with_context(|| format!("serializing priority marker for {}", path.display()))?;
+            tmp.persist(&path)
+                .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
+            Ok(())
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        },
+    }
 }
 
 /// List changes currently waiting on a human reply (i.e. those containing a
@@ -634,6 +728,13 @@ pub fn archive_at_with_runner(
             src.display()
         ));
     }
+    // Consume the gitignored `.priority.json` marker before archiving: the
+    // change is done, so its priority is moot. Removing it pre-archive also
+    // keeps the active dir clean so the postcondition's "active path still
+    // present" check can't trip on an orphaned gitignored marker if openspec
+    // moves only tracked files. Best-effort — the postcondition is the
+    // backstop if removal somehow fails. (prioritize-changes-in-queue)
+    let _ = std::fs::remove_file(src.join(PRIORITY_FILE));
     match openspec_archive_with_postcondition(runner, spec_root, change) {
         Ok(_archive_path) => Ok(()),
         Err(ArchiveFailure::NonZeroExit { code, stderr, stdout }) => {
@@ -677,6 +778,9 @@ pub fn archive_with_runner(
             src.display()
         ));
     }
+    // Consume the gitignored `.priority.json` marker before archiving — see
+    // `archive_at_with_runner` for the rationale. (prioritize-changes-in-queue)
+    let _ = std::fs::remove_file(src.join(PRIORITY_FILE));
     // `workspace` here is the dir containing openspec/ (which for non-
     // spec_storage repos is the code workspace; for spec_storage repos
     // is the spec_storage path). Wrap it in a `SpecRoot::from_parts`
@@ -2049,5 +2153,259 @@ mod tests {
         assert!(msg.contains("a38-bar"));
         assert!(msg.contains("a3"));
         assert!(msg.contains("longer prefix"));
+    }
+
+    // ================================================================
+    // Priority tier (prioritize-changes-in-queue)
+    // ================================================================
+
+    /// Write a raw `.priority.json` body into a change dir — used to
+    /// exercise both valid AND corrupt marker handling without going
+    /// through `set_priority`.
+    fn write_priority_raw(workspace: &Path, name: &str, body: &str) {
+        std::fs::write(
+            workspace.join(CHANGES_SUBDIR).join(name).join(PRIORITY_FILE),
+            body,
+        )
+        .unwrap();
+    }
+
+    fn iteration_marker(n: u32) -> crate::iteration_pending::IterationPendingMarker {
+        crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec![],
+            remaining_tasks: vec!["x".into()],
+            reason: "wip".into(),
+            iteration_number: n,
+        }
+    }
+
+    fn ws_basename(workspace: &Path) -> String {
+        workspace
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string()
+    }
+
+    /// 7.1 — a single priority-marked change sorts ahead of
+    /// alphabetically-earlier unprioritized changes but behind any
+    /// iteration-pending change.
+    #[test]
+    fn list_pending_priority_sorts_ahead_of_unprioritized() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a05-aaa");
+        make_change(ws, "a06-bbb");
+        make_change(ws, "a30-foo");
+        write_priority_raw(ws, "a30-foo", r#"{"priority":2}"#);
+        let listed = list_pending(&paths, ws).unwrap();
+        assert_eq!(listed, vec!["a30-foo", "a05-aaa", "a06-bbb"]);
+    }
+
+    /// 7.1 — iteration-pending always preempts the priority tier, even
+    /// when the priority change carries the highest priority (lowest N).
+    #[test]
+    fn list_pending_iteration_preempts_priority() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-foo");
+        make_change(ws, "a05-bar");
+        let basename = ws_basename(ws);
+        crate::iteration_pending::write_marker(&paths, &basename, "a30-foo", &iteration_marker(2))
+            .unwrap();
+        write_priority_raw(ws, "a05-bar", r#"{"priority":0}"#);
+        let listed = list_pending(&paths, ws).unwrap();
+        assert_eq!(listed, vec!["a30-foo", "a05-bar"]);
+    }
+
+    /// 7.1 — a change carrying BOTH markers sorts in the iteration-pending
+    /// tier, never the priority tier.
+    #[test]
+    fn list_pending_both_markers_stays_in_iteration_tier() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-both"); // iteration + priority
+        make_change(ws, "a05-prio"); // priority only
+        make_change(ws, "a01-plain"); // unprioritized, alphabetically first
+        let basename = ws_basename(ws);
+        crate::iteration_pending::write_marker(&paths, &basename, "a30-both", &iteration_marker(1))
+            .unwrap();
+        write_priority_raw(ws, "a30-both", r#"{"priority":0}"#);
+        write_priority_raw(ws, "a05-prio", r#"{"priority":9}"#);
+        let listed = list_pending(&paths, ws).unwrap();
+        // iteration tier (a30-both) first, then priority tier (a05-prio),
+        // then alphabetical (a01-plain) — despite a01-plain sorting first
+        // alphabetically.
+        assert_eq!(listed, vec!["a30-both", "a05-prio", "a01-plain"]);
+    }
+
+    /// 7.2 — multiple priority markers sort by ascending N, alphabetical
+    /// within equal N; the unprioritized entry sorts last.
+    #[test]
+    fn list_pending_priority_multiple_sorted_by_n() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-foo");
+        make_change(ws, "a31-bar");
+        make_change(ws, "a32-baz");
+        make_change(ws, "a40-zzz");
+        write_priority_raw(ws, "a30-foo", r#"{"priority":5}"#);
+        write_priority_raw(ws, "a31-bar", r#"{"priority":1}"#);
+        write_priority_raw(ws, "a32-baz", r#"{"priority":1}"#);
+        let listed = list_pending(&paths, ws).unwrap();
+        assert_eq!(listed, vec!["a31-bar", "a32-baz", "a30-foo", "a40-zzz"]);
+    }
+
+    /// 7.2 — a corrupt priority marker (truncated JSON, or negative
+    /// `priority`) is treated as unprioritized; enumeration does NOT error;
+    /// valid markers still sort ahead of it.
+    #[test]
+    fn list_pending_corrupt_priority_treated_as_unprioritized() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a10-truncated");
+        make_change(ws, "a11-negative");
+        make_change(ws, "a12-missing");
+        make_change(ws, "a20-valid");
+        write_priority_raw(ws, "a10-truncated", "{not json");
+        write_priority_raw(ws, "a11-negative", r#"{"priority":-1}"#);
+        write_priority_raw(ws, "a12-missing", r#"{"foo":1}"#);
+        write_priority_raw(ws, "a20-valid", r#"{"priority":3}"#);
+        let listed = list_pending(&paths, ws).unwrap();
+        // a20-valid (priority tier) first; the three corrupt entries fall
+        // to the alphabetical tier.
+        assert_eq!(
+            listed,
+            vec!["a20-valid", "a10-truncated", "a11-negative", "a12-missing"]
+        );
+        // read_priority agrees the corrupt ones are unprioritized.
+        assert_eq!(read_priority(ws, "a10-truncated"), None);
+        assert_eq!(read_priority(ws, "a11-negative"), None);
+        assert_eq!(read_priority(ws, "a12-missing"), None);
+        assert_eq!(read_priority(ws, "a20-valid"), Some(3));
+    }
+
+    /// 7.2 — with NO priority markers the order is byte-for-byte the prior
+    /// two-tier (iteration-pending, then alphabetical) ordering.
+    #[test]
+    fn list_pending_no_priority_markers_preserves_prior_order() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a40-foo");
+        make_change(ws, "a10-bar");
+        make_change(ws, "a31-wip");
+        let basename = ws_basename(ws);
+        crate::iteration_pending::write_marker(&paths, &basename, "a31-wip", &iteration_marker(2))
+            .unwrap();
+        let listed = list_pending(&paths, ws).unwrap();
+        // iteration-pending first, then the rest alphabetical.
+        assert_eq!(listed, vec!["a31-wip", "a10-bar", "a40-foo"]);
+    }
+
+    /// 7.4 — `set_priority` write→read round-trips `{ priority: N }`;
+    /// clearing removes the file.
+    #[test]
+    fn set_priority_round_trip_and_clear() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a07-foo");
+        set_priority(&paths, ws, "a07-foo", Some(3)).unwrap();
+        assert_eq!(read_priority(ws, "a07-foo"), Some(3));
+        let marker = ws.join(CHANGES_SUBDIR).join("a07-foo").join(PRIORITY_FILE);
+        assert!(marker.is_file());
+
+        // Overwrite with a new value.
+        set_priority(&paths, ws, "a07-foo", Some(8)).unwrap();
+        assert_eq!(read_priority(ws, "a07-foo"), Some(8));
+
+        // Clear removes the file.
+        set_priority(&paths, ws, "a07-foo", None).unwrap();
+        assert_eq!(read_priority(ws, "a07-foo"), None);
+        assert!(!marker.exists());
+        // Clearing again is idempotent (still pending, no file).
+        set_priority(&paths, ws, "a07-foo", None).unwrap();
+    }
+
+    /// 6.1 — archiving a prioritized change consumes its `.priority.json`
+    /// marker: the active change dir (with the marker) goes away, leaving no
+    /// residue in the active queue.
+    #[test]
+    fn archive_consumes_priority_marker_no_residue() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR)).unwrap();
+        make_change(ws, "a07-foo");
+        make_change(ws, "a08-bar");
+        set_priority(&paths, ws, "a07-foo", Some(1)).unwrap();
+        // Pre-archive: a07-foo is prioritized and sorts first.
+        assert_eq!(read_priority(ws, "a07-foo"), Some(1));
+        assert_eq!(list_pending(&paths, ws).unwrap(), vec!["a07-foo", "a08-bar"]);
+
+        archive_with_runner(&SuccessRunner, ws, "a07-foo").unwrap();
+
+        // Post-archive: the active change dir (and its marker) are gone; the
+        // queue returns to pure alphabetical with no priority residue.
+        assert_eq!(read_priority(ws, "a07-foo"), None);
+        assert!(
+            !ws.join(CHANGES_SUBDIR).join("a07-foo").exists(),
+            "active change dir must be gone after archive"
+        );
+        assert_eq!(list_pending(&paths, ws).unwrap(), vec!["a08-bar"]);
+        // The marker did not travel into the archive entry either.
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let archived = ws
+            .join(CHANGES_SUBDIR)
+            .join(ARCHIVE_DIR)
+            .join(format!("{today}-a07-foo"));
+        assert!(archived.is_dir(), "archive entry should exist");
+        assert!(
+            !archived.join(PRIORITY_FILE).exists(),
+            "priority marker must not survive into the archive entry"
+        );
+    }
+
+    /// 7.4 — writing for a slug that does not resolve to a pending change
+    /// is refused with no file written.
+    #[test]
+    fn set_priority_non_pending_refused_no_file() {
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // No change directory at all.
+        let err = set_priority(&paths, ws, "a99-missing", Some(1)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a pending change"),
+            "error must explain why: {err:#}"
+        );
+        assert!(
+            !ws.join(CHANGES_SUBDIR)
+                .join("a99-missing")
+                .join(PRIORITY_FILE)
+                .exists()
+        );
+
+        // An excluded (perma-stuck) change is not pending either → refused.
+        make_change(ws, "a08-stuck");
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("a08-stuck").join(PERMA_STUCK_FILE),
+            r#"{"change":"a08-stuck","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}"#,
+        )
+        .unwrap();
+        let err = set_priority(&paths, ws, "a08-stuck", Some(1)).unwrap_err();
+        assert!(format!("{err:#}").contains("not a pending change"), "{err:#}");
+        assert!(
+            !ws.join(CHANGES_SUBDIR)
+                .join("a08-stuck")
+                .join(PRIORITY_FILE)
+                .exists()
+        );
     }
 }

@@ -309,6 +309,7 @@ async fn resume_spec_needs_revision(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: unimplementable_tasks.clone(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: revision_suggestion.clone(),
         gate_error: None,
         contradictions: Vec::new(),

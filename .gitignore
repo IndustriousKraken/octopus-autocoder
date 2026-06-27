@@ -14,3 +14,6 @@ target/
 
 # Application Config
 config.yaml
+
+# Daemon bookkeeping markers (untracked, never committed)
+**/.priority.json
