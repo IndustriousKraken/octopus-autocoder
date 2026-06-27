@@ -340,6 +340,25 @@ pub fn recreate_branch(workspace: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// `true` when a local branch named `branch` exists, probed via
+/// `git rev-parse --verify --quiet refs/heads/<branch>` (the exit code is the
+/// stable signal across git versions, unlike the stderr string). `Err` only
+/// when git cannot be spawned. Used to RESUME a persisted spec-revision branch
+/// across rounds rather than recreating it from base.
+pub fn local_branch_exists(workspace: &Path, branch: &str) -> Result<bool> {
+    let probe = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git rev-parse` to probe branch {branch}"))?;
+    Ok(probe.status.success())
+}
+
 pub fn add_all(workspace: &Path) -> Result<()> {
     // Keep per-run, server-specific CLI artifacts (autocoder-generated configs at
     // the workspace root) out of commits. `.git/info/exclude` only affects
