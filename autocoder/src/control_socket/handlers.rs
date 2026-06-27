@@ -128,9 +128,10 @@ async fn build_repo_status(
     // workspace-derived fields" — the URL header + branches + busy-marker
     // peek are still useful, and operators won't see a false error.
     if !workspace_path.is_dir() {
-        // Try the GitHub PR call anyway — it does not depend on the local
-        // workspace.
+        // Try the GitHub PR calls anyway — they do not depend on the
+        // local workspace.
         resp.latest_pr = fetch_latest_pr(repo, github_cfg).await;
+        resp.open_agent_pr_numbers = fetch_open_agent_prs(repo, github_cfg).await;
         return Ok(resp);
     }
 
@@ -160,6 +161,10 @@ async fn build_repo_status(
     // Latest PR by the daemon (one outbound GitHub call). Failure is
     // log-and-degrade.
     resp.latest_pr = fetch_latest_pr(repo, github_cfg).await;
+    // Open agent-branch PRs — the skip-iteration gate's own signal, used
+    // to surface the open-PR park on the `currently:` line. Failure
+    // degrades to `None` (no fabricated park).
+    resp.open_agent_pr_numbers = fetch_open_agent_prs(repo, github_cfg).await;
 
     // Marker-excluded changes — pull marked_at + detail from the marker
     // JSON files where possible. Each marker entry also carries a
@@ -315,6 +320,68 @@ pub(crate) async fn fetch_latest_pr_at(
         Ok(pr) => pr,
         Err(e) => {
             tracing::warn!(url = %repo.url, "status: latest_pr_for_head failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Resolve owner / repo / token for `repo` and call
+/// `github::list_open_prs_for_head` — the SAME query the skip-iteration
+/// gate (`open_pr_exists_for_agent_branch`) uses — so the status reply's
+/// open-PR park claim matches the gate's actual behavior. Returns
+/// `Some(prs)` (possibly empty) on success; on ANY failure (parse,
+/// token-resolve, HTTP) logs a WARN and returns `None`, so the
+/// `currently:` line degrades to the marker-based determination rather
+/// than fabricating a park (status-surfaces-open-pr-park).
+///
+/// This is a second outbound call distinct from `fetch_latest_pr`: the
+/// `latest PR:` line queries `state=all&per_page=1` (most recent PR of
+/// any state) which cannot reveal an OLDER open PR behind a newer
+/// closed/merged one, so the park determination needs its own
+/// `state=open` listing.
+async fn fetch_open_agent_prs(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> Option<Vec<u64>> {
+    fetch_open_agent_prs_at(github::DEFAULT_API_BASE, repo, github_cfg).await
+}
+
+/// Test-instrumentable variant of `fetch_open_agent_prs`. Same
+/// head_owner-from-fork_owner semantics as `fetch_latest_pr_at` (a20a4).
+/// Returns the open PR numbers (the only field the park line names).
+pub(crate) async fn fetch_open_agent_prs_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> Option<Vec<u64>> {
+    let (owner, repo_name) = match github::parse_repo_url(&repo.url) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: parse_repo_url failed (open-PR park): {e:#}");
+            return None;
+        }
+    };
+    let token = match github_credentials::resolve_token(github_cfg, &owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: github token resolve failed (open-PR park): {e:#}");
+            return None;
+        }
+    };
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&owner);
+    match github::list_open_prs_for_head(
+        api_base,
+        &token,
+        &owner,
+        &repo_name,
+        head_owner,
+        &repo.agent_branch,
+    )
+    .await
+    {
+        Ok(prs) => Some(prs.iter().map(|p| p.number).collect()),
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: list_open_prs_for_head failed (open-PR park): {e:#}");
             None
         }
     }
