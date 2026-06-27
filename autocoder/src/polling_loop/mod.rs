@@ -519,6 +519,7 @@ pub async fn run_with_hooks(
             &pending_brownfield_survey_requests,
             &pending_brownfield_batch_requests,
             &pending_revision_requests,
+            stuck_threshold_secs,
         )
         .await;
 
