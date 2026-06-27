@@ -643,6 +643,14 @@ impl OpencodeStrategy {
             "edit": verdict(allows("Edit") || allows("Write")),
             "bash": verdict(allows("Bash")),
             "webfetch": verdict(allows("WebFetch")),
+            // opencode's loop guard defaults to "ask"; a non-interactive agentic
+            // session (reviewer + the [in]/[canon]/[rules] gates) has no one to
+            // answer the prompt, so it auto-rejects and the session aborts before
+            // writing its submit_* verdict ("no verdict written"). Allow it: the
+            // session is still bounded by agentic_session_timeout_secs. This is a
+            // session-control gate, not a filesystem permission, so the read-only
+            // sandbox profile is unaffected.
+            "doom_loop": "allow",
         })
     }
 
@@ -2561,6 +2569,10 @@ mod tests {
         assert_eq!(perm["edit"], "deny", "Write/Edit denied for a read-only role");
         assert_eq!(perm["bash"], "deny", "Bash denied for a read-only role");
         assert_eq!(perm["webfetch"], "deny");
+        // opencode's loop guard must be allowed even for a read-only role, or a
+        // non-interactive session aborts on the unanswerable prompt before it
+        // writes its submit_* verdict.
+        assert_eq!(perm["doom_loop"], "allow");
         // The role's submission tool stays reachable via the mcp block.
         assert_eq!(
             v["mcp"][crate::mcp_askuser_server::SERVER_NAME]["environment"]
