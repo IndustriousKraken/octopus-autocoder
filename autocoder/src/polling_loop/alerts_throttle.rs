@@ -283,7 +283,6 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
     // gate_error) is a TRACKED revision thread — post via the thread-returning
     // path AND stamp a RevisionThreadState so a later reply can be matched.
     let findings = findings.to_vec();
-    let suggestion = revision_suggestion.to_string();
     let attribution = attribution.map(|a| a.to_string());
     post_tracked_revision_alert(
         paths,
@@ -331,9 +330,8 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                 })
                 .unwrap_or_default();
             format!(
-                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                suggestion = suggestion,
                 advert = revision_thread_advert(),
                 change = change,
                 base = repo.base_branch,
@@ -413,7 +411,6 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
     // a03: like the `[in]` findings alert, the `[canon]` contradiction marker is
     // a TRACKED revision thread — post threaded AND stamp a RevisionThreadState.
     let findings = findings.to_vec();
-    let suggestion = revision_suggestion.to_string();
     let attribution = attribution.map(|a| a.to_string());
     post_tracked_revision_alert(
         paths,
@@ -462,9 +459,8 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                 })
                 .unwrap_or_default();
             format!(
-                "This change's requirements conflict with canon:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change's requirements conflict with canon:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                suggestion = suggestion,
                 advert = revision_thread_advert(),
                 change = change,
                 base = repo.base_branch,
@@ -494,7 +490,6 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
     // a03: like the other findings alerts, the `[rules]` marker is a TRACKED
     // revision thread — post threaded AND stamp a RevisionThreadState.
     let findings = findings.to_vec();
-    let suggestion = revision_suggestion.to_string();
     let attribution = attribution.map(|a| a.to_string());
     post_tracked_revision_alert(
         paths,
@@ -532,9 +527,8 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
                 })
                 .unwrap_or_default();
             format!(
-                "This change violates one or more global rules:\n{findings_block}\nSuggested revision:\n{suggestion}\n\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change violates one or more global rules:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                suggestion = suggestion,
                 advert = revision_thread_advert(),
                 change = change,
                 base = repo.base_branch,
@@ -584,11 +578,10 @@ pub(crate) async fn maybe_post_unarchivable_deltas_alert(
                 ));
             }
             format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
                 repo_url = repo.url,
                 change = change,
                 violations_block = violations_block,
-                suggestion = revision_suggestion,
                 base = repo.base_branch,
                 marker = marker_path.display(),
             )
@@ -630,11 +623,10 @@ pub(crate) async fn maybe_post_canon_editing_tasks_alert(
                 tasks_block.push_str(&format!("  - {task}\n"));
             }
             format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has a task directing a canon edit (pre-flight)\n\nThe implementer implements code and tests only; a change's spec delta is folded into openspec/specs/ by `openspec archive` automatically. These task(s) instead apply it to canon, which would abort the archive on a duplicate requirement:\n{tasks_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Remove the offending task(s) from openspec/changes/{change}/tasks.md.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has a task directing a canon edit (pre-flight)\n\nThe implementer implements code and tests only; a change's spec delta is folded into openspec/specs/ by `openspec archive` automatically. These task(s) instead apply it to canon, which would abort the archive on a duplicate requirement:\n{tasks_block}\nOperator action:\n  1. Remove the offending task(s) from openspec/changes/{change}/tasks.md.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
                 repo_url = repo.url,
                 change = change,
                 tasks_block = tasks_block,
-                suggestion = revision_suggestion,
                 base = repo.base_branch,
                 marker = marker_path.display(),
             )
