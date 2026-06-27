@@ -30,6 +30,7 @@ pub(crate) async fn handle_archivability_preflight(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: violations.clone(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
         contradictions: Vec::new(),
@@ -79,6 +80,89 @@ fn build_unarchivable_revision_suggestion(
         "\nEdit openspec/changes/{change}/specs/<capability>/spec.md to use the\n\
          exact canonical header. After fixing, push the spec change AND clear\n\
          this marker via @<bot> clear-revision <repo> <change>.\n"
+    ));
+    out
+}
+
+/// Run the canon-editing-tasks pre-flight against `change`. A sibling of
+/// [`handle_archivability_preflight`] — same point in the pipeline, same
+/// marker, same halt semantics — but it scans `tasks.md` CONTENT for a task
+/// that directs a direct edit to the canonical specs (`openspec/specs/`).
+///
+/// The implementer implements code and tests only; a change's spec delta is
+/// folded into canon by `openspec archive`. A task that instead applies the
+/// delta to `openspec/specs/` makes the implementer pre-fold canon, after which
+/// `openspec archive` aborts on a duplicate requirement and the change goes
+/// perma-stuck — so the defect is caught here, before any executor or
+/// verifier-gate run is spent on it.
+///
+/// On a clean result: returns `Ok(None)` and the caller proceeds. On a flag:
+/// writes the `.needs-spec-revision.json` marker with `canon_editing_tasks`
+/// populated, posts the `AlertCategory::SpecNeedsRevision` chatops alert
+/// (24h-throttled), and returns `Ok(Some(QueueStep::SpecRevisionMarked))` so the
+/// caller short-circuits without invoking the executor OR the `[in]`/`[canon]`
+/// verifier gates.
+pub(crate) async fn handle_canon_editing_tasks_preflight(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+) -> Result<Option<QueueStep>> {
+    let offending =
+        crate::preflight::canon_editing_tasks::check_tasks_edit_canon(workspace, change);
+    if offending.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_canon_editing_revision_suggestion(change, &offending);
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        offending = offending.len(),
+        "canon-editing-tasks pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: offending.clone(),
+        revision_suggestion: suggestion.clone(),
+        gate_error: None,
+        contradictions: Vec::new(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to write spec-needs-revision marker (canon-editing pre-flight): {e:#}"
+        );
+    }
+    maybe_post_canon_editing_tasks_alert(paths, chatops_ctx, repo, change, &offending, &suggestion)
+        .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the `revision_suggestion` written into the marker when the
+/// canon-editing-tasks pre-flight flags a change. Names each offending task AND
+/// states the rule: the implementer implements code and tests only; the spec
+/// delta is folded into canon by `openspec archive`, so no task may apply it to
+/// `openspec/specs/`.
+fn build_canon_editing_revision_suggestion(change: &str, offending: &[String]) -> String {
+    let mut out = format!(
+        "Pre-flight found {} task{} directing an edit to the canonical specs:\n",
+        offending.len(),
+        if offending.len() == 1 { "" } else { "s" }
+    );
+    for task in offending {
+        out.push_str(&format!("- {task}\n"));
+    }
+    out.push_str(&format!(
+        "\nThe implementer implements CODE and TESTS only. A change's spec delta\n\
+         lives in openspec/changes/{change}/specs/<capability>/spec.md and is folded\n\
+         into the canonical openspec/specs/ by `openspec archive` automatically — a\n\
+         task must NOT apply it to openspec/specs/ (doing so makes archive abort on a\n\
+         duplicate requirement). Remove the offending task(s) from\n\
+         openspec/changes/{change}/tasks.md, push, AND clear this marker via\n\
+         @<bot> clear-revision <repo> <change> (or delete the marker file).\n"
     ));
     out
 }
@@ -151,6 +235,7 @@ pub(crate) async fn handle_contradiction_preflight(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
         // The durable marker carries the structured findings (additive to the
@@ -251,6 +336,7 @@ pub(crate) async fn handle_gate_error(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion,
         gate_error: Some(crate::spec_revision::GateErrorRecord {
             gate: label.to_string(),
@@ -333,6 +419,7 @@ pub(crate) async fn handle_canon_contradiction_preflight(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
         // The durable marker carries the structured findings (additive to the
@@ -465,6 +552,7 @@ pub(crate) async fn handle_rules_violations_preflight(
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
         contradictions: Vec::new(),

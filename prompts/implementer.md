@@ -123,7 +123,10 @@ when unsure.
 5. Do not ask the operator for clarification. Make reasonable decisions
    and proceed. If a decision is genuinely irrecoverable, use `ask_user`.
 6. Do not archive the change. `openspec archive` is denied in this
-   sandbox; autocoder commits + archives on success.
+   sandbox; autocoder commits + archives on success. Do NOT edit
+   `openspec/specs/` directly — your change's spec delta is folded into
+   canon automatically on archive; pre-folding it makes the archive
+   abort on a duplicate requirement.
 7. Mark tasks in tasks.md as you complete them (`- [ ]` → `- [x]`).
 8. On the success path, BEFORE exiting, call `outcome_success` with a
    `final_answer` per the content guidance above.

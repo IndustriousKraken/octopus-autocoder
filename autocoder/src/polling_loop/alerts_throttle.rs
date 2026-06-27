@@ -597,6 +597,52 @@ pub(crate) async fn maybe_post_unarchivable_deltas_alert(
     .await;
 }
 
+/// Sibling of [`maybe_post_unarchivable_deltas_alert`] for the canon-editing-
+/// tasks pre-flight path. Body framing names "tasks directing a canon edit" and
+/// lists each offending task line. Throttle state, channel, and gating flag are
+/// identical to the existing pre-flight alerts so a single stream of
+/// `AlertCategory::SpecNeedsRevision` notifications covers all reject paths.
+/// Untracked (like the unarchivable-deltas alert): a mechanical reject, not a
+/// contradiction revision thread.
+pub(crate) async fn maybe_post_canon_editing_tasks_alert(
+    paths: &DaemonPaths,
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    offending: &[String],
+    revision_suggestion: &str,
+) {
+    post_throttled_change_alert(
+        paths,
+        chatops_ctx,
+        repo,
+        change,
+        ThrottleMap::SpecRevision,
+        truncate_reason(revision_suggestion),
+        "canon-editing-tasks",
+        |workspace| {
+            let marker_path = workspace
+                .join("openspec/changes")
+                .join(change)
+                .join(".needs-spec-revision.json");
+            let mut tasks_block = String::new();
+            for task in offending {
+                tasks_block.push_str(&format!("  - {task}\n"));
+            }
+            format!(
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has a task directing a canon edit (pre-flight)\n\nThe implementer implements code and tests only; a change's spec delta is folded into openspec/specs/ by `openspec archive` automatically. These task(s) instead apply it to canon, which would abort the archive on a duplicate requirement:\n{tasks_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Remove the offending task(s) from openspec/changes/{change}/tasks.md.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                repo_url = repo.url,
+                change = change,
+                tasks_block = tasks_block,
+                suggestion = revision_suggestion,
+                base = repo.base_branch,
+                marker = marker_path.display(),
+            )
+        },
+    )
+    .await;
+}
+
 /// Post the chatops perma-stuck alert (best-effort, 24h-throttled per
 /// change). The state for this throttle lives in the daemon's
 /// alert-state file (`<state_dir>/alert-state/<basename>.json`) under
