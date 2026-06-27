@@ -114,8 +114,13 @@ No bot reply, no apparent action. Check:
 - **Trigger pattern is strict:** the comment body MUST begin with
   `@<bot>` (case-insensitive) followed by `revise` (case-insensitive)
   followed by at least one non-whitespace character. `@<bot> looks good`
-  is conversational and is ignored. Leading whitespace before `@<bot>` is
-  tolerated; a non-`@<bot>` prefix is not.
+  is not a `revise` — but because it *addresses* the bot, an authorized
+  commenter gets a one-time affordance reply naming the recognized
+  commands rather than silence (see
+  [OPERATIONS.md → Unrecognized commands get a one-time affordance
+  reply](OPERATIONS.md#unrecognized-commands-get-a-one-time-affordance-reply)).
+  Leading whitespace before `@<bot>` is tolerated; a non-`@<bot>` prefix
+  is a non-addressing comment and is ignored with no reply.
 - **Wrong bot username:** if you have multiple bot users (e.g. one per
   GitHub org via `owner_tokens`), the trigger only fires when the
   mention matches the bot whose PAT is routed to this repo. Check the

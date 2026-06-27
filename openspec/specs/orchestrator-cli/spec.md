@@ -2378,7 +2378,7 @@ Iteration-level errors that happen OUTSIDE the per-change loop (workspace init, 
 - **AND** the counter increments by exactly 1, not 2
 
 ### Requirement: Chatops operator commands
-The chatops listener SHALL recognize a small set of operator-issued commands as in-channel equivalents of the most common SSH-and-edit operator workflows: querying daemon state, clearing exclusion markers, and wiping the local workspace. Commands SHALL be addressed to the bot via the per-backend mention syntax (Slack `<@bot>`, Discord `<@!bot>`, etc.) followed by a verb and arguments. Unrecognized verbs SHALL be silently ignored (no negative feedback for typos in normal channel chat). Recognized commands SHALL be parsed by a backend-independent parser, dispatched as actions through the existing Unix-domain control socket, and replied to in the same channel where the command arrived.
+The chatops listener SHALL recognize a small set of operator-issued commands as in-channel equivalents of the most common SSH-and-edit operator workflows: querying daemon state, clearing exclusion markers, and wiping the local workspace. Commands SHALL be addressed to the bot via the per-backend mention syntax (Slack `<@bot>`, Discord `<@!bot>`, etc.) followed by a verb and arguments. An addressed message whose verb is not in the recognized set — AND which matches no open AskUser question — SHALL receive the `?` reaction acknowledgment (per `chatops-manager`'s `None` → `?` dispatcher contract): no text reply, but never silent (conforming to the `The bot acknowledges every request addressed to it, never silently dropping it` standard). A message that does NOT address the bot (no leading mention, or ordinary channel chatter) is ignored entirely, with no reaction. Recognized commands SHALL be parsed by a backend-independent parser, dispatched as actions through the existing Unix-domain control socket, and replied to in the same channel where the command arrived.
 
 The initial verb set is:
 
@@ -2434,24 +2434,23 @@ The threat model is unchanged from existing chatops behavior: write access to th
 #### Scenario: wipe-workspace two-step confirmation
 - **WHEN** an operator posts `@<bot> wipe-workspace your-repo`
   in channel `C` AND `your-repo` resolves to a unique repo
-- **THEN** the bot posts a warning naming the workspace path it
-  would delete (and that a re-clone follows on the next
-  iteration) AND prompting the operator to reply with the
-  canonical confirm verb (`@<bot> confirm`) within the
-  confirmation window
+- **THEN** the bot posts a warning
+  `⚠️ This will delete /tmp/workspaces/<sanitized-url>
+  (forces a re-clone on the next iteration). Reply 'confirm'
+  within 60 seconds.`
 - **AND** the bot stores an in-memory pending-confirmation
   entry keyed by `C` with a 60-second expiry
-- **WHEN** the operator (any channel member) replies with the
-  confirm verb (`@<bot> confirm`, or the bare/deprecated alias)
-  in `C` within 60 seconds
+- **WHEN** the operator (any channel member) replies
+  `confirm` in `C` within 60 seconds
 - **THEN** the bot submits the `WipeWorkspace` action,
-  removes the pending entry, AND posts a success confirmation
-  naming the wiped workspace
-- **AND** if no confirm reply arrives within 60 seconds, the
-  pending entry expires AND a subsequent confirm reply is
-  treated as if there were no pending confirmation (the bot
-  reports there is no pending confirmation in the channel —
-  the op-agnostic message shared by every two-step confirm)
+  removes the pending entry, AND posts
+  `✓ wiped /tmp/workspaces/<sanitized-url>; next iteration
+  will re-clone`
+- **AND** if no `confirm` reply arrives within 60 seconds,
+  the pending entry expires AND a subsequent `confirm` reply
+  is treated as if there were no pending confirmation
+  (`✗ no pending wipe-workspace confirmation in this
+  channel (or it expired)`)
 
 #### Scenario: Cross-channel confirmations do not match
 - **WHEN** the wipe-workspace command is issued in channel A
@@ -2461,18 +2460,20 @@ The threat model is unchanged from existing chatops behavior: write access to th
 - **AND** channel A's pending confirmation expires after 60s
   without firing
 
-#### Scenario: Unknown verbs are silently ignored
+#### Scenario: Unknown verbs addressed to the bot get a `?` acknowledgment, not silence
 - **WHEN** a message starts with the bot mention but the
   next token is not in the recognized verb set (e.g.
-  `@<bot> hello`, `@<bot> please archive everything`, an
-  AskUser reply that doesn't match an open question)
+  `@<bot> hello`, `@<bot> please archive everything`)
 - **THEN** the operator-command parser returns `None`
 - **AND** the chatops listener continues to the existing
   AskUser-reply detection path (so chatops-escalation
   replies still work as today)
-- **AND** if neither path matches, the message is ignored
-  silently (no error reply, no log spam beyond the existing
-  message-received DEBUG log)
+- **AND** if the AskUser path also does not match, the listener
+  applies the `?` reaction acknowledgment (per `chatops-manager`'s
+  `None` → `?` contract) — no text reply, but not silent
+- **AND** a message that does NOT address the bot (no leading
+  mention) receives no reaction (ordinary channel chatter is
+  not acknowledged)
 
 #### Scenario: Repo-substring matching is case-insensitive
 - **WHEN** an operator posts `@<bot> status MYREPO`,
@@ -2498,7 +2499,8 @@ The threat model is unchanged from existing chatops behavior: write access to th
 - **WHEN** an operator posts `@<bot> pause your-repo` (or
   `resume`, `clear-alert-throttle`)
 - **THEN** the message is parsed as an unknown verb AND
-  silently ignored (per the unknown-verbs scenario above)
+  acknowledged with the `?` reaction (per the unknown-verbs
+  scenario above)
 - **AND** the spec explicitly leaves these verbs to
   follow-up changes when usage patterns indicate they're
   worth adding
@@ -3076,20 +3078,28 @@ The `❌ <audit-type> produced an invalid proposal` chatops notification SHALL f
 ### Requirement: PR comments matching `@<bot> revise <text>` trigger an in-place revision of the autocoder-opened PR
 Each polling iteration, before processing pending changes for a repository, the daemon SHALL fetch open pull requests whose head branch matches `repositories[].agent_branch` AND poll each one's issue comments for revision-trigger messages. A comment qualifies as a trigger when its body's first non-whitespace token is `@<bot-username>` (case-insensitive on the username) AND its next whitespace-separated token (case-insensitive) is `revise` AND at least one non-whitespace character follows. The revision text is everything after `revise` with leading whitespace trimmed. Comments authored by the bot itself (`user.login == self.bot_username`) SHALL be filtered before parsing. The bot's GitHub username SHALL be learned at startup via `GET /user` and cached for the process lifetime.
 
+A comment whose first non-whitespace token is `@<bot-username>` but whose verb is NOT a recognized command (`revise`, `code-review`) AND whose author is authorized SHALL receive a one-time command-affordance reply: a single PR comment listing the recognized commands AND noting the command was not recognized, deduplicated by the originating comment id so the every-iteration comment fetch posts it at most once. This conforms to the `The bot acknowledges every request addressed to it, never silently dropping it` standard — a forge PR has no bot-reaction affordance, so the acknowledgment is a reply. A comment that does NOT address the bot as its first token (an incidental mention, or none), OR whose author is not authorized, is ignored with no reply. Bot-authored comments remain filtered before this handling, so the affordance never replies to the bot's own comments; the reply's example syntax is not placed as its first line, so a re-parse cannot match the `revise` trigger.
+
 #### Scenario: Triggering comment is detected
 - **WHEN** an open PR has a new comment whose body is `@<bot> revise the find_user function drops error info`
 - **THEN** the daemon parses the body as a revision trigger
 - **AND** extracts the revision text `the find_user function drops error info`
 
-#### Scenario: Non-triggering comment is ignored
-- **WHEN** an open PR has a new comment whose body is `@<bot> looks good`
-- **THEN** the daemon does NOT treat the body as a trigger
-- **AND** no revision is attempted
+#### Scenario: An addressed comment with an unrecognized command gets a one-time affordance reply
+- **WHEN** an open PR has a new comment from an authorized commenter whose first token is `@<bot>` but whose verb is not `revise` or `code-review` (e.g. `@<bot> looks good`, or a mistyped `@<bot> revize ...`)
+- **THEN** the daemon does NOT attempt a revision
+- **AND** it posts exactly one affordance reply listing the recognized commands (`@<bot> revise <text>`, `@<bot> code-review`) AND noting the command was not recognized
+- **AND** the reply is deduplicated by the originating comment id (posted at most once for that comment across iterations)
+
+#### Scenario: A non-addressing comment is ignored
+- **WHEN** an open PR has a comment that does NOT begin with `@<bot>` as its first token (a plain review comment, or `cc @<bot>` where the mention is not the leading token)
+- **THEN** the daemon does NOT treat it as a trigger AND does NOT post an affordance reply
+- **AND** ordinary PR discussion is not acknowledged
 
 #### Scenario: Bot's own comments are filtered
-- **WHEN** the daemon's previous revision reply (`✅ Revision applied: ...`) appears in the comment fetch
+- **WHEN** the daemon's previous revision reply (`✅ Revision applied: ...`) OR a prior affordance reply appears in the comment fetch
 - **THEN** the daemon filters it out before parsing
-- **AND** the same reply does not trigger a recursive revision
+- **AND** the same reply does not trigger a recursive revision OR a recursive affordance reply
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
 On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); a substantive `Failed` (the subprocess ran and the task failed) → failure reply comment + count increment; a **precondition-unmet** failure (the agent subprocess never started because a required precondition was unmet, e.g. the OS-sandbox-mechanism gate) → failure reply comment that directs the operator to resolve the precondition AND post a new revision request, with the trigger consumed (manual re-trigger; the daemon does NOT auto-retry, since an unmet precondition will not heal between polls) but the revision count NOT incremented (no revision work was attempted).

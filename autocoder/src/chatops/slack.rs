@@ -2804,6 +2804,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_non_addressing_message_gets_no_reaction() {
+        // never-silent-when-addressed (task 3.4): a message that does NOT
+        // address the bot as its leading token — here an incidental mention
+        // (`cc <@UBOT> fyi`) — is dropped by the leading-mention filter
+        // BEFORE dispatch, so the listener posts NEITHER a `?` reaction NOR a
+        // threaded reply. Only ADDRESSED-but-unrecognized messages get the
+        // `?` acknowledgment (see
+        // `event_loop_unrecognized_message_posts_question_reaction`).
+        let mut server = mockito::Server::new_async().await;
+        let react_mock = server
+            .mock("POST", "/reactions.add")
+            .expect(0)
+            .create_async()
+            .await;
+        let post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            server.url(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let env = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "cc <@UBOT> fyi",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        });
+        in_tx
+            .send(Ok(WsMessage::Text(env.to_string().into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
+        react_mock.assert_async().await;
+        post_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn event_loop_mobile_mention_form_normalized_and_dispatched() {
         // Inbound message uses the mobile-client `<@B_BOT_ID>` form. The
         // listener must normalise to the desktop `<@U_BOT_USER>` form
