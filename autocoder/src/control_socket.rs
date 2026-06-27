@@ -795,6 +795,9 @@ const DISPATCH: &[(&str, Handler)] = &[
     ("clear_ignore_for_queue_marker", |p, s| {
         Box::pin(async move { handle_clear_ignore_for_queue(p, s) })
     }),
+    ("prioritize", |p, s| {
+        Box::pin(async move { handle_prioritize(p, s) })
+    }),
     ("wipe_workspace", |p, s| Box::pin(handle_wipe_workspace(p, s))),
     ("rebuild_specs", |p, s| Box::pin(handle_rebuild_specs(p, s))),
     ("trigger_audit_action", |p, s| {
