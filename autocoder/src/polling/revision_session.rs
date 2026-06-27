@@ -503,6 +503,55 @@ fn render_surviving_findings(
     out
 }
 
+/// Compose the budget-exhausted failure reply for a `send it` that exhausted
+/// its bounded converge loop with a contradiction remaining. ALWAYS names the
+/// remaining contradiction — the surviving finding identities when the SAME
+/// identity persisted across the attempts (escalation), else the gate summary
+/// `text`. When `consecutive_count` has reached `threshold` consecutive failed
+/// rounds (default 3), the reply ADDITIONALLY recommends DECOMPOSING the change
+/// into smaller changes — a change failing repeated revision rounds is likely
+/// too large or interconnected to converge via `send it`; the operator MAY
+/// still `send it` again, but decomposition is the recommended path. Below the
+/// threshold the reply is the pre-existing form (names the contradiction,
+/// invites another `send it`) with NO decomposition nudge. `threshold == 0`
+/// disables the nudge entirely.
+fn build_budget_exhausted_reply(
+    survivors: &[&crate::spec_revision::ContradictionFindingRecord],
+    text: &str,
+    max_iterations: u32,
+    consecutive_count: u32,
+    threshold: u32,
+) -> String {
+    // The contradiction-naming head (unchanged behavior).
+    let mut body = if !survivors.is_empty() {
+        format!(
+            "✗ send it: the revision is NOT clearing {} contradiction(s) that survived {} attempt(s) — no PR opened.\n{}",
+            survivors.len(),
+            max_iterations,
+            render_surviving_findings(survivors),
+        )
+    } else {
+        format!(
+            "✗ send it: the revision still fails the gates after {} attempt(s) — no PR opened.\n{text}",
+            max_iterations,
+        )
+    };
+    if threshold > 0 && consecutive_count >= threshold {
+        // Threshold reached: recommend decomposition (additive — the operator
+        // may still `send it`, but this is the recommended path).
+        body.push_str(&format!(
+            "\n\n⚠️ This change has now failed {consecutive_count} consecutive `send it` rounds. A change that fails repeated revision rounds is usually too large or too interconnected to converge this way — the recommended fix is to DECOMPOSE it into smaller, independent changes that each gate cleanly, rather than another `send it`. You MAY still `send it` again, but decomposition is the better path here."
+        ));
+    } else if !survivors.is_empty() {
+        body.push_str(
+            "\nThis is a persistent non-convergence; discuss the direction further, then `send it` again.",
+        );
+    } else {
+        body.push_str("\nReply to discuss further, then `send it` again.");
+    }
+    body
+}
+
 /// Build the executor session prompt: the marching orders (edit the change's
 /// spec deltas along the discussed direction), the artifacts to read, the
 /// discussion so far, the CURRENT contradiction set the revision MUST resolve
@@ -944,6 +993,7 @@ pub async fn process_pending_revision_execute(
         request,
         in_ctx.revision_transcript_fetch_retries,
         in_ctx.revision_converge_attempts,
+        in_ctx.revision_nonconvergence_threshold,
         stuck_threshold_secs,
         &state_root,
     )
@@ -969,6 +1019,7 @@ async fn execute_with_deps(
     request: &RevisionExecuteRequest,
     transcript_fetch_retries: u32,
     converge_attempts: u32,
+    nonconvergence_threshold: u32,
     stuck_threshold_secs: u64,
     state_root: &Path,
 ) -> Result<()> {
@@ -1070,6 +1121,7 @@ async fn execute_with_deps(
         request,
         &transcript,
         converge_attempts,
+        nonconvergence_threshold,
         state_root,
     )
     .await
@@ -1094,6 +1146,7 @@ async fn run_revision_execute(
     request: &RevisionExecuteRequest,
     transcript: &[ThreadMessage],
     converge_attempts: u32,
+    nonconvergence_threshold: u32,
     state_root: &Path,
 ) -> Result<()> {
     let change_slug = &request.change_slug;
@@ -1243,23 +1296,33 @@ async fn run_revision_execute(
 
                 if remaining == 0 {
                     // Budget exhausted with a contradiction remaining → restore
-                    // base AND report. When a finding identity survived the
-                    // bounded attempts, NAME it specifically (escalation)
-                    // rather than an identical generic "still fails" line.
+                    // base AND report. This is a FAILED revision round: bump the
+                    // per-change consecutive-failure counter so repeated
+                    // non-convergence can nudge the operator toward decomposition
+                    // (best-effort — a marker-write failure falls back to a count
+                    // of 0, i.e. no nudge, so the reply still posts). When a
+                    // finding identity survived the bounded attempts the reply
+                    // NAMES it specifically (escalation); at the threshold it
+                    // ALSO recommends decomposing the change.
                     restore_base(workspace, repo);
-                    let body = if !survivors.is_empty() {
-                        format!(
-                            "✗ send it: the revision is NOT clearing {} contradiction(s) that survived {} attempt(s) — no PR opened.\n{}\nThis is a persistent non-convergence; discuss the direction further, then `send it` again.",
-                            survivors.len(),
-                            max_iterations,
-                            render_surviving_findings(&survivors),
-                        )
-                    } else {
-                        format!(
-                            "✗ send it: the revision still fails the gates after {} attempt(s) — no PR opened.\n{text}\nReply to discuss further, then `send it` again.",
-                            max_iterations,
-                        )
-                    };
+                    let consecutive =
+                        match crate::spec_revision::record_failed_round(workspace, change_slug) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::warn!(
+                                    change = %change_slug,
+                                    "revision-execute: recording the consecutive-failed-round counter failed (continuing without the decomposition nudge): {e:#}"
+                                );
+                                0
+                            }
+                        };
+                    let body = build_budget_exhausted_reply(
+                        &survivors,
+                        &text,
+                        max_iterations,
+                        consecutive,
+                        nonconvergence_threshold,
+                    );
                     post_reply(chatops_ctx, &request.channel, &request.thread_ts, &body).await;
                     return Ok(());
                 }
@@ -1333,6 +1396,18 @@ async fn run_revision_execute(
             return Ok(());
         }
     };
+
+    // The change has cleared (a clean re-gate opened a PR): reset the per-change
+    // consecutive-failure counter so a future first failure does not start at
+    // the decomposition-nudge threshold. The marker is gitignored untracked
+    // state that survives `restore_base`, so this reset persists. Best-effort:
+    // a write failure is logged AND never changes the revision outcome.
+    if let Err(e) = crate::spec_revision::reset_consecutive_failures(workspace, change_slug) {
+        tracing::warn!(
+            change = %change_slug,
+            "revision-execute: resetting the consecutive-failure counter after a clean re-gate failed (continuing): {e:#}"
+        );
+    }
 
     // Flip the thread state to Acted so a repeat `send it` is handled
     // gracefully (task 4.3). Reconstruct a fresh state when none was stored
@@ -1900,6 +1975,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -1959,6 +2035,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2001,6 +2078,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2038,6 +2116,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2087,6 +2166,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2135,6 +2215,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries
             0,
+            3, // nonconvergence_threshold
             1800, // stuck_threshold_secs
             state_dir.path(),
         )
@@ -2194,6 +2275,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries (>= the one failure)
             0,
+            3, // nonconvergence_threshold
             1800, // stuck_threshold_secs
             state_dir.path(),
         )
@@ -2253,6 +2335,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2307,6 +2390,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             2, // converge_attempts → up to 3 passes
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2356,6 +2440,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0, // single-pass
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2407,6 +2492,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2466,6 +2552,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             1, // one additional attempt → 2 passes, both contradict the same identity
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2480,6 +2567,200 @@ mod tests {
         assert!(
             replies.iter().any(|r| r.contains("not clearing") || r.contains("persistent")),
             "the escalation must say the revision is not clearing it: {replies:?}"
+        );
+    }
+
+    // ---------- non-convergence nudges decomposition (this change) ----------
+
+    /// Pure reply builder: at the threshold the reply names the contradiction
+    /// (`no PR opened`) AND recommends decomposition (task 3.1).
+    #[test]
+    fn budget_reply_recommends_decomposition_at_threshold() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 3, 3);
+        assert!(body.contains("no PR opened"), "{body}");
+        assert!(body.to_lowercase().contains("decompose"), "{body}");
+        assert!(body.to_lowercase().contains("too large"), "{body}");
+    }
+
+    /// Below the threshold the reply is the existing "names the contradiction,
+    /// invites another `send it`" form with NO decomposition nudge (task 3.2).
+    #[test]
+    fn budget_reply_unchanged_below_threshold() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 2, 3);
+        assert!(body.contains("no PR opened"), "{body}");
+        assert!(body.contains("send it"), "{body}");
+        assert!(!body.to_lowercase().contains("decompose"), "{body}");
+    }
+
+    /// A threshold of zero disables the nudge entirely (defensive: a count is
+    /// always ≥1 at a failure, so `>= 0` must NOT mean always-nudge).
+    #[test]
+    fn budget_reply_threshold_zero_disables_nudge() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 9, 0);
+        assert!(!body.to_lowercase().contains("decompose"), "{body}");
+    }
+
+    /// End-to-end (task 3.1): with two prior failed rounds recorded, a third
+    /// budget-exhausted `send it` reaches the default threshold of 3 — the reply
+    /// recommends decomposition while still naming the failed revision, AND the
+    /// per-change counter advanced to the threshold.
+    #[tokio::test]
+    async fn nudge_at_threshold_recommends_decomposition() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Pre-seed two prior failed rounds; THIS run is the third.
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0, // single-pass → budget exhausted on the first contradiction
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR when the contradiction persists");
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.to_lowercase().contains("decompose")),
+            "at the threshold the reply must recommend decomposition: {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("no PR opened")),
+            "the reply still names the failed revision: {replies:?}"
+        );
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            3,
+            "the failed round advanced the counter to the threshold"
+        );
+    }
+
+    /// End-to-end (task 3.2): the FIRST budget-exhausted `send it` (count 1 <
+    /// threshold 3) gets the existing reply — names the contradiction, invites
+    /// another `send it` — with no decomposition nudge.
+    #[tokio::test]
+    async fn below_threshold_no_decomposition_nudge() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("no PR opened") && r.contains("send it")),
+            "below the threshold the reply names the contradiction and invites another send it: {replies:?}"
+        );
+        assert!(
+            replies.iter().all(|r| !r.to_lowercase().contains("decompose")),
+            "below the threshold the reply must NOT recommend decomposition: {replies:?}"
+        );
+    }
+
+    /// End-to-end (task 3.3): a clean re-gate that opens a PR resets the
+    /// per-change consecutive-failure counter to zero, so a later first failure
+    /// does not immediately trigger the decomposition nudge.
+    #[tokio::test]
+    async fn clean_regate_resets_consecutive_failure_count() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Two prior failed rounds recorded in the marker.
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            2
+        );
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr { url: "https://example/pr/clean".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 1, "a clean re-gate opens the PR");
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            0,
+            "a clean re-gate (PR opened) resets the consecutive-failure counter"
         );
     }
 
@@ -2572,6 +2853,7 @@ mod tests {
             &execute_request("9.9"),
             0,
             0,
+            3, // nonconvergence_threshold
             1800,
             state_dir.path(),
         )
@@ -2641,6 +2923,7 @@ mod tests {
             &execute_request("9.9"),
             0,
             converge_attempts,
+            3, // nonconvergence_threshold
             1800,
             state_dir.path(),
         )

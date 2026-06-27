@@ -339,6 +339,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                     .executor
                     .revision_transcript_fetch_retries,
                 revision_converge_attempts: cfg.executor.revision_converge_attempts,
+                revision_nonconvergence_threshold: cfg.executor.revision_nonconvergence_threshold,
                 paths: Some(daemon_paths.clone()),
                 #[cfg(test)]
                 test_submission: None,

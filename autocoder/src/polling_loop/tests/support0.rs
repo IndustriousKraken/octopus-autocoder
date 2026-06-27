@@ -596,6 +596,7 @@ pub(crate) fn cc_test_ctx(
         timeout: std::time::Duration::from_secs(crate::config::default_agentic_session_timeout()),
         revision_transcript_fetch_retries: 0,
         revision_converge_attempts: 0,
+        revision_nonconvergence_threshold: 3,
         paths: None,
         test_submission: Some(submission),
     }
