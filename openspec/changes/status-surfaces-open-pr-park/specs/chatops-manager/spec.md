@@ -8,7 +8,10 @@ The `currently:` line's value SHALL be computed by branching on the busy marker'
 1. No marker present:
    a. AND an open PR exists for the agent branch (`list_open_prs_for_head` returns one or more — the `Skip iteration when an open PR exists for the agent branch` gate is active) → `parked: open PR #<n> awaiting review — no new work until it is merged or closed` (naming the lowest-numbered open PR, with a `(+N more)` suffix when several exist).
    b. OTHERWISE → `idle`.
-2. Marker present AND classification per `a08`'s busy-marker semantics says the marker is stale (dead pid OR live pid past threshold) → `stale marker from pid <pid> (age <age>, recovery <eligible-or-remaining-time>)`.
+2. Marker present AND classification per `a08`'s busy-marker semantics says the marker is stale OR approaching stale:
+   - Dead pid → `stale marker from pid <pid> (age <age>, recovery eligible now)`
+   - Live pid AND age ≥ threshold → `stale marker from pid <pid> (age <age>, recovery eligible next iteration)`
+   - Live pid AND age ≥ 80% of threshold (but < threshold) → `stale marker from pid <pid> (age <age>, recovery in <remaining>)`
 3. Marker present AND `change` non-empty → `working on <change> (started <age> ago)`.
 4. Marker present AND `stage=executor` AND `change` empty AND an audit-log file at `<logs_dir>/runs/<workspace>/audits/<audit_type>-<timestamp>.log` matches the marker's `started_at` → `running audit <audit_type> (started <age> ago)`.
 5. Marker present AND `stage` ∈ `{commit, review, push, pr}` AND `change` empty → `<stage> in progress (started <age> ago)`.
@@ -17,7 +20,7 @@ The `currently:` line's value SHALL be computed by branching on the busy marker'
 
 The status code path SHALL read the busy marker from the daemon's resolved runtime-dir path (per `a09`'s state-path-resolution rule). The status reply MUST NOT report `idle` when the daemon's writer has stamped a marker at the runtime path, NOR when an open PR exists for the agent branch (it reports the park instead). On a failed agent-branch open-PR query the `currently:` line degrades to the marker-based determination (`idle` when no marker), never a fabricated park.
 
-The age formatting matches the existing convention: `Xm ago` for ages under 1 hour, `XhYm ago` for older.
+The age formatting matches the existing convention: `Xs ago` for ages under 1 minute, `Xm ago` for ages under 1 hour, `XhYm ago` for older.
 
 #### Scenario: All sections present for a healthy repo
 - **WHEN** an operator issues `status <repo>` against a repo with commits on both branches, a merged PR from the agent branch (no open PR), an idle daemon, and an empty queue
@@ -77,13 +80,13 @@ The age formatting matches the existing convention: `Xm ago` for ages under 1 ho
 
 #### Scenario: Stale marker with live pid past threshold surfaces upcoming recovery
 - **WHEN** the busy marker has `pid: <some live pid>`, `started_at: now - 700 seconds` AND `executor.busy_marker_stale_threshold_secs: 600`
-- **THEN** the reply's `currently:` line reads `stale marker from pid <pid> (age 11m40s, recovery eligible next iteration)`
+- **THEN** the reply's `currently:` line reads `stale marker from pid <pid> (age 11m, recovery eligible next iteration)`
 - **AND** the operator sees that recovery will fire on the next polling iteration via SIGTERM (per `a08`)
 
 #### Scenario: Stale marker approaching threshold surfaces remaining time
 - **WHEN** the busy marker has `pid: <some live pid>`, `started_at: now - 8 minutes` AND threshold is 10 minutes
 - **THEN** the reply's `currently:` line reads `stale marker from pid <pid> (age 8m, recovery in 2m)`
-- **AND** the heuristic (surface upcoming-recovery when age > 80% of threshold) makes "stuck-feeling" markers visibly transitioning rather than permanent
+- **AND** the heuristic (surface upcoming-recovery when age ≥ 80% of threshold) makes "stuck-feeling" markers visibly transitioning rather than permanent
 
 #### Scenario: Status read path matches daemon write path
 - **WHEN** the daemon's busy-marker writer stamps a marker at `<runtime_dir>/busy/<workspace>.json`
