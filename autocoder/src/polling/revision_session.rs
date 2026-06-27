@@ -503,6 +503,55 @@ fn render_surviving_findings(
     out
 }
 
+/// Compose the budget-exhausted failure reply for a `send it` that exhausted
+/// its bounded converge loop with a contradiction remaining. ALWAYS names the
+/// remaining contradiction — the surviving finding identities when the SAME
+/// identity persisted across the attempts (escalation), else the gate summary
+/// `text`. When `consecutive_count` has reached `threshold` consecutive failed
+/// rounds (default 3), the reply ADDITIONALLY recommends DECOMPOSING the change
+/// into smaller changes — a change failing repeated revision rounds is likely
+/// too large or interconnected to converge via `send it`; the operator MAY
+/// still `send it` again, but decomposition is the recommended path. Below the
+/// threshold the reply is the pre-existing form (names the contradiction,
+/// invites another `send it`) with NO decomposition nudge. `threshold == 0`
+/// disables the nudge entirely.
+fn build_budget_exhausted_reply(
+    survivors: &[&crate::spec_revision::ContradictionFindingRecord],
+    text: &str,
+    max_iterations: u32,
+    consecutive_count: u32,
+    threshold: u32,
+) -> String {
+    // The contradiction-naming head (unchanged behavior).
+    let mut body = if !survivors.is_empty() {
+        format!(
+            "✗ send it: the revision is NOT clearing {} contradiction(s) that survived {} attempt(s) — no PR opened.\n{}",
+            survivors.len(),
+            max_iterations,
+            render_surviving_findings(survivors),
+        )
+    } else {
+        format!(
+            "✗ send it: the revision still fails the gates after {} attempt(s) — no PR opened.\n{text}",
+            max_iterations,
+        )
+    };
+    if threshold > 0 && consecutive_count >= threshold {
+        // Threshold reached: recommend decomposition (additive — the operator
+        // may still `send it`, but this is the recommended path).
+        body.push_str(&format!(
+            "\n\n⚠️ This change has now failed {consecutive_count} consecutive `send it` rounds. A change that fails repeated revision rounds is usually too large or too interconnected to converge this way — the recommended fix is to DECOMPOSE it into smaller, independent changes that each gate cleanly, rather than another `send it`. You MAY still `send it` again, but decomposition is the better path here."
+        ));
+    } else if !survivors.is_empty() {
+        body.push_str(
+            "\nThis is a persistent non-convergence; discuss the direction further, then `send it` again.",
+        );
+    } else {
+        body.push_str("\nReply to discuss further, then `send it` again.");
+    }
+    body
+}
+
 /// Build the executor session prompt: the marching orders (edit the change's
 /// spec deltas along the discussed direction), the artifacts to read, the
 /// discussion so far, the CURRENT contradiction set the revision MUST resolve
@@ -944,6 +993,7 @@ pub async fn process_pending_revision_execute(
         request,
         in_ctx.revision_transcript_fetch_retries,
         in_ctx.revision_converge_attempts,
+        in_ctx.revision_nonconvergence_threshold,
         stuck_threshold_secs,
         &state_root,
     )
@@ -969,6 +1019,7 @@ async fn execute_with_deps(
     request: &RevisionExecuteRequest,
     transcript_fetch_retries: u32,
     converge_attempts: u32,
+    nonconvergence_threshold: u32,
     stuck_threshold_secs: u64,
     state_root: &Path,
 ) -> Result<()> {
@@ -1070,6 +1121,7 @@ async fn execute_with_deps(
         request,
         &transcript,
         converge_attempts,
+        nonconvergence_threshold,
         state_root,
     )
     .await
@@ -1094,6 +1146,7 @@ async fn run_revision_execute(
     request: &RevisionExecuteRequest,
     transcript: &[ThreadMessage],
     converge_attempts: u32,
+    nonconvergence_threshold: u32,
     state_root: &Path,
 ) -> Result<()> {
     let change_slug = &request.change_slug;
@@ -1113,20 +1166,59 @@ async fn run_revision_execute(
     }
 
     // Work on a dedicated revision branch off base — never the base branch.
+    // Task 1.1: when a revision branch persisted from a prior round exists,
+    // RESUME it so this round builds on the prior round's surviving edits
+    // (monotonic convergence) instead of restarting from the same contradictory
+    // base. When none exists — the first round, or a prior round whose edits were
+    // discarded down to base — create it from base as before.
     let branch = revision_branch_name(&repo.agent_branch, change_slug);
-    if let Err(e) = git::checkout(workspace, &repo.base_branch) {
-        tracing::warn!("revision-execute: checkout of base branch failed: {e:#}");
+    let resumed = git::local_branch_exists(workspace, &branch).unwrap_or(false)
+        && match git::checkout(workspace, &branch) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "revision-execute: resuming persisted branch `{branch}` failed; recreating from base: {e:#}"
+                );
+                false
+            }
+        };
+    if !resumed {
+        if let Err(e) = git::checkout(workspace, &repo.base_branch) {
+            tracing::warn!("revision-execute: checkout of base branch failed: {e:#}");
+        }
+        if let Err(e) = git::recreate_branch(workspace, &branch) {
+            post_reply(
+                chatops_ctx,
+                &request.channel,
+                &request.thread_ts,
+                &format!("✗ send it: could not prepare the revision branch `{branch}`: {e}"),
+            )
+            .await;
+            return Ok(());
+        }
     }
-    if let Err(e) = git::recreate_branch(workspace, &branch) {
-        post_reply(
-            chatops_ctx,
-            &request.channel,
-            &request.thread_ts,
-            &format!("✗ send it: could not prepare the revision branch `{branch}`: {e}"),
-        )
-        .await;
-        return Ok(());
-    }
+
+    // The change-internal contradiction set BEFORE this round — the regression
+    // guard's baseline (task 2.1). Read from the durable marker, which holds the
+    // prior round's final findings, BEFORE the converge loop refreshes it. Only
+    // `[in]`-gate (change-internal) identities count, per the guard's contract
+    // (the proposal's design note scopes the test to the `[in]` gate). Best-
+    // effort: an unreadable/absent marker yields an empty baseline, so any change-
+    // internal contradiction after the round counts as new (conservative
+    // discard). The full pre-round set is kept too, to revert the marker if the
+    // round is discarded, so a regression is not carried forward in the marker.
+    let before_contradictions: Vec<crate::spec_revision::ContradictionFindingRecord> =
+        crate::spec_revision::read_marker(workspace, change_slug)
+            .ok()
+            .flatten()
+            .map(|m| m.contradictions)
+            .unwrap_or_default();
+    let before_in_identities: Vec<crate::spec_revision::ContradictionIdentity> =
+        before_contradictions
+            .iter()
+            .filter(|f| f.gate == crate::spec_revision::ContradictionGate::In)
+            .map(|f| f.identity())
+            .collect();
 
     // Bounded converge loop within one `send it` (task 6): up to
     // `converge_attempts` ADDITIONAL edit→scope-check→re-gate passes beyond the
@@ -1242,24 +1334,92 @@ async fn run_revision_execute(
                     .collect();
 
                 if remaining == 0 {
-                    // Budget exhausted with a contradiction remaining → restore
-                    // base AND report. When a finding identity survived the
-                    // bounded attempts, NAME it specifically (escalation)
-                    // rather than an identical generic "still fails" line.
-                    restore_base(workspace, repo);
-                    let body = if !survivors.is_empty() {
-                        format!(
-                            "✗ send it: the revision is NOT clearing {} contradiction(s) that survived {} attempt(s) — no PR opened.\n{}\nThis is a persistent non-convergence; discuss the direction further, then `send it` again.",
-                            survivors.len(),
-                            max_iterations,
-                            render_surviving_findings(&survivors),
-                        )
+                    // Budget exhausted with a contradiction remaining → a FAILED
+                    // revision round. Tasks 1.2 / 2: instead of unconditionally
+                    // discarding, apply the regression guard to decide whether to
+                    // PERSIST the round's accumulated edits on the revision branch
+                    // (so the next `send it` resumes from them — monotonic
+                    // convergence) or DISCARD them (so a regression is never
+                    // locked in). Then bump the per-change consecutive-failure
+                    // counter so repeated non-convergence can nudge the operator
+                    // toward decomposition (best-effort — a marker-write failure
+                    // falls back to a count of 0, i.e. no nudge, so the reply
+                    // still posts). When a finding identity survived the bounded
+                    // attempts the reply NAMES it specifically (escalation); at
+                    // the threshold it ALSO recommends decomposing the change.
+                    //
+                    // Regressed iff this round's change-internal (`[in]`)
+                    // contradiction set gained an identity absent before the round
+                    // (task 2.1). `[canon]` findings do not count — the guard is
+                    // scoped to change-internal contradictions per the spec.
+                    let after_in_identities: Vec<crate::spec_revision::ContradictionIdentity> =
+                        findings
+                            .iter()
+                            .filter(|f| f.gate == crate::spec_revision::ContradictionGate::In)
+                            .map(|f| f.identity())
+                            .collect();
+                    let regressed = after_in_identities
+                        .iter()
+                        .any(|id| !before_in_identities.contains(id));
+
+                    if regressed {
+                        // DISCARD (task 2.3): revert the working tree to the
+                        // revision branch's last commit — the prior persisted
+                        // state, or base when no round persisted — so the
+                        // regression is not carried forward. Also revert the
+                        // marker's contradiction set to the pre-round set (the
+                        // loop refreshed it to the regressed findings, but those
+                        // edits are now gone), so the next round is not grounded
+                        // in a contradiction the reverted tree no longer has.
+                        restore_base(workspace, repo);
+                        if let Err(e) = crate::spec_revision::refresh_marker_contradictions(
+                            workspace,
+                            change_slug,
+                            &before_contradictions,
+                        ) {
+                            tracing::warn!(
+                                change = %change_slug,
+                                "revision-execute: reverting the marker after a discarded regressing round failed (continuing): {e:#}"
+                            );
+                        }
                     } else {
-                        format!(
-                            "✗ send it: the revision still fails the gates after {} attempt(s) — no PR opened.\n{text}\nReply to discuss further, then `send it` again.",
-                            max_iterations,
-                        )
-                    };
+                        // PERSIST (task 2.2): commit the round's accumulated edits
+                        // to the revision branch (NEVER base — human PR review
+                        // remains the sole merge gate) so the next `send it`
+                        // resumes from them. On a commit failure fall back to a
+                        // discard rather than leaving a half-staged tree.
+                        if let Err(e) = commit_revision_edits(
+                            workspace,
+                            change_slug,
+                            &format!(
+                                "spec-revision: persist incremental progress for `{change_slug}` (not yet converged)"
+                            ),
+                        ) {
+                            tracing::warn!(
+                                change = %change_slug,
+                                "revision-execute: persisting the failed round's edits failed; discarding instead: {e:#}"
+                            );
+                        }
+                        restore_base(workspace, repo);
+                    }
+                    let consecutive =
+                        match crate::spec_revision::record_failed_round(workspace, change_slug) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::warn!(
+                                    change = %change_slug,
+                                    "revision-execute: recording the consecutive-failed-round counter failed (continuing without the decomposition nudge): {e:#}"
+                                );
+                                0
+                            }
+                        };
+                    let body = build_budget_exhausted_reply(
+                        &survivors,
+                        &text,
+                        max_iterations,
+                        consecutive,
+                        nonconvergence_threshold,
+                    );
                     post_reply(chatops_ctx, &request.channel, &request.thread_ts, &body).await;
                     return Ok(());
                 }
@@ -1287,22 +1447,12 @@ async fn run_revision_execute(
         }
     }
 
-    // Clean re-gate → stage the change directory's revised deltas, then
-    // unstage the daemon's `.needs-spec-revision.json` marker so it never
-    // rides into the PR (it is untracked bookkeeping, not a spec delta).
-    // tasks.md is already guaranteed unmodified by the guardrail above.
-    let change_dir = change_dir_rel(change_slug);
-    let marker = marker_rel_path(change_slug);
-    let _ = std::process::Command::new("git")
-        .args(["add", "--", &change_dir])
-        .current_dir(workspace)
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["reset", "-q", "--", &marker])
-        .current_dir(workspace)
-        .status();
+    // Clean re-gate → commit the change directory's revised deltas to the
+    // revision branch (the daemon's untracked `.needs-spec-revision.json` marker
+    // is kept out of the commit). tasks.md is already guaranteed unmodified by
+    // the guardrail above.
     let subject = format!("spec-revision: resolve contradiction in `{change_slug}`");
-    if let Err(e) = git::commit(workspace, &subject) {
+    if let Err(e) = commit_revision_edits(workspace, change_slug, &subject) {
         restore_base(workspace, repo);
         post_reply(
             chatops_ctx,
@@ -1333,6 +1483,18 @@ async fn run_revision_execute(
             return Ok(());
         }
     };
+
+    // The change has cleared (a clean re-gate opened a PR): reset the per-change
+    // consecutive-failure counter so a future first failure does not start at
+    // the decomposition-nudge threshold. The marker is gitignored untracked
+    // state that survives `restore_base`, so this reset persists. Best-effort:
+    // a write failure is logged AND never changes the revision outcome.
+    if let Err(e) = crate::spec_revision::reset_consecutive_failures(workspace, change_slug) {
+        tracing::warn!(
+            change = %change_slug,
+            "revision-execute: resetting the consecutive-failure counter after a clean re-gate failed (continuing): {e:#}"
+        );
+    }
 
     // Flip the thread state to Acted so a repeat `send it` is handled
     // gracefully (task 4.3). Reconstruct a fresh state when none was stored
@@ -1369,8 +1531,30 @@ async fn run_revision_execute(
     Ok(())
 }
 
-/// Restore the base-branch checkout (discarding any in-flight revision tree)
-/// so the next iteration phase starts clean. Best-effort.
+/// Stage the change directory's revised spec deltas and commit them to the
+/// CURRENT (revision) branch, keeping the daemon's untracked
+/// `.needs-spec-revision.json` marker out of the commit (it is excluded AND
+/// explicitly unstaged). Shared by the clean-regate PR path AND the budget-
+/// exhausted persist path — both commit the round's edits to the revision
+/// branch, NEVER to base.
+fn commit_revision_edits(workspace: &Path, change_slug: &str, subject: &str) -> Result<()> {
+    let change_dir = change_dir_rel(change_slug);
+    let marker = marker_rel_path(change_slug);
+    let _ = std::process::Command::new("git")
+        .args(["add", "--", &change_dir])
+        .current_dir(workspace)
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["reset", "-q", "--", &marker])
+        .current_dir(workspace)
+        .status();
+    git::commit(workspace, subject)
+}
+
+/// Restore the base-branch checkout (discarding any in-flight, UNCOMMITTED
+/// revision tree) so the next iteration phase starts clean. A persisted revision
+/// branch's commits are unaffected — only the working tree is reset to its
+/// current HEAD, then base is checked out. Best-effort.
 fn restore_base(workspace: &Path, repo: &RepositoryConfig) {
     let _ = git::reset_hard_head(workspace);
     let _ = git::clean_force(workspace);
@@ -1900,6 +2084,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -1959,6 +2144,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2001,6 +2187,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2038,6 +2225,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2087,6 +2275,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
              0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2135,6 +2324,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries
             0,
+            3, // nonconvergence_threshold
             1800, // stuck_threshold_secs
             state_dir.path(),
         )
@@ -2194,6 +2384,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries (>= the one failure)
             0,
+            3, // nonconvergence_threshold
             1800, // stuck_threshold_secs
             state_dir.path(),
         )
@@ -2253,6 +2444,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2307,6 +2499,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             2, // converge_attempts → up to 3 passes
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2356,6 +2549,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0, // single-pass
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2407,6 +2601,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             0,
+            3,
             state_dir.path(),
         )
         .await
@@ -2466,6 +2661,7 @@ mod tests {
             &execute_request("9.9"),
             &[],
             1, // one additional attempt → 2 passes, both contradict the same identity
+            3, // nonconvergence_threshold
             state_dir.path(),
         )
         .await
@@ -2480,6 +2676,200 @@ mod tests {
         assert!(
             replies.iter().any(|r| r.contains("not clearing") || r.contains("persistent")),
             "the escalation must say the revision is not clearing it: {replies:?}"
+        );
+    }
+
+    // ---------- non-convergence nudges decomposition (this change) ----------
+
+    /// Pure reply builder: at the threshold the reply names the contradiction
+    /// (`no PR opened`) AND recommends decomposition (task 3.1).
+    #[test]
+    fn budget_reply_recommends_decomposition_at_threshold() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 3, 3);
+        assert!(body.contains("no PR opened"), "{body}");
+        assert!(body.to_lowercase().contains("decompose"), "{body}");
+        assert!(body.to_lowercase().contains("too large"), "{body}");
+    }
+
+    /// Below the threshold the reply is the existing "names the contradiction,
+    /// invites another `send it`" form with NO decomposition nudge (task 3.2).
+    #[test]
+    fn budget_reply_unchanged_below_threshold() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 2, 3);
+        assert!(body.contains("no PR opened"), "{body}");
+        assert!(body.contains("send it"), "{body}");
+        assert!(!body.to_lowercase().contains("decompose"), "{body}");
+    }
+
+    /// A threshold of zero disables the nudge entirely (defensive: a count is
+    /// always ≥1 at a failure, so `>= 0` must NOT mean always-nudge).
+    #[test]
+    fn budget_reply_threshold_zero_disables_nudge() {
+        let body = build_budget_exhausted_reply(&[], "gate summary", 3, 9, 0);
+        assert!(!body.to_lowercase().contains("decompose"), "{body}");
+    }
+
+    /// End-to-end (task 3.1): with two prior failed rounds recorded, a third
+    /// budget-exhausted `send it` reaches the default threshold of 3 — the reply
+    /// recommends decomposition while still naming the failed revision, AND the
+    /// per-change counter advanced to the threshold.
+    #[tokio::test]
+    async fn nudge_at_threshold_recommends_decomposition() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Pre-seed two prior failed rounds; THIS run is the third.
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0, // single-pass → budget exhausted on the first contradiction
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR when the contradiction persists");
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.to_lowercase().contains("decompose")),
+            "at the threshold the reply must recommend decomposition: {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("no PR opened")),
+            "the reply still names the failed revision: {replies:?}"
+        );
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            3,
+            "the failed round advanced the counter to the threshold"
+        );
+    }
+
+    /// End-to-end (task 3.2): the FIRST budget-exhausted `send it` (count 1 <
+    /// threshold 3) gets the existing reply — names the contradiction, invites
+    /// another `send it` — with no decomposition nudge.
+    #[tokio::test]
+    async fn below_threshold_no_decomposition_nudge() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        let replies = chat.replies.lock().unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("no PR opened") && r.contains("send it")),
+            "below the threshold the reply names the contradiction and invites another send it: {replies:?}"
+        );
+        assert!(
+            replies.iter().all(|r| !r.to_lowercase().contains("decompose")),
+            "below the threshold the reply must NOT recommend decomposition: {replies:?}"
+        );
+    }
+
+    /// End-to-end (task 3.3): a clean re-gate that opens a PR resets the
+    /// per-change consecutive-failure counter to zero, so a later first failure
+    /// does not immediately trigger the decomposition nudge.
+    #[tokio::test]
+    async fn clean_regate_resets_consecutive_failure_count() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        // Two prior failed rounds recorded in the marker.
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        crate::spec_revision::record_failed_round(&ws, "c1").unwrap();
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            2
+        );
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let edit_prompts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit: &RecordingEdit { prompts: edit_prompts.clone() },
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr { url: "https://example/pr/clean".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3, // nonconvergence_threshold
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 1, "a clean re-gate opens the PR");
+        assert_eq!(
+            crate::spec_revision::read_marker(&ws, "c1")
+                .unwrap()
+                .unwrap()
+                .consecutive_failed_rounds,
+            0,
+            "a clean re-gate (PR opened) resets the consecutive-failure counter"
         );
     }
 
@@ -2572,6 +2962,7 @@ mod tests {
             &execute_request("9.9"),
             0,
             0,
+            3, // nonconvergence_threshold
             1800,
             state_dir.path(),
         )
@@ -2641,6 +3032,7 @@ mod tests {
             &execute_request("9.9"),
             0,
             converge_attempts,
+            3, // nonconvergence_threshold
             1800,
             state_dir.path(),
         )
@@ -2685,5 +3077,299 @@ mod tests {
             0,
         )
         .await;
+    }
+
+    // ---------- persist incremental progress across rounds (this change) ----------
+
+    /// An `[in]` (change-internal) finding record for the regression-guard tests.
+    fn in_record(a: &str, b: &str) -> crate::spec_revision::ContradictionFindingRecord {
+        crate::spec_revision::ContradictionFindingRecord {
+            gate: crate::spec_revision::ContradictionGate::In,
+            requirement_a: a.into(),
+            requirement_b: b.into(),
+            canonical_capability: String::new(),
+            summary: format!("{a} conflicts with {b}"),
+            suggested_fix: String::new(),
+        }
+    }
+
+    /// Contents of `<rev>:<path>` (e.g. the spec delta as committed on a branch),
+    /// or `None` when the object does not exist (`git show` failed).
+    fn git_show(ws: &Path, rev_path: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["show", rev_path])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Resolve `rev` to a commit SHA.
+    fn git_rev_parse(ws: &Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Edit runner that records the spec-delta content it SEES on entry (before
+    /// editing), then writes `body`. Proves which state a round STARTED from
+    /// (the prior round's persisted edits, or base).
+    struct CaptureThenWrite {
+        seen: std::sync::Arc<Mutex<Option<String>>>,
+        body: String,
+    }
+    #[async_trait]
+    impl EditSessionRunner for CaptureThenWrite {
+        async fn revise(&self, ws: &Path, _prompt: &str) -> Result<()> {
+            let path = ws.join("openspec/changes/c1/specs/cap/spec.md");
+            *self.seen.lock().unwrap() = std::fs::read_to_string(&path).ok();
+            std::fs::write(&path, &self.body).unwrap();
+            Ok(())
+        }
+    }
+
+    const REVISION_SPEC: &str = "openspec/changes/c1/specs/cap/spec.md";
+
+    /// (4.1) A non-regressing budget-exhausted round persists its edits on the
+    /// revision branch (NOT base), and the next `send it` RESUMES from the
+    /// persisted state rather than recreating the branch from base.
+    #[tokio::test]
+    async fn non_regressing_round_persists_and_next_send_it_resumes() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let branch = revision_branch_name("agent-q", "c1");
+
+        // Round 1: the fixture marker has NO change-internal contradictions, and
+        // the re-gate reports only a `[canon]` contradiction → the change-internal
+        // set did not grow → the round PERSISTS its edits.
+        let deps1 = ExecutorDeps {
+            edit: &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nPERSISTED ROUND ONE.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting with canon".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps1,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR on a failed round");
+        // Edits persisted on the revision branch; base untouched.
+        let on_branch = git_show(&ws, &format!("{branch}:{REVISION_SPEC}"))
+            .expect("the revision branch carries the persisted spec delta");
+        assert!(on_branch.contains("PERSISTED ROUND ONE"), "persisted on the branch: {on_branch}");
+        let on_base = git_show(&ws, &format!("main:{REVISION_SPEC}")).unwrap();
+        assert!(on_base.contains("Original body"), "base untouched: {on_base}");
+        assert!(!on_base.contains("PERSISTED ROUND ONE"), "base never committed to: {on_base}");
+
+        // Round 2: the next `send it` RESUMES the persisted branch — the edit
+        // session sees round one's edits, not base.
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let deps2 = ExecutorDeps {
+            edit: &CaptureThenWrite {
+                seen: seen.clone(),
+                body: "## ADDED Requirements\n\n### Requirement: A\nPERSISTED ROUND TWO.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting with canon".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps2,
+            &ws,
+            &repo,
+            &gh,
+            Some(&ctx),
+            &execute_request("9.9"),
+            &[],
+            0,
+            3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap().clone().expect("round two's edit ran");
+        assert!(
+            seen.contains("PERSISTED ROUND ONE"),
+            "round two resumed from round one's persisted edits, not base: {seen}"
+        );
+        assert!(
+            !seen.contains("Original body"),
+            "the deltas were NOT reset to base between rounds: {seen}"
+        );
+    }
+
+    /// (4.2) A round that introduces a NEW change-internal contradiction identity
+    /// is DISCARDED — the persisted state reverts to the prior round, so the
+    /// regression is not carried forward.
+    #[tokio::test]
+    async fn regressing_round_is_discarded_and_reverts_to_prior_persisted() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let branch = revision_branch_name("agent-q", "c1");
+
+        // Round 1: non-regressing (canon only) → persists "PERSISTED ROUND ONE".
+        let deps1 = ExecutorDeps {
+            edit: &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nPERSISTED ROUND ONE.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "canon conflict".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps1, &ws, &repo, &gh, Some(&ctx), &execute_request("9.9"), &[], 0, 3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            git_show(&ws, &format!("{branch}:{REVISION_SPEC}")).unwrap().contains("PERSISTED ROUND ONE"),
+            "round one persisted"
+        );
+
+        // Round 2: introduces a NEW `[in]` contradiction (absent before the
+        // round) → REGRESSED → discarded; the branch reverts to round one.
+        let deps2 = ExecutorDeps {
+            edit: &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nREGRESSED ROUND TWO.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![in_record("new-req-X", "new-req-Y")],
+                text: "a new within-change contradiction".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps2, &ws, &repo, &gh, Some(&ctx), &execute_request("9.9"), &[], 0, 3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR on a failed round");
+        let on_branch = git_show(&ws, &format!("{branch}:{REVISION_SPEC}")).unwrap();
+        assert!(on_branch.contains("PERSISTED ROUND ONE"), "reverted to prior persisted: {on_branch}");
+        assert!(!on_branch.contains("REGRESSED ROUND TWO"), "regression not carried forward: {on_branch}");
+        // The marker also reverted to the pre-round set (no carried-forward
+        // regressed `[in]` finding); it still records round one's canon finding.
+        let marker = crate::spec_revision::read_marker(&ws, "c1").unwrap().unwrap();
+        assert!(
+            marker.contradictions.iter().all(|f| f.requirement_a != "new-req-X"),
+            "the regressed finding must not survive in the marker: {:?}",
+            marker.contradictions
+        );
+    }
+
+    /// (4.2, base branch of the guard) A FIRST round that regresses — no prior
+    /// round persisted — is discarded down to base.
+    #[tokio::test]
+    async fn first_round_regression_reverts_to_base() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let branch = revision_branch_name("agent-q", "c1");
+
+        let deps = ExecutorDeps {
+            edit: &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nREGRESSED FIRST ROUND.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![in_record("x", "y")],
+                text: "a new within-change contradiction".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps, &ws, &repo, &gh, Some(&ctx), &execute_request("9.9"), &[], 0, 3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0);
+        let on_branch = git_show(&ws, &format!("{branch}:{REVISION_SPEC}")).unwrap();
+        assert!(on_branch.contains("Original body"), "first-round regression reverts to base: {on_branch}");
+        assert!(!on_branch.contains("REGRESSED FIRST ROUND"), "regression discarded: {on_branch}");
+    }
+
+    /// (4.3) A failed round opens NO PR, never advances base, AND keeps the
+    /// `.needs-spec-revision.json` marker (it is removed only on a clean re-gate).
+    #[tokio::test]
+    async fn failed_round_keeps_marker_and_never_commits_to_base() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let base_before = git_rev_parse(&ws, "main");
+
+        let deps = ExecutorDeps {
+            edit: &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nRevised.\n".into(),
+            },
+            regate: &CannedReGate(ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            }),
+            pr: &FakePr { url: "x".into(), calls: pr_calls.clone() },
+        };
+        run_revision_execute(
+            &deps, &ws, &repo, &gh, Some(&ctx), &execute_request("9.9"), &[], 0, 3,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*pr_calls.lock().unwrap(), 0, "no PR on a failed round");
+        assert_eq!(git_rev_parse(&ws, "main"), base_before, "base must not advance on a failed round");
+        assert!(
+            crate::spec_revision::read_marker(&ws, "c1").unwrap().is_some(),
+            "the marker remains after a failed round (removed only on a clean re-gate)"
+        );
     }
 }

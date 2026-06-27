@@ -191,8 +191,67 @@ pub struct SpecNeedsRevisionMarker {
     /// still parses (`#[serde(default)]` — back-compat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contradictions: Vec<ContradictionFindingRecord>,
+    /// Count of CONSECUTIVE failed `send it` rounds for this change — a round
+    /// being a spec-revision `send it` whose bounded converge loop exhausts its
+    /// budget with a contradiction remaining (the budget-exhausted branch in
+    /// `revision_session.rs`). Untracked daemon bookkeeping carried alongside
+    /// the durable findings; the spec-revision executor reads it to nudge the
+    /// operator toward DECOMPOSING a change that repeatedly fails to converge.
+    /// Reset to zero when the change clears (a clean re-gate opens a PR) OR when
+    /// the marker is cleared (removing the marker file drops the counter with
+    /// it). Omitted from JSON when zero so an older marker still parses
+    /// (`#[serde(default)]` — back-compat).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub consecutive_failed_rounds: u32,
     pub revision_suggestion: String,
     pub operator_action: String,
+}
+
+/// `skip_serializing_if` predicate for the consecutive-failure counter: keep
+/// the common zero out of the on-disk JSON an operator may read by eye.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// A fresh marker carrying only defaults (used when no parseable marker exists
+/// yet but one of the counter/findings refreshers must write one).
+fn fresh_marker(change: &str) -> SpecNeedsRevisionMarker {
+    SpecNeedsRevisionMarker {
+        change: change.to_string(),
+        marked_at: Utc::now(),
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
+        gate_error: None,
+        contradictions: Vec::new(),
+        consecutive_failed_rounds: 0,
+        revision_suggestion: String::new(),
+        operator_action: OPERATOR_ACTION.to_string(),
+    }
+}
+
+/// Atomically write `marker` to the change's marker path (tempfile + rename in
+/// the change directory, which must already exist). Shared by every marker
+/// writer so the durable-write semantics live in one place.
+fn persist_marker(workspace: &Path, change: &str, marker: &SpecNeedsRevisionMarker) -> Result<()> {
+    let path = marker_path(workspace, change);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
+    if !parent.is_dir() {
+        return Err(anyhow!(
+            "change directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, marker).with_context(|| {
+        format!("serializing spec-needs-revision marker for {}", path.display())
+    })?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn marker_path(workspace: &Path, change: &str) -> PathBuf {
@@ -215,16 +274,6 @@ pub fn write_marker(
     change: &str,
     detail: &SpecNeedsRevisionDetail,
 ) -> Result<()> {
-    let path = marker_path(workspace, change);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
-    if !parent.is_dir() {
-        return Err(anyhow!(
-            "change directory does not exist: {}",
-            parent.display()
-        ));
-    }
     let unarchivable_records: Vec<UnarchivableDeltaRecord> = detail
         .unarchivable_deltas
         .iter()
@@ -248,17 +297,13 @@ pub fn write_marker(
         canon_editing_tasks: detail.canon_editing_tasks.clone(),
         gate_error: detail.gate_error.clone(),
         contradictions: detail.contradictions.clone(),
+        // A fresh flag starts the consecutive-failure counter at zero; the
+        // marker-cleared / clean-re-gate reset paths bring it back here too.
+        consecutive_failed_rounds: 0,
         revision_suggestion: detail.revision_suggestion.clone(),
         operator_action: operator_action.to_string(),
     };
-    let tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
-    serde_json::to_writer_pretty(&tmp, &marker).with_context(|| {
-        format!("serializing spec-needs-revision marker for {}", path.display())
-    })?;
-    tmp.persist(&path)
-        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
-    Ok(())
+    persist_marker(workspace, change, &marker)
 }
 
 /// Idempotent removal of the marker. A missing file is success.
@@ -306,38 +351,48 @@ pub fn refresh_marker_contradictions(
     contradictions: &[ContradictionFindingRecord],
 ) -> Result<()> {
     let existing = read_marker(workspace, change).unwrap_or(None);
-    let mut marker = existing.unwrap_or_else(|| SpecNeedsRevisionMarker {
-        change: change.to_string(),
-        marked_at: Utc::now(),
-        unimplementable_tasks: Vec::new(),
-        unarchivable_deltas: Vec::new(),
-        canon_editing_tasks: Vec::new(),
-        gate_error: None,
-        contradictions: Vec::new(),
-        revision_suggestion: String::new(),
-        operator_action: OPERATOR_ACTION.to_string(),
-    });
+    let mut marker = existing.unwrap_or_else(|| fresh_marker(change));
     marker.contradictions = contradictions.to_vec();
     marker.marked_at = Utc::now();
+    persist_marker(workspace, change, &marker)
+}
 
-    let path = marker_path(workspace, change);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
-    if !parent.is_dir() {
-        return Err(anyhow!(
-            "change directory does not exist: {}",
-            parent.display()
-        ));
+/// Increment this change's CONSECUTIVE-failed-`send it`-rounds counter by one
+/// AND return the new value. Preserves the marker's other fields (mirrors
+/// [`refresh_marker_contradictions`]); when no parseable marker exists yet,
+/// writes a fresh one carrying just the bumped counter so the count survives
+/// into the next `send it`. The change directory must exist.
+///
+/// Callers treat this as best-effort: a write failure is logged AND must not
+/// change the revision outcome (fall back to the prior count for the reply).
+pub fn record_failed_round(workspace: &Path, change: &str) -> Result<u32> {
+    let mut marker = read_marker(workspace, change)
+        .unwrap_or(None)
+        .unwrap_or_else(|| fresh_marker(change));
+    marker.consecutive_failed_rounds = marker.consecutive_failed_rounds.saturating_add(1);
+    marker.marked_at = Utc::now();
+    let n = marker.consecutive_failed_rounds;
+    persist_marker(workspace, change, &marker)?;
+    Ok(n)
+}
+
+/// Reset this change's consecutive-failed-rounds counter to zero, preserving
+/// the marker's other fields. A no-op when no parseable marker exists OR the
+/// count is already zero (nothing to reset). The marker-cleared reset path is
+/// handled by removal of the marker file itself; this covers the clean-re-gate
+/// reset, where the marker persists.
+///
+/// Best-effort at the call site: a write failure is logged AND never changes
+/// the revision outcome.
+pub fn reset_consecutive_failures(workspace: &Path, change: &str) -> Result<()> {
+    let Some(mut marker) = read_marker(workspace, change).unwrap_or(None) else {
+        return Ok(());
+    };
+    if marker.consecutive_failed_rounds == 0 {
+        return Ok(());
     }
-    let tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
-    serde_json::to_writer_pretty(&tmp, &marker).with_context(|| {
-        format!("serializing refreshed spec-needs-revision marker for {}", path.display())
-    })?;
-    tmp.persist(&path)
-        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
-    Ok(())
+    marker.consecutive_failed_rounds = 0;
+    persist_marker(workspace, change, &marker)
 }
 
 #[cfg(test)]
@@ -709,5 +764,102 @@ mod tests {
         assert_eq!(parsed.unarchivable_deltas.len(), 1);
         assert_eq!(parsed.unarchivable_deltas[0].kind, "Renamed");
         assert_eq!(parsed.unarchivable_deltas[0].header, "from A to B");
+    }
+
+    /// `record_failed_round` increments the per-change counter AND persists it,
+    /// returning the new value each time (task 1.1 / 1.2).
+    #[test]
+    fn record_failed_round_increments_and_persists() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "c");
+        write_marker(ws, "c", &fixture_detail()).unwrap();
+        assert_eq!(record_failed_round(ws, "c").unwrap(), 1);
+        assert_eq!(record_failed_round(ws, "c").unwrap(), 2);
+        assert_eq!(record_failed_round(ws, "c").unwrap(), 3);
+        // The persisted marker carries the latest count AND keeps its findings.
+        let parsed = read_marker(ws, "c").unwrap().unwrap();
+        assert_eq!(parsed.consecutive_failed_rounds, 3);
+        assert_eq!(parsed.unimplementable_tasks.len(), 2);
+    }
+
+    /// With no parseable marker present, the first failed round writes a fresh
+    /// marker starting the counter at one (not at the threshold).
+    #[test]
+    fn record_failed_round_on_absent_marker_starts_at_one() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "c");
+        assert!(!marker_exists(ws, "c"));
+        assert_eq!(record_failed_round(ws, "c").unwrap(), 1);
+        assert_eq!(
+            read_marker(ws, "c").unwrap().unwrap().consecutive_failed_rounds,
+            1
+        );
+    }
+
+    /// `reset_consecutive_failures` zeroes the counter AND preserves the
+    /// marker's other fields (task 1.2 / 3.3); a later first failure starts at
+    /// one again, NOT at the threshold.
+    #[test]
+    fn reset_consecutive_failures_zeroes_and_preserves_fields() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "c");
+        write_marker(ws, "c", &fixture_detail()).unwrap();
+        record_failed_round(ws, "c").unwrap();
+        record_failed_round(ws, "c").unwrap();
+        reset_consecutive_failures(ws, "c").unwrap();
+        let parsed = read_marker(ws, "c").unwrap().unwrap();
+        assert_eq!(parsed.consecutive_failed_rounds, 0);
+        // Other fields survive the reset.
+        assert_eq!(parsed.unimplementable_tasks.len(), 2);
+        // A subsequent first failure does not jump back to the prior count.
+        assert_eq!(record_failed_round(ws, "c").unwrap(), 1);
+    }
+
+    /// Refreshing the contradiction set does NOT disturb the consecutive-failure
+    /// counter — the converge loop refreshes findings every re-gate but the
+    /// round count only changes on the budget-exhausted increment / a reset.
+    #[test]
+    fn refresh_contradictions_preserves_consecutive_failure_count() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "c");
+        write_marker(ws, "c", &fixture_detail()).unwrap();
+        record_failed_round(ws, "c").unwrap();
+        record_failed_round(ws, "c").unwrap();
+        refresh_marker_contradictions(
+            ws,
+            "c",
+            &[ContradictionFindingRecord {
+                gate: ContradictionGate::In,
+                requirement_a: "A".into(),
+                requirement_b: "B".into(),
+                canonical_capability: String::new(),
+                summary: "x".into(),
+                suggested_fix: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            read_marker(ws, "c").unwrap().unwrap().consecutive_failed_rounds,
+            2,
+            "refreshing findings must not reset the round counter"
+        );
+    }
+
+    /// Back-compat: a marker JSON with NO `consecutive_failed_rounds` field (an
+    /// older daemon) parses with the counter defaulting to zero.
+    #[test]
+    fn marker_without_failure_counter_field_deserializes() {
+        let raw = r#"{
+            "change": "old",
+            "marked_at": "2026-05-27T10:00:00Z",
+            "revision_suggestion": "no counter here",
+            "operator_action": "Edit tasks.md, commit + push, then delete this marker file."
+        }"#;
+        let parsed: SpecNeedsRevisionMarker = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.consecutive_failed_rounds, 0);
     }
 }

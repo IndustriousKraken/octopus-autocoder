@@ -1489,6 +1489,18 @@ pub struct ExecutorConfig {
     /// bound, the report names that specific requirement (escalation).
     #[serde(default = "default_revision_converge_attempts")]
     pub revision_converge_attempts: u32,
+    /// Consecutive failed `send it` revision rounds on ONE change before the
+    /// budget-exhausted failure reply ALSO recommends decomposing the change
+    /// into smaller changes (in addition to naming the remaining contradiction,
+    /// which it always does). A "failed round" is a `send it` whose bounded
+    /// converge loop exhausts its budget with a contradiction remaining; the
+    /// per-change counter resets when the change clears (a clean re-gate opens a
+    /// PR) or its `.needs-spec-revision.json` marker is cleared. `3` (the
+    /// default) nudges on the third consecutive non-convergence; below the
+    /// threshold the reply is unchanged. A change failing repeated revision
+    /// rounds is usually too large or interconnected to converge via `send it`.
+    #[serde(default = "default_revision_nonconvergence_threshold")]
+    pub revision_nonconvergence_threshold: u32,
     /// Additional whole-session re-invocations the orchestrator may perform when
     /// an executor session FAILS and produced no committable result — a clean
     /// working tree (executor-outcome-legibility-and-retry). A transient
@@ -1533,6 +1545,13 @@ pub fn default_revision_transcript_fetch_retries() -> u32 {
 /// restores base AND reports the remaining contradiction.
 pub fn default_revision_converge_attempts() -> u32 {
     2
+}
+
+/// Default for [`ExecutorConfig::revision_nonconvergence_threshold`]: 3
+/// consecutive failed `send it` rounds before the budget-exhausted failure
+/// reply recommends decomposing the change into smaller changes.
+pub fn default_revision_nonconvergence_threshold() -> u32 {
+    3
 }
 
 /// Opt-in gate for the change-internal contradiction pre-flight (a19).
@@ -2177,6 +2196,7 @@ pub fn placeholder_executor_config() -> ExecutorConfig {
         verifier_gate_retries: default_verifier_gate_retries(),
         revision_transcript_fetch_retries: default_revision_transcript_fetch_retries(),
         revision_converge_attempts: default_revision_converge_attempts(),
+        revision_nonconvergence_threshold: default_revision_nonconvergence_threshold(),
         session_retries: default_executor_session_retries(),
         implementer: None,
         changelog_stylist: None,
@@ -4796,6 +4816,7 @@ github:
             "verifier_gate_retries",
             "revision_transcript_fetch_retries",
             "revision_converge_attempts",
+            "revision_nonconvergence_threshold",
             "session_retries",
             "allowed_tools",
             "disallowed_bash_patterns",
@@ -4999,6 +5020,13 @@ github:
         );
         assert_eq!(default_revision_transcript_fetch_retries(), 2);
         assert_eq!(default_revision_converge_attempts(), 2);
+        // The non-convergence decomposition-nudge threshold defaults to 3.
+        assert_eq!(
+            exec.revision_nonconvergence_threshold,
+            default_revision_nonconvergence_threshold(),
+            "unset non-convergence threshold takes the serde default"
+        );
+        assert_eq!(default_revision_nonconvergence_threshold(), 3);
     }
 
     #[test]
