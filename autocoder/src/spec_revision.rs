@@ -34,13 +34,18 @@ pub struct GateErrorRecord {
 /// Outcome details captured at the moment the marker is written. Exactly one
 /// population is non-empty per write (the schema permits several):
 /// `unimplementable_tasks` (executor `SpecNeedsRevision`), `unarchivable_deltas`
-/// (pre-executor archivability check), OR `gate_error` (a verifier gate that
-/// could not run — a fail-closed hold). `revision_suggestion` always carries the
-/// human-readable narrative.
+/// (pre-executor archivability check), `canon_editing_tasks` (a task directing a
+/// canon edit), OR `gate_error` (a verifier gate that could not run — a
+/// fail-closed hold). `revision_suggestion` always carries the human-readable
+/// narrative.
 #[derive(Debug, Clone, Default)]
 pub struct SpecNeedsRevisionDetail {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     pub unarchivable_deltas: Vec<UnarchivableDelta>,
+    /// The text of each `tasks.md` task that directs a direct edit to the
+    /// canonical specs (the pre-executor canon-editing-tasks check). Populated
+    /// when that pre-flight flags the change; empty otherwise.
+    pub canon_editing_tasks: Vec<String>,
     pub revision_suggestion: String,
     pub gate_error: Option<GateErrorRecord>,
     /// The CURRENT contradiction set in STRUCTURED form (additive to the
@@ -173,6 +178,11 @@ pub struct SpecNeedsRevisionMarker {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unarchivable_deltas: Vec<UnarchivableDeltaRecord>,
+    /// The text of each `tasks.md` task that directs a canon edit (the
+    /// canon-editing-tasks pre-flight). Omitted from JSON when empty so a marker
+    /// written without it (an older daemon, or another hold reason) still parses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canon_editing_tasks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_error: Option<GateErrorRecord>,
     /// The current contradiction set in STRUCTURED form (additive to
@@ -235,6 +245,7 @@ pub fn write_marker(
         marked_at: Utc::now(),
         unimplementable_tasks: detail.unimplementable_tasks.clone(),
         unarchivable_deltas: unarchivable_records,
+        canon_editing_tasks: detail.canon_editing_tasks.clone(),
         gate_error: detail.gate_error.clone(),
         contradictions: detail.contradictions.clone(),
         revision_suggestion: detail.revision_suggestion.clone(),
@@ -300,6 +311,7 @@ pub fn refresh_marker_contradictions(
         marked_at: Utc::now(),
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        canon_editing_tasks: Vec::new(),
         gate_error: None,
         contradictions: Vec::new(),
         revision_suggestion: String::new(),
@@ -352,6 +364,7 @@ mod tests {
                 },
             ],
             unarchivable_deltas: Vec::new(),
+            canon_editing_tasks: Vec::new(),
             revision_suggestion:
                 "Replace 5.2 with a CI gate. Drop 15.3 — the workflow's own first real run is the integration test.".into(),
             gate_error: None,
@@ -418,6 +431,7 @@ mod tests {
                 header: "Reviewer prompt budget is operator-configurable".into(),
                 reason: "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)".into(),
             }],
+            canon_editing_tasks: Vec::new(),
             revision_suggestion: "Pre-flight check found 1 unarchivable spec delta:\n- capability=code-reviewer kind=Modified header=\"...\" reason=\"...\"".into(),
             gate_error: None,
             contradictions: Vec::new(),
@@ -432,6 +446,7 @@ mod tests {
         let detail = SpecNeedsRevisionDetail {
             unimplementable_tasks: Vec::new(),
             unarchivable_deltas: Vec::new(),
+            canon_editing_tasks: Vec::new(),
             revision_suggestion: "the [verifier:in] gate could not run".into(),
             gate_error: Some(GateErrorRecord {
                 gate: "[verifier:in]".into(),
@@ -478,6 +493,40 @@ mod tests {
         assert!(
             parsed.operator_action.contains("specs/<capability>/spec.md"),
             "operator_action must point at spec edit for unarchivable-deltas marker: {:?}",
+            parsed.operator_action
+        );
+    }
+
+    /// A canon-editing-tasks marker serialises its offending task lines AND
+    /// keeps the default tasks.md-edit operator action (the fix is to remove the
+    /// offending task, not edit a spec file).
+    #[test]
+    fn write_marker_serialises_canon_editing_tasks() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change_dir(ws, "foo");
+        let detail = SpecNeedsRevisionDetail {
+            canon_editing_tasks: vec![
+                "1.1 Apply the ADDED block to openspec/specs/cap/spec.md".into(),
+            ],
+            revision_suggestion: "A task directs a canon edit; remove it.".into(),
+            ..Default::default()
+        };
+        write_marker(ws, "foo", &detail).unwrap();
+        let raw = std::fs::read_to_string(
+            ws.join("openspec/changes/foo/.needs-spec-revision.json"),
+        )
+        .unwrap();
+        let parsed: SpecNeedsRevisionMarker = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.canon_editing_tasks.len(), 1);
+        assert!(parsed.canon_editing_tasks[0].contains("openspec/specs/cap/spec.md"));
+        assert!(parsed.unarchivable_deltas.is_empty());
+        assert!(parsed.unimplementable_tasks.is_empty());
+        // The fix is to remove the flagged task from tasks.md — the default
+        // operator action, not the spec-file-edit one.
+        assert!(
+            parsed.operator_action.contains("tasks.md"),
+            "operator_action must point at tasks.md: {:?}",
             parsed.operator_action
         );
     }
@@ -645,6 +694,7 @@ mod tests {
                 header: "from A to B".into(),
                 reason: "from-title not found".into(),
             }],
+            canon_editing_tasks: Vec::new(),
             revision_suggestion: "fix both".into(),
             gate_error: None,
             contradictions: Vec::new(),

@@ -406,6 +406,52 @@ fn strip_leading_html_comment_lines(body: &str) -> &str {
     &body[cursor..]
 }
 
+/// never-silent-when-addressed: `true` when `body`'s first non-whitespace
+/// token (after leading whole-line HTML comments are stripped) is
+/// `@<bot_username>` (case-insensitive on the username) — i.e. the message
+/// *addresses* the bot as a command attempt. This is the same leading-token
+/// rule [`parse_revision_trigger`] / [`parse_code_review_trigger`] apply; an
+/// incidental mention (`cc @<bot> fyi`) or a message with no leading mention
+/// returns `false`.
+fn addresses_bot(body: &str, bot_username: &str) -> bool {
+    let body = strip_leading_html_comment_lines(body);
+    let trimmed = body.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let expected_mention = format!("@{bot_username}");
+    let mention_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    trimmed[..mention_end].eq_ignore_ascii_case(&expected_mention)
+}
+
+/// never-silent-when-addressed: classify a comment as
+/// "addressed-but-unrecognized" — its first token addresses the bot
+/// ([`addresses_bot`]) but its verb is neither `revise` nor `code-review`.
+/// Such a comment from an authorized commenter earns the one-time
+/// command-affordance reply ([`compose_affordance_reply`]); a recognized
+/// verb returns `false` (it flows to its own handler), as does a
+/// non-addressing comment. Authorization + dedup are applied by the caller.
+pub(crate) fn is_addressed_but_unrecognized(comment_body: &str, bot_username: &str) -> bool {
+    addresses_bot(comment_body, bot_username)
+        && parse_revision_trigger(comment_body, bot_username).is_none()
+        && !parse_code_review_trigger(comment_body, bot_username)
+}
+
+/// never-silent-when-addressed: body of the one-time command-affordance
+/// reply posted when an authorized commenter addresses the bot with an
+/// unrecognized command. Lists the recognized commands so the operator can
+/// correct their syntax. The lead line is deliberately NOT the example
+/// syntax, so a re-parse of this reply (were the bot-author filter ever
+/// bypassed) cannot match the `@<bot> revise` trigger.
+pub(crate) fn compose_affordance_reply(bot_username: &str) -> String {
+    format!(
+        "🤖 That command wasn't recognized. On a PR I understand:\n\n\
+         - `@{bot_username} revise <text>` — revise this PR in place\n\
+         - `@{bot_username} code-review` — re-run the code review\n\n\
+         Other comments are ignored."
+    )
+}
+
 /// a000: decide whether a comment-sourced verb from `comment` is
 /// authorized to dispatch. Returns `true` when EITHER the comment's
 /// `author_association` is in `auth.allowed_associations` (case-sensitive
@@ -1561,6 +1607,92 @@ mod tests {
         assert!(parse_code_review_trigger(body, "bot"));
     }
 
+    // ---------- never-silent-when-addressed: PR affordance ----------
+
+    /// Task 3.2: a comment that does NOT address the bot as its first token
+    /// is not classified as addressed-but-unrecognized (so it earns no
+    /// affordance reply). Covers ordinary chatter AND an incidental mention
+    /// (`cc @bot ...`) where the mention is not the leading token.
+    #[test]
+    fn affordance_non_addressing_comment_is_not_unrecognized() {
+        assert!(!is_addressed_but_unrecognized("please take a look", "bot"));
+        assert!(!is_addressed_but_unrecognized("cc @bot fyi", "bot"));
+        assert!(!is_addressed_but_unrecognized("looks good to me", "bot"));
+        assert!(!is_addressed_but_unrecognized("", "bot"));
+        assert!(!is_addressed_but_unrecognized("@otherbot revise foo", "bot"));
+    }
+
+    /// Task 3.1: an authorized addressed-but-unrecognized comment — a plain
+    /// `@<bot> looks good` OR a mistyped verb (`@<bot> revize ...`) — IS
+    /// classified as addressed-but-unrecognized (the affordance trigger),
+    /// case-insensitively on the mention.
+    #[test]
+    fn affordance_addressed_unknown_verb_is_unrecognized() {
+        assert!(is_addressed_but_unrecognized("@bot looks good", "bot"));
+        assert!(is_addressed_but_unrecognized("@bot revize the thing", "bot"));
+        assert!(is_addressed_but_unrecognized("@BOT please archive", "bot"));
+        // Leading HTML comment is stripped before the leading-token check.
+        assert!(is_addressed_but_unrecognized(
+            "<!-- note -->\n@bot hello",
+            "bot"
+        ));
+    }
+
+    /// Task 3.1 (regression): a recognized verb (`revise` / `code-review`)
+    /// is NOT classified as addressed-but-unrecognized, so it never diverts
+    /// to the affordance reply — it still flows to its own handler.
+    #[test]
+    fn affordance_recognized_verbs_are_not_unrecognized() {
+        assert!(!is_addressed_but_unrecognized("@bot revise drop the error", "bot"));
+        assert!(!is_addressed_but_unrecognized("@bot code-review", "bot"));
+        assert!(!is_addressed_but_unrecognized("@bot REVISE foo", "bot"));
+    }
+
+    /// Task 3.1: the affordance reply names both recognized commands AND its
+    /// first line is NOT the example syntax — so a re-parse of the reply
+    /// (were the bot-author filter ever bypassed) cannot match the `revise`
+    /// or `code-review` trigger. Asserts behavior (commands named, no
+    /// re-trigger), not exact phrasing.
+    #[test]
+    fn affordance_reply_names_commands_and_does_not_self_trigger() {
+        let reply = compose_affordance_reply("bot");
+        assert!(reply.contains("@bot revise"), "names the revise command");
+        assert!(reply.contains("@bot code-review"), "names the code-review command");
+        // The reply, re-parsed, must not match either trigger (the example
+        // syntax is not the first line).
+        assert!(parse_revision_trigger(&reply, "bot").is_none());
+        assert!(!parse_code_review_trigger(&reply, "bot"));
+    }
+
+    /// Task 3.3: an unauthorized addressed-but-unknown comment fails the
+    /// authorization gate (so the dispatcher posts no affordance reply). An
+    /// `OWNER`-association comment passes. This is the same gate the `revise`
+    /// trigger uses; the affordance branch ANDs `is_comment_authorized` with
+    /// `is_addressed_but_unrecognized` before posting.
+    #[test]
+    fn affordance_authorization_gate_blocks_unauthorized() {
+        let auth = CommandAuthorizationConfig::default();
+        let unauthorized = crate::github::IssueComment {
+            id: 1,
+            body: "@bot looks good".to_string(),
+            user: Some(crate::github::IssueCommentUser {
+                login: "rando".to_string(),
+            }),
+            created_at: ts("2026-06-26T10:00:00Z"),
+            author_association: Some("NONE".to_string()),
+        };
+        assert!(is_addressed_but_unrecognized(&unauthorized.body, "bot"));
+        assert!(
+            !is_comment_authorized(&unauthorized, &auth),
+            "a NONE-association commenter is not authorized → no affordance reply"
+        );
+        let authorized = crate::github::IssueComment {
+            author_association: Some("OWNER".to_string()),
+            ..unauthorized.clone()
+        };
+        assert!(is_comment_authorized(&authorized, &auth));
+    }
+
     // ---------- a20a5: agent-notes extraction ----------
 
     fn ic(body: &str, ts: chrono::DateTime<chrono::Utc>) -> crate::github::IssueComment {
@@ -2439,6 +2571,169 @@ mod tests {
         let state = read_state(&paths, &ws, 53).unwrap().expect("state persisted");
         assert_eq!(state.auto_revisions_applied, 1);
 
+        token_env_clear(env_var);
+    }
+
+    // ============================================================
+    // revision-clears-needs-spec-revision-marker: a dirty-tree applied
+    // revision clears the change's `.needs-spec-revision.json` marker.
+    // ============================================================
+
+    /// Register `.needs-spec-revision.json` in the test workspace's
+    /// `.git/info/exclude` (mirroring `workspace::ensure_initialized`) so the
+    /// marker file does NOT dirty the working tree — exactly as in production,
+    /// where the gitignored marker leaves a clean-tree declination clean.
+    fn exclude_revision_marker(ws: &Path) {
+        let exclude = ws.join(".git/info/exclude");
+        let mut body = std::fs::read_to_string(&exclude).unwrap_or_default();
+        body.push_str("\n.needs-spec-revision.json\n");
+        std::fs::write(&exclude, body).unwrap();
+    }
+
+    /// Write a `.needs-spec-revision.json` marker for `change` in `ws`,
+    /// returning its path.
+    fn write_revision_marker(ws: &Path, change: &str) -> std::path::PathBuf {
+        let dir = ws.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".needs-spec-revision.json");
+        std::fs::write(&path, r#"{"change":"target-change","marked_at":"2026-05-25T10:00:00Z"}"#)
+            .unwrap();
+        path
+    }
+
+    /// Task 2.1: a dirty-tree `Completed` revision with a marker present
+    /// deletes that marker (asserts filesystem state, not message wording).
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_completed_clears_revision_marker() {
+        let env_var = "REVISIONS_TOKEN_CLEARS_MARKER";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(61, 6101).await;
+
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        let marker = write_revision_marker(&ws, "target-change");
+        assert!(marker.exists());
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Default `new` writes a file → dirty tree → applied (commit + push).
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !marker.exists(),
+            "an applied revision must clear the needs-spec-revision marker",
+        );
+        token_env_clear(env_var);
+    }
+
+    /// Task 2.2: a clean-tree declination, a substantive `Failed`, and a
+    /// precondition-unmet revision each RETAIN a present marker — no
+    /// revision was applied, so the flagged concern may still stand.
+    #[tokio::test]
+    async fn dispatcher_non_applied_outcomes_retain_revision_marker() {
+        let env_var = "REVISIONS_TOKEN_RETAINS_MARKER";
+        token_env_set(env_var);
+        for (i, label) in ["declination", "failed", "precondition"].iter().enumerate() {
+            let pr = 71 + i as u64;
+            let (server, _mocks) = revise_dispatcher_mockito(pr, 7101 + i as u64).await;
+            let (_dir, ws) = init_git_workspace();
+            exclude_revision_marker(&ws);
+            let marker = write_revision_marker(&ws, "target-change");
+            let (_td_paths, paths) = crate::testing::test_daemon_paths();
+            let repo = make_repo("git@github.com:owner/repo.git");
+            let gh = make_github(env_var);
+            // Every variant leaves the working tree clean → no diff committed.
+            let executor = match *label {
+                "declination" => StubExecutor::new_clean(vec![ExecutorOutcome::Completed {
+                    final_answer: Some("verified; no change needed".to_string()),
+                }]),
+                "failed" => StubExecutor::new(vec![ExecutorOutcome::Failed {
+                    reason: "agent run failed".to_string(),
+                }]),
+                "precondition" => StubExecutor::new(vec![ExecutorOutcome::PreconditionUnmet {
+                    reason: "no sandbox mechanism".to_string(),
+                }]),
+                _ => unreachable!(),
+            };
+            process_revision_requests_at(
+                &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+                CancellationToken::new(), &server.url(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("dispatcher {label} should succeed: {e:#}"));
+            assert!(
+                marker.exists(),
+                "{label}: marker must be retained when no revision is applied",
+            );
+        }
+        token_env_clear(env_var);
+    }
+
+    /// Task 2.3: a dirty-tree `Completed` revision with NO marker present is
+    /// a no-op for the clear (no error) — the clear is conditional on the
+    /// marker existing.
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_completed_no_marker_is_noop() {
+        let env_var = "REVISIONS_TOKEN_NO_MARKER_NOOP";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(81, 8101).await;
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        let marker = ws.join("openspec/changes/target-change/.needs-spec-revision.json");
+        assert!(!marker.exists());
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed even with no marker to clear");
+        assert!(!marker.exists());
+        token_env_clear(env_var);
+    }
+
+    /// Spec scenario "Marker deletion failure does not fail the revision":
+    /// the best-effort clear swallows a delete error. Simulated by making the
+    /// marker path a non-empty directory so `remove_file` fails with a
+    /// non-NotFound error; the revision must still be reported successful.
+    #[tokio::test]
+    async fn dispatcher_marker_clear_failure_does_not_fail_revision() {
+        let env_var = "REVISIONS_TOKEN_MARKER_CLEAR_FAILS";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(91, 9101).await;
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        // Marker path is a non-empty DIRECTORY → remove_file errs (not NotFound).
+        let marker = ws.join("openspec/changes/target-change/.needs-spec-revision.json");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("keep"), "x").unwrap();
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("revision must still succeed despite a marker-clear failure");
+        assert!(marker.exists(), "delete failed and was swallowed; path remains");
         token_env_clear(env_var);
     }
 

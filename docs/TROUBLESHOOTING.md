@@ -85,6 +85,18 @@ On any precondition violation, autocoder writes `<workspace>/openspec/changes/<c
 
 **Why this matters.** The pre-flight is sub-millisecond and runs on every change before every executor invocation (no caching — the canonical might have shifted since the prior check). The cost trade is dramatically favourable: a few markdown parses per iteration in exchange for never running an implementer against a change whose archive step is structurally guaranteed to fail.
 
+## Change held because a task directs a canon edit
+
+The `.needs-spec-revision.json` marker has a `canon_editing_tasks` array, AND the chatops alert frames the failure as "a task directing a canon edit (pre-flight)". This is a sibling of the a17 archivability reject above, but it inspects `tasks.md` CONTENT rather than spec-delta headers.
+
+**The cause.** A change's `tasks.md` is the implementer's marching orders, and the implementer implements CODE and TESTS only. The change's spec delta lives in its own `openspec/changes/<change>/specs/<capability>/spec.md` and is folded into the canonical `openspec/specs/` by `openspec archive` automatically. A task that instead directs the implementer to apply the delta to `openspec/specs/` directly (e.g. "Apply the ADDED Requirements block … to `openspec/specs/<cap>/spec.md`") makes the implementer pre-fold the requirement into canon; `openspec archive` then tries to fold the same delta, finds it already present, and aborts on a duplicate-ADD. Left uncaught, the change fails every iteration and goes perma-stuck.
+
+**The check.** Before invoking the executor, autocoder scans `tasks.md` for a task pairing a mutation verb (apply, add, copy, write, edit, update, insert, append, paste, create, populate — case-insensitive) with a canonical-specs target (the path segment `openspec/specs/`, OR the words `canon` / `canonical spec`). A reference to the change's OWN delta (`openspec/changes/<slug>/specs/…`, or a bare `specs/<cap>/spec.md`) is NOT a canonical-specs target; a read-only mention of canon (no mutation verb) is NOT flagged. On a flag the executor is NEVER invoked AND the `[in]`/`[canon]` verifier gates do not run.
+
+**Where to find the diagnosis.** Read `canon_editing_tasks` in the marker file — it names each offending task line. The marker's `revision_suggestion` is auto-generated and states the rule.
+
+**Fix.** Remove the offending task from `openspec/changes/<change>/tasks.md` (the spec delta itself is correct and untouched — do NOT edit `openspec/specs/`). Commit + push, then clear the marker via `@<bot> clear-revision <repo> <change>` from chat (or `rm <workspace>/openspec/changes/<change>/.needs-spec-revision.json` directly). The next iteration retries the change.
+
 ## PR-comment revision keeps failing
 
 You comment `@<bot> revise <text>` on an open PR and the bot replies
@@ -114,8 +126,13 @@ No bot reply, no apparent action. Check:
 - **Trigger pattern is strict:** the comment body MUST begin with
   `@<bot>` (case-insensitive) followed by `revise` (case-insensitive)
   followed by at least one non-whitespace character. `@<bot> looks good`
-  is conversational and is ignored. Leading whitespace before `@<bot>` is
-  tolerated; a non-`@<bot>` prefix is not.
+  is not a `revise` — but because it *addresses* the bot, an authorized
+  commenter gets a one-time affordance reply naming the recognized
+  commands rather than silence (see
+  [OPERATIONS.md → Unrecognized commands get a one-time affordance
+  reply](OPERATIONS.md#unrecognized-commands-get-a-one-time-affordance-reply)).
+  Leading whitespace before `@<bot>` is tolerated; a non-`@<bot>` prefix
+  is a non-addressing comment and is ignored with no reply.
 - **Wrong bot username:** if you have multiple bot users (e.g. one per
   GitHub org via `owner_tokens`), the trigger only fires when the
   mention matches the bot whose PAT is routed to this repo. Check the

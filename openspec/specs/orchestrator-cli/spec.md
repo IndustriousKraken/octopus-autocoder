@@ -2157,7 +2157,7 @@ autocoder SHALL ship an `install` subcommand alongside `run`, `rewind`, and `rel
 - **AND** no test depends on a TTY being available
 
 ### Requirement: Spec-needs-revision executor outcome + marker
-The executor SHALL return a new `ExecutorOutcome::SpecNeedsRevision` variant when one or more tasks in a change's `tasks.md` require capabilities outside the executor's sandbox. The agent flags upfront — BEFORE making any changes to the workspace — by scanning `tasks.md` against an enumerated set of unimplementable-task patterns. When the outcome fires, autocoder SHALL write an operator-cleared `.needs-spec-revision.json` marker in the change's directory, post a chatops alert under a new `AlertCategory::SpecNeedsRevision` (24h-throttled per the existing per-category window), and halt the queue walk for the iteration (consistent with the existing halt-on-non-archive semantic). The marker SHALL exclude the change from `list_pending` until removed by the operator, mirroring the perma-stuck marker's pattern.
+The executor SHALL return a new `ExecutorOutcome::SpecNeedsRevision` variant when one or more tasks in a change's `tasks.md` require capabilities outside the executor's sandbox. The agent flags upfront — BEFORE making any changes to the workspace — by scanning `tasks.md` against an enumerated set of unimplementable-task patterns. When the outcome fires, autocoder SHALL write an operator-cleared `.needs-spec-revision.json` marker in the change's directory, post a chatops alert under a new `AlertCategory::SpecNeedsRevision` (24h-throttled per the existing per-category window), and halt the queue walk for the iteration (consistent with the existing halt-on-non-archive semantic). The marker SHALL exclude the change from `list_pending` until removed by the operator or by the revision dispatcher on a dirty-tree Completed outcome, mirroring the perma-stuck marker's pattern.
 
 The agent SHALL NOT auto-edit `tasks.md` to make the spec implementable. The agent flags; the operator authors the edit. This preserves the project's invariant that no AI process modifies its own marching orders without human review.
 
@@ -2205,20 +2205,12 @@ The agent SHALL NOT auto-edit `tasks.md` to make the spec implementable. The age
   incremented (the marker is operator-action territory, not
   repeat-failure territory)
 
-#### Scenario: Marker is operator-cleared, not auto-cleared
-- **WHEN** an operator edits `tasks.md` to revise the flagged
-  tasks AND commits + pushes the revision
-- **THEN** the marker file `.needs-spec-revision.json` is
-  NOT auto-removed by autocoder on the next iteration
-- **AND** the operator must delete the marker file
-  (typically by `rm` and a subsequent commit, OR by deleting
-  it locally and relying on autocoder's iteration to surface
-  the now-cleaned state on next pass — the marker is in
-  `.git/info/exclude` so it's never committed, but operators
-  who want a literal git-tracked clear may use `git rm`)
-- **AND** the next iteration after the marker is gone
-  proceeds normally: the change re-enters `list_pending`
-  and the executor is invoked against the revised tasks.md
+#### Scenario: Marker is operator-cleared for the tasks.md workflow; auto-cleared only on a successful revision-dispatcher run
+- **WHEN** an operator edits `tasks.md` to revise the flagged tasks AND commits + pushes the revision
+- **THEN** the marker file `.needs-spec-revision.json` is NOT auto-removed by autocoder on the next polling iteration
+- **AND** the operator must delete the marker file (typically by `rm` and a subsequent commit, OR by deleting it locally and relying on autocoder's iteration to surface the now-cleaned state on next pass — the marker is in `.git/info/exclude` so it's never committed)
+- **AND** the next iteration after the marker is gone proceeds normally: the change re-enters `list_pending` and the executor is invoked against the revised tasks.md
+- **EXCEPTION** the revision dispatcher clears the marker on a dirty-tree `Completed` outcome, per the "A successfully applied revision clears the change's needs-spec-revision marker" requirement above — this is the only auto-clear path; the prohibition above applies exclusively to the edit-tasks.md workflow and any other polling iteration
 
 #### Scenario: Operator overrides an over-conservative flag
 - **WHEN** an operator reviews the flagged tasks AND judges
@@ -2378,7 +2370,7 @@ Iteration-level errors that happen OUTSIDE the per-change loop (workspace init, 
 - **AND** the counter increments by exactly 1, not 2
 
 ### Requirement: Chatops operator commands
-The chatops listener SHALL recognize a small set of operator-issued commands as in-channel equivalents of the most common SSH-and-edit operator workflows: querying daemon state, clearing exclusion markers, and wiping the local workspace. Commands SHALL be addressed to the bot via the per-backend mention syntax (Slack `<@bot>`, Discord `<@!bot>`, etc.) followed by a verb and arguments. Unrecognized verbs SHALL be silently ignored (no negative feedback for typos in normal channel chat). Recognized commands SHALL be parsed by a backend-independent parser, dispatched as actions through the existing Unix-domain control socket, and replied to in the same channel where the command arrived.
+The chatops listener SHALL recognize a small set of operator-issued commands as in-channel equivalents of the most common SSH-and-edit operator workflows: querying daemon state, clearing exclusion markers, and wiping the local workspace. Commands SHALL be addressed to the bot via the per-backend mention syntax (Slack `<@bot>`, Discord `<@!bot>`, etc.) followed by a verb and arguments. An addressed message whose verb is not in the recognized set — AND which matches no open AskUser question — SHALL receive the `?` reaction acknowledgment (per `chatops-manager`'s `None` → `?` dispatcher contract): no text reply, but never silent (conforming to the `The bot acknowledges every request addressed to it, never silently dropping it` standard). A message that does NOT address the bot (no leading mention, or ordinary channel chatter) is ignored entirely, with no reaction. Recognized commands SHALL be parsed by a backend-independent parser, dispatched as actions through the existing Unix-domain control socket, and replied to in the same channel where the command arrived.
 
 The initial verb set is:
 
@@ -2434,24 +2426,23 @@ The threat model is unchanged from existing chatops behavior: write access to th
 #### Scenario: wipe-workspace two-step confirmation
 - **WHEN** an operator posts `@<bot> wipe-workspace your-repo`
   in channel `C` AND `your-repo` resolves to a unique repo
-- **THEN** the bot posts a warning naming the workspace path it
-  would delete (and that a re-clone follows on the next
-  iteration) AND prompting the operator to reply with the
-  canonical confirm verb (`@<bot> confirm`) within the
-  confirmation window
+- **THEN** the bot posts a warning
+  `⚠️ This will delete /tmp/workspaces/<sanitized-url>
+  (forces a re-clone on the next iteration). Reply 'confirm'
+  within 60 seconds.`
 - **AND** the bot stores an in-memory pending-confirmation
   entry keyed by `C` with a 60-second expiry
-- **WHEN** the operator (any channel member) replies with the
-  confirm verb (`@<bot> confirm`, or the bare/deprecated alias)
-  in `C` within 60 seconds
+- **WHEN** the operator (any channel member) replies
+  `confirm` in `C` within 60 seconds
 - **THEN** the bot submits the `WipeWorkspace` action,
-  removes the pending entry, AND posts a success confirmation
-  naming the wiped workspace
-- **AND** if no confirm reply arrives within 60 seconds, the
-  pending entry expires AND a subsequent confirm reply is
-  treated as if there were no pending confirmation (the bot
-  reports there is no pending confirmation in the channel —
-  the op-agnostic message shared by every two-step confirm)
+  removes the pending entry, AND posts
+  `✓ wiped /tmp/workspaces/<sanitized-url>; next iteration
+  will re-clone`
+- **AND** if no `confirm` reply arrives within 60 seconds,
+  the pending entry expires AND a subsequent `confirm` reply
+  is treated as if there were no pending confirmation
+  (`✗ no pending wipe-workspace confirmation in this
+  channel (or it expired)`)
 
 #### Scenario: Cross-channel confirmations do not match
 - **WHEN** the wipe-workspace command is issued in channel A
@@ -2461,18 +2452,20 @@ The threat model is unchanged from existing chatops behavior: write access to th
 - **AND** channel A's pending confirmation expires after 60s
   without firing
 
-#### Scenario: Unknown verbs are silently ignored
+#### Scenario: Unknown verbs addressed to the bot get a `?` acknowledgment, not silence
 - **WHEN** a message starts with the bot mention but the
   next token is not in the recognized verb set (e.g.
-  `@<bot> hello`, `@<bot> please archive everything`, an
-  AskUser reply that doesn't match an open question)
+  `@<bot> hello`, `@<bot> please archive everything`)
 - **THEN** the operator-command parser returns `None`
 - **AND** the chatops listener continues to the existing
   AskUser-reply detection path (so chatops-escalation
   replies still work as today)
-- **AND** if neither path matches, the message is ignored
-  silently (no error reply, no log spam beyond the existing
-  message-received DEBUG log)
+- **AND** if the AskUser path also does not match, the listener
+  applies the `?` reaction acknowledgment (per `chatops-manager`'s
+  `None` → `?` contract) — no text reply, but not silent
+- **AND** a message that does NOT address the bot (no leading
+  mention) receives no reaction (ordinary channel chatter is
+  not acknowledged)
 
 #### Scenario: Repo-substring matching is case-insensitive
 - **WHEN** an operator posts `@<bot> status MYREPO`,
@@ -2498,7 +2491,8 @@ The threat model is unchanged from existing chatops behavior: write access to th
 - **WHEN** an operator posts `@<bot> pause your-repo` (or
   `resume`, `clear-alert-throttle`)
 - **THEN** the message is parsed as an unknown verb AND
-  silently ignored (per the unknown-verbs scenario above)
+  acknowledged with the `?` reaction (per the unknown-verbs
+  scenario above)
 - **AND** the spec explicitly leaves these verbs to
   follow-up changes when usage patterns indicate they're
   worth adding
@@ -3076,20 +3070,28 @@ The `❌ <audit-type> produced an invalid proposal` chatops notification SHALL f
 ### Requirement: PR comments matching `@<bot> revise <text>` trigger an in-place revision of the autocoder-opened PR
 Each polling iteration, before processing pending changes for a repository, the daemon SHALL fetch open pull requests whose head branch matches `repositories[].agent_branch` AND poll each one's issue comments for revision-trigger messages. A comment qualifies as a trigger when its body's first non-whitespace token is `@<bot-username>` (case-insensitive on the username) AND its next whitespace-separated token (case-insensitive) is `revise` AND at least one non-whitespace character follows. The revision text is everything after `revise` with leading whitespace trimmed. Comments authored by the bot itself (`user.login == self.bot_username`) SHALL be filtered before parsing. The bot's GitHub username SHALL be learned at startup via `GET /user` and cached for the process lifetime.
 
+A comment whose first non-whitespace token is `@<bot-username>` but whose verb is NOT a recognized command (`revise`, `code-review`) AND whose author is authorized SHALL receive a one-time command-affordance reply: a single PR comment listing the recognized commands AND noting the command was not recognized, deduplicated by the originating comment id so the every-iteration comment fetch posts it at most once. This conforms to the `The bot acknowledges every request addressed to it, never silently dropping it` standard — a forge PR has no bot-reaction affordance, so the acknowledgment is a reply. A comment that does NOT address the bot as its first token (an incidental mention, or none), OR whose author is not authorized, is ignored with no reply. Bot-authored comments remain filtered before this handling, so the affordance never replies to the bot's own comments; the reply's example syntax is not placed as its first line, so a re-parse cannot match the `revise` trigger.
+
 #### Scenario: Triggering comment is detected
 - **WHEN** an open PR has a new comment whose body is `@<bot> revise the find_user function drops error info`
 - **THEN** the daemon parses the body as a revision trigger
 - **AND** extracts the revision text `the find_user function drops error info`
 
-#### Scenario: Non-triggering comment is ignored
-- **WHEN** an open PR has a new comment whose body is `@<bot> looks good`
-- **THEN** the daemon does NOT treat the body as a trigger
-- **AND** no revision is attempted
+#### Scenario: An addressed comment with an unrecognized command gets a one-time affordance reply
+- **WHEN** an open PR has a new comment from an authorized commenter whose first token is `@<bot>` but whose verb is not `revise` or `code-review` (e.g. `@<bot> looks good`, or a mistyped `@<bot> revize ...`)
+- **THEN** the daemon does NOT attempt a revision
+- **AND** it posts exactly one affordance reply listing the recognized commands (`@<bot> revise <text>`, `@<bot> code-review`) AND noting the command was not recognized
+- **AND** the reply is deduplicated by the originating comment id (posted at most once for that comment across iterations)
+
+#### Scenario: A non-addressing comment is ignored
+- **WHEN** an open PR has a comment that does NOT begin with `@<bot>` as its first token (a plain review comment, or `cc @<bot>` where the mention is not the leading token)
+- **THEN** the daemon does NOT treat it as a trigger AND does NOT post an affordance reply
+- **AND** ordinary PR discussion is not acknowledged
 
 #### Scenario: Bot's own comments are filtered
-- **WHEN** the daemon's previous revision reply (`✅ Revision applied: ...`) appears in the comment fetch
+- **WHEN** the daemon's previous revision reply (`✅ Revision applied: ...`) OR a prior affordance reply appears in the comment fetch
 - **THEN** the daemon filters it out before parsing
-- **AND** the same reply does not trigger a recursive revision
+- **AND** the same reply does not trigger a recursive revision OR a recursive affordance reply
 
 ### Requirement: Revision execution updates the agent branch and posts a reply comment
 On a triggering comment for an open PR, the daemon SHALL re-invoke the executor in revision mode (passing the original change material, the current PR diff, AND the revision text). The executor's outcome drives the next step: `Completed` → see the branching below; `AskUser` → existing chatops escalation (no commit, no count increment, no PR reply yet, revision treated as in-progress); a substantive `Failed` (the subprocess ran and the task failed) → failure reply comment + count increment; a **precondition-unmet** failure (the agent subprocess never started because a required precondition was unmet, e.g. the OS-sandbox-mechanism gate) → failure reply comment that directs the operator to resolve the precondition AND post a new revision request, with the trigger consumed (manual re-trigger; the daemon does NOT auto-retry, since an unmet precondition will not heal between polls) but the revision count NOT incremented (no revision work was attempted).
@@ -8791,4 +8793,81 @@ This cap is independent of the auto-revision cap (`executor.max_auto_revisions_p
 - **WHEN** a human cap is configured AND the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
 - **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
 - **AND** exhausting the human cap does not change the auto-revision count
+
+### Requirement: Pre-flight rejects a change whose tasks direct edits to the canonical specs
+Before invoking the executor against any change, autocoder SHALL scan the change's `tasks.md` for any task that directs a direct edit to the canonical specs, AND reject the change for revision when one is found. This runs alongside the `Spec-delta archivability pre-flight check` — the same point in the pipeline, the same marker, the same halt semantics — but it inspects task CONTENT rather than delta headers. The rationale: the implementer implements code and tests only; a change's spec delta lives in its own `specs/<capability>/spec.md` and is folded into the canonical specs by `openspec archive`. A task that instead applies the delta to `openspec/specs/` makes the implementer pre-fold canon, after which `openspec archive` aborts on a duplicate requirement and the change goes perma-stuck — so the defect SHALL be caught before any executor or verifier-gate run is spent on it.
+
+The detection is mechanical AND precision-biased: a task is flagged when it pairs a mutation verb (apply, add, copy, write, edit, update, insert, append, paste, create, populate — case-insensitive) with a canonical-specs target (the path segment `openspec/specs/`, OR the words `canon` / `canonical spec`). A reference to the change's OWN delta — a path under `openspec/changes/<slug>/specs/`, or a `specs/<capability>/spec.md` qualified as belonging to this change — is NOT a canonical-specs target. A read-only mention of canon for context (no mutation verb) is NOT flagged.
+
+On a flagged task, autocoder SHALL write `.needs-spec-revision.json` whose `revision_suggestion` names the offending task(s) AND states that the implementer implements code and tests only — the spec delta is folded by `openspec archive`, so no task may apply it to `openspec/specs/`. It SHALL post the `AlertCategory::SpecNeedsRevision` chatops alert (subject to the existing 24h throttle) AND halt the queue walk for this iteration per the same-repo blocking policy. The executor SHALL NOT be invoked for this change, NOR SHALL the `[in]` / `[canon]` verifier gates run for it.
+
+#### Scenario: A task applying the delta to canon is flagged before the executor
+- **WHEN** a change's `tasks.md` contains a task such as `Apply the ADDED Requirements block from specs/<cap>/spec.md to openspec/specs/<cap>/spec.md`
+- **THEN** the pre-flight flags it (mutation verb `Apply` + canonical-specs target `openspec/specs/`)
+- **AND** autocoder writes `.needs-spec-revision.json` naming the offending task, posts the `SpecNeedsRevision` alert, AND halts
+- **AND** the executor is NOT invoked AND the `[in]` / `[canon]` gates do NOT run for this change
+
+#### Scenario: A read-only reference to canon is not flagged
+- **WHEN** a task references the canonical specs for context only (e.g. "ensure the change matches the existing `<cap>` contract") with no mutation verb directing a write to `openspec/specs/`
+- **THEN** the pre-flight does NOT flag it
+- **AND** the change proceeds normally to the executor
+
+#### Scenario: A reference to the change's own delta is not flagged
+- **WHEN** a task references the change's own delta — a path under `openspec/changes/<slug>/specs/`, or `specs/<cap>/spec.md` qualified as belonging to this change
+- **THEN** the pre-flight does NOT treat it as a canonical-specs target
+- **AND** the change proceeds normally
+
+#### Scenario: A clean change is unaffected
+- **WHEN** a change's `tasks.md` directs only code and test work
+- **THEN** the pre-flight finds nothing to flag
+- **AND** the change proceeds to the executor exactly as before
+
+### Requirement: A successfully applied revision clears the change's needs-spec-revision marker
+When the revision dispatcher applies a revision to an open PR with the dirty-tree `Completed` outcome — a real change committed and force-pushed to the agent branch, per "Revision execution updates the agent branch and posts a reply comment" — the daemon SHALL clear that change's local `.needs-spec-revision.json` marker if it is present, AFTER the commit and `--force-with-lease` push succeed. This eliminates the operator toil of remembering `clear-revision` once a flagged spec has been revised: the open PR already parks the repository, so the marker's hold is redundant, and the marker is transient runtime state (gitignored, lost on re-clone) rather than the authoritative record — the gate or preflight that wrote it remains the source of truth.
+
+The clear SHALL fire ONLY for the dirty-tree `Completed` branch (a revision was actually applied). It SHALL NOT clear the marker on a clean-tree declination (`Completed` with no code change), a substantive `Failed`, a precondition-unmet failure, or `AskUser` — no revision landed in those cases, so a flagged concern may still stand. The clear SHALL be best-effort: a failure to delete the marker is logged but does NOT fail the revision, which has already succeeded.
+
+This clear is a daemon-side filesystem delete performed after the push. It does NOT change the existing revision behavior in which the agent is instructed not to delete the marker and the daemon unstages it so it is never committed. The operator `clear-revision` verb is unchanged and remains the path for markers that never reach a revision (e.g. an operator-must-edit `SpecNeedsRevision` flag) and as a manual override. Clearing on a successful revision is safe under a later close-without-merge: the gate or preflight re-flags the still-un-revised spec on a subsequent pass and re-writes the marker, so no un-revised change is stranded.
+
+#### Scenario: A successfully applied revision clears a present marker
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision dispatcher processes a triggering comment AND the executor returns the dirty-tree `Completed` outcome (the commit and `--force-with-lease` push to the agent branch succeed)
+- **THEN** the daemon deletes that change's `.needs-spec-revision.json` marker
+- **AND** the revision's existing behavior (the success reply comment, the cap increment, the seen-marker advance) is unchanged
+
+#### Scenario: A declination or failed revision retains the marker
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision outcome is a clean-tree `Completed` declination (no code change), OR a substantive `Failed`, OR a precondition-unmet failure, OR `AskUser`
+- **THEN** the daemon does NOT delete the `.needs-spec-revision.json` marker (no revision was applied, so the flagged concern may still stand)
+
+#### Scenario: No marker present — clear is a no-op
+- **WHEN** a dirty-tree `Completed` revision succeeds for a change with NO `.needs-spec-revision.json` marker present
+- **THEN** the dispatcher performs no marker delete AND reports no error (the clear is conditional on the marker existing)
+
+#### Scenario: Marker deletion failure does not fail the revision
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision dispatcher processes a triggering comment AND the executor returns the dirty-tree `Completed` outcome AND the marker deletion fails
+- **THEN** the deletion failure is logged AND the revision outcome is still reported as successful (the marker is non-authoritative runtime state)
+
+### Requirement: The spec-revision executor holds the per-repo busy marker for its run
+When the daemon runs a `send it` spec-revision (the spec-revision executor that drains a revision-execute request and runs the bounded edit → re-gate converge loop), it SHALL acquire/stamp the per-repo busy marker for the DURATION of that revision, recording the change slug being revised, AND SHALL release the marker when the revision completes via ANY terminal path: a clean re-gate that opens a PR, the converge budget exhausted with a contradiction remaining, a scope/edit-guardrail violation, a gate that could-not-run, an unreadable discussion thread, OR an error.
+
+This brings the revision under the same per-repo concurrency control as a normal pass (per `Per-repo busy marker prevents concurrent work`): a normal pass and a spec-revision SHALL NOT run concurrently on one workspace. It also makes an in-flight revision VISIBLE to the `status` verb: because the `currently:` line is computed from the per-repo busy marker (per `Status reply always shows live workspace snapshot`), and that requirement's branching renders a stamped marker whose `change` is non-empty as `working on <change> (started <age> ago)`, a `status` issued while a revision is editing or re-gating SHALL reflect the change under revision rather than reporting `idle`.
+
+Before this requirement the spec-revision executor stamped no marker, so a `status` issued during an active revision read `currently: idle` — a false negative the marker now prevents (consistent with the existing rule that status MUST NOT report `idle` when a marker is stamped). This requirement does NOT add a revision-specific `currently:` variant; surfacing the change via the existing change-non-empty branch is sufficient to remove the false-idle.
+
+#### Scenario: A revision in flight is not reported as idle
+- **WHEN** the spec-revision executor is actively revising change `c03-adaptive-selection` (editing its spec deltas or re-running the `[in]` / `[canon]` gates)
+- **AND** an operator issues `status <repo>` for that repo
+- **THEN** the per-repo busy marker is stamped with `c03-adaptive-selection`, so the `currently:` line reads `working on c03-adaptive-selection (started <age> ago)` per the live-busy-marker branching
+- **AND** the `currently:` line does NOT read `idle`
+
+#### Scenario: The marker is released on every terminal path
+- **WHEN** a revision completes — whether by a clean re-gate opening a PR, the converge budget exhausting with a contradiction remaining, a scope/edit-guardrail violation, a gate that could-not-run, an unreadable discussion thread, OR an error
+- **THEN** the per-repo busy marker is released
+- **AND** a subsequent `status` reflects the post-revision state (idle, or the next unit of work) with no lingering revision marker
+
+#### Scenario: A pass and a revision do not run concurrently on one workspace
+- **WHEN** a spec-revision holds the per-repo busy marker for a repo
+- **THEN** a normal pass for that repo cannot acquire the marker until the revision releases it, per `Per-repo busy marker prevents concurrent work`
 

@@ -5,6 +5,7 @@
 //! LLM cost has already been spent.
 
 pub mod canon_contradiction;
+pub mod canon_editing_tasks;
 pub mod change_contradiction;
 pub mod corpus_check;
 pub mod global_rules;

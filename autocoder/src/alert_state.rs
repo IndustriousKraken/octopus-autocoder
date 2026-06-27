@@ -118,6 +118,15 @@ pub struct AlertState {
     /// best-effort secondary store that survives state-file pruning.
     #[serde(default)]
     pub rereview_suggestion_dedup: HashMap<String, u32>,
+    /// Per-comment command-affordance reply deduplication map
+    /// (never-silent-when-addressed). Keyed by the GitHub `comment_id` of an
+    /// addressed-but-unrecognized PR comment (first token `@<bot>`, verb not
+    /// `revise`/`code-review`). Records when the one-time affordance reply
+    /// was posted so the every-iteration comment fetch posts it at most once
+    /// per comment. Reuses the per-comment-id dedup keying the revise /
+    /// code-review notification maps use.
+    #[serde(default)]
+    pub affordance_replies: HashMap<String, DateTime<Utc>>,
 }
 
 /// Per-comment record of which revise-lifecycle notifications have
@@ -293,6 +302,21 @@ impl AlertState {
             CodeReviewNotificationKind::Complete => entry.posted_complete_at.is_some(),
             CodeReviewNotificationKind::Failed => entry.posted_failed_at.is_some(),
         }
+    }
+
+    /// `true` when the one-time command-affordance reply has already been
+    /// posted for `comment_id` (never-silent-when-addressed). A missing entry
+    /// returns `false`.
+    pub fn affordance_reply_already_posted(&self, comment_id: &str) -> bool {
+        self.affordance_replies.contains_key(comment_id)
+    }
+
+    /// Record that the command-affordance reply was posted for `comment_id`
+    /// at `when` (never-silent-when-addressed). Called AFTER a successful
+    /// post, before saving the alert-state file.
+    pub fn record_affordance_reply(&mut self, comment_id: &str, when: DateTime<Utc>) {
+        self.affordance_replies
+            .insert(comment_id.to_string(), when);
     }
 
     /// Idempotent removal of the alert-state file. A missing file is a
@@ -580,6 +604,38 @@ mod tests {
         assert_eq!(entry.posted_failed_at, Some(t2));
         assert_eq!(entry.posted_succeeded_at, None);
         assert_eq!(state.revise_notifications.len(), 1);
+    }
+
+    /// never-silent-when-addressed (task 3.1 dedup): the affordance-reply
+    /// dedup map records a comment id once and reports it as already-posted
+    /// thereafter, surviving a save/load round-trip. A missing field in a
+    /// legacy file defaults to an empty map.
+    #[test]
+    fn affordance_replies_dedup_round_trips_and_defaults_empty() {
+        let (_temp, paths) = test_daemon_paths();
+        let ws = workspace_under(&paths);
+        let mut state = AlertState::default();
+        assert!(!state.affordance_reply_already_posted("c-100"));
+        state.record_affordance_reply("c-100", Utc::now());
+        assert!(state.affordance_reply_already_posted("c-100"));
+        assert!(!state.affordance_reply_already_posted("c-101"));
+        state.save(&paths, &ws).unwrap();
+
+        let reloaded = AlertState::load_or_default(&paths, &ws);
+        assert!(
+            reloaded.affordance_reply_already_posted("c-100"),
+            "affordance dedup entry must survive save/load"
+        );
+        assert!(!reloaded.affordance_reply_already_posted("c-101"));
+
+        // A legacy file with no `affordance_replies` key loads with an empty
+        // map (no false positives).
+        let legacy_json = serde_json::json!({ "alerts": {} });
+        let path = alert_state_path(&paths, &ws);
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap()).unwrap();
+        let legacy = AlertState::load_or_default(&paths, &ws);
+        assert!(legacy.affordance_replies.is_empty());
+        assert!(!legacy.affordance_reply_already_posted("c-100"));
     }
 
     #[test]

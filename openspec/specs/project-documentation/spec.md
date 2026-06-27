@@ -1272,3 +1272,53 @@ OCTOPUS.md SHALL be discoverable via the `AGENTS.md` convention: the repository'
 - **THEN** the `AGENTS.md` reference to OCTOPUS.md is present
 - **AND** the repository's pre-existing `AGENTS.md` content is left intact
 
+### Requirement: The bot acknowledges every request addressed to it, never silently dropping it
+
+When an operator authorized on that surface **addresses** the bot — a `@<bot>` command in chatops (where channel write-access is the authorization boundary), a `@<bot>` comment from an authorized commenter on a forge pull request (GitHub, and any future GitLab/other forge), or any future addressed surface — AND the bot has **no handler** for the request (an unrecognized verb, a malformed command, a request it cannot map to any action), it SHALL emit a non-silent acknowledgment rather than dropping the request without any signal. The acknowledgment scales to the surface and the need: a reaction where a minimal "not understood" signal suffices (the chatops `?` reaction), OR a reply naming what the bot can do where the affordance is more useful (a forge PR comment).
+
+A message is **addressed** when the bot mention is the leading token of a command attempt (the "first token is `@<bot>`" rule the existing triggers use). A message that does NOT address the bot — an incidental mention (`cc @<bot>`), or ordinary channel/PR conversation with no mention — is NOT subject to this requirement; the bot SHALL NOT react to ordinary conversation. **Silent** means no acknowledgment of any kind; a `?` reaction is an acknowledgment, not silence.
+
+This standard governs requests the bot has **no handler** for. It does NOT govern a RECOGNIZED request the bot deliberately rate-limits, caps, or declines under policy (e.g. a per-PR revision cap): those follow their own one-time-decline-then-deduplicate policy, where a single decline is the acknowledgment AND subsequent duplicates of the same request MAY be deduplicated without re-acknowledging. It ALSO does NOT govern a request dropped by an access-control gate before the bot considers acting — e.g. a commenter not authorized on that surface — which follows that gate's own decline-or-stay-silent policy (such as the forge `decline_comment` flag, default no-reply to avoid public-PR spam and feedback loops). "Never silent" requires at least one acknowledgment per distinct addressed request **from an authorized operator** that the bot cannot handle — not a reply to every repeat of an already-answered one, AND not a reply to a request an access-control gate has already dropped.
+
+This is a cross-surface UX invariant, sibling to `Control-plane gatekeepers fail closed`: a control that silently does nothing when addressed leaves the operator unable to tell whether the bot saw the request, is working, or rejected it.
+
+#### Scenario: An unrecognized addressed request is acknowledged, not dropped
+- **WHEN** an operator authorized on that surface addresses the bot (mention as the leading token) AND the request matches no handler the bot can act on
+- **THEN** the bot emits a non-silent acknowledgment — a reaction where a minimal signal suffices, OR a reply naming what it can do where the affordance is more useful
+- **AND** the operator is never left with no signal at all
+
+#### Scenario: A non-addressing message is not reacted to
+- **WHEN** a message does not address the bot (an incidental mention, or ordinary conversation with no mention)
+- **THEN** the bot does NOT react or reply
+- **AND** ordinary conversation is never decorated with acknowledgments
+
+#### Scenario: An access-control-gated request follows the gate's policy, not this standard
+- **WHEN** a commenter who is NOT authorized on the surface addresses the bot with a request the bot has no handler for (e.g. an unauthorized author on a public forge PR)
+- **THEN** the request follows that surface's access-control policy (e.g. the forge `decline_comment` flag — by default no reply, to avoid public-PR spam and feedback loops)
+- **AND** this standard does NOT compel an acknowledgment
+
+#### Scenario: A reaction counts as acknowledgment
+- **WHEN** the surface supports reactions AND the bot acknowledges an unrecognized addressed request with the `?` reaction
+- **THEN** the invariant is satisfied without a text reply
+- **AND** "silent" is reserved for the case of no acknowledgment of any kind
+
+### Requirement: OCTOPUS.md documents the local verify pre-check
+Beyond the protocols listed in the `Managed repos carry a committed OCTOPUS.md agent guide` requirement, OCTOPUS.md SHALL also tell readers that, before pushing a change, they MAY run the local verify pre-check — `autocoder verify <change-slug>` — to learn whether the change will pass the server gates before the server evaluates it. OCTOPUS.md SHALL state that this runs the same `[in]` / `[canon]` / `[rules]` gates the daemon runs pre-executor, against the change in the local working tree; that it is READ-ONLY (it does not run the executor, edit specs, or write markers); AND that it is a feedback ACCELERATOR, NOT a replacement for the server gates, which remain the fail-closed enforcement (they run against fresher canon at implement time AND cover every contributor).
+
+OCTOPUS.md SHALL note that the `verify` subcommand ships in the autocoder binary AND is usable without running the daemon via the check-only install, AND that a gate reporting it "could not run" (fail-closed: model unconfigured, transport error, or no resolvable rule corpus) is an ENVIRONMENT/CONFIG condition, not a spec defect — so the fix is the config, not the change.
+
+This requirement adds to the guide's content only. It does NOT restate the gate model (per the `The gate model` protocol of the agent-guide requirement) NOR alter the provisioning mechanism (per the daemon's OCTOPUS.md provisioning requirement) — it points readers at the local surface of those same gates.
+
+#### Scenario: OCTOPUS.md describes the local verify pre-check
+- **WHEN** an agent or human reads OCTOPUS.md before pushing a change
+- **THEN** it learns it MAY run `autocoder verify <change-slug>` to run the `[in]` / `[canon]` / `[rules]` gates locally, in the working tree, before the server evaluates the change
+- **AND** it is told that verify is read-only AND is a feedback accelerator, not a replacement for the server gates
+
+#### Scenario: OCTOPUS.md frames verify as available via the check-only install
+- **WHEN** a reader without a running daemon consults OCTOPUS.md's verify section
+- **THEN** it states that the `verify` subcommand ships in the autocoder binary AND is usable without the daemon via the check-only install
+
+#### Scenario: OCTOPUS.md distinguishes a real finding from a gate that could not run
+- **WHEN** OCTOPUS.md's verify section is read
+- **THEN** it states that a gate reporting it "could not run" (fail-closed) is an environment/config condition, not a spec defect — the fix is the config, not the change
+
