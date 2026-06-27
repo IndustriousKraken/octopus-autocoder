@@ -336,6 +336,20 @@ pub fn remove_revision_marker(workspace: &Path, change: &str) -> Result<()> {
     }
 }
 
+/// Idempotent removal of `.needs-spec-revision.json`. Distinct from
+/// `remove_revision_marker` — this is best-effort: the marker's absence is a
+/// no-op (`Ok(false)`) rather than an error. Used by the revision dispatcher
+/// to clear the marker on a dirty-tree `Completed` revision, where the marker
+/// may or may not be present and a delete failure must not fail the revision.
+pub fn remove_revision_marker_idempotent(workspace: &Path, change: &str) -> Result<bool> {
+    let path = change_dir(workspace, change).join(NEEDS_REVISION_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// True when `<workspace>/openspec/changes/<change>/.ignore-for-queue.json`
 /// exists. Pure filesystem check. The marker downgrades any sibling
 /// operator-action marker (`.perma-stuck.json`, `.needs-spec-revision.json`,

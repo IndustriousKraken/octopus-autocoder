@@ -1269,6 +1269,31 @@ impl<'a> ReviseCtx<'a> {
                 "failed to post success PR comment: {e:#}"
             );
         }
+        // A successfully applied (dirty-tree) revision clears the change's
+        // `.needs-spec-revision.json` marker if present: the commit + push
+        // succeeded above, so the flagged spec has been revised in this PR
+        // and the marker's hold is redundant (the open PR already parks the
+        // repo). Best-effort — the marker is non-authoritative runtime state,
+        // so a delete failure is logged at WARN but does NOT fail the
+        // revision. The clean-tree declination branch deliberately skips this:
+        // no revision was applied, so a flagged concern may still stand.
+        if tree_dirty {
+            match crate::queue::remove_revision_marker_idempotent(workspace, change_name) {
+                Ok(true) => tracing::info!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    change = %change_name,
+                    "cleared .needs-spec-revision.json marker after applied revision"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    change = %change_name,
+                    "failed to clear .needs-spec-revision.json marker after applied revision (revision still succeeded): {e:#}"
+                ),
+            }
+        }
         // a33 task 7.3: maybe-post the re-review suggestion. Only the
         // dirty branch moved the agent-branch head, so the clean
         // (no-change) branch skips it — there is nothing new to
