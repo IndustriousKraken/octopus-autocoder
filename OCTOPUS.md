@@ -95,6 +95,25 @@ an inability to run a gate is a non-passing outcome, never a pass:
 - `[rules]` — the change conforms to the global engineering rules.
 - `[out]` — the merged code implements the spec.
 
+## Verify a change locally before pushing
+
+Before you push a change, you MAY run `autocoder verify <change-slug>` to learn
+whether it will pass the server gates before the server evaluates it. `verify`
+runs the same `[in]` / `[canon]` / `[rules]` gates the daemon runs pre-executor,
+against the change in your local working tree. It is READ-ONLY: it does not run
+the executor, edit specs, or write markers.
+
+`verify` is a feedback ACCELERATOR, not a replacement for the server gates. The
+server gates remain the fail-closed enforcement — they run against fresher canon
+at implement time AND cover every contributor — so a local pass is an early
+signal, not a guarantee. You still push and let the server decide.
+
+The `verify` subcommand ships in the autocoder binary AND is usable without
+running the daemon via the check-only install. A gate that reports it
+"could not run" (fail-closed: model unconfigured, transport error, or no
+resolvable rule corpus) is an environment/config condition, not a spec defect —
+fix the config, not the change.
+
 ## Further reading
 
 For the fuller OpenSpec documentation, see https://github.com/Fission-AI/OpenSpec.
