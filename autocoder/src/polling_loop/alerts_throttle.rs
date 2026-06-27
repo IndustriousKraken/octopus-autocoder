@@ -181,7 +181,13 @@ async fn post_tracked_revision_alert(
     excerpt: String,
     label: &str,
     top_line: impl FnOnce(&Path) -> String,
-    thread_body: impl FnOnce(&Path) -> String,
+    // `threaded` = this backend returns an addressable `thread_ts`, so the post
+    // is reply-matchable AND the body may advertise the interactive thread
+    // (`@<bot> send it`). A non-threading backend gets `false` so the advert —
+    // which would be orphaned in a single-message degraded post — is omitted in
+    // place (send-it-explains-manual-fix-markers: a degraded contradiction
+    // post's body "does not advertise `@<bot> send it` as an actionable path").
+    thread_body: impl FnOnce(&Path, bool) -> String,
 ) {
     let Some(ctx) = chatops_ctx else { return };
     if !ctx.failure_alerts_enabled {
@@ -194,7 +200,7 @@ async fn post_tracked_revision_alert(
         return;
     }
     let top = top_line(&workspace);
-    let body = thread_body(&workspace);
+    let body = thread_body(&workspace, ctx.chatops.supports_threading());
     let posted = ctx
         .chatops
         .post_notification_with_thread(&ctx.channel, &top, &body)
@@ -263,6 +269,19 @@ fn revision_thread_advert() -> &'static str {
     "This alert is an interactive revision thread:\n  • Reply in this thread to discuss the revision with autocoder (read-only — nothing is written).\n  • Post `@<bot> send it` in this thread to have autocoder revise the change's spec deltas, re-run the gates, AND open a PR for review."
 }
 
+/// The advert block spliced into a contradiction alert body, with its trailing
+/// blank-line separator. Empty when the post is NOT reply-matchable (the backend
+/// returns no `thread_ts`): a degraded post's body must NOT advertise `@<bot>
+/// send it`, since there is no thread for the operator to act in
+/// (send-it-explains-manual-fix-markers).
+fn revision_advert_block(threaded: bool) -> String {
+    if threaded {
+        format!("{}\n\n", revision_thread_advert())
+    } else {
+        String::new()
+    }
+}
+
 /// Sibling of `maybe_post_unarchivable_deltas_alert` for the a19
 /// contradiction pre-flight path. Same throttle state, channel, and
 /// gating flag as the existing alert so a single stream of
@@ -300,7 +319,7 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -332,10 +351,11 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
@@ -428,7 +448,7 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -461,10 +481,11 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "This change's requirements conflict with canon:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change's requirements conflict with canon:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
@@ -507,7 +528,7 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -529,10 +550,11 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "This change violates one or more global rules:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change violates one or more global rules:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),

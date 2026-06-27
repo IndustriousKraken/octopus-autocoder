@@ -148,6 +148,10 @@ impl ChatOpsBackend for SlackBackend {
         false
     }
 
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
     async fn post_question(
         &self,
         channel: &str,

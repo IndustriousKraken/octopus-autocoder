@@ -570,6 +570,13 @@ impl crate::chatops::ChatOpsBackend for TrackingThreadBackend {
     fn is_experimental(&self) -> bool {
         true
     }
+    fn supports_threading(&self) -> bool {
+        // Mirror the real backends: a configured `thread_ts` models a
+        // native-threading backend (returns `Some`); `None` models a degraded
+        // backend (returns `Ok(None)`). So the contradiction poster includes the
+        // `@<bot> send it` advert iff this post will be reply-matchable.
+        self.thread_ts.is_some()
+    }
     async fn post_question(&self, _: &str, _: &str, _: &str) -> Result<String> {
         unreachable!()
     }
@@ -656,7 +663,7 @@ async fn degraded_contradiction_alert_records_no_revision_thread_state() {
     let tmp_ws = tempfile::TempDir::new().unwrap();
     let repo = fixture_repo(tmp_ws.path());
     // Backend returns no thread_ts (no native threading) → not reply-matchable.
-    let (_backend, ctx) = tracking_ctx(None);
+    let (backend, ctx) = tracking_ctx(None);
 
     let findings = vec![crate::preflight::change_contradiction::ContradictionFinding {
         requirement_a: "A".into(),
@@ -680,6 +687,15 @@ async fn degraded_contradiction_alert_records_no_revision_thread_state() {
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert_eq!(count, 0, "a degraded post records no RevisionThreadState");
+    // ...AND, because the degraded post is not reply-matchable, its body must
+    // NOT advertise `@<bot> send it` as an actionable path (the operator has no
+    // thread to act in). The `clear-revision` manual escape still applies.
+    let bodies = backend.bodies.lock().unwrap();
+    let body = bodies.last().expect("the degraded alert must still post a body");
+    assert!(
+        !body.contains("@<bot> send it"),
+        "a degraded (untracked) contradiction post must NOT advertise `@<bot> send it`: {body}"
+    );
 }
 
 /// contradiction-gate-findings-complete-and-actionable (task 5.1 + 5.2, `[in]`
