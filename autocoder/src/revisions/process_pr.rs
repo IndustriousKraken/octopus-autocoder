@@ -45,7 +45,7 @@ struct ReviseCtx<'a> {
     reviewer: Option<&'a CodeReviewer>,
     executor: &'a dyn Executor,
     chatops_ctx: Option<&'a ChatOpsCtx<'a>>,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     push_remote: &'a str,
     api_base: &'a str,
     forge: GithubForge,
@@ -93,7 +93,7 @@ pub(crate) async fn process_one_pr(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsCtx<'_>>,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     push_remote: &str,
     api_base: &str,
     cancel: CancellationToken,
@@ -326,19 +326,25 @@ impl<'a> ReviseCtx<'a> {
             self.maybe_post_auto_cap_decline(state).await?;
             return Ok(CommentFlow::Continue);
         }
-        // a000: human-revise per-PR cap. A human `@<bot> revise` (NOT
-        // reviewer-marked) is bounded by
-        // `executor.max_revise_triggers_per_pr` (read live from config and
-        // tracked separately from the automatic + re-review counters). At
-        // the cap the trigger is declined WITHOUT invoking the executor:
-        // post the one-time per-PR notice (guarded by
-        // `human_revise_cap_decline_posted` so a burst of over-cap
+        // human-revise-cap-opt-in: the per-PR human-revise cap is OPTIONAL.
+        // When `executor.max_revise_triggers_per_pr` is `None` (the default)
+        // a human `@<bot> revise` is NEVER gated — it always invokes the
+        // executor regardless of how many revises this PR has already had,
+        // mirroring the opt-in `reviewer.max_code_reviews_per_pr`. When set to
+        // `Some(cap)`, a human `@<bot> revise` (NOT reviewer-marked) is bounded
+        // by the cap (read live from config and tracked separately from the
+        // automatic + re-review counters): at the cap the trigger is declined
+        // WITHOUT invoking the executor — post the one-time per-PR notice
+        // (guarded by `human_revise_cap_decline_posted` so a burst of over-cap
         // comments does not spam replies), advance the seen-marker, and
-        // continue (so a later interleaved automatic trigger still
-        // processes). The automatic + re-review caps are untouched.
-        if !is_automatic && state.human_revise_count >= self.human_revise_cap {
+        // continue (so a later interleaved automatic trigger still processes).
+        // The automatic + re-review caps are untouched.
+        if !is_automatic
+            && let Some(cap) = self.human_revise_cap
+            && state.human_revise_count >= cap
+        {
             advance_seen(latest_seen, comment.created_at);
-            self.maybe_post_human_cap_decline(state).await?;
+            self.maybe_post_human_cap_decline(state, cap).await?;
             return Ok(CommentFlow::Continue);
         }
         // Per a20a5: assemble the executor's revision context from
@@ -699,7 +705,11 @@ impl<'a> ReviseCtx<'a> {
     /// Post the one-time human-revise cap-decline (PR comment + chatops
     /// notification), guarded by `human_revise_cap_decline_posted`. Persists
     /// the flag.
-    async fn maybe_post_human_cap_decline(&self, state: &mut RevisionState) -> Result<()> {
+    async fn maybe_post_human_cap_decline(
+        &self,
+        state: &mut RevisionState,
+        human_revise_cap: u32,
+    ) -> Result<()> {
         if state.human_revise_cap_decline_posted {
             return Ok(());
         }
@@ -712,7 +722,6 @@ impl<'a> ReviseCtx<'a> {
         let repo_name = self.repo_name;
         let token = self.token;
         let bot_username = self.bot_username;
-        let human_revise_cap = self.human_revise_cap;
         let pr_text = format!(
             "🛑 Human-revision cap reached ({} `@{} revise` requests on this PR). Further revise requests will be ignored. Close + re-open or merge as-is.",
             human_revise_cap, bot_username,

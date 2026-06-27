@@ -85,7 +85,7 @@ async fn cancellation_during_sleep_exits() {
             u32::MAX,
             Some(u32::MAX),
             0,  // revision_cap: disabled in tests
-            10, // human_revise_cap: irrelevant (dispatcher disabled)
+            Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
             0,  // startup_jitter_max_secs: deterministic for tests
             0,  // inter_iteration_jitter_pct: deterministic for tests
             std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -512,7 +512,7 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         u32::MAX,
         u32::MAX,
         0,  // revision_cap: disabled in tests
-        10, // human_revise_cap: irrelevant (dispatcher disabled)
+        Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),

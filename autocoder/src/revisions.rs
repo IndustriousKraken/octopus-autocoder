@@ -490,10 +490,12 @@ pub struct ChatOpsCtx<'a> {
 /// per-PR state files. PRs whose state file pre-dates a config change
 /// continue to use the cap stored in their state file.
 ///
-/// `human_revise_cap` is `executor.max_revise_triggers_per_pr` (a000); it
-/// bounds HUMAN-initiated `@<bot> revise` triggers per PR and is read live
-/// from config on every pass (NOT stored in state), so a reload applies to
-/// subsequent triggers.
+/// `human_revise_cap` is the OPTIONAL `executor.max_revise_triggers_per_pr`
+/// (human-revise-cap-opt-in). `None` (the default) means UNLIMITED — human
+/// `@<bot> revise` triggers are never gated. `Some(n)` bounds HUMAN-initiated
+/// `@<bot> revise` triggers per PR at `n`. It is read live from config on
+/// every pass (NOT stored in state), so a reload applies to subsequent
+/// triggers.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_revision_requests(
     paths: &crate::paths::DaemonPaths,
@@ -504,7 +506,7 @@ pub async fn process_revision_requests(
     executor: &dyn Executor,
     chatops_ctx: Option<ChatOpsCtx<'_>>,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     cancel: CancellationToken,
 ) -> Result<()> {
     process_revision_requests_at(
@@ -536,7 +538,7 @@ pub async fn process_revision_requests_at(
     executor: &dyn Executor,
     chatops_ctx: Option<ChatOpsCtx<'_>>,
     revision_cap: u32,
-    human_revise_cap: u32,
+    human_revise_cap: Option<u32>,
     cancel: CancellationToken,
     api_base: &str,
 ) -> Result<()> {
@@ -2180,7 +2182,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2257,7 +2259,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2347,7 +2349,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2422,7 +2424,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2545,7 +2547,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2618,7 +2620,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2696,7 +2698,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2764,7 +2766,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2841,7 +2843,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -2915,7 +2917,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3015,7 +3017,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, Some(ctx), 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, Some(ctx), 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3129,7 +3131,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3177,7 +3179,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3262,7 +3264,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3406,7 +3408,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3478,7 +3480,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3561,7 +3563,7 @@ mod tests {
         let cancel = CancellationToken::new();
         process_revision_requests_at(
             &paths,
-            &ws, &repo, &gh, None, &executor, None, 5, 10, cancel, &server.url(),
+            &ws, &repo, &gh, None, &executor, None, 5, Some(10), cancel, &server.url(),
         )
         .await
         .expect("dispatcher should succeed");
@@ -3670,7 +3672,7 @@ mod tests {
             &executor,
             None,
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -3696,7 +3698,7 @@ mod tests {
             &executor,
             None,
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -3784,7 +3786,7 @@ mod tests {
             &executor,
             None,
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -3870,7 +3872,7 @@ mod tests {
             &executor,
             None,
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -3986,7 +3988,7 @@ mod tests {
             &executor,
             Some(ctx),
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -4022,7 +4024,7 @@ mod tests {
             &executor,
             Some(ctx2),
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -4513,7 +4515,7 @@ mod tests {
             &executor,
             Some(ctx),
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -4587,7 +4589,7 @@ mod tests {
             &executor,
             Some(ctx),
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -4648,7 +4650,7 @@ mod tests {
             &executor,
             None,
             5,
-            10,
+            Some(10),
             CancellationToken::new(),
             &server.url(),
         )
@@ -5250,7 +5252,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5296,7 +5298,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(Vec::new());
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5352,7 +5354,7 @@ mod tests {
         };
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5390,7 +5392,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(Vec::new());
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5430,7 +5432,7 @@ mod tests {
         gh.command_authorization.decline_comment = true;
         let executor = StubExecutor::new(Vec::new());
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5471,7 +5473,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 2,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(2),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5521,7 +5523,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(Vec::new());
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 2,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(2),
             CancellationToken::new(), &server.url(),
         )
         .await
@@ -5536,6 +5538,79 @@ mod tests {
         let state = read_state(&paths, &ws, 706).unwrap().expect("state persisted");
         assert_eq!(state.human_revise_count, 2, "human counter does not advance past the cap");
         assert_eq!(state.auto_revisions_applied, 4, "auto-revision counter unaffected");
+        token_env_clear(env);
+    }
+
+    /// human-revise-cap-opt-in 3.1: with `max_revise_triggers_per_pr` unset
+    /// (the default `None`, threaded here as `human_revise_cap: None`), a
+    /// large run of authorized `@<bot> revise` triggers on one PR ALL invoke
+    /// the executor and NONE is declined for cap reasons — regardless of how
+    /// many have already been made. Asserts the invocation count and that the
+    /// cap-decline notice was never posted.
+    #[tokio::test]
+    async fn human_revise_unlimited_default_never_caps() {
+        let env = "REVISIONS_HRCOI_UNLIMITED";
+        token_env_set(env);
+        const N: u64 = 25;
+        // 25 distinct authorized human-revise comments (distinct ids AND
+        // strictly-increasing timestamps so each is processed in the pass).
+        let comments = {
+            let items: Vec<String> = (1..=N)
+                .map(|i| {
+                    format!(
+                        r#"{{
+                "id": {i},
+                "body": "@my-bot revise do the thing {i}",
+                "user": {{"login": "collab-dev"}},
+                "author_association": "COLLABORATOR",
+                "created_at": "2026-05-25T11:00:{i:02}Z"
+            }}"#,
+                    )
+                })
+                .collect();
+            format!("[{}]", items.join(","))
+        };
+        let mut server = revise_auth_server(708, &comments).await;
+        let post = server
+            .mock("POST", "/repos/owner/repo/issues/708/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(201)
+            .with_body(r#"{"id":9}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env);
+        let outcomes: Vec<ExecutorOutcome> = (0..N)
+            .map(|_| ExecutorOutcome::Completed { final_answer: None })
+            .collect();
+        let executor = StubExecutor::new(outcomes);
+        // human_revise_cap = None → uncapped.
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, None,
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            N as usize,
+            "with the cap unset (None), every authorized human revise invokes the executor"
+        );
+        post.assert_async().await;
+        let state = read_state(&paths, &ws, 708).unwrap().expect("state persisted");
+        assert!(
+            !state.human_revise_cap_decline_posted,
+            "no cap-decline notice is ever posted when the cap is None"
+        );
+        assert_eq!(
+            state.human_revise_count, N as u32,
+            "all human revises are counted; none gated by a cap"
+        );
         token_env_clear(env);
     }
 
@@ -5571,7 +5646,7 @@ mod tests {
         let gh = make_github(env);
         let executor = StubExecutor::new(Vec::new());
         process_revision_requests_at(
-            &paths, &ws, &repo, &gh, None, &executor, None, 5, 10,
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
             CancellationToken::new(), &server.url(),
         )
         .await

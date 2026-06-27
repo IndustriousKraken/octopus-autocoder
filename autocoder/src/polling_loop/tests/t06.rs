@@ -79,7 +79,7 @@ async fn failure_alert_cleared_on_subsequent_success() {
         u32::MAX,
         u32::MAX,
         0,  // revision_cap: disabled in tests
-        10, // human_revise_cap: irrelevant (dispatcher disabled)
+        Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
         &crate::audits::AuditRegistry::default(),
         None,
         &std::collections::HashMap::new(),

@@ -190,7 +190,7 @@ async fn run_exits_during_startup_jitter() {
             u32::MAX,
             None,
             0,  // revision_cap: disabled in tests
-            10, // human_revise_cap: irrelevant (dispatcher disabled)
+            Some(10), // human_revise_cap: irrelevant (dispatcher disabled)
             60, // startup_jitter_max_secs: large window
             0,  // inter_iteration_jitter_pct: irrelevant
             std::sync::Arc::new(crate::audits::AuditRegistry::default()),

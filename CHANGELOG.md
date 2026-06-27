@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Issues lane is now on by default.** The `features.issues.enabled` flag defaults to `true` — the issues lane is one of the two fundamental work paths. On upgrade, an existing install whose config omits `features.issues` gains the active issues lane (per-iteration unit selection becomes `issues > changes > audits`). This does **not** enable autonomous GitHub-issue triage, which stays separately gated by `features.scout.include_issues`. Operators who track corrections in an external tracker (Jira, Linear, and similar) can opt out by setting `features.issues.enabled: false`.
+
 ## [v1.1.1] - 2026-05-24
 
 First tagged release. autocoder is an autonomous, multi-repository daemon that

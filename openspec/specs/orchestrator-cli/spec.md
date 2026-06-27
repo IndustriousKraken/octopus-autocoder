@@ -6736,27 +6736,6 @@ A comment that parses as a verb but whose author is NOT authorized SHALL be **dr
 - **WHEN** an operator posts a verb in an allowlisted Slack channel
 - **THEN** dispatch proceeds under the Slack channel-allowlist filters with no `author_association` check (this requirement governs GitHub comment-sourced verbs only)
 
-### Requirement: Human-initiated PR revisions are rate-capped per PR
-The daemon SHALL bound the number of human-initiated `@<bot> revise` triggers it acts on per pull request, to cap cost AND abuse independent of requester. The per-PR limit SHALL read from `executor.max_revise_triggers_per_pr` (default `10`). The count is tracked in the existing per-PR state file. When the cap is reached, a further `@<bot> revise` trigger on that PR SHALL be declined with exactly one notice AND SHALL NOT invoke the executor.
-
-This cap is independent of the existing auto-revision cap (`executor.max_auto_revisions_per_pr`, which bounds reviewer-initiated revisions) AND the re-review cap (`reviewer.max_code_reviews_per_pr`). It applies only to revisions triggered by an authorized human comment (per `GitHub comment-sourced verbs require an authorized commenter`).
-
-#### Scenario: Revision under the cap proceeds
-- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count is below `executor.max_revise_triggers_per_pr`
-- **THEN** the executor is invoked for the revision
-- **AND** the PR's human-revise count increments by one
-
-#### Scenario: Revision at the cap is declined without invoking the executor
-- **WHEN** an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count has reached `executor.max_revise_triggers_per_pr`
-- **THEN** the executor is NOT invoked
-- **AND** the daemon posts exactly one notice that the per-PR revise cap is reached
-- **AND** the count does not increment further
-
-#### Scenario: Human and auto revision caps are independent
-- **WHEN** the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
-- **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
-- **AND** exhausting the human cap does not change the auto-revision count
-
 ### Requirement: Prompt-template substitution is single-pass (no placeholder re-expansion)
 autocoder SHALL render `{{placeholder}}` prompt templates by substituting all placeholders in a SINGLE pass, such that a placeholder token appearing inside a substituted value is NEVER re-expanded. A shared substitution helper SHALL perform this; every prompt-assembly site that injects dynamic content into a `{{placeholder}}` template SHALL use it. The polling-iteration prompts — `scout`, `brownfield-draft`, AND `brownfield-survey` — SHALL use the helper (the reviewer adopts the same helper per the code-reviewer requirement).
 
@@ -7131,15 +7110,15 @@ The daemon SHALL provide a second work lane, `issues/`, for corrections — fixe
 
 NEITHER form SHALL contain a `specs/` directory — that absence is the contract that an issue changes no spec; a unit carrying a `specs/` directory is malformed. A public-origin issue (one carrying an untrusted public report body) SHALL use the directory form so the quarantined `report-body.md` stays a separate file from the maintainer-approved task, preserving the quarantine boundary; collapsing an untrusted body into the single-file form is NOT permitted.
 
-The lane SHALL be gated by a `features.issues` flag, off by default. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
+The lane SHALL be gated by a `features.issues.enabled` field that defaults to `true`, because the issues lane is one of the two fundamental work paths; an operator who tracks corrections in an external system SHALL disable it by setting `features.issues.enabled: false`. The curated entry path is a maintainer committing an `issues/<slug>.md` (or `issues/<slug>/`) directly (repository write is the allowlist; no public surface). Per-issue markers (the `.in-progress` lock AND the `.perma-stuck.json` park marker — the only markers the issues lane writes) live INSIDE the directory for a directory-form issue, AND as sibling files for a single-file issue (e.g. `issues/<slug>.in-progress`, `issues/<slug>.perma-stuck.json`); the lane's ready-list treats an `<slug>.md` file OR a `<slug>/` directory as a unit AND ignores marker siblings AND any other non-`.md`, non-directory sibling. On completion the unit SHALL move to `issues/archive/` — `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/` — mirroring `changes/archive/`, AND no canonical spec SHALL be modified (the issues lane leaves an audit trail only).
 
 #### Scenario: An enabled lane works a committed issue
-- **WHEN** `features.issues` is on AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
+- **WHEN** `features.issues.enabled` is `true` AND an `issues/<slug>.md` (OR an `issues/<slug>/` with `issue.md` and `tasks.md`) is present
 - **THEN** the issue is selected and worked
 - **AND** no spec delta is required for it
 
 #### Scenario: A single-file issue is a valid unit
-- **WHEN** `features.issues` is on AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
+- **WHEN** `features.issues.enabled` is `true` AND an `issues/<slug>.md` carries a description AND an optional `## Tasks` checklist, with no accompanying `specs/`
 - **THEN** it loads as a well-formed issue AND is worked like a directory-form issue
 - **AND** its `## Tasks` checklist (when present) is the fix-step list the implementer follows
 
@@ -7157,8 +7136,12 @@ The lane SHALL be gated by a `features.issues` flag, off by default. The curated
 - **THEN** a single-file issue moves `issues/<slug>.md` → `issues/archive/<UTC-date>-<slug>.md`, AND a directory-form issue moves `issues/<slug>/` → `issues/archive/<UTC-date>-<slug>/`
 - **AND** no canonical spec file is modified
 
-#### Scenario: The lane is disabled by default
-- **WHEN** `features.issues` is unset
+#### Scenario: The lane is enabled by default
+- **WHEN** the config has no `features.issues` entry
+- **THEN** the issues lane is active AND `issues/<slug>.md` files and `issues/<slug>/` directories are worked (the schema's default-on representation: `features.issues.enabled` defaults to `true`)
+
+#### Scenario: An operator disables the lane
+- **WHEN** the config sets `features.issues.enabled: false`
 - **THEN** the issues lane is inactive AND neither `issues/<slug>.md` files nor `issues/<slug>/` directories are worked
 
 ### Requirement: Independent lane walkers over shared utilities
@@ -7579,29 +7562,25 @@ The ledger SHALL be rendered into the PR body as a compliance record: per gate, 
 - **AND** a `PASS` is visible there (not inferred from silence), so an operator can judge whether a verdict came from a model they trust
 
 ### Requirement: Install wizard configures the issues lane
-The `autocoder install` wizard SHALL prompt operators about the issues lane during first-time install, after the periodic-audits prompts AND before the config-assembly step, as a single yes/no gate defaulting to NO. Because enabling the lane changes daemon behavior autonomously — per-iteration unit selection becomes `issues > changes > audits`, AND with `features.scout.include_issues` enabled the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it` — the gate is an explicit opt-in, NOT a default-on feature, AND the prompt body SHALL state these effects so the operator decides informed rather than toggling blind. The wizard SHALL write `features.issues.enabled: true` to config.yaml ONLY when the operator opts in; declining SHALL write no `features.issues` entry, matching the schema's default-off representation. The non-interactive mode SHALL mirror the gate with a `--issues-lane <enabled|disabled>` flag whose default (`disabled`) matches the conservative interactive default, so IaC scripts that predate the flag continue to produce a lane-off install without behavior change.
+The `autocoder install` wizard SHALL prompt operators about the issues lane during first-time install, after the periodic-audits prompts AND before the config-assembly step, as a single yes/no gate defaulting to YES (keep the lane on). Because the issues lane is one of the two fundamental work paths — where behavior-preserving corrections, including audit-found implementation fixes, are worked — it is ON by default; an operator who tracks corrections in an external system (Jira, Linear, and similar) may opt out. Enabling the lane makes per-iteration unit selection `issues > changes > audits`; autonomous triage of open GitHub issues remains separately gated by `features.scout.include_issues` AND is NOT turned on by the issues lane, so default-on introduces no autonomous public-issue behavior. The prompt body SHALL state these effects so the operator decides informed. The wizard SHALL write `features.issues.enabled: false` to config.yaml ONLY when the operator opts out; keeping the default SHALL write no `features.issues` entry, matching the schema's default-on representation. The non-interactive mode SHALL mirror the gate with a `--issues-lane <enabled|disabled>` flag whose default (`enabled`) matches the interactive default.
 
-#### Scenario: Default interactive path leaves the issues lane off
-- **WHEN** an operator runs `autocoder install` AND accepts the issues-lane default (bare-Enter on the gate → no)
+#### Scenario: Default interactive path keeps the issues lane on
+- **WHEN** an operator runs `autocoder install` AND accepts the issues-lane default (bare-Enter on the gate → keep on)
 - **THEN** the rendered config.yaml contains no `features.issues` entry
-- **AND** the issues lane is off (the schema's default-off representation)
+- **AND** the issues lane is on (the schema's default-on representation)
 
-#### Scenario: Operator opts in interactively
-- **WHEN** the operator answers `y` to the issues-lane gate
-- **THEN** the rendered config.yaml contains `features.issues.enabled: true`
+#### Scenario: Operator opts out interactively
+- **WHEN** the operator answers to disable the issues lane
+- **THEN** the rendered config.yaml contains `features.issues.enabled: false`
 
-#### Scenario: Non-interactive default leaves the issues lane off
+#### Scenario: Non-interactive default keeps the issues lane on
 - **WHEN** an operator runs `autocoder install --non-interactive` with all required flags AND no `--issues-lane` flag
 - **THEN** the rendered config.yaml contains no `features.issues` entry
-- **AND** IaC scripts that pre-date this flag produce the same lane-off install as before
-
-#### Scenario: Non-interactive enable
-- **WHEN** an operator runs `autocoder install --non-interactive --issues-lane enabled` with all other required flags
-- **THEN** the rendered config.yaml contains `features.issues.enabled: true`
+- **AND** the issues lane is on (the default); an install that omits the flag gains the active lane
 
 #### Scenario: Non-interactive explicit disable
 - **WHEN** an operator passes `--issues-lane disabled`
-- **THEN** the rendered config.yaml contains no `features.issues` entry (same as the default)
+- **THEN** the rendered config.yaml contains `features.issues.enabled: false`
 
 ### Requirement: Audit runs fail closed to a non-passing did-not-complete outcome
 Every audit run SHALL initialize its outcome to an explicit non-passing "did not complete" state, conforming to the project-documentation `gatekeepers-fail-closed` standard. That initial state SHALL be overwritten ONLY by an evidenced terminal verdict: a session that demonstrably ran to completion AND either produced its expected artifact OR positively declared a survey conclusion. A run that cannot produce such evidence SHALL resolve to a surfaced did-not-complete outcome — never to a passing `NoFindings` / empty `SpecsWritten` result.
@@ -8786,4 +8765,30 @@ A git-URL corpus value SHALL be UNAFFECTED: a value detected as a git URL takes 
 - **WHEN** `executor.global_rules.corpus` is a value detected as a git URL
 - **THEN** autocoder takes the clone/reuse branch and does NOT apply home expansion
 - **AND** the resolved corpus is the local clone, exactly as before this change
+
+### Requirement: Human-initiated PR revisions are optionally rate-capped per PR
+The daemon SHALL support an OPTIONAL per-PR cap on the number of human-initiated `@<bot> revise` triggers it acts on, OFF by default. The per-PR limit reads from `executor.max_revise_triggers_per_pr`, which SHALL be an OPTIONAL value (`Option<u32>`) defaulting to NONE (unlimited) — mirroring the opt-in re-review cap (`reviewer.max_code_reviews_per_pr`). When it is NONE (the default), an authorized human `@<bot> revise` trigger SHALL ALWAYS be acted on: it is never counted against a cap AND never declined for cap reasons, preserving the invariant that an operator's deliberate revision always processes. When it is set to a positive `N`, the daemon SHALL bound the count at `N`: the count is tracked in the existing per-PR state file, AND a further `@<bot> revise` trigger once the count has reached `N` SHALL be declined with exactly one notice AND SHALL NOT invoke the executor.
+
+This cap is independent of the auto-revision cap (`executor.max_auto_revisions_per_pr`, which bounds reviewer-initiated revisions) AND the re-review cap (`reviewer.max_code_reviews_per_pr`). It applies only to revisions triggered by an authorized human comment (per `GitHub comment-sourced verbs require an authorized commenter`).
+
+#### Scenario: Default is unlimited so human revises always process
+- **WHEN** `executor.max_revise_triggers_per_pr` is unset (the default `None`) AND authorized `@<bot> revise` triggers arrive on a PR
+- **THEN** every such trigger invokes the executor
+- **AND** none is declined for cap reasons, regardless of how many have already been made on that PR
+
+#### Scenario: Revision under the cap proceeds
+- **WHEN** `executor.max_revise_triggers_per_pr` is set to a positive `N` AND an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count is below `N`
+- **THEN** the executor is invoked for the revision
+- **AND** the PR's human-revise count increments by one
+
+#### Scenario: Revision at the cap is declined without invoking the executor
+- **WHEN** `executor.max_revise_triggers_per_pr` is set to a positive `N` AND an authorized `@<bot> revise` trigger arrives AND the PR's recorded human-revise count has reached `N`
+- **THEN** the executor is NOT invoked
+- **AND** the daemon posts exactly one notice that the per-PR revise cap is reached
+- **AND** the count does not increment further
+
+#### Scenario: Human and auto revision caps are independent
+- **WHEN** a human cap is configured AND the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
+- **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
+- **AND** exhausting the human cap does not change the auto-revision count
 
