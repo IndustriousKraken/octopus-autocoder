@@ -109,6 +109,17 @@ pub trait ChatOpsBackend: Send + Sync {
     /// threading). Used for start-of-work and throttled failure alerts.
     async fn post_notification(&self, channel: &str, text: &str) -> Result<()>;
 
+    /// Whether `post_notification_with_thread` yields an addressable
+    /// `thread_ts` (a native thread). Default `false`: a non-threading
+    /// backend concatenates `top_line` + `thread_body` into ONE message
+    /// and returns `Ok(None)`, so any thread-only content (e.g. a "reply
+    /// here / `@<bot> send it`" advert that is only actionable once the
+    /// post is reply-matchable) would be orphaned and SHOULD be omitted
+    /// up-front. Only Slack overrides this to `true`.
+    fn supports_threading(&self) -> bool {
+        false
+    }
+
     /// Post a notification whose body might be long enough to warrant
     /// threading. Backends that support native threading (Slack) post
     /// the `top_line` as the top-level message and `thread_body` as a

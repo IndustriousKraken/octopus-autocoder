@@ -181,7 +181,13 @@ async fn post_tracked_revision_alert(
     excerpt: String,
     label: &str,
     top_line: impl FnOnce(&Path) -> String,
-    thread_body: impl FnOnce(&Path) -> String,
+    // `threaded` = this backend returns an addressable `thread_ts`, so the post
+    // is reply-matchable AND the body may advertise the interactive thread
+    // (`@<bot> send it`). A non-threading backend gets `false` so the advert —
+    // which would be orphaned in a single-message degraded post — is omitted in
+    // place (send-it-explains-manual-fix-markers: a degraded contradiction
+    // post's body "does not advertise `@<bot> send it` as an actionable path").
+    thread_body: impl FnOnce(&Path, bool) -> String,
 ) {
     let Some(ctx) = chatops_ctx else { return };
     if !ctx.failure_alerts_enabled {
@@ -194,7 +200,7 @@ async fn post_tracked_revision_alert(
         return;
     }
     let top = top_line(&workspace);
-    let body = thread_body(&workspace);
+    let body = thread_body(&workspace, ctx.chatops.supports_threading());
     let posted = ctx
         .chatops
         .post_notification_with_thread(&ctx.channel, &top, &body)
@@ -263,6 +269,19 @@ fn revision_thread_advert() -> &'static str {
     "This alert is an interactive revision thread:\n  • Reply in this thread to discuss the revision with autocoder (read-only — nothing is written).\n  • Post `@<bot> send it` in this thread to have autocoder revise the change's spec deltas, re-run the gates, AND open a PR for review."
 }
 
+/// The advert block spliced into a contradiction alert body, with its trailing
+/// blank-line separator. Empty when the post is NOT reply-matchable (the backend
+/// returns no `thread_ts`): a degraded post's body must NOT advertise `@<bot>
+/// send it`, since there is no thread for the operator to act in
+/// (send-it-explains-manual-fix-markers).
+fn revision_advert_block(threaded: bool) -> String {
+    if threaded {
+        format!("{}\n\n", revision_thread_advert())
+    } else {
+        String::new()
+    }
+}
+
 /// Sibling of `maybe_post_unarchivable_deltas_alert` for the a19
 /// contradiction pre-flight path. Same throttle state, channel, and
 /// gating flag as the existing alert so a single stream of
@@ -280,8 +299,11 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
 ) {
     let label = crate::verifier_gate::VerifierGate::In.label();
     // a03: the contradiction marker (empty unimplementable_tasks, empty
-    // gate_error) is a TRACKED revision thread — post via the thread-returning
-    // path AND stamp a RevisionThreadState so a later reply can be matched.
+    // gate_error, AND empty unarchivable_deltas) is a TRACKED revision thread —
+    // post via the thread-returning path AND stamp a RevisionThreadState so a
+    // later reply can be matched. A non-empty unarchivable_deltas array is a
+    // MANUAL-FIX hold, not a contradiction (`maybe_post_unarchivable_deltas_alert`
+    // keeps the untracked path), so `send it`'s executor cannot revise it.
     let findings = findings.to_vec();
     let attribution = attribution.map(|a| a.to_string());
     post_tracked_revision_alert(
@@ -297,7 +319,7 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -329,10 +351,11 @@ pub(crate) async fn maybe_post_contradiction_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "Requirements within this change cannot all hold simultaneously:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the conflicting requirements can both hold (or remove one), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
@@ -380,7 +403,7 @@ pub(crate) async fn maybe_post_gate_error_alert(
                 })
                 .unwrap_or_default();
             gate.label_line(&format!(
-                "⚠️ `{repo_url}`: {label} gate FAILED TO RUN on `{change}` — change HELD (NOT evaluated; this is NOT a finding)\n\nThe gate could not run, so the change is held rather than waved through (gatekeepers fail closed).\nCause: {cause}\n\nOperator action:\n  1. Fix the gate — e.g. install/authenticate the configured CLI, or check the daemon control socket.\n  2. `@<bot> clear-revision <repo> <change>` to retry (clearing without fixing the gate will re-hold).\n\nmarker: {marker}{attribution_suffix}",
+                "⚠️ `{repo_url}`: {label} gate FAILED TO RUN on `{change}` — change HELD (NOT evaluated; this is NOT a finding)\n\nThe gate could not run, so the change is held rather than waved through (gatekeepers fail closed).\nCause: {cause}\n\nThis is a MANUAL fix — `@<bot> send it` cannot revise it (it cannot fix a broken gate). Fix the gate, then clear the hold:\nOperator action:\n  1. Fix the gate — e.g. install/authenticate the configured CLI, or check the daemon control socket.\n  2. `@<bot> clear-revision <repo> <change>` to retry (clearing without fixing the gate will re-hold).\n\nmarker: {marker}{attribution_suffix}",
                 repo_url = repo.url,
                 label = label,
                 change = change,
@@ -425,7 +448,7 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -458,10 +481,11 @@ pub(crate) async fn maybe_post_canon_contradiction_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "This change's requirements conflict with canon:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change's requirements conflict with canon:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change is consistent with canon (or turn it into a coherent MODIFIED delta of the canonical requirement), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
@@ -504,7 +528,7 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
                 repo_url = repo.url,
             ))
         },
-        |workspace| {
+        |workspace, threaded| {
             let marker_path = workspace
                 .join("openspec/changes")
                 .join(change)
@@ -526,10 +550,11 @@ pub(crate) async fn maybe_post_rule_violations_findings_alert(
                     )
                 })
                 .unwrap_or_default();
+            let advert_block = revision_advert_block(threaded);
             format!(
-                "This change violates one or more global rules:\n{findings_block}\n{advert}\n\nManual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
+                "This change violates one or more global rules:\n{findings_block}\n{advert_block}Manual escape (still supported): edit openspec/changes/{change}/specs/<capability>/spec.md so the change honors the named rule(s), commit + push to {base}, then `@<bot> clear-revision <repo> <change>` (or delete the marker file).\n\nmarker: {marker}{attribution_suffix}",
                 findings_block = findings_block,
-                advert = revision_thread_advert(),
+                advert_block = advert_block,
                 change = change,
                 base = repo.base_branch,
                 marker = marker_path.display(),
@@ -578,7 +603,7 @@ pub(crate) async fn maybe_post_unarchivable_deltas_alert(
                 ));
             }
             format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nThis is a MANUAL spec fix — `@<bot> send it` cannot revise it (it cannot reconcile a delta header with canonical). Fix the delta header(s), then clear the hold:\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
                 repo_url = repo.url,
                 change = change,
                 violations_block = violations_block,
