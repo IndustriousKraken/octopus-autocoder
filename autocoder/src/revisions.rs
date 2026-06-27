@@ -2575,6 +2575,169 @@ mod tests {
     }
 
     // ============================================================
+    // revision-clears-needs-spec-revision-marker: a dirty-tree applied
+    // revision clears the change's `.needs-spec-revision.json` marker.
+    // ============================================================
+
+    /// Register `.needs-spec-revision.json` in the test workspace's
+    /// `.git/info/exclude` (mirroring `workspace::ensure_initialized`) so the
+    /// marker file does NOT dirty the working tree — exactly as in production,
+    /// where the gitignored marker leaves a clean-tree declination clean.
+    fn exclude_revision_marker(ws: &Path) {
+        let exclude = ws.join(".git/info/exclude");
+        let mut body = std::fs::read_to_string(&exclude).unwrap_or_default();
+        body.push_str("\n.needs-spec-revision.json\n");
+        std::fs::write(&exclude, body).unwrap();
+    }
+
+    /// Write a `.needs-spec-revision.json` marker for `change` in `ws`,
+    /// returning its path.
+    fn write_revision_marker(ws: &Path, change: &str) -> std::path::PathBuf {
+        let dir = ws.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".needs-spec-revision.json");
+        std::fs::write(&path, r#"{"change":"target-change","marked_at":"2026-05-25T10:00:00Z"}"#)
+            .unwrap();
+        path
+    }
+
+    /// Task 2.1: a dirty-tree `Completed` revision with a marker present
+    /// deletes that marker (asserts filesystem state, not message wording).
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_completed_clears_revision_marker() {
+        let env_var = "REVISIONS_TOKEN_CLEARS_MARKER";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(61, 6101).await;
+
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        let marker = write_revision_marker(&ws, "target-change");
+        assert!(marker.exists());
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Default `new` writes a file → dirty tree → applied (commit + push).
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !marker.exists(),
+            "an applied revision must clear the needs-spec-revision marker",
+        );
+        token_env_clear(env_var);
+    }
+
+    /// Task 2.2: a clean-tree declination, a substantive `Failed`, and a
+    /// precondition-unmet revision each RETAIN a present marker — no
+    /// revision was applied, so the flagged concern may still stand.
+    #[tokio::test]
+    async fn dispatcher_non_applied_outcomes_retain_revision_marker() {
+        let env_var = "REVISIONS_TOKEN_RETAINS_MARKER";
+        token_env_set(env_var);
+        for (i, label) in ["declination", "failed", "precondition"].iter().enumerate() {
+            let pr = 71 + i as u64;
+            let (server, _mocks) = revise_dispatcher_mockito(pr, 7101 + i as u64).await;
+            let (_dir, ws) = init_git_workspace();
+            exclude_revision_marker(&ws);
+            let marker = write_revision_marker(&ws, "target-change");
+            let (_td_paths, paths) = crate::testing::test_daemon_paths();
+            let repo = make_repo("git@github.com:owner/repo.git");
+            let gh = make_github(env_var);
+            // Every variant leaves the working tree clean → no diff committed.
+            let executor = match *label {
+                "declination" => StubExecutor::new_clean(vec![ExecutorOutcome::Completed {
+                    final_answer: Some("verified; no change needed".to_string()),
+                }]),
+                "failed" => StubExecutor::new(vec![ExecutorOutcome::Failed {
+                    reason: "agent run failed".to_string(),
+                }]),
+                "precondition" => StubExecutor::new(vec![ExecutorOutcome::PreconditionUnmet {
+                    reason: "no sandbox mechanism".to_string(),
+                }]),
+                _ => unreachable!(),
+            };
+            process_revision_requests_at(
+                &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+                CancellationToken::new(), &server.url(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("dispatcher {label} should succeed: {e:#}"));
+            assert!(
+                marker.exists(),
+                "{label}: marker must be retained when no revision is applied",
+            );
+        }
+        token_env_clear(env_var);
+    }
+
+    /// Task 2.3: a dirty-tree `Completed` revision with NO marker present is
+    /// a no-op for the clear (no error) — the clear is conditional on the
+    /// marker existing.
+    #[tokio::test]
+    async fn dispatcher_dirty_tree_completed_no_marker_is_noop() {
+        let env_var = "REVISIONS_TOKEN_NO_MARKER_NOOP";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(81, 8101).await;
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        let marker = ws.join("openspec/changes/target-change/.needs-spec-revision.json");
+        assert!(!marker.exists());
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed even with no marker to clear");
+        assert!(!marker.exists());
+        token_env_clear(env_var);
+    }
+
+    /// Spec scenario "Marker deletion failure does not fail the revision":
+    /// the best-effort clear swallows a delete error. Simulated by making the
+    /// marker path a non-empty directory so `remove_file` fails with a
+    /// non-NotFound error; the revision must still be reported successful.
+    #[tokio::test]
+    async fn dispatcher_marker_clear_failure_does_not_fail_revision() {
+        let env_var = "REVISIONS_TOKEN_MARKER_CLEAR_FAILS";
+        token_env_set(env_var);
+        let (server, _mocks) = revise_dispatcher_mockito(91, 9101).await;
+        let (_dir, ws) = init_git_workspace();
+        exclude_revision_marker(&ws);
+        // Marker path is a non-empty DIRECTORY → remove_file errs (not NotFound).
+        let marker = ws.join("openspec/changes/target-change/.needs-spec-revision.json");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("keep"), "x").unwrap();
+
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        process_revision_requests_at(
+            &paths, &ws, &repo, &gh, None, &executor, None, 5, Some(10),
+            CancellationToken::new(), &server.url(),
+        )
+        .await
+        .expect("revision must still succeed despite a marker-clear failure");
+        assert!(marker.exists(), "delete failed and was swallowed; path remains");
+        token_env_clear(env_var);
+    }
+
+    // ============================================================
     // a005: aggregated reviewer-initiated revisions (one run per review)
     // ============================================================
 

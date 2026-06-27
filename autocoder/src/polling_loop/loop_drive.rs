@@ -377,6 +377,7 @@ pub(crate) async fn drain_sync_survey_batch_queues(
         std::collections::VecDeque<crate::control_socket::BrownfieldBatchRequest>,
     >,
     pending_revision_requests: &crate::control_socket::RevisionRequestQueues,
+    stuck_threshold_secs: u64,
 ) {
     // OSS-fork support (a26): drain at most ONE sync-upstream
     // request per iteration. The handler fetches the configured
@@ -523,6 +524,7 @@ pub(crate) async fn drain_sync_survey_batch_queues(
             github_snap,
             chatops_ctx,
             &req,
+            stuck_threshold_secs,
         )
         .await
     {

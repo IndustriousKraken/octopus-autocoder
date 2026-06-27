@@ -2157,7 +2157,7 @@ autocoder SHALL ship an `install` subcommand alongside `run`, `rewind`, and `rel
 - **AND** no test depends on a TTY being available
 
 ### Requirement: Spec-needs-revision executor outcome + marker
-The executor SHALL return a new `ExecutorOutcome::SpecNeedsRevision` variant when one or more tasks in a change's `tasks.md` require capabilities outside the executor's sandbox. The agent flags upfront — BEFORE making any changes to the workspace — by scanning `tasks.md` against an enumerated set of unimplementable-task patterns. When the outcome fires, autocoder SHALL write an operator-cleared `.needs-spec-revision.json` marker in the change's directory, post a chatops alert under a new `AlertCategory::SpecNeedsRevision` (24h-throttled per the existing per-category window), and halt the queue walk for the iteration (consistent with the existing halt-on-non-archive semantic). The marker SHALL exclude the change from `list_pending` until removed by the operator, mirroring the perma-stuck marker's pattern.
+The executor SHALL return a new `ExecutorOutcome::SpecNeedsRevision` variant when one or more tasks in a change's `tasks.md` require capabilities outside the executor's sandbox. The agent flags upfront — BEFORE making any changes to the workspace — by scanning `tasks.md` against an enumerated set of unimplementable-task patterns. When the outcome fires, autocoder SHALL write an operator-cleared `.needs-spec-revision.json` marker in the change's directory, post a chatops alert under a new `AlertCategory::SpecNeedsRevision` (24h-throttled per the existing per-category window), and halt the queue walk for the iteration (consistent with the existing halt-on-non-archive semantic). The marker SHALL exclude the change from `list_pending` until removed by the operator or by the revision dispatcher on a dirty-tree Completed outcome, mirroring the perma-stuck marker's pattern.
 
 The agent SHALL NOT auto-edit `tasks.md` to make the spec implementable. The agent flags; the operator authors the edit. This preserves the project's invariant that no AI process modifies its own marching orders without human review.
 
@@ -2205,20 +2205,12 @@ The agent SHALL NOT auto-edit `tasks.md` to make the spec implementable. The age
   incremented (the marker is operator-action territory, not
   repeat-failure territory)
 
-#### Scenario: Marker is operator-cleared, not auto-cleared
-- **WHEN** an operator edits `tasks.md` to revise the flagged
-  tasks AND commits + pushes the revision
-- **THEN** the marker file `.needs-spec-revision.json` is
-  NOT auto-removed by autocoder on the next iteration
-- **AND** the operator must delete the marker file
-  (typically by `rm` and a subsequent commit, OR by deleting
-  it locally and relying on autocoder's iteration to surface
-  the now-cleaned state on next pass — the marker is in
-  `.git/info/exclude` so it's never committed, but operators
-  who want a literal git-tracked clear may use `git rm`)
-- **AND** the next iteration after the marker is gone
-  proceeds normally: the change re-enters `list_pending`
-  and the executor is invoked against the revised tasks.md
+#### Scenario: Marker is operator-cleared for the tasks.md workflow; auto-cleared only on a successful revision-dispatcher run
+- **WHEN** an operator edits `tasks.md` to revise the flagged tasks AND commits + pushes the revision
+- **THEN** the marker file `.needs-spec-revision.json` is NOT auto-removed by autocoder on the next polling iteration
+- **AND** the operator must delete the marker file (typically by `rm` and a subsequent commit, OR by deleting it locally and relying on autocoder's iteration to surface the now-cleaned state on next pass — the marker is in `.git/info/exclude` so it's never committed)
+- **AND** the next iteration after the marker is gone proceeds normally: the change re-enters `list_pending` and the executor is invoked against the revised tasks.md
+- **EXCEPTION** the revision dispatcher clears the marker on a dirty-tree `Completed` outcome, per the "A successfully applied revision clears the change's needs-spec-revision marker" requirement above — this is the only auto-clear path; the prohibition above applies exclusively to the edit-tasks.md workflow and any other polling iteration
 
 #### Scenario: Operator overrides an over-conservative flag
 - **WHEN** an operator reviews the flagged tasks AND judges
@@ -8829,4 +8821,53 @@ On a flagged task, autocoder SHALL write `.needs-spec-revision.json` whose `revi
 - **WHEN** a change's `tasks.md` directs only code and test work
 - **THEN** the pre-flight finds nothing to flag
 - **AND** the change proceeds to the executor exactly as before
+
+### Requirement: A successfully applied revision clears the change's needs-spec-revision marker
+When the revision dispatcher applies a revision to an open PR with the dirty-tree `Completed` outcome — a real change committed and force-pushed to the agent branch, per "Revision execution updates the agent branch and posts a reply comment" — the daemon SHALL clear that change's local `.needs-spec-revision.json` marker if it is present, AFTER the commit and `--force-with-lease` push succeed. This eliminates the operator toil of remembering `clear-revision` once a flagged spec has been revised: the open PR already parks the repository, so the marker's hold is redundant, and the marker is transient runtime state (gitignored, lost on re-clone) rather than the authoritative record — the gate or preflight that wrote it remains the source of truth.
+
+The clear SHALL fire ONLY for the dirty-tree `Completed` branch (a revision was actually applied). It SHALL NOT clear the marker on a clean-tree declination (`Completed` with no code change), a substantive `Failed`, a precondition-unmet failure, or `AskUser` — no revision landed in those cases, so a flagged concern may still stand. The clear SHALL be best-effort: a failure to delete the marker is logged but does NOT fail the revision, which has already succeeded.
+
+This clear is a daemon-side filesystem delete performed after the push. It does NOT change the existing revision behavior in which the agent is instructed not to delete the marker and the daemon unstages it so it is never committed. The operator `clear-revision` verb is unchanged and remains the path for markers that never reach a revision (e.g. an operator-must-edit `SpecNeedsRevision` flag) and as a manual override. Clearing on a successful revision is safe under a later close-without-merge: the gate or preflight re-flags the still-un-revised spec on a subsequent pass and re-writes the marker, so no un-revised change is stranded.
+
+#### Scenario: A successfully applied revision clears a present marker
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision dispatcher processes a triggering comment AND the executor returns the dirty-tree `Completed` outcome (the commit and `--force-with-lease` push to the agent branch succeed)
+- **THEN** the daemon deletes that change's `.needs-spec-revision.json` marker
+- **AND** the revision's existing behavior (the success reply comment, the cap increment, the seen-marker advance) is unchanged
+
+#### Scenario: A declination or failed revision retains the marker
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision outcome is a clean-tree `Completed` declination (no code change), OR a substantive `Failed`, OR a precondition-unmet failure, OR `AskUser`
+- **THEN** the daemon does NOT delete the `.needs-spec-revision.json` marker (no revision was applied, so the flagged concern may still stand)
+
+#### Scenario: No marker present — clear is a no-op
+- **WHEN** a dirty-tree `Completed` revision succeeds for a change with NO `.needs-spec-revision.json` marker present
+- **THEN** the dispatcher performs no marker delete AND reports no error (the clear is conditional on the marker existing)
+
+#### Scenario: Marker deletion failure does not fail the revision
+- **GIVEN** a change with a `.needs-spec-revision.json` marker present AND an open PR
+- **WHEN** the revision dispatcher processes a triggering comment AND the executor returns the dirty-tree `Completed` outcome AND the marker deletion fails
+- **THEN** the deletion failure is logged AND the revision outcome is still reported as successful (the marker is non-authoritative runtime state)
+
+### Requirement: The spec-revision executor holds the per-repo busy marker for its run
+When the daemon runs a `send it` spec-revision (the spec-revision executor that drains a revision-execute request and runs the bounded edit → re-gate converge loop), it SHALL acquire/stamp the per-repo busy marker for the DURATION of that revision, recording the change slug being revised, AND SHALL release the marker when the revision completes via ANY terminal path: a clean re-gate that opens a PR, the converge budget exhausted with a contradiction remaining, a scope/edit-guardrail violation, a gate that could-not-run, an unreadable discussion thread, OR an error.
+
+This brings the revision under the same per-repo concurrency control as a normal pass (per `Per-repo busy marker prevents concurrent work`): a normal pass and a spec-revision SHALL NOT run concurrently on one workspace. It also makes an in-flight revision VISIBLE to the `status` verb: because the `currently:` line is computed from the per-repo busy marker (per `Status reply always shows live workspace snapshot`), and that requirement's branching renders a stamped marker whose `change` is non-empty as `working on <change> (started <age> ago)`, a `status` issued while a revision is editing or re-gating SHALL reflect the change under revision rather than reporting `idle`.
+
+Before this requirement the spec-revision executor stamped no marker, so a `status` issued during an active revision read `currently: idle` — a false negative the marker now prevents (consistent with the existing rule that status MUST NOT report `idle` when a marker is stamped). This requirement does NOT add a revision-specific `currently:` variant; surfacing the change via the existing change-non-empty branch is sufficient to remove the false-idle.
+
+#### Scenario: A revision in flight is not reported as idle
+- **WHEN** the spec-revision executor is actively revising change `c03-adaptive-selection` (editing its spec deltas or re-running the `[in]` / `[canon]` gates)
+- **AND** an operator issues `status <repo>` for that repo
+- **THEN** the per-repo busy marker is stamped with `c03-adaptive-selection`, so the `currently:` line reads `working on c03-adaptive-selection (started <age> ago)` per the live-busy-marker branching
+- **AND** the `currently:` line does NOT read `idle`
+
+#### Scenario: The marker is released on every terminal path
+- **WHEN** a revision completes — whether by a clean re-gate opening a PR, the converge budget exhausting with a contradiction remaining, a scope/edit-guardrail violation, a gate that could-not-run, an unreadable discussion thread, OR an error
+- **THEN** the per-repo busy marker is released
+- **AND** a subsequent `status` reflects the post-revision state (idle, or the next unit of work) with no lingering revision marker
+
+#### Scenario: A pass and a revision do not run concurrently on one workspace
+- **WHEN** a spec-revision holds the per-repo busy marker for a repo
+- **THEN** a normal pass for that repo cannot acquire the marker until the revision releases it, per `Per-repo busy marker prevents concurrent work`
 

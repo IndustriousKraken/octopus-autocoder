@@ -26,6 +26,7 @@
 //! injected behind traits so the orchestration is unit-testable without
 //! spawning a CLI or touching GitHub.
 
+use crate::busy_marker;
 use crate::chatops::ThreadMessage;
 use crate::config::{GithubConfig, RepositoryConfig};
 use crate::control_socket::{RevisionAdviseRequest, RevisionExecuteRequest};
@@ -881,6 +882,7 @@ pub async fn process_pending_revision_execute(
     github_cfg: &GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     request: &RevisionExecuteRequest,
+    stuck_threshold_secs: u64,
 ) -> Result<()> {
     let state_root = revision_thread::default_state_root(paths);
     // The executor reuses the `[in]` gate's model + command (a02's invocation),
@@ -932,6 +934,7 @@ pub async fn process_pending_revision_execute(
         pr: &pr,
     };
     execute_with_deps(
+        paths,
         &deps,
         &fetcher,
         workspace,
@@ -941,6 +944,7 @@ pub async fn process_pending_revision_execute(
         request,
         in_ctx.revision_transcript_fetch_retries,
         in_ctx.revision_converge_attempts,
+        stuck_threshold_secs,
         &state_root,
     )
     .await
@@ -955,6 +959,7 @@ pub async fn process_pending_revision_execute(
 /// backend, a CLI subprocess, or GitHub.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_deps(
+    paths: &DaemonPaths,
     deps: &ExecutorDeps<'_>,
     fetcher: &dyn TranscriptFetcher,
     workspace: &Path,
@@ -964,8 +969,66 @@ async fn execute_with_deps(
     request: &RevisionExecuteRequest,
     transcript_fetch_retries: u32,
     converge_attempts: u32,
+    stuck_threshold_secs: u64,
     state_root: &Path,
 ) -> Result<()> {
+    // Hold the per-repo busy marker for the DURATION of the revision, recording
+    // the change slug being revised. Acquired BEFORE the transcript fetch so
+    // EVERY terminal path below — transcript-unreadable refusal, scope/edit
+    // violation, gate could-not-run, budget exhausted, clean PR, or error —
+    // releases it via the guard's Drop (the same RAII mechanism the normal pass
+    // uses, so the existing stale-detection/recovery + the status `currently:`
+    // branching apply unchanged). Effects: a `status` issued mid-revision reads
+    // `working on <change>` instead of `idle`, AND a normal pass cannot run on
+    // this workspace concurrently (per-repo concurrency).
+    let _busy_guard = match busy_marker::try_acquire(
+        paths,
+        workspace,
+        &repo.url,
+        stuck_threshold_secs,
+    ) {
+        Ok(busy_marker::AcquireOutcome::Acquired(g)) => {
+            // Record the change under revision so the `currently:` line renders
+            // the change-non-empty branch (`working on <change>`).
+            busy_marker::update_change(paths, workspace, &request.change_slug);
+            g
+        }
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(details)) => {
+            tracing::info!(
+                url = %repo.url,
+                change = %request.change_slug,
+                pid = details.marker.pid,
+                age = %busy_marker::format_age_human(details.age_secs),
+                "revision-execute: per-repo busy marker held by another pass; not running a revision concurrently"
+            );
+            post_reply(
+                Some(ctx),
+                &request.channel,
+                &request.thread_ts,
+                "⏳ send it: the workspace is busy with another pass right now — `send it` again in a moment.",
+            )
+            .await;
+            return Ok(());
+        }
+        Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => {
+            tracing::error!(
+                url = %repo.url,
+                change = %request.change_slug,
+                pid = m.pid,
+                "revision-execute: ambiguous busy-marker state; not running a revision"
+            );
+            post_reply(
+                Some(ctx),
+                &request.channel,
+                &request.thread_ts,
+                "✗ send it: the workspace busy marker is in an ambiguous state (possible stuck pass) — investigate, then `send it` again.",
+            )
+            .await;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
     let transcript = match fetch_transcript_bounded(
         fetcher,
         &request.channel,
@@ -2060,7 +2123,9 @@ mod tests {
             messages: Vec::new(),
             calls: std::sync::Arc::new(Mutex::new(0)),
         };
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         execute_with_deps(
+            &paths,
             &deps,
             &fetcher,
             &ws,
@@ -2070,6 +2135,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries
             0,
+            1800, // stuck_threshold_secs
             state_dir.path(),
         )
         .await
@@ -2083,6 +2149,12 @@ mod tests {
         assert!(
             replies.iter().any(|r| r.contains("could not read the discussion")),
             "must report it could not read the thread: {replies:?}"
+        );
+        // The marker acquired before the transcript fetch is released on the
+        // unreadable-thread refusal path (task 1.2) — no lingering marker.
+        assert!(
+            busy_marker::current(&paths, &ws, 1800).is_none(),
+            "the busy marker must be released after the transcript-unreadable refusal"
         );
     }
 
@@ -2110,7 +2182,9 @@ mod tests {
             messages: vec![msg(false, "align to canon")],
             calls: std::sync::Arc::new(Mutex::new(0)),
         };
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
         execute_with_deps(
+            &paths,
             &deps,
             &fetcher,
             &ws,
@@ -2120,6 +2194,7 @@ mod tests {
             &execute_request("9.9"),
             2, // transcript_fetch_retries (>= the one failure)
             0,
+            1800, // stuck_threshold_secs
             state_dir.path(),
         )
         .await
@@ -2130,6 +2205,11 @@ mod tests {
             "the revision proceeds once the transcript loads on retry"
         );
         assert_eq!(*pr_calls.lock().unwrap(), 1, "a clean re-gate opens the PR");
+        // Clean PR path released the marker (task 1.2 / 2.2).
+        assert!(
+            busy_marker::current(&paths, &ws, 1800).is_none(),
+            "the busy marker must be released after a clean re-gate opens the PR"
+        );
     }
 
     // ---------- resolve-all grounding (task 4) ----------
@@ -2401,5 +2481,209 @@ mod tests {
             replies.iter().any(|r| r.contains("not clearing") || r.contains("persistent")),
             "the escalation must say the revision is not clearing it: {replies:?}"
         );
+    }
+
+    // ---------- busy marker held across the revision (revision-holds-busy-marker) ----------
+
+    /// Edit runner that peeks the per-repo busy marker WHILE the revision is in
+    /// flight (recording the rendered `currently:` line AND whether a concurrent
+    /// acquire is blocked), then performs a real in-scope spec-delta edit so the
+    /// scope/has-edit guards pass. Lets the in-flight assertions observe the
+    /// marker the converge loop is holding.
+    struct MarkerPeekEdit {
+        paths: std::sync::Arc<crate::paths::DaemonPaths>,
+        repo_url: String,
+        currently: std::sync::Arc<Mutex<Option<String>>>,
+        concurrent_acquire_blocked: std::sync::Arc<Mutex<Option<bool>>>,
+    }
+    #[async_trait]
+    impl EditSessionRunner for MarkerPeekEdit {
+        async fn revise(&self, ws: &Path, _prompt: &str) -> Result<()> {
+            // (2.1) Peek the marker exactly as the `status` verb does, and
+            // render the `currently:` line from it.
+            let summary = busy_marker::current(&self.paths, ws, 1800);
+            *self.currently.lock().unwrap() = Some(
+                crate::chatops::operator_commands::format_currently_line(summary.as_ref()),
+            );
+            // (2.3) A normal pass acquiring the SAME repo now must be blocked
+            // (per-repo concurrency). `try_acquire` finds the held marker (our
+            // own live pid, fresh) and yields a skip — never `Acquired`.
+            let blocked = !matches!(
+                busy_marker::try_acquire(&self.paths, ws, &self.repo_url, 1800),
+                Ok(busy_marker::AcquireOutcome::Acquired(_))
+            );
+            *self.concurrent_acquire_blocked.lock().unwrap() = Some(blocked);
+            // Real in-scope edit so the revision proceeds past the scope guards.
+            std::fs::write(
+                ws.join("openspec/changes/c1/specs/cap/spec.md"),
+                "## ADDED Requirements\n\n### Requirement: A\nRevised in-flight.\n",
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    /// (2.1 + 2.3) While a revision is editing, the per-repo busy marker is
+    /// stamped with the change slug so the `currently:` line reads `working on
+    /// <slug>` and NOT `idle`; AND a normal pass cannot acquire the marker for
+    /// that repo. After the revision completes the marker is released (2.2).
+    #[tokio::test]
+    async fn revision_in_flight_marker_is_stamped_and_blocks_a_pass() {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let paths = std::sync::Arc::new(paths);
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let currently = std::sync::Arc::new(Mutex::new(None));
+        let blocked = std::sync::Arc::new(Mutex::new(None));
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let peek = MarkerPeekEdit {
+            paths: paths.clone(),
+            repo_url: repo.url.clone(),
+            currently: currently.clone(),
+            concurrent_acquire_blocked: blocked.clone(),
+        };
+        let deps = ExecutorDeps {
+            edit: &peek,
+            regate: &CannedReGate(ReGateOutcome::Clean),
+            pr: &FakePr {
+                url: "https://example/pr/inflight".into(),
+                calls: pr_calls.clone(),
+            },
+        };
+        let fetcher = ScriptedTranscriptFetcher {
+            fail_count: 0,
+            messages: vec![msg(false, "align to canon")],
+            calls: std::sync::Arc::new(Mutex::new(0)),
+        };
+        execute_with_deps(
+            &paths,
+            &deps,
+            &fetcher,
+            &ws,
+            &repo,
+            &gh,
+            &ctx,
+            &execute_request("9.9"),
+            0,
+            0,
+            1800,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        // (2.1) Mid-revision the `currently:` line surfaced the change slug,
+        // never `idle`.
+        let line = currently
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the edit ran while the marker was held");
+        assert!(line.contains("working on c1"), "currently in flight: {line}");
+        assert!(!line.contains("idle"), "must not be idle while revising: {line}");
+        // (2.3) A concurrent pass acquire for the same repo was blocked.
+        assert_eq!(
+            blocked.lock().unwrap().clone(),
+            Some(true),
+            "a normal pass must not acquire the marker while a revision holds it"
+        );
+        // (2.2) After completion the marker is released — no lingering marker.
+        assert!(
+            busy_marker::current(&paths, &ws, 1800).is_none(),
+            "the busy marker is released once the revision completes"
+        );
+    }
+
+    /// (2.2) Run one revision terminal path and assert the per-repo busy marker
+    /// is released afterward. The transcript always loads; `edit`/`regate`/
+    /// `converge_attempts` select the path under test.
+    async fn assert_marker_released_after(
+        edit: &dyn EditSessionRunner,
+        regate: ReGateOutcome,
+        converge_attempts: u32,
+    ) {
+        let (_d, ws) = fixture_repo_with_change("c1");
+        let state_dir = TempDir::new().unwrap();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        let chat = std::sync::Arc::new(RecordingChat {
+            replies: Mutex::new(Vec::new()),
+        });
+        let ctx = ctx_for(&chat);
+        let repo = test_repo(&ws);
+        let gh = test_github();
+        let pr_calls = std::sync::Arc::new(Mutex::new(0));
+        let deps = ExecutorDeps {
+            edit,
+            regate: &CannedReGate(regate),
+            pr: &FakePr {
+                url: "x".into(),
+                calls: pr_calls.clone(),
+            },
+        };
+        let fetcher = ScriptedTranscriptFetcher {
+            fail_count: 0,
+            messages: vec![msg(false, "align to canon")],
+            calls: std::sync::Arc::new(Mutex::new(0)),
+        };
+        execute_with_deps(
+            &paths,
+            &deps,
+            &fetcher,
+            &ws,
+            &repo,
+            &gh,
+            &ctx,
+            &execute_request("9.9"),
+            0,
+            converge_attempts,
+            1800,
+            state_dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            busy_marker::current(&paths, &ws, 1800).is_none(),
+            "the busy marker must be released after the revision completes"
+        );
+    }
+
+    /// (2.2) Budget exhausted with a contradiction remaining → marker released.
+    #[tokio::test]
+    async fn marker_released_on_budget_exhausted() {
+        assert_marker_released_after(
+            &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nStill conflicting.\n".into(),
+            },
+            ReGateOutcome::Contradiction {
+                findings: vec![canon_record("A", "canon-A", "cap")],
+                text: "still conflicting".into(),
+            },
+            0,
+        )
+        .await;
+    }
+
+    /// (2.2) A scope/edit-guardrail violation (tasks.md) → marker released.
+    #[tokio::test]
+    async fn marker_released_on_scope_violation() {
+        assert_marker_released_after(&EditTasks, ReGateOutcome::Clean, 0).await;
+    }
+
+    /// (2.2) A gate that could-not-run → marker released.
+    #[tokio::test]
+    async fn marker_released_on_gate_could_not_run() {
+        assert_marker_released_after(
+            &EditSpec {
+                body: "## ADDED Requirements\n\n### Requirement: A\nRevised.\n".into(),
+            },
+            ReGateOutcome::CouldNotRun("[in] gate disabled".into()),
+            0,
+        )
+        .await;
     }
 }
