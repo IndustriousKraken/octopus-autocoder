@@ -2506,6 +2506,118 @@ github:
         }
     }
 
+    // ---------- open-PR park: daemon-side query (1.1 / 1.2) ----------
+
+    fn open_pr_park_repo() -> RepositoryConfig {
+        RepositoryConfig {
+            forge: None,
+            url: "git@github.com:owner/repo.git".to_string(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+            spec_storage: None,
+            upstream: None,
+            auto_submit_pr: true,
+            octopus_guide: None,
+            sandbox: None,
+        }
+    }
+
+    fn open_pr_park_github(env_var: &str) -> GithubConfig {
+        GithubConfig {
+            token_env: env_var.to_string(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        }
+    }
+
+    /// 1.1: `fetch_open_agent_prs_at` runs the SAME `state=open` head
+    /// query the skip-iteration gate uses and returns the open PRs.
+    #[tokio::test]
+    async fn fetch_open_agent_prs_returns_open_prs() {
+        let env_var = "STATUS_OPEN_PR_PARK_OK";
+        // SAFETY: tests run sequentially; the env var is unique here.
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("state".into(), "open".into()),
+                mockito::Matcher::UrlEncoded("head".into(), "owner:agent-q".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"[
+                    {"number": 12, "title": "later", "state": "open",
+                     "html_url": "https://example.invalid/pr/12",
+                     "head": {"ref": "agent-q"}, "base": {"ref": "main"},
+                     "created_at": "2026-05-25T10:00:00Z"},
+                    {"number": 5, "title": "earlier", "state": "open",
+                     "html_url": "https://example.invalid/pr/5",
+                     "head": {"ref": "agent-q"}, "base": {"ref": "main"},
+                     "created_at": "2026-05-24T10:00:00Z"}
+                ]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let prs = super::fetch_open_agent_prs_at(
+            &server.url(),
+            &open_pr_park_repo(),
+            &open_pr_park_github(env_var),
+        )
+        .await;
+        let prs = prs.expect("successful query must be Some");
+        assert_eq!(prs.len(), 2);
+        assert!(prs.contains(&5));
+        mock.assert_async().await;
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
+    }
+
+    /// 1.2: a GitHub failure degrades to `None` (park unknown) rather than
+    /// fabricating a park or failing the whole status reply.
+    #[tokio::test]
+    async fn fetch_open_agent_prs_degrades_to_none_on_github_error() {
+        let env_var = "STATUS_OPEN_PR_PARK_ERR";
+        // SAFETY: tests run sequentially; the env var is unique here.
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("boom")
+            .create_async()
+            .await;
+
+        let prs = super::fetch_open_agent_prs_at(
+            &server.url(),
+            &open_pr_park_repo(),
+            &open_pr_park_github(env_var),
+        )
+        .await;
+        assert!(prs.is_none(), "a GitHub error must degrade to None, not Some");
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
+    }
+
     // -----------------------------------------------------------------
     // a27a0: record_outcome + consume_outcome control-socket actions
     // -----------------------------------------------------------------

@@ -5,7 +5,7 @@
 
 #### Scenario: Reply-shape examples include every variant
 - **WHEN** an operator reads `docs/CHATOPS.md`'s `status` reply-shape examples
-- **THEN** at least one example each appears for: `idle`, `parked: open PR #<n> ...`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `recovery in progress`, `stale marker from pid <pid> (... recovery eligible now)`, `stale marker from pid <pid> (... recovery in <duration>)`
+- **THEN** at least one example each appears for: `idle`, `parked: open PR #<n> ...`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `recovery in progress`, `stale marker from pid <pid> (... recovery eligible now)`, `stale marker from pid <pid> (... recovery eligible next iteration)`, `stale marker from pid <pid> (... recovery in <duration>)`
 
 #### Scenario: Section explains the diagnostic value
 - **WHEN** an operator reads the section
