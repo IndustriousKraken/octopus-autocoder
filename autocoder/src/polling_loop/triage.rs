@@ -43,8 +43,14 @@ pub async fn process_audit_triages(
         .with_context(|| format!("audit-triage: checkout `{}`", repo.base_branch))?;
     git::pull_ff_only(workspace, &repo.base_branch)
         .with_context(|| format!("audit-triage: pull --ff-only `{}`", repo.base_branch))?;
-    git::recreate_branch(workspace, &repo.agent_branch)
-        .with_context(|| format!("audit-triage: recreate `{}`", repo.agent_branch))?;
+    // Use a temp work branch rather than agent_branch so the real agent_branch
+    // ref keeps pointing at the open PR's commit. run_revision_dispatchers runs
+    // later in the same iteration and calls diff_three_dot(base, agent_branch) —
+    // if triage overwrote the ref it would see an empty diff every time a triage
+    // and a code-review comment land in the same pass.
+    let triage_work_branch = format!("{}-triage-work", repo.agent_branch);
+    git::recreate_branch(workspace, &triage_work_branch)
+        .with_context(|| format!("audit-triage: recreate `{triage_work_branch}`"))?;
 
     for thread_ts in thread_tses {
         let state_root = threads::default_state_root(paths);
@@ -327,6 +333,13 @@ pub(crate) async fn process_completed_triage(
     };
     git::commit(workspace, &subject)
         .with_context(|| "audit-triage: commit triage branch".to_string())?;
+    // On a retry the branch already exists on the fork remote; fetch it so
+    // --force-with-lease has a live tracking ref and doesn't reject with
+    // "stale info". Ignored on first push (branch absent → fetch is a no-op
+    // for the lease check).
+    if push_remote != "origin" {
+        let _ = git::fetch_remote_branch(workspace, push_remote, &branch);
+    }
     if let Err(e) = git::push_force_with_lease(workspace, &branch, push_remote) {
         return Err(anyhow!("audit-triage: pushing triage branch failed: {e:#}"));
     }

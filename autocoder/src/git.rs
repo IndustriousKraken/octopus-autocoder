@@ -340,6 +340,16 @@ pub fn recreate_branch(workspace: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git branch -f <branch> <target>` — force-move a local branch ref to
+/// `target` (a sha, ref, or remote-tracking name such as `origin/agent-q`)
+/// WITHOUT checking it out. Used to sync a local branch from a remote
+/// tracking ref after `fetch_remote_branch`, so callers like the revision
+/// dispatcher can be sure the local ref matches the PR's current state.
+pub fn branch_force_move(workspace: &Path, branch: &str, target: &str) -> Result<()> {
+    run_git(workspace, "branch -f", &["branch", "-f", branch, target])?;
+    Ok(())
+}
+
 /// `true` when a local branch named `branch` exists, probed via
 /// `git rev-parse --verify --quiet refs/heads/<branch>` (the exit code is the
 /// stable signal across git versions, unlike the stderr string). `Err` only

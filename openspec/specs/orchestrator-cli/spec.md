@@ -266,6 +266,8 @@ autocoder SHALL implement the per-repository polling task referenced in `orchest
 ### Requirement: Iteration-level error tolerance
 The polling loop SHALL continue running after a failed iteration; a single iteration's error MUST NOT terminate the task or affect other repositories. Predictable failure categories (workspace init, mid-iteration dirty workspace, branch push, PR creation) SHALL emit a throttled chatops alert via the existing `AlertCategory` + `handle_predictable_failure` mechanism before the iteration returns `Err`. For the mid-iteration dirty-workspace category, the alert SHALL fire only AFTER an auto-recovery attempt has been made and failed to clean the workspace (see "Dirty workspace auto-recovers mid-iteration").
 
+For the branch-push category, BEFORE returning `Err` the iteration SHALL preserve the completed work — the agent branch AND its commits are retained, never reset — AND write a push-block hold (per "Branch-push failure preserves completed work via a push-block hold") so a subsequent pass resumes at the push step instead of re-running the executor for the already-committed changes. A branch-push failure SHALL NEVER cause a destructive branch or workspace reset; the only destructive reset is an explicit operator action (`rewind` / `wipe-repo`). Re-running the executor cannot fix a push failure (the work is already committed), so the work is held for push, not re-implementation.
+
 #### Scenario: Iteration fails
 - **WHEN** any error occurs during a polling iteration (workspace init, git operation, executor failure, PR creation)
 - **THEN** the task emits a log line of the form `"polling iteration failed for <url>: <error chain>"` naming the failed step
@@ -307,6 +309,13 @@ The polling loop SHALL continue running after a failed iteration; a single itera
   category
 - **AND** if the workspace becomes dirty again later, the next
   occurrence re-alerts immediately (no leftover suppression)
+
+#### Scenario: Branch-push failure preserves the completed work
+- **WHEN** the branch push fails AND the pass had committed one or more changes
+- **THEN** the agent branch AND its commits are retained (not reset)
+- **AND** a push-block hold is written (per "Branch-push failure preserves completed work via a push-block hold")
+- **AND** the throttled `BranchPushFailure` alert still fires before the iteration returns `Err`
+- **AND** no destructive branch or workspace reset occurs as a result of the push failure
 
 ### Requirement: Graceful shutdown on signal
 The orchestrator SHALL respond to SIGINT or SIGTERM by cancelling all polling tasks; each task completes its current iteration (if any) and exits cleanly.
@@ -8928,4 +8937,69 @@ This requirement does NOT change any other terminal behavior of the spec-revisio
 - **WHEN** the executor persists progress on a failed round
 - **THEN** it does NOT commit the revision to the base branch outside the PR, and it does NOT open a PR
 - **AND** the `.needs-spec-revision.json` marker remains until a re-gate is clean, at which point a PR is opened for human review
+
+### Requirement: Daemon emits a unified rotated log file
+The daemon SHALL write its structured `tracing` event stream to a rotated log file under the logs directory, IN ADDITION to its existing stderr/journal destination. The existing journal output (per "Iteration lifecycle logging") is unchanged; the file is a second sink, so operators have one greppable on-disk place for daemon-level diagnostics alongside the per-session logs under `runs/`.
+
+The file SHALL live in the logs directory (e.g. `<logs>/journal.log`, a sibling of `runs/`). It SHALL honor the same active level filtering as the existing sink (the `RUST_LOG` / default filter), so daemon-level events — INCLUDING the predictable-failure categories (`WorkspaceInitFailure`, `BranchPushFailure`, `PrCreationFailure`) and their underlying error chains — are recorded on disk rather than only in the process journal.
+
+The file SHALL be rotated by size AND/OR age to bound disk usage, retaining a bounded number of rotated segments; the rotation thresholds SHALL be operator-configurable with sane defaults.
+
+#### Scenario: A predictable failure is greppable on disk
+- **WHEN** a polling iteration emits a predictable-failure event (e.g. a `BranchPushFailure` carrying the git rejection text)
+- **THEN** that event AND its error chain appear in `<logs>/journal.log`
+- **AND** the same event still appears in the process journal (the existing sink is unchanged)
+
+#### Scenario: The log rotates and is retained within a bound
+- **WHEN** the journal log reaches the configured size or age threshold
+- **THEN** it is rotated and a bounded number of prior segments is retained
+- **AND** older segments beyond the retention bound are removed so the log cannot grow without limit
+
+#### Scenario: The unified log lives with the per-session logs
+- **WHEN** an operator looks for daemon diagnostics
+- **THEN** the unified log file is in the logs directory alongside the `runs/` per-session logs, not only in `journalctl`
+
+### Requirement: Branch-push failure preserves completed work via a push-block hold
+When the pass-level branch push fails AFTER one or more changes were committed (and archived) on the agent branch during the pass, autocoder SHALL NOT discard the completed work NOR re-implement it — re-running the executor cannot fix a transport failure. The completed work is held for push.
+
+autocoder SHALL write a **push-block marker** in the daemon STATE directory, keyed to the workspace (NOT inside any change directory — the carried changes have already been archived during the pass, so a per-change marker location is unavailable). The marker SHALL record: the unpushed agent-branch tip commit, the change slug(s) the push was carrying, AND the rejection reason. autocoder SHALL post the existing throttled `BranchPushFailure` alert naming the rejection reason, the operator remedy, AND that the completed work is preserved on the agent branch.
+
+Branch preservation is ANCHORED by the marker: while a push-block marker is present for the workspace AND the agent branch tip still matches the marker's recorded tip commit (the preserved work is intact), the pass SHALL NOT recreate the agent branch NOR re-run the executor for the carried changes (see the `git-workflow-manager` "Per-pass agent branch" requirement). A marker is written ONLY on a real push failure and removed ONLY on a successful push, so it never falsely triggers on a branch that was never push-failed (e.g. a stale post-merge branch). If the marker is present but the tip no longer matches (the preserved work is gone — e.g. an operator deleted the branch), the marker is STALE and SHALL be removed, and the pass proceeds normally (recreate the branch).
+
+While the marker is present and matching, each pass SHALL retry the push step ONLY (never the executor — the work is already committed). Retrying a failed `git push` costs no executor tokens, so a persistent failure simply re-attempts the cheap push each pass and re-posts the throttled alert until it succeeds. On a SUCCESSFUL push, autocoder SHALL remove the push-block marker AND open the PR. Operator recovery: the operator fixes the underlying cause (e.g. grants the missing token scope or lifts branch protection) and the next pass's retry succeeds automatically; to ABANDON the preserved work instead, the operator deletes the marker file directly, which lets the next pass recreate the branch.
+
+This hold is distinct from the perma-stuck counter (which covers repeated EXECUTION failures that re-implementation could fix); a push failure is not an execution failure, so it does NOT increment the perma-stuck counter — it uses this dedicated push-block hold instead.
+
+#### Scenario: Push failure preserves the branch and writes the push-block marker
+- **WHEN** the executor returned `Completed` for change `foo` (committed + archived on the agent branch) AND the pass-level branch push then fails
+- **THEN** the agent branch AND its commits are retained (never reset)
+- **AND** a push-block marker is written in the state directory keyed to the workspace, recording the unpushed tip commit, `foo`, AND the rejection reason
+- **AND** the throttled `BranchPushFailure` alert fires naming the reason, the remedy, AND that the work is preserved on the agent branch
+
+#### Scenario: Persistent push failure retries the push without re-implementing
+- **WHEN** a push-block marker is present AND matching on a subsequent pass AND the push fails again
+- **THEN** the pass retries the push step ONLY
+- **AND** the executor is NOT re-run for the already-committed changes
+- **AND** the marker is retained (its reason refreshed) and the throttled alert re-posts
+
+#### Scenario: Successful push clears the hold and opens the PR
+- **WHEN** a push-block marker is present AND a subsequent push of the preserved branch succeeds
+- **THEN** the push-block marker is removed
+- **AND** the PR is opened (its body derived from the carried change slugs)
+- **AND** the `BranchPushFailure` alert state is cleared on the successful iteration
+
+#### Scenario: Operator fixes the cause and the retry succeeds
+- **WHEN** the operator fixes the underlying cause (e.g. grants the missing token scope) while a push-block marker is present
+- **THEN** the next pass's push retry succeeds with no operator command and no re-implementation
+- **AND** an operator who instead deletes the marker file abandons the preserved work — the next pass recreates the branch
+
+#### Scenario: Stale marker whose preserved work is gone
+- **WHEN** a push-block marker is present BUT the agent branch tip no longer matches the marker's recorded tip commit (e.g. an operator deleted or moved the branch)
+- **THEN** the marker is treated as STALE and removed
+- **AND** the pass proceeds normally (recreate the agent branch from base)
+
+#### Scenario: Push failure never resets the branch or workspace
+- **WHEN** a branch push fails for any reason
+- **THEN** autocoder performs no destructive reset of the agent branch or the workspace as a consequence
+- **AND** the only destructive reset remains an explicit operator action (`rewind` / `wipe-repo`)
 

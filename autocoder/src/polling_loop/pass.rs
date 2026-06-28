@@ -307,6 +307,16 @@ async fn resume_push_block(
     } else {
         "origin"
     };
+    // Refresh the remote tracking ref before retrying --force-with-lease.
+    // A stale tracking ref (e.g. the previous attempt fetched origin but
+    // not the fork, or the remote branch was deleted after a merge) causes
+    // --force-with-lease to reject the push as "stale info". Ignored on
+    // failure (branch absent on remote → no tracking ref → lease omitted).
+    if push_remote != "origin" {
+        let _ = git::fetch_remote_branch(workspace, push_remote, &repo.agent_branch);
+    } else {
+        let _ = git::fetch(workspace);
+    }
     let _ = guard.set_stage(busy_marker::Stage::Push);
     if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
         // Still blocked. Refresh the marker's reason and re-alert (the work stays
