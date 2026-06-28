@@ -545,6 +545,7 @@ fn submission_only_state(
         features: crate::config::FeaturesConfig::default(),
         canonical_rag: None,
         models: None,
+        journal_log: None,
     };
     // A no-op spawn closure: the reload handler is never invoked on the
     // submission path, so this returning `StartupCheckFailed` is unreachable.

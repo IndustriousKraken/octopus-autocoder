@@ -77,6 +77,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         features: config::FeaturesConfig::default(),
         canonical_rag: None,
         models: None,
+        journal_log: None,
     };
     crate::paths::resolve_daemon_paths(&cfg)
 }

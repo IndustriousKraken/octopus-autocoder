@@ -105,6 +105,23 @@ pub struct Config {
     /// Absent → no registry; every block must be inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
+    /// Optional tuning for the daemon's unified rotated log file
+    /// (`<logs>/journal.*.log`). Absent → sane defaults (daily rotation,
+    /// [`crate::logging::DEFAULT_JOURNAL_MAX_FILES`] retained segments).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_log: Option<JournalLogConfig>,
+}
+
+/// Operator tuning for the unified rotated daemon log. The file lives under the
+/// logs directory alongside `runs/`; it rotates daily and retains `max_files`
+/// segments so it cannot grow without bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalLogConfig {
+    /// Rotated segments to retain (daily rotation → ≈ this many days). Absent →
+    /// [`crate::logging::DEFAULT_JOURNAL_MAX_FILES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<usize>,
 }
 
 /// A single entry in the top-level `models:` registry (a55). Carries the

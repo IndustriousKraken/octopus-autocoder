@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ask_user": {
+      "command": [
+        "/home/meow/.local/bin/autocoder",
+        "mcp-ask-user-server"
+      ],
+      "enabled": true,
+      "environment": {
+        "ORCH_DAEMON_CONTROL_SOCKET": "/run/user/1000/autocoder/control.sock",
+        "ORCH_MCP_CHANGE": "global_rules_check",
+        "ORCH_MCP_ROLE": "global_rules_check",
+        "ORCH_MCP_WORKSPACE": "/home/meow/code/octopus-autocoder",
+        "ORCH_MCP_WORKSPACE_BASENAME": "octopus-autocoder"
+      },
+      "type": "local"
+    }
+  },
+  "permission": {
+    "bash": "deny",
+    "edit": "deny",
+    "webfetch": "deny"
+  }
+}

@@ -38,6 +38,7 @@ mod iteration_pending;
 mod lanes;
 mod llm;
 mod log_retention;
+mod logging;
 mod mcp_askuser_server;
 mod migration;
 mod octopus_guide;
@@ -50,6 +51,7 @@ mod polling_loop;
 mod preflight;
 mod prompts;
 mod proposal_requests;
+mod push_block;
 mod queue;
 mod rag;
 mod recovery_classification;
@@ -72,12 +74,7 @@ mod workspace_cache;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    logging::init();
 
     let cli = cli::Cli::parse();
     cli::dispatch(cli).await

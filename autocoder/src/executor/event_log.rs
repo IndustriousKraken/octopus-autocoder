@@ -97,25 +97,50 @@ pub fn stream_path_for(summary_path: &Path) -> PathBuf {
 /// ready to accept `write_prompt` followed by any number of
 /// `append_action` / `append_stderr` calls and one
 /// `set_final_answer` / `finalize` at the end.
+/// Run-divider prefix written at the start of each run's section in the
+/// append-mode logs, so consecutive runs for the same change are separable.
+pub const RUN_LOG_DIVIDER_PREFIX: &str = "=== RUN ";
+
+/// Write a run-start divider to a freshly-opened (append-mode) log file. A
+/// leading blank line is added only when the file already holds a prior run's
+/// content. Diagnostic side-effect: a write failure is ignored (logging must
+/// never abort the run).
+fn write_run_divider(f: &mut std::fs::File) {
+    use std::io::Write;
+    let sep = match f.metadata() {
+        Ok(m) if m.len() > 0 => "\n",
+        _ => "",
+    };
+    let line = format!(
+        "{sep}{RUN_LOG_DIVIDER_PREFIX}{ts} ===\n",
+        ts = chrono::Utc::now().to_rfc3339(),
+    );
+    let _ = f.write_all(line.as_bytes());
+}
+
 pub fn open(summary_path: &Path) -> Result<StructuredLogWriter> {
     if let Some(parent) = summary_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("creating log directory {}", parent.display())
         })?;
     }
-    let summary_file = std::fs::OpenOptions::new()
-        .write(true)
+    // Open in APPEND mode (NOT truncate) so a re-invocation for the same
+    // change — an executor retry, a multi-iteration sequence, a revision, or a
+    // re-queued change — preserves prior runs' transcripts instead of erasing
+    // them. A run-divider separates each run, mirroring the recovery-turn append.
+    let mut summary_file = std::fs::OpenOptions::new()
+        .append(true)
         .create(true)
-        .truncate(true)
         .open(summary_path)
         .with_context(|| format!("opening summary log file {}", summary_path.display()))?;
+    write_run_divider(&mut summary_file);
     let stream_path = stream_path_for(summary_path);
-    let stream_file = std::fs::OpenOptions::new()
-        .write(true)
+    let mut stream_file = std::fs::OpenOptions::new()
+        .append(true)
         .create(true)
-        .truncate(true)
         .open(&stream_path)
         .with_context(|| format!("opening stream log file {}", stream_path.display()))?;
+    write_run_divider(&mut stream_file);
     Ok(StructuredLogWriter {
         inner: Mutex::new(Inner {
             summary_file,
@@ -267,7 +292,9 @@ pub fn read_final_answer(log_path: &Path) -> Option<String> {
 
 fn extract_final_answer(raw: &str) -> Option<String> {
     let marker = "=== FINAL ANSWER (";
-    let header_idx = raw.find(marker)?;
+    // `rfind`: with append-mode logs the file may hold several runs' sections;
+    // the PR body wants the LATEST run's final answer, not the oldest.
+    let header_idx = raw.rfind(marker)?;
     // Advance past the header line (everything up to and including the
     // newline that ends `=== FINAL ANSWER (n bytes) ===`).
     let after_header_rel = raw[header_idx..].find('\n')?;
@@ -361,6 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn second_run_appends_and_preserves_the_first() {
+        // Re-invoking the executor for the same change must NOT erase the prior
+        // run's transcript (the data-loss bug); both runs are retained under
+        // separate RUN dividers, and the LATEST final answer is the one read.
+        let tmp = TempDir::new().unwrap();
+        let path = log_path(&tmp, "change.log");
+
+        let w1 = open(&path).unwrap();
+        w1.write_prompt("FIRST_PROMPT").unwrap();
+        w1.set_final_answer("first run answer".to_string()).unwrap();
+        w1.finalize().unwrap();
+        drop(w1);
+
+        let w2 = open(&path).unwrap();
+        w2.write_prompt("SECOND_PROMPT").unwrap();
+        w2.set_final_answer("second run answer".to_string()).unwrap();
+        w2.finalize().unwrap();
+        drop(w2);
+
+        let summary = std::fs::read_to_string(&path).unwrap();
+        // Both runs survive.
+        assert!(summary.contains("FIRST_PROMPT"), "first run wiped: {summary}");
+        assert!(summary.contains("SECOND_PROMPT"), "second run missing: {summary}");
+        // Two run dividers, one per run.
+        assert_eq!(
+            summary.matches(RUN_LOG_DIVIDER_PREFIX).count(),
+            2,
+            "expected one RUN divider per run: {summary}"
+        );
+        // The PR body reads the LATEST run's final answer.
+        assert_eq!(
+            extract_final_answer(&summary).as_deref(),
+            Some("second run answer")
+        );
+
+        // The stream log is likewise appended, not truncated.
+        let stream = std::fs::read_to_string(path.with_extension("stream.log")).unwrap();
+        assert_eq!(stream.matches(RUN_LOG_DIVIDER_PREFIX).count(), 2);
+    }
+
+    #[test]
     fn final_answer_returned_post_finalize() {
         let tmp = TempDir::new().unwrap();
         let writer = open(&log_path(&tmp, "run.log")).unwrap();
@@ -420,7 +488,15 @@ mod tests {
         assert!(summary.contains("Quick reply with no tool calls."));
 
         let stream = std::fs::read_to_string(&stream_path).unwrap();
-        assert!(stream.is_empty(), "zero-action stream log must be empty");
+        // The stream carries the run-divider but no ACTION lines for a
+        // zero-action run (the divider is added at open so consecutive runs are
+        // separable; see `write_run_divider`).
+        assert!(
+            !stream.contains("[tool_use]")
+                && !stream.contains("[tool_result]")
+                && !stream.contains("[assistant]"),
+            "zero-action stream log must contain no action lines: {stream}"
+        );
     }
 
     #[test]
