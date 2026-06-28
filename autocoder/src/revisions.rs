@@ -631,6 +631,15 @@ pub async fn process_revision_requests_at(
     } else {
         "origin"
     };
+    // Sync local agent_branch from the remote before processing PRs so
+    // diff_three_dot in build_review_context always reflects the remote PR
+    // state. A previous triage pass (or any other operation) may have reset
+    // the local ref to base without the pass that opened the PR ever re-
+    // updating it (the open-PR early-return path skips prepare_workspace_for_pass).
+    if crate::git::fetch_remote_branch(workspace, push_remote, &repo.agent_branch).is_ok() {
+        let remote_ref = format!("{push_remote}/{}", repo.agent_branch);
+        let _ = crate::git::branch_force_move(workspace, &repo.agent_branch, &remote_ref);
+    }
     for pr in &open_prs {
         if cancel.is_cancelled() {
             return Ok(());
