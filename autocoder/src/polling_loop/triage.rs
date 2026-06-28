@@ -43,8 +43,14 @@ pub async fn process_audit_triages(
         .with_context(|| format!("audit-triage: checkout `{}`", repo.base_branch))?;
     git::pull_ff_only(workspace, &repo.base_branch)
         .with_context(|| format!("audit-triage: pull --ff-only `{}`", repo.base_branch))?;
-    git::recreate_branch(workspace, &repo.agent_branch)
-        .with_context(|| format!("audit-triage: recreate `{}`", repo.agent_branch))?;
+    // Use a temp work branch rather than agent_branch so the real agent_branch
+    // ref keeps pointing at the open PR's commit. run_revision_dispatchers runs
+    // later in the same iteration and calls diff_three_dot(base, agent_branch) —
+    // if triage overwrote the ref it would see an empty diff every time a triage
+    // and a code-review comment land in the same pass.
+    let triage_work_branch = format!("{}-triage-work", repo.agent_branch);
+    git::recreate_branch(workspace, &triage_work_branch)
+        .with_context(|| format!("audit-triage: recreate `{triage_work_branch}`"))?;
 
     for thread_ts in thread_tses {
         let state_root = threads::default_state_root(paths);
