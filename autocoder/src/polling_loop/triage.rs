@@ -327,6 +327,13 @@ pub(crate) async fn process_completed_triage(
     };
     git::commit(workspace, &subject)
         .with_context(|| "audit-triage: commit triage branch".to_string())?;
+    // On a retry the branch already exists on the fork remote; fetch it so
+    // --force-with-lease has a live tracking ref and doesn't reject with
+    // "stale info". Ignored on first push (branch absent → fetch is a no-op
+    // for the lease check).
+    if push_remote != "origin" {
+        let _ = git::fetch_remote_branch(workspace, push_remote, &branch);
+    }
     if let Err(e) = git::push_force_with_lease(workspace, &branch, push_remote) {
         return Err(anyhow!("audit-triage: pushing triage branch failed: {e:#}"));
     }
