@@ -1625,10 +1625,12 @@ The sandbox SHALL be applied by a **platform-appropriate mechanism**: on Linux v
 
 **The default filesystem policy is the exposed-home denylist for every role**, because a wrapped CLI and the toolchains it drives live under `$HOME` (node/pyenv/rbenv/cargo, and the CLI's own install + session + caches). Roles differ only in **workspace** writability:
 
-- **Exposed home, default-deny mask-list (denylist) — executor AND read-only roles.** The home directory SHALL be present AND writable, so toolchains installed under `$HOME` (`~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.rbenv`, the CLI's own install + session, caches, …) work without enumeration — EXCEPT a default-deny **mask-list** of sensitive paths which SHALL be masked (replaced with empty or inaccessible mounts). The mask-list covers **credential paths** (read-protection: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, cloud-token dirs, other CLIs' config stores, package-manager credential files such as `~/.cargo/credentials.toml` / `~/.npmrc`) AND **shell-init/persistence paths** (write-protection: `~/.bashrc`, `~/.profile`, `~/.ssh/authorized_keys`, autostart/cron). It ships with defaults AND is operator-editable (see the orchestrator-cli config requirement). System paths outside `$HOME` are visible read-only.
+- **Exposed home, default-deny mask-list (denylist) — executor AND read-only roles.** The home directory SHALL be present AND writable, so toolchains installed under `$HOME` (`~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.rbenv`, the CLI's own install + session, caches, …) work without enumeration — EXCEPT a default-deny **mask-list** of sensitive paths which SHALL be masked (replaced with empty or inaccessible mounts). The mask-list covers **credential paths** (read-protection: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, cloud-token dirs, other CLIs' config stores, package-manager credential files such as `~/.cargo/credentials.toml` / `~/.npmrc`, AND the daemon's OWN resolved config file AND secrets file — wherever they reside, in or out of `$HOME` — which hold the deployment's credentials) AND **shell-init/persistence paths** (write-protection: `~/.bashrc`, `~/.profile`, `~/.ssh/authorized_keys`, autostart/cron). It ships with defaults AND is operator-editable (see the orchestrator-cli config requirement). System paths outside `$HOME` are visible read-only.
 - **Strict mode — opt-in masked-home allowlist.** An operator MAY opt into the masked-home allowlist for high-compliance hosts: the home directory SHALL be masked; the subprocess sees only the workspace, the running role's own CLI config store (read-only, for authentication), the **resolved CLI binary AND its runtime dependency closure** (following symlinks, even when installed under `~/.local/bin`), AND the minimal runtime. This is NOT the default, and it accepts that a toolchain-heavy CLI (e.g. a Node app whose runtime sprawls under `$HOME`) may be unable to start under the mask.
 
 The workspace SHALL be read-write for the executor AND read-only for read-only roles, in every policy — EXCEPT that a read-only role's workspace SHALL expose a writable, ephemeral project-scratch subtree where the running CLI requires one (e.g. opencode writes `<workspace>/.opencode/` and crashes if it cannot). That subtree SHALL be overlaid writable (a tmpfs, discarded after the run, on the Linux mechanisms) so the CLI's project scratch works while the repo files stay read-only; it SHALL be derived from the role's resolved CLI, NOT operator-supplied. The home directory's read-WRITE exposure under the denylist applies to read-only roles too: their "read-only" is the workspace's tracked files, not the home — a read-only role may read the home AND write its own caches/session there, but SHALL NOT modify the repo.
+
+Under the denylist policy, the executor's read-write home exposure SHALL NOT extend write access to OTHER managed repositories' workspaces: the directory holding the per-repository workspaces SHALL be bound read-only, with ONLY the role's own workspace read-write. An agent MAY READ a sibling repository's workspace (useful for referring to a related project) but SHALL NOT modify or delete it; the rest of the exposed home (toolchain caches/sessions) stays writable. This bounds the blast radius of a stray or mis-targeted filesystem mutation (e.g. an `rm -rf`) to the role's own workspace.
 
 - **Capability / operation restriction.** On Linux: drop `CAP_NET_RAW` (no raw-socket sniffing), `CAP_NET_ADMIN` (no route/iptables hijack), AND `CAP_SYS_PTRACE` (no reading another process's memory); `NoNewPrivileges`; address families restricted to exclude `AF_PACKET`. On macOS the generated Seatbelt profile SHALL deny the equivalents where the platform exposes them — raw/packet networking, inspection of other processes, AND privilege elevation.
 - **Process-table restriction.** On Linux, `/proc` mounted so the subprocess cannot read another process's `environ` or `mem`. On macOS (which has no `/proc`), the Seatbelt profile SHALL deny process-information access to other processes.
@@ -1645,9 +1647,21 @@ Outbound network egress SHALL NOT be restricted by this sandbox: network egress 
 - **THEN** the read fails because the path is masked
 - **AND** the failure does not depend on the wrapped CLI's own permission rules
 
+#### Scenario: The daemon's own config and secrets are masked
+- **WHEN** the spawned agent attempts to read the daemon's own resolved config file OR secrets file — at whatever path the daemon loaded them from, including a non-standard location such as `~/autocoder/config.yaml` or `/etc/autocoder/secrets.env` — through any tool, including a `Bash` command such as `cat` or `python -c open()`
+- **THEN** the read fails because the path is masked
+- **AND** an attempt to write to OR delete the config file also fails
+- **AND** this holds for the executor AND read-only roles
+
 #### Scenario: A masked persistence file cannot be written
 - **WHEN** the spawned agent attempts to write a mask-listed persistence file (e.g. `~/.bashrc` or `~/.ssh/authorized_keys`)
 - **THEN** the write does not persist to the real file because the path is masked
+
+#### Scenario: Sibling workspaces are readable but not writable
+- **WHEN** under the denylist policy the spawned agent reads a file in ANOTHER managed repository's workspace under the workspaces-parent directory
+- **THEN** the read succeeds (sibling repositories are referenceable)
+- **AND** an attempt to write to OR delete a file in a sibling workspace fails because sibling workspaces are bound read-only
+- **AND** a write within the role's OWN workspace still succeeds (for the executor)
 
 #### Scenario: Read-only roles get the exposed home with a read-only workspace
 - **WHEN** a read-only role (an audit, an agentic reviewer, or a verifier gate) spawns through `agentic_run` under the default policy
